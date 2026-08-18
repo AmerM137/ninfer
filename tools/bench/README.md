@@ -127,6 +127,26 @@ schema-v10 serving startup record. The stochastic route pins its complete
 temperature/top-p/top-k/min-p/presence/frequency profile explicitly, so model-default changes do
 not alter the measurement method.
 
+## Quick serving benchmark
+
+`quick_serve_bench.py` is the 2-5 minute shakeout: it starts `ninfer-serve` once per speculative
+mode (`mtp0` and `mtp3` by default; `dflash7` selectable) and sends four greedy requests from
+three fixed prompts (prose / code / math). The first request is an excluded warm-up, the second
+repeats it so its TTFT shows prefix reuse, and the reported means cover the remaining two timed
+requests. Rates come from the request-log JSONL, whose artifact type and schema version the tool
+pins, and the run ends with a cross-mode summary carrying the decode speedup. Indicative numbers
+only — two timed requests per mode, short prompts, prefix reuse left on — not the published
+methodology (`run_serve_corpus.py`). Each mode prints the temporary directory holding its request
+log and server stderr.
+
+```bash
+python tools/bench/quick_serve_bench.py --artifact /path/to/model.ninfer
+
+# Point at a different build tree, run one mode:
+python tools/bench/quick_serve_bench.py --artifact /path/to/model.ninfer \
+  --serve build-clangcl/apps/ninfer-serve.exe --mode mtp3
+```
+
 ## Concurrent serving benchmark
 
 `run_serve_concurrency.py` measures two separate concurrency properties through real loopback
