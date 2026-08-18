@@ -6,12 +6,19 @@ import argparse
 import json
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from tools.bench import hostexec  # noqa: E402
 
 
 class TestFailure(RuntimeError):
@@ -266,7 +273,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--artifact", type=Path, required=True)
     parser.add_argument("--backend", choices=("mtp", "dflash"), required=True)
-    parser.add_argument("--server-bin", type=Path, default=Path("build/apps/ninfer-serve"))
+    parser.add_argument(
+        "--server-bin", type=Path, default=hostexec.binary_path("build/apps/ninfer-serve")
+    )
     parser.add_argument(
         "--fixture",
         type=Path,
@@ -328,6 +337,7 @@ def main() -> None:
                 stdout=output,
                 stderr=subprocess.STDOUT,
                 text=True,
+                creationflags=hostexec.SERVER_POPEN_FLAGS,
             )
             try:
                 wait_for_server(base_url, process, args.startup_timeout)
@@ -340,7 +350,7 @@ def main() -> None:
                 raise SystemExit(f"{error}\n\nlast server log lines:\n{detail}") from error
             finally:
                 if process.poll() is None:
-                    process.terminate()
+                    hostexec.request_stop(process)
                     try:
                         process.wait(timeout=15)
                     except subprocess.TimeoutExpired:

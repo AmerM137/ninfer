@@ -12,7 +12,6 @@ import math
 import os
 import queue
 import random
-import shlex
 import sys
 import threading
 import time
@@ -24,6 +23,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from tools.bench import hostexec  # noqa: E402
 from tools.bench import run_serve_corpus as corpus  # noqa: E402
 
 
@@ -95,7 +95,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--serve",
         type=Path,
-        default=REPO_ROOT / "build/apps/ninfer-serve",
+        default=hostexec.binary_path("build/apps/ninfer-serve"),
         help="ninfer-serve executable",
     )
     parser.add_argument(
@@ -1037,7 +1037,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"# {point.key}: {len(jobs)} request(s), "
                 f"order={workload_order_label(point)}"
             )
-            print(shlex.join(server_command(serve, point, log_path, args)))
+            print(hostexec.format_command(server_command(serve, point, log_path, args)))
         return 0
 
     reports: list[dict[str, Any]] = []

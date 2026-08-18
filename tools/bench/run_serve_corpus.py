@@ -19,6 +19,11 @@ from typing import Any, Iterable, Sequence
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from tools.bench import hostexec  # noqa: E402
+
 MANIFEST_PATH = REPO_ROOT / "examples/cli/manifest.json"
 
 TARGET_MODEL_IDS = {
@@ -199,7 +204,9 @@ class RunningServer:
 
     def __enter__(self) -> "RunningServer":
         initial_offset = self.log_path.stat().st_size if self.log_path.exists() else 0
-        self.process = subprocess.Popen(self.command, cwd=REPO_ROOT)
+        self.process = subprocess.Popen(
+            self.command, cwd=REPO_ROOT, creationflags=hostexec.SERVER_POPEN_FLAGS
+        )
         self.tail = ServerLogTail(self.log_path, self.process, initial_offset)
         return self
 
@@ -209,7 +216,7 @@ class RunningServer:
     def stop(self) -> None:
         if self.process is None or self.process.poll() is not None:
             return
-        self.process.terminate()
+        hostexec.request_stop(self.process)
         try:
             self.process.wait(timeout=15.0)
         except subprocess.TimeoutExpired:
@@ -271,7 +278,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--serve",
         type=Path,
-        default=REPO_ROOT / "build/apps/ninfer-serve",
+        default=hostexec.binary_path("build/apps/ninfer-serve"),
         help="ninfer-serve executable",
     )
     parser.add_argument(
