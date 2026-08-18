@@ -129,22 +129,58 @@ not alter the measurement method.
 
 ## Quick serving benchmark
 
-`quick_serve_bench.py` is the 2-5 minute shakeout: it starts `ninfer-serve` once per speculative
-mode (`mtp0` and `mtp3` by default; `dflash7` selectable) and sends four greedy requests from
-three fixed prompts (prose / code / math). The first request is an excluded warm-up, the second
-repeats it so its TTFT shows prefix reuse, and the reported means cover the remaining two timed
-requests. Rates come from the request-log JSONL, whose artifact type and schema version the tool
-pins, and the run ends with a cross-mode summary carrying the decode speedup. Indicative numbers
-only — two timed requests per mode, short prompts, prefix reuse left on — not the published
-methodology (`run_serve_corpus.py`). Each mode prints the temporary directory holding its request
-log and server stderr.
+`quick_serve_bench.py` is the 2-5 minute shakeout, in two stages. Every stage reads its rates
+from the request-log JSONL, whose artifact type and schema version the tool pins, and prints the
+temporary directory holding that log and the server's stderr.
+
+The **prefill stage** measures prefill throughput on prompts long enough for the rate to mean
+something: the committed `long_niah_8k` and `long_niah_64k` manifest cases (`--prefill-fixture`
+selects others, including the 128k and 256k rungs). Each request asks for one output token by
+default, so `timings_seconds.prefill` is the whole measurement; `--prefill-max-tokens 128` takes
+the point under the published NIAH shape instead, worth under 1% here. The rate is
+`computed_prefill_tokens / timings_seconds.prefill`, and a repetition served from the prefix cache
+fails the point rather than reporting a rate whose seconds cover fewer tokens than its label.
+
+Three details make its numbers comparable with `run_serve_corpus.py`'s published rows:
+
+- The stage runs its own server with `--no-prefix-reuse` and `--log-stats-interval-ms 0`, the flags
+  every published row uses, and its own `--max-context` sized for the largest selected fixture
+  (`max_context` is fixed at startup; `--prefill-max-context 262144` matches the campaign exactly,
+  though context size measured no difference here). The mode stage below is left on the server
+  default instead, so its numbers stay comparable with earlier runs of this tool.
+- One warm-up request is sent and excluded. This is not a nicety: the first prefill on a freshly
+  loaded server measured ~4.5% slow with roughly ten times the spread, because it also pays graph
+  capture and cold clocks.
+- TTFT is reported as `prepare + vision + prefill`, the same definition `run_serve_corpus.py` uses,
+  rather than the log's `ttft` field.
+
+The fixture's bytes are checked against the manifest's `messages_sha256`, since its declared
+`prompt_tokens` is the label on the reported rate. That count is the CLI preparation basis; the
+serving path prepares two tokens fewer (7,678 and 64,510), and the stage prints a note whenever the
+measured length differs from the declared one. The NIAH cases also declare `kv_dtype: int8` while
+this tool defaults to the server's KV dtype — pass `--kv-dtype int8` to match the published rows,
+though that measured no difference either.
+
+The **mode stage** then starts `ninfer-serve` once per speculative mode (`mtp0` and `mtp3` by
+default; `dflash7` selectable) on the server's default 8192-token context, and sends four greedy
+requests from three fixed prompts (prose / code / math). The first request is an excluded warm-up,
+the second repeats it so its TTFT shows prefix reuse, and the reported means cover the remaining
+two timed requests; the run ends with a cross-mode summary carrying the decode speedup. Its
+prefill column is a latency in milliseconds rather than a rate: at these prompt lengths the pass
+costs about 60 ms whether the prompt is 31 tokens or 42, so a tok/s figure would report prompt
+length instead of prefill speed — the prefill stage above is where the rate is measured.
+Indicative numbers only, not the published methodology (`run_serve_corpus.py`).
 
 ```bash
 python tools/bench/quick_serve_bench.py --artifact /path/to/model.ninfer
 
-# Point at a different build tree, run one mode:
+# Prefill only, three repetitions, matching the published rows' KV dtype:
 python tools/bench/quick_serve_bench.py --artifact /path/to/model.ninfer \
-  --serve build-clangcl/apps/ninfer-serve.exe --mode mtp3
+  --prefill-fixture long_niah_8k --prefill-reps 3 --kv-dtype int8 --mode mtp0
+
+# Point at a different build tree, skip the prefill stage, run one mode:
+python tools/bench/quick_serve_bench.py --artifact /path/to/model.ninfer \
+  --serve build-clangcl/apps/ninfer-serve.exe --no-prefill --mode mtp3
 ```
 
 ## Concurrent serving benchmark
