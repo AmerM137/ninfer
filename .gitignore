@@ -37,6 +37,7 @@ tools/freq_corpus/fixtures/*
 !tools/freq_corpus/fixtures/ranking/
 
 # Editor / OS
+.vs/
 .vscode/
 .idea/
 *.swp
