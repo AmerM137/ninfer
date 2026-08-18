@@ -299,6 +299,16 @@ if(NINFER_BUILD_APPS OR BUILD_TESTING)
   add_library(ninfer_product_load_progress STATIC
     product/load_progress/load_progress.cpp)
   ninfer_internal_includes(ninfer_product_load_progress)
+
+  # UTF-8 console code pages and wide-argv recovery for product entry points
+  # (no-op passthrough off Windows).
+  add_library(ninfer_product_console_unicode STATIC
+    product/console_unicode/console_unicode.cpp)
+  ninfer_internal_includes(ninfer_product_console_unicode)
+  if(WIN32)
+    # CommandLineToArgvW
+    target_link_libraries(ninfer_product_console_unicode PRIVATE shell32)
+  endif()
 endif()
 
 # One cold closed registry plus the opaque public product Engine. Family and exact-target

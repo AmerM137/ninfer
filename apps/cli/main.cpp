@@ -1,4 +1,5 @@
 #include "options.h"
+#include "product/console_unicode/console_unicode.h"
 #include "product/load_progress/load_progress.h"
 #include "product/prompt_input/prompt_input.h"
 
@@ -232,6 +233,9 @@ void print_generation_summary(const ninfer::GenerationResult& result,
 } // namespace
 
 int main(int argc, char** argv) {
+    const ninfer::product::ConsoleUtf8Scope console_utf8(argc, argv);
+    argc = console_utf8.argc();
+    argv = console_utf8.argv();
     try {
         const ninfer::cli::Options cli = ninfer::cli::parse_options(argc, argv);
         if (cli.help_requested) {

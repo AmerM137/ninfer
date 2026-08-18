@@ -7,12 +7,17 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <unistd.h>
+#endif
 
 namespace {
 
@@ -345,10 +350,15 @@ int main() {
                           console_prefix.ends_with("] [info] ninfer-serve: "),
                       "console log prefix mismatch");
 
+#ifdef _WIN32
+    const std::string process_tag =
+        std::to_string(static_cast<long long>(::GetCurrentProcessId()));
+#else
+    const std::string process_tag = std::to_string(static_cast<long long>(::getpid()));
+#endif
     const std::filesystem::path log_path =
-        std::filesystem::temp_directory_path() /
-        ("ninfer-request-log-test-" + std::to_string(static_cast<long long>(::getpid())) +
-         ".jsonl");
+        std::filesystem::temp_directory_path() / ("ninfer-request-log-test-" + process_tag +
+                                                  ".jsonl");
     std::filesystem::remove(log_path);
     {
         JsonlRequestLog writer(log_path.string());
@@ -380,6 +390,15 @@ int main() {
                           "third appended event mismatch");
     }
     input.close();
+
+    // The JSONL byte stream is a cross-platform contract: LF-only line
+    // terminators. A text-mode stream on Windows would silently write CRLF.
+    std::ifstream raw(log_path, std::ios::binary);
+    const std::string raw_bytes{std::istreambuf_iterator<char>(raw),
+                                std::istreambuf_iterator<char>()};
+    failures += check(!raw_bytes.empty() && raw_bytes.find('\r') == std::string::npos,
+                      "request JSONL log contains CR bytes (text-mode stream?)");
+    raw.close();
     std::filesystem::remove(log_path);
 
     if (failures == 0) { std::cout << "ok\n"; }
