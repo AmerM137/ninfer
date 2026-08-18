@@ -15,10 +15,16 @@
 #include <unordered_map>
 #include <utility>
 
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
+
+#include <cstdio>
 
 namespace ninfer::artifact {
 namespace {
@@ -178,6 +184,156 @@ struct TransparentStringHash {
     }
 };
 
+#ifdef _WIN32
+// Win32 counterpart to the POSIX MappedFile. Two handles on the same file: a
+// plain handle backing the file mapping (the JSON directory and the small
+// resource objects) and a FILE_FLAG_NO_BUFFERING handle for the 4096-byte
+// aligned direct reads (every tensor payload). The mapping stands in for
+// mmap(PROT_READ, MAP_PRIVATE); the positional unbuffered ReadFile stands in
+// for pread(O_DIRECT), including the short read a trailing partial sector
+// returns at end of file.
+//
+// If the volume's logical sector size exceeds 4096, or the file system does
+// not support unbuffered I/O, direct reads degrade to buffered ReadFile on
+// the plain handle: a correct, slower load instead of a failure.
+class MappedFile {
+public:
+    explicit MappedFile(const std::filesystem::path& path) {
+        const auto wide_path = path.wstring();
+        map_handle_ = ::CreateFileW(
+            wide_path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL, 0);
+        if (map_handle_ == INVALID_HANDLE_VALUE) {
+            throw std::system_error(::GetLastError(), std::generic_category(),
+                                    "open " + path.string());
+        }
+
+        LARGE_INTEGER file_size{};
+        if (!::GetFileSizeEx(map_handle_, &file_size)) {
+            const DWORD error = ::GetLastError();
+            close_all();
+            throw std::system_error(error, std::generic_category(), "fstat " + path.string());
+        }
+        if (file_size.QuadPart < 0 ||
+            static_cast<std::uintmax_t>(file_size.QuadPart) >
+                std::numeric_limits<std::size_t>::max()) {
+            close_all();
+            throw ArtifactError("artifact size does not fit the process address space");
+        }
+
+        const auto size = static_cast<std::size_t>(file_size.QuadPart);
+        if (size != 0) {
+            // CreateFileMappingW reports failure as NULL, unlike CreateFileW's
+            // INVALID_HANDLE_VALUE; the member's not-open sentinel matches.
+            mapping_handle_ = ::CreateFileMappingW(map_handle_, nullptr, PAGE_READONLY,
+                                                   static_cast<DWORD>(file_size.HighPart),
+                                                   static_cast<DWORD>(file_size.LowPart), nullptr);
+            if (mapping_handle_ == nullptr) {
+                const DWORD error = ::GetLastError();
+                close_all();
+                throw std::system_error(error, std::generic_category(), "mmap " + path.string());
+            }
+            const auto* mapping =
+                ::MapViewOfFile(mapping_handle_, FILE_MAP_READ, 0, 0, file_size.QuadPart);
+            if (mapping == nullptr) {
+                const DWORD error = ::GetLastError();
+                close_all();
+                throw std::system_error(error, std::generic_category(), "mmap " + path.string());
+            }
+            data_ = static_cast<const std::byte*>(mapping);
+        }
+        size_ = size;
+        open_direct_handle(wide_path);
+    }
+
+    ~MappedFile() { close_all(); }
+
+    MappedFile(const MappedFile&)            = delete;
+    MappedFile& operator=(const MappedFile&) = delete;
+
+    const std::byte* data() const noexcept { return data_; }
+
+    std::size_t size() const noexcept { return size_; }
+
+    // Direct reads are positional: the offset travels in an OVERLAPPED
+    // structure on a synchronous handle, so no file pointer is mutated and
+    // the method stays honest as const. The 4096-byte alignment pre-checks
+    // are kept verbatim from the POSIX path: they match the
+    // FILE_FLAG_NO_BUFFERING sector rules.
+    std::size_t read_direct(std::uint64_t absolute_offset, std::span<std::byte> destination) const {
+        constexpr std::size_t alignment = Reader::direct_io_alignment;
+        if (absolute_offset % alignment != 0 || destination.size() % alignment != 0 ||
+            reinterpret_cast<std::uintptr_t>(destination.data()) % alignment != 0) {
+            throw ArtifactError("direct artifact read is not 4096-byte aligned");
+        }
+        if (absolute_offset >
+                static_cast<std::uint64_t>(std::numeric_limits<LONGLONG>::max()) ||
+            destination.size() > static_cast<std::size_t>(std::numeric_limits<DWORD>::max())) {
+            throw ArtifactError("direct artifact read exceeds platform I/O limits");
+        }
+
+        const HANDLE handle = direct_io_ ? io_handle_ : map_handle_;
+        OVERLAPPED overlapped{};
+        overlapped.OffsetHigh = static_cast<DWORD>(absolute_offset >> 32);
+        overlapped.Offset     = static_cast<DWORD>(absolute_offset);
+        DWORD bytes_read      = 0;
+        if (!::ReadFile(handle, destination.data(), static_cast<DWORD>(destination.size()),
+                        &bytes_read, &overlapped)) {
+            throw std::system_error(::GetLastError(), std::generic_category(),
+                                    "direct artifact read");
+        }
+        return static_cast<std::size_t>(bytes_read);
+    }
+
+private:
+    void open_direct_handle(const std::wstring& wide_path) {
+        DWORD sector_size = 0;
+        FILE_STORAGE_INFO storage {};
+        if (::GetFileInformationByHandleEx(map_handle_, FileStorageInfo, &storage,
+                                           sizeof(storage))) {
+            sector_size = storage.LogicalBytesPerSector;
+        }
+        if (sector_size != 0 && sector_size <= Reader::direct_io_alignment) {
+            io_handle_ = ::CreateFileW(wide_path.c_str(), FILE_READ_DATA, FILE_SHARE_READ,
+                                       nullptr, OPEN_EXISTING,
+                                       FILE_ATTRIBUTE_NORMAL | FILE_FLAG_NO_BUFFERING, 0);
+            if (io_handle_ != INVALID_HANDLE_VALUE) {
+                direct_io_ = true;
+                return;
+            }
+        }
+        log_direct_io_fallback_once(sector_size);
+    }
+
+    void log_direct_io_fallback_once(DWORD sector_size) noexcept {
+        static bool logged = false;
+        if (logged) { return; }
+        logged = true;
+        std::fprintf(stderr,
+                     "NInfer artifact direct I/O unavailable (sector size %lu); falling back "
+                     "to buffered reads\n",
+                     static_cast<unsigned long>(sector_size));
+    }
+
+    void close_all() noexcept {
+        if (data_ != nullptr) { ::UnmapViewOfFile(const_cast<std::byte*>(data_)); }
+        if (mapping_handle_ != nullptr) { ::CloseHandle(mapping_handle_); }
+        if (io_handle_ != INVALID_HANDLE_VALUE) { ::CloseHandle(io_handle_); }
+        if (map_handle_ != INVALID_HANDLE_VALUE) { ::CloseHandle(map_handle_); }
+        data_           = nullptr;
+        mapping_handle_ = nullptr;
+        io_handle_      = INVALID_HANDLE_VALUE;
+        map_handle_     = INVALID_HANDLE_VALUE;
+    }
+
+    HANDLE map_handle_     = INVALID_HANDLE_VALUE;
+    HANDLE mapping_handle_ = nullptr;
+    HANDLE io_handle_      = INVALID_HANDLE_VALUE;
+    const std::byte* data_ = nullptr;
+    std::size_t size_      = 0;
+    bool direct_io_        = false;
+};
+#else
 class MappedFile {
 public:
     explicit MappedFile(const std::filesystem::path& path) {
@@ -253,6 +409,7 @@ private:
     const std::byte* data_ = nullptr;
     std::size_t size_      = 0;
 };
+#endif
 
 } // namespace
 

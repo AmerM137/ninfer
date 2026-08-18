@@ -277,6 +277,10 @@ add_library(ninfer_text STATIC
   text/unicode.cpp
   ${PROJECT_SOURCE_DIR}/third_party/utf8proc/utf8proc.c)
 ninfer_internal_includes(ninfer_text)
+# utf8proc is compiled into this static archive, not a DLL: without
+# UTF8PROC_STATIC MSVC would decorate its symbols with __declspec(dllimport)
+# and reject the definitions (C2491).
+target_compile_definitions(ninfer_text PRIVATE UTF8PROC_STATIC)
 
 add_library(ninfer_media_decode STATIC
   media/decode/decode.cpp)

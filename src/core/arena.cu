@@ -2,7 +2,12 @@
 
 #include <cuda_runtime.h>
 
+#ifdef _WIN32
+#include <malloc.h>
+#endif
+
 #include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <new>
 #include <stdexcept>
@@ -44,9 +49,35 @@ void free_device(void*& ptr) noexcept {
     }
 }
 
+// 4096-byte aligned backing for PinnedHostBuffer (see arena.h).
+constexpr std::size_t kPinnedAlignment = 4096;
+
+void* allocate_pinned(std::size_t bytes) {
+#ifdef _WIN32
+    void* ptr = _aligned_malloc(bytes, kPinnedAlignment);
+#else
+    void* ptr = nullptr;
+    if (posix_memalign(&ptr, kPinnedAlignment, bytes) != 0) { ptr = nullptr; }
+#endif
+    if (ptr == nullptr) { throw std::runtime_error("aligned pinned allocation failed"); }
+    return ptr;
+}
+
+void deallocate_pinned(void* ptr) noexcept {
+    if (ptr == nullptr) { return; }
+#ifdef _WIN32
+    _aligned_free(ptr);
+#else
+    std::free(ptr);
+#endif
+}
+
 void free_pinned(void*& ptr) noexcept {
     if (ptr != nullptr) {
-        log_cuda_error("cudaFreeHost", cudaFreeHost(ptr));
+        // cudaFreeHost is only valid for cudaMallocHost memory; registered
+        // user memory is released with cudaHostUnregister + the original free.
+        log_cuda_error("cudaHostUnregister", cudaHostUnregister(ptr));
+        deallocate_pinned(ptr);
         ptr = nullptr;
     }
 }
@@ -237,13 +268,13 @@ void DeviceArena::reset_peak() noexcept { peak_ = off_; }
 PinnedHostBuffer::PinnedHostBuffer(std::size_t size_bytes) {
     if (size_bytes == 0) { throw std::invalid_argument("PinnedHostBuffer size must be nonzero"); }
 
-    void* ptr             = nullptr;
-    const cudaError_t err = cudaMallocHost(&ptr, size_bytes);
+    data_ = allocate_pinned(size_bytes);
+    const cudaError_t err = cudaHostRegister(data_, size_bytes, cudaHostRegisterDefault);
     if (err != cudaSuccess) {
-        throw std::runtime_error(cuda_error_message("cudaMallocHost failed", err));
+        deallocate_pinned(data_);
+        data_ = nullptr;
+        throw std::runtime_error(cuda_error_message("cudaHostRegister failed", err));
     }
-
-    data_ = ptr;
     size_ = size_bytes;
 }
 

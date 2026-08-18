@@ -88,6 +88,11 @@ private:
     bool owns_        = true;
 };
 
+// Owning pinned (page-locked) host buffer, 4096-byte aligned by construction:
+// the backing memory is allocated with a 4096-byte alignment
+// (_aligned_malloc / posix_memalign) and pinned with cudaHostRegister, so it
+// may serve as a direct-I/O staging destination (Reader::read_direct) on
+// every platform without a runtime alignment gamble.
 class PinnedHostBuffer {
 public:
     explicit PinnedHostBuffer(std::size_t size_bytes);
