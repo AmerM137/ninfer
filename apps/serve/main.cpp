@@ -1,3 +1,4 @@
+#include "product/console_unicode/console_unicode.h"
 #include "product/load_progress/load_progress.h"
 #include "serve/console_log.h"
 #include "serve/generation_service.h"
@@ -6,7 +7,6 @@
 
 #include <atomic>
 #include <chrono>
-#include <csignal>
 #include <cstddef>
 #include <exception>
 #include <iomanip>
@@ -15,14 +15,43 @@
 #include <stdexcept>
 #include <utility>
 
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <csignal>
+#endif
+
 namespace {
 
 std::atomic<ninfer::serve::HttpServer*> g_server{nullptr};
 
-void handle_signal(int) {
+void stop_server() {
     ninfer::serve::HttpServer* server = g_server.load();
     if (server != nullptr) { server->stop(); }
 }
+
+#ifdef _WIN32
+// Ctrl+C, Ctrl+Break, console close, and shutdown all request a clean stop.
+// For CTRL_CLOSE_EVENT / CTRL_SHUTDOWN_EVENT Windows still terminates the
+// process on a short deadline after the handler returns, so an in-flight
+// request-log line may be truncated; Ctrl+C and Ctrl+Break complete cleanly.
+BOOL WINAPI handle_console_event(DWORD ctrl_type) {
+    switch (ctrl_type) {
+    case CTRL_C_EVENT:
+    case CTRL_BREAK_EVENT:
+    case CTRL_CLOSE_EVENT:
+    case CTRL_LOGOFF_EVENT:
+    case CTRL_SHUTDOWN_EVENT:
+        break;
+    default:
+        return FALSE;
+    }
+    stop_server();
+    return TRUE;
+}
+#else
+void handle_signal(int) { stop_server(); }
+#endif
 
 std::string format_bytes(std::size_t bytes) {
     constexpr double kMiB = 1024.0 * 1024.0;
@@ -41,6 +70,9 @@ std::string format_bytes(std::size_t bytes) {
 
 int main(int argc, char** argv) {
     ninfer::serve::ServeOptions options;
+    const ninfer::product::ConsoleUtf8Scope console_utf8(argc, argv);
+    argc = console_utf8.argc();
+    argv = console_utf8.argv();
     try {
         options = ninfer::serve::parse_serve_options(argc, argv);
     } catch (const std::invalid_argument& exception) {
@@ -124,8 +156,15 @@ int main(int argc, char** argv) {
         server.attach(service);
 
         g_server.store(&server);
+#ifdef _WIN32
+        if (!::SetConsoleCtrlHandler(handle_console_event, TRUE)) {
+            std::cerr << "failed to install console control handler (error "
+                      << ::GetLastError() << "); Ctrl+C will not shut down cleanly\n";
+        }
+#else
         std::signal(SIGINT, handle_signal);
         std::signal(SIGTERM, handle_signal);
+#endif
 
         std::ostringstream listening;
         listening << "listening on http://" << options.host << ':' << options.port

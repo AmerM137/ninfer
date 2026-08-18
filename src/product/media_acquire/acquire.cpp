@@ -2,14 +2,23 @@
 
 #include <curl/curl.h>
 
+#ifdef _WIN32
+// winsock2.h first, then ws2tcpip.h: getaddrinfo/freeaddrinfo/gai_strerror,
+// inet_ntop, and the IN6_IS_ADDR_* macros live in ws2tcpip.h; ntohl lives in
+// winsock2.h. Both must precede any windows.h include.
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <sys/socket.h>
+#endif
 
 #include <algorithm>
 #include <array>
 #include <cstddef>
 #include <chrono>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -26,6 +35,26 @@ namespace ninfer::product::media_acquire {
 namespace {
 
 using Clock = std::chrono::steady_clock;
+
+#ifdef _WIN32
+// Winsock is process-wide state: initialize it once before the first
+// getaddrinfo and release the provider at process exit. A failed WSAStartup
+// throws (and is retried on the next call, since a throwing initializer
+// leaves the local static uninitialized) so that only media acquisition
+// fails, not the whole process.
+void ensure_winsock() {
+    static const bool initialized = [] {
+        WSADATA data{};
+        if (::WSAStartup(MAKEWORD(2, 2), &data) != 0) {
+            throw Error(ErrorKind::RemoteUnavailable,
+                        "Winsock initialization (WSAStartup) failed");
+        }
+        std::atexit([] { ::WSACleanup(); });
+        return true;
+    }();
+    (void)initialized;
+}
+#endif
 
 void check_control(const Policy& policy) {
     if (policy.is_cancelled && policy.is_cancelled()) {
@@ -143,6 +172,9 @@ UrlParts parse_url(std::string_view value) {
 }
 
 std::string resolve_public(const UrlParts& url, bool allow_private) {
+#ifdef _WIN32
+    ensure_winsock();
+#endif
     addrinfo hints{};
     hints.ai_family   = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;

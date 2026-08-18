@@ -19,6 +19,8 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <exception>
 #include <fstream>
 #include <future>
 #include <iostream>
@@ -111,13 +113,25 @@ const fi::CompiledChatTemplate& reasoning_effort_template() {
     return value;
 }
 
+// Official Qwen3.6-27B HF checkpoint directory holding tokenizer.json,
+// tokenizer_config.json, and generation_config.json. Overridable so the test
+// runs on machines other than the maintainer's; main() skips (77) when the
+// files are absent instead of failing on the resource read.
+std::string official_checkpoint_file(const char* name) {
+    const char* directory = std::getenv("NINFER_QWEN3_6_27B_HF");
+    if (directory == nullptr || *directory == '\0') {
+        directory = "/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16";
+    }
+    return std::string(directory) + "/" + name;
+}
+
 const fi::Tokenizer& official_tokenizer() {
     static const std::string tokenizer_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/tokenizer.json");
+        read_file(official_checkpoint_file("tokenizer.json").c_str());
     static const std::string tokenizer_config_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/tokenizer_config.json");
+        read_file(official_checkpoint_file("tokenizer_config.json").c_str());
     static const std::string generation_config_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/generation_config.json");
+        read_file(official_checkpoint_file("generation_config.json").c_str());
     static const fi::Tokenizer tokenizer({.tokenizer_json         = tokenizer_json,
                                           .tokenizer_config_json  = tokenizer_config_json,
                                           .generation_config_json = generation_config_json});
@@ -2159,7 +2173,15 @@ int test_media_preparation_cancellation() {
 
 } // namespace
 
-int main() {
+int main() try {
+    for (const char* name : {"tokenizer.json", "tokenizer_config.json", "generation_config.json"}) {
+        const std::string path = official_checkpoint_file(name);
+        if (!std::ifstream(path, std::ios::binary)) {
+            std::cout << "SKIP: official checkpoint resource missing: " << path
+                      << " (set NINFER_QWEN3_6_27B_HF to a Qwen3.6-27B HF checkpoint directory)\n";
+            return 77;
+        }
+    }
     const FrontendResources owned = resources();
     const Frontend frontend       = FrontendFactory::create_component(owned);
     int failures                  = 0;
@@ -2203,4 +2225,10 @@ int main() {
     failures += test_invalid_media_classification();
     failures += test_disabled_vision();
     return failures == 0 ? 0 : 1;
+} catch (const std::exception& error) {
+    // Without this, an uncaught throw reaches std::terminate, which MSVC
+    // reports as an opaque fail-fast (0xc0000409) with all buffered output
+    // discarded.
+    std::cerr << "uncaught exception: " << error.what() << std::endl;
+    return 1;
 }

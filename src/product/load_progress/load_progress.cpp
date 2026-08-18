@@ -1,6 +1,10 @@
 #include "product/load_progress/load_progress.h"
 
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -60,7 +64,18 @@ std::string format_line(std::string_view phase, std::uint64_t done, std::uint64_
 } // namespace
 
 LoadProgressRendererOptions stderr_load_progress_options() noexcept {
-    if (::isatty(STDERR_FILENO) == 1) {
+#ifdef _WIN32
+    // A console-attached stderr has a retrievable console mode; a redirected
+    // one does not. Same probe shape as the POSIX isatty check. The mode
+    // output pointer is not optional: GetConsoleMode dereferences it whenever
+    // the handle is a real console.
+    DWORD console_mode     = 0;
+    const bool interactive =
+        ::GetConsoleMode(::GetStdHandle(STD_ERROR_HANDLE), &console_mode) != 0;
+#else
+    const bool interactive = ::isatty(STDERR_FILENO) == 1;
+#endif
+    if (interactive) {
         return LoadProgressRendererOptions{
             .mode                 = LoadProgressOutputMode::Interactive,
             .min_refresh_interval = std::chrono::milliseconds(200),
