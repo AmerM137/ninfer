@@ -36,7 +36,7 @@ as today.
 |---|---|
 | GPU | RTX 5090 32 GB, WDDM, driver 610.88 (UMD 13.3) |
 | CUDA | 13.3 toolkit at `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3` (nvcc reports 13.3.33; satisfies the existing >= 13.1 gate) |
-| Host compiler | MSVC 14.51 / `cl` 19.51.36256.0 via Visual Studio 2026 (Community) at `C:\Program Files\Microsoft Visual Studio\18`; clang 22 / clang-cl available but **not** used (nvcc on Windows officially supports only `cl` as host compiler) |
+| Host compiler | MSVC 14.51 / `cl` 19.51.36256.0 via Visual Studio 2026 (Community) at `C:\Program Files\Microsoft Visual Studio\18`; clang-cl 22.1.8 verified 2026-08-18 as an alternative C/C++ host compiler (nvcc keeps `cl` via `-ccbin` — nvcc on Windows officially supports only `cl`); see the bring-up section in `docs/windows-port/review.md` |
 | Build tools | CMake 4.3.2, Ninja (scoop), pkgconf 3.0.5 (scoop, shimmed as `pkg-config.exe`) |
 | Python | 3.14.6 (mamba env) |
 | Python packages | `torch`/`safetensors`/`numpy` for the conversion tooling — confirm they are installed in this env before choosing the conversion option in section 9 (3.14.6 is fine for the tooling; the 3.11 convention in `AGENTS.md` is not a hard floor) |
@@ -213,6 +213,12 @@ Remaining CMake work, none of it dependency-related:
   omission, because tolerance failures here will present as port bugs. Note also that clang-cl
   reports `Clang` and would take the existing branch — verify it accepts those GCC-style
   spellings under the MSVC driver rather than warning and ignoring them.
+  **Resolved 2026-08-17**: the demanded probe was run on cl 19.51 by disassembling `a*b+c`
+  (float and double): no contraction under the default model, and none under
+  `/arch:AVX2 /fp:precise` either — only `/fp:fast` or an explicit `/fp:contract` would
+  introduce it, so MSVC's default already matches the pinned `-ffp-contract=off` behavior.
+  `/fp:strict` is applied to op-test host references (`tests/CMakeLists.txt`) to pin that
+  contract explicitly at zero cost today.
 - Nothing else changes: `CMAKE_CUDA_ARCHITECTURES=120a` gate, CUDA >= 13.1 gate, RDC
   settings, `-lineinfo`, Ninja job pool, and the `sm_120a`-only policy all apply as-is on
   Windows — all verified by the passing configure.
@@ -298,7 +304,7 @@ Behavior notes:
 | `src/product/load_progress/load_progress.cpp` | `isatty(STDERR_FILENO)` → `GetConsoleMode(GetStdHandle(STD_ERROR_HANDLE), &mode) != 0` on Windows |
 | `src/serve/request_log.cpp` | (a) `getpid()` → `GetCurrentProcessId()` (instance id string format unchanged). (b) **Add `std::ios::binary` to the stream open at line 637.** `output_.open(path_, std::ios::out \| std::ios::app)` is a text-mode stream; MSVC translates `\n` → `\r\n` on write, so every JSONL line would diverge byte-wise from Linux and silently break decision 3.7. This is the only file-writing stream in `src/` and `apps/`, so the fix is that one flag |
 | `src/serve/console_log.cpp` | `localtime_r` → `localtime_s(&tm, &time_t)` on Windows (MSVC argument order, verified) |
-| `apps/serve/main.cpp` | Windows: `SetConsoleCtrlHandler` for `CTRL_C_EVENT`, `CTRL_BREAK_EVENT`, `CTRL_CLOSE_EVENT`, `CTRL_SHUTDOWN_EVENT` calling `HttpServer::stop()`; POSIX keeps `std::signal(SIGINT/SIGTERM)` |
+| `apps/serve/main.cpp` | Windows: `SetConsoleCtrlHandler` for `CTRL_C_EVENT`, `CTRL_BREAK_EVENT`, `CTRL_CLOSE_EVENT`, `CTRL_LOGOFF_EVENT`, `CTRL_SHUTDOWN_EVENT` calling `HttpServer::stop()` (logoff added during bring-up: a console session logoff should stop the server); POSIX keeps `std::signal(SIGINT/SIGTERM)` |
 | `src/product/media_acquire/acquire.cpp` | `#include <winsock2.h>` **then `<ws2tcpip.h>`** on Windows, both before any `windows.h`; one-time `WSAStartup` before `getaddrinfo` (with `WSACleanup` on process exit). `inet_ntop`, `getaddrinfo`/`freeaddrinfo`, `gai_strerror`, and the `IN6_IS_ADDR_*` macros used at `acquire.cpp:100-104,150-166` are declared in **ws2tcpip.h**, not winsock2.h. `ntohl` is in winsock2. The address logic is unchanged. No explicit `ws2_32` link needed — curl's `.pc` supplies it |
 | `tests/test_request_log.cpp` | `getpid()` → `GetCurrentProcessId()` on Windows |
 | `tests/test_gdn_replay_records.cpp` | `std::aligned_alloc` at line 17 **does not exist in MSVC** — the UCRT deliberately omits it, and the `std::free` deleter at line 15 would be wrong for `_aligned_malloc` anyway. Replace with `operator new(bytes, std::align_val_t{256})` and a matching sized aligned delete, which is portable |
@@ -307,6 +313,17 @@ Behavior notes:
 `third_party/*` (httplib 0.18.3 is natively Win32-capable; utf8proc is plain C; nlohmann is
 header-only) need no changes; the build itself is the verification. **`src/ops` is no longer
 on this list** — see 4.4.1.
+
+Four further items the bring-up discovered (2026-08-17), so this list stays truthful:
+
+- Top-level `CMakeLists.txt`: `/Zc:preprocessor` for MSVC host compiles — CCCL rejects the
+  traditional MSVC preprocessor.
+- `ninfer_text`: `UTF8PROC_STATIC` compile definition — without it MSVC decorates the
+  utf8proc symbols `__declspec(dllimport)` and rejects the definitions (C2491).
+- `src/targets/qwen3_6/impl/runtime/api_impl.h`: explicit-specialization defaulted-move
+  workaround for an MSVC LNK2019 — the tree's only occurrence of that pattern; other
+  `= default` uses are non-template and unaffected.
+- Three test files: `constexpr std::sqrt` → `const` (a GCC constexpr extension MSVC rejects).
 
 The `__restrict__` qualifiers throughout `src/ops` appear only in `__device__`/`__global__`
 declarations, which nvcc handles before the host compiler sees them; they are not a problem.
@@ -477,7 +494,14 @@ requires a Linux regression pass, because 4.3 changes a shared load path.
   additionally retired the "vcpkg vs. dev kits" open decision and the entire projected Windows
   CMake dependency branch.
 
-**Phase 1 — Core engine + artifact reader**
+**Phase 1 — Core engine + artifact reader — COMPLETE (2026-08-17)**
+
+All build and test criteria below are met on the target machine: the full 423-target build is
+green, reader/materialization tests pass against the real 16.7 GB artifact, the unbuffered
+handle is live (no fallback line, 512-byte logical sector), the trailing short read at EOF
+matches `O_DIRECT` `pread`, and load statistics are sane (weights materialized at
+~5.2 GB/s, H2D ~8.2 GB/s under WDDM). 4.4.1 resolved as option 1 (see 9.2). Details in
+`docs/windows-port/review.md` §4.
 
 - Re-run the platform-API scan against the current tree, **widened** past includes / host
   inline assembly / `__builtin_` to cover host-compiler ABI constraints surfaced through
@@ -493,7 +517,12 @@ requires a Linux regression pass, because 4.3 changes a shared load path.
   to behave as `O_DIRECT` `pread` does, and materialization statistics (`file_bytes`,
   `peak_staging_bytes`, `upload_seconds`) are sane.
 
-**Phase 2 — CLI + serve**
+**Phase 2 — CLI + serve — COMPLETE (2026-08-17)**
+
+All exit criteria pass on the real artifact: CLI greedy generation answers correctly, serve
+handles non-stream and streaming Chat Completions, `CTRL_BREAK_EVENT` shuts down cleanly
+with exit 0 through the `SetConsoleCtrlHandler` path, and the request-log JSONL is complete
+and LF-only (byte-checked). Details in `docs/windows-port/review.md` §4.
 
 - Product-surface items in 4.4 (load progress, console log, serve main, request log),
   `ninfer.exe` and `ninfer-serve.exe` build.
@@ -505,7 +534,13 @@ requires a Linux regression pass, because 4.3 changes a shared load path.
   and **LF-only** — grep the file for CR bytes, since a text-mode stream would produce CRLF
   and break decision 3.7 without any visible symptom (see the 4.4 row).
 
-**Phase 3 — Media path**
+**Phase 3 — Media path — Windows side COMPLETE (2026-08-17); Linux parity comparison open**
+
+Both libraries build, the five DLLs are staged by CMake, a local PNG and the repo video
+fixture (`temporal_events.mp4`) through `--vision` are decoded and answered correctly, and an
+`https://` fetch succeeds through Schannel against the Windows certificate store via the new
+Winsock path. Remaining: the same-artifact/same-seed output comparison against the Linux
+reference (needs a Linux-side run).
 
 - `ninfer_media_decode` (FFmpeg) and `ninfer_media_acquire` (curl + Winsock) build; the five
   DLLs from 2.2 are deployed beside the executables.
@@ -513,7 +548,16 @@ requires a Linux regression pass, because 4.3 changes a shared load path.
   reference for the same artifact and seed; an `http://` media URL fetch works (including the
   private-address guard); an `https://` fetch succeeds against the Windows certificate store.
 
-**Phase 4 — Python tooling + docs**
+**Phase 4 — Python tooling + docs — COMPLETE (2026-08-17)**
+
+4.5 landed as `tools/bench/hostexec.py` (binary `.exe` resolution, `CREATE_NEW_PROCESS_GROUP`
++ `CTRL_BREAK_EVENT` server shutdown, platform-correct command rendering) wired into the four
+runners, plus the `migrate_v1_to_v2.py` Linux-only guard; 4.6 landed in README/AGENTS.md.
+Verified: all runners parse on Windows; `ninfer-serve.exe` driven through the new Popen path
+shuts down with exit 0 and an LF-only request log on `request_stop()`;
+`serve_thinking_preservation.py` drives ten requests end to end (it fails one reuse-path
+assertion that is a plan-§6 cross-platform parity question, recorded in
+`docs/windows-port/review.md`, not a tooling defect).
 
 - 4.5 and 4.6 land.
 - Done when: `run_serve_corpus.py` smoke on Windows drives `ninfer-serve.exe` end to end and
@@ -602,28 +646,30 @@ involved — this is a documented platform difference under decision 3.7, not a 
 1. ~~**Dependency provisioning**: vcpkg vs. pinned prebuilt dev kits.~~ **Resolved
    2026-08-17**: prebuilt LGPL-shared FFmpeg + source-built static Schannel curl, discovered
    through pkg-config on both platforms, no CMake branch. See 2.1 and 4.1.
-2. **NVFP4 TMA / C2719 approach** (4.4.1): opaque byte parameter, pointer parameter, or
-   clang-cl host compiler. Blocks `ninfer_ops` and therefore all of Phase 1's build criteria.
-   Deferred 2026-08-17; must be decided before Phase 1 closes.
-3. **Verification artifact**: download `qwen3_6_27b.ninfer` from the published HF artifact,
-   or run `tools/convert` from a local BF16 checkpoint on this machine. Download is cheaper;
-   conversion additionally proves the Windows conversion toolchain. The choice is scoped to
-   the `qwen3.6-27b/groupwise-int` artifact that Phase 5 measures, so the conversion option
-   exercises `tools/convert/qwen3_6_27b` plus the shared `tools/convert/qwen3_6` and
-   `tools/convert/common` family code. It does **not** touch `tools/convert/qwen3_8_27b`,
-   which is a separate per-target package that converting this artifact never reaches.
-4. **`PinnedHostBuffer` change scope** (decision 3.3, 4.3): apply `cudaHostRegister` to every
-   consumer on both platforms, or introduce an explicitly-aligned staging type used only by
-   the materializer's direct-I/O slots. The narrow option leaves the working Linux allocation
-   path untouched and shrinks the Phase 5 regression surface; the broad option makes one
-   guarantee hold everywhere. Decide before 4.3 is implemented.
-5. **Console and command-line text encoding**: `apps/cli/main.cpp:234` takes ANSI-encoded
-   `char** argv`, so non-ASCII prompts passed on the command line are lossy, and UTF-8 model
-   output written to `std::cout`/`std::cerr` renders as mojibake unless the console code page
-   is UTF-8. `/utf-8` (4.1) fixes source literals only, not runtime I/O. Either add
-   `SetConsoleOutputCP(CP_UTF8)`/`SetConsoleCP(CP_UTF8)` plus a `GetCommandLineW`-based argv
-   path, or scope non-ASCII console input/rendering out explicitly. Decision 3.7's
-   byte-identical claim holds for files and pipes regardless.
-6. **Documentation timing**: land the README/AGENTS.md Windows sections in Phase 4 with the
-   working build (recommended, matches the "active authority" lifecycle), or defer docs until
-   Phase 5 performance numbers exist.
+2. ~~**NVFP4 TMA / C2719 approach** (4.4.1): opaque byte parameter, pointer parameter, or
+   clang-cl host compiler.~~ **Resolved 2026-08-17**: option 1 (128-byte-aligned opaque byte
+   parameter with a device-side alignment guard that traps, never silences). Verified live on
+   the target machine across all five caller families' op tests; the guard never trapped, so
+   the misaligned-constant-bank risk does not materialize on this toolchain.
+3. ~~**Verification artifact**: download or convert.~~ **Resolved 2026-08-17**: downloaded
+   from the published HF artifact — `qwen3_6_27b.ninfer` (16.7 GB) and
+   `qwen3_6_27b_nvfp4.ninfer` at `C:\Users\A149\models\ninfer\Qwen3.6-27B-Ninfer\`. The
+   Windows conversion toolchain therefore remains unproven (out of scope for the port).
+4. ~~**`PinnedHostBuffer` change scope** (decision 3.3, 4.3).~~ **Resolved 2026-08-17 as the
+   broad option**: `arena.cu` applies aligned-malloc + `cudaHostRegister` to every
+   `PinnedHostBuffer` consumer on both platforms, so the one 4096-alignment guarantee holds
+   everywhere (documented in `arena.h`). The cost — page-granular pinning and a slower
+   registration path for the small per-request ingress buffers — is accepted; the
+   consequence is that the Phase 5 Linux regression pass must cover the arena on both
+   platforms (its scope row already says so).
+5. ~~**Console and command-line text encoding**.~~ **Resolved 2026-08-17, implemented**:
+   `ninfer::product::ConsoleUtf8Scope` (`src/product/console_unicode/`) is entered first in
+   both apps' `main` — it switches both console code pages to UTF-8 (restoring them on normal
+   exit) and rebuilds argv as UTF-8 from `GetCommandLineW`/`CommandLineToArgvW`; a no-op
+   passthrough off Windows. Verified: a non-ASCII argument round-trips as UTF-8 bytes through
+   `ninfer.exe` (previously the ANSI code page byte). Known residual limitation, scoped out:
+   legacy conhost may still deliver `?` for non-ASCII typed interactively at a UTF-8 input
+   code page; arguments, files, and pipes are unaffected.
+6. ~~**Documentation timing**.~~ **Resolved 2026-08-17**: README/AGENTS.md Windows sections
+   landed in Phase 4 with the working build. The Windows performance row is still Phase 5
+   work and the published numbers remain Linux results.

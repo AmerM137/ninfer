@@ -58,6 +58,11 @@ Artifact and model references:
 
 Pending implementation work:
 
+- [`windows-port/`](windows-port/) holds the Windows port series: the phased
+  [plan](windows-port/plan.md), the dated [review and verification ledger](windows-port/review.md)
+  with the items still owed, the new-machine [setup notes](windows-port/setup-notes.md), and a
+  rendered [narrative report](windows-port/report.html) of the bring-up. The Linux regression pass
+  and cross-platform parity checks the plan requires are not yet done.
 - [Softmax Attention organization and migration](maintainer/softmax-attention.md) describes the
   single target state for an unfinished source and public-contract cutover; it is not the current
   implementation map.

@@ -1,0 +1,607 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NInfer Windows Port</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Condensed:wght@500;600;700&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+:root {
+  --bg: #f7f8fa;
+  --surface: #ffffff;
+  --ink: #1c2430;
+  --muted: #5b6675;
+  --accent: #35618f;
+  --accent-soft: #e8eef5;
+  --line: #dde2e9;
+  --ok: #2e7d4f;
+  --ok-soft: #e3f0e8;
+  --warn: #a06a00;
+  --warn-soft: #f7edd8;
+  --bad: #b3403a;
+  --bad-soft: #f7e4e2;
+  --code-bg: #eef1f5;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #14181e;
+    --surface: #1c222b;
+    --ink: #e6eaf0;
+    --muted: #98a2b0;
+    --accent: #7aa3d4;
+    --accent-soft: #23303f;
+    --line: #2b333e;
+    --ok: #6fbf8f;
+    --ok-soft: #1e3128;
+    --warn: #d9a94e;
+    --warn-soft: #372c17;
+    --bad: #de8a84;
+    --bad-soft: #3b2321;
+    --code-bg: #232a34;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #14181e;
+  --surface: #1c222b;
+  --ink: #e6eaf0;
+  --muted: #98a2b0;
+  --accent: #7aa3d4;
+  --accent-soft: #23303f;
+  --line: #2b333e;
+  --ok: #6fbf8f;
+  --ok-soft: #1e3128;
+  --warn: #d9a94e;
+  --warn-soft: #372c17;
+  --bad: #de8a84;
+  --bad-soft: #3b2321;
+  --code-bg: #232a34;
+}
+
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: "Source Serif 4", Georgia, "Times New Roman", serif;
+  font-size: 1.02rem;
+  line-height: 1.62;
+}
+.page { max-width: 62rem; margin: 0 auto; padding: 2.5rem 1.5rem 5rem; }
+.prose { max-width: 70ch; }
+
+h1, h2, h3 {
+  font-family: "IBM Plex Sans Condensed", "Arial Narrow", Arial, sans-serif;
+  line-height: 1.15;
+  text-wrap: balance;
+  margin: 0;
+}
+h1 { font-size: 2.6rem; font-weight: 700; letter-spacing: -0.01em; }
+h2 { font-size: 1.55rem; font-weight: 600; margin-top: 3.2rem; scroll-margin-top: 1rem; }
+h3 { font-size: 1.12rem; font-weight: 600; margin-top: 1.9rem; color: var(--ink); }
+h2 + p, h3 + p { margin-top: 0.6rem; }
+p { margin: 0.85rem 0; }
+a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+
+.eyebrow {
+  font-family: "IBM Plex Mono", Consolas, monospace;
+  font-size: 0.72rem;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--accent);
+  margin-bottom: 0.7rem;
+}
+.subtitle { color: var(--muted); font-size: 1.12rem; margin-top: 0.9rem; max-width: 62ch; }
+
+.meta-row { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 1.4rem; }
+.meta {
+  font-family: "IBM Plex Mono", Consolas, monospace;
+  font-size: 0.76rem;
+  color: var(--muted);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  padding: 0.28rem 0.6rem;
+}
+.meta b { color: var(--ink); font-weight: 500; }
+
+code, .mono {
+  font-family: "IBM Plex Mono", Consolas, "Courier New", monospace;
+  font-size: 0.86em;
+}
+code { background: var(--code-bg); border-radius: 3px; padding: 0.08em 0.32em; }
+pre {
+  background: var(--code-bg);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 0.9rem 1.1rem;
+  overflow-x: auto;
+  line-height: 1.5;
+  margin: 1rem 0;
+}
+pre code { background: none; padding: 0; font-size: 0.82rem; }
+
+table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 0.92rem;
+  margin: 1.1rem 0;
+}
+.table-wrap { overflow-x: auto; }
+th {
+  font-family: "IBM Plex Sans Condensed", Arial, sans-serif;
+  font-weight: 600;
+  font-size: 0.82rem;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--muted);
+  text-align: left;
+  padding: 0.5rem 0.9rem 0.5rem 0;
+  border-bottom: 2px solid var(--line);
+}
+td {
+  padding: 0.55rem 0.9rem 0.55rem 0;
+  border-bottom: 1px solid var(--line);
+  vertical-align: top;
+}
+td.num { font-family: "IBM Plex Mono", monospace; font-variant-numeric: tabular-nums; font-size: 0.85rem; white-space: nowrap; }
+
+.chip {
+  display: inline-block;
+  font-family: "IBM Plex Mono", Consolas, monospace;
+  font-size: 0.7rem;
+  letter-spacing: 0.06em;
+  padding: 0.14rem 0.5rem;
+  border-radius: 3px;
+  white-space: nowrap;
+}
+.chip.ok   { color: var(--ok);   background: var(--ok-soft); }
+.chip.warn { color: var(--warn); background: var(--warn-soft); }
+.chip.open { color: var(--bad);  background: var(--bad-soft); }
+.chip.info { color: var(--accent); background: var(--accent-soft); }
+
+.board {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 1.3rem 1.5rem 0.6rem;
+  margin-top: 2.2rem;
+}
+.board h2 { margin-top: 0; font-size: 1.05rem; }
+.board table { margin-top: 0.8rem; }
+.board td:first-child { font-family: "IBM Plex Sans Condensed", Arial, sans-serif; font-weight: 600; white-space: nowrap; }
+
+ul, ol { padding-left: 1.4rem; margin: 0.85rem 0; }
+li { margin: 0.4rem 0; }
+li::marker { color: var(--muted); }
+
+.note {
+  border-left: 3px solid var(--accent);
+  background: var(--accent-soft);
+  padding: 0.7rem 1.1rem;
+  border-radius: 0 4px 4px 0;
+  margin: 1.2rem 0;
+  font-size: 0.95rem;
+}
+.finding {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 1rem 1.3rem;
+  margin: 1rem 0;
+}
+.finding h3 { margin-top: 0; }
+.finding .chip { vertical-align: 2px; margin-left: 0.5rem; }
+
+.bar-wrap { display: flex; align-items: center; gap: 0.8rem; }
+.bar {
+  flex: 1 1 auto;
+  height: 8px;
+  min-width: 60px;
+  background: var(--line);
+  border-radius: 4px;
+  overflow: hidden;
+}
+.bar span { display: block; height: 100%; background: var(--accent); }
+
+hr { border: 0; border-top: 1px solid var(--line); margin: 3rem 0 0; }
+footer { color: var(--muted); font-size: 0.88rem; margin-top: 1.2rem; }
+footer p { margin: 0.4rem 0; }
+
+.toc {
+  columns: 2;
+  column-gap: 3rem;
+  font-size: 0.95rem;
+  margin-top: 0.8rem;
+}
+.toc a { text-decoration: none; }
+.toc li { break-inside: avoid; }
+@media (max-width: 640px) {
+  .toc { columns: 1; }
+  h1 { font-size: 2rem; }
+}
+</style>
+</head>
+<body>
+<div class="page">
+
+<header>
+  <div class="eyebrow">Engineering report · docs/windows-port-bringup</div>
+  <h1>NInfer Windows Port</h1>
+  <p class="subtitle">Bringing the full NInfer product surface — text, vision, MTP speculation,
+  prefix reuse, CLI, and OpenAI/Anthropic serving — to native 64-bit Windows with MSVC and the
+  CUDA Toolkit, from the same <code>.ninfer</code> artifacts and the same kernel identities as
+  Linux.</p>
+  <div class="meta-row">
+    <span class="meta"><b>2026-08-17</b> bring-up, review &amp; phase-4 close-out</span>
+    <span class="meta">RTX 5090 32&nbsp;GB · WDDM · driver 610.88</span>
+    <span class="meta">MSVC 14.51 (cl 19.51) · CUDA 13.3 · sm_120a</span>
+    <span class="meta">CMake 4.3.2 · Ninja · pkgconf 3.0.5</span>
+  </div>
+</header>
+
+<section class="board" aria-label="Phase status">
+  <h2>Where the port stands</h2>
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>Phase</th><th>Scope</th><th>Status</th></tr></thead>
+    <tbody>
+      <tr><td>0 · Dependencies</td><td>FFmpeg + libcurl provisioned, unmodified tree configures</td><td><span class="chip ok">complete</span></td></tr>
+      <tr><td>1 · Core engine</td><td>Reader, pinned staging, NVFP4 TMA blocker, full build, op tests</td><td><span class="chip ok">complete</span></td></tr>
+      <tr><td>2 · CLI + serve</td><td>Generation, serving, clean shutdown, request-log contract</td><td><span class="chip ok">complete</span></td></tr>
+      <tr><td>3 · Media</td><td>Image + video decode and HTTPS fetch verified on Windows; Linux output parity pending</td><td><span class="chip warn">parity pending</span></td></tr>
+      <tr><td>4 · Tooling + docs</td><td>Python <code>.exe</code> + console-event shutdown helper, README/AGENTS.md Windows sections</td><td><span class="chip ok">complete</span></td></tr>
+      <tr><td>5 · Full verification</td><td>ctest fully green on Windows (90/90); perf row and Linux regression pending</td><td><span class="chip warn">partial</span></td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p style="font-size:0.9rem; color:var(--muted); margin-top:0.2rem;">Bottom line: everything
+  that can be proven on this machine is proven — full build, full test suite, text, image, and
+  video generation, serving with clean console-event shutdown, tooling, and docs. What remains
+  needs either a long benchmark window (the Windows performance row) or a Linux machine
+  (regression pass and cross-platform parity evidence).</p>
+</section>
+
+<nav aria-label="Contents">
+  <h2 id="contents">Contents</h2>
+  <ol class="toc">
+    <li><a href="#objective">Objective and ground rules</a></li>
+    <li><a href="#dependencies">Dependency strategy</a></li>
+    <li><a href="#work">What changed in the tree</a></li>
+    <li><a href="#tma">The one real blocker: NVFP4 TMA</a></li>
+    <li><a href="#review">Review findings and fixes</a></li>
+    <li><a href="#verification">Verification evidence</a></li>
+    <li><a href="#remaining">Remaining work and open decisions</a></li>
+  </ol>
+</nav>
+
+<section class="prose">
+<h2 id="objective">1 · Objective and ground rules</h2>
+<p>Deliver <code>ninfer.exe</code> and <code>ninfer-serve.exe</code> built from this tree on
+64-bit Windows, executing the full product surface from the same artifacts, compiled for
+<code>sm_120a</code> as on Linux. The port is host-platform work only: no target identity,
+kernel schedule, artifact format, or serving schema changes. Platform branches are confined to a
+small file list and guarded by <code>_WIN32</code>; no feature is dropped.</p>
+<p>Two platform differences are accepted and documented rather than hidden: TLS trust roots
+(system CA bundle on Linux, Windows certificate store via Schannel) and a reduced curl feature
+set (no compressed transfer encodings, HTTP/1.1 only). Neither affects media bytes. Docker stays
+Linux-only; WSL, TCC mode, multi-GPU, and installers are out of scope. Published performance
+numbers remain Linux results — Windows gets its own measured row at the end.</p>
+
+<h2 id="dependencies">2 · Dependency strategy</h2>
+<p>Both dependencies are provisioned locally and discovered through pkg-config on both
+platforms — no vcpkg, no CMake platform branch. The unmodified tree configured on Windows on the
+first attempt; all five version gates passed.</p>
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Dependency</th><th>Choice</th><th>Why</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><b>FFmpeg</b></td>
+      <td>BtbN <span class="mono">n6.1.2</span> win64 <b>LGPL shared</b> prebuilt at <code>C:\libs\ffmpeg-n6.1.2</code></td>
+      <td>Shared, because the mingw-built static archives cannot be linked by MSVC — only a C ABI
+      crosses the DLL boundary, and the decode path never crosses the CRT heap or file handles.
+      LGPL keeps the binaries distributable. <b>n6.1.2 specifically</b> matches the Linux
+      reference (Ubuntu 24.04 / FFmpeg 6.1 / swscale 7): a swscale rounding difference would
+      change decoded pixels, then vision tokens, then generated text — a silent cross-platform
+      divergence dressed up as a port bug.</td>
+    </tr>
+    <tr>
+      <td><b>libcurl</b></td>
+      <td>8.21.0 built from source: static, Schannel TLS, at <code>C:\libs\curl</code></td>
+      <td>With Schannel it has zero external dependencies and builds in a minute. Static means
+      nothing extra to deploy; Schannel means HTTPS trust comes from the Windows certificate
+      store with no CA-bundle discovery problem.</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+<p>vcpkg was evaluated and rejected: it added a multi-hour FFmpeg source build and a registry
+baseline while providing nothing the manual pkg-config path doesn't, and two of its defaults
+(dynamic triplet, Schannel-backed curl) contradicted assumptions an earlier draft depended on.</p>
+<p>Deployment set: five DLLs beside every binary that loads FFmpeg —
+<code>avcodec-60</code>, <code>avformat-60</code>, <code>avutil-58</code>,
+<code>swscale-7</code>, <code>swresample-4</code>. swresample never appears on a link line (it is
+a private dependency of avformat behind the DLL boundary) but is required at load time. CMake now
+stages all five into <code>build/apps/</code> and <code>build/tests/</code> at configure time.</p>
+
+<h2 id="work">3 · What changed in the tree</h2>
+<p>The whole port is ~800 inserted lines across 36 files, four of them new
+(<code>console_unicode.{h,cpp}</code>, <code>hostexec.py</code>, and the containment
+regression test). By area:</p>
+
+<h3>Build system</h3>
+<ul>
+  <li><code>/utf-8</code>, <code>/bigobj</code>, and <code>/Zc:preprocessor</code> on both the
+  plain <code>cl</code> path and nvcc's host path (CCCL <code>#error</code>s on the traditional
+  preprocessor); <code>NOMINMAX</code> + <code>WIN32_LEAN_AND_MEAN</code> globally.</li>
+  <li><code>UTF8PROC_STATIC</code> on <code>ninfer_text</code> — without it MSVC decorates
+  utf8proc symbols as <code>dllimport</code> and rejects the definitions (C2491).</li>
+  <li><code>ws2_32</code> linked explicitly for <code>ninfer-serve</code>; curl's
+  <code>.pc</code> already carries the Winsock set for media acquisition.</li>
+  <li>Op-test FP model: <code>/fp:strict</code> on MSVC. The decision was probed, not assumed —
+  disassembly of <code>a*b+c</code> on cl 19.51 shows <b>no FMA contraction even under
+  <code>/arch:AVX2 /fp:precise</code></b>; only <code>/fp:fast</code> or <code>/fp:contract</code>
+  would introduce it. The flag pins that contract against either creeping in.</li>
+  <li>FFmpeg DLL staging into <code>apps/</code> and <code>tests/</code> (configure-time copy).</li>
+</ul>
+
+<h3>Artifact reader — the central item</h3>
+<p><code>MappedFile</code> in <code>src/artifact/reader.cpp</code> gained a Win32 implementation
+behind the same class. Two handles on the same file: a plain handle backing
+<code>CreateFileMappingW</code>/<code>MapViewOfFile</code> for the JSON directory and small
+resources, and a <code>FILE_FLAG_NO_BUFFERING</code> handle for the 4096-byte-aligned direct
+reads that carry every tensor payload — the Windows equivalent of the Linux
+<code>O_DIRECT</code> contract.</p>
+<ul>
+  <li>Direct reads are positional: the offset travels in an <code>OVERLAPPED</code> structure on
+  a synchronous handle, so no file pointer mutates and <code>read_direct</code> stays honestly
+  <code>const</code>. The 4096-byte pre-checks are kept verbatim; they match the
+  <code>NO_BUFFERING</code> sector rules.</li>
+  <li>At open, the volume's logical sector size is probed via
+  <code>GetFileInformationByHandleEx(FileStorageInfo)</code>. Sector &gt; 4096 (or an unsupported
+  file system) degrades to buffered reads — a correct, slower load, logged once, never a
+  failure.</li>
+  <li>Limit checks re-expressed against <code>LONGLONG</code>/<code>DWORD</code>
+  (<code>off_t</code>/<code>ssize_t</code> don't exist under MSVC); <code>DWORD</code> is the
+  tighter byte-count bound and is enforced.</li>
+  <li>The load-bearing subtlety — a trailing partial sector at EOF must return a short count,
+  not an error, exactly as <code>O_DIRECT</code> <code>pread</code> does — was verified
+  empirically on the target volume before trusting it (§6).</li>
+</ul>
+
+<h3>Pinned staging</h3>
+<p><code>PinnedHostBuffer</code> keeps its API; internally it is now an explicitly 4096-byte
+aligned allocation (<code>_aligned_malloc</code> / <code>posix_memalign</code>) pinned with
+<code>cudaHostRegister</code>, released with <code>cudaHostUnregister</code> plus the original
+aligned free. This makes the direct-I/O alignment guarantee hold by construction on both
+platforms instead of relying on the driver returning page-aligned memory.
+<span class="chip ok">ratified</span> Plan decision 9.4 is now recorded as the broad option:
+every consumer on both platforms gets the one alignment guarantee, and the accepted cost
+(page-granular pinning on small per-request ingress buffers) pulls the arena into the Linux
+regression pass.</p>
+
+<h3>Product surface</h3>
+<div class="table-wrap">
+<table>
+  <thead><tr><th>File</th><th>Change</th></tr></thead>
+  <tbody>
+    <tr><td><code>load_progress.cpp</code></td><td><code>isatty</code> → <code>GetConsoleMode</code> probe for interactive rendering</td></tr>
+    <tr><td><code>request_log.cpp</code></td><td><code>getpid</code> → <code>GetCurrentProcessId</code>; JSONL stream opened with <code>std::ios::binary</code> so the log stays byte-identical (LF-only) across platforms</td></tr>
+    <tr><td><code>console_log.cpp</code></td><td><code>localtime_r</code> → <code>localtime_s</code> (MSVC argument order)</td></tr>
+    <tr><td><code>apps/serve/main.cpp</code></td><td><code>SetConsoleCtrlHandler</code> for Ctrl+C, Ctrl+Break, console close, logoff, shutdown → <code>HttpServer::stop()</code>; POSIX keeps <code>std::signal</code></td></tr>
+    <tr><td><code>acquire.cpp</code></td><td><code>winsock2.h</code>/<code>ws2tcpip.h</code> includes; one-time <code>WSAStartup</code> before the pre-curl <code>getaddrinfo</code> (failure throws a typed <code>Error</code>, keeping serve alive); media-root containment check corrected to compare path elements (see §5)</td></tr>
+    <tr><td><code>api_impl.h</code> (qwen3_6)</td><td>Defaulted move operations on explicit template specializations given explicit bodies — MSVC omits the definition symbol while referencing TUs still emit external references (LNK2019)</td></tr>
+    <tr><td><code>src/product/console_unicode/</code> <span class="chip info">new</span></td><td>Plan decision 9.5, resolved as "implement": <code>ConsoleUtf8Scope</code> enters both apps' <code>main</code> — switches the console code pages to UTF-8 (restored on normal exit) and rebuilds argv as UTF-8 from <code>GetCommandLineW</code>/<code>CommandLineToArgvW</code>; a passthrough off Windows. Verified: a non-ASCII argument round-trips through <code>ninfer.exe</code> as UTF-8 bytes where the ANSI argv delivered the legacy code-page byte</td></tr>
+    <tr><td>test sources</td><td><code>std::aligned_alloc</code> (absent from the UCRT) → aligned <code>operator new</code>; <code>constexpr std::sqrt</code> (a GCC extension) → <code>const</code> in three files</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h3>Python tooling</h3>
+<p>New shared helper <code>tools/bench/hostexec.py</code>, wired into
+<code>run_serve_corpus.py</code>, <code>run_serve_concurrency.py</code>,
+<code>run_ninfer_bench_matrix.py</code>, and <code>serve_thinking_preservation.py</code>:</p>
+<ul>
+  <li><code>binary_path()</code> resolves build-tree binaries with the <code>.exe</code> suffix
+  on Windows (single-config generator assumed — Ninja, the documented choice).</li>
+  <li>Servers start with <code>CREATE_NEW_PROCESS_GROUP</code> and stop via
+  <code>request_stop()</code> — <code>CTRL_BREAK_EVENT</code> on Windows instead of
+  <code>Popen.terminate()</code>, which is <code>TerminateProcess</code> and would skip the
+  console handler, losing the request log's final records. SIGTERM on POSIX, unchanged.</li>
+  <li><code>format_command()</code> renders reproduction command lines with
+  <code>list2cmdline</code> on Windows instead of POSIX <code>shlex</code> quoting.</li>
+  <li><code>migrate_v1_to_v2.py</code> fails fast on Windows with a "Linux-only" parser error
+  (its durable-rename path needs <code>os.O_DIRECTORY</code>; v1 is a dead format).</li>
+</ul>
+<p>README gained the Windows requirements and a "Building on Windows" section (provisioning
+recipe, <code>CMAKE_PREFIX_PATH</code> configure line, native-tools-prompt requirement, DLL
+staging); AGENTS.md gained Windows in the product contract and a Windows toolchain row.</p>
+
+<h2 id="tma">4 · The one real blocker: NVFP4 TMA kernels vs. MSVC</h2>
+<p>Both NVFP4 TMA translation units failed under MSVC with <b>C2719</b> — and the root cause is
+NVIDIA's own header. <code>cuda.h</code> declares <code>CUtensorMap</code> as
+<code>alignas(128)</code>, the kernels take four of them by value as a
+<code>__grid_constant__</code> parameter, and nvcc's generated host launch stub re-declares that
+parameter by value. GCC copies an over-aligned by-value parameter into an aligned slot; MSVC
+refuses any formal parameter aligned beyond the stack-slot guarantee. Skipping the target was not
+an option: five caller families depend on it, including the largest NVFP4 GEMMs in the tree.</p>
+<p><b>Resolution — opaque byte parameter.</b> The descriptors travel as
+<code>Nvfp4W4a4TmaDescriptorBytes</code>, a <code>uint8_t[sizeof(...)]</code> wrapper with
+alignment 1, reinterpreted inside the kernel. This keeps <code>__grid_constant__</code> and
+constant-bank residency, and touches only the parameter declaration — no per-launch H2D upload,
+no host-compiler swap. The known risk (nvcc placing the alignment-1 wrapper at an offset that
+violates <code>CUtensorMap</code>'s own 128-byte contract, which would fail as a silent
+wrong-address TMA load) is guarded by a device-side check that asserts <b>128-byte</b> alignment
+— the type's bound, deliberately stricter than the driver's documented 64 — and traps loudly
+before any load.</p>
+<p class="note">This is kernel source that Linux also compiles, so the fix pulls NVFP4
+correctness into the Linux regression pass. On Windows the guard has been exercised live: the
+TMA route runs at exactly its admission gate (<code>tokens = 1024</code>) in the op tests, all
+five caller families pass, and the guard has never trapped.</p>
+
+<h2 id="review">5 · Review findings and fixes</h2>
+<p>A full review of the port diff (plus empirical probes on the target machine) produced nine
+fixes, all landed and re-verified. The two that mattered most:</p>
+
+<div class="finding">
+  <h3>GetConsoleMode(handle, nullptr) crashes on a real console<span class="chip ok">fixed</span></h3>
+  <p>The interactive-stderr probe passed <code>nullptr</code> for the mode output. Verified with
+  MSVC-built probes: on a real console handle this raises an <b>access violation</b> — and with
+  redirected stderr the call fails before the dereference, so the crash appears only in
+  interactive use and evades every piped test. Until the fix, any console run of
+  <code>ninfer.exe</code> died at the first progress line. Fix: a real <code>DWORD</code>
+  output.</p>
+</div>
+
+<div class="finding">
+  <h3>CreateFileMappingW failure checked against the wrong sentinel<span class="chip ok">fixed</span></h3>
+  <p>That API reports failure as <code>NULL</code>, not <code>INVALID_HANDLE_VALUE</code>. A real
+  mapping failure slipped past the check and surfaced one call later with a masking error code,
+  and cleanup called <code>CloseHandle(NULL)</code>. Fix: <code>nullptr</code> checks and
+  sentinel for the mapping handle.</p>
+</div>
+
+<div class="finding">
+  <h3>Frontend test died as an opaque 0xc0000409<span class="chip ok">fixed</span></h3>
+  <p>Not a port bug: the test reads the official Qwen3.6-27B HF tokenizer files from a hardcoded
+  path in the maintainer's Linux home directory. With no top-level catch, the miss reached
+  <code>std::terminate</code>, which MSVC reports as fail-fast with all buffered output
+  discarded. Fixes: the path is overridable via <code>NINFER_QWEN3_6_27B_HF</code>, absence skips
+  with code 77 and a message, and <code>main</code> now catches and prints. The test skips
+  cleanly until the three small JSON files are provisioned.</p>
+</div>
+
+<p>The remaining six: <code>WSAStartup</code> failure throws a typed error instead of
+<code>std::exit(1)</code>; the TMA trap's diagnostic printf is gated to one thread per block; the
+<code>/fp:strict</code> comment records the actual disassembly probe; the request-log test now
+byte-asserts LF-only output; CMake stages the FFmpeg DLLs (they had been hand-copied); and the
+media-root containment change — <code>*relative.begin() == ".."</code> instead of a native-string
+prefix test that falsely rejected real entries named like <code>..hidden</code> — gained a
+dedicated regression test (<code>tests/test_media_acquire_path.cpp</code>) covering accept and
+escape cases on both platforms. That containment change is Linux-visible and is recommended for
+its own commit.</p>
+
+<h2 id="verification">6 · Verification evidence</h2>
+
+<h3>Empirical probes (MSVC-built, target machine)</h3>
+<ul>
+  <li><b>Trailing short read at EOF</b> under <code>FILE_FLAG_NO_BUFFERING</code> — the one place
+  the port could silently corrupt a load: on C: (NTFS, 512-byte logical sectors) a 4096-byte
+  positional read whose range ends 1808 bytes past the last sector boundary returns
+  <code>TRUE</code> with <code>bytes_read = 1808</code> and correct content, matching
+  <code>O_DIRECT</code> <code>pread</code>. Reads at/past EOF fail with
+  <code>ERROR_HANDLE_EOF</code>, which the materializer never issues.</li>
+  <li><b>FP contraction</b>: none under any <code>/fp:precise</code> configuration on cl 19.51,
+  including <code>/arch:AVX2</code> (§3).</li>
+  <li><b>GetConsoleMode null behavior</b>: crash confirmed, fix shape confirmed (§5).</li>
+</ul>
+
+<h3>Build and test suite</h3>
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Check</th><th>Result</th><th>Notes</th></tr></thead>
+  <tbody>
+    <tr><td>Full build (423 targets)</td><td><span class="chip ok">green</span></td><td>MSVC 14.51 + CUDA 13.3 + <code>sm_120a</code>, Ninja, Release</td></tr>
+    <tr><td>ctest (90 tests)</td><td><span class="chip ok">90/90 · 0 fail</span></td><td>84 pass + 6 environment-gated skips in a bare shell; with the weights env vars set, <span class="mono">prefix_real</span> (9.75&nbsp;s), <span class="mono">load_plan</span> (NVFP4 artifact now local), and <span class="mono">visual_scatter</span> all pass too. Remaining skips: the 35B artifacts and the HF tokenizer trio</td></tr>
+    <tr><td>NVFP4 TMA, all five caller families</td><td><span class="chip ok">pass</span></td><td>TMA route exercised live at its <code>tokens ≥ 1024</code> gate; alignment guard never trapped</td></tr>
+    <tr><td>Real-artifact integration (<span class="mono">prefix_real</span>)</td><td><span class="chip ok">pass</span></td><td>Against the 16.7&nbsp;GB <code>qwen3_6_27b.ninfer</code>, full load + prefix/MTP generation</td></tr>
+    <tr><td><code>cudaHostRegister</code> under WDDM</td><td><span class="chip ok">works</span></td><td>Registration and H2D both fine; the plan's §7 risk row is retired</td></tr>
+    <tr><td>Unbuffered path in actual use</td><td><span class="chip ok">confirmed</span></td><td>No fallback log line; C: reports 512-byte logical sectors</td></tr>
+    <tr><td>UTF-8 argv (decision 9.5)</td><td><span class="chip ok">verified</span></td><td>Non-ASCII argument round-trips through <code>ninfer.exe</code> as UTF-8 (<span class="mono">0xC3 0xB6</span> for <span class="mono">ö</span>)</td></tr>
+    <tr><td>Tooling shutdown path</td><td><span class="chip ok">verified</span></td><td><code>ninfer-serve.exe</code> started through <code>hostexec</code> exits <b>0</b> on <code>request_stop()</code> with an LF-only request log</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h3>Measured load, real artifact (16.7 GB, groupwise-int)</h3>
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Stage</th><th>Time</th><th>Effective rate</th><th></th></tr></thead>
+  <tbody>
+    <tr><td>Artifact materialization (unbuffered NVMe reads)</td><td class="num">2.94 s</td><td class="num">≈5.6 GB/s</td>
+      <td style="width:30%"><div class="bar" role="img" aria-label="5.6 of 8.8 GB per second"><span style="width:64%"></span></div></td></tr>
+    <tr><td>Host-to-device upload (pinned, WDDM)</td><td class="num">1.87 s</td><td class="num">≈8.8 GB/s</td>
+      <td><div class="bar" role="img" aria-label="8.8 of 8.8 GB per second"><span style="width:100%"></span></div></td></tr>
+    <tr><td>GPU weights resident</td><td class="num" colspan="2">15.25 GiB</td><td></td></tr>
+  </tbody>
+</table>
+</div>
+
+<h3>Product smokes, real artifact</h3>
+<ul>
+  <li><b>CLI</b>: greedy generation answers correctly (<code>--no-thinking</code> →
+  <span class="mono">"Paris"</span>); with thinking enabled, reasoning streams to stderr as
+  designed.</li>
+  <li><b>Serve</b>: binds, reports <span class="mono">qwen3.6-27b</span> on
+  <code>/v1/models</code>, completes a non-stream and a streaming chat completion (201 SSE events
+  + <code>[DONE]</code>), shuts down cleanly with exit 0 via <code>CTRL_BREAK_EVENT</code>
+  through the new console handler, and writes a complete, byte-verified <b>LF-only</b> request
+  log (<span class="mono">server_start</span>, two request pairs,
+  <span class="mono">throughput</span>).</li>
+  <li><b>Media</b>: a locally generated PNG through <code>--vision</code> decodes via the
+  mingw-built FFmpeg DLLs and answers <span class="mono">"red"</span>; an
+  <code>https://</code> image URL resolves through the new Winsock path, fetches through
+  Schannel against the Windows certificate store, and is recognized
+  (<span class="mono">"Python"</span>).</li>
+  <li><b>Video</b>: the repo fixture <span class="mono">temporal_events.mp4</span> through
+  <code>--vision --greedy</code> answers <span class="mono">红色圆形；3；是；9</span> — exactly
+  the four semicolon-separated items its Chinese prompt demands (which object moved, the green
+  digit, whether the blue square was still visible, the end-marker digit) — with clean UTF-8
+  output and exit 0. This closes the Windows half of Phase 3.</li>
+  <li><b>Serve driven by the tooling</b>: <span class="mono">serve_thinking_preservation.py</span>
+  drives ten requests (Chat Completions + Responses API, tool calls, checkpoint restores)
+  end to end through <code>ninfer-serve.exe</code>. Nine pass every assertion; the tenth is the
+  parity question below.</li>
+</ul>
+
+<div class="finding">
+  <h3>One smoke assertion diverges — a parity question, not a tooling defect<span class="chip warn">Linux-side</span></h3>
+  <p>The Responses-API continuation (<code>previous_response_id</code>, thinking inherited)
+  takes the <span class="mono">append_frontier</span> reuse path where the smoke expects
+  <span class="mono">restore_response_checkpoint</span>; all chat-side checkpoint assertions
+  pass. The path chosen is a deterministic function of whether the parent's 16 greedy output
+  tokens re-tokenize identically across the response boundary in the re-rendered continuation
+  prompt — i.e., this is the plan-§6 cross-platform greedy-parity question surfacing through a
+  smoke. The Linux run settles it: if Linux generates the same 16 tokens and still restores
+  from the checkpoint, this is a real port divergence to chase; otherwise the smoke's
+  expectation is content-coupled.</p>
+</div>
+<p class="note">Operational reality worth keeping: the plan's GPU-contention risk materialized
+immediately — a resident <span class="mono">llama-server</span> held 27 of 32&nbsp;GB VRAM at
+review time and had to be closed before GPU verification could run. Benchmark runs need the same
+discipline.</p>
+
+<h2 id="remaining">7 · Remaining work and open decisions</h2>
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Item</th><th>What it needs</th><th></th></tr></thead>
+  <tbody>
+    <tr><td>Cross-platform greedy parity (plan §6)</td><td>A Linux reference run of the same prompt/seed to diff against — including image/video output parity and the Responses-continuation reuse-path divergence from §6</td><td><span class="chip open">Linux-side</span></td></tr>
+    <tr><td>Phase 5 — Performance row</td><td>The published single-request serving method rerun on Windows/WDDM (<span class="mono">run_serve_corpus.py</span>, now Windows-capable; same fixtures/seeds), added to <span class="mono">docs/performance.md</span>. A multi-hour exclusive-GPU run</td><td><span class="chip open">pending</span></td></tr>
+    <tr><td>Phase 5 — Linux regression</td><td>Shared-path changes must re-verify on Linux: arena pinning, NVFP4 TMA kernel source (all five caller families), the containment check, <code>api_impl.h</code></td><td><span class="chip open">Linux-side</span></td></tr>
+    <tr><td>One small download</td><td>The HF tokenizer trio + <code>NINFER_QWEN3_6_27B_HF</code> unlocks the frontend test (the NVFP4 artifact is now local; load-plan already passes)</td><td><span class="chip warn">quick</span></td></tr>
+    <tr><td>Containment commit split</td><td>The <code>..hidden</code> fix is a Linux-visible behavior change riding in the port diff; split into its own commit (with its new regression test) when the port lands</td><td><span class="chip info">at landing</span></td></tr>
+  </tbody>
+</table>
+</div>
+<p>Every plan open decision is now closed and recorded: 9.1 dependencies (prebuilt
+LGPL-shared FFmpeg + Schannel curl), 9.2 NVFP4 TMA (opaque byte parameter + trapping guard),
+9.3 verification artifact (downloaded), 9.4 pinning scope (broad), 9.5 console encoding
+(implemented), 9.6 documentation timing (landed in Phase 4).</p>
+
+<hr>
+<footer>
+  <p>Sources: <span class="mono">docs/windows-port/plan.md</span> (design and
+  phase criteria) and <span class="mono">docs/windows-port/review.md</span> (review findings,
+  fix status, verification ledger). Both are working documents; this report is the narrative
+  summary of the bring-up as of 2026-08-17.</p>
+  <p>Environment note: builds run from the x64 Native Tools prompt for VS 2026 — nvcc shells out
+  to <code>cl</code>, so this is not optional. Dependency prefixes are passed as
+  <code>-DCMAKE_PREFIX_PATH="C:/libs/ffmpeg-n6.1.2;C:/libs/curl"</code>.</p>
+</footer>
+
+</div>
+</body>
+</html>

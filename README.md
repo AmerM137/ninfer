@@ -121,11 +121,12 @@ notes.
 
 NInfer currently requires:
 
-- 64-bit Linux;
+- 64-bit Linux or 64-bit Windows;
 - NVIDIA GeForce RTX 5090 (`sm_120a`);
 - NVIDIA driver support for CUDA 13.1 and the CUDA Toolkit 13.1 or newer;
-- CMake 3.28 or newer and a C++20-capable host compiler;
-- `pkg-config`;
+- CMake 3.28 or newer and a C++20-capable host compiler (on Windows: MSVC with the Windows
+  SDK — nvcc supports only `cl` as its host compiler there);
+- `pkg-config` (on Windows: pkgconf, shimmed as `pkg-config.exe`);
 - FFmpeg development libraries: `libavformat >= 60`, `libavcodec >= 60`,
   `libavutil >= 58`, and `libswscale >= 7`;
 - `libcurl >= 7.85`;
@@ -152,6 +153,42 @@ build/apps/ninfer-serve
 ```
 
 Tests, benchmarks, and maintainer tools are excluded from the default build.
+
+### Building on Windows
+
+Launch the build shell from the **x64 Native Tools Command Prompt** of the installed Visual
+Studio, so that `cl`, `nvcc`, and the Windows SDK `LIB`/`INCLUDE` paths are all present
+(`nvcc` shells out to `cl`; a plain shell will not work).
+
+Provision the two library dependencies once:
+
+- **FFmpeg**: use a prebuilt **LGPL shared** win64 package from the FFmpeg **6.1** release
+  branch (for example BtbN's `ffmpeg-n6.1.2-*-win64-lgpl-shared`), unzipped to a prefix such
+  as `C:\libs\ffmpeg-n6.1.2`. Both qualifiers matter: the `shared` variant is required
+  because MSVC cannot link the mingw-built static archives (only the C ABI crosses the DLL
+  boundary), and the 6.1 branch matches the Linux reference decoders so decoded pixels — and
+  therefore vision outputs — stay identical across platforms.
+- **libcurl**: build from source with MSVC and Schannel TLS (static, no external
+  dependencies), installed to a prefix such as `C:\libs\curl`. TLS trust then comes from the
+  Windows certificate store; no CA bundle is deployed.
+
+Then configure with the dependency prefixes as a cache variable and build:
+
+```bat
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release ^
+  -DCMAKE_PREFIX_PATH="C:/libs/ffmpeg-n6.1.2;C:/libs/curl"
+cmake --build build --parallel
+```
+
+`CMAKE_PREFIX_PATH` entries extend the pkg-config search path automatically. If you export
+`PKG_CONFIG_PATH` instead, note that pkgconf splits it on `;` under Windows, not `:`.
+
+The executables are `build\apps\ninfer.exe` and `build\apps\ninfer-serve.exe`; the build
+stages the five FFmpeg runtime DLLs (`avformat`, `avcodec`, `avutil`, `swscale`,
+`swresample`) beside them at configure time, so no PATH change is needed. The repository's
+tooling assumes a single-config generator (Ninja, as above); Visual Studio generators, which
+place binaries under a per-config subdirectory, are not supported. Docker deployment stays
+Linux-only.
 
 ## Docker
 
