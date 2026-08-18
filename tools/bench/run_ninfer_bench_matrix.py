@@ -21,14 +21,18 @@ import csv
 import dataclasses
 import datetime as dt
 import json
-import shlex
 import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_BENCH = REPO_ROOT / "build/bench/ninfer_bench"
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from tools.bench import hostexec  # noqa: E402
+
+DEFAULT_BENCH = hostexec.binary_path("build/bench/ninfer_bench")
 DEFAULT_WEIGHTS = REPO_ROOT / "out/qwen3_6_27b.ninfer"
 DEFAULT_CORPUS = REPO_ROOT / "bench/fixtures/bench_corpus.ids"
 
@@ -69,7 +73,7 @@ def mtp_args(k: int) -> tuple[str, ...]:
 
 
 def shell_join(command: Sequence[str]) -> str:
-    return " ".join(shlex.quote(str(part)) for part in command)
+    return hostexec.format_command(command)
 
 
 def utc_stamp() -> str:

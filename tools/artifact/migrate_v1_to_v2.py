@@ -377,6 +377,10 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("artifact", type=Path)
     arguments = parser.parse_args(argv)
+    if os.name == "nt":
+        # The durable-rename path opens the directory with O_DIRECTORY, which
+        # does not exist on Windows. v1 is a dead format; migrate on Linux.
+        parser.error("v1 -> v2 migration is Linux-only; run this tool on Linux")
     try:
         migrate(arguments.artifact)
     except (MigrationError, OSError) as exc:
