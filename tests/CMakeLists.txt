@@ -31,10 +31,25 @@ endfunction()
 function(ninfer_add_op_test name)
   ninfer_add_test(${name} ${ARGN})
   set_tests_properties(${name} PROPERTIES SKIP_RETURN_CODE 77)
-  if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang"
+     AND NOT CMAKE_CXX_SIMULATE_ID STREQUAL "MSVC")
     target_compile_options(${name} PRIVATE
       $<$<COMPILE_LANGUAGE:CXX>:-fno-fast-math>
       $<$<COMPILE_LANGUAGE:CXX>:-ffp-contract=off>)
+  elseif(MSVC)
+    # Covers both cl and clang-cl (SIMULATE_ID=MSVC excludes clang-cl from the
+    # GNU-spelling branch above: clang-cl warns-and-ignores -fno-fast-math and
+    # -ffp-contract=off, probed on clang-cl 22.1.8, 2026-08-18).
+    # cl: the default x64 baseline (SSE2) has no FMA instruction, and
+    # /fp:precise reassociates nothing and never fast-divides, so the host
+    # reference matches the pinned GCC/Clang model as-is. Probed on cl 19.51
+    # (2026-08-17) by disassembling a*b+c: no contraction even under
+    # /arch:AVX2 /fp:precise — only /fp:fast or /fp:contract would introduce
+    # it. /fp:strict pins that contract explicitly (zero cost today).
+    # clang-cl: NOT zero-cost hygiene — its default /fp:precise DOES contract
+    # a*b+c into vfmadd under /arch:AVX2 (probed 2026-08-18); /fp:strict
+    # disables it, matching the pinned model.
+    target_compile_options(${name} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/fp:strict>)
   endif()
 endfunction()
 

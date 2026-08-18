@@ -6,17 +6,24 @@
 #include <cstdlib>
 #include <iostream>
 #include <memory>
+#include <new>
 #include <stdexcept>
 #include <utility>
 
 namespace {
 
-using AlignedBacking = std::unique_ptr<void, decltype(&std::free)>;
+// 256-byte aligned backing through the standard aligned new/delete: portable
+// to MSVC, whose UCRT deliberately does not provide std::aligned_alloc (and
+// whose _aligned_malloc would need its own _aligned_free).
+struct Aligned256Deleter {
+    void operator()(void* ptr) const noexcept {
+        ::operator delete(ptr, std::align_val_t{256});
+    }
+};
+using AlignedBacking = std::unique_ptr<void, Aligned256Deleter>;
 
 AlignedBacking make_backing(std::size_t bytes) {
-    void* data = std::aligned_alloc(256, bytes);
-    if (data == nullptr) { throw std::bad_alloc(); }
-    return AlignedBacking(data, &std::free);
+    return AlignedBacking(::operator new(bytes, std::align_val_t{256}));
 }
 
 int fail(const char* label) {

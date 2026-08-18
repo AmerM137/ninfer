@@ -47,10 +47,11 @@ __global__ __launch_bounds__(
     Schedule::kThreads,
     Schedule::
         kMinBlocksPerSm) void nvfp4_linear_swiglu_w4a4_tma_kernel(const __grid_constant__
-                                                                      Nvfp4W4a4TmaDescriptors
-                                                                          descriptors,
+                                                                      Nvfp4W4a4TmaDescriptorBytes
+                                                                          descriptor_bytes,
                                                                   float alpha,
-                                                                  __nv_bfloat16* __restrict__ output) {
+                                                                  __nv_bfloat16* __restrict__
+                                                                      output) {
     static_assert(Geometry::kOutputRows == 34816);
     static_assert(Geometry::kInputRows == 5120);
     static_assert((Geometry::kInputRows % Schedule::kBlockK) == 0);
@@ -62,6 +63,12 @@ __global__ __launch_bounds__(
     constexpr int kPairN        = Schedule::kBlockN / 2;
     static_assert((kIntermediate % kPairN) == 0);
     static_assert((kIntermediate % 128) == 0);
+
+    // See nvfp4_w4a4_tma_kernel: the opaque wrapper is verified against
+    // CUtensorMap's 128-byte alignment before any TMA load re-interprets it.
+    nvfp4_require_tma_descriptor_alignment(descriptor_bytes.bytes);
+    const Nvfp4W4a4TmaDescriptors& descriptors =
+        *reinterpret_cast<const Nvfp4W4a4TmaDescriptors*>(descriptor_bytes.bytes);
 
     extern __shared__ __align__(128) unsigned char shared_bytes[];
     auto& shared = *reinterpret_cast<Nvfp4LinearSwiGluTmaSharedStorage<Schedule>*>(shared_bytes);

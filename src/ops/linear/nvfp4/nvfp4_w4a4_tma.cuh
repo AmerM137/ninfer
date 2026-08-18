@@ -9,6 +9,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 
@@ -20,6 +21,33 @@ struct alignas(128) Nvfp4W4a4TmaDescriptors {
     CUtensorMap a_scales;
     CUtensorMap b_scales;
 };
+
+// Opaque by-value transport for Nvfp4W4a4TmaDescriptors. Declared with
+// alignment 1 because MSVC, nvcc's Windows host compiler, rejects a by-value
+// formal parameter whose requested alignment (128, inherited from CUtensorMap)
+// exceeds what the stack slot guarantees (error C2719 in nvcc's generated
+// launch stub); GCC, the Linux host compiler, copies such parameters into an
+// aligned slot, so the plain struct worked there. The kernel reinterprets the
+// bytes as the descriptor struct and, before any TMA load, verifies that the
+// __grid_constant__ copy actually satisfies CUtensorMap's 128-byte alignment
+// contract. A misaligned descriptor would fail as a silent wrong-address TMA
+// load, not an error, so the guard traps loudly instead. (The driver documents
+// a 64-byte floor for tensor map addresses; the type itself is alignas(128),
+// and 128 is the conservative bound the guard enforces.)
+struct Nvfp4W4a4TmaDescriptorBytes {
+    std::uint8_t bytes[sizeof(Nvfp4W4a4TmaDescriptors)];
+};
+
+__device__ __forceinline__ void nvfp4_require_tma_descriptor_alignment(const std::uint8_t* bytes) {
+    if ((reinterpret_cast<std::uintptr_t>(bytes) & 127U) != 0) {
+        // One diagnostic line per block, not one per thread; every thread traps.
+        if (threadIdx.x == 0) {
+            printf("NInfer NVFP4 TMA descriptor is not 128-byte aligned: %p\n",
+                   reinterpret_cast<const void*>(bytes));
+        }
+        __trap();
+    }
+}
 
 inline void nvfp4_check_driver(CUresult status, const char* operation) {
     if (status == CUDA_SUCCESS) { return; }
@@ -79,6 +107,17 @@ Nvfp4W4a4TmaDescriptors make_nvfp4_w4a4_tma_descriptors(const std::uint8_t* acti
         const_cast<std::uint8_t*>(weight_scales), CU_TENSOR_MAP_DATA_TYPE_UINT8, 16,
         kWeightScaleBytes / 16, 16, 16, 64, CU_TENSOR_MAP_SWIZZLE_NONE, "encode weight scales TMA");
     return descriptors;
+}
+
+// Host-side conversion into the opaque transport type. The kernel parameter
+// must be the alignment-1 byte wrapper so that nvcc's generated host launch
+// stub compiles under MSVC; the kernel re-interprets the bytes behind
+// nvfp4_require_tma_descriptor_alignment.
+inline Nvfp4W4a4TmaDescriptorBytes
+make_nvfp4_w4a4_tma_descriptor_bytes(const Nvfp4W4a4TmaDescriptors& descriptors) {
+    Nvfp4W4a4TmaDescriptorBytes bytes{};
+    std::memcpy(bytes.bytes, &descriptors, sizeof(bytes.bytes));
+    return bytes;
 }
 
 template <int BlockM, int Stages, int MinBlocksPerSm>
@@ -182,10 +221,18 @@ __device__ __forceinline__ void nvfp4_tma_load_2d(void* destination, const CUten
 template <class Geometry, class Schedule, class Epilogue, class OutputPolicy>
 __global__
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4_tma_kernel(
-    const __grid_constant__ Nvfp4W4a4TmaDescriptors descriptors, float alpha,
+    const __grid_constant__ Nvfp4W4a4TmaDescriptorBytes descriptor_bytes, float alpha,
     const __grid_constant__ Epilogue epilogue, const __grid_constant__ OutputPolicy output) {
     static_assert((Geometry::kInputRows % Schedule::kBlockK) == 0);
     static_assert((Geometry::kOutputRows % Schedule::kBlockN) == 0);
+
+    // The wrapper was passed with alignment 1; the TMA hardware requires the
+    // constant-bank copy to satisfy CUtensorMap's 128-byte alignment. Verify
+    // before any load re-interprets the bytes (a misaligned descriptor would
+    // fail as a silent wrong-address TMA load, not an error).
+    nvfp4_require_tma_descriptor_alignment(descriptor_bytes.bytes);
+    const Nvfp4W4a4TmaDescriptors& descriptors =
+        *reinterpret_cast<const Nvfp4W4a4TmaDescriptors*>(descriptor_bytes.bytes);
 
     extern __shared__ __align__(128) unsigned char shared_bytes[];
     auto& shared          = *reinterpret_cast<Nvfp4W4a4TmaSharedStorage<Schedule>*>(shared_bytes);

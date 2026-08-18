@@ -58,9 +58,10 @@ void launch_tma(const std::uint8_t* activation_codes, const std::uint8_t* activa
                 const std::uint8_t* weight_codes, const std::uint8_t* weight_scales,
                 std::int32_t tokens, float alpha, Epilogue epilogue, Output output,
                 cudaStream_t stream) {
-    const Nvfp4W4a4TmaDescriptors descriptors =
-        make_nvfp4_w4a4_tma_descriptors<Geometry, Schedule::kBlockM>(
-            activation_codes, activation_scales, weight_codes, weight_scales, tokens);
+    const Nvfp4W4a4TmaDescriptorBytes descriptor_bytes =
+        make_nvfp4_w4a4_tma_descriptor_bytes(make_nvfp4_w4a4_tma_descriptors<
+                                             Geometry, Schedule::kBlockM>(
+            activation_codes, activation_scales, weight_codes, weight_scales, tokens));
     constexpr std::size_t kSharedBytes = sizeof(Nvfp4W4a4TmaSharedStorage<Schedule>);
     static const bool kConfigured      = [] {
         CUDA_CHECK(cudaFuncSetAttribute(nvfp4_w4a4_tma_kernel<Geometry, Schedule, Epilogue, Output>,
@@ -72,7 +73,8 @@ void launch_tma(const std::uint8_t* activation_codes, const std::uint8_t* activa
 
     const dim3 grid(Geometry::kOutputRows / Schedule::kBlockN, tokens / Schedule::kBlockM);
     nvfp4_w4a4_tma_kernel<Geometry, Schedule>
-        <<<grid, Schedule::kThreads, kSharedBytes, stream>>>(descriptors, alpha, epilogue, output);
+        <<<grid, Schedule::kThreads, kSharedBytes, stream>>>(
+            descriptor_bytes, alpha, epilogue, output);
     CUDA_CHECK(cudaGetLastError());
 }
 
