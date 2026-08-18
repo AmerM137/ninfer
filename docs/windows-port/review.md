@@ -2,7 +2,7 @@
 
 Status: temporary working document, companion to
 `docs/windows-port/plan.md`. It records the review of the unstaged
-working tree on `docs/windows-port-bringup` (the Phase 1/2 code implementation) against that
+working tree on `windows-port` (the Phase 1/2 code implementation) against that
 plan: bugs to fix, decisions the implementation made that the plan left open, and the
 verification items still owed. Remove it when the items are resolved and folded into the plan
 doc or the code. File/line references are against the working tree as of this date.
