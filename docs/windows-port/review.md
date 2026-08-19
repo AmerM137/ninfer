@@ -441,6 +441,17 @@ Two observations recorded, neither acted on:
   NVFP4 TMA kernel source (both platforms, all five caller families' op tests),
   `acquire.cpp` containment check (both platforms), `api_impl.h` (both platforms,
   semantically identical).
+- `eval/` runners arriving from master (added after this branch's base, first seen at the
+  2026-08-19 rebase onto `feaf4dd0`): `eval/run_qwen3_8_27b_groupwise_reasoning.sh` and
+  `eval/run_qwen3_8_27b_nvfp4_reasoning.sh` are bash-only server drivers that plan §4.5 already
+  scoped ("any `eval/` driver that spawns a binary") but that did not exist when
+  `tools/bench/hostexec.py` landed. Each hardcodes `build/apps/ninfer-serve` without the `.exe`
+  suffix, stops the server with `kill -TERM` — the hard-kill path §4.5 called out, which skips
+  `SetConsoleCtrlHandler` and truncates the request log — and resolves the interpreter at
+  `eval/.venv/bin/python` rather than the Windows `Scripts\python.exe` layout. Decide between
+  routing them through `hostexec.py` and declaring them Linux-only alongside Docker and v1
+  artifact migration; the rest of `eval/ninfer_eval/` needs nothing, since its only subprocess
+  use is `git`. Not a regression in this branch: the files are new on master and untouched here.
 - Ratification leftovers by design: splitting the containment fix into its own commit when
   the port lands.
 
