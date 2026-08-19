@@ -241,7 +241,7 @@ class:
 | `fstat` + `st_size` | `GetFileSizeEx` |
 | `mmap(PROT_READ, MAP_PRIVATE)` / `munmap` | `CreateFileMapping(handle, PAGE_READONLY, sizeHigh, sizeLow, nullptr)` + `MapViewOfFile` / `UnmapViewOfFile` (size passed as 64-bit high/low pair; a 17–22 GB artifact maps fine in a 64-bit process) |
 | `pread` with `EINTR` retry | `ReadFile` on the unbuffered handle, offset supplied through an `OVERLAPPED` structure on a **synchronous** handle (positional, no file-pointer mutation, keeps `Reader::read_direct`'s `const` honest). The existing 4096-alignment pre-checks on offset, size, and destination are kept verbatim: they match `FILE_FLAG_NO_BUFFERING` sector rules |
-| `errno` | `GetLastError()` → `std::system_error(err, std::generic_category(), ...)`, matching the existing POSIX `generic_category` style |
+| `errno` | `GetLastError()` → `std::system_error(err, std::system_category(), ...)`. **Not `generic_category`** — that category interprets its value as `errno`, and Win32 codes use a different numbering, so it renders most failures as an unrelated message (`ERROR_ACCESS_DENIED` 5 → "Input/output error", `ERROR_SHARING_VIOLATION` 32 → "Broken pipe"). `system_category` is the Windows-native one and routes through `FormatMessage`. The POSIX branch keeps `generic_category` because it passes a real `errno` |
 | `off_t` / `ssize_t` limit checks (`reader.cpp:235-240`) | Neither type exists in MSVC. Re-express against `LONGLONG` / `DWORD` — `ReadFile`'s byte count is a `DWORD`, which is a tighter bound than `ssize_t` and must be enforced |
 
 Behavior notes:

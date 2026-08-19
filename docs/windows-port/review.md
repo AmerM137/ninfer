@@ -384,6 +384,52 @@ Evidence (target machine, 2026-08-18):
 Status: clang-cl is a **verified-working alternative host compiler**, not the documented
 default — README/AGENTS.md continue to name MSVC. The MSVC `build/` tree is untouched.
 
+### Load-path review (2026-08-18, fourth session) — two fixes landed
+
+Reviewed `src/artifact/reader.cpp` and `src/artifact/materializer.cpp` against a real
+20 GiB load on the target machine. The pipeline is sound and no performance defect was
+found; two correctness items were fixed in `reader.cpp`.
+
+- **`GetLastError()` was paired with `std::generic_category()`** at all five Win32 throw
+  sites (open, `GetFileSizeEx`, `CreateFileMappingW`, `MapViewOfFile`, `ReadFile`). That
+  category maps its value through `errno`, so Win32 codes rendered as unrelated text.
+  Fixed to `std::system_category()`; the four POSIX sites keep `generic_category` because
+  they pass a real `errno`. Verified on the target machine: a directory named `*.ninfer`
+  (`ERROR_ACCESS_DENIED`, 5) reported "Input/output error" before and "Access is denied."
+  after. Note that a missing file masked the bug — `ERROR_FILE_NOT_FOUND` is 2, which
+  collides with `ENOENT`, so the most common failure was accidentally correct.
+  **`plan.md` §"`errno`" prescribed the wrong category and has been corrected**, since the
+  next Win32 call site would otherwise reintroduce it.
+- **`log_direct_io_fallback_once` raced on a plain `static bool`.** Benign (a duplicated
+  warning line at worst), now a `std::atomic<bool>` exchange. Deliberately *not*
+  `std::call_once`: that reports failure by throwing `std::system_error` and the function
+  is `noexcept`, so a throw would reach `std::terminate`.
+
+Measured load, Qwen3.6-35B-A3B `groupwise-int`, clang-cl build, warm process start:
+
+| Phase | Time |
+|---|---:|
+| `host to device` (read + H2D pipeline, 19.59 GiB) | 2.459 s |
+| `artifact/materialize` | 3.448 s |
+| `engine construction` | 3.512 s |
+
+That is **7.97 GiB/s (8.55 GB/s)** sustained through the 4 × 64 MiB pinned-slot pipeline,
+so the read is the pace-setter and H2D hides behind it. Re-measured after the fixes at
+2.469 s — no regression. The ~1.0 s between the pipeline and `artifact/materialize` is the
+19.59 GiB `cudaMalloc` plus `cudaHostRegister` on the staging buffers, both serial before
+the read loop starts; `cudaMalloc` at that size is slow under WDDM specifically.
+
+Two observations recorded, neither acted on:
+
+- `read_direct` is synchronous inside a single-threaded slot loop, so the disk queue depth
+  is 1 regardless of slot count. This is shared with the POSIX `pread`/`O_DIRECT` path, not
+  a Windows regression. Raising queue depth is the only remaining read-side lever.
+- `FILE_FLAG_NO_BUFFERING` bypasses the page cache, so every process start pays the full
+  read; it never amortizes. The target machine has 47.7 GiB of RAM against a 19.59 GiB
+  artifact, so a buffered opt-in would let repeat loads serve from standby cache — relevant
+  only to develop-restart loops, and direct I/O remains the right default for a one-shot
+  20 GiB read.
+
 ### Still owed (updated after the evidence above)
 
 - Cross-platform greedy parity (plan §6): the same prompt/seed against the Linux reference
