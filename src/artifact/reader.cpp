@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <cstring>
 #include <functional>
@@ -204,7 +205,7 @@ public:
             wide_path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
             FILE_ATTRIBUTE_NORMAL, 0);
         if (map_handle_ == INVALID_HANDLE_VALUE) {
-            throw std::system_error(::GetLastError(), std::generic_category(),
+            throw std::system_error(::GetLastError(), std::system_category(),
                                     "open " + path.string());
         }
 
@@ -212,7 +213,7 @@ public:
         if (!::GetFileSizeEx(map_handle_, &file_size)) {
             const DWORD error = ::GetLastError();
             close_all();
-            throw std::system_error(error, std::generic_category(), "fstat " + path.string());
+            throw std::system_error(error, std::system_category(), "fstat " + path.string());
         }
         if (file_size.QuadPart < 0 ||
             static_cast<std::uintmax_t>(file_size.QuadPart) >
@@ -231,14 +232,14 @@ public:
             if (mapping_handle_ == nullptr) {
                 const DWORD error = ::GetLastError();
                 close_all();
-                throw std::system_error(error, std::generic_category(), "mmap " + path.string());
+                throw std::system_error(error, std::system_category(), "mmap " + path.string());
             }
             const auto* mapping =
                 ::MapViewOfFile(mapping_handle_, FILE_MAP_READ, 0, 0, file_size.QuadPart);
             if (mapping == nullptr) {
                 const DWORD error = ::GetLastError();
                 close_all();
-                throw std::system_error(error, std::generic_category(), "mmap " + path.string());
+                throw std::system_error(error, std::system_category(), "mmap " + path.string());
             }
             data_ = static_cast<const std::byte*>(mapping);
         }
@@ -279,7 +280,7 @@ public:
         DWORD bytes_read      = 0;
         if (!::ReadFile(handle, destination.data(), static_cast<DWORD>(destination.size()),
                         &bytes_read, &overlapped)) {
-            throw std::system_error(::GetLastError(), std::generic_category(),
+            throw std::system_error(::GetLastError(), std::system_category(),
                                     "direct artifact read");
         }
         return static_cast<std::size_t>(bytes_read);
@@ -306,9 +307,10 @@ private:
     }
 
     void log_direct_io_fallback_once(DWORD sector_size) noexcept {
-        static bool logged = false;
-        if (logged) { return; }
-        logged = true;
+        // Atomic exchange rather than std::call_once: this function is noexcept,
+        // and call_once reports failure by throwing std::system_error.
+        static std::atomic<bool> logged{false};
+        if (logged.exchange(true, std::memory_order_relaxed)) { return; }
         std::fprintf(stderr,
                      "NInfer artifact direct I/O unavailable (sector size %lu); falling back "
                      "to buffered reads\n",
