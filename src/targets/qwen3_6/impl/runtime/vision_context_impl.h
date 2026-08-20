@@ -10,7 +10,7 @@
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/residual_add.h"
 #include "ninfer/ops/rope.h"
-#include "ninfer/ops/vision_attention.h"
+#include "ninfer/ops/softmax_attention.h"
 #include "ninfer/ops/vision_pos_embed.h"
 
 #include <algorithm>
@@ -95,9 +95,12 @@ VisionWorkspaceLayout build_workspace_layout(std::size_t patches64, std::size_t 
                 out.attention_norm = add(DType::BF16, {VisionScheduleConfig::hidden, patches},
                                          "vision attention norm");
             }
-            const std::size_t attention_bytes = ops::vision_attention_workspace_capacity_bytes(
-                patches, patches, static_cast<std::int32_t>(segment_count),
-                static_cast<std::int32_t>(segment_count));
+            const std::size_t attention_bytes =
+                ops::packed_softmax_attention_workspace_capacity_bytes(
+                    {VisionScheduleConfig::head_dim, VisionScheduleConfig::heads,
+                     VisionScheduleConfig::heads},
+                    patches, patches, static_cast<std::int32_t>(segment_count),
+                    static_cast<std::int32_t>(segment_count));
             if (attention_bytes != 0) {
                 out.attention_workspace =
                     builder.add(attention_bytes, kWorkspaceAlignment, "vision attention workspace");
@@ -272,8 +275,12 @@ void VisionContext::encode(const VisionItemView& item, Tensor& output,
                                                          ? layout.attention_workspace->bind(backing)
                                                          : backing;
                 WorkspaceArena attention_workspace(attention_backing);
-                ops::vision_attention(q, k, v, cu_seqlens, attention_workspace, attended_heads,
-                                      stream);
+                ops::packed_softmax_attention(q, k, v,
+                                              {VisionScheduleConfig::head_dim,
+                                               VisionScheduleConfig::heads,
+                                               VisionScheduleConfig::heads},
+                                              VisionScheduleConfig::attention_scale, cu_seqlens,
+                                              attention_workspace, attended_heads, stream);
             }
             Tensor projected = layout.projected.bind(backing);
             ops::linear(attended, *block.projection, projected, stream);

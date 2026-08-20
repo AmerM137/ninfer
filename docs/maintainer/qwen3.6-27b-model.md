@@ -147,9 +147,11 @@ x = x + o_projection(a)
 
 Prefill appends all K/V columns and evaluates causal attention for the chunk. Decode appends one
 column and attends over the resident prefix. KV storage may be BF16 or INT8-G64. The exact runtime
-cache codec and the common ideal attention oracle are defined by the repository-internal
-[`gqa_attention.h`](../../include/ninfer/ops/gqa_attention.h) contract. Both cache formats and their
-optimized compute profiles are judged by that one oracle construction rather than by
+cache codec is defined by the repository-internal
+[`kv_cache_append.h`](../../include/ninfer/ops/kv_cache_append.h) contract; append-and-attend and
+cached-only computation use
+[`softmax_attention.h`](../../include/ninfer/ops/softmax_attention.h). Both cache formats and their
+optimized compute profiles are judged by the common ideal Attention oracle rather than by
 implementation-mirroring references.
 
 Text-only positions use the same scalar position for temporal, height, and width MRoPE sections.

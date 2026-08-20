@@ -39,6 +39,7 @@ struct VisionScheduleConfig {
     static constexpr int rotary_dim          = VisionConfig::rotary_dim;
     static constexpr float rope_theta        = VisionConfig::rope_theta;
     static constexpr float norm_eps          = VisionConfig::norm_epsilon;
+    static constexpr float attention_scale   = 0.11785113019775792F;
 };
 
 class VisionContext {

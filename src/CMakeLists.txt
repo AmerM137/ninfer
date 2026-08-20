@@ -68,11 +68,6 @@ add_library(ninfer_ops STATIC
   ops/launcher/embed_gather.cu
   ops/launcher/gdn_gating.cu
   ops/launcher/gelu.cu
-  ops/launcher/bidirectional_gqa_attention.cu
-  ops/launcher/swa.cu
-  ops/launcher/gqa_attention_decode.cu
-  ops/launcher/gqa_attention_prefill.cu
-  ops/launcher/kv_cache_append_prefix.cu
   ops/launcher/l2norm.cu
   ops/launcher/layer_norm.cu
   ops/launcher/mtp_pack.cu
@@ -89,8 +84,19 @@ add_library(ninfer_ops STATIC
   ops/launcher/scatter.cu
   ops/launcher/sigmoid_gate_mul.cu
   ops/launcher/silu_and_mul.cu
-  ops/launcher/vision_attention.cu
   ops/launcher/vision_pos_embed.cu
+  # Softmax Attention and KV-cache state transitions.
+  ops/softmax_attention/dense/causal_cache/causal_softmax_attention.cpp
+  ops/softmax_attention/dense/causal_cache/small_t.cu
+  ops/softmax_attention/dense/causal_cache/prompt.cu
+  ops/softmax_attention/dense/packed/packed_softmax_attention.cpp
+  ops/softmax_attention/dense/packed/launch.cu
+  ops/softmax_attention/dense/context/context_softmax_attention.cpp
+  ops/softmax_attention/dense/context/launch.cu
+  ops/softmax_attention/sliding_window/sliding_window_attention.cpp
+  ops/softmax_attention/sliding_window/launch.cu
+  ops/kv_cache/append/kv_cache_append.cpp
+  ops/kv_cache/append/launch.cu
   # Gated DeltaNet Linear Attention core.
   ops/linear_attention/gated_delta_net/gated_delta_net.cpp
   ops/linear_attention/gated_delta_net/replay.cpp
@@ -233,10 +239,6 @@ add_library(ninfer_ops STATIC
   ops/wrapper/gdn_gating_proj.cpp
   ops/wrapper/gdn_input_proj.cpp
   ops/wrapper/gelu.cpp
-  ops/wrapper/bidirectional_gqa_attention.cpp
-  ops/wrapper/swa.cpp
-  ops/wrapper/gqa_attention.cpp
-  ops/wrapper/kv_cache_append_prefix.cpp
   ops/wrapper/attn_input_proj.cpp
   ops/wrapper/l2norm.cpp
   ops/wrapper/layer_norm.cpp
@@ -258,7 +260,6 @@ add_library(ninfer_ops STATIC
   ops/wrapper/sigmoid_mul.cpp
   ops/wrapper/silu_mul.cpp
   ops/wrapper/sparse_moe.cpp
-  ops/wrapper/vision_attention.cpp
   ops/wrapper/vision_pos_embed.cpp)
 ninfer_internal_includes(ninfer_ops)
 ninfer_cuda_archive(ninfer_ops)

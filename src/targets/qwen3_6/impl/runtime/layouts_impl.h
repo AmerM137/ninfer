@@ -11,10 +11,9 @@
 #include "ninfer/ops/linear_add.h"
 #include "ninfer/ops/linear_swiglu.h"
 #include "ninfer/ops/sampling.h"
+#include "ninfer/ops/sliding_window_attention.h"
+#include "ninfer/ops/softmax_attention.h"
 #include "ninfer/ops/speculative_round.h"
-#include "ninfer/ops/gqa_attention.h"
-#include "ninfer/ops/bidirectional_gqa_attention.h"
-#include "ninfer/ops/swa.h"
 
 #include <algorithm>
 #include <initializer_list>
@@ -234,7 +233,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     const auto chunk  = static_cast<std::int32_t>(chunk_u32);
     const auto drafts = static_cast<std::int32_t>(plan.draft_window);
     const auto verify = drafts + 1;
-    const ops::GqaExecutionEnvelope text_envelope{1, plan.capacity};
+    const ops::CausalAttentionExecutionEnvelope text_envelope{1, plan.capacity};
 
     const auto matrix  = [](WorkspaceLayoutBuilder& layout, DType dtype, std::int32_t rows,
                            std::int32_t tokens) { (void)layout.alloc(dtype, {rows, tokens}); };
@@ -252,15 +251,16 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     const auto attention_stage = [&](WorkspaceLayoutBuilder& layout, std::int32_t first,
                                      std::int32_t last, qwen3_6::TextPhase phase,
                                      std::int32_t batch_size, std::int32_t min_width,
-                                     std::int32_t max_width, ops::GqaExecutionEnvelope envelope) {
+                                     std::int32_t max_width,
+                                     ops::CausalAttentionExecutionEnvelope envelope) {
         auto stage = layout.scope();
         (void)workspace_recipe::text_attention_projection<TextConfig>(layout, last);
         scratch(layout, Variant::attention_projection_workspace_capacity_bytes(plan.weights_profile,
                                                                                phase, first, last));
         (void)workspace_recipe::text_attention_results<TextConfig>(layout, last);
-        scratch(layout, ops::gqa_attention_workspace_capacity_bytes(
-                            TextConfig::query_heads, plan.kv_dtype, envelope, batch_size, min_width,
-                            max_width));
+        scratch(layout, ops::causal_softmax_attention_workspace_capacity_bytes(
+                            {TextConfig::head_dim, TextConfig::query_heads, TextConfig::kv_heads},
+                            plan.kv_dtype, envelope, batch_size, min_width, max_width));
         scratch(layout, Variant::attention_output_projection_workspace_capacity_bytes(
                             plan.weights_profile, phase, first, last));
     };
@@ -303,7 +303,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     const auto target_body = [&](WorkspaceLayoutBuilder& layout, std::int32_t first,
                                  std::int32_t last, qwen3_6::TextPhase phase, GdnWorkspacePath path,
                                  std::int32_t batch_size, std::int32_t min_width,
-                                 std::int32_t max_width, ops::GqaExecutionEnvelope envelope) {
+                                 std::int32_t max_width,
+                                 ops::CausalAttentionExecutionEnvelope envelope) {
         attention_stage(layout, first, last, phase, batch_size, min_width, max_width, envelope);
         gdn_stage(layout, first, last, phase, path, batch_size, min_width, max_width);
         post_mixer_stage(layout, first, last, phase);
@@ -318,19 +319,21 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         (void)workspace_recipe::mtp_stem<TextConfig>(layout, tokens, !preembedded);
     };
     const auto mtp_full_core = [&](WorkspaceLayoutBuilder& layout, std::int32_t tokens,
-                                   ops::GqaExecutionEnvelope envelope) {
+                                   ops::CausalAttentionExecutionEnvelope envelope) {
         auto core = layout.scope();
         mtp_stem(layout, tokens, false);
         (void)workspace_recipe::mtp_attention_projection<TextConfig>(layout, tokens);
         scratch(layout, Variant::mtp_attention_projection_workspace_capacity_bytes(tokens, tokens));
         (void)workspace_recipe::mtp_attention_results<TextConfig>(layout, tokens);
-        scratch(layout, ops::gqa_attention_workspace_capacity_bytes(
-                            TextConfig::query_heads, plan.kv_dtype, envelope, 1, tokens, tokens));
+        scratch(layout, ops::causal_softmax_attention_workspace_capacity_bytes(
+                            {TextConfig::head_dim, TextConfig::query_heads, TextConfig::kv_heads},
+                            plan.kv_dtype, envelope, 1, tokens, tokens));
         (void)workspace_recipe::mtp_post_attention<TextConfig>(layout, tokens);
         scratch(layout, Variant::mtp_post_mixer_workspace_capacity_bytes(tokens, tokens));
     };
     const auto mtp_full_call = [&](WorkspaceLayoutBuilder& layout, std::int32_t tokens,
-                                   ops::GqaExecutionEnvelope envelope, bool build_proposal) {
+                                   ops::CausalAttentionExecutionEnvelope envelope,
+                                   bool build_proposal) {
         auto call = layout.scope();
         matrix(layout, DType::I32, 1, tokens);
         mtp_full_core(layout, tokens, envelope);
@@ -358,8 +361,9 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         matrix(layout, DType::BF16, TextConfig::query_size, 1);
         matrix(layout, DType::I32, 3, 1);
         matrix(layout, DType::BF16, TextConfig::query_size, 1);
-        scratch(layout, ops::gqa_attention_workspace_capacity_bytes(
-                            TextConfig::query_heads, plan.kv_dtype, text_envelope, 1, 1, 1));
+        scratch(layout, ops::causal_softmax_attention_workspace_capacity_bytes(
+                            {TextConfig::head_dim, TextConfig::query_heads, TextConfig::kv_heads},
+                            plan.kv_dtype, text_envelope, 1, 1, 1));
         matrix(layout, DType::BF16, TextConfig::hidden, 1);
         matrix(layout, DType::BF16, TextConfig::hidden, 1);
         scratch(layout, Variant::mtp_post_mixer_workspace_capacity_bytes(1, 1));
@@ -431,9 +435,10 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                 scratch(layout,
                         Variant::mtp_attention_projection_workspace_capacity_bytes(tokens, tokens));
                 (void)workspace_recipe::mtp_attention_results<TextConfig>(layout, tokens);
-                scratch(layout, ops::gqa_attention_workspace_capacity_bytes(
-                                    TextConfig::query_heads, plan.kv_dtype, text_envelope, batch,
-                                    width, width));
+                scratch(layout,
+                        ops::causal_softmax_attention_workspace_capacity_bytes(
+                            {TextConfig::head_dim, TextConfig::query_heads, TextConfig::kv_heads},
+                            plan.kv_dtype, text_envelope, batch, width, width));
                 (void)workspace_recipe::mtp_post_attention<TextConfig>(layout, tokens);
                 scratch(layout, Variant::mtp_post_mixer_workspace_capacity_bytes(tokens, tokens));
             };
@@ -476,9 +481,14 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                     auto attention = layout.scope();
                     (void)workspace_recipe::dflash_attention<DFlashConfig>(layout, tokens);
                     scratch(layout,
-                            std::max(ops::swa_workspace_capacity_bytes({0, plan.capacity}, width,
-                                                                       width, batch),
-                                     ops::bidirectional_gqa_attention_workspace_capacity_bytes(
+                            std::max(ops::sliding_window_attention_workspace_capacity_bytes(
+                                         {DFlashConfig::head_dim, DFlashConfig::query_heads,
+                                          DFlashConfig::kv_heads},
+                                         DFlashConfig::local_capacity, {0, plan.capacity}, width,
+                                         width, batch),
+                                     ops::context_softmax_attention_workspace_capacity_bytes(
+                                         {DFlashConfig::head_dim, DFlashConfig::query_heads,
+                                          DFlashConfig::kv_heads},
                                          {0, plan.capacity}, width, width, batch)));
                     scratch(layout, ops::linear_add_workspace_capacity_bytes(
                                         QType::W8G32_F16S, DFlashConfig::hidden,

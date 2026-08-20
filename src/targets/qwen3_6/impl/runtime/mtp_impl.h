@@ -38,7 +38,7 @@ void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,
                                rope_position.size_bytes(), cudaMemcpyHostToDevice,
                                state.execution.device.stream));
     const auto bridge_visible = static_cast<std::uint32_t>(position + 1);
-    const ops::GqaExecutionEnvelope bridge_envelope{bridge_visible, bridge_visible};
+    const ops::CausalAttentionExecutionEnvelope bridge_envelope{bridge_visible, bridge_visible};
     card.mtp_forward_batch(next_token, previous_hidden, position_view, bridge_envelope, mtp_hidden,
                            build_proposal ? 0 : -1, build_proposal ? &logits : nullptr,
                            build_proposal ? &draft0 : nullptr, &rope_position_view, next_embedding);
@@ -57,7 +57,7 @@ void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,
         Tensor next_draft     = state.execution.io.mtp->draft_tokens.slice(0, i, 1);
         Tensor next_hidden    = state.execution.prefill_hidden.slice(1, i, 1);
         const auto visible    = static_cast<std::uint32_t>(position + i + 1);
-        const ops::GqaExecutionEnvelope envelope{visible, visible};
+        const ops::CausalAttentionExecutionEnvelope envelope{visible, visible};
         card.mtp_forward_ar_step(previous_token, state.execution.io.mtp->ar_hidden, ar_position,
                                  envelope, next_hidden, logits, next_draft);
         CUDA_CHECK(cudaMemcpyAsync(state.execution.io.mtp->ar_hidden.data, next_hidden.data,
@@ -68,7 +68,7 @@ void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,
 }
 
 auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std::uint32_t k,
-                           MtpGqaEnvelopes envelopes) {
+                           MtpCausalAttentionEnvelopes envelopes) {
     return [&state, batch_size, k, envelopes] {
         if (batch_size <= 0 || batch_size > static_cast<std::int32_t>(kMaximumConcurrency) ||
             k == 0 || k > kMtpDecodeMaximumDrafts) {
@@ -183,13 +183,14 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
 }
 
 void capture_mtp_decode_batch(MtpBatchContext& state, std::int32_t batch_size, std::uint32_t k,
-                              MtpGqaEnvelopes envelopes, DecodeGraphDefinition& definition) {
+                              MtpCausalAttentionEnvelopes envelopes,
+                              DecodeGraphDefinition& definition) {
     auto body = mtp_decode_batch_body(state, batch_size, k, envelopes);
     capture_graph(state, definition, body);
 }
 
 void mtp_decode_batch(MtpBatchContext& state, std::int32_t batch_size, std::uint32_t k,
-                      MtpGqaEnvelopes envelopes, DecodeGraphExecutable* executable) {
+                      MtpCausalAttentionEnvelopes envelopes, DecodeGraphExecutable* executable) {
     auto body = mtp_decode_batch_body(state, batch_size, k, envelopes);
     run_prepared(state, executable, body);
 }

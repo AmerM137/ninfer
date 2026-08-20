@@ -192,7 +192,6 @@ set(ninfer_op_tests
   gdn_gating_proj
   rope
   vision_pos_embed
-  vision_attention
   sampling
   scalar
   cast
@@ -206,17 +205,17 @@ endforeach()
 
 # Stateful, fused, and exact-shape Ops remain central even when the current implementation domain
 # is one checkpoint/device.
-ninfer_add_op_test(ninfer_gqa_attention_test
-  SOURCES ops/test_gqa_attention.cpp
+ninfer_add_op_test(ninfer_softmax_attention_test
+  SOURCES ops/softmax_attention/main.cpp
+          ops/softmax_attention/causal_cache.cpp
+          ops/softmax_attention/plain_and_packed.cpp
+          ops/softmax_attention/context.cpp
   LIBRARIES ninfer_ops)
-ninfer_add_op_test(ninfer_bidirectional_gqa_attention_test
-  SOURCES ops/test_bidirectional_gqa_attention.cpp
+ninfer_add_op_test(ninfer_sliding_window_attention_test
+  SOURCES ops/test_sliding_window_attention.cpp
   LIBRARIES ninfer_ops)
-ninfer_add_op_test(ninfer_swa_test
-  SOURCES ops/test_swa.cpp
-  LIBRARIES ninfer_ops)
-ninfer_add_op_test(ninfer_kv_cache_append_prefix_test
-  SOURCES ops/test_kv_cache_append_prefix.cpp
+ninfer_add_op_test(ninfer_kv_cache_append_test
+  SOURCES ops/test_kv_cache_append.cpp
   LIBRARIES ninfer_ops)
 ninfer_add_op_test(ninfer_prepare_masked_block_test
   SOURCES ops/test_prepare_masked_block.cpp

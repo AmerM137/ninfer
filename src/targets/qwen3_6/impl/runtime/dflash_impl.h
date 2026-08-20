@@ -4,9 +4,8 @@
 
 #include "ninfer/ops/argmax.h"
 #include "ninfer/ops/attn_input_proj.h"
-#include "ninfer/ops/bidirectional_gqa_attention.h"
 #include "ninfer/ops/embedding.h"
-#include "ninfer/ops/kv_cache_append_prefix.h"
+#include "ninfer/ops/kv_cache_append.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/linear_add.h"
 #include "ninfer/ops/linear_pair.h"
@@ -15,10 +14,11 @@
 #include "ninfer/ops/prepare_ragged_prefix.h"
 #include "ninfer/ops/rmsnorm.h"
 #include "ninfer/ops/rope.h"
-#include "ninfer/ops/scatter.h"
 #include "ninfer/ops/scalar.h"
+#include "ninfer/ops/scatter.h"
+#include "ninfer/ops/sliding_window_attention.h"
+#include "ninfer/ops/softmax_attention.h"
 #include "ninfer/ops/speculative_round.h"
-#include "ninfer/ops/swa.h"
 
 #include <cuda_runtime.h>
 
@@ -239,14 +239,17 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                 Tensor attention_batch = roots.attention.view(
                     {Config::head_dim, Config::query_heads, width, batch_size});
                 if (layer < Config::local_layers) {
-                    ops::swa(query_batch, key_batch, value_batch, positions, valid_columns, lanes,
-                             Config::attention_scale,
-                             dflash_state(state).local_layer(static_cast<std::uint32_t>(layer)),
-                             envelopes.local, state.execution.work, attention_batch,
-                             state.execution.device.stream);
+                    ops::sliding_window_attention(
+                        query_batch, key_batch, value_batch, positions, valid_columns, lanes,
+                        {Config::head_dim, Config::query_heads, Config::kv_heads},
+                        Config::local_capacity, Config::attention_scale,
+                        dflash_state(state).local_layer(static_cast<std::uint32_t>(layer)),
+                        envelopes.local, state.execution.work, attention_batch,
+                        state.execution.device.stream);
                 } else {
-                    ops::bidirectional_gqa_attention(
+                    ops::context_softmax_attention(
                         query_batch, key_batch, value_batch, frontiers, valid_columns, full_rows,
+                        {Config::head_dim, Config::query_heads, Config::kv_heads},
                         Config::attention_scale, dflash_state(state).full_batch_layer(0),
                         envelopes.full, state.execution.work, attention_batch,
                         state.execution.device.stream);
@@ -310,7 +313,7 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
 
 auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size, std::uint32_t k,
                               DFlashEnvelopes envelopes,
-                              ops::GqaExecutionEnvelope target_envelope) {
+                              ops::CausalAttentionExecutionEnvelope target_envelope) {
     return [&state, batch_size, k, envelopes, target_envelope] {
         if (batch_size <= 0 || batch_size > static_cast<std::int32_t>(kMaximumConcurrency) ||
             k == 0 || k > kDFlashDecodeMaximumDrafts) {
@@ -417,14 +420,15 @@ void dflash_append_context(PrefillContext& state, const Tensor& features, const 
 
 void capture_dflash_decode_batch(DFlashBatchContext& state, std::int32_t batch_size,
                                  std::uint32_t k, DFlashEnvelopes envelopes,
-                                 ops::GqaExecutionEnvelope target_envelope,
+                                 ops::CausalAttentionExecutionEnvelope target_envelope,
                                  DecodeGraphDefinition& definition) {
     auto body = dflash_decode_batch_body(state, batch_size, k, envelopes, target_envelope);
     capture_graph(state, definition, body);
 }
 
 void dflash_decode_batch(DFlashBatchContext& state, std::int32_t batch_size, std::uint32_t k,
-                         DFlashEnvelopes envelopes, ops::GqaExecutionEnvelope target_envelope,
+                         DFlashEnvelopes envelopes,
+                         ops::CausalAttentionExecutionEnvelope target_envelope,
                          DecodeGraphExecutable* executable) {
     auto body = dflash_decode_batch_body(state, batch_size, k, envelopes, target_envelope);
     run_prepared(state, executable, body);

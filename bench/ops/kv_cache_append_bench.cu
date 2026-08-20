@@ -1,8 +1,8 @@
 // Public-Op benchmark for full and device-count-prefix KV cache append contracts.
 // Cache encoding, launch geometry, and route selection remain private to the public wrappers.
 
-#include "ninfer/ops/gqa_attention.h"
-#include "ninfer/ops/kv_cache_append_prefix.h"
+#include "ninfer/ops/softmax_attention.h"
+#include "ninfer/ops/kv_cache_append.h"
 
 #include "core/device.h"
 #include "core/cyclic_kv_cache.h"
@@ -305,7 +305,7 @@ public:
     }
 
     void launch(cudaStream_t stream) {
-        ops::gqa_kv_append(k_tensor_, v_tensor_, positions_tensor_, cache_view_, stream);
+        ops::kv_cache_append(k_tensor_, v_tensor_, positions_tensor_, cache_view_, stream);
     }
 
 private:

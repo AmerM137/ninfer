@@ -1072,13 +1072,13 @@ storage/view boundary。
 
 | Entry | Cache contract | State effect |
 |---|---|---|
-| `gqa_attention` | writable `PagedKVBatchLayerView` + `table_rows[B]` | 为 `B` 条独立 sequences append valid K/V columns，并执行一次 ragged causal Attention |
-| `gqa_attention_cached` | read-only `PagedKVLayerView` | 只读已经 populated 的 paged cache |
-| `gqa_kv_append` | writable `PagedKVLayerView` | 写入全部 supplied rows，BF16 copy 或 INT8-G64 encode |
-| `kv_cache_append_prefix` growing entry | writable `PagedKVBatchLayerView` + counts/table rows | 只写每行 device count 选择的 exact prefix |
-| `bidirectional_gqa_attention` | read-only `PagedKVBatchLayerView` + table rows | batched 读取 DFlash Full pool；query K/V 仍是 transient Tensor |
-| `kv_cache_append_prefix` cyclic entry | batched `CyclicKVCacheLayerView` + lane selectors | DFlash local fixed window，不属于 growing pool |
-| `swa` | batched `CyclicKVCacheLayerView` + lane selectors | DFlash local fixed window，不属于 growing pool |
+| `causal_softmax_attention` | writable `PagedKVBatchLayerView` + `table_rows[B]` | 为 `B` 条独立 sequences append valid K/V columns，并执行一次 ragged causal Attention |
+| `causal_softmax_attention_cached` | read-only `PagedKVLayerView` | 只读已经 populated 的 paged cache |
+| `kv_cache_append` | writable `PagedKVLayerView` | 写入全部 supplied rows，BF16 copy 或 INT8-G64 encode |
+| paged `kv_cache_append_prefix` overload | writable `PagedKVBatchLayerView` + counts/table rows | 只写每行 device count 选择的 exact prefix |
+| `context_softmax_attention` | read-only `PagedKVBatchLayerView` + table rows | batched 读取 DFlash Full pool；query K/V 仍是 transient Tensor |
+| cyclic `kv_cache_append_prefix` overload | batched `CyclicKVCacheLayerView` + lane selectors | DFlash local fixed window，不属于 growing pool |
+| `sliding_window_attention` | batched `CyclicKVCacheLayerView` + lane selectors | DFlash local fixed window，不属于 growing pool |
 
 这些 entries 不构成 parallel storage-overload family。Workspace capacity query 由
 现有execution envelope和token interval决定；paging不会成为一个workspace route，也不额外申请与context
@@ -1089,7 +1089,7 @@ Growing `KVCacheLayerView` 和依赖连续 `[D,padded_context,Hkv]` 的实现不
 
 ### 16.2 Tensor domains
 
-Main Text 和 MTP causal `gqa_attention` 接受 request-major batched tensors：
+Main Text 和 MTP `causal_softmax_attention` 接受 request-major batched tensors：
 
 ```text
 Q/Out          BF16 [D,Hq,W,B]
@@ -1104,8 +1104,8 @@ table_rows     I32  [B]
 RoPE/MRoPE coordinate。对 row `b` 的 query position `p`，causal visible domain 仍是该 allocation 的
 `[0,p]`；page boundary 不产生 mask boundary。
 
-`gqa_attention_cached` 和 `gqa_kv_append` 保留 single-sequence `[D,H,T]` tensor domain，用于 prefill
-拆分路径，不构成第二套 growing-cache storage contract。
+`causal_softmax_attention_cached` 和 `kv_cache_append` 保留 single-sequence `[D,H,T]` tensor
+domain，用于 prompt 拆分路径，不构成第二套 growing-cache storage contract。
 
 DFlash full-context entry 使用 `[D,H,W,B]` query block、per-row `context_lengths[B]`、
 `valid_columns[B]` 和 `table_rows[B]`。每行只读取自己 allocation 的 context `[0,Lb)`，再加该行完整

@@ -271,6 +271,12 @@ backend may page or quantize K/V, but those are representation choices rather th
 The persistent cache boundary is the offset-normalized, MRoPE-rotated K and the directly projected
 V; raw K, Q, and the output gate are not cached.
 
+The production append-and-attend and cached-only entries are `causal_softmax_attention` and
+`causal_softmax_attention_cached`; standalone population uses `kv_cache_append`. Their exact
+repository-internal contracts are defined by
+[`softmax_attention.h`](../../include/ninfer/ops/softmax_attention.h) and
+[`kv_cache_append.h`](../../include/ninfer/ops/kv_cache_append.h).
+
 Only 64 of each 256-dimensional Q/K head are rotated. They contain 32 complex frequency pairs split
 across temporal, height, and width MRoPE sections `[11,11,10]`. The checkpoint sets
 `mrope_interleaved=true`, so axis selection is interleaved by frequency pair. For text-only input,
@@ -595,6 +601,11 @@ or numerical oracle.
 The query rows therefore attend bidirectionally to one another while also attending the admitted
 context K/V. This all-non-causal mask is the single model contract and numerical oracle; a causal
 draft mask computes a different head and is not a supported execution profile.
+
+Production layers 0 through 4 use `sliding_window_attention`; layer 5 uses
+`context_softmax_attention`. The corresponding exact repository-internal contracts are defined by
+[`sliding_window_attention.h`](../../include/ninfer/ops/sliding_window_attention.h) and
+[`softmax_attention.h`](../../include/ninfer/ops/softmax_attention.h).
 
 The companion consumes target Text residual features and owns no Vision component. Its query and
 context positions are scalar one-dimensional positions. This model-side contract does not by

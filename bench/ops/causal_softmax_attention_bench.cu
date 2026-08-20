@@ -4,7 +4,7 @@
 // contracts. Decode, small-T, prompt, split-KV, and kernel selection remain private production
 // implementation details and never enter this benchmark's dispatch or output schema.
 
-#include "ninfer/ops/gqa_attention.h"
+#include "ninfer/ops/softmax_attention.h"
 
 #include "core/device.h"
 #include "core/paged_kv_cache.h"
@@ -358,10 +358,11 @@ PagedKVBatchLayerView make_batch_cache_view(DeviceBuffer& k, DeviceBuffer& v, De
 
 std::size_t workspace_capacity(const Geometry& geometry, DType dtype, std::int32_t tokens,
                                std::int32_t batch, std::int32_t visible) {
-    const ops::GqaExecutionEnvelope envelope{static_cast<std::uint32_t>(visible),
-                                             static_cast<std::uint32_t>(visible)};
-    return ops::gqa_attention_workspace_capacity_bytes(geometry.query_heads, dtype, envelope, batch,
-                                                       tokens, tokens);
+    const ops::CausalAttentionExecutionEnvelope envelope{static_cast<std::uint32_t>(visible),
+                                                         static_cast<std::uint32_t>(visible)};
+    return ops::causal_softmax_attention_workspace_capacity_bytes(
+        {kHeadDim, geometry.query_heads, geometry.kv_heads}, dtype, envelope, batch, tokens,
+        tokens);
 }
 
 std::int32_t profile_visible(std::span<const std::int32_t> contexts,
@@ -452,12 +453,14 @@ public:
     void launch(Entry entry, cudaStream_t stream) {
         if (entry == Entry::Append) {
             const Tensor validity = masked_ ? valid_columns_tensor_ : Tensor{};
-            ops::gqa_attention(q_tensor_, k_tensor_, v_tensor_, positions_tensor_, validity,
-                               table_rows_tensor_, kScale, batch_cache_view_, envelope_, workspace_,
-                               output_tensor_, stream);
+            ops::causal_softmax_attention(
+                q_tensor_, k_tensor_, v_tensor_, positions_tensor_, validity, table_rows_tensor_,
+                {kHeadDim, q_tensor_.ne[1], k_tensor_.ne[1]}, kScale, batch_cache_view_, envelope_,
+                workspace_, output_tensor_, stream);
         } else {
-            ops::gqa_attention_cached(q_tensor_, positions_tensor_, kScale, cache_view_, envelope_,
-                                      workspace_, output_tensor_, stream);
+            ops::causal_softmax_attention_cached(
+                q_tensor_, positions_tensor_, {kHeadDim, q_tensor_.ne[1], cache_view_.num_kv_heads},
+                kScale, cache_view_, envelope_, workspace_, output_tensor_, stream);
         }
     }
 
@@ -494,7 +497,7 @@ private:
     Tensor output_tensor_;
     PagedKVLayerView cache_view_;
     PagedKVBatchLayerView batch_cache_view_;
-    ops::GqaExecutionEnvelope envelope_;
+    ops::CausalAttentionExecutionEnvelope envelope_;
 };
 
 const char* entry_name(Entry entry) { return entry == Entry::Append ? "append" : "cached"; }
@@ -691,8 +694,8 @@ RowProfile make_row_profile(const Options& options, std::int32_t batch, std::int
         const std::int32_t context = profile.contexts[static_cast<std::size_t>(row)];
         const std::int32_t valid   = profile.valid_columns[static_cast<std::size_t>(row)];
         if (valid < 0 || valid > width || context < 0 ||
-            context > static_cast<std::int32_t>(ops::kGqaAttentionMaximumVisibleKeys) - valid) {
-            throw std::invalid_argument("row profile exceeds the public GQA domain");
+            context > static_cast<std::int32_t>(ops::kCausalAttentionMaximumVisibleKeys) - valid) {
+            throw std::invalid_argument("row profile exceeds the public causal-attention domain");
         }
     }
     return profile;

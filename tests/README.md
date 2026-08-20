@@ -68,7 +68,7 @@ Enable uniform floating-point error records when establishing or reviewing an Op
 
 ```bash
 NINFER_OP_REPORT_STATS=1 \
-  ctest --test-dir build -V -R '^ninfer_(rmsnorm|gqa_attention)_test$'
+  ctest --test-dir build -V -R '^ninfer_(rmsnorm|softmax_attention)_test$'
 ```
 
 Every participating comparison emits one `OP_ERROR_STATS` record containing the stable case label,

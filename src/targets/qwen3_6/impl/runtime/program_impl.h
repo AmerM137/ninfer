@@ -43,12 +43,13 @@ std::array<std::int32_t, 3> prompt_rope_position(const PreparedPromptData& promp
             prompt.positions[2 * tokens + token]};
 }
 
-schedule::MtpGqaEnvelopes mtp_gqa_envelopes(std::uint32_t max_frontier, std::uint32_t k,
-                                            std::uint32_t capacity) {
+schedule::MtpCausalAttentionEnvelopes mtp_causal_attention_envelopes(std::uint32_t max_frontier,
+                                                                     std::uint32_t k,
+                                                                     std::uint32_t capacity) {
     const auto visible = [capacity](std::uint64_t value) {
         return static_cast<std::uint32_t>(std::min<std::uint64_t>(capacity, value));
     };
-    schedule::MtpGqaEnvelopes out;
+    schedule::MtpCausalAttentionEnvelopes out;
     out.target_verify = {1, visible(static_cast<std::uint64_t>(max_frontier) + k + 1ULL)};
     out.batch         = out.target_verify;
     for (std::uint32_t step = 0; step + 1 < k; ++step) {
@@ -1587,7 +1588,8 @@ void ProgramImplCore::prepare_graphs() {
                 profile.max_execution_frontier = planned.max;
                 profile.topology_class =
                     planned.topology_class * ordinary_batch_limit + (batch_size - 1U);
-                const ops::GqaExecutionEnvelope envelope{planned.min + 1, planned.max + 1};
+                const ops::CausalAttentionExecutionEnvelope envelope{planned.min + 1,
+                                                                     planned.max + 1};
                 schedule::capture_ordinary_decode_batch(ordinary_state,
                                                         static_cast<std::int32_t>(batch_size),
                                                         envelope, profile.definition);
@@ -1604,9 +1606,9 @@ void ProgramImplCore::prepare_graphs() {
         const GraphExecutionProfile code_warm = planned_profiles.front();
         prepare_representative(code_warm.min, 1);
         device.synchronize();
-        schedule::mtp_decode_batch(mtp_state, 1, draft_window,
-                                   mtp_gqa_envelopes(code_warm.max, draft_window, capacity),
-                                   nullptr);
+        schedule::mtp_decode_batch(
+            mtp_state, 1, draft_window,
+            mtp_causal_attention_envelopes(code_warm.max, draft_window, capacity), nullptr);
         device.synchronize();
 
         mtp_graphs.profiles.reserve(planned_profiles.size() * max_concurrency);
@@ -1621,7 +1623,8 @@ void ProgramImplCore::prepare_graphs() {
                     planned.topology_class * max_concurrency + (batch_size - 1U);
                 schedule::capture_mtp_decode_batch(
                     mtp_state, static_cast<std::int32_t>(batch_size), draft_window,
-                    mtp_gqa_envelopes(planned.max, draft_window, capacity), profile.definition);
+                    mtp_causal_attention_envelopes(planned.max, draft_window, capacity),
+                    profile.definition);
             }
         }
     }
@@ -1632,7 +1635,7 @@ void ProgramImplCore::prepare_graphs() {
             execution_core(),     decoder->text_kv,    *dflash,          *io.dflash_decode,
             *dflash_host_ingress, *dflash_host_egress, tail_hidden_store};
         const GraphExecutionProfile code_warm = batch_one_profiles.front();
-        const ops::GqaExecutionEnvelope code_warm_target{
+        const ops::CausalAttentionExecutionEnvelope code_warm_target{
             1, static_cast<std::uint32_t>(std::min<std::uint64_t>(
                    capacity, static_cast<std::uint64_t>(code_warm.max) + draft_window + 1ULL))};
         prepare_representative(code_warm.min, 1);
@@ -1656,7 +1659,7 @@ void ProgramImplCore::prepare_graphs() {
                 profile.max_execution_frontier = planned.max;
                 profile.topology_class =
                     planned.topology_class * max_concurrency + (batch_size - 1U);
-                const ops::GqaExecutionEnvelope target_envelope{
+                const ops::CausalAttentionExecutionEnvelope target_envelope{
                     1,
                     static_cast<std::uint32_t>(std::min<std::uint64_t>(
                         capacity, static_cast<std::uint64_t>(planned.max) + draft_window + 1ULL))};
@@ -2086,7 +2089,7 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
     const auto start = Clock::now();
     try {
         DecodeGraphExecutable* executable = nullptr;
-        ops::GqaExecutionEnvelope envelope{maximum_frontier + 1, maximum_frontier + 1};
+        ops::CausalAttentionExecutionEnvelope envelope{maximum_frontier + 1, maximum_frontier + 1};
         if (use_cuda_graph) {
             DecodeGraphProfile& profile =
                 select_graph_profile(ordinary_graphs, static_cast<std::uint32_t>(lanes.size()),
@@ -2198,14 +2201,15 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
     const auto started = Clock::now();
     try {
         DecodeGraphExecutable* executable = nullptr;
-        schedule::MtpGqaEnvelopes envelopes =
-            mtp_gqa_envelopes(maximum_frontier, draft_window, capacity);
+        schedule::MtpCausalAttentionEnvelopes envelopes =
+            mtp_causal_attention_envelopes(maximum_frontier, draft_window, capacity);
         if (use_cuda_graph) {
             DecodeGraphProfile& profile =
                 select_graph_profile(mtp_graphs, static_cast<std::uint32_t>(lanes.size()),
                                      maximum_frontier, "MTP batch");
             executable = &install_graph_profile(mtp_graphs, profile, "MTP batch");
-            envelopes  = mtp_gqa_envelopes(profile.max_execution_frontier, draft_window, capacity);
+            envelopes = mtp_causal_attention_envelopes(profile.max_execution_frontier, draft_window,
+                                                       capacity);
         }
 
         for (std::size_t row = 0; row < lanes.size(); ++row) {
@@ -2366,7 +2370,7 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
     try {
         DecodeGraphExecutable* executable   = nullptr;
         schedule::DFlashEnvelopes envelopes = dflash_envelopes(0, maximum_frontier, draft_window);
-        ops::GqaExecutionEnvelope target_envelope{1, maximum_target_tokens};
+        ops::CausalAttentionExecutionEnvelope target_envelope{1, maximum_target_tokens};
         if (use_cuda_graph) {
             DecodeGraphProfile& profile =
                 select_graph_profile(dflash_graphs, static_cast<std::uint32_t>(lanes.size()),
