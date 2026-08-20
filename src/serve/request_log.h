@@ -80,12 +80,12 @@ struct ThroughputReport {
 };
 
 RequestLogContext make_request_log_context(std::uint64_t id, std::string protocol,
+                                           const std::string& model,
                                            const GenerationRequest& request,
                                            const PreparedRequest& prepared);
-RequestRejectionLogContext make_request_rejection_log_context(std::uint64_t id,
-                                                              std::string protocol,
-                                                              const GenerationRequest& request,
-                                                              ApiError error);
+RequestRejectionLogContext
+make_request_rejection_log_context(std::uint64_t id, std::string protocol, const std::string& model,
+                                   const GenerationRequest& request, ApiError error);
 
 // Compact console records retained for operator visibility.
 std::string format_request_start(const RequestLogContext& context);

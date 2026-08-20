@@ -20,8 +20,8 @@ namespace ninfer::serve {
 // Top-level `system` becomes a leading system turn; system-role messages retain
 // their array position; user tool_result blocks become ordered tool turns; and
 // assistant tool_use blocks become tool calls. Throws ApiException on malformed /
-// unsupported requests. The `model` field is accepted verbatim (any Claude model
-// name) and echoed back, never validated against the loaded model.
+// unsupported requests. The optional `model` field is ignored: this server always
+// runs and reports its one loaded model.
 GenerationRequest parse_messages_request(const nlohmann::json& body, const RequestLimits& limits);
 
 // Map an internal finish reason (+ whether tool calls were produced) onto the

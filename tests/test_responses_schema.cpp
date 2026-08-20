@@ -78,8 +78,7 @@ Json parse_event(const std::string& event) {
 }
 
 int test_basic_request() {
-    const Json body                = {{"model", "qwen3.6-27b"},
-                                      {"input", "hello"},
+    const Json body                = {{"input", "hello"},
                                       {"instructions", "be concise"},
                                       {"previous_response_id", "resp_previous"},
                                       {"max_output_tokens", 64},
@@ -89,11 +88,10 @@ int test_basic_request() {
                                       {"metadata", Json{{"trace", "abc"}}}};
     const ResponsesRequest request = parse_responses_request(body, limits());
     int failures                   = 0;
-    failures += check(request.generation.model == "qwen3.6-27b", "model parsed");
     failures += check(request.input_turns.size() == 1 &&
                           request.input_turns[0].role == ninfer::ChatRole::User &&
                           request.input_turns[0].content[0].text == "hello",
-                      "string input normalized to a user turn");
+                      "model-less string input normalized to a user turn");
     failures += check(request.input_items[0].at("type") == "message" &&
                           request.input_items[0].at("content")[0].at("type") == "input_text" &&
                           request.input_items[0].contains("id"),
@@ -255,32 +253,32 @@ int test_typed_items_and_tools() {
     const Json body     = {
         {"model", "qwen3.6-27b"},
         {"input",
-             Json::array({Json{{"id", "rs_old"},
-                               {"type", "reasoning"},
-                               {"summary", Json::array()},
-                               {"content", Json::array({Json{{"type", "reasoning_text"},
-                                                             {"text", "need tools"}}})}},
-                          Json{{"id", "fc_old_1"},
-                               {"type", "function_call"},
-                               {"call_id", "call_1"},
-                               {"name", "weather"},
-                               {"arguments", R"({"city":"Paris"})"}},
-                          Json{{"id", "fc_old_2"},
-                               {"type", "function_call"},
-                               {"call_id", "call_2"},
-                               {"name", "weather"},
-                               {"arguments", R"({"city":"Rome"})"}},
-                          Json{{"id", "fco_old"},
-                               {"type", "function_call_output"},
-                               {"call_id", "call_1"},
-                               {"output", R"({"temp":20})"}},
-                          Json{{"type", "message"},
-                               {"role", "user"},
-                               {"content",
-                                Json::array({Json{{"type", "input_image"},
-                                                  {"image_url", "data:image/png;base64,AA=="},
-                                                  {"detail", "auto"}},
-                                             Json{{"type", "input_text"}, {"text", "describe"}}})}}})},
+         Json::array({Json{{"id", "rs_old"},
+                           {"type", "reasoning"},
+                           {"summary", Json::array()},
+                           {"content", Json::array({Json{{"type", "reasoning_text"},
+                                                         {"text", "need tools"}}})}},
+                      Json{{"id", "fc_old_1"},
+                           {"type", "function_call"},
+                           {"call_id", "call_1"},
+                           {"name", "weather"},
+                           {"arguments", R"({"city":"Paris"})"}},
+                      Json{{"id", "fc_old_2"},
+                           {"type", "function_call"},
+                           {"call_id", "call_2"},
+                           {"name", "weather"},
+                           {"arguments", R"({"city":"Rome"})"}},
+                      Json{{"id", "fco_old"},
+                           {"type", "function_call_output"},
+                           {"call_id", "call_1"},
+                           {"output", R"({"temp":20})"}},
+                      Json{{"type", "message"},
+                           {"role", "user"},
+                           {"content",
+                            Json::array({Json{{"type", "input_image"},
+                                              {"image_url", "data:image/png;base64,AA=="},
+                                              {"detail", "auto"}},
+                                         Json{{"type", "input_text"}, {"text", "describe"}}})}}})},
         {"tools", Json::array({function})},
         {"tool_choice", "auto"},
         {"parallel_tool_calls", true},
@@ -375,11 +373,13 @@ int test_response_object() {
     runtime.temperature = 0.6F;
     runtime.top_p       = 0.95F;
     const BuiltResponse built =
-        make_response_object("resp_test", 123, request, runtime, sample_outcome());
+        make_response_object("resp_test", 123, "loaded-model", request, runtime, sample_outcome());
     const Json& response = built.body;
     int failures         = 0;
     failures += check(response.at("object") == "response" && response.at("status") == "completed",
                       "completed response envelope");
+    failures += check(response.at("model") == "loaded-model",
+                      "response names the loaded model rather than the request label");
     failures += check(response.at("output").size() == 2 &&
                           response.at("output")[0].at("type") == "reasoning" &&
                           response.at("output")[1].at("type") == "message",
@@ -400,7 +400,8 @@ int test_response_object() {
 
     GenerationOutcome incomplete = sample_outcome();
     incomplete.finish_reason     = ninfer::FinishReason::OutputLimit;
-    const Json limited = make_response_object("resp_limit", 123, request, runtime, incomplete).body;
+    const Json limited =
+        make_response_object("resp_limit", 123, "loaded-model", request, runtime, incomplete).body;
     failures += check(limited.at("status") == "incomplete" &&
                           limited.at("incomplete_details").at("reason") == "max_output_tokens",
                       "output limit mapped to incomplete response");
@@ -408,7 +409,8 @@ int test_response_object() {
     GenerationOutcome tools = sample_outcome();
     tools.text.clear();
     tools.tool_calls.push_back(ToolCall{"call_weather", "weather", R"({"city":"Paris"})"});
-    const Json tool_response = make_response_object("resp_tool", 123, request, runtime, tools).body;
+    const Json tool_response =
+        make_response_object("resp_tool", 123, "loaded-model", request, runtime, tools).body;
     failures += check(tool_response.at("output").back().at("type") == "function_call" &&
                           tool_response.at("output").back().at("call_id") == "call_weather" &&
                           !tool_response.at("output").back().at("id").get<std::string>().empty(),
@@ -422,7 +424,7 @@ int test_sse_sequence() {
                                                             {"max_output_tokens", 32},
                                                             {"stream", true}},
                                                        limits());
-    ResponsesEventStream encoder("resp_stream", 123, request, {});
+    ResponsesEventStream encoder("resp_stream", 123, "loaded-model", request, {});
     std::vector<std::string> wire = encoder.start();
     std::vector<std::string> more = encoder.reasoning_delta("thought");
     wire.insert(wire.end(), more.begin(), more.end());
@@ -451,6 +453,8 @@ int test_sse_sequence() {
     }
     failures += check(parse_event(wire.front()).at("type") == "response.created",
                       "stream starts with response.created");
+    failures += check(parse_event(wire.front()).at("response").at("model") == "loaded-model",
+                      "stream names the loaded model rather than the request label");
     failures += check(parse_event(wire.back()).at("type") == "response.completed",
                       "stream ends with response.completed");
     failures += check(text_deltas == "answer", "text deltas reconstruct terminal output");
@@ -464,7 +468,7 @@ int test_sse_function_call() {
                                                             {"max_output_tokens", 32},
                                                             {"stream", true}},
                                                        limits());
-    ResponsesEventStream encoder("resp_tool_stream", 123, request, {});
+    ResponsesEventStream encoder("resp_tool_stream", 123, "loaded-model", request, {});
     std::vector<std::string> wire = encoder.start();
     GenerationOutcome outcome;
     outcome.prompt_tokens     = 8;
@@ -509,7 +513,7 @@ int test_input_tokens_schema() {
                       Json{{"model", "qwen3.6-27b"}, {"input", "hello"}, {"instructions", "x"}},
                       limits());
               }) == "unknown_parameter",
-              "input_tokens accepts only model and input");
+              "input_tokens rejects unsupported fields");
     return failures;
 }
 

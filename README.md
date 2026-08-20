@@ -322,11 +322,12 @@ Then send an OpenAI-style request:
 curl http://127.0.0.1:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "qwen3.6-27b",
     "messages": [{"role": "user", "content": "Reply with one short sentence."}],
     "max_tokens": 64
   }'
 ```
+
+The request does not select a model: the server always runs the artifact loaded at startup.
 
 The server also implements OpenAI Responses Core (typed Items, semantic SSE, local continuation
 state, and function calls) plus Anthropic Messages, token counting, and multimodal input. See

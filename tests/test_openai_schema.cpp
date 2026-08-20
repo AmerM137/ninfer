@@ -101,12 +101,10 @@ Json parse_sse(const std::string& event) {
 }
 
 int test_parse_string_content() {
-    int failures                = 0;
-    const Json body             = {{"model", "qwen3.6-27b"},
-                                   {"messages", Json::array({Json{{"role", "user"}, {"content", "hello"}}})}};
+    int failures    = 0;
+    const Json body = {{"messages", Json::array({Json{{"role", "user"}, {"content", "hello"}}})}};
     const GenerationRequest req = parse_chat_completion_request(body, default_limits());
-    failures += check(req.model == "qwen3.6-27b", "model parsed");
-    failures += check(req.messages.size() == 1, "one message parsed");
+    failures += check(req.messages.size() == 1, "model-less request parsed");
     failures += check(req.messages[0].role == ninfer::ChatRole::User, "role parsed");
     failures += check(req.messages[0].content.size() == 1, "one content part");
     failures += check(req.messages[0].content[0].kind == ContentKind::Text, "text part kind");
@@ -372,8 +370,8 @@ int test_reject_unsupported() {
 
     Json no_model = {{"messages", Json::array({Json{{"role", "user"}, {"content", "hi"}}})}};
     failures +=
-        check(throws_api([&] { (void)parse_chat_completion_request(no_model, default_limits()); }),
-              "missing model rejected");
+        check(!throws_api([&] { (void)parse_chat_completion_request(no_model, default_limits()); }),
+              "missing model accepted");
 
     Json function_role = {
         {"model", "m"}, {"messages", Json::array({Json{{"role", "function"}, {"content", "x"}}})}};
@@ -504,13 +502,13 @@ int test_parse_stop_and_max_tokens() {
 }
 
 int test_parse_sampling_carried() {
-    int failures                = 0;
-    const Json body             = {{"model", "m"},
-                                   {"messages", Json::array({Json{{"role", "user"}, {"content", "hi"}}})},
-                                   {"temperature", 0.7},
-                                   {"top_p", 0.9},
-                                   {"seed", 123},
-                                   {"logit_bias", Json{{"5", -1.5}}}};
+    int failures    = 0;
+    const Json body = {{"model", "m"},
+                       {"messages", Json::array({Json{{"role", "user"}, {"content", "hi"}}})},
+                       {"temperature", 0.7},
+                       {"top_p", 0.9},
+                       {"seed", 123},
+                       {"logit_bias", Json{{"5", -1.5}}}};
     const GenerationRequest req = parse_chat_completion_request(body, default_limits());
     failures += check(req.sampling.temperature.has_value() && *req.sampling.temperature == 0.7,
                       "temperature carried");

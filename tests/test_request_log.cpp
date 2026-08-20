@@ -14,9 +14,9 @@
 #include <vector>
 
 #ifdef _WIN32
-#include <windows.h>
+#    include <windows.h>
 #else
-#include <unistd.h>
+#    include <unistd.h>
 #endif
 
 namespace {
@@ -175,7 +175,6 @@ int main() {
                       "server argv did not retain the redaction marker");
 
     GenerationRequest request;
-    request.model          = "qwen3.6-27b";
     request.stream         = false;
     request.max_tokens     = 4096;
     request.max_tokens_set = true;
@@ -203,7 +202,7 @@ int main() {
     prepared.preparation.built_patch_bytes             = 49152;
 
     const RequestLogContext context =
-        make_request_log_context(7, "openai_chat_completions", request, prepared);
+        make_request_log_context(7, "openai_chat_completions", "qwen3.6-27b", request, prepared);
     const Json started = Json::parse(format_request_start_json("serve-test", 2000, context));
     failures +=
         check(started.at("request").at("request_id") == 7, "request id missing from start record");
@@ -230,8 +229,8 @@ int main() {
     preparation_error.code   = "context_length_exceeded";
     preparation_error.message =
         "prepared prompt has 270000 tokens, exceeding Engine max_context 262144";
-    const RequestRejectionLogContext rejected_context =
-        make_request_rejection_log_context(8, "anthropic_messages", request, preparation_error);
+    const RequestRejectionLogContext rejected_context = make_request_rejection_log_context(
+        8, "anthropic_messages", "qwen3.6-27b", request, preparation_error);
     const Json rejected =
         Json::parse(format_request_rejected_json("serve-test", 2500, rejected_context));
     failures +=
@@ -351,14 +350,12 @@ int main() {
                       "console log prefix mismatch");
 
 #ifdef _WIN32
-    const std::string process_tag =
-        std::to_string(static_cast<long long>(::GetCurrentProcessId()));
+    const std::string process_tag = std::to_string(static_cast<long long>(::GetCurrentProcessId()));
 #else
     const std::string process_tag = std::to_string(static_cast<long long>(::getpid()));
 #endif
-    const std::filesystem::path log_path =
-        std::filesystem::temp_directory_path() / ("ninfer-request-log-test-" + process_tag +
-                                                  ".jsonl");
+    const std::filesystem::path log_path = std::filesystem::temp_directory_path() /
+                                           ("ninfer-request-log-test-" + process_tag + ".jsonl");
     std::filesystem::remove(log_path);
     {
         JsonlRequestLog writer(log_path.string());

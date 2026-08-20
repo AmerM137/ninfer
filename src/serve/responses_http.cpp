@@ -67,17 +67,6 @@ ApiError response_not_found(const std::string& id) {
     return error;
 }
 
-void validate_model(const std::string& requested, const std::string& available) {
-    if (requested == available) { return; }
-    ApiError error;
-    error.status  = 404;
-    error.type    = "invalid_request_error";
-    error.param   = "model";
-    error.code    = "model_not_found";
-    error.message = "model '" + requested + "' not found";
-    throw ApiException(std::move(error));
-}
-
 Json parse_json_body(const httplib::Request& request) {
     try {
         return Json::parse(request.body);
@@ -210,7 +199,6 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
         RequestLimits limits;
         limits.default_max_tokens = options_.default_max_tokens;
         request                   = parse_responses_request(parse_json_body(req), limits);
-        validate_model(request.generation.model, public_model_id_);
         if (request.previous_response_id) {
             const std::shared_ptr<const StoredResponse> previous =
                 response_store_.get(*request.previous_response_id);
@@ -235,22 +223,22 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
         prepared = service_->prepare(request.generation, [&req] { return disconnected(req); });
     } catch (const ApiException& exception) {
         const ApiError error = responses_error(exception.error());
-        log_request_rejected(make_request_rejection_log_context(req_id, "openai_responses",
-                                                                request.generation, error));
+        log_request_rejected(make_request_rejection_log_context(
+            req_id, "openai_responses", public_model_id_, request.generation, error));
         write_error(res, error);
         return;
     } catch (const std::exception& exception) {
         const ApiError error = internal_error(exception);
-        log_request_rejected(make_request_rejection_log_context(req_id, "openai_responses",
-                                                                request.generation, error));
+        log_request_rejected(make_request_rejection_log_context(
+            req_id, "openai_responses", public_model_id_, request.generation, error));
         write_error(res, error);
         return;
     }
 
-    const std::string id       = new_response_id();
-    const std::int64_t created = unix_time_now();
-    const RequestLogContext log_context =
-        make_request_log_context(req_id, "openai_responses", request.generation, prepared);
+    const std::string id                = new_response_id();
+    const std::int64_t created          = unix_time_now();
+    const RequestLogContext log_context = make_request_log_context(
+        req_id, "openai_responses", public_model_id_, request.generation, prepared);
     log_request_start(log_context);
 
     if (!request.stream) {
@@ -258,7 +246,8 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
             const GenerationOutcome outcome =
                 service_->run(prepared, nullptr, [&req] { return disconnected(req); });
             const ResponsesRuntimeValues runtime = runtime_values(prepared, &outcome);
-            BuiltResponse response = make_response_object(id, created, request, runtime, outcome);
+            BuiltResponse response =
+                make_response_object(id, created, public_model_id_, request, runtime, outcome);
             if (request.store) {
                 StoredResponse stored;
                 stored.id                = id;
@@ -286,8 +275,8 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
     stream->request          = std::move(request);
     stream->previous_context = std::move(previous_context);
     stream->log_context      = log_context;
-    stream->encoder          = std::make_unique<ResponsesEventStream>(id, created, stream->request,
-                                                                      runtime_values(stream->prepared));
+    stream->encoder          = std::make_unique<ResponsesEventStream>(
+        id, created, public_model_id_, stream->request, runtime_values(stream->prepared));
 
     res.set_header("Cache-Control", "no-cache");
     res.set_header("X-Accel-Buffering", "no");
@@ -360,7 +349,6 @@ void HttpServer::handle_response_input_tokens(const httplib::Request& req, httpl
         limits.default_max_tokens = options_.default_max_tokens;
         ResponsesRequest request =
             parse_response_input_tokens_request(parse_json_body(req), limits);
-        validate_model(request.generation.model, public_model_id_);
         const int tokens =
             service_->count_prompt_tokens(request.generation, [&req] { return disconnected(req); });
         res.set_content(make_response_input_tokens_body(tokens), "application/json");

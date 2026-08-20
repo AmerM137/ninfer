@@ -52,8 +52,8 @@ struct BuiltResponse {
 // accepted; recognized but unsupported OpenAI fields fail explicitly.
 ResponsesRequest parse_responses_request(const nlohmann::json& body, const RequestLimits& limits);
 
-// Parse POST /v1/responses/input_tokens. The current OpenAI endpoint accepts
-// model + input; the result still uses GenerationRequest for shared translation.
+// Parse POST /v1/responses/input_tokens. The endpoint accepts input and an optional ignored model
+// field; the result still uses GenerationRequest for shared translation.
 ResponsesRequest parse_response_input_tokens_request(const nlohmann::json& body,
                                                      const RequestLimits& limits);
 
@@ -66,7 +66,7 @@ void compose_responses_generation_messages(ResponsesRequest& request,
 void inherit_responses_preserve_thinking(ResponsesRequest& request, bool parent_value);
 
 BuiltResponse make_response_object(const std::string& id, std::int64_t created_at,
-                                   const ResponsesRequest& request,
+                                   const std::string& model, const ResponsesRequest& request,
                                    const ResponsesRuntimeValues& runtime,
                                    const GenerationOutcome& outcome);
 
@@ -81,8 +81,8 @@ struct ResponsesStreamFinish {
 // stable Item IDs and monotonically increasing sequence_number values.
 class ResponsesEventStream {
 public:
-    ResponsesEventStream(std::string response_id, std::int64_t created_at, ResponsesRequest request,
-                         ResponsesRuntimeValues runtime);
+    ResponsesEventStream(std::string response_id, std::int64_t created_at, std::string model,
+                         ResponsesRequest request, ResponsesRuntimeValues runtime);
     ~ResponsesEventStream();
     ResponsesEventStream(ResponsesEventStream&&) noexcept;
     ResponsesEventStream& operator=(ResponsesEventStream&&) noexcept;

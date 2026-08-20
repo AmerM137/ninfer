@@ -26,9 +26,10 @@ identity automatically:
   --lm-head-draft
 ```
 
-When `--model-id` is omitted, the server advertises and accepts the loaded container's exact
+When `--model-id` is omitted, the server advertises the loaded container's exact
 `identity.model_id`. An explicit `--model-id` remains a public HTTP alias override and does not
-select or alter the artifact.
+select or alter the artifact. Every generation request runs that one loaded model; `model` is
+optional and ignored when supplied.
 
 Vision is disabled by default: its weights, Vision scratch phase, and frozen request-transient
 buffer are not allocated, and media
@@ -60,7 +61,6 @@ cannot be combined with `--vision`. A later request cannot enable a capability o
 curl http://127.0.0.1:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "qwen3.6-27b",
     "messages": [
       {"role": "system", "content": "Answer concisely."},
       {"role": "user", "content": "What is speculative decoding?"}
@@ -83,9 +83,10 @@ The endpoint supports:
 - the `enable_thinking` extension;
 - `chat_template_kwargs.preserve_thinking` and the top-level `preserve_thinking` alias.
 
-The request `model` must equal the public model ID: the artifact `identity.model_id` by default, or
-the explicit `--model-id` override. Reasoning is returned separately as `reasoning_content`; answer
-text remains in `content`.
+The server always runs the one loaded artifact and emits its public model ID (the artifact
+`identity.model_id` by default, or `--model-id`) in responses. A request may omit `model`; a
+supplied value is ignored. Reasoning is returned separately as `reasoning_content`; answer text
+remains in `content`.
 
 Message roles retain their input order through schema translation. The Qwen family frontend maps
 both `system` and `developer` to system-class ChatML blocks at their original positions; it does not
@@ -122,7 +123,6 @@ Start the server with `--vision` before sending media:
 curl http://127.0.0.1:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "qwen3.6-27b",
     "messages": [{
       "role": "user",
       "content": [
@@ -171,7 +171,6 @@ Conversations, or compaction.
 curl http://127.0.0.1:8080/v1/responses \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "qwen3.6-27b",
     "instructions": "Answer concisely.",
     "input": "What is speculative decoding?",
     "max_output_tokens": 128,
@@ -186,7 +185,7 @@ from openai import OpenAI
 
 client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="local-secret")
 response = client.responses.create(
-    model="qwen3.6-27b",
+    model="ignored-by-ninfer",  # required by this SDK; ignored for model selection
     instructions="Answer concisely.",
     input="What is speculative decoding?",
     max_output_tokens=128,
@@ -195,13 +194,14 @@ print(response.output_text)  # SDK helper derived from response.output
 ```
 
 `output_text` is an SDK convenience property. It is not emitted as a top-level wire field; the
-wire response contains typed `output` Items.
+wire response contains typed `output` Items. The OpenAI SDK requires a `model` argument locally;
+NInfer ignores its serialized value and still runs its loaded model.
 
 ### Create request fields
 
 | Field | NInfer Responses Core contract |
 |---|---|
-| `model` | required non-empty string; must equal the artifact-derived public model ID or explicit `--model-id` override |
+| `model` | optional, ignored when supplied; responses always name the loaded artifact's public model ID |
 | `input` | required string or non-empty typed Item array |
 | `instructions` | optional string, inserted before the reconstructed conversation for this request only |
 | `previous_response_id` | optional ID of a retained local Response |
@@ -372,13 +372,14 @@ stored.
 
 ### Responses input token count
 
-`POST /v1/responses/input_tokens` accepts exactly `model` and `input`, performs the same typed Item,
-template, and media expansion, and does not run generation:
+`POST /v1/responses/input_tokens` requires `input`, accepts optional `model` and
+preserve-thinking settings, performs the same typed Item, template, and media expansion, and does
+not run generation:
 
 ```bash
 curl http://127.0.0.1:8080/v1/responses/input_tokens \
   -H 'Content-Type: application/json' \
-  -d '{"model":"qwen3.6-27b","input":"Count this prompt."}'
+  -d '{"input":"Count this prompt."}'
 ```
 
 ```json
@@ -396,7 +397,6 @@ tools. These are compatibility boundaries, not silently accepted placeholders.
 curl http://127.0.0.1:8080/v1/messages \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "qwen3.6-27b",
     "max_tokens": 128,
     "messages": [
       {"role": "user", "content": "Explain prefix reuse in one sentence."}
@@ -421,7 +421,8 @@ Anthropic `output_config.effort` accepts the protocol values `low`, `medium`, `h
 endpoints; the registered effort-capable template exposes `low`, `medium`, and `xhigh`. Combining
 an effort with `thinking.type: "disabled"` is rejected as contradictory.
 
-Anthropic's `model` field is treated as a response label and does not select the loaded artifact.
+Anthropic's `model` field is optional and ignored. Responses name the loaded artifact's public
+model ID.
 
 `POST /v1/messages/count_tokens` uses the artifact's tokenizer, chat template, and media expansion
 without running GPU generation:
@@ -430,7 +431,6 @@ without running GPU generation:
 curl http://127.0.0.1:8080/v1/messages/count_tokens \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "qwen3.6-27b",
     "messages": [{"role": "user", "content": "Count this prompt."}]
   }'
 ```
@@ -537,7 +537,7 @@ but are rounded and are not the aggregation source. Console lines use local
 `[YYYY-MM-DD HH:MM:SS.mmm] [level]` timestamps. OpenAI Responses, OpenAI Chat, and Anthropic
 generation requests receive a request ID when they enter synchronous preparation. Successful
 preparation produces `request_start`; a preparation failure produces `request_rejected` without a
-matching start. Later generation failures produce `request_error`. Schema/model validation
+matching start. Later generation failures produce `request_error`. Schema validation
 rejections before preparation and token-count-only calls are not measurement requests and do not
 receive request IDs.
 

@@ -712,11 +712,6 @@ ResponsesRequest parse_request_impl(const Json& body, const RequestLimits& limit
     reject_server_managed_features(body);
 
     ResponsesRequest out;
-    if (!body.contains("model") || !body.at("model").is_string() ||
-        body.at("model").get<std::string>().empty()) {
-        bad_request("missing required field: model", "model");
-    }
-    out.generation.model = body.at("model").get<std::string>();
     if (!body.contains("input")) { bad_request("missing required field: input", "input"); }
     parse_input(body.at("input"), out);
 
@@ -806,7 +801,7 @@ struct ItemIds {
     std::vector<std::string> function_calls;
 };
 
-Json response_common(const std::string& id, std::int64_t created_at,
+Json response_common(const std::string& id, std::int64_t created_at, const std::string& model,
                      const ResponsesRequest& request, const ResponsesRuntimeValues& runtime) {
     const Json reasoning = {
         {"effort", request.generation.reasoning_effort
@@ -822,7 +817,7 @@ Json response_common(const std::string& id, std::int64_t created_at,
         {"max_output_tokens", request.generation.max_tokens},
         {"max_tool_calls", nullptr},
         {"metadata", request.metadata},
-        {"model", request.generation.model},
+        {"model", model},
         {"parallel_tool_calls", true},
         {"previous_response_id",
          request.previous_response_id ? Json(*request.previous_response_id) : Json(nullptr)},
@@ -839,7 +834,8 @@ Json response_common(const std::string& id, std::int64_t created_at,
 }
 
 BuiltResponse build_response(const std::string& id, std::int64_t created_at,
-                             const ResponsesRequest& request, const ResponsesRuntimeValues& runtime,
+                             const std::string& model, const ResponsesRequest& request,
+                             const ResponsesRuntimeValues& runtime,
                              const GenerationOutcome& outcome, ItemIds ids) {
     BuiltResponse built;
     const std::string status      = response_status(outcome.finish_reason);
@@ -898,7 +894,7 @@ BuiltResponse build_response(const std::string& id, std::int64_t created_at,
     }
     built.output_history.push_back(std::move(history));
 
-    Json response            = response_common(id, created_at, request, runtime);
+    Json response            = response_common(id, created_at, model, request, runtime);
     response["status"]       = status;
     response["completed_at"] = completion_time_now();
     response["error"]        = nullptr;
@@ -923,9 +919,9 @@ std::string sse(const Json& event) {
            "\n\n";
 }
 
-Json in_progress_response(const std::string& id, std::int64_t created_at,
+Json in_progress_response(const std::string& id, std::int64_t created_at, const std::string& model,
                           const ResponsesRequest& request, const ResponsesRuntimeValues& runtime) {
-    Json response                  = response_common(id, created_at, request, runtime);
+    Json response                  = response_common(id, created_at, model, request, runtime);
     response["status"]             = "in_progress";
     response["completed_at"]       = nullptr;
     response["error"]              = nullptr;
@@ -987,10 +983,10 @@ void compose_responses_generation_messages(ResponsesRequest& request,
 }
 
 BuiltResponse make_response_object(const std::string& id, std::int64_t created_at,
-                                   const ResponsesRequest& request,
+                                   const std::string& model, const ResponsesRequest& request,
                                    const ResponsesRuntimeValues& runtime,
                                    const GenerationOutcome& outcome) {
-    return build_response(id, created_at, request, runtime, outcome, {});
+    return build_response(id, created_at, model, request, runtime, outcome, {});
 }
 
 std::string make_response_input_tokens_body(int input_tokens) {
@@ -999,10 +995,10 @@ std::string make_response_input_tokens_body(int input_tokens) {
 
 class ResponsesEventStream::Impl {
 public:
-    Impl(std::string response_id, std::int64_t created_at_, ResponsesRequest request_,
-         ResponsesRuntimeValues runtime_)
-        : id(std::move(response_id)), created_at(created_at_), request(std::move(request_)),
-          runtime(runtime_) {}
+    Impl(std::string response_id, std::int64_t created_at_, std::string model_,
+         ResponsesRequest request_, ResponsesRuntimeValues runtime_)
+        : id(std::move(response_id)), created_at(created_at_), model(std::move(model_)),
+          request(std::move(request_)), runtime(runtime_) {}
 
     Json event(std::string type, Json fields = Json::object()) {
         fields["type"]            = std::move(type);
@@ -1098,6 +1094,7 @@ public:
 
     std::string id;
     std::int64_t created_at = 0;
+    std::string model;
     ResponsesRequest request;
     ResponsesRuntimeValues runtime;
     std::uint64_t sequence = 0;
@@ -1117,9 +1114,10 @@ public:
 };
 
 ResponsesEventStream::ResponsesEventStream(std::string response_id, std::int64_t created_at,
-                                           ResponsesRequest request, ResponsesRuntimeValues runtime)
-    : impl_(std::make_unique<Impl>(std::move(response_id), created_at, std::move(request),
-                                   runtime)) {}
+                                           std::string model, ResponsesRequest request,
+                                           ResponsesRuntimeValues runtime)
+    : impl_(std::make_unique<Impl>(std::move(response_id), created_at, std::move(model),
+                                   std::move(request), runtime)) {}
 
 ResponsesEventStream::~ResponsesEventStream()                                          = default;
 ResponsesEventStream::ResponsesEventStream(ResponsesEventStream&&) noexcept            = default;
@@ -1127,9 +1125,9 @@ ResponsesEventStream& ResponsesEventStream::operator=(ResponsesEventStream&&) no
 
 std::vector<std::string> ResponsesEventStream::start() {
     if (impl_->started) { throw std::logic_error("Responses event stream already started"); }
-    impl_->started = true;
-    const Json response =
-        in_progress_response(impl_->id, impl_->created_at, impl_->request, impl_->runtime);
+    impl_->started      = true;
+    const Json response = in_progress_response(impl_->id, impl_->created_at, impl_->model,
+                                               impl_->request, impl_->runtime);
     return {sse(impl_->event("response.created", Json{{"response", response}})),
             sse(impl_->event("response.in_progress", Json{{"response", response}}))};
 }
@@ -1246,8 +1244,8 @@ ResponsesStreamFinish ResponsesEventStream::finish(const GenerationOutcome& outc
                              Json{{"output_index", output_index}, {"item", done_item}})));
     }
 
-    finished.response = build_response(impl_->id, impl_->created_at, impl_->request, impl_->runtime,
-                                       outcome, impl_->ids);
+    finished.response = build_response(impl_->id, impl_->created_at, impl_->model, impl_->request,
+                                       impl_->runtime, outcome, impl_->ids);
     return finished;
 }
 
@@ -1269,8 +1267,8 @@ std::string ResponsesEventStream::failed(const ApiError& error) {
         throw std::logic_error("invalid Responses failed event state");
     }
     impl_->terminal_emitted = true;
-    Json response =
-        in_progress_response(impl_->id, impl_->created_at, impl_->request, impl_->runtime);
+    Json response = in_progress_response(impl_->id, impl_->created_at, impl_->model, impl_->request,
+                                         impl_->runtime);
     response["status"]       = "failed";
     response["completed_at"] = completion_time_now();
     response["error"]        = Json{{"code", error.code.empty() ? Json(nullptr) : Json(error.code)},

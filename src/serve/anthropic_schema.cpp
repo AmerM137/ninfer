@@ -517,11 +517,6 @@ GenerationRequest parse_messages_request(const Json& body, const RequestLimits& 
 
     GenerationRequest out;
     out.tool_name_max_length = kMaxToolNameLength;
-    if (!body.contains("model") || !body.at("model").is_string() ||
-        body.at("model").get<std::string>().empty()) {
-        bad_request("missing required field: model", "model");
-    }
-    out.model = body.at("model").get<std::string>();
 
     parse_tools(body, out);
     parse_tool_choice(body, out);

@@ -16,9 +16,9 @@
 #include <utility>
 
 #ifdef _WIN32
-#include <windows.h>
+#    include <windows.h>
 #else
-#include <unistd.h>
+#    include <unistd.h>
 #endif
 
 namespace ninfer::serve {
@@ -302,12 +302,13 @@ std::string speculative_str(const GenerationMetrics& metrics) {
 } // namespace
 
 RequestLogContext make_request_log_context(std::uint64_t id, std::string protocol,
+                                           const std::string& model,
                                            const GenerationRequest& request,
                                            const PreparedRequest& prepared) {
     RequestLogContext context;
     context.id                                 = id;
     context.protocol                           = std::move(protocol);
-    context.model                              = request.model;
+    context.model                              = model;
     context.stream                             = request.stream;
     context.message_count                      = request.messages.size();
     context.media_item_count                   = request.media_item_count();
@@ -325,14 +326,13 @@ RequestLogContext make_request_log_context(std::uint64_t id, std::string protoco
     return context;
 }
 
-RequestRejectionLogContext make_request_rejection_log_context(std::uint64_t id,
-                                                              std::string protocol,
-                                                              const GenerationRequest& request,
-                                                              ApiError error) {
+RequestRejectionLogContext
+make_request_rejection_log_context(std::uint64_t id, std::string protocol, const std::string& model,
+                                   const GenerationRequest& request, ApiError error) {
     RequestRejectionLogContext context;
     context.id                                 = id;
     context.protocol                           = std::move(protocol);
-    context.model                              = request.model;
+    context.model                              = model;
     context.stream                             = request.stream;
     context.message_count                      = request.messages.size();
     context.media_item_count                   = request.media_item_count();
@@ -475,24 +475,24 @@ std::string format_server_start_json(
                               {"load_seconds", load.load_seconds},
                               {"upload_seconds", load.upload_seconds}};
     record["engine"]   = Json{
-          {"device", options.device},
-          {"max_context", options.max_context},
-          {"kv_capacity_mode", kv_capacity_mode_name(memory.kv_capacity_mode)},
-          {"kv_capacity", memory.kv_capacity},
-          {"kv_capacity_page_groups", memory.kv_capacity_page_groups},
-          {"kv_capacity_max_page_groups", memory.kv_capacity_max_page_groups},
-          {"max_concurrency", options.max_concurrency},
-          {"max_pending_requests", options.max_pending_requests},
-          {"pending_timeout_ms", options.pending_timeout_ms},
-          {"prefill_chunk", options.prefill_chunk},
-          {"log_stats_interval_ms", options.log_stats_interval_ms},
-          {"kv_cache", kv_cache_name(options.kv_cache)},
-          {"vision", options.enable_vision},
-          {"cuda_graph", options.use_cuda_graph},
-          {"prefix_reuse", options.allow_prefix_reuse},
-          {"speculative_backend", product::speculative_backend_name(options.speculative.backend)},
-          {"speculative_draft_window", options.speculative.draft_tokens},
-          {"proposal_head", proposal_head_name(options.speculative.proposal_head)}};
+        {"device", options.device},
+        {"max_context", options.max_context},
+        {"kv_capacity_mode", kv_capacity_mode_name(memory.kv_capacity_mode)},
+        {"kv_capacity", memory.kv_capacity},
+        {"kv_capacity_page_groups", memory.kv_capacity_page_groups},
+        {"kv_capacity_max_page_groups", memory.kv_capacity_max_page_groups},
+        {"max_concurrency", options.max_concurrency},
+        {"max_pending_requests", options.max_pending_requests},
+        {"pending_timeout_ms", options.pending_timeout_ms},
+        {"prefill_chunk", options.prefill_chunk},
+        {"log_stats_interval_ms", options.log_stats_interval_ms},
+        {"kv_cache", kv_cache_name(options.kv_cache)},
+        {"vision", options.enable_vision},
+        {"cuda_graph", options.use_cuda_graph},
+        {"prefix_reuse", options.allow_prefix_reuse},
+        {"speculative_backend", product::speculative_backend_name(options.speculative.backend)},
+        {"speculative_draft_window", options.speculative.draft_tokens},
+        {"proposal_head", proposal_head_name(options.speculative.proposal_head)}};
     record["sampling_defaults"] =
         Json{{"thinking", preset_json(sampling_defaults.thinking)},
              {"non_thinking", preset_json(sampling_defaults.non_thinking)},

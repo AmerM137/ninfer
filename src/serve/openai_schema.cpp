@@ -466,9 +466,9 @@ Json tool_calls_json(const std::vector<ToolCall>& tool_calls, bool include_index
     Json out = Json::array();
     for (std::size_t i = 0; i < tool_calls.size(); ++i) {
         const ToolCall& call = tool_calls[i];
-        Json item            = {{"id", call.id},
-                                {"type", "function"},
-                                {"function", Json{{"name", call.name}, {"arguments", call.arguments_json}}}};
+        Json item = {{"id", call.id},
+                     {"type", "function"},
+                     {"function", Json{{"name", call.name}, {"arguments", call.arguments_json}}}};
         if (include_index) { item["index"] = static_cast<int>(i); }
         out.push_back(std::move(item));
     }
@@ -537,11 +537,6 @@ GenerationRequest parse_chat_completion_request(const Json& body, const RequestL
     reject_unsupported_features(body);
 
     GenerationRequest out;
-    if (!body.contains("model") || !body.at("model").is_string() ||
-        body.at("model").get<std::string>().empty()) {
-        bad_request("missing required field: model", "model");
-    }
-    out.model = body.at("model").get<std::string>();
 
     parse_tools(body, out);
     parse_tool_choice(body, out);
