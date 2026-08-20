@@ -39,11 +39,15 @@ API documentation.
 
 Runtime and Op references:
 
-- [Small-scale concurrent inference architecture](maintainer/concurrent-inference-architecture.md)
+- [Engine architecture, execution ownership, scheduling, and request lifecycles](maintainer/engine-architecture.md)
 - [Paged KV context storage, ownership, and capacity model](maintainer/paged-kv-cache.md)
 - [Op admission, contracts, ownership, qualification, and performance rules](maintainer/op-development.md)
 - [ReplaySSM GDN technical reference](maintainer/replayssm-gdn.md)
 - [Linear benchmark contract and registered suites](maintainer/linear-benchmark.md)
+
+`engine-architecture.md` is the sole top-level Engine architecture reference. The remaining files
+define narrower physical-storage, model, artifact, Op, or measurement contracts rather than
+parallel architecture variants.
 
 Artifact and model references:
 

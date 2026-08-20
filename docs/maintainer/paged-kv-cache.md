@@ -1,17 +1,21 @@
 # NInfer Paged KV Context Store
 
 本文定义 NInfer 在单 GPU、单 resident model、少量并发请求下的 growing KV 存储架构。它是
-[小规模并发推理架构](concurrent-inference-architecture.md)所依赖的 KV substrate。
+[NInfer Engine 架构](engine-architecture.md)所依赖的 physical KV substrate。
 
 本文定义 KV pool layout、page ownership、容量预留、逻辑 frontier、prefix retention 和生命周期，
 同时定义 device block-table representation、single-sequence 与 batched paged KV execution view、受影响
 Op 的状态效果、kernel 寻址约束和性能准入条件。具体 allocator 算法和 CUDA kernel 代码不由本文规定。
 
+顶层所有权以 Engine 架构文档为准：ResourceManager 选择 logical admission、continuation 和 eviction，
+Program 持有 physical lane、完整 continuation state 与 KV allocation；本文的 KV Store 不选择请求顺序或
+eviction victim。
+
 ---
 
 ## 1. Requirements
 
-- `max_concurrency=2..8` 的 active requests 共享各类 growing KV capacity；
+- `max_concurrency=1..8` 的 active requests 共享各类 growing KV capacity；
 - 单个 request 可以使用 main KV pool 的大部分容量，不按 slot 平均切分；
 - 不同 request 的物理 KV 不要求连续；
 - active、retained 和 speculative provisional KV 使用同一套 reservation accounting；
@@ -449,8 +453,8 @@ needed pages     = 1024
 连续 allocator 会因为最大 hole 只有 768 pages 而失败；paged allocator 可以把 C 的前 768 个 logical
 pages 映射到 A 的旧 pages，再从尾部取得 256 pages，因此无需搬移 B。
 
-Retained allocation 持有的 pages 不是 free capacity。若 retained A 阻塞 active admission，Prefix Cache
-先 eviction A；这是 occupancy 回收，不是 compaction。
+Retained allocation 持有的 pages 不是 free capacity。若 retained A 阻塞 active admission，
+ResourceManager 先选择并通过 Program 释放 A；这是 occupancy 回收，不是 compaction。
 
 唯一的 payload slack 是每个 pool allocation 的最后一个未填满 page，最多 `P-1` positions。对于
 `P=64`，8 个 active allocations 在一个 pool 中的最大尾页 slack 为：
@@ -522,8 +526,9 @@ device_block_tables[s][slot][logical_block] -> pool-local page-group ID
 行数固定为 `max_concurrency`。矩阵是 execution metadata，不是 KV capacity，也不拥有 physical pages。
 
 `PoolAllocation` 持有 authoritative ordered mapping；lane admission 时把 mapping 安装到对应 row。
-Retained state 不占用已绑定的 table row；当前 runtime 的完整 SequenceState 物理上 lane-affine，因此 reuse
-时重新绑定同一 lane row，而不是搬迁 fixed continuation state。KV allocator 本身仍不从 row 推导 ownership。
+Resident continuation 不占用已绑定的 table row；Program-owned 完整 continuation state 物理上
+lane-affine，ResourceManager catalog 只持有其 opaque `ContinuationHandle`。Reuse 时 Program 重新绑定同一
+lane row，而不是搬迁 fixed continuation state。KV allocator 本身仍不从 row 推导 ownership。
 未映射的 tail entries 不具有 consumer-visible 含义，可以在 debug/test 中使用 invalid sentinel，但
 production kernel 不为每次读取增加 page-ID bounds branch。
 
@@ -652,8 +657,8 @@ Admission 是跨所有 pools、fixed state 和 output capacity 的原子 transac
 
 这个 per-request vector check 不表示 backend 是一个可以正常先于 main contract 耗尽的独立 admission
 维度。Startup `KVCapacityProfile` 必须满足 §3.3 的 active-set implication：当 request 在 slot、fixed state
-和 advertised main capacity 上可 admission 时，selected-backend reservation 也必须可兑现。Retained
-backend pages 在判断前先按 active-priority policy eviction。
+和 advertised main capacity 上可 admission 时，selected-backend reservation 也必须可兑现。
+ResourceManager 在 selected admission 前按 active-priority policy 选择并释放阻塞它的 resident bundle。
 
 Reservation 只承诺 pool-local page 数量，不提前选择 IDs。Prefill/decode 推进把 reserved capacity 转为
 mapped pages，不改变总 entitlement。因此一个 admitted request 不会因其他 request 后来增长而失去
@@ -671,8 +676,9 @@ Engine 选定的 speculative backend 在 Engine lifetime 内固定。启用 back
 ordinary target progress，不构成 backend capability 降级，也不能据此释放 backend state。完成时要么把
 完整、可继续的 bundle 一起 retain，要么释放整个 bundle。
 
-Admission 被 retained occupancy 阻塞时，Prefix Cache 选择并释放完整 retained entries，再重新执行
-atomic admission。KV Store 不自行选择 eviction victim。
+Admission 被 retained occupancy 阻塞时，ResourceManager 选择完整 resident entries，Program 消费相应
+ContinuationHandle 并释放 physical bundle，再执行 selected admission。KV Store 不自行选择 eviction
+victim。
 
 ---
 
@@ -688,8 +694,8 @@ WAITING
   -> install pool mappings in an active slot execution view
 ```
 
-这些步骤与 fixed Linear Attention/backend state 和 output capacity 一起构成 concurrent architecture 的
-atomic admission transaction。
+这些步骤与 fixed Linear Attention/backend state 和 output capacity 一起构成 Engine/Program 的 admission
+transaction。
 
 ### 9.2 Prefill chunk
 
@@ -723,7 +729,8 @@ Request 到达 model completion 后执行两种互斥操作之一：
 
 ```text
 retain:
-    active sequence transfers complete SequenceKVBundle ownership to Prefix Cache
+    Program returns a unique ContinuationHandle for the complete SequenceKVBundle
+    ResourceManager adopts the handle into its resident continuation catalog
 
 release:
     every PoolAllocation returns mapped pages to its own pool
@@ -731,10 +738,11 @@ release:
 ```
 
 启用 speculative backend 时，只有 Main、backend 和其他 continuation state 位于同一 exact frontier 的
-完整 bundle 才能进入 Prefix Cache。不完整状态释放整个 bundle，不能发布 target-only reusable entry。
+完整 bundle 才能发布为 resident continuation。不完整状态释放整个 bundle，不能发布 target-only reusable
+entry。
 
 Slot 和 device table rows 随后可以复用。Network response lifetime 不延长 KV ownership。
-Cancellation 在第一个观察到它的 GPU boundary release bundle；不修改 in-flight round mappings。
+Cancellation 在 Engine 第一个观察到它的 GPU boundary release bundle；不修改 in-flight round mappings。
 
 ---
 
@@ -869,9 +877,9 @@ ID、allocator handle 或 mutable frontier。Caller 用绝对位置和 live inte
 不进入 growing pools，不参与 page reservation，不使用 `PagedKVLayerView`，也不因 paged migration 改变
 modulo/window 语义。
 
-Fixed KV state 从按 admitted sequence 管理的 fixed-state pool 获取。Engine 必须始终能够为
-`max_concurrency` 个 active sequences 提供这类固定资源。当前 retained entry 只使用原 lane 的空闲
-fixed unit；new admission 可以 claim 或先驱逐 retained entry，不能降低 active concurrency guarantee。
+Fixed KV state 从 Program 按 admitted sequence 管理的 fixed-state pool 获取。Startup SequencePlan 为
+`max_concurrency` 个 active sequences 建立这类固定资源。当前 resident entry 只使用原 lane 的空闲 fixed
+unit；new admission 可以 claim 或先驱逐 resident entry，不能降低 active concurrency guarantee。
 
 ---
 
@@ -886,7 +894,7 @@ fixed unit；new admission 可以 claim 或先驱逐 retained entry，不能降�
 7. frontier publish 前，该 pool position 的完整 K/V 以及必要 code/scale planes 必须已经写入；
 8. page recycle 不要求清零，但新 owner 不得从旧 frontier 或 stale bytes 推导有效状态；
 9. page mapping 使用 cache ordinal，不使用 RoPE/MRoPE coordinate；
-10. prefix hit 必须由完整 SequenceState 证明，KV token match 或 page match 本身不构成 hit；
+10. prefix hit 必须由 Program 已验证的完整 continuation state 证明，KV token match 或 page match 本身不构成 hit；
 11. active pages 不因 compaction、retained eviction 或其他 request growth 被搬迁；
 12. admitted request 的合法最大 per-pool growth 必须始终被 reservation vector 覆盖；
 13. `KVCapacityProfile` 必须按 §3.2–§3.3 从 `max_context`、`kv_capacity`、`max_concurrency` 和 selected
@@ -919,7 +927,7 @@ fixed unit；new admission 可以 claim 或先驱逐 retained entry，不能降�
 | prompt 正好结束在已保存 rewrite checkpoint | exclusive claim 后恢复完整 checkpoint，从 checkpoint hidden 完成 finalization |
 | 命中已保存 rewrite checkpoint 且有 suffix | exclusive claim 后 truncate pages、恢复完整 checkpoint，再 prefill suffix |
 | 只有更短 token prefix match，但该位置没有 checkpoint | cache miss |
-| retained occupancy 阻塞 admission | Prefix Cache eviction 完整 entry 后重试 atomic admission |
+| retained occupancy 阻塞 admission | ResourceManager 选择完整 entry，Program release 后执行 selected admission |
 | retained eviction 后，request set 满足 main contract 但 backend reservation 失败 | startup sizing 或 accounting invariant violation；不是正常等待条件 |
 | request cancellation | in-flight unit 完成后的 boundary release bundle |
 | admitted request materialize 时无 free page | reservation-accounting violation，作为 Engine failure |
@@ -977,8 +985,9 @@ arbitrary-stride 或另一 pool profile 的 growing view。
 - prefix-cache ownership 或 backend mode；
 - per-page K/V pointers。
 
-这些事实分别属于 KV Store、target sequence state 或 scheduler。Consumer wrapper 根据 Tensor shape 和
-execution envelope 验证静态范围；caller 保证实际访问位置已 mapped 且位于该 Op 声明的有效域。
+这些事实分别属于 KV Store、Program target state 或 Engine round membership。Consumer wrapper 根据
+Tensor shape 和 execution envelope 验证静态范围；caller 保证实际访问位置已 mapped 且位于该 Op 声明的
+有效域。
 
 ### 15.2 `PagedKVBatchLayerView`
 
