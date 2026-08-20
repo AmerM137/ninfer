@@ -7,6 +7,7 @@
 #include "ops/common/math.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/kernel/paged_kv_address.cuh"
+#include "ops/kv_cache/hadamard_d256.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>

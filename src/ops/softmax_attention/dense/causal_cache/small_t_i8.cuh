@@ -2,9 +2,9 @@
 
 // ninfer::ops - split-KV causal small-T attention, INT8 KV-cache partial kernel.
 //
-//   * QK runs on native m16n8k32.s8 tensor cores. Q is quantized on-chip to int8
-//     per (row, 64-group); K stays int8 in the cache and is read straight into
-//     smem (no dequant). The int32 MMA output is rescaled per 64-group by
+//   * QK runs on native m16n8k32.s8 tensor cores. Q and newly appended K receive the same fixed
+//     register-only D256 rotation before G64 quantization. K stays int8 in the cache and is read
+//     straight into smem (no dequant). The int32 MMA output is rescaled per 64-group by
 //     qs[row,g]*ks[key,g]. This halves the QK MMA count vs bf16 and removes the
 //     entire K dequant.
 //   * PV stays bf16 (V is quantized per key, so its scale cannot be factored out
@@ -207,29 +207,62 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     }
 
     if constexpr (CacheInput::writes_cache) {
-        // The owning split quantizes each current row before its cache tile is consumed.
+        // Decompose H256 as H4 over four independently transformed H64 groups. The existing
+        // (token, group) warp schedule computes all H64 fragments in parallel; the FP32 main arena
+        // is the exchange point for the final H4 stage. This retains the complete transform's
+        // butterfly/rounding order while shortening the fused append critical path. V stays in
+        // the original coordinates and retains the existing G64 codec.
+        float* k_h64_s = reinterpret_cast<float*>(r_s);
         for (int pair = warp; pair < valid_tokens * Groups; pair += Wc) {
             const int token    = pair / Groups;
             const int grp      = pair - token * Groups;
             const int position = pos[token];
             if (position < split_start || position >= split_end) { continue; }
-            int physical_page       = lane == 0 ? paged_kv_physical_page(block_table, position) : 0;
+            const int d0            = grp * kKVCacheInt8Group + lane;
+            const int d1            = d0 + 32;
+            const std::int64_t src0 = kv_cache_int8_new_index<Geometry>(kv_head, d0, token);
+            const std::int64_t src1 = kv_cache_int8_new_index<Geometry>(kv_head, d1, token);
+            float k_h64[2] = {__bfloat162float(input.k[src0]), __bfloat162float(input.k[src1])};
+            hadamard_d64_fragment_inplace(k_h64, lane);
+            k_h64_s[token * D + d0] = k_h64[0];
+            k_h64_s[token * D + d1] = k_h64[1];
+        }
+        __syncthreads();
+
+        for (int pair = warp; pair < valid_tokens * Groups; pair += Wc) {
+            const int token    = pair / Groups;
+            const int grp      = pair - token * Groups;
+            const int position = pos[token];
+            if (position < split_start || position >= split_end) { continue; }
+            const int physical_page =
+                physical_pages_s[(position >> kPagedKVPageShift) - first_page];
             const int page_offset   = position & kPagedKVPageMask;
             const int d0            = grp * kKVCacheInt8Group + lane;
             const int d1            = d0 + 32;
             const std::int64_t src0 = kv_cache_int8_new_index<Geometry>(kv_head, d0, token);
             const std::int64_t src1 = kv_cache_int8_new_index<Geometry>(kv_head, d1, token);
-            const float kv0         = __bfloat162float(input.k[src0]);
-            const float kv1         = __bfloat162float(input.k[src1]);
-            const float vv0         = __bfloat162float(input.v[src0]);
-            const float vv1         = __bfloat162float(input.v[src1]);
-            float kamax             = fmaxf(fabsf(kv0), fabsf(kv1));
-            float vamax             = fmaxf(fabsf(vv0), fabsf(vv1));
-            kamax                   = warp_max(kamax, FullMask);
-            vamax                   = warp_max(vamax, FullMask);
-            const auto k_quant      = kv_cache_int8_quant_params(kamax);
-            const auto v_quant      = kv_cache_int8_quant_params(vamax);
-            physical_page           = __shfl_sync(FullMask, physical_page, 0);
+
+            float k_out[2];
+#pragma unroll
+            for (int half = 0; half < 2; ++half) {
+                const int dh   = lane + half * 32;
+                const float x0 = k_h64_s[token * D + dh];
+                const float x1 = k_h64_s[token * D + kKVCacheInt8Group + dh];
+                const float x2 = k_h64_s[token * D + 2 * kKVCacheInt8Group + dh];
+                const float x3 = k_h64_s[token * D + 3 * kKVCacheInt8Group + dh];
+                k_out[half]    = normalized_hadamard_d256_group_value_from_h64(x0, x1, x2, x3, grp);
+            }
+
+            const float kv0    = k_out[0];
+            const float kv1    = k_out[1];
+            const float vv0    = __bfloat162float(input.v[src0]);
+            const float vv1    = __bfloat162float(input.v[src1]);
+            float kamax        = fmaxf(fabsf(kv0), fabsf(kv1));
+            float vamax        = fmaxf(fabsf(vv0), fabsf(vv1));
+            kamax              = warp_max(kamax, FullMask);
+            vamax              = warp_max(vamax, FullMask);
+            const auto k_quant = kv_cache_int8_quant_params(kamax);
+            const auto v_quant = kv_cache_int8_quant_params(vamax);
             cache_k_i8[kv_cache_int8_quant_code_index<Geometry>(physical_page, kv_head, d0,
                                                                 page_offset)] =
                 kv_cache_int8_quant_code(kv0, k_quant.inverse_scale);
@@ -256,23 +289,32 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     for (int i = tid; i < RowCount * Groups; i += Threads) { q_scale_tmp[i] = 0.0f; }
     __syncthreads();
 
-    for (int unit = warp; unit < RowCount * Groups; unit += Wc) {
-        const int row = unit / Groups;
-        const int grp = unit - row * Groups;
-        const int d0  = grp * kKVCacheInt8Group + lane;
-        const int d1  = d0 + 32;
-        int q_head    = 0;
-        int token     = 0;
+    for (int row = warp; row < RowCount; row += Wc) {
+        int q_head = 0;
+        int token  = 0;
         causal_small_t_tc_row_to_qt<Geometry>(row, TokenTile, kv_head, q_head, token);
-        const float x0  = __bfloat162float(q[causal_q_index<Geometry>(q_head, d0, token)]);
-        const float x1  = __bfloat162float(q[causal_q_index<Geometry>(q_head, d1, token)]);
-        float amax      = fmaxf(fabsf(x0), fabsf(x1));
-        amax            = warp_max(amax, FullMask);
-        const float qs  = amax > 0.0f ? amax / 127.0f : 0.0f;
-        const float inv = qs > 0.0f ? 1.0f / qs : 0.0f;
-        causal_small_t_i8_store_swz(q_i8, row, d0, DB16, kv_cache_int8_quant_code(x0, inv));
-        causal_small_t_i8_store_swz(q_i8, row, d1, DB16, kv_cache_int8_quant_code(x1, inv));
-        if (lane == 0) { q_scale_tmp[row * Groups + grp] = qs; }
+        float q_values[8];
+#pragma unroll
+        for (int r = 0; r < 8; ++r) {
+            const int d = lane + 32 * r;
+            q_values[r] = __bfloat162float(q[causal_q_index<Geometry>(q_head, d, token)]);
+        }
+        normalized_hadamard_d256_inplace(q_values, lane);
+
+#pragma unroll
+        for (int grp = 0; grp < Groups; ++grp) {
+            const int d0    = grp * kKVCacheInt8Group + lane;
+            const int d1    = d0 + 32;
+            const float x0  = q_values[2 * grp];
+            const float x1  = q_values[2 * grp + 1];
+            float amax      = fmaxf(fabsf(x0), fabsf(x1));
+            amax            = warp_max(amax, FullMask);
+            const float qs  = amax > 0.0f ? amax / 127.0f : 0.0f;
+            const float inv = qs > 0.0f ? 1.0f / qs : 0.0f;
+            causal_small_t_i8_store_swz(q_i8, row, d0, DB16, kv_cache_int8_quant_code(x0, inv));
+            causal_small_t_i8_store_swz(q_i8, row, d1, DB16, kv_cache_int8_quant_code(x1, inv));
+            if (lane == 0) { q_scale_tmp[row * Groups + grp] = qs; }
+        }
     }
     __syncthreads();
 

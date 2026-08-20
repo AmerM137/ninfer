@@ -66,7 +66,7 @@ Pending implementation work:
   defines the selected continuation, checkpoint, state/KV residency, materialization, and ownership
   contracts for the upcoming context-cache implementation; it does not describe the current Engine.
 - [FP8 KV-cache Attention staged implementation roadmap](maintainer/2026-08-20-fp8-kv-attention-roadmap.md)
-  records the remaining mandatory order—INT8-G64 Hadamard, then FP8—and the numerical decisions
-  that gate those stages. Its Attention semantic/source cutover prerequisite is complete. Delete
-  the roadmap when the remaining Op work is complete and its stable contracts have moved into
-  active authorities.
+  records the mandatory stage order and the numerical decisions fixed for FP8 KV-cache Attention.
+  Its Attention cutover and INT8-G64 Hadamard prerequisites are complete; FP8 implementation is the
+  remaining Op stage. Delete the roadmap when that work is complete and its stable contracts have
+  moved into active authorities.

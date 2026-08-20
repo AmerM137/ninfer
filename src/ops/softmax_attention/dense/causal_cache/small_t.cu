@@ -1,4 +1,5 @@
-// ninfer::ops - split-KV causal small-T launcher and unified route dispatcher.
+// ninfer::ops - split-KV causal small-T launcher and unified route dispatcher. INT8 Q/K
+// preparation, including their paired fixed rotation, remains private to the included kernel.
 #include "ops/softmax_attention/dense/causal_cache/launch.h"
 
 #include "ops/common/math.h"
@@ -42,14 +43,15 @@ std::int32_t causal_small_t_split_upper_bound(std::int32_t window) {
 
 template <typename Geometry>
 std::int32_t causal_small_t_split_count(std::int32_t window, std::int32_t tokens, DType kv_dtype) {
-    // A 64-key default split just above a 32-key boundary makes the partial
-    // kernel execute a nearly empty second tile. These short ranges instead
-    // launch one 32-key tile per split; the larger CTAs keep the small grid busy.
+    // A 64-key default split just above a 32-key boundary makes the partial kernel execute a
+    // nearly empty second tile. T=5 uses one 32-key tile per split; the short T=6 profile keeps
+    // all newly appended rows in one tail split while retaining a useful B=8 grid.
     if (kv_dtype == DType::I8 && tokens == 5 && window > 128 && window <= 512) {
         return div_up(window, 32 / Geometry::SmallTSplitScale);
     }
     if (kv_dtype == DType::I8 && tokens == 6 && window > 128 && window <= 160) {
-        return div_up(window, 24 / Geometry::SmallTSplitScale);
+        constexpr std::int32_t kKeysPerSplit = Geometry::SmallTSplitScale == 2 ? 17 : 24;
+        return div_up(window, kKeysPerSplit);
     }
     // Bc=64 is one CTA/SM on these model shapes. Keep the 8K grid at or below
     // one 170-SM wave after accounting for the geometry's KV-head count.

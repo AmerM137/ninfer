@@ -311,6 +311,10 @@ DFlash Full: K[d,h,p] = k_pages[d,o,g,h]
 INT8 code 使用同一公式；scale 把 `d` 换成 quant group `d/64`。K、V、code 和 scale 不保存各自的
 page pointer table，而是使用同一个 pool-local page-group ID `g`。
 
+INT8 K code 第一维仍使用相同 D256 physical coordinate 和地址公式，但其值是 causal Attention
+producer/consumer 配对拥有的私有表示；allocator 不解释 rotation、logical decode 或 Q preparation。
+V code 继续直接表示原坐标 V。
+
 Common allocator 接收已经确定的 closed plane order、bytes、strides 和 alignment，不从中推导 head、codec
 或 Attention 语义。Production wrapper 只接受其 route 对应的上述 closed stride formula。Kernel 在
 page/tile 粒度计算 base，不在 hot loop 中解释 arbitrary layout，也不存在 runtime layout selector。
@@ -1166,7 +1170,8 @@ reduce grid:  (Q head, D chunk, query token)
 1. growing cache 寻址不包含基于 `padded_context` 的 flat cache index；
 2. 对每个 logical key tile 取得一次 page ID，计算当前 KV head 的 page-local K/V bases；
 3. page ID 在 CTA 内共享，不能由每个 vector lane 重复查询；
-4. current K/V rows 仍从 input Tensor直接参与 Attention，同时写入对应 page；
+4. current K/V rows 先写入对应 page，并通过与历史 rows 相同的 cache representation 参与
+   Attention；
 5. 不让其他 split依赖本 split的 cache write；
 6. partial accumulator、softmax statistics 和 reducer layout 不因 paging 改变。
 
@@ -1191,7 +1196,10 @@ key block和dynamic shared-memory profile，但 split span必须以 page-compati
 保留旧 heuristic引入逐元素boundary branch。
 
 Append/encode阶段应以至少 `(token, kv_head)` 为page-translation共享单位。四个64-d quant groups不能
-各自从global memory重复加载同一个 block-table entry。Codec公式和最终 code/scale bits不变。
+各自从global memory重复加载同一个 block-table entry。V codec公式不变；K writer先形成一个完整
+D256 row的paired causal profile私有固定rotation，再使用现有G64 codec。实现可以由一个warp拥有
+整行，也可以在同一CTA内以FP32 fragment分解变换并让四个group warp共享page translation；不能在
+中间增加低精度cast或跨CTA handoff。raw K code/scale bits不是独立qualification结果。
 
 ### 17.4 Causal prefill and cached prompt route
 
@@ -1299,7 +1307,8 @@ positions和represented cache values计算结果，不复制production page trav
 - rewrite-checkpoint restore 截断 fragmented mapping、释放 trailing pages 并从 exact checkpoint
   继续；
 - BF16 append bit-exact；
-- INT8-G64 code和FP16 scale bits与独立codec oracle一致；
+- INT8 V code和FP16 scale保持既有exact codec；K representation通过append后由causal Attention
+  消费并直接对独立Attention oracle；
 - cached-only route不修改任意cache plane；
 - prefix append的count为0、page边界前后和full count；
 - rejected/provisional stale bytes不进入valid read domain；

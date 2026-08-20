@@ -40,11 +40,12 @@ struct ContextAttentionExecutionEnvelope {
  * Op output is promoted to FP64 for comparison; storage rounding belongs to the Op criterion and
  * is not reproduced by the oracle.
  *
- * A causal INT8-G64 cache is interpreted by decoding each signed code c with its stored FP16 scale
- * bits: FP32(c) * FP32(scale_bits). Its observable BF16-to-INT8 encoding is the exact codec stated
- * by kv_cache_append. The native Q8-G64 query path used by an INT8-cache implementation is a
- * private compute profile, not part of the ideal oracle. BF16-cache and INT8-cache routes therefore
- * have separate numerical criteria and are each checked directly against the same ideal oracle;
+ * A causal INT8-G64 V row is interpreted by decoding each signed code c with its stored FP16 scale
+ * bits: FP32(c) * FP32(scale_bits). K uses the paired physical representation written by
+ * kv_cache_append; its original-coordinate logical row is consumed through the matching private Q/K
+ * profile. The fixed orthogonal preparation and native Q8-G64 materialization are implementation
+ * details, not intermediate values in the ideal oracle above. BF16-cache and INT8-cache routes
+ * therefore have separate numerical criteria and are each checked directly against that oracle;
  * route-to-route parity is only supplementary evidence. Those criteria apply to the registered
  * geometries, tested extents, conformance matrix, and target-representative activation range; they
  * are not universal error bounds for arbitrary adversarial BF16 tensors.

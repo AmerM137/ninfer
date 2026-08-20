@@ -102,7 +102,8 @@ __device__ __forceinline__ int causal_small_t_active_splits(int window, int laun
         if (tokens == 5 && window > 128 && window <= 512) {
             splits = div_up(window, 32 / Geometry::SmallTSplitScale);
         } else if (tokens == 6 && window > 128 && window <= 160) {
-            splits = div_up(window, 24 / Geometry::SmallTSplitScale);
+            constexpr int kKeysPerSplit = Geometry::SmallTSplitScale == 2 ? 17 : 24;
+            splits                      = div_up(window, kKeysPerSplit);
         } else if (tokens == 6 && window > 5000 && window <= 8198) {
             splits             = div_up(window, 192 / Geometry::SmallTSplitScale);
             constexpr int kMin = 4 * Geometry::SmallTSplitScale;

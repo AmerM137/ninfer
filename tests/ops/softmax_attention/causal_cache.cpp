@@ -6,6 +6,7 @@
 #include "ops/softmax_attention/oracle.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -330,9 +331,12 @@ struct HostCache {
     std::vector<std::int8_t> v_i8;
     std::vector<std::uint16_t> k_scale;
     std::vector<std::uint16_t> v_scale;
+    // Original-coordinate logical K after decoding the private rotated INT8 representation. This
+    // is fixture input to the independent Attention oracle, not a separately asserted transform.
+    std::vector<float> logical_k_i8;
 };
 
-void encode_group(const std::vector<float>& source, std::size_t source_base,
+void encode_group(std::span<const float> source, std::size_t source_base,
                   std::vector<std::int8_t>& codes, std::size_t code_base,
                   std::vector<std::uint16_t>& scales, std::size_t scale_offset) {
     float absmax = 0.0f;
@@ -355,6 +359,48 @@ void encode_group(const std::vector<float>& source, std::size_t source_base,
     }
 }
 
+void normalized_hadamard_d256(std::array<float, kHeadDim>& values) {
+    for (std::int32_t stride = 1; stride < kHeadDim; stride *= 2) {
+        for (std::int32_t base = 0; base < kHeadDim; base += 2 * stride) {
+            for (std::int32_t offset = 0; offset < stride; ++offset) {
+                const float low  = values[static_cast<std::size_t>(base + offset)];
+                const float high = values[static_cast<std::size_t>(base + offset + stride)];
+                values[static_cast<std::size_t>(base + offset)]          = low + high;
+                values[static_cast<std::size_t>(base + offset + stride)] = low - high;
+            }
+        }
+    }
+    for (float& value : values) { value *= 0x1p-4f; }
+}
+
+void encode_rotated_key_row(std::span<const float> source, std::size_t source_base,
+                            std::vector<std::int8_t>& codes, std::size_t code_base,
+                            std::vector<std::uint16_t>& scales, std::size_t scale_base,
+                            std::vector<float>& logical, std::size_t logical_base) {
+    std::array<float, kHeadDim> rotated{};
+    for (std::int32_t d = 0; d < kHeadDim; ++d) {
+        rotated[static_cast<std::size_t>(d)] = source[source_base + static_cast<std::size_t>(d)];
+    }
+    normalized_hadamard_d256(rotated);
+    for (std::int32_t group = 0; group < kQuantGroups; ++group) {
+        const std::size_t d = static_cast<std::size_t>(group * kQuantGroup);
+        encode_group(rotated, d, codes, code_base + d, scales,
+                     scale_base + static_cast<std::size_t>(group));
+    }
+
+    std::array<float, kHeadDim> decoded{};
+    for (std::int32_t d = 0; d < kHeadDim; ++d) {
+        const std::size_t offset = static_cast<std::size_t>(d);
+        const std::size_t group  = static_cast<std::size_t>(d / kQuantGroup);
+        decoded[offset]          = static_cast<float>(codes[code_base + offset]) *
+                          f16_bits_to_f32(scales[scale_base + group]);
+    }
+    normalized_hadamard_d256(decoded);
+    for (std::int32_t d = 0; d < kHeadDim; ++d) {
+        logical[logical_base + static_cast<std::size_t>(d)] = decoded[static_cast<std::size_t>(d)];
+    }
+}
+
 HostCache make_cache(const Geometry& geometry, DType dtype, std::int32_t max_context,
                      std::uint32_t seed) {
     const std::int32_t logical_capacity = align_up_page(max_context);
@@ -374,15 +420,21 @@ HostCache make_cache(const Geometry& geometry, DType dtype, std::int32_t max_con
     const std::size_t scales = scale_elements(geometry, logical_capacity);
     cache.k_scale.assign(scales, 0);
     cache.v_scale.assign(scales, 0);
+    cache.logical_k_i8.assign(elements, 0.0f);
     for (std::int32_t head = 0; head < geometry.kv_heads; ++head) {
         for (std::int32_t position = 0; position < logical_capacity; ++position) {
+            const std::size_t code  = cache_index(geometry, logical_capacity, head, position, 0);
+            const std::size_t scale = scale_index(geometry, logical_capacity, head, position, 0);
+            encode_rotated_key_row(logical_k, code, cache.k_i8, code, cache.k_scale, scale,
+                                   cache.logical_k_i8, code);
             for (std::int32_t group = 0; group < kQuantGroups; ++group) {
-                const std::int32_t d   = group * kQuantGroup;
-                const std::size_t code = cache_index(geometry, logical_capacity, head, position, d);
-                const std::size_t scale =
+                const std::int32_t d = group * kQuantGroup;
+                const std::size_t group_code =
+                    cache_index(geometry, logical_capacity, head, position, d);
+                const std::size_t group_scale =
                     scale_index(geometry, logical_capacity, head, position, group);
-                encode_group(logical_k, code, cache.k_i8, code, cache.k_scale, scale);
-                encode_group(logical_v, code, cache.v_i8, code, cache.v_scale, scale);
+                encode_group(logical_v, group_code, cache.v_i8, group_code, cache.v_scale,
+                             group_scale);
             }
         }
     }
@@ -406,15 +458,21 @@ void append_cache(HostCache& cache, const std::vector<float>& k, const std::vect
                 continue;
             }
 
+            const std::size_t source = kv_input_index(geometry, head, 0, token);
+            const std::size_t target =
+                cache_index(geometry, cache.logical_capacity, head, position, 0);
+            const std::size_t scale =
+                scale_index(geometry, cache.logical_capacity, head, position, 0);
+            encode_rotated_key_row(k, source, cache.k_i8, target, cache.k_scale, scale,
+                                   cache.logical_k_i8, target);
             for (std::int32_t group = 0; group < kQuantGroups; ++group) {
-                const std::int32_t d     = group * kQuantGroup;
-                const std::size_t source = kv_input_index(geometry, head, d, token);
-                const std::size_t target =
+                const std::int32_t d           = group * kQuantGroup;
+                const std::size_t group_source = kv_input_index(geometry, head, d, token);
+                const std::size_t group_target =
                     cache_index(geometry, cache.logical_capacity, head, position, d);
-                const std::size_t scale =
+                const std::size_t group_scale =
                     scale_index(geometry, cache.logical_capacity, head, position, group);
-                encode_group(k, source, cache.k_i8, target, cache.k_scale, scale);
-                encode_group(v, source, cache.v_i8, target, cache.v_scale, scale);
+                encode_group(v, group_source, cache.v_i8, group_target, cache.v_scale, group_scale);
             }
         }
     }
@@ -427,11 +485,12 @@ double cache_value(const HostCache& cache, bool key, std::int32_t head, std::int
         return static_cast<double>(bf16_to_f32(key ? cache.k_bf16[code] : cache.v_bf16[code]));
     }
 
+    if (key) { return static_cast<double>(cache.logical_k_i8[code]); }
+
     const std::size_t scale =
         scale_index(cache.geometry, cache.logical_capacity, head, position, d / kQuantGroup);
-    const auto& codes   = key ? cache.k_i8 : cache.v_i8;
-    const auto& scales  = key ? cache.k_scale : cache.v_scale;
-    const float decoded = static_cast<float>(codes[code]) * f16_bits_to_f32(scales[scale]);
+    const float decoded =
+        static_cast<float>(cache.v_i8[code]) * f16_bits_to_f32(cache.v_scale[scale]);
     return static_cast<double>(decoded);
 }
 
@@ -691,30 +750,18 @@ public:
                 verify_exact((label + " cache-v").c_str(),
                              copy_from_guarded<std::uint16_t>(v_, code_elements_), expected_v);
         } else {
-            std::vector<std::int8_t> expected_k(code_elements_, 0);
             std::vector<std::int8_t> expected_v(code_elements_, 0);
-            std::vector<std::uint16_t> expected_ks(scale_elements_, 0);
             std::vector<std::uint16_t> expected_vs(scale_elements_, 0);
             for (std::size_t row = 0; row < rows_; ++row) {
                 const std::span<const std::int32_t> table = row_table(row);
-                scatter_paged_into(expected[row].k_i8, kHeadDim, geometry_, logical_capacity_,
-                                   table, expected_k);
                 scatter_paged_into(expected[row].v_i8, kHeadDim, geometry_, logical_capacity_,
                                    table, expected_v);
-                scatter_paged_into(expected[row].k_scale, kQuantGroups, geometry_,
-                                   logical_capacity_, table, expected_ks);
                 scatter_paged_into(expected[row].v_scale, kQuantGroups, geometry_,
                                    logical_capacity_, table, expected_vs);
             }
             failures +=
-                verify_exact((label + " cache-k-code").c_str(),
-                             copy_from_guarded<std::int8_t>(k_, code_elements_), expected_k);
-            failures +=
                 verify_exact((label + " cache-v-code").c_str(),
                              copy_from_guarded<std::int8_t>(v_, code_elements_), expected_v);
-            failures += verify_exact((label + " cache-k-scale").c_str(),
-                                     copy_from_guarded<std::uint16_t>(k_scale_, scale_elements_),
-                                     expected_ks);
             failures += verify_exact((label + " cache-v-scale").c_str(),
                                      copy_from_guarded<std::uint16_t>(v_scale_, scale_elements_),
                                      expected_vs);
@@ -795,15 +842,19 @@ private:
     GuardedDeviceBuffer block_tables_;
 };
 
-int verify_cache(const std::string& label, const HostCache& got, const HostCache& expected) {
+int verify_cache(const std::string& label, const HostCache& got, const HostCache& expected,
+                 bool verify_private_key_representation) {
     int failures = 0;
     if (expected.dtype == DType::BF16) {
         failures += verify_exact((label + " cache-k").c_str(), got.k_bf16, expected.k_bf16);
         failures += verify_exact((label + " cache-v").c_str(), got.v_bf16, expected.v_bf16);
     } else {
-        failures += verify_exact((label + " cache-k-code").c_str(), got.k_i8, expected.k_i8);
+        if (verify_private_key_representation) {
+            failures += verify_exact((label + " cache-k-code").c_str(), got.k_i8, expected.k_i8);
+            failures +=
+                verify_exact((label + " cache-k-scale").c_str(), got.k_scale, expected.k_scale);
+        }
         failures += verify_exact((label + " cache-v-code").c_str(), got.v_i8, expected.v_i8);
-        failures += verify_exact((label + " cache-k-scale").c_str(), got.k_scale, expected.k_scale);
         failures += verify_exact((label + " cache-v-scale").c_str(), got.v_scale, expected.v_scale);
     }
     return failures;
@@ -923,7 +974,7 @@ int run_a1_case(const Geometry& geometry, DType dtype, const AttentionCase& test
         copy_from_guarded<std::uint16_t>(dout, q_bits.size());
     int failures = verify_attention(label, bf16_bits_to_double(output_bits), reference,
                                     attention_criterion(dtype));
-    failures += verify_cache(label, cache.snapshot(), expected);
+    failures += verify_cache(label, cache.snapshot(), expected, dtype == DType::BF16);
     failures += verify_input(label + " q unchanged", dq, q_bits);
     failures += verify_input(label + " k unchanged", dk, k_bits);
     failures += verify_input(label + " v unchanged", dv, v_bits);
@@ -986,7 +1037,7 @@ int run_a3_case(const Geometry& geometry, DType dtype, const AttentionCase& test
         copy_from_guarded<std::uint16_t>(dout, q_bits.size());
     int failures = verify_attention(label, bf16_bits_to_double(output_bits), reference,
                                     attention_criterion(dtype));
-    failures += verify_cache(label + " cache unchanged", cache.snapshot(), cache_host);
+    failures += verify_cache(label + " cache unchanged", cache.snapshot(), cache_host, true);
     failures += verify_input(label + " q unchanged", dq, q_bits);
     failures += verify_positions(label + " positions unchanged", dp, positions);
     failures += dout.verify_guards((label + " output").c_str());

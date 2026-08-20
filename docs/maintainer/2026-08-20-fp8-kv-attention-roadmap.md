@@ -44,22 +44,20 @@ causal_softmax_attention_cached    只读已有 cache，并计算 causal Attenti
 INT8 和 FP8 使用同一个 D256 正交变换：
 
 ```text
-R = H256 * diag(signs) / 16
+R = H256 / 16
 ```
 
 其中：
 
-- `H256` 是 Sylvester Hadamard matrix；
-- `signs[256]` 是一次生成后冻结在源码和独立 oracle 中的固定 `+1/-1` 表；
-- device primitive 先施加 signs，再以固定 pair 顺序执行 8-stage FP32 FWHT，最后乘精确的
-  `2^-4`；
-- 不存在 runtime seed、request/layer/position 相关随机状态或 cache metadata；
+- `H256[i,j] = (-1)^popcount(i & j)`，即标准 Sylvester Hadamard matrix；
+- device primitive 以 8-stage FP32 FWHT 实现，最后乘精确的 `2^-4`；
+- 不存在 seed、sign table、request/layer/position 相关状态或 cache metadata；
 - Q/K 必须在 Q/K RMSNorm 和 MRoPE 之后、量化之前施加同一个 `R`；
 - V 默认不旋转。
 
 固定变换使 prefix-reuse page 可以直接共享，不需要保存或转换 request-specific rotation 状态。
-数学上 `R^T R = I`；生产 kernel 可以在旋转坐标中计算 dot product，而独立 oracle 仍从
-公共 BF16 Q 和原坐标逻辑 K 定义 Attention。
+数学上 `R^T R = I`；生产 kernel 可以在旋转坐标中计算 dot product。Hadamard 是私有计算策略，
+不成为公共 Op、中间 Tensor 或独立 oracle 结果；Attention 仍由现有公共输入和独立理想 oracle 定义。
 
 ## 3. 第一阶段：完成 Attention 目录和语义整理（已完成）
 
@@ -98,12 +96,13 @@ benchmark 未发现超过 3% 的迁移回退，context T=16/L=131072 的 64-key 
 
 上述条件已经满足；逐文件临时计划和完成使命的目录目标说明已删除。第二阶段可以开始。
 
-## 4. 第二阶段：为 INT8-G64 KV 加入 Hadamard rotation
+## 4. 第二阶段：为 INT8-G64 KV 加入 Hadamard rotation（已完成）
 
-第二阶段的目的既是改善现有 INT8 K/Q 量化，也是先验证后续 FP8 要复用的 transform、cache
-逻辑值、append bit contract、prefix reuse 和 Q staging 边界。
+第二阶段已经在现有 INT8 K/Q 量化中接入后续 FP8 可以复用的 H256 primitive，同时保持公共
+Attention 数学、cache page layout 和 V/PV 路径不变。完成使命的逐 kernel 临时计划已经删除；
+本节只保留第三阶段仍需依赖的稳定事实。
 
-### 4.1 INT8 cache 语义
+### 4.1 INT8 私有计算 profile
 
 现有 INT8-G64 scale、rounding、clamp 和 decode 公式保持不变。唯一变化是 K codec 的输入：
 
@@ -118,53 +117,52 @@ V_logical   = existing_INT8_G64_decode(v_code)
 
 因此：
 
-- K cache 的 code/scale bits 有意改变；
-- V 不旋转，给定相同 V 输入时，V code/scale bits 必须与变更前逐 bit 相同；
+- K cache 的私有 code/scale 表示有意改变；
+- V 不旋转；
 - BF16 cache profile 完全不变；
-- standalone append 与 append-and-attend 必须生成逐 bit 相同的旋转后 K 和原样 V；
 - 当前调用中新写入的 K/V 必须以 cache codec 后的逻辑值参与 Attention，不能旁路使用未量化
   BF16 K/V。
 
-独立理想 Attention oracle 使用公共 BF16 Q 和上述 `K_logical/V_logical` 执行 FP64 dot、stable
-softmax 和 value reduction。生产 Q route 则执行：
+生产 Q route 执行：
 
 ```text
 q_rot  = R * BF16(q_after_mrope)
 q_code = existing_Q8_G64_encode(q_rot)
 ```
 
-Q rotation/quantization 仍是私有 compute profile，不成为公共输入语义或 oracle 的显式中间值。
+Q/K rotation 和量化均是私有 compute profile，不成为公共输入语义或 oracle 的显式中间值。
+包含该 profile 的 append-and-attend 和 cached-only 结果继续直接对现有独立 Attention oracle。
 
 ### 4.2 实现 ownership
 
-- `R` 的常量和 device primitive 由唯一 KV codec implementation 拥有；causal Attention 的 Q
-  preparation 引用同一个定义；
-- standalone append 和 fused append-and-attend 不复制 K transform 或 codec；
+- `src/ops/kv_cache/hadamard_d256.cuh` 唯一拥有 `R` 的完整 warp-register primitive 及其等价的
+  H64/H4 factorized device helpers；standalone append、prompt Q 和 small-T Q 共享这些定义；
+- standalone K writer 由一个 warp 完成整行 H256。small-T fused writer 为保持原有
+  `(token,group)` 并行度，在同一 CTA 内并行形成四个 FP32 H64 fragment，经一次 shared-memory
+  exchange 完成 H4 后进入不变的 G64 codec；该分解不增加 cast，也不复制 transform 数学；
+- small-T append 的 page ID 从已有 CTA shared page table 广播，四个 group 不重复读取 global
+  block table；
 - 不创建 standalone Hadamard Op，不在 target 内实现 rotation；
-- decode split 不得无条件重复计算同一个 Q rotation。比较 fused/recomputed 与一次性 Q staging
-  的完整公共 Op latency，保留真实 supported domain 需要的路线，删除仅用于候选比较的入口。
+- prompt 和 small-T 都在现有 kernel 内使用 warp-register FWHT；本阶段不增加 prepared-Q
+  workspace、额外 staging kernel 或 route switch。
 
 本阶段不借机改变现有 INT8 PV dtype、softmax profile、scale granularity 或 cache physical layout。
 
-### 4.3 Qualification
+### 4.3 Qualification 结果
 
-- 独立 exact transform/codec oracle 覆盖固定 signs、basis、impulse、stage order 和 normalization；
-- A1 append 与 standalone append 的 K/V code/scale 完全相同；
-- V cache bytes 与旋转前生产 codec 的 task-local reference 完全相同；
-- append-and-attend 与 cached-only 分别直接对 FP64 logical-cache oracle；
-- 覆盖两个 D256 geometry、B=1/2/4/8、route seams、page 63/64/65、fragmented mapping 和 Graph
-  replay；
-- prefix reuse 直接共享旋转后 pages，不重新量化或变换；
-- 用真实目标 activation trace 比较旧的 unrotated INT8 profile，rotation 必须在预先冻结的误差
-  指标上改善或至少不回退；旧 profile 只作为任务期对照，阶段结束时删除；
-- decode 长 context 的 cache throughput 不因 Q rotation 或额外 staging 产生实质回退。
+- 已复用现有两个 D256 geometry、small-T、prompt、mapping、masked-row 和 Graph 用例，没有为
+  Hadamard 建立新的笛卡尔测试矩阵；
+- append-and-attend 及 standalone append 后的 cached-only Attention 已直接通过同一个独立
+  Attention oracle；
+- 没有建立 exact Hadamard、basis/impulse、seed、raw rotated-K bytes 或 activation sweep；
+- 实施前冻结的 public Attention 代表点复测没有显著退化，因而不保留候选调度、route forcing 或
+  额外性能 gate。
 
-### 4.4 完成门槛
+### 4.4 完成结果
 
-- 新 INT8 K codec 和逻辑 decode 已进入 contract header；
-- 固定 transform 只有一个生产实现，exact oracle 与生产实现相互独立；
-- 所有 INT8 public route 通过数值、状态、page mapping 和 Graph qualification；
-- 不保留可选 `use_hadamard` flag、unrotated compatibility path 或旧 codec alias。
+- 固定 H256 只有一个 implementation owner；
+- INT8 append-and-attend 和 append-then-cached-only 已通过现有独立 Attention oracle；
+- 没有可选 `use_hadamard` flag、unrotated compatibility path 或旧 codec alias。第三阶段可以开始。
 
 ## 5. 第三阶段：实现 FP8 E4M3FN KV-cache Attention
 
@@ -309,7 +307,8 @@ read-only control 测量可实现上限。大 context、cache-dominant workload 
 
 ### 5.7 第三阶段完成门槛
 
-- FP8 format、Hadamard、logical decode 和 compute profile 已写入公共 contract；
+- FP8 persistent format 与公共 cache/Attention 语义已写入稳定 contract；Hadamard 仍是私有
+  compute profile；
 - standalone append、append-and-attend、cached-only 全部通过直接 qualification；
 - prefill 使用原生 FP8 QK，PV 使用选定的 FP16/FP32 路线；
 - decode 满足单次 cache stream 和匹配布局的 VRAM throughput 门槛；
@@ -321,8 +320,8 @@ read-only control 测量可实现上限。大 context、cache-dominant workload 
 | 阶段 | 状态 | 后续阶段准入条件 |
 |---|---|---|
 | 1. Attention 目录和语义整理 | 已完成 | 准入条件已满足，第二阶段可以开始 |
-| 2. INT8-G64 Hadamard | 未开始 | 新 INT8 codec/Attention 通过 exact、数值、状态和性能 qualification |
-| 3. FP8 E4M3FN KV Attention | 未开始 | 第二阶段固定 transform 和 logical-cache 语义已经成为稳定 authority |
+| 2. INT8-G64 Hadamard | 已完成 | 准入条件已满足，第三阶段可以开始 |
+| 3. FP8 E4M3FN KV Attention | 未开始 | 第二阶段共享 H256 primitive 与 paired Q/K 路径已经稳定 |
 
 实施中只更新本表的当前状态和仍会影响后续工作的实质决策。详细命令、日志、候选 sweep、profile
 报告和已完成事项不回填为历史记录。

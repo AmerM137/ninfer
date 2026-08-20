@@ -1,6 +1,7 @@
 #pragma once
 
-// INT8-cache causal prompt kernel for the registered head geometries. QK stays INT8 through
+// INT8-cache causal prompt kernel for the registered head geometries. Q and cached K use the same
+// fixed register-only D256 rotation before their private G64 encoders. QK stays INT8 through
 // m16n8k32.s8 Tensor Cores; V alone is dequantized with packed FP16 arithmetic while
 // producer warps execute QK. Sixteen warps split each 16-row FP16 PV output across
 // four 64-dimension slices.
@@ -140,25 +141,34 @@ __global__ __maxnreg__(120) void causal_attention_prompt_i8_kernel(
     const int max_query_abs = base_pos + q0 + tile_rows - 1;
     const int key_blocks    = max_query_abs / Bc + 1;
 
-    // Quantize Q cooperatively. One warp owns one (row, 64-d group) at a time.
-    for (int unit = warp; unit < Br * Groups; unit += kCausalPromptI8Warps) {
-        const int row = unit / Groups;
-        const int grp = unit - row * Groups;
-        const int d0  = grp * kKVCacheInt8Group + lane;
-        const int d1  = d0 + 32;
-        float x0      = 0.0f;
-        float x1      = 0.0f;
-        if (row < tile_rows) {
-            x0 = __bfloat162float(q[causal_prompt_q_index<Geometry>(q_head, d0, q0 + row)]);
-            x1 = __bfloat162float(q[causal_prompt_q_index<Geometry>(q_head, d1, q0 + row)]);
+    // Quantize Q cooperatively. One full warp rotates and encodes one D256 row at a time.
+    for (int row = warp; row < Br; row += kCausalPromptI8Warps) {
+        float q_values[8];
+#pragma unroll
+        for (int r = 0; r < 8; ++r) {
+            const int d = lane + 32 * r;
+            q_values[r] = 0.0f;
+            if (row < tile_rows) {
+                q_values[r] =
+                    __bfloat162float(q[causal_prompt_q_index<Geometry>(q_head, d, q0 + row)]);
+            }
         }
-        float absmax    = fmaxf(fabsf(x0), fabsf(x1));
-        absmax          = warp_max(absmax, FullMask);
-        const float qs  = absmax > 0.0f ? absmax / 127.0f : 0.0f;
-        const float inv = qs > 0.0f ? 1.0f / qs : 0.0f;
-        causal_prompt_i8_store_swz(q_i8, row, d0, kv_cache_int8_quant_code(x0, inv));
-        causal_prompt_i8_store_swz(q_i8, row, d1, kv_cache_int8_quant_code(x1, inv));
-        if (lane == 0) { q_scale[row * Groups + grp] = qs; }
+        normalized_hadamard_d256_inplace(q_values, lane);
+
+#pragma unroll
+        for (int grp = 0; grp < Groups; ++grp) {
+            const int d0    = grp * kKVCacheInt8Group + lane;
+            const int d1    = d0 + 32;
+            const float x0  = q_values[2 * grp];
+            const float x1  = q_values[2 * grp + 1];
+            float absmax    = fmaxf(fabsf(x0), fabsf(x1));
+            absmax          = warp_max(absmax, FullMask);
+            const float qs  = absmax > 0.0f ? absmax / 127.0f : 0.0f;
+            const float inv = qs > 0.0f ? 1.0f / qs : 0.0f;
+            causal_prompt_i8_store_swz(q_i8, row, d0, kv_cache_int8_quant_code(x0, inv));
+            causal_prompt_i8_store_swz(q_i8, row, d1, kv_cache_int8_quant_code(x1, inv));
+            if (lane == 0) { q_scale[row * Groups + grp] = qs; }
+        }
     }
     __syncthreads();
 
