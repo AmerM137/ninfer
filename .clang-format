@@ -1,7 +1,7 @@
 BasedOnStyle: LLVM
 
 # 预处理指令缩进
-IndentPPDirectives: AfterHash
+IndentPPDirectives: None
 
 # 允许短句在同一行
 AllowShortIfStatementsOnASingleLine: true
