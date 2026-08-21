@@ -62,6 +62,9 @@ Artifact and model references:
 
 Pending implementation work:
 
+- [Resource scheduling and context-cache target architecture](maintainer/resource-scheduling-and-context-cache.md)
+  defines the selected continuation, checkpoint, state/KV residency, materialization, and ownership
+  contracts for the upcoming context-cache implementation; it does not describe the current Engine.
 - [Softmax Attention organization and migration](maintainer/softmax-attention.md) describes the
   single target state for an unfinished source and public-contract cutover; it is not the current
   implementation map.
