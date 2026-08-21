@@ -544,20 +544,35 @@ within Linux has been excluded as the cause:
 
 The clang-host experiment is the informative one: on Linux the host compiler does not
 influence nvcc's device code for this file at all, so "clang-cl instead of g++" cannot by
-itself explain a Windows pass. What remains is the OS boundary — most plausibly `_MSC_VER`
-guarded paths inside the CUDA headers (`cuda_bf16.hpp` selects device-side BF16 conversion
-paths, which is exactly what this failure turns on), or a different nvcc patch build in the
-Windows 13.3 installer.
+itself explain a Windows pass.
 
-Linux SASS reference for the diff, nvcc 13.3 / `sm_120a`, instruction text hashed with
-addresses and encodings stripped (identical under both g++ and clang++ hosts):
+~~What remains is the OS boundary — most plausibly `_MSC_VER` guarded paths inside the CUDA
+headers, or a different nvcc patch build in the Windows 13.3 installer.~~ **Superseded by the
+Windows answers below**: the device code is the same on both platforms and the divergence is
+in the test inputs, not in codegen. The hypothesis is kept here only to show what the
+Linux-side evidence did and did not narrow — it excluded everything that varies within Linux,
+which correctly pointed at the OS boundary, but it wrongly assumed the two platforms were
+running the same problem.
+
+Linux SASS reference, nvcc 13.3 / `sm_120a` (identical under both g++ and clang++ hosts):
 
 ```
-ba856fe651d1  3312 instrs  swa_split_partial_kernel<8, 2, 32, false>   <- failing case
-b2ddd1393da2  3392 instrs  swa_split_partial_kernel<8, 2, 32, true>
-1fc422942274  2704 instrs  swa_reduce_kernel<8, 32, 1>
-             all 48 swa_* kernels aggregate: 2abe2002bd55b830
+1656 instrs  swa_split_partial_kernel<8, 2, 32, false>   <- failing case
+1696 instrs  swa_split_partial_kernel<8, 2, 32, true>
+1352 instrs  swa_reduce_kernel<8, 32, 1>
+             48 swa_* kernels in the object
 ```
+
+**Counting correction.** These counts were first published here as 3312 / 3392 / 2704, which
+was wrong by a factor of two: on `sm_120a` each instruction occupies two lines of
+`cuobjdump --dump-sass` output — the mnemonic line and an encoding-only continuation — and the
+normalization used counted both. Real instructions are the lines carrying an address marker
+(`/*0000*/`). The corrected counts above match the Windows build exactly. The text hashes
+originally given alongside them embedded the raw encoding bytes and were likewise not
+comparable to a differently normalized dump; they are dropped rather than restated, since the
+instruction counts plus the error statistics already settle the question. The g++ vs clang++
+comparison below is unaffected — both sides used the same normalization and came out
+byte-identical.
 
 **Open, deferred, and outside this branch's scope** (it reproduces on `master` and the port
 does not touch SWA):
@@ -611,6 +626,63 @@ kernel. This strengthens the case for fixing the criterion on its own merits: wi
 `gross_absolute` below one BF16 output ulp, the test outcome is decided by which STL
 implementation generated the inputs.
 
+### Op-test inputs are implementation-defined across platforms (2026-08-21)
+
+Surfaced by the `ninfer_swa_test` investigation above, but wider than that test and
+independent of the port: **op-test input data is not reproducible across standard libraries**,
+so Linux and Windows do not run the same test problems.
+
+`tests/ops/op_tester.h:90`:
+
+```cpp
+inline void fill_uniform(std::vector<float>& v, std::uint32_t seed, float lo, float hi) {
+    std::mt19937 g(seed);
+    std::uniform_real_distribution<float> d(lo, hi);
+    for (auto& x : v) x = d(g);
+}
+```
+
+`std::mt19937` is fully specified by the standard, so the underlying bit stream is identical
+everywhere. `std::uniform_real_distribution` is **not** — the standard constrains its
+distribution, not its algorithm, so libstdc++ and the MSVC STL consume that stream differently
+and emit different value sequences from the same seed. Same source, same seed, different
+inputs.
+
+The SWA case is the direct evidence: `max_reference` is 0.17266 on Linux and 0.17332 on
+Windows for `case=swa T=8 L=96 envelope=[0,4096]`. That statistic depends only on the
+reference tensor, so a differing value proves the *inputs* differ; had the kernel been the
+variable, `max_reference` would match and only `max_abs` would move. The aggregate
+`rel_l2_ratio` is nearly identical across platforms (0.672 vs 0.677) — the same kernel doing
+equally good work on different data.
+
+Reach: three call sites, one of which is shared broadly.
+
+| Site | Users |
+|---|---|
+| `tests/ops/op_tester.h:90` (`fill_uniform`) | 24 test files |
+| `tests/ops/test_rope.cpp` | direct `uniform_real_distribution` |
+| `tests/ops/test_gated_delta_net.cpp` | direct `uniform_real_distribution` |
+
+No `uniform_int_distribution`, `normal_distribution`, or `std::shuffle` use in `tests/`, so
+the exposure is limited to these three.
+
+Why it matters beyond one flaky case. A tolerance is only meaningful against a known problem;
+when the problem itself varies by platform, a passing op test on one host says nothing about
+the other, and a criterion tuned on Linux is being applied to different data on Windows. That
+is a poor fit for a port whose contract is that the same artifact behaves the same way on both
+platforms. It also makes any future cross-platform numerical comparison — including the greedy
+parity item still owed above — rest on inputs that are not actually shared.
+
+The fix is small and local: derive the values from `mt19937`'s bits directly rather than
+through a distribution object, e.g. map `g()` to `[0,1)` by scaling with 2^-32 and then affinely
+into `[lo, hi)`. That keeps the existing seeds, is exactly reproducible on every standard
+library, and changes the drawn values once (so any criterion tuned to today's draw should be
+re-checked in the same change). `std::generate_canonical` is not a substitute — its
+specification has known defects and its output is not reliably portable either.
+
+Not a port regression and not owed by this branch: the code predates it and both platforms are
+equally affected. Recorded because the port is what made the divergence observable.
+
 ### Still owed (updated after the evidence above)
 
 - Cross-platform greedy parity (plan §6): the Linux side is now recorded (fifth session),
@@ -636,10 +708,11 @@ implementation generated the inputs.
 - Ratification leftovers by design: splitting the containment fix into its own commit when
   the port lands.
 - Not owed by this port, recorded because the regression pass surfaced it and **deferred by
-  agreement**: `ninfer_swa_test` fails on Linux and not on Windows from the same checkout. The
-  mechanism (32-way split-KV with BF16 partials against a sub-ulp criterion) is established
-  and the Linux-side variables are all excluded; what remains is a SASS diff from the Windows
-  build. See the fifth-session section above for the reference hashes and the exact asks.
+  agreement**: `ninfer_swa_test` fails on Linux and passes on Windows from the same checkout.
+  Resolved as of the Windows answers above — the kernel is identical on both platforms and the
+  divergence is in the test *inputs*. Two independent follow-ups remain open, neither owed by
+  this branch: raising `gross_absolute` above one BF16 output ulp, and making op-test inputs
+  reproducible across standard libraries (see the section directly above).
 
 ## 5. Reference comparison: `natpate/ninfer-windows` (2026-08-18)
 
