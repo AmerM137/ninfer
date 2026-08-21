@@ -430,17 +430,161 @@ Two observations recorded, neither acted on:
   only to develop-restart loops, and direct I/O remains the right default for a one-shot
   20 GiB read.
 
+### Linux regression pass (2026-08-21, fifth session) — Phase 5's Linux half is green
+
+Run on the Linux reference machine (RTX 5090, **CUDA 13.3**, driver 610.57.04, GCC 16.2.1,
+Ninja/Release) against the branch at `a32456e6`. Note the toolkit: the published Linux numbers
+and the maintainer's ctest baseline are CUDA 13.1, and this machine is one minor version ahead.
+
+Build: all 407 targets clean with `-DBUILD_TESTING=ON`, no warnings.
+
+`ctest`: **88 passed, 1 skipped by design, 1 failed (pre-existing, see below)** out of 90.
+
+Plan §5 "Linux regression pass" scope, item by item:
+
+| Item | Result |
+|---|---|
+| Clean Linux build | pass |
+| `ninfer_artifact_reader_test`, `ninfer_artifact_materialization_test` | pass |
+| Load stats vs. pre-change baseline | no regression (A/B below) |
+| NVFP4 op tests, all five caller families | pass |
+| `acquire.cpp` containment | pass (`ninfer_media_acquire_path_test`, new in this branch) |
+| `api_impl.h` | pass (engine and target tests) |
+
+The five NVFP4 caller families named in 4.4.1 all pass on Linux: `ninfer_linear_nvfp4_a4_test`,
+`ninfer_linear_add_nvfp4_test`, `ninfer_linear_swiglu_nvfp4_test`, `ninfer_attn_input_proj_test`,
+and `ninfer_gdn_input_proj_test`. The device-side alignment guard added with the opaque
+descriptor wrapper never trapped, so the `__grid_constant__` copy satisfies CUtensorMap's
+128-byte contract under nvcc's Linux host path as well.
+
+`ninfer_qwen3_6_frontend_test` **skips with 77**, which is 1.3's fix working as intended on a
+machine that is not the maintainer's: `NINFER_QWEN3_6_27B_HF` is unset and no Qwen3.6-27B HF
+checkpoint is present, so the test reports the missing resource instead of failing in a static
+initializer. This is the first time that path has been exercised on a non-maintainer machine.
+
+**Arena A/B (2.1 / 4.3, `cudaMallocHost` -> `posix_memalign` + `cudaHostRegister`).** Same
+build tree, only `src/core/arena.cu` and `src/core/arena.h` swapped between `master` and the
+branch, three runs each, machine idle, CLI greedy load of the 15.25 GiB
+`qwen3.6-27b/groupwise-int` artifact:
+
+| Phase | master arena | branch arena |
+|---|---|---|
+| `host to device` | 1.432 / 1.500 / 1.615 s | 1.413 / 1.440 / 1.542 s |
+| `artifact/materialize` | 2.086 / 2.175 / 2.288 s | 2.045 / 2.058 / 2.174 s |
+
+Indistinguishable within run-to-run spread, ~10.6 GiB/s H2D. `artifact file read` (15.27 GiB),
+`weight H2D` (15.25 GiB), and `pinned staging peak` (256.00 MiB) are identical across both.
+**The shared load-path change carries no Linux cost**, which is what plan §5 required before
+the broad `PinnedHostBuffer` option (9.4) could stand.
+
+Method note worth keeping: a first attempt at this A/B ran while an unrelated CUDA build was
+saturating the CPU and showed the branch ~2x slower on both phases. That was contention, not
+the arena change — the read/H2D pipeline is CPU-paced enough that any concurrent compile
+invalidates the measurement. Re-run these on an idle machine only.
+
+**Linux half of the greedy parity item (plan §6).** `qwen3.6-27b/groupwise-int`,
+`--greedy --no-thinking --max-new 16 --max-context 4096`, prompt
+"What is the capital of France? Answer in one word." -> `Paris`, stable across five runs and
+across both arena variants. Recorded so the Windows side has something to compare against,
+but a one-word answer is a weak parity probe: the real comparison should use a longer fixed
+prompt where a single divergent token is visible.
+
+### Pre-existing failure surfaced by the regression pass: `ninfer_swa_test`
+
+`ninfer_swa_test` fails on this machine, **and it fails identically on `master`** — the test
+was built from a clean `master` worktree and produced the same index, the same values, and the
+same statistics to all 17 digits:
+
+```
+swa T=8 L=96 envelope=[0,4096]: reduction criterion failed at index 15035
+    actual=-0.168945 reference=-0.169779
+gross_ratio=1.0187358370098487   rel_l2_ratio=0.67219031288843023
+```
+
+Not a port regression, and nothing in this branch touches SWA or its kernels. Deterministic
+across repeated runs, so it is not flakiness either.
+
+What it actually is: the criterion is **tighter than the resolution of its own output type**.
+The output is BF16, so one ulp at the failing magnitude (0.1698, binade `[0.125, 0.25)`) is
+9.766e-4. The kernel value is exactly **one BF16 ulp** below the correctly-rounded BF16 of the
+f64 oracle (`bf16(-0.169779) = -0.169922`, kernel gave `-0.168945`). Meanwhile the gross limit
+is `gross_absolute + gross_relative_to_max_reference * max_reference`
+`= 3e-4 + 3e-3 * 0.17266 = 8.180e-4`, which is **0.838 ulp** — below one ulp, so no
+single-ulp disagreement at this magnitude can ever pass. The same holds for the next-tightest
+case (`swa T=16 L=1`, `gross_ratio` 0.873): its limit is 0.772 ulp. The aggregate `relative_l2`
+check, which is the meaningful accuracy statement, sits at 67% of its own limit and is fine.
+
+`gross_absolute = 3e-4` is also the outlier among the sibling attention criteria —
+`test_gqa_attention.cpp` uses `1.0e-3` and `test_bidirectional_gqa_attention.cpp` `3e-4` with a
+`5.7e-3` relative term. Raising SWA's `gross_absolute` to `1.0e-3`, matching GQA, puts the
+floor above one BF16 ulp and gives the failing case a `gross_ratio` of 0.55 and `T=16 L=1`
+0.60, with `relative_l2` untouched as the primary check.
+
+**Mechanism (established 2026-08-21).** `swa_resolve_plan` (`src/ops/launcher/swa.cu:57`)
+selects the route from the *envelope*, not the actual context: `direct = envelope.max_context
+<= 96`. This case is the only one in the suite with a deliberately oversized envelope
+(`L=96`, `envelope=[0,4096]`), so it is the only one that takes **SplitKv**, with
+`split_capacity = min(32, 4095/32) = 32` splits covering 104 keys — about 3.2 keys per split.
+The split partial accumulator is `__nv_bfloat16` (`swa.cu:110,129,139`), so every partial is
+rounded at 2^-9 before the combine kernel merges them. That predicts ~0.195% relative error;
+the kernel's pre-rounding value measures 0.2032% off the f64 oracle, while fp32 accumulation
+over 104 keys would be 6e-7. The BF16 partial dtype accounts for the deviation essentially
+exactly.
+
+**Windows does not reproduce it.** On the same checkout and branch, the Windows box
+(nvcc 13.3 + clang-cl, CUDA 13.3) reports this test as not failing. Everything that varies
+within Linux has been excluded as the cause:
+
+| Variable tested | Effect |
+|---|---|
+| GPU undervolt (stock 600 W vs undervolted) | none — bit-identical `gross_ratio` to 17 digits, 3 runs each |
+| Host FP model (`-ffp-contract=off` / `=fast` / `-ffast-math`) | none — oracle moves only in the 13th significant digit |
+| Host compiler (g++ 16.2.1 vs clang++ 22.1.8 as nvcc host) | none — **all 48 `swa_*` kernels emit byte-identical SASS**, and the test fails identically |
+| Branch vs `master` | none — bit-identical |
+
+The clang-host experiment is the informative one: on Linux the host compiler does not
+influence nvcc's device code for this file at all, so "clang-cl instead of g++" cannot by
+itself explain a Windows pass. What remains is the OS boundary — most plausibly `_MSC_VER`
+guarded paths inside the CUDA headers (`cuda_bf16.hpp` selects device-side BF16 conversion
+paths, which is exactly what this failure turns on), or a different nvcc patch build in the
+Windows 13.3 installer.
+
+Linux SASS reference for the diff, nvcc 13.3 / `sm_120a`, instruction text hashed with
+addresses and encodings stripped (identical under both g++ and clang++ hosts):
+
+```
+ba856fe651d1  3312 instrs  swa_split_partial_kernel<8, 2, 32, false>   <- failing case
+b2ddd1393da2  3392 instrs  swa_split_partial_kernel<8, 2, 32, true>
+1fc422942274  2704 instrs  swa_reduce_kernel<8, 32, 1>
+             all 48 swa_* kernels aggregate: 2abe2002bd55b830
+```
+
+**Open, deferred, and outside this branch's scope** (it reproduces on `master` and the port
+does not touch SWA):
+
+- Get `cuobjdump --dump-sass ...\swa.cu.obj` from the Windows build and diff against the
+  hashes above. Differing SASS confirms header-mediated device codegen; identical SASS with a
+  passing test would mean the pass comes from somewhere other than the kernel.
+- Confirm the Windows result is `Passed` and not `Skipped` — `ninfer_add_op_test` sets
+  `SKIP_RETURN_CODE 77`, so a skip reads as "not failing" in a ctest summary. Cheapest check,
+  and it would collapse the question outright.
+- Get a `NINFER_OP_REPORT_STATS=1` line for `case=swa T=8 L=96 envelope=[0,4096]` from
+  Windows; `max_abs` is the tell.
+- Then decide whether to widen `gross_absolute`. Note the criterion is knife-edge on three of
+  five cases regardless of how the platform question resolves, so it is worth fixing on its
+  own merits rather than only as a means of turning this run green.
+
 ### Still owed (updated after the evidence above)
 
-- Cross-platform greedy parity (plan §6): the same prompt/seed against the Linux reference
-  build — needs a Linux-side run to compare against. Same for image/video output parity
-  (Phase 3's remaining half; the Windows-side video smoke above passes) and the
+- Cross-platform greedy parity (plan §6): the Linux side is now recorded (fifth session),
+  so what remains is the Windows run of the same prompt/seed and the comparison — preferably
+  re-done with a longer prompt than the one-word probe used here. Same for image/video output
+  parity (Phase 3's remaining half; the Windows-side video smoke above passes) and the
   thinking-preservation divergence in "New finding".
-- Phase 5: the Windows performance row (`run_serve_corpus.py`, now Windows-capable); the
-  Linux regression pass — whose scope is fixed by the choices above: arena (both platforms),
-  NVFP4 TMA kernel source (both platforms, all five caller families' op tests),
-  `acquire.cpp` containment check (both platforms), `api_impl.h` (both platforms,
-  semantically identical).
+- Phase 5: the Windows performance row (`run_serve_corpus.py`, now Windows-capable). **The
+  Linux regression pass is closed** (fifth session, 2026-08-21): arena, NVFP4 TMA kernel
+  source across all five caller families, `acquire.cpp` containment, and `api_impl.h` are all
+  green on Linux, with the arena A/B showing no load-path cost.
 - `eval/` runners arriving from master (added after this branch's base, first seen at the
   2026-08-19 rebase onto `feaf4dd0`): `eval/run_qwen3_8_27b_groupwise_reasoning.sh` and
   `eval/run_qwen3_8_27b_nvfp4_reasoning.sh` are bash-only server drivers that plan §4.5 already
@@ -454,6 +598,11 @@ Two observations recorded, neither acted on:
   use is `git`. Not a regression in this branch: the files are new on master and untouched here.
 - Ratification leftovers by design: splitting the containment fix into its own commit when
   the port lands.
+- Not owed by this port, recorded because the regression pass surfaced it and **deferred by
+  agreement**: `ninfer_swa_test` fails on Linux and not on Windows from the same checkout. The
+  mechanism (32-way split-KV with BF16 partials against a sub-ulp criterion) is established
+  and the Linux-side variables are all excluded; what remains is a SASS diff from the Windows
+  build. See the fifth-session section above for the reference hashes and the exact asks.
 
 ## 5. Reference comparison: `natpate/ninfer-windows` (2026-08-18)
 
