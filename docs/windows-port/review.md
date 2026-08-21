@@ -574,6 +574,43 @@ does not touch SWA):
   five cases regardless of how the platform question resolves, so it is worth fixing on its
   own merits rather than only as a means of turning this run green.
 
+**Windows answers (2026-08-21, same day).** All three questions above are resolved, and the
+platform question collapses to test-input divergence, not codegen:
+
+- The Windows result is a real **`Passed`**, not a skip: ctest reports `Passed` (full suite
+  90/90, clang-cl tree, `-DBUILD_TESTING=ON`), and the binary run directly prints `swa: PASS`
+  with exit 0.
+- Windows `NINFER_OP_REPORT_STATS=1` for the failing case:
+
+  ```
+  OP_ERROR_STATS kind=reduction count=32768 rel_l2=0.002674371636191612
+  rel_l2_ratio=0.67705611042825609 max_abs=0.00074653386161907531
+  max_reference=0.1733194041923371 gross_limit=0.0008199582125770113
+  gross_ratio=0.91045354527619915 case=swa T=8 L=96 envelope=[0,4096]
+  ```
+
+  Windows sits on the same knife edge — `gross_ratio` 0.910 against Linux's 1.019, with the
+  aggregate `rel_l2_ratio` nearly identical (0.677 vs 0.672). The tell is `max_reference`:
+  0.17332 on Windows vs 0.17266 on Linux — **the test inputs themselves differ**.
+  `tests/ops/op_tester.h:92` fills tensors with `std::uniform_real_distribution`, whose output
+  is implementation-defined; libstdc++ and the MSVC STL produce different sequences from the
+  same seeded `mt19937`. Each platform samples a different random problem against a sub-ulp
+  limit, and Linux's draw happens to land 2% over where Windows' lands 9% under.
+- SASS: Windows nvcc 13.3 emits the **same instruction counts** for every named kernel once
+  the counting convention is aligned — the Linux counts above include the encoding-only
+  second line each sm_120a instruction prints, so 3312/3392/2704 lines correspond exactly to
+  the Windows counts of 1656/1696/1352 instructions for
+  `swa_split_partial_kernel<8,2,32,false>` / `<8,2,32,true>` / `swa_reduce_kernel<8,32,1>`,
+  and the object contains the same 48 `swa_*` kernels. The text hashes used different
+  normalizations and are not directly comparable, but with identical instruction counts
+  across all three probes and the near-identical error statistics above, header-mediated
+  device-codegen divergence is effectively excluded.
+
+Conclusion: the Windows pass is luck of the RNG draw, not a platform difference in the
+kernel. This strengthens the case for fixing the criterion on its own merits: with
+`gross_absolute` below one BF16 output ulp, the test outcome is decided by which STL
+implementation generated the inputs.
+
 ### Still owed (updated after the evidence above)
 
 - Cross-platform greedy parity (plan §6): the Linux side is now recorded (fifth session),
