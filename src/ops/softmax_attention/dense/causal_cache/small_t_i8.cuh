@@ -23,7 +23,7 @@
 #include <math_constants.h>
 
 #include "ops/softmax_attention/dense/causal_cache/small_t.cuh"
-#include "ops/kv_cache/codec.cuh"
+#include "ops/kv_cache/int8_g64_codec.cuh"
 
 #include <cstdint>
 

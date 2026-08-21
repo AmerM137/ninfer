@@ -13,6 +13,7 @@
 #include <array>
 #include <chrono>
 #include <cstring>
+#include <exception>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -2535,7 +2536,19 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
     out.device      = device.device;
     out.max_context = capacity;
     out.kv_capacity = kv_capacity;
-    out.kv_cache = kv_dtype == DType::BF16 ? KvCacheStorage::BFloat16 : KvCacheStorage::Int8Group64;
+    switch (kv_dtype) {
+    case DType::BF16:
+        out.kv_cache = KvCacheStorage::BFloat16;
+        break;
+    case DType::I8:
+        out.kv_cache = KvCacheStorage::Int8Group64;
+        break;
+    case DType::FP8_E4M3FN:
+        out.kv_cache = KvCacheStorage::Fp8E4M3Row256;
+        break;
+    default:
+        std::terminate();
+    }
     DeviceArena& weights = *model.weights_arena;
     out.weights = ArenaMemorySummary{weights.capacity(), weights.used(), weights.peak_used()};
     out.sequence =

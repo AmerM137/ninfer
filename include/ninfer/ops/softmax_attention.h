@@ -41,14 +41,21 @@ struct ContextAttentionExecutionEnvelope {
  * is not reproduced by the oracle.
  *
  * A causal INT8-G64 V row is interpreted by decoding each signed code c with its stored FP16 scale
- * bits: FP32(c) * FP32(scale_bits). K uses the paired physical representation written by
- * kv_cache_append; its original-coordinate logical row is consumed through the matching private Q/K
- * profile. The fixed orthogonal preparation and native Q8-G64 materialization are implementation
- * details, not intermediate values in the ideal oracle above. BF16-cache and INT8-cache routes
- * therefore have separate numerical criteria and are each checked directly against that oracle;
- * route-to-route parity is only supplementary evidence. Those criteria apply to the registered
- * geometries, tested extents, conformance matrix, and target-representative activation range; they
- * are not universal error bounds for arbitrary adversarial BF16 tensors.
+ * bits: FP32(c) * FP32(scale_bits). A causal FP8-E4M3FN V row has one stored FP16 scale for D256;
+ * each finite code e is decoded as FP32(e) * FP32(scale_bits). Quantized K uses the paired physical
+ * representation written by kv_cache_append; its original-coordinate logical row is consumed
+ * through the matching private Q/K profile. The fixed orthogonal preparation and transient Q
+ * quantization are implementation details, not intermediate values in the ideal oracle above.
+ *
+ * The qualified FP8 compute profile uses native E4M3FN QK MMA with FP32 accumulation, FP32
+ * Softmax, exact E4M3FN-to-FP16 V-code conversion followed by one represented FP16 scale multiply,
+ * FP16 P/V MMA with FP32 accumulation, FP32 split merge/normalization, and a final BF16 output
+ * store. This arithmetic path is an implementation profile rather than an extra public semantic
+ * boundary. BF16, INT8-G64, and FP8-E4M3FN routes have separate numerical criteria and are each
+ * checked directly against the ideal oracle; route-to-route parity is only supplementary evidence.
+ * Those criteria apply to the registered geometries, tested extents, conformance matrix, and
+ * target-representative activation range; they are not universal error bounds for arbitrary
+ * adversarial BF16 tensors.
  */
 
 /**
@@ -101,10 +108,11 @@ void packed_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
  * The registered profiles are [D,Hq,Hkv]=[256,24,4] (group 6) and [256,16,2] (group 8), with
  * scale=1/sqrt(256). q/out are contiguous BF16 [D,Hq,W,B], k/v are contiguous BF16
  * [D,Hkv,W,B], positions are contiguous device I32 [W,B], kv_table_rows is contiguous device I32
- * [B], and the cache is BF16 or INT8-G64. valid_columns is either contiguous device I32 [B] or an
- * empty Tensor meaning every row has W live columns. This dense/masked topology is chosen by the
- * caller and never inferred by copying device metadata to the host. B=1 accepts every positive W
- * in the current prompt/decode domain; B=2..8 accepts W=1..16.
+ * [B], and the cache is BF16, INT8-G64, or row-scaled FP8-E4M3FN. valid_columns is either
+ * contiguous device I32 [B] or an empty Tensor meaning every row has W live columns. This
+ * dense/masked topology is chosen by the caller and never inferred by copying device metadata to
+ * the host. B=1 accepts every positive W in the current prompt/decode domain; B=2..8 accepts
+ * W=1..16.
  *
  * Let Vb be W for dense input or valid_columns[b] otherwise. For live column j<Vb with absolute
  * position p=positions[j,b], query head h attends cache rows [0,p] through table row

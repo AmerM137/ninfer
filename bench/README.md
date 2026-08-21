@@ -44,7 +44,7 @@ ninfer_bench --weights <artifact.ninfer>
           [-pg, --prompt-gen <P,G;P,G...>]
           [-r, --repetitions <n>] [--warmup <n>]
           [--max-ctx <tokens>] [--prefill-chunk <tokens>]
-          [--kv-dtype <bf16|int8>]
+          [--kv-dtype <bf16|int8|fp8>]
           [--mtp-draft-tokens <0..5>] [--lm-head-draft]
           [--device <id>] [--no-cuda-graph] [--profile-measured]
           [-o, --output <table|json|csv>] [--output-file <path>]
@@ -60,7 +60,8 @@ Example:
   -p 512,2048 -n 128 -pg '2048,128' -r 5 --warmup 1
 ```
 
-`bf16` selects BF16 KV storage and `int8` selects INT8 group-64 KV storage. MTP is enabled with
+`bf16` selects BF16 KV storage, `int8` selects INT8 group-64 KV storage, and `fp8` selects
+row-scaled E4M3 D256 KV storage. MTP is enabled with
 `--mtp-draft-tokens`; `--lm-head-draft` selects the optimized proposal head. CUDA Graph decode is
 enabled by default.
 
@@ -309,8 +310,8 @@ counts, or kernel-name filters in these benchmarks.
 
 `ninfer_causal_softmax_attention_bench` measures the two public causal-cache entries:
 append-and-attend and cached-only. It covers the registered D256 H24/KV4 and H16/KV2 geometries
-with BF16 and INT8-G64 KV storage. Production dispatch receives the caller-visible execution
-envelope and owns all decode, prompt, Small-T, and split-KV choices.
+with BF16, INT8-G64, and FP8-E4M3FN-row256 KV storage. Production dispatch receives the
+caller-visible execution envelope and owns all decode, prompt, Small-T, and split-KV choices.
 
 Append-and-attend accepts `--batch 1,2,4,8`; each ordinary `--context L` point gives every row the
 same context and all `W` columns are valid. One exact mixed profile uses `--row-contexts`,
@@ -333,7 +334,21 @@ cmake --build build --parallel --target ninfer_causal_softmax_attention_bench
 ./build/bench/ninfer_causal_softmax_attention_bench \
   --entry cached --geometry d256-h16-kv2 --kv-dtype int8 \
   --tokens 16 --context 8192 --execution graph --cache cold --profile
+./build/bench/ninfer_causal_softmax_attention_bench \
+  --entry append --geometry all --kv-dtype fp8 --batch 1 \
+  --tokens 1 --context 16384 --mapping fragmented \
+  --execution graph --cache cold --warmup 100 --repeat 201
+./build/bench/ninfer_causal_softmax_attention_bench \
+  --entry append --geometry all --kv-dtype fp8 --batch 1 \
+  --tokens 1024 --context 16384 --mapping fragmented \
+  --execution eager --cache cold --warmup 10 --repeat 61
 ```
+
+For FP8 points the report and CSV additionally expose separate QK/PV FLOPs, the mixed Tensor Core
+floor (`419 TFLOP/s` E4M3/FP32 QK plus `209.5 TFLOP/s` FP16/FP32 PV), and a one-stream persistent-KV
+payload. The latter counts one 516-byte K+V row per visible KV head and reports bandwidth against
+the measured `1674.5 GB/s` cold pure-read ceiling; it does not inflate the numerator with Q/output,
+append traffic, metadata, workspace, or duplicate cache reads.
 
 `ninfer_context_softmax_attention_bench` measures the public read-only context-plus-query contract
 at Q32/KV8/D128 with BF16 context storage. `T` is a complete non-causal query block and `L` is its
@@ -379,10 +394,10 @@ instruction utilization require a profiler capture of the complete public call.
 ## KV cache append Op benchmark
 
 `ninfer_kv_cache_append_bench` unifies the two public append contracts without combining them in
-one timed body. `--mode full` calls full D256 KV publication for KV4/KV2 and BF16/INT8-G64 caches.
-`--mode prefix` calls device-count prefix publication for BF16 D128/KV8 linear or 4096-slot cyclic
-caches; `T` is the public envelope and `C` is the device commit count. Every measured interval or
-captured graph contains exactly one selected public append call.
+one timed body. `--mode full` calls full D256 KV publication for KV4/KV2 and BF16, INT8-G64, or
+FP8-E4M3FN-row256 caches. `--mode prefix` calls device-count prefix publication for BF16 D128/KV8
+linear or 4096-slot cyclic caches; `T` is the public envelope and `C` is the device commit count.
+Every measured interval or captured graph contains exactly one selected public append call.
 
 ```bash
 cmake --build build --parallel --target ninfer_kv_cache_append_bench

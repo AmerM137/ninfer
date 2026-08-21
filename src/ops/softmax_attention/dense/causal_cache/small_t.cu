@@ -43,6 +43,11 @@ std::int32_t causal_small_t_split_upper_bound(std::int32_t window) {
 
 template <typename Geometry>
 std::int32_t causal_small_t_split_count(std::int32_t window, std::int32_t tokens, DType kv_dtype) {
+    if constexpr (Geometry::SmallTSplitScale == 1) {
+        if (kv_dtype == DType::FP8_E4M3FN && tokens == 1 && window > 8198) {
+            return Geometry::SmallTMaximumSplits;
+        }
+    }
     // A 64-key default split just above a 32-key boundary makes the partial kernel execute a
     // nearly empty second tile. T=5 uses one 32-key tile per split; the short T=6 profile keeps
     // all newly appended rows in one tail split while retaining a useful B=8 grid.
@@ -225,7 +230,9 @@ bool causal_attention_uses_small_t(std::int32_t tokens) { return tokens >= 1 && 
 std::int32_t causal_attention_split_capacity(std::int32_t q_heads, std::int32_t tokens,
                                              DType cache_dtype,
                                              CausalAttentionExecutionEnvelope envelope) {
-    if (tokens < 1 || tokens > 6 || (cache_dtype != DType::BF16 && cache_dtype != DType::I8) ||
+    if (tokens < 1 || tokens > 6 ||
+        (cache_dtype != DType::BF16 && cache_dtype != DType::I8 &&
+         cache_dtype != DType::FP8_E4M3FN) ||
         envelope.min_visible_keys == 0 || envelope.min_visible_keys > envelope.max_visible_keys) {
         throw std::invalid_argument("causal_softmax_attention split capacity: invalid profile");
     }
@@ -356,6 +363,12 @@ void causal_attention_small_t_launch(
     const Tensor& valid_columns, const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,
     CausalAttentionExecutionEnvelope envelope, std::int32_t column_begin, std::int32_t width,
     Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l, Tensor& out, cudaStream_t stream) {
+    if (cache.dtype == DType::FP8_E4M3FN) {
+        causal_attention_small_t_fp8_launch(q, k, v, pos, valid_columns, table_rows, scale, cache,
+                                            envelope, column_begin, width, partial_acc, partial_m,
+                                            partial_l, out, stream);
+        return;
+    }
     const CausalAppendInput input{static_cast<const __nv_bfloat16*>(k.data),
                                   static_cast<const __nv_bfloat16*>(v.data)};
     const CausalSmallTInvocation invocation{
@@ -382,6 +395,11 @@ void causal_attention_cached_small_t_launch(const Tensor& q, const Tensor& pos, 
                                             CausalAttentionExecutionEnvelope envelope,
                                             Tensor& partial_acc, Tensor& partial_m,
                                             Tensor& partial_l, Tensor& out, cudaStream_t stream) {
+    if (cache.dtype == DType::FP8_E4M3FN) {
+        causal_attention_cached_small_t_fp8_launch(q, pos, scale, cache, envelope, partial_acc,
+                                                   partial_m, partial_l, out, stream);
+        return;
+    }
     const CausalCachedInput input{};
     const CausalSmallTInvocation invocation{
         .valid_columns = nullptr,

@@ -26,6 +26,7 @@ inline constexpr std::size_t kDefaultMediaLiveBytes   = 2ULL << 30;
 enum class KvCacheStorage : std::uint8_t {
     BFloat16,
     Int8Group64,
+    Fp8E4M3Row256,
 };
 
 enum class KvCapacityMode : std::uint8_t {

@@ -1,6 +1,7 @@
 #include "ninfer/ops/kv_cache_append.h"
 
 #include "ops/kv_cache/append/launch.h"
+#include "ops/kv_cache/d256_profile.h"
 
 #include <cstdint>
 #include <limits>
@@ -10,13 +11,12 @@
 namespace ninfer::ops {
 namespace {
 
-constexpr std::int32_t kHeadDim        = 128;
-constexpr std::int32_t kKVHeads        = 8;
-constexpr std::uint32_t kWindow        = 4096;
-constexpr std::int32_t kFullHeadDim    = 256;
-constexpr std::int32_t kFullQuantGroup = 64;
-constexpr const char* kAppendOp        = "kv_cache_append";
-constexpr const char* kPrefixAppendOp  = "kv_cache_append_prefix";
+constexpr std::int32_t kHeadDim       = 128;
+constexpr std::int32_t kKVHeads       = 8;
+constexpr std::uint32_t kWindow       = 4096;
+constexpr std::int32_t kFullHeadDim   = 256;
+constexpr const char* kAppendOp       = "kv_cache_append";
+constexpr const char* kPrefixAppendOp = "kv_cache_append_prefix";
 
 void require_shape(const Tensor& tensor, std::int32_t n0, std::int32_t n1, std::int32_t n2,
                    std::int32_t n3, const char* op, const char* name) {
@@ -33,10 +33,14 @@ void require_contiguous_nonnull(const Tensor& tensor, const char* op, const char
 }
 
 std::uint32_t validate_full_cache(const PagedKVLayerView& cache, std::int32_t kv_heads) {
-    if ((cache.dtype != DType::BF16 && cache.dtype != DType::I8) ||
-        cache.num_kv_heads != kv_heads || cache.head_dim != kFullHeadDim ||
-        (cache.dtype == DType::BF16 && cache.quant_group != 0) ||
-        (cache.dtype == DType::I8 && cache.quant_group != kFullQuantGroup)) {
+    D256KVCacheProfile profile{};
+    try {
+        profile = d256_kv_cache_profile(cache.dtype);
+    } catch (const std::invalid_argument&) {
+        throw std::invalid_argument("kv_cache_append: invalid cache geometry or dtype");
+    }
+    if (cache.num_kv_heads != kv_heads || cache.head_dim != kFullHeadDim ||
+        cache.quant_group != profile.quant_group) {
         throw std::invalid_argument("kv_cache_append: invalid cache geometry or dtype");
     }
 
@@ -48,8 +52,7 @@ std::uint32_t validate_full_cache(const PagedKVLayerView& cache, std::int32_t kv
         throw std::invalid_argument("kv_cache_append: invalid cache capacity");
     }
 
-    const DType code_dtype = cache.dtype == DType::I8 ? DType::I8 : DType::BF16;
-    if (cache.k_pages.dtype != code_dtype || cache.v_pages.dtype != code_dtype) {
+    if (cache.k_pages.dtype != profile.code_dtype || cache.v_pages.dtype != profile.code_dtype) {
         throw std::invalid_argument("kv_cache_append: invalid cache code dtype");
     }
     require_shape(cache.k_pages, kFullHeadDim, kPagedKVPageSize, kv_heads, physical_pages,
@@ -71,14 +74,13 @@ std::uint32_t validate_full_cache(const PagedKVLayerView& cache, std::int32_t kv
         return static_cast<std::uint32_t>(capacity);
     }
 
-    constexpr std::int32_t groups = kFullHeadDim / kFullQuantGroup;
     if (cache.k_scale_pages.dtype != DType::FP16 || cache.v_scale_pages.dtype != DType::FP16) {
         throw std::invalid_argument("kv_cache_append: invalid cache scale dtype");
     }
-    require_shape(cache.k_scale_pages, groups, kPagedKVPageSize, kv_heads, physical_pages,
-                  kAppendOp, "cache k scale pages");
-    require_shape(cache.v_scale_pages, groups, kPagedKVPageSize, kv_heads, physical_pages,
-                  kAppendOp, "cache v scale pages");
+    require_shape(cache.k_scale_pages, profile.scale_leading_extent, kPagedKVPageSize, kv_heads,
+                  physical_pages, kAppendOp, "cache k scale pages");
+    require_shape(cache.v_scale_pages, profile.scale_leading_extent, kPagedKVPageSize, kv_heads,
+                  physical_pages, kAppendOp, "cache v scale pages");
     require_contiguous_nonnull(cache.k_scale_pages, kAppendOp, "cache k scale pages");
     require_contiguous_nonnull(cache.v_scale_pages, kAppendOp, "cache v scale pages");
     return static_cast<std::uint32_t>(capacity);

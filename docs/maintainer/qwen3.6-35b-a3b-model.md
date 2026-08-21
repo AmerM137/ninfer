@@ -266,8 +266,9 @@ y = o_projection(a)                       # [2048,T]
 ```
 
 Each KV head serves eight query heads. Prefill appends all K/V columns and evaluates causal
-attention over the chunk. Decode appends one column and attends over the resident prefix. A cache
-backend may page or quantize K/V, but those are representation choices rather than model math.
+attention over the chunk. Decode appends one column and attends over the resident prefix. Runtime
+KV storage may be BF16, INT8-G64, or FP8-E4M3FN-row256; paging and quantization are representation
+choices rather than model math.
 The persistent cache boundary is the offset-normalized, MRoPE-rotated K and the directly projected
 V; raw K, Q, and the output gate are not cached.
 
@@ -758,8 +759,8 @@ encoder or audio projection tower. Token presence is not evidence of an audio in
   matrix. Proposal selection may use the existing full `lm_head` or the artifact's existing
   optimized proposal head; neither is a private companion parameter.
 - Public activation, cache, and recurrent-state dtypes are stated by their owning Op/state contract.
-  In particular, GDN recurrent matrices and decay controls are FP32, while registered BF16/INT8 KV
-  formats remain real persistent representation boundaries.
+  In particular, GDN recurrent matrices and decay controls are FP32, while registered BF16,
+  INT8-G64, and FP8-E4M3FN-row256 KV formats remain real persistent representation boundaries.
 - Every floating-point Op uses one independent naive FP32/FP64 mathematical oracle over its logical
   inputs. Packed weights are decoded from their stored codes and exact stored scales. Exact
   transforms and codecs use exact oracles.

@@ -1,6 +1,6 @@
 #pragma once
 
-// Signed int8, per-token group-wise KV-cache codec shared by append and causal-attention kernels.
+// Signed int8, per-token G64 KV-cache codec shared by append and causal-attention kernels.
 // This header owns index math, vectorized decode, and scalar encode; there is deliberately no
 // standalone transcode kernel in the production path.
 
@@ -59,9 +59,6 @@ __device__ __forceinline__ KVCacheInt8QuantParams kv_cache_int8_quant_params(flo
     };
 }
 
-// Quantize one bf16 value with a precomputed 1/scale (scale is the FP16-rounded
-// per-group absmax/127). Round-to-nearest-even + symmetric clamp to keep codes
-// bit-identical to the CPU oracle and to bf16 parity.
 __device__ __forceinline__ std::int8_t kv_cache_int8_quant_code(float x, float inv_scale) {
     if (inv_scale == 0.0f) { return static_cast<std::int8_t>(0); }
     int q = __float2int_rn(x * inv_scale);
@@ -69,10 +66,6 @@ __device__ __forceinline__ std::int8_t kv_cache_int8_quant_code(float x, float i
     return static_cast<std::int8_t>(q);
 }
 
-// Dequantize 8 consecutive int8 codes (dims [d, d+8), aligned to a multiple of 8
-// so they lie inside one 64-group) into 8 bf16 packed as an int4, given a pointer
-// to the 8 codes and the group's dequant scale. One 64-bit load reads the codes; the vector load
-// and decode arithmetic are identical whether codes reside in shared memory or cache storage.
 __device__ __forceinline__ int4 kv_cache_int8_dequant_i8x8_from(const std::int8_t* codes8,
                                                                 float s) {
     const int2 raw       = load_vec<int2>(codes8);

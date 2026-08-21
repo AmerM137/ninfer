@@ -64,6 +64,10 @@ void causal_attention_prompt_attention_launch_for(const Tensor& q, const Tensor&
 void causal_attention_prompt_attention_launch(const Tensor& q, const Tensor& positions, float scale,
                                               const PagedKVLayerView& cache, Tensor& out,
                                               cudaStream_t stream) {
+    if (cache.dtype == DType::FP8_E4M3FN) {
+        causal_attention_prompt_fp8_attention_launch(q, positions, scale, cache, out, stream);
+        return;
+    }
     const CausalPromptDirectMetadata metadata{
         static_cast<const std::int32_t*>(cache.block_table.data)};
     if (q.ne[1] == CausalD256H24Kv4::QHeads) {
@@ -79,6 +83,11 @@ void causal_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tens
                                     const Tensor& positions, const Tensor& valid_columns,
                                     const Tensor& table_rows, float scale,
                                     PagedKVBatchLayerView cache, Tensor& out, cudaStream_t stream) {
+    if (cache.dtype == DType::FP8_E4M3FN) {
+        causal_attention_prompt_fp8_launch(q, k, v, positions, valid_columns, table_rows, scale,
+                                           cache, out, stream);
+        return;
+    }
     kv_cache_append_batch_launch(k, v, positions, valid_columns, table_rows, cache, stream);
     const auto launch = [&]<bool Masked>() {
         const CausalPromptBatchMetadata<Masked> metadata{

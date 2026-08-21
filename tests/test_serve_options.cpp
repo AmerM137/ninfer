@@ -59,6 +59,10 @@ int main() {
     failures += check(resolve_public_model_id(defaults, "artifact-model") == "artifact-model",
                       "artifact model id was not selected by default");
 
+    const ServeOptions fp8 = parse({"ninfer-serve", "model.ninfer", "--kv-dtype", "fp8"});
+    failures += check(fp8.kv_cache == ninfer::KvCacheStorage::Fp8E4M3Row256,
+                      "--kv-dtype fp8 did not select row-scaled E4M3 KV");
+
     const ServeOptions model_alias =
         parse({"ninfer-serve", "model.ninfer", "--model-id", "deployment-alias"});
     failures +=

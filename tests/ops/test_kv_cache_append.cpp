@@ -29,6 +29,7 @@ constexpr int kWindow        = 4096;
 constexpr int kFullHeadDim   = 256;
 constexpr int kFullGroup     = 64;
 constexpr int kFullGroups    = kFullHeadDim / kFullGroup;
+constexpr int kFullFp8Groups = 1;
 
 std::vector<std::uint16_t> patterned_bits(std::size_t count, std::uint32_t seed);
 
@@ -112,6 +113,93 @@ std::int32_t round_even_to_i32(float value) {
     return (lower & 1) == 0 ? lower : lower + 1;
 }
 
+float decode_e4m3fn_positive(std::uint8_t code) {
+    const int exponent = (code >> 3) & 0x0f;
+    const int mantissa = code & 0x07;
+    if (exponent == 0) return std::ldexp(static_cast<float>(mantissa), -9);
+    return std::ldexp(1.0f + static_cast<float>(mantissa) / 8.0f, exponent - 7);
+}
+
+std::uint8_t encode_e4m3fn_rne_satfinite(float value) {
+    const bool negative   = std::signbit(value);
+    const float magnitude = std::abs(value);
+    std::uint8_t selected = 0x7e;
+    if (magnitude < 448.0f) {
+        for (std::uint8_t upper = 1; upper <= 0x7e; ++upper) {
+            const float upper_value = decode_e4m3fn_positive(upper);
+            if (upper_value < magnitude) continue;
+            const std::uint8_t lower = static_cast<std::uint8_t>(upper - 1);
+            const float lower_value  = decode_e4m3fn_positive(lower);
+            const float lower_error  = magnitude - lower_value;
+            const float upper_error  = upper_value - magnitude;
+            selected                 = lower_error < upper_error   ? lower
+                                       : upper_error < lower_error ? upper
+                                                                   : ((lower & 1U) == 0U ? lower : upper);
+            break;
+        }
+    }
+    return static_cast<std::uint8_t>(selected | (negative ? 0x80U : 0U));
+}
+
+void normalized_hadamard_d256_host(std::array<float, kFullHeadDim>& values) {
+    for (int block = 0; block < 8; ++block) {
+        const int block_begin = block * 32;
+        for (int stride = 1; stride <= 16; stride <<= 1) {
+            for (int base = 0; base < 32; base += 2 * stride) {
+                for (int offset = 0; offset < stride; ++offset) {
+                    const int low_index  = block_begin + base + offset;
+                    const int high_index = low_index + stride;
+                    const float low      = values[static_cast<std::size_t>(low_index)];
+                    const float high     = values[static_cast<std::size_t>(high_index)];
+                    values[static_cast<std::size_t>(low_index)]  = low + high;
+                    values[static_cast<std::size_t>(high_index)] = low - high;
+                }
+            }
+        }
+    }
+    for (int span = 1; span < 8; span <<= 1) {
+        for (int base = 0; base < 8; base += 2 * span) {
+            for (int offset = 0; offset < span; ++offset) {
+                for (int lane = 0; lane < 32; ++lane) {
+                    const int low_index  = lane + 32 * (base + offset);
+                    const int high_index = lane + 32 * (base + offset + span);
+                    const float low      = values[static_cast<std::size_t>(low_index)];
+                    const float high     = values[static_cast<std::size_t>(high_index)];
+                    values[static_cast<std::size_t>(low_index)]  = low + high;
+                    values[static_cast<std::size_t>(high_index)] = low - high;
+                }
+            }
+        }
+    }
+    for (float& value : values) value *= 0x1p-4f;
+}
+
+void encode_full_fp8_row(const std::array<float, kFullHeadDim>& values,
+                         std::vector<std::uint8_t>& codes, int head, int position,
+                         int physical_page, int kv_heads, std::vector<std::uint16_t>& scales) {
+    float absmax = 0.0f;
+    for (const float value : values) absmax = std::max(absmax, std::abs(value));
+    std::uint16_t scale_bits = 0;
+    float scale              = 0.0f;
+    if (absmax != 0.0f) {
+        const float raw_scale = absmax / 448.0f;
+        const float bounded   = std::clamp(raw_scale, std::ldexp(1.0f, -24), 65504.0f);
+        scale_bits            = f32_to_f16_bits(bounded);
+        scale                 = f16_bits_to_f32(scale_bits);
+    }
+    const float inverse = scale == 0.0f ? 0.0f : 1.0f / scale;
+    for (int d = 0; d < kFullHeadDim; ++d) {
+        const auto target =
+            full_cache_index(kFullHeadDim, d, head, position, physical_page, kv_heads);
+        codes[target] =
+            scale == 0.0f
+                ? 0
+                : encode_e4m3fn_rne_satfinite(values[static_cast<std::size_t>(d)] * inverse);
+    }
+    scales[full_cache_index(kFullFp8Groups, 0, head, position, physical_page, kv_heads)] =
+        scale_bits;
+}
+
 void encode_full_group(const std::vector<float>& source, std::size_t source_base,
                        std::vector<std::int8_t>& codes, int head, int position, int physical_page,
                        int group, int kv_heads, std::vector<std::uint16_t>& scales) {
@@ -152,8 +240,11 @@ int full_append_case(int kv_heads, DType dtype, int tokens = 3) {
     const std::size_t input_count = static_cast<std::size_t>(kFullHeadDim) * kv_heads * tokens;
     const std::size_t code_count =
         static_cast<std::size_t>(kFullHeadDim) * kPage * kv_heads * physical_pages;
+    const int scale_groups = dtype == DType::I8           ? kFullGroups
+                             : dtype == DType::FP8_E4M3FN ? kFullFp8Groups
+                                                          : 0;
     const std::size_t scale_count =
-        static_cast<std::size_t>(kFullGroups) * kPage * kv_heads * physical_pages;
+        static_cast<std::size_t>(scale_groups) * kPage * kv_heads * physical_pages;
 
     std::vector<float> host_k(input_count);
     std::vector<float> host_v(input_count);
@@ -164,6 +255,23 @@ int full_append_case(int kv_heads, DType dtype, int tokens = 3) {
     for (int i = 0; i < kFullGroup; ++i) {
         host_k[full_input_index(i, 0, 0, kv_heads)]              = 0.0f;
         host_v[full_input_index(kFullGroup + i, 0, 0, kv_heads)] = 0.0f;
+    }
+    if (dtype == DType::FP8_E4M3FN) {
+        for (int d = 0; d < kFullHeadDim; ++d) {
+            host_k[full_input_index(d, 0, 0, kv_heads)] = 0.0f;
+            host_v[full_input_index(d, 0, 0, kv_heads)] = 0.0f;
+        }
+        host_v[full_input_index(0, 1, 0, kv_heads)] = 448.0f;
+        host_v[full_input_index(1, 1, 0, kv_heads)] = 1.0625f;
+        host_v[full_input_index(0, 0, 1, kv_heads)] = std::ldexp(1.0f, -20);
+        host_v[full_input_index(0, 1, 1, kv_heads)] = bf16_to_f32(0x7f7fU);
+        // With absmax=49, d1/s is exactly an E4M3 midpoint while d1*FP32(1/s) is one
+        // FP32 ulp above it. This row locks the codec's ordered reciprocal-multiply semantics.
+        for (int d = 0; d < kFullHeadDim; ++d) {
+            host_v[full_input_index(d, 0, 2, kv_heads)] = 0.0f;
+        }
+        host_v[full_input_index(0, 0, 2, kv_heads)] = 49.0f;
+        host_v[full_input_index(1, 0, 2, kv_heads)] = 0.0013885498046875f;
     }
     std::vector<std::uint16_t> input_k(input_count);
     std::vector<std::uint16_t> input_v(input_count);
@@ -182,8 +290,9 @@ int full_append_case(int kv_heads, DType dtype, int tokens = 3) {
 
     GuardedDeviceBuffer cache_k(code_count * dtype_size(dtype));
     GuardedDeviceBuffer cache_v(code_count * dtype_size(dtype));
-    GuardedDeviceBuffer scale_k(dtype == DType::I8 ? scale_count * sizeof(std::uint16_t) : 1);
-    GuardedDeviceBuffer scale_v(dtype == DType::I8 ? scale_count * sizeof(std::uint16_t) : 1);
+    const bool quantized = dtype == DType::I8 || dtype == DType::FP8_E4M3FN;
+    GuardedDeviceBuffer scale_k(quantized ? scale_count * sizeof(std::uint16_t) : 1);
+    GuardedDeviceBuffer scale_v(quantized ? scale_count * sizeof(std::uint16_t) : 1);
     PagedKVLayerView cache{
         .k_pages = Tensor(cache_k.data(), dtype, {kFullHeadDim, kPage, kv_heads, physical_pages}),
         .v_pages = Tensor(cache_v.data(), dtype, {kFullHeadDim, kPage, kv_heads, physical_pages}),
@@ -191,7 +300,9 @@ int full_append_case(int kv_heads, DType dtype, int tokens = 3) {
         .head_dim     = kFullHeadDim,
         .num_kv_heads = kv_heads,
         .dtype        = dtype,
-        .quant_group  = dtype == DType::I8 ? kFullGroup : 0,
+        .quant_group  = dtype == DType::I8           ? kFullGroup
+                        : dtype == DType::FP8_E4M3FN ? kFullHeadDim
+                                                     : 0,
     };
 
     int failures = 0;
@@ -224,7 +335,7 @@ int full_append_case(int kv_heads, DType dtype, int tokens = 3) {
         failures +=
             verify_exact((label + " v").c_str(),
                          from_device<std::uint16_t>(cache_v.data(), code_count), expected_v);
-    } else {
+    } else if (dtype == DType::I8) {
         std::vector<std::int8_t> expected_k(code_count, static_cast<std::int8_t>(0x55));
         std::vector<std::int8_t> expected_v(code_count, static_cast<std::int8_t>(0xaa));
         auto expected_scale_k = patterned_bits(scale_count, 0x01234567u);
@@ -257,6 +368,56 @@ int full_append_case(int kv_heads, DType dtype, int tokens = 3) {
                                   " P=" + std::to_string(first_position);
         failures += verify_exact((label + " v codes").c_str(),
                                  from_device<std::int8_t>(cache_v.data(), code_count), expected_v);
+        failures +=
+            verify_exact((label + " v scales").c_str(),
+                         from_device<std::uint16_t>(scale_v.data(), scale_count), expected_scale_v);
+        failures += scale_k.verify_guards((label + " k scale guards").c_str());
+        failures += scale_v.verify_guards((label + " v scale guards").c_str());
+    } else {
+        std::vector<std::uint8_t> expected_k(code_count, 0x55U);
+        std::vector<std::uint8_t> expected_v(code_count, 0xaaU);
+        auto expected_scale_k = patterned_bits(scale_count, 0x01234567u);
+        auto expected_scale_v = patterned_bits(scale_count, 0x89abcdefu);
+        cache_k.copy_from_host(expected_k.data(), expected_k.size());
+        cache_v.copy_from_host(expected_v.data(), expected_v.size());
+        scale_k.copy_from_host(expected_scale_k.data(),
+                               expected_scale_k.size() * sizeof(std::uint16_t));
+        scale_v.copy_from_host(expected_scale_v.data(),
+                               expected_scale_v.size() * sizeof(std::uint16_t));
+        cache.k_scale_pages =
+            Tensor(scale_k.data(), DType::FP16, {kFullFp8Groups, kPage, kv_heads, physical_pages});
+        cache.v_scale_pages =
+            Tensor(scale_v.data(), DType::FP16, {kFullFp8Groups, kPage, kv_heads, physical_pages});
+        for (int token = 0; token < tokens; ++token) {
+            const int position = positions[static_cast<std::size_t>(token)];
+            const int page     = mapping[static_cast<std::size_t>(position / kPage)];
+            for (int head = 0; head < kv_heads; ++head) {
+                std::array<float, kFullHeadDim> k_row{};
+                std::array<float, kFullHeadDim> v_row{};
+                for (int d = 0; d < kFullHeadDim; ++d) {
+                    const auto source                  = full_input_index(d, head, token, kv_heads);
+                    k_row[static_cast<std::size_t>(d)] = host_k[source];
+                    v_row[static_cast<std::size_t>(d)] = host_v[source];
+                }
+                normalized_hadamard_d256_host(k_row);
+                encode_full_fp8_row(k_row, expected_k, head, position, page, kv_heads,
+                                    expected_scale_k);
+                encode_full_fp8_row(v_row, expected_v, head, position, page, kv_heads,
+                                    expected_scale_v);
+            }
+        }
+        ops::kv_cache_append(k, v, position_tensor, cache, nullptr);
+        cuda_synchronize();
+        const std::string label =
+            "kv_cache_append full fp8-row256 Hkv=" + std::to_string(kv_heads) +
+            " T=" + std::to_string(tokens) + " P=" + std::to_string(first_position);
+        failures += verify_exact((label + " k codes").c_str(),
+                                 from_device<std::uint8_t>(cache_k.data(), code_count), expected_k);
+        failures += verify_exact((label + " v codes").c_str(),
+                                 from_device<std::uint8_t>(cache_v.data(), code_count), expected_v);
+        failures +=
+            verify_exact((label + " k scales").c_str(),
+                         from_device<std::uint16_t>(scale_k.data(), scale_count), expected_scale_k);
         failures +=
             verify_exact((label + " v scales").c_str(),
                          from_device<std::uint16_t>(scale_v.data(), scale_count), expected_scale_v);
@@ -683,8 +844,10 @@ int main() {
     for (const int kv_heads : {4, 2}) {
         failures += full_append_case(kv_heads, DType::BF16);
         failures += full_append_case(kv_heads, DType::I8);
+        failures += full_append_case(kv_heads, DType::FP8_E4M3FN);
     }
     failures += full_append_case(2, DType::I8, 129);
+    failures += full_append_case(2, DType::FP8_E4M3FN, 129);
     failures += run_case(1, 0, 0, false, {0, 1, 2});
     failures += run_case(1, 1, 63, false, {2, 3, 4});
     failures += run_case(16, 7, 60, false, {5, 1, 4}, 5);

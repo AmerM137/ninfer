@@ -60,6 +60,23 @@ std::uint32_t page_count(std::uint32_t capacity) {
     return 1U + (capacity - 1U) / static_cast<std::uint32_t>(kPagedKVPageSize);
 }
 
+struct TargetKVCacheProfile {
+    DType dtype;
+    std::int32_t quant_group;
+};
+
+TargetKVCacheProfile target_kv_cache_profile(KvCacheStorage storage) {
+    switch (storage) {
+    case KvCacheStorage::BFloat16:
+        return {DType::BF16, 0};
+    case KvCacheStorage::Int8Group64:
+        return {DType::I8, qwen3_6::kKvInt8QuantGroup};
+    case KvCacheStorage::Fp8E4M3Row256:
+        return {DType::FP8_E4M3FN, qwen3_6::kKvFp8QuantGroup};
+    }
+    throw std::invalid_argument("unknown KV-cache storage profile");
+}
+
 template <class ProfileAllowance>
 std::size_t graph_topology_allowance(const std::vector<GraphExecutionProfile>& profiles,
                                      ProfileAllowance&& profile_allowance, const char* label) {
@@ -697,6 +714,7 @@ std::unique_ptr<qwen3_6::detail::SequencePlannerImpl<Variant>>
 make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
                            WeightsProfile weights_profile) {
     validate_target_options(device, options);
+    const TargetKVCacheProfile kv_profile = target_kv_cache_profile(options.kv_cache);
 
     SequencePlanningInputs inputs{
         .weights_profile     = weights_profile,
@@ -705,12 +723,12 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .prefill_chunk       = std::min(options.prefill_chunk, options.max_context),
         .draft_window        = options.speculative.draft_tokens,
         .speculative_backend = options.speculative.backend,
-        .kv_dtype       = options.kv_cache == KvCacheStorage::BFloat16 ? DType::BF16 : DType::I8,
-        .kv_quant_group = options.kv_cache == KvCacheStorage::BFloat16 ? 0 : qwen3_6::kKvQuantGroup,
-        .proposal_head  = options.speculative.proposal_head,
-        .features       = qwen3_6::startup_features(options),
-        .use_cuda_graph = options.use_cuda_graph,
-        .device         = options.device,
+        .kv_dtype            = kv_profile.dtype,
+        .kv_quant_group      = kv_profile.quant_group,
+        .proposal_head       = options.speculative.proposal_head,
+        .features            = qwen3_6::startup_features(options),
+        .use_cuda_graph      = options.use_cuda_graph,
+        .device              = options.device,
     };
     const std::uint32_t logical_pages = page_count(inputs.capacity);
     const std::uint32_t minimum_pages = std::max(logical_pages, inputs.max_concurrency);
