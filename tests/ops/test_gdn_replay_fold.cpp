@@ -621,7 +621,7 @@ int run_record_fold_rounds() {
 
         for (std::int32_t layer = 0; layer < kProfile.layers; ++layer) {
             GdnReplayRecordLayer layer_records = records.layer(layer, 1);
-            Tensor& conv_states                = state_pool.conv[static_cast<std::size_t>(layer)];
+            Tensor conv_states = state_pool.layer_view(static_cast<std::uint32_t>(layer)).conv;
             ops::gdn_input_proj_conv_snapshot(x, parent.view(), conv_weight, conv_states, valid,
                                               initial_selector, snapshot_selector, snapshot_query,
                                               snapshot_key, snapshot_value, snapshot_z_tensor,
@@ -638,9 +638,10 @@ int run_record_fold_rounds() {
             Tensor record_q_view = record_query.view({kStateDim, kQkHeads, kWidth, 1});
             Tensor record_k_view = record_key.view({kStateDim, kQkHeads, kWidth, 1});
             Tensor record_v_view = record_value.view({kStateDim, kProfile.value_heads, kWidth, 1});
-            Tensor& recurrent_states = state_pool.recurrent[static_cast<std::size_t>(layer)];
-            Tensor q_direct          = snapshot_q_view.view({kStateDim, kQkHeads, kWidth});
-            Tensor k_direct          = snapshot_k_view.view({kStateDim, kQkHeads, kWidth});
+            Tensor recurrent_states =
+                state_pool.layer_view(static_cast<std::uint32_t>(layer)).recurrent;
+            Tensor q_direct    = snapshot_q_view.view({kStateDim, kQkHeads, kWidth});
+            Tensor k_direct    = snapshot_k_view.view({kStateDim, kQkHeads, kWidth});
             Tensor v_direct    = snapshot_v_view.view({kStateDim, kProfile.value_heads, kWidth});
             Tensor g_direct    = g.view({kProfile.value_heads, kWidth});
             Tensor beta_direct = beta.view({kProfile.value_heads, kWidth});
