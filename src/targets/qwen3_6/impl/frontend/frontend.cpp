@@ -425,17 +425,6 @@ std::size_t longest_suffix_prefix(std::string_view text, std::string_view marker
     return 0;
 }
 
-struct DecoderState {
-    std::string utf8_pending;
-    std::string think_marker_pending;
-    std::array<std::string, 2> stop_pending;
-    bool in_reasoning              = false;
-    bool strip_content_leading     = false;
-    bool terminal                  = false;
-    std::uint64_t decoded_bytes    = 0;
-    std::uint32_t reasoning_tokens = 0;
-};
-
 struct StopMatch {
     bool found                      = false;
     std::uint32_t committed_tokens  = 0;
@@ -463,7 +452,7 @@ std::size_t stop_hold_size(std::string_view text, OutputChannel channel, const S
     return hold;
 }
 
-void feed_channel(DecoderState& state, OutputChannel channel, std::string_view text,
+void feed_channel(OutputDecoderState& state, OutputChannel channel, std::string_view text,
                   const StopPolicy& policy, PublishedOutput& emitted,
                   std::uint32_t committed_tokens, StopMatch* best_match) {
     if (text.empty()) { return; }
@@ -499,13 +488,13 @@ void feed_channel(DecoderState& state, OutputChannel channel, std::string_view t
     state.decoded_bytes += text.size();
 }
 
-void close_channel(DecoderState& state, OutputChannel channel, PublishedOutput& emitted) {
+void close_channel(OutputDecoderState& state, OutputChannel channel, PublishedOutput& emitted) {
     std::string& pending = state.stop_pending[channel_index(channel)];
     append_delta(emitted, channel, std::move(pending));
     pending.clear();
 }
 
-void feed_content(DecoderState& state, std::string text, const StopPolicy& policy,
+void feed_content(OutputDecoderState& state, std::string text, const StopPolicy& policy,
                   PublishedOutput& emitted, std::uint32_t committed_tokens, StopMatch* best_match) {
     if (state.strip_content_leading) {
         std::size_t begin = 0;
@@ -519,7 +508,7 @@ void feed_content(DecoderState& state, std::string text, const StopPolicy& polic
                  best_match);
 }
 
-void feed_decoded_text(DecoderState& state, std::string_view text, const StopPolicy& policy,
+void feed_decoded_text(OutputDecoderState& state, std::string_view text, const StopPolicy& policy,
                        PublishedOutput& emitted, std::uint32_t committed_tokens,
                        StopMatch* best_match) {
     if (!state.in_reasoning) {
@@ -550,7 +539,7 @@ void feed_decoded_text(DecoderState& state, std::string_view text, const StopPol
     state.think_marker_pending.erase(0, safe);
 }
 
-void feed_token_bytes(DecoderState& state, std::string bytes, const StopPolicy& policy,
+void feed_token_bytes(OutputDecoderState& state, std::string bytes, const StopPolicy& policy,
                       PublishedOutput& emitted, std::uint32_t committed_tokens,
                       StopMatch* best_match) {
     state.utf8_pending += bytes;
@@ -561,7 +550,7 @@ void feed_token_bytes(DecoderState& state, std::string bytes, const StopPolicy& 
     feed_decoded_text(state, text, policy, emitted, committed_tokens, best_match);
 }
 
-void terminalize(DecoderState& state, const StopPolicy& policy, PublishedOutput& emitted,
+void terminalize(OutputDecoderState& state, const StopPolicy& policy, PublishedOutput& emitted,
                  std::uint32_t committed_tokens) {
     if (!state.utf8_pending.empty()) {
         // A token budget can end between byte-level tokens of one code point.
@@ -582,7 +571,7 @@ void terminalize(DecoderState& state, const StopPolicy& policy, PublishedOutput&
     state.terminal     = true;
 }
 
-DecoderState terminal_state(DecoderState state) {
+OutputDecoderState terminal_state(OutputDecoderState state) {
     state.utf8_pending.clear();
     state.think_marker_pending.clear();
     state.stop_pending = {};
@@ -635,23 +624,6 @@ struct Frontend::FrontendState {
     std::shared_ptr<fi::MediaPreprocessCache> media_cache;
     StopPolicy defaults;
     bool vision_enabled = true;
-};
-
-struct OutputSession::OutputSessionState {
-    OutputSessionState(std::shared_ptr<const fi::Tokenizer> tokenizer, StopPolicy policy,
-                       OutputOptions output, bool starts_in_reasoning)
-        : tokenizer(std::move(tokenizer)), policy(std::move(policy)),
-          preserve_special(output.raw || output.preserve_special_tokens) {
-        decoder.in_reasoning = starts_in_reasoning && !output.raw;
-    }
-
-    std::shared_ptr<const fi::Tokenizer> tokenizer;
-    StopPolicy policy;
-    bool preserve_special = false;
-    DecoderState decoder;
-    DecoderState preview_decoder;
-    PublishedOutput preview_output;
-    bool preview_ready = false;
 };
 
 std::span<const std::int32_t> PreparedPromptData::position_axis(int axis) const {
@@ -738,20 +710,20 @@ void PublishedOutput::push_back(OutputDelta value) {
     values[count++] = std::move(value);
 }
 
-OutputSession::OutputSession() noexcept                           = default;
-OutputSession::~OutputSession()                                   = default;
-OutputSession::OutputSession(OutputSession&&) noexcept            = default;
-OutputSession& OutputSession::operator=(OutputSession&&) noexcept = default;
-
-OutputSession::OutputSession(std::unique_ptr<OutputSessionState> state) noexcept
-    : state(std::move(state)) {}
+OutputSession::OutputSession(std::shared_ptr<const fi::Tokenizer> owned_tokenizer,
+                             StopPolicy stop_policy, OutputOptions output,
+                             bool starts_in_reasoning) noexcept
+    : tokenizer(std::move(owned_tokenizer)), policy(std::move(stop_policy)),
+      preserve_special(output.raw || output.preserve_special_tokens) {
+    decoder.in_reasoning = starts_in_reasoning && !output.raw;
+}
 
 runtime::OutputDecision OutputSession::preview(std::span<const TokenId> tokens,
                                                std::uint32_t budget_remaining,
                                                FinishReason limit_reason) {
-    if (state == nullptr) { throw std::logic_error("output session is empty"); }
-    if (state->decoder.terminal) { throw std::logic_error("output session is already terminal"); }
-    if (state->preview_ready) { throw std::logic_error("output session already has a preview"); }
+    if (tokenizer == nullptr) { throw std::logic_error("output session is empty"); }
+    if (decoder.terminal) { throw std::logic_error("output session is already terminal"); }
+    if (preview_ready) { throw std::logic_error("output session already has a preview"); }
     if (tokens.empty()) {
         throw std::invalid_argument("cannot preview an empty generated-token round");
     }
@@ -763,91 +735,88 @@ runtime::OutputDecision OutputSession::preview(std::span<const TokenId> tokens,
         throw std::invalid_argument("generated-token budget has an invalid limit reason");
     }
 
-    state->preview_decoder = state->decoder;
-    state->preview_output.clear();
+    preview_decoder = decoder;
+    preview_output.clear();
 
     const auto complete = [&](std::uint32_t count, FinishReason reason) {
-        state->preview_ready = true;
+        preview_ready = true;
         return runtime::OutputDecision{.accepted_tokens = count, .finish_reason = reason};
     };
 
     for (std::size_t index = 0; index < tokens.size(); ++index) {
         const std::uint32_t count = static_cast<std::uint32_t>(index + 1);
         const TokenId token       = tokens[index];
-        if (!state->tokenizer->is_valid_token(token)) {
+        if (!tokenizer->is_valid_token(token)) {
             throw std::out_of_range("generated token is outside the checkpoint vocabulary: " +
                                     std::to_string(token));
         }
 
-        if (state->preview_decoder.in_reasoning) { ++state->preview_decoder.reasoning_tokens; }
+        if (preview_decoder.in_reasoning) { ++preview_decoder.reasoning_tokens; }
 
-        const bool stop_token =
-            std::find(state->policy.token_ids.begin(), state->policy.token_ids.end(), token) !=
-            state->policy.token_ids.end();
-        DecoderState before_state;
+        const bool stop_token = std::find(policy.token_ids.begin(), policy.token_ids.end(),
+                                          token) != policy.token_ids.end();
+        OutputDecoderState before_state;
         PublishedOutput before_output;
-        if (stop_token && !state->policy.publish_stop_token) {
-            before_state  = state->preview_decoder;
-            before_output = state->preview_output;
+        if (stop_token && !policy.publish_stop_token) {
+            before_state  = preview_decoder;
+            before_output = preview_output;
         }
 
         StopMatch match;
-        const std::string bytes =
-            state->tokenizer->decode_token_bytes(token, !state->preserve_special);
-        feed_token_bytes(state->preview_decoder, bytes, state->policy, state->preview_output, count,
-                         &match);
+        const std::string bytes = tokenizer->decode_token_bytes(token, !preserve_special);
+        feed_token_bytes(preview_decoder, bytes, policy, preview_output, count, &match);
 
         if (match.found) {
-            state->preview_decoder = terminal_state(std::move(state->preview_decoder));
-            state->preview_output  = std::move(match.output);
+            preview_decoder = terminal_state(std::move(preview_decoder));
+            preview_output  = std::move(match.output);
             return complete(match.committed_tokens, FinishReason::StopString);
         }
 
         if (stop_token) {
-            if (!state->policy.publish_stop_token) {
-                state->preview_decoder = std::move(before_state);
-                state->preview_output  = std::move(before_output);
+            if (!policy.publish_stop_token) {
+                preview_decoder = std::move(before_state);
+                preview_output  = std::move(before_output);
             }
-            terminalize(state->preview_decoder, state->policy, state->preview_output, count);
+            terminalize(preview_decoder, policy, preview_output, count);
             return complete(count, FinishReason::StopToken);
         }
     }
 
     const auto count = static_cast<std::uint32_t>(tokens.size());
     if (tokens.size() == budget_remaining) {
-        terminalize(state->preview_decoder, state->policy, state->preview_output, count);
+        terminalize(preview_decoder, policy, preview_output, count);
         return complete(count, limit_reason);
     }
     return complete(count, FinishReason::None);
 }
 
 runtime::OutputDecision OutputSession::preview_terminal(FinishReason reason) {
-    if (state == nullptr) { throw std::logic_error("output session is empty"); }
-    if (state->decoder.terminal) { throw std::logic_error("output session is already terminal"); }
-    if (state->preview_ready) { throw std::logic_error("output session already has a preview"); }
+    if (tokenizer == nullptr) { throw std::logic_error("output session is empty"); }
+    if (decoder.terminal) { throw std::logic_error("output session is already terminal"); }
+    if (preview_ready) { throw std::logic_error("output session already has a preview"); }
     if (reason == FinishReason::None || reason == FinishReason::StopString ||
         reason == FinishReason::StopToken) {
         throw std::invalid_argument("invalid between-round terminal decoder reason");
     }
-    state->preview_decoder = state->decoder;
-    state->preview_output.clear();
-    terminalize(state->preview_decoder, state->policy, state->preview_output, 0);
-    state->preview_ready = true;
+    preview_decoder = decoder;
+    preview_output.clear();
+    terminalize(preview_decoder, policy, preview_output, 0);
+    preview_ready = true;
     return runtime::OutputDecision{.accepted_tokens = 0, .finish_reason = reason};
 }
 
 PublishedOutput OutputSession::commit_preview() noexcept {
-    if (state == nullptr || !state->preview_ready) { std::terminate(); }
+    if (tokenizer == nullptr || !preview_ready) { std::terminate(); }
     using std::swap;
-    swap(state->decoder, state->preview_decoder);
-    PublishedOutput output = std::move(state->preview_output);
-    state->preview_output.clear();
-    state->preview_ready = false;
+    swap(decoder, preview_decoder);
+    PublishedOutput output = std::move(preview_output);
+    preview_output.clear();
+    preview_ready = false;
     return output;
 }
 
 std::uint32_t OutputSession::reasoning_tokens() const noexcept {
-    return state != nullptr ? state->decoder.reasoning_tokens : 0;
+    return tokenizer != nullptr ? decoder.reasoning_tokens : 0;
 }
 
 Frontend::Frontend(std::shared_ptr<const FrontendState> state) noexcept : state(std::move(state)) {}
@@ -1015,8 +984,7 @@ OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,
     const PreparedPromptData& prepared = prompt.view();
     StopPolicy policy                  = merge_stop_policy(*state->tokenizer, caller_stop);
     if (output.raw) { policy.publish_stop_token = true; }
-    return OutputSession(std::make_unique<OutputSession::OutputSessionState>(
-        state->tokenizer, std::move(policy), output, prepared.starts_in_reasoning));
+    return OutputSession(state->tokenizer, std::move(policy), output, prepared.starts_in_reasoning);
 }
 
 const StopPolicy& Frontend::default_stop_policy() const noexcept { return state->defaults; }

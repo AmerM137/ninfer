@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <memory>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace ninfer::targets::qwen3_6 {
@@ -27,6 +28,21 @@ struct FrontendOptions {
 struct FrontendResources;
 class Frontend;
 class FrontendTestAccess;
+
+namespace frontend_internal {
+class Tokenizer;
+}
+
+struct OutputDecoderState {
+    std::string utf8_pending;
+    std::string think_marker_pending;
+    std::array<std::string, 2> stop_pending;
+    bool in_reasoning              = false;
+    bool strip_content_leading     = false;
+    bool terminal                  = false;
+    std::uint64_t decoded_bytes    = 0;
+    std::uint32_t reasoning_tokens = 0;
+};
 
 class PublishedOutput {
 public:
@@ -65,13 +81,13 @@ private:
 
 class OutputSession {
 public:
-    OutputSession() noexcept;
-    ~OutputSession();
-    OutputSession(OutputSession&&) noexcept;
-    OutputSession& operator=(OutputSession&&) noexcept;
+    ~OutputSession()                        = default;
+    OutputSession(OutputSession&&) noexcept = default;
 
+    OutputSession()                                = delete;
     OutputSession(const OutputSession&)            = delete;
     OutputSession& operator=(const OutputSession&) = delete;
+    OutputSession& operator=(OutputSession&&)      = delete;
 
     [[nodiscard]] runtime::OutputDecision preview(std::span<const TokenId> tokens,
                                                   std::uint32_t budget_remaining,
@@ -81,9 +97,16 @@ public:
     [[nodiscard]] std::uint32_t reasoning_tokens() const noexcept;
 
 private:
-    struct OutputSessionState;
-    explicit OutputSession(std::unique_ptr<OutputSessionState> state) noexcept;
-    std::unique_ptr<OutputSessionState> state;
+    OutputSession(std::shared_ptr<const frontend_internal::Tokenizer> tokenizer, StopPolicy policy,
+                  OutputOptions output, bool starts_in_reasoning) noexcept;
+
+    std::shared_ptr<const frontend_internal::Tokenizer> tokenizer;
+    StopPolicy policy;
+    bool preserve_special = false;
+    OutputDecoderState decoder;
+    OutputDecoderState preview_decoder;
+    PublishedOutput preview_output;
+    bool preview_ready = false;
 
     friend class Frontend;
 };
