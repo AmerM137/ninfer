@@ -140,28 +140,29 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
 
 } // namespace
 
-Qwen3_6_27BInstance::Qwen3_6_27BInstance(std::unique_ptr<Qwen3_6_27B::LoadedModel> stable_model,
+Qwen3_6_27BInstance::Qwen3_6_27BInstance(Qwen3_6_27B::LoadedModel&& loaded_model,
                                          const EngineOptions& options,
                                          runtime::KvCapacityResolution resolution,
                                          Qwen3_6_27B::SequencePlan sequence_plan,
                                          DeviceContext& device)
-    : model(std::move(stable_model)), frontend(Qwen3_6_27B::make_frontend(*model, options)),
+    : model(std::move(loaded_model)), frontend(Qwen3_6_27B::make_frontend(model, options)),
       kv_capacity_resolution(resolution),
       request_memory(device, sequence_plan.request_transient_capacity_bytes),
       capacity(sequence_plan.capacity),
-      program(Qwen3_6_27B::create_program(*model, std::move(sequence_plan), device)) {}
+      program(Qwen3_6_27B::create_program(model, std::move(sequence_plan), device)) {}
 
 Qwen3_6_27BInstance::~Qwen3_6_27BInstance() = default;
 
-Qwen3_6_35BA3BInstance::Qwen3_6_35BA3BInstance(
-    std::unique_ptr<Qwen3_6_35BA3B::LoadedModel> stable_model, const EngineOptions& options,
-    runtime::KvCapacityResolution resolution, Qwen3_6_35BA3B::SequencePlan sequence_plan,
-    DeviceContext& device)
-    : model(std::move(stable_model)), frontend(Qwen3_6_35BA3B::make_frontend(*model, options)),
+Qwen3_6_35BA3BInstance::Qwen3_6_35BA3BInstance(Qwen3_6_35BA3B::LoadedModel&& loaded_model,
+                                               const EngineOptions& options,
+                                               runtime::KvCapacityResolution resolution,
+                                               Qwen3_6_35BA3B::SequencePlan sequence_plan,
+                                               DeviceContext& device)
+    : model(std::move(loaded_model)), frontend(Qwen3_6_35BA3B::make_frontend(model, options)),
       kv_capacity_resolution(resolution),
       request_memory(device, sequence_plan.request_transient_capacity_bytes),
       capacity(sequence_plan.capacity),
-      program(Qwen3_6_35BA3B::create_program(*model, std::move(sequence_plan), device)) {}
+      program(Qwen3_6_35BA3B::create_program(model, std::move(sequence_plan), device)) {}
 
 Qwen3_6_35BA3BInstance::~Qwen3_6_35BA3BInstance() = default;
 

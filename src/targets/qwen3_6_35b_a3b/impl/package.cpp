@@ -25,6 +25,8 @@ const artifact::MaterializationPlan& LoadPlan::materialization() const {
 
 LoadedModel::LoadedModel(std::unique_ptr<LoadedModelData> data) noexcept : data(std::move(data)) {}
 
+LoadedModel::LoadedModel(LoadedModel&&) noexcept = default;
+
 LoadedModel::~LoadedModel() = default;
 
 } // namespace ninfer::targets::qwen3_6_35b_a3b::detail
@@ -70,13 +72,13 @@ Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptio
         detail::bind_artifact(binder, weights_profile, qwen3_6::startup_features(options))));
 }
 
-std::unique_ptr<Package::LoadedModel>
+Package::LoadedModel
 Package::construct_loaded_model(LoadPlan&& plan, artifact::MaterializedArtifact&& materialized) {
     if (plan.artifact == nullptr) { throw std::invalid_argument("target load plan is empty"); }
     auto artifact = std::move(plan.artifact);
     auto data     = std::make_unique<detail::LoadedModelData>(
         artifact->weights_profile, std::move(artifact->bindings), std::move(materialized));
-    return std::unique_ptr<LoadedModel>(new LoadedModel(std::move(data)));
+    return LoadedModel(std::move(data));
 }
 
 Package::Frontend Package::make_frontend(const LoadedModel& model, const EngineOptions& options) {

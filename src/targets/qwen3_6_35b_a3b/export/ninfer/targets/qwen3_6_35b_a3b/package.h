@@ -71,11 +71,12 @@ private:
 
 class LoadedModel {
 public:
+    // Movable into its final instance; Program retains references into data after that.
+    LoadedModel(LoadedModel&&) noexcept;
     ~LoadedModel();
 
     LoadedModel(const LoadedModel&)            = delete;
     LoadedModel& operator=(const LoadedModel&) = delete;
-    LoadedModel(LoadedModel&&)                 = delete;
     LoadedModel& operator=(LoadedModel&&)      = delete;
 
 private:
@@ -107,7 +108,7 @@ struct Package {
     [[nodiscard]] static WeightsProfile resolve_weights(const artifact::ArtifactIdentity& identity);
     [[nodiscard]] static LoadPlan plan_load(artifact::Binder& binder, const EngineOptions& options,
                                             WeightsProfile weights_profile);
-    [[nodiscard]] static std::unique_ptr<LoadedModel>
+    [[nodiscard]] static LoadedModel
     construct_loaded_model(LoadPlan&& plan, artifact::MaterializedArtifact&& materialized);
     [[nodiscard]] static Frontend make_frontend(const LoadedModel& model,
                                                 const EngineOptions& options);
