@@ -28,6 +28,8 @@ struct Package;
 namespace detail {
 
 struct Variant;
+struct ArtifactLoadPlan;
+struct LoadedModelData;
 
 enum class WeightsProfile : std::uint8_t {
     GroupwiseInt,
@@ -49,9 +51,8 @@ public:
     [[nodiscard]] const artifact::MaterializationPlan& materialization() const;
 
 private:
-    class Impl;
-    explicit LoadPlan(std::unique_ptr<Impl> impl) noexcept;
-    std::unique_ptr<Impl> impl_;
+    explicit LoadPlan(std::unique_ptr<ArtifactLoadPlan> artifact) noexcept;
+    std::unique_ptr<ArtifactLoadPlan> artifact;
 
     friend struct qwen3_6_35b_a3b::Package;
 };
@@ -66,9 +67,8 @@ public:
     LoadedModel& operator=(LoadedModel&&)      = delete;
 
 private:
-    class Impl;
-    explicit LoadedModel(std::unique_ptr<Impl> impl) noexcept;
-    std::unique_ptr<Impl> impl_;
+    explicit LoadedModel(std::unique_ptr<LoadedModelData> data) noexcept;
+    std::unique_ptr<LoadedModelData> data;
 
     friend struct qwen3_6_35b_a3b::Package;
 };

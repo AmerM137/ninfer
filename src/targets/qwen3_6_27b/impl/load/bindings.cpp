@@ -412,7 +412,7 @@ void validate_draft_ids(const artifact::Binder& binder, artifact::ObjectHandle h
 
 ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_profile,
                                qwen3_6::StartupFeatures features) {
-    ArtifactLoadPlan load_plan;
+    ArtifactLoadPlan load_plan{.weights_profile = weights_profile};
     BindingPlan& out = load_plan.bindings;
     out.frontend     = qwen3_6::bind_frontend_resources(binder);
     out.features     = features;
@@ -489,8 +489,9 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     return load_plan;
 }
 
-LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifact materialized)
-    : backing(std::move(materialized)) {
+LoadedModelData::LoadedModelData(WeightsProfile weights_profile, BindingPlan plan,
+                                 artifact::MaterializedArtifact materialized)
+    : weights_profile(weights_profile), backing(std::move(materialized)) {
     frontend = qwen3_6::take_frontend_resources(backing, plan.frontend);
 
     runtime.weights_arena = &backing.device_arena();

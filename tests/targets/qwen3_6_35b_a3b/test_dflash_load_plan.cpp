@@ -28,6 +28,8 @@ ninfer::targets::qwen3_6::StartupFeatures load_features(bool dflash) {
 } // namespace
 
 int main() {
+    constexpr auto weights_profile =
+        ninfer::targets::qwen3_6_35b_a3b::detail::WeightsProfile::GroupwiseInt;
     const std::filesystem::path path = artifact_path();
     if (!std::filesystem::is_regular_file(path)) {
         std::cerr << "skip: real 35B artifact is unavailable at " << path << '\n';
@@ -37,8 +39,8 @@ int main() {
     ninfer::artifact::Reader reader(path);
     {
         ninfer::artifact::Binder binder(reader);
-        const auto plan =
-            ninfer::targets::qwen3_6_35b_a3b::detail::bind_artifact(binder, load_features(false));
+        const auto plan = ninfer::targets::qwen3_6_35b_a3b::detail::bind_artifact(
+            binder, weights_profile, load_features(false));
         if (plan.materialization.object_count != 940 ||
             plan.materialization.device_objects.size() != 883 ||
             plan.materialization.host_objects.size() != 6 ||
@@ -51,8 +53,8 @@ int main() {
     }
     {
         ninfer::artifact::Binder binder(reader);
-        const auto plan =
-            ninfer::targets::qwen3_6_35b_a3b::detail::bind_artifact(binder, load_features(true));
+        const auto plan = ninfer::targets::qwen3_6_35b_a3b::detail::bind_artifact(
+            binder, weights_profile, load_features(true));
         if (plan.materialization.object_count != 940 ||
             plan.materialization.device_objects.size() != 586 ||
             plan.materialization.host_objects.size() != 6 ||

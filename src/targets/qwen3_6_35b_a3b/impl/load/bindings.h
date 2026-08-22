@@ -105,11 +105,13 @@ struct BindingPlan {
 };
 
 struct ArtifactLoadPlan {
+    WeightsProfile weights_profile;
     BindingPlan bindings;
     artifact::MaterializationPlan materialization;
 };
 
-ArtifactLoadPlan bind_artifact(artifact::Binder& binder, qwen3_6::StartupFeatures features);
+ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_profile,
+                               qwen3_6::StartupFeatures features);
 
 struct SparseMoePayload {
     ops::SparseMoeWeights op;
@@ -136,28 +138,19 @@ using MtpWeights           = RuntimeModelView::MtpLayer;
 using DFlashWeights        = RuntimeModelView::DFlash;
 using DFlashLayerWeights   = qwen3_6::DFlashLayerWeights;
 
-class LoadedModelData {
-public:
-    LoadedModelData(BindingPlan plan, artifact::MaterializedArtifact materialized);
+struct LoadedModelData {
+    LoadedModelData(WeightsProfile weights_profile, BindingPlan plan,
+                    artifact::MaterializedArtifact materialized);
 
     LoadedModelData(const LoadedModelData&)            = delete;
     LoadedModelData& operator=(const LoadedModelData&) = delete;
     LoadedModelData(LoadedModelData&&)                 = delete;
     LoadedModelData& operator=(LoadedModelData&&)      = delete;
 
+    WeightsProfile weights_profile;
     artifact::MaterializedArtifact backing;
     qwen3_6::FrontendResources frontend;
     RuntimeModelView runtime;
-};
-
-class LoadedModel::Impl {
-public:
-    Impl(WeightsProfile weights_profile_in, BindingPlan plan,
-         artifact::MaterializedArtifact materialized)
-        : weights_profile(weights_profile_in), data(std::move(plan), std::move(materialized)) {}
-
-    WeightsProfile weights_profile;
-    LoadedModelData data;
 };
 
 } // namespace ninfer::targets::qwen3_6_35b_a3b::detail
