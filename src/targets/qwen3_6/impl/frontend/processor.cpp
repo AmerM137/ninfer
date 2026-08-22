@@ -269,18 +269,18 @@ void enforce_media_resource_limits(const PreprocessStats& stats, const Processor
 // waiting for memory that this same request will never release.
 class ConcurrentMediaBudget {
 public:
-    explicit ConcurrentMediaBudget(const ProcessorOptions& options) : options_(options) {}
+    explicit ConcurrentMediaBudget(const ProcessorOptions& options) : options(options) {}
 
     void claim(const VisionItem& item) {
-        std::lock_guard lock(mutex_);
-        add_budget(stats_, item);
-        enforce_media_resource_limits(stats_, options_);
+        std::lock_guard lock(mutex);
+        add_budget(stats, item);
+        enforce_media_resource_limits(stats, options);
     }
 
 private:
-    const ProcessorOptions& options_;
-    std::mutex mutex_;
-    PreprocessStats stats_;
+    const ProcessorOptions& options;
+    std::mutex mutex;
+    PreprocessStats stats;
 };
 
 Prepared prepare_image(std::span<const std::uint8_t> bytes, const ProcessorOptions& options,
@@ -470,12 +470,10 @@ void add_budget(PreprocessStats& stats, const VisionItem& item) {
 
 void enforce_media_resource_limits(const PreprocessStats& stats, const ProcessorOptions& options) {
     if (stats.raw_patches > options.max_raw_patches) {
-        throw ProcessorError(ProcessorErrorKind::BudgetExceeded,
-                             "vision raw patches exceed processor budget");
+        throw MediaBudgetError("vision raw patches exceed processor budget");
     }
     if (stats.vision_tokens > options.max_vision_tokens) {
-        throw ProcessorError(ProcessorErrorKind::BudgetExceeded,
-                             "vision tokens exceed processor budget");
+        throw MediaBudgetError("vision tokens exceed processor budget");
     }
 }
 
@@ -610,46 +608,39 @@ EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat&
     return encoded;
 }
 
-Processor::Processor(const Tokenizer& tokenizer, const CompiledChatTemplate& chat_template,
-                     ProcessorOptions options, std::shared_ptr<MediaPreprocessCache> media_cache)
-    : tokenizer_(tokenizer), chat_template_(chat_template), options_(std::move(options)),
-      media_cache_(std::move(media_cache)) {
-    if (options_.max_encoded_media_bytes == 0 || options_.max_decoded_pixels == 0 ||
-        options_.max_decoded_video_pixels == 0 || options_.max_raw_patches == 0 ||
-        options_.max_vision_tokens == 0 || options_.image_min_pixels == 0 ||
-        options_.image_max_pixels < options_.image_min_pixels || options_.video_min_pixels == 0 ||
-        options_.video_max_pixels < options_.video_min_pixels || !(options_.video_fps > 0.0) ||
-        options_.video_min_frames <= 0 || options_.video_max_frames < options_.video_min_frames ||
-        options_.max_video_source_frames < options_.video_max_frames ||
-        !(options_.max_video_duration_seconds > 0.0)) {
+ProcessedInput process_multimodal_input(
+    const Tokenizer& tokenizer, const CompiledChatTemplate& chat_template, ProcessorOptions options,
+    std::shared_ptr<MediaPreprocessCache> media_cache, std::vector<ChatMessage> messages,
+    ChatRenderOptions render_options, const PreparationControl& control) {
+    if (options.max_encoded_media_bytes == 0 || options.max_decoded_pixels == 0 ||
+        options.max_decoded_video_pixels == 0 || options.max_raw_patches == 0 ||
+        options.max_vision_tokens == 0 || options.image_min_pixels == 0 ||
+        options.image_max_pixels < options.image_min_pixels || options.video_min_pixels == 0 ||
+        options.video_max_pixels < options.video_min_pixels || !(options.video_fps > 0.0) ||
+        options.video_min_frames <= 0 || options.video_max_frames < options.video_min_frames ||
+        options.max_video_source_frames < options.video_max_frames ||
+        !(options.max_video_duration_seconds > 0.0)) {
         throw std::invalid_argument("processor budgets must be positive");
     }
-    if (!media_cache_) { throw std::invalid_argument("processor media cache must not be null"); }
-    validate_special_token(tokenizer_, kImagePad, kImageToken);
-    validate_special_token(tokenizer_, kVideoPad, kVideoToken);
-}
-
-ProcessedInput Processor::process(std::vector<ChatMessage> messages,
-                                  ChatRenderOptions render_options,
-                                  const PreparationControl& control) const {
+    if (!media_cache) { throw std::invalid_argument("processor media cache must not be null"); }
+    validate_special_token(tokenizer, kImagePad, kImageToken);
+    validate_special_token(tokenizer, kVideoPad, kVideoToken);
     check_preparation_control(control);
     const std::vector<ChatPart*> parts = media_parts(messages);
     const std::uint64_t maximum_items_from_extents =
-        std::min(options_.max_raw_patches / kMinimumRawPatchesPerItem, options_.max_vision_tokens);
+        std::min(options.max_raw_patches / kMinimumRawPatchesPerItem, options.max_vision_tokens);
     if (std::cmp_greater(parts.size(), maximum_items_from_extents)) {
-        throw ProcessorError(ProcessorErrorKind::BudgetExceeded,
-                             "minimum Vision grids exceed processor extent budget");
+        throw MediaBudgetError("minimum Vision grids exceed processor extent budget");
     }
-    std::size_t remaining_media_bytes = options_.max_encoded_media_bytes;
+    std::size_t remaining_media_bytes = options.max_encoded_media_bytes;
     for (const ChatPart* part : parts) {
         if (part->media.bytes.size() > remaining_media_bytes) {
-            throw ProcessorError(ProcessorErrorKind::BudgetExceeded,
-                                 "request media bytes exceed processor budget");
+            throw MediaBudgetError("request media bytes exceed processor budget");
         }
         remaining_media_bytes -= part->media.bytes.size();
     }
-    MediaPreparationPermit request_permit = media_cache_->acquire_request(control);
-    RenderedChat rendered = chat_template_.render(messages, std::move(render_options));
+    MediaPreparationPermit request_permit = media_cache->acquire_request(control);
+    RenderedChat rendered = chat_template.render(messages, std::move(render_options));
     std::atomic<bool> stop_preparation{false};
     const PreparationControl worker_control{
         .deadline     = control.deadline,
@@ -657,11 +648,11 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
             [&stop_preparation] { return stop_preparation.load(std::memory_order_relaxed); }),
     };
     const media::decode::Policy policy{
-        .max_bytes                  = options_.max_encoded_media_bytes,
-        .max_decoded_pixels         = options_.max_decoded_pixels,
-        .max_decoded_video_pixels   = options_.max_decoded_video_pixels,
-        .max_video_source_frames    = options_.max_video_source_frames,
-        .max_video_duration_seconds = options_.max_video_duration_seconds,
+        .max_bytes                  = options.max_encoded_media_bytes,
+        .max_decoded_pixels         = options.max_decoded_pixels,
+        .max_decoded_video_pixels   = options.max_decoded_video_pixels,
+        .max_video_source_frames    = options.max_video_source_frames,
+        .max_video_duration_seconds = options.max_video_duration_seconds,
         .checkpoint = [&worker_control] { check_preparation_control(worker_control); },
     };
     ProcessedInput output;
@@ -669,11 +660,11 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
     items.reserve(parts.size());
     PreprocessStats stats;
     stats.media_items = parts.size();
-    stats.media_bytes = options_.max_encoded_media_bytes - remaining_media_bytes;
+    stats.media_bytes = options.max_encoded_media_bytes - remaining_media_bytes;
 
     std::vector<PendingMedia> pending_items;
     pending_items.reserve(parts.size());
-    ConcurrentMediaBudget request_budget(options_);
+    ConcurrentMediaBudget request_budget(options);
     std::exception_ptr preparation_error;
     const auto media_phase_started = Clock::now();
     for (ChatPart* part : parts) {
@@ -686,14 +677,15 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
                 .digest   = digest,
                 .modality = kind == ChatPartKind::Image ? Modality::Image : Modality::Video,
             };
-            PendingMedia pending = media_cache_->begin_prepare(
+            PendingMedia pending = media_cache->begin_prepare(
                 key, worker_control,
-                [this, part, kind, digest, &policy, &request_budget, &worker_control]() {
+                [part, kind, digest, &options, &policy, &request_budget, &worker_control,
+                 media_cache]() {
                     Prepared built =
                         kind == ChatPartKind::Image
-                            ? prepare_image(part->media.bytes, options_, policy, *media_cache_,
+                            ? prepare_image(part->media.bytes, options, policy, *media_cache,
                                             request_budget, worker_control)
-                            : prepare_video(part->media.bytes, options_, policy, *media_cache_,
+                            : prepare_video(part->media.bytes, options, policy, *media_cache,
                                             request_budget, worker_control);
                     built.item.content_digest = digest;
                     return PreparedMedia{std::move(built.item), std::move(built.payload)};
@@ -710,8 +702,8 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
     for (PendingMedia& pending : pending_items) {
         PreparedMedia media;
         try {
-            media = media_cache_->await(pending, preparation_error ? PreparationControl{} : control,
-                                        cache_stats);
+            media = media_cache->await(pending, preparation_error ? PreparationControl{} : control,
+                                       cache_stats);
         } catch (...) {
             if (!preparation_error) {
                 preparation_error = std::current_exception();
@@ -719,7 +711,7 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
             }
             MediaCacheRequestStats discarded;
             try {
-                (void)media_cache_->await(pending, {}, discarded);
+                (void)media_cache->await(pending, {}, discarded);
             } catch (...) {}
             continue;
         }
@@ -736,7 +728,7 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
         patch_cursor += item.patch_count;
         try {
             add_budget(stats, item);
-            enforce_media_resource_limits(stats, options_);
+            enforce_media_resource_limits(stats, options);
         } catch (...) {
             preparation_error = std::current_exception();
             stop_preparation.store(true, std::memory_order_relaxed);
@@ -752,7 +744,7 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
             std::rethrow_exception(preparation_error);
         } catch (const media::decode::Error& error) {
             if (error.kind() == media::decode::ErrorKind::BudgetExceeded) {
-                throw ProcessorError(ProcessorErrorKind::BudgetExceeded, error.what());
+                throw MediaBudgetError(error.what());
             }
             throw;
         }
@@ -767,7 +759,7 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
     check_preparation_control(control);
     rendered                    = expand_placeholders(std::move(rendered), items);
     const auto tokenize_started = Clock::now();
-    EncodedChat encoded         = encode_rendered_chat(tokenizer_, rendered);
+    EncodedChat encoded         = encode_rendered_chat(tokenizer, rendered);
     stats.tokenize_seconds = std::chrono::duration<double>(Clock::now() - tokenize_started).count();
     check_preparation_control(control, "tokenization");
     output.input_ids          = std::move(encoded.input_ids);
@@ -781,7 +773,7 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
         }
     }
     stats.prompt_tokens = output.input_ids.size();
-    enforce_media_resource_limits(stats, options_);
+    enforce_media_resource_limits(stats, options);
 
     stats.media_cache_hits              = cache_stats.hits;
     stats.media_cache_misses            = cache_stats.misses;

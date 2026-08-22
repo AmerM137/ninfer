@@ -210,12 +210,8 @@ fi::CompiledChatTemplate compile_chat_template(const FrontendResources& resource
     return fi::CompiledChatTemplate::resolve(resources.chat_template_jinja);
 }
 
-[[noreturn]] void throw_processor_error(const fi::ProcessorError& error) {
-    switch (error.kind()) {
-    case fi::ProcessorErrorKind::BudgetExceeded:
-        throw RequestError(RequestErrorKind::MediaBudgetExceeded, error.what());
-    }
-    throw std::logic_error("unknown Qwen3.6 processor error kind");
+[[noreturn]] void throw_media_budget_error(const fi::MediaBudgetError& error) {
+    throw RequestError(RequestErrorKind::MediaBudgetExceeded, error.what());
 }
 
 void validate_registered_tokenizer(const fi::Tokenizer& tokenizer) {
@@ -840,11 +836,12 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
 
     PreparedPromptData result;
     if (has_media) {
-        fi::Processor processor(*tokenizer, chat_template, processor_options, media_cache);
         fi::ProcessedInput processed;
         try {
-            processed = processor.process(std::move(messages), render_options(options), control);
-        } catch (const fi::ProcessorError& error) { throw_processor_error(error); }
+            processed = fi::process_multimodal_input(*tokenizer, chat_template, processor_options,
+                                                     media_cache, std::move(messages),
+                                                     render_options(options), control);
+        } catch (const fi::MediaBudgetError& error) { throw_media_budget_error(error); }
         result.token_ids.assign(processed.input_ids.begin(), processed.input_ids.end());
         result.token_types    = std::move(processed.token_types);
         result.positions      = std::move(processed.positions);
@@ -905,12 +902,12 @@ std::uint32_t Frontend::count_tokens(PromptInput input, const PreparationControl
         return count;
     }
 
-    fi::Processor processor(*tokenizer, chat_template, processor_options, media_cache);
     try {
         return checked_token_count(
-            processor.process(std::move(messages), render_options(options), control)
+            fi::process_multimodal_input(*tokenizer, chat_template, processor_options, media_cache,
+                                         std::move(messages), render_options(options), control)
                 .input_ids.size());
-    } catch (const fi::ProcessorError& error) { throw_processor_error(error); }
+    } catch (const fi::MediaBudgetError& error) { throw_media_budget_error(error); }
 }
 
 PromptCapabilities Frontend::prompt_capabilities() const noexcept {

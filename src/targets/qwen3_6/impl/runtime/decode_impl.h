@@ -21,10 +21,10 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
                                    sizeof(qwen3_6::OrdinaryDecodeIngress), cudaMemcpyHostToDevice,
                                    state.execution.device.stream));
 
-        TextContext card(state.execution.device, state.execution.model, state.execution.work, {},
-                         state.execution.linear_attention, state.execution.io,
-                         state.execution.prefill_hidden, state.execution.prefill_chunk, 0, {},
-                         &state.text_cache);
+        TextContext context(state.execution.device, state.execution.model, state.execution.work, {},
+                            state.execution.linear_attention, state.execution.io,
+                            state.execution.prefill_hidden, state.execution.prefill_chunk, 0, {},
+                            &state.text_cache);
 
         Tensor tokens          = ordinary.tokens.slice(0, 0, batch_size);
         Tensor cache_positions = ordinary.cache_positions.slice(0, 0, batch_size);
@@ -35,8 +35,8 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
         Tensor logits          = ordinary.logits.slice(1, 0, batch_size);
         Tensor sampled         = ordinary.sampled_tokens.slice(0, 0, batch_size);
 
-        card.ordinary_decode_batch(tokens, cache_positions, rope_positions, kv_rows, lanes,
-                                   envelope, hidden, logits);
+        context.ordinary_decode_batch(tokens, cache_positions, rope_positions, kv_rows, lanes,
+                                      envelope, hidden, logits);
         ops::scatter(hidden, lanes, state.continuation_hidden_store, state.execution.device.stream);
         ops::sample(logits, sampled, TextConfig::token_domain, ordinary.sampling, cache_positions,
                     ops::kSamplePurposeDecode, state.execution.work, state.execution.device.stream);

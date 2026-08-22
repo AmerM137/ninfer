@@ -13,26 +13,15 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
-#include <utility>
 #include <vector>
 
 namespace ninfer::targets::qwen3_6::frontend_internal {
 
 class MediaPreprocessCache;
 
-enum class ProcessorErrorKind {
-    BudgetExceeded,
-};
-
-class ProcessorError final : public std::runtime_error {
+class MediaBudgetError final : public std::runtime_error {
 public:
-    ProcessorError(ProcessorErrorKind kind, std::string message)
-        : std::runtime_error(std::move(message)), kind_(kind) {}
-
-    [[nodiscard]] ProcessorErrorKind kind() const noexcept { return kind_; }
-
-private:
-    ProcessorErrorKind kind_;
+    using std::runtime_error::runtime_error;
 };
 
 enum class Modality : std::uint8_t {
@@ -122,19 +111,9 @@ struct EncodedChat {
 
 EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat& rendered);
 
-class Processor {
-public:
-    Processor(const Tokenizer& tokenizer, const CompiledChatTemplate& chat_template,
-              ProcessorOptions options, std::shared_ptr<MediaPreprocessCache> media_cache);
-
-    ProcessedInput process(std::vector<ChatMessage> messages, ChatRenderOptions render_options = {},
-                           const PreparationControl& control = {}) const;
-
-private:
-    const Tokenizer& tokenizer_;
-    const CompiledChatTemplate& chat_template_;
-    ProcessorOptions options_;
-    std::shared_ptr<MediaPreprocessCache> media_cache_;
-};
+ProcessedInput process_multimodal_input(
+    const Tokenizer& tokenizer, const CompiledChatTemplate& chat_template, ProcessorOptions options,
+    std::shared_ptr<MediaPreprocessCache> media_cache, std::vector<ChatMessage> messages,
+    ChatRenderOptions render_options = {}, const PreparationControl& control = {});
 
 } // namespace ninfer::targets::qwen3_6::frontend_internal

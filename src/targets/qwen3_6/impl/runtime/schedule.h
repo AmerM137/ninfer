@@ -125,12 +125,12 @@ struct TargetVerifyFrameView {
     DFlashFeatureSink* feature_sink        = nullptr;
 };
 
-void configure_text_card(TextContext& card, const ExecutionCore& execution,
-                         const ops::SamplingConfig* sampling, std::int32_t current_state_slot,
-                         std::int32_t rewrite_checkpoint_state_slot,
-                         std::uint32_t mtp_proposal_extent);
+void configure_text_context(TextContext& context, const ExecutionCore& execution,
+                            const ops::SamplingConfig* sampling, std::int32_t current_state_slot,
+                            std::int32_t rewrite_checkpoint_state_slot,
+                            std::uint32_t mtp_proposal_extent);
 void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_store,
-                          TextContext& card, TargetVerifyFrameView frame,
+                          TextContext& context, TargetVerifyFrameView frame,
                           ops::GqaExecutionEnvelope envelope);
 
 [[nodiscard]] PrefillChunkResult prefill_text_chunk(

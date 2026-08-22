@@ -7,21 +7,21 @@
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
 
 void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_store,
-                          TextContext& card, TargetVerifyFrameView frame,
+                          TextContext& context, TargetVerifyFrameView frame,
                           ops::GqaExecutionEnvelope envelope) {
     if (frame.replay_records == nullptr) {
         throw std::logic_error("speculative target verify has no ReplaySSM record storage");
     }
-    card.set_gdn_state_action(GdnStateAction::RecordForReplay, frame.replay_records);
+    context.set_gdn_state_action(GdnStateAction::RecordForReplay, frame.replay_records);
     if (frame.feature_sink != nullptr) {
-        card.target_verify_batch(frame.ids, frame.cache_positions, frame.rope_positions,
-                                 frame.valid_columns, frame.kv_table_rows, frame.lanes, envelope,
-                                 frame.target_hidden, frame.target_logits, frame.target_tokens,
-                                 *frame.feature_sink);
+        context.target_verify_batch(frame.ids, frame.cache_positions, frame.rope_positions,
+                                    frame.valid_columns, frame.kv_table_rows, frame.lanes, envelope,
+                                    frame.target_hidden, frame.target_logits, frame.target_tokens,
+                                    *frame.feature_sink);
     } else {
-        card.target_verify_batch(frame.ids, frame.cache_positions, frame.rope_positions,
-                                 frame.valid_columns, frame.kv_table_rows, frame.lanes, envelope,
-                                 frame.target_hidden, frame.target_logits, frame.target_tokens);
+        context.target_verify_batch(frame.ids, frame.cache_positions, frame.rope_positions,
+                                    frame.valid_columns, frame.kv_table_rows, frame.lanes, envelope,
+                                    frame.target_hidden, frame.target_logits, frame.target_tokens);
     }
     ops::speculative_accept_greedy_drafts(frame.target_tokens, frame.target_logits, frame.drafts,
                                           frame.current_extents, frame.frontiers, frame.anchors,

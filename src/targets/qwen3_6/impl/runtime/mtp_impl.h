@@ -21,12 +21,12 @@ void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,
         throw std::invalid_argument("MTP bridge requires one three-axis rope position");
     }
     state.execution.work.reset();
-    TextContext card(state.execution.device, state.execution.model, state.execution.work,
-                     state.text_kv, state.execution.linear_attention, state.execution.io,
-                     state.execution.prefill_hidden, state.execution.prefill_chunk,
-                     state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache);
-    configure_text_card(card, state.execution, state.sampling, state.current_state_slot,
-                        state.rewrite_checkpoint_state_slot, state.mtp_proposal_extent);
+    TextContext context(state.execution.device, state.execution.model, state.execution.work,
+                        state.text_kv, state.execution.linear_attention, state.execution.io,
+                        state.execution.prefill_hidden, state.execution.prefill_chunk,
+                        state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache);
+    configure_text_context(context, state.execution, state.sampling, state.current_state_slot,
+                           state.rewrite_checkpoint_state_slot, state.mtp_proposal_extent);
 
     Tensor position_view = state.execution.io.mtp->target_positions.slice(0, 0, 1);
     ops::set_i32_scalar(position_view, position, state.execution.device.stream);
@@ -39,9 +39,10 @@ void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,
                                state.execution.device.stream));
     const auto bridge_visible = static_cast<std::uint32_t>(position + 1);
     const ops::GqaExecutionEnvelope bridge_envelope{bridge_visible, bridge_visible};
-    card.mtp_forward_batch(next_token, previous_hidden, position_view, bridge_envelope, mtp_hidden,
-                           build_proposal ? 0 : -1, build_proposal ? &logits : nullptr,
-                           build_proposal ? &draft0 : nullptr, &rope_position_view, next_embedding);
+    context.mtp_forward_batch(
+        next_token, previous_hidden, position_view, bridge_envelope, mtp_hidden,
+        build_proposal ? 0 : -1, build_proposal ? &logits : nullptr,
+        build_proposal ? &draft0 : nullptr, &rope_position_view, next_embedding);
     if (!build_proposal) { return; }
 
     if (state.mtp_proposal_extent == 0 ||
@@ -58,8 +59,8 @@ void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,
         Tensor next_hidden    = state.execution.prefill_hidden.slice(1, i, 1);
         const auto visible    = static_cast<std::uint32_t>(position + i + 1);
         const ops::GqaExecutionEnvelope envelope{visible, visible};
-        card.mtp_forward_ar_step(previous_token, state.execution.io.mtp->ar_hidden, ar_position,
-                                 envelope, next_hidden, logits, next_draft);
+        context.mtp_forward_ar_step(previous_token, state.execution.io.mtp->ar_hidden, ar_position,
+                                    envelope, next_hidden, logits, next_draft);
         CUDA_CHECK(cudaMemcpyAsync(state.execution.io.mtp->ar_hidden.data, next_hidden.data,
                                    state.execution.io.mtp->ar_hidden.bytes(),
                                    cudaMemcpyDeviceToDevice, state.execution.device.stream));
@@ -81,10 +82,10 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
                                    sizeof(qwen3_6::MtpDecodeIngress), cudaMemcpyHostToDevice,
                                    state.execution.device.stream));
 
-        TextContext card(state.execution.device, state.execution.model, state.execution.work, {},
-                         state.execution.linear_attention, state.execution.io,
-                         state.execution.prefill_hidden, state.execution.prefill_chunk, 0, {},
-                         &state.text_cache, &state.mtp_cache);
+        TextContext context(state.execution.device, state.execution.model, state.execution.work, {},
+                            state.execution.linear_attention, state.execution.io,
+                            state.execution.prefill_hidden, state.execution.prefill_chunk, 0, {},
+                            &state.text_cache, &state.mtp_cache);
         Tensor anchors           = frame.anchors.slice(0, 0, batch_size);
         Tensor frontiers         = frame.base_frontiers.slice(0, 0, batch_size);
         Tensor budgets           = frame.remaining_budgets.slice(0, 0, batch_size);
@@ -118,7 +119,7 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
         ops::speculative_prepare_verify_inputs(anchors, current_drafts, frontiers, current_extents,
                                                verify_ids, target_positions,
                                                state.execution.device.stream);
-        target_verify_accept(state.execution, state.continuation_hidden_store, card,
+        target_verify_accept(state.execution, state.continuation_hidden_store, context,
                              TargetVerifyFrameView{
                                  .ids             = verify_ids,
                                  .cache_positions = target_positions,
@@ -147,14 +148,15 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
                                     ar_positions, ar_rope_positions, ar_valid_columns,
                                     static_cast<std::int32_t>(state.text_cache.max_context()),
                                     state.execution.device.stream);
-        card.mtp_forward_decode_batch(alignment_ids, target_hidden, target_positions, target_rope,
-                                      licensed_counts, mtp_rows, envelopes.batch, alignment_hidden);
+        context.mtp_forward_decode_batch(alignment_ids, target_hidden, target_positions,
+                                         target_rope, licensed_counts, mtp_rows, envelopes.batch,
+                                         alignment_hidden);
         ops::speculative_select_accepted_hidden(alignment_hidden, accepted, ar_hidden,
                                                 state.execution.device.stream);
 
         Tensor proposal_logits = frame.proposal_logits.slice(1, 0, batch_size);
         Tensor draft0          = next_drafts.slice(1, 0, 1).view({batch_size});
-        card.mtp_propose_batch(ar_hidden, proposal_logits, draft0);
+        context.mtp_propose_batch(ar_hidden, proposal_logits, draft0);
         for (std::uint32_t step = 0; step + 1 < k; ++step) {
             Tensor previous =
                 next_drafts.slice(1, static_cast<std::int32_t>(step), 1).view({batch_size});
@@ -169,9 +171,9 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
             Tensor previous_batch    = previous.view({1, batch_size});
             Tensor hidden_batch      = ar_hidden.view({TextConfig::hidden, 1, batch_size});
             Tensor next_hidden_batch = next_hidden.view({TextConfig::hidden, 1, batch_size});
-            card.mtp_forward_decode_batch(previous_batch, hidden_batch, position, rope, valid,
-                                          mtp_rows, envelopes.ar[step], next_hidden_batch);
-            card.mtp_propose_batch(next_hidden, proposal_logits, next);
+            context.mtp_forward_decode_batch(previous_batch, hidden_batch, position, rope, valid,
+                                             mtp_rows, envelopes.ar[step], next_hidden_batch);
+            context.mtp_propose_batch(next_hidden, proposal_logits, next);
             CUDA_CHECK(cudaMemcpyAsync(ar_hidden.data, next_hidden.data, ar_hidden.bytes(),
                                        cudaMemcpyDeviceToDevice, state.execution.device.stream));
         }

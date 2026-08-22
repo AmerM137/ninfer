@@ -44,7 +44,7 @@ public:
     std::string decode_token_bytes(int id, bool skip_special_tokens = false) const;
 
     [[nodiscard]] const std::vector<int>& default_stop_token_ids() const noexcept {
-        return default_stop_token_ids_;
+        return default_stop_ids;
     }
 
     [[nodiscard]] bool is_special_token(int id) const noexcept;
@@ -52,14 +52,13 @@ public:
     [[nodiscard]] bool has_exact_token_domain(std::size_t size) const noexcept;
 
 private:
-    std::vector<std::string> id_to_token_;
-    std::vector<bool> valid_token_ids_;
-    std::unordered_map<std::string, int> vocab_token_to_id_;
-    std::unordered_map<std::string, int> bpe_merge_ranks_;
-    bool has_bpe_merges_ = true;
-    std::vector<AddedToken> added_tokens_;
-    std::array<std::vector<std::size_t>, 256> added_token_candidates_;
-    std::vector<int> default_stop_token_ids_;
+    std::vector<std::string> id_to_token;
+    std::vector<bool> valid_token_ids;
+    std::unordered_map<std::string, int> vocab_token_to_id;
+    std::unordered_map<std::string, int> bpe_merge_ranks;
+    std::vector<AddedToken> added_tokens;
+    std::array<std::vector<std::size_t>, 256> added_token_candidates;
+    std::vector<int> default_stop_ids;
 };
 
 } // namespace ninfer::targets::qwen3_6::frontend_internal

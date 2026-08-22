@@ -9,7 +9,6 @@
 #include <ninfer/targets/qwen3_6/vision_control.h>
 #include "runtime/contract/transient_region.h"
 
-#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -23,22 +22,6 @@ struct VisionItemView {
     const qwen3_6::VisionItemControl* control = nullptr;
 };
 
-struct VisionScheduleConfig {
-    static constexpr int layers              = VisionConfig::layers;
-    static constexpr int hidden              = VisionConfig::hidden;
-    static constexpr int intermediate        = VisionConfig::intermediate;
-    static constexpr int out_hidden          = VisionConfig::output_hidden;
-    static constexpr int heads               = VisionConfig::heads;
-    static constexpr int head_dim            = VisionConfig::head_dim;
-    static constexpr int patch_dim           = VisionConfig::patch_dim;
-    static constexpr int merge_unit          = VisionConfig::merge_unit;
-    static constexpr int merger_hidden       = VisionConfig::merger_hidden;
-    static constexpr int position_embeddings = VisionConfig::position_embeddings;
-    static constexpr int rotary_dim          = VisionConfig::rotary_dim;
-    static constexpr float rope_theta        = VisionConfig::rope_theta;
-    static constexpr float norm_eps          = VisionConfig::norm_epsilon;
-};
-
 class VisionContext {
 public:
     VisionContext(DeviceContext& device, const LoadedModelData& model);
@@ -50,36 +33,8 @@ public:
     void encode(const VisionItemView& item, Tensor& output, WorkspaceArena& workspace) const;
 
 private:
-    struct BlockW {
-        const Tensor* norm1_weight    = nullptr;
-        const Tensor* norm1_bias      = nullptr;
-        const Weight* qkv             = nullptr;
-        const Tensor* qkv_bias        = nullptr;
-        const Weight* projection      = nullptr;
-        const Tensor* projection_bias = nullptr;
-        const Tensor* norm2_weight    = nullptr;
-        const Tensor* norm2_bias      = nullptr;
-        const Weight* fc1             = nullptr;
-        const Tensor* fc1_bias        = nullptr;
-        const Weight* fc2             = nullptr;
-        const Tensor* fc2_bias        = nullptr;
-    };
-
-    struct MergerW {
-        const Tensor* norm_weight = nullptr;
-        const Tensor* norm_bias   = nullptr;
-        const Weight* fc1         = nullptr;
-        const Tensor* fc1_bias    = nullptr;
-        const Weight* fc2         = nullptr;
-        const Tensor* fc2_bias    = nullptr;
-    };
-
-    DeviceContext& ctx_;
-    const Weight* patch_embed_      = nullptr;
-    const Tensor* patch_embed_bias_ = nullptr;
-    const Tensor* position_embed_   = nullptr;
-    std::array<BlockW, VisionScheduleConfig::layers> blocks_{};
-    MergerW merger_{};
+    DeviceContext& device;
+    const VisionWeights& vision;
 };
 
 struct VisionChunk {
@@ -99,15 +54,15 @@ public:
     [[nodiscard]] double elapsed_seconds() const;
 
 private:
-    DeviceContext& device_;
-    WorkspaceArena& workspace_;
-    qwen3_6::PreparedPromptData& prompt_;
-    const VisionPrefillPlan& plan_;
-    runtime::TransientRegion transient_;
-    VisionContext context_;
-    std::optional<std::uint32_t> active_item_;
-    std::vector<std::uint32_t> encoded_payloads_pending_release_;
-    std::vector<CudaEventTimer> timers_;
+    DeviceContext& device;
+    WorkspaceArena& workspace;
+    qwen3_6::PreparedPromptData& prompt;
+    const VisionPrefillPlan& plan;
+    runtime::TransientRegion transient;
+    VisionContext context;
+    std::optional<std::uint32_t> active_item;
+    std::vector<std::uint32_t> encoded_payloads_pending_release;
+    std::vector<CudaEventTimer> timers;
 };
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule

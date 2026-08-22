@@ -284,12 +284,10 @@ bool throws_invalid_argument(Callable&& callable) {
 }
 
 template <class Callable>
-bool throws_processor_budget(Callable&& callable) {
+bool throws_media_budget(Callable&& callable) {
     try {
         callable();
-    } catch (const fi::ProcessorError& error) {
-        return error.kind() == fi::ProcessorErrorKind::BudgetExceeded;
-    }
+    } catch (const fi::MediaBudgetError&) { return true; }
     return false;
 }
 
@@ -892,8 +890,6 @@ int test_media_admission_uses_aggregate_resources(const Frontend& frontend) {
     options.max_encoded_media_bytes = bytes.size() * 2 - 1;
     auto cache = std::make_shared<fi::MediaPreprocessCache>(ninfer::kDefaultMediaCacheBytes,
                                                             ninfer::kDefaultMediaLiveBytes);
-    fi::Processor processor(official_tokenizer(), thinking_toggle_template(), options,
-                            std::move(cache));
     fi::ChatMessage internal_message;
     internal_message.role = ninfer::ChatRole::User;
     for (std::size_t index = 0; index < 2; ++index) {
@@ -902,8 +898,10 @@ int test_media_admission_uses_aggregate_resources(const Frontend& frontend) {
                                               .media_type  = "image/x-portable-pixmap",
                                               .source_name = "byte-budget.ppm"}));
     }
-    failures += check(throws_processor_budget([&] {
-                          (void)processor.process(std::vector<fi::ChatMessage>{internal_message});
+    failures += check(throws_media_budget([&] {
+                          (void)fi::process_multimodal_input(
+                              official_tokenizer(), thinking_toggle_template(), options, cache,
+                              std::vector<fi::ChatMessage>{internal_message});
                       }),
                       "processor did not enforce the aggregate encoded-media byte budget");
     return failures;

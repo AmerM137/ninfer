@@ -35,20 +35,20 @@ DFlashFeatureSink make_dflash_prefill_sink(PrefillContext& state) {
 
 } // namespace
 
-void configure_text_card(TextContext& card, const ExecutionCore& execution,
-                         const ops::SamplingConfig* sampling, std::int32_t current_state_slot,
-                         std::int32_t rewrite_checkpoint_state_slot,
-                         std::uint32_t mtp_proposal_extent) {
-    card.set_sampling(sampling);
-    card.set_linear_state_slots(current_state_slot, rewrite_checkpoint_state_slot);
-    card.set_gdn_state_action(GdnStateAction::UpdateInPlace, nullptr);
-    card.set_mtp_proposal_extent(mtp_proposal_extent);
+void configure_text_context(TextContext& context, const ExecutionCore& execution,
+                            const ops::SamplingConfig* sampling, std::int32_t current_state_slot,
+                            std::int32_t rewrite_checkpoint_state_slot,
+                            std::uint32_t mtp_proposal_extent) {
+    context.set_sampling(sampling);
+    context.set_linear_state_slots(current_state_slot, rewrite_checkpoint_state_slot);
+    context.set_gdn_state_action(GdnStateAction::UpdateInPlace, nullptr);
+    context.set_mtp_proposal_extent(mtp_proposal_extent);
     if (execution.proposal_head == ProposalHead::Full) {
-        card.set_proposal_head(nullptr, nullptr, 0);
+        context.set_proposal_head(nullptr, nullptr, 0);
         return;
     }
-    if (card.proposal_head() == nullptr || card.proposal_head_ids() == nullptr ||
-        card.proposal_head_n() <= 0) {
+    if (context.proposal_head() == nullptr || context.proposal_head_ids() == nullptr ||
+        context.proposal_head_count() <= 0) {
         throw std::runtime_error("optimized proposal head is unavailable");
     }
 }
@@ -56,24 +56,24 @@ void configure_text_card(TextContext& card, const ExecutionCore& execution,
 PrefillChunkResult prefill_text_chunk(
     PrefillContext& state, std::span<const TokenId> ids, std::uint32_t nominal_length,
     std::optional<std::uint32_t> rewrite_checkpoint_capture_frontier, bool finalize_at_end) {
-    TextContext card(state.execution.device, state.execution.model, state.execution.work,
-                     state.text_kv, state.execution.linear_attention, state.execution.io,
-                     state.execution.prefill_hidden, state.execution.prefill_chunk,
-                     state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache);
-    configure_text_card(card, state.execution, state.sampling, state.current_state_slot,
-                        state.rewrite_checkpoint_state_slot, state.mtp_proposal_extent);
-    card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
-    card.set_prefill_rewrite_checkpoint_frontier(
+    TextContext context(state.execution.device, state.execution.model, state.execution.work,
+                        state.text_kv, state.execution.linear_attention, state.execution.io,
+                        state.execution.prefill_hidden, state.execution.prefill_chunk,
+                        state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache);
+    configure_text_context(context, state.execution, state.sampling, state.current_state_slot,
+                           state.rewrite_checkpoint_state_slot, state.mtp_proposal_extent);
+    context.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
+    context.set_prefill_rewrite_checkpoint_frontier(
         rewrite_checkpoint_capture_frontier
             ? static_cast<std::int64_t>(*rewrite_checkpoint_capture_frontier)
             : -1);
     const std::span<const int> prompt(ids.data(), ids.size());
     if (state.dflash != nullptr) {
         DFlashFeatureSink sink = make_dflash_prefill_sink(state);
-        return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, finalize_at_end,
-                                  sink);
+        return context.prefill_chunk(prompt, state.text_kv_base, nominal_length, finalize_at_end,
+                                     sink);
     }
-    return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, finalize_at_end);
+    return context.prefill_chunk(prompt, state.text_kv_base, nominal_length, finalize_at_end);
 }
 
 PrefillChunkResult
@@ -84,18 +84,19 @@ prefill_multimodal_chunk(PrefillContext& state, const PreparedPromptData& prompt
     if (state.dflash != nullptr) {
         throw std::logic_error("DFlash staged multimodal prefill is unavailable");
     }
-    TextContext card(state.execution.device, state.execution.model, state.execution.work,
-                     state.text_kv, state.execution.linear_attention, state.execution.io,
-                     state.execution.prefill_hidden, state.execution.prefill_chunk,
-                     state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache);
-    configure_text_card(card, state.execution, state.sampling, state.current_state_slot,
-                        state.rewrite_checkpoint_state_slot, state.mtp_proposal_extent);
-    card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
-    card.set_prefill_rewrite_checkpoint_frontier(
+    TextContext context(state.execution.device, state.execution.model, state.execution.work,
+                        state.text_kv, state.execution.linear_attention, state.execution.io,
+                        state.execution.prefill_hidden, state.execution.prefill_chunk,
+                        state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache);
+    configure_text_context(context, state.execution, state.sampling, state.current_state_slot,
+                           state.rewrite_checkpoint_state_slot, state.mtp_proposal_extent);
+    context.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
+    context.set_prefill_rewrite_checkpoint_frontier(
         rewrite_checkpoint_capture_frontier
             ? static_cast<std::int64_t>(*rewrite_checkpoint_capture_frontier)
             : -1);
-    return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, vision, finalize_at_end);
+    return context.prefill_chunk(prompt, state.text_kv_base, nominal_length, vision,
+                                 finalize_at_end);
 }
 
 void mtp_bridge_multimodal(PrefillContext& state, const PreparedPromptData& prompt,
