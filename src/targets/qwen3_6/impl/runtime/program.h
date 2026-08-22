@@ -309,20 +309,15 @@ inline CaptureAssessment::CaptureAssessment()
     : implementation(std::make_shared<detail::CaptureAssessmentImpl>()) {}
 
 template <>
+void detail::AdmissionCandidateImplDeleter<NINFER_QWEN36_VARIANT>::operator()(
+    detail::AdmissionCandidateImpl<NINFER_QWEN36_VARIANT>* impl) const noexcept {
+    delete impl;
+}
+
+template <>
 AdmissionCandidate<NINFER_QWEN36_VARIANT>::AdmissionCandidate(
     std::unique_ptr<detail::AdmissionCandidateImpl<NINFER_QWEN36_VARIANT>> impl) noexcept
-    : impl_(std::move(impl)) {}
-
-template <>
-AdmissionCandidate<NINFER_QWEN36_VARIANT>::AdmissionCandidate(AdmissionCandidate&&) noexcept =
-    default;
-
-template <>
-AdmissionCandidate<NINFER_QWEN36_VARIANT>&
-AdmissionCandidate<NINFER_QWEN36_VARIANT>::operator=(AdmissionCandidate&&) noexcept = default;
-
-template <>
-AdmissionCandidate<NINFER_QWEN36_VARIANT>::~AdmissionCandidate() = default;
+    : impl_(impl.release()) {}
 
 template <>
 const runtime::RequestPlanSummary&

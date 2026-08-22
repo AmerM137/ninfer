@@ -13,16 +13,33 @@ namespace ninfer::targets::qwen3_6 {
 using detail::NINFER_QWEN36_RUNTIME_NS::Variant;
 
 template <>
-SequencePlan<Variant>::SequencePlan(
-    std::unique_ptr<detail::SequencePlanImpl<Variant>> impl) noexcept
-    : impl_(std::move(impl)) {}
+void detail::SequencePlanImplDeleter<Variant>::operator()(
+    detail::SequencePlanImpl<Variant>* impl) const noexcept {
+    delete impl;
+}
 
 template <>
-SequencePlan<Variant>::SequencePlan(SequencePlan&&) noexcept = default;
+void detail::SequencePlannerImplDeleter<Variant>::operator()(
+    detail::SequencePlannerImpl<Variant>* impl) const noexcept {
+    delete impl;
+}
+
 template <>
-SequencePlan<Variant>& SequencePlan<Variant>::operator=(SequencePlan&&) noexcept = default;
+void detail::RequestBasePlanImplDeleter<Variant>::operator()(
+    detail::RequestBasePlanImpl<Variant>* impl) const noexcept {
+    delete impl;
+}
+
 template <>
-SequencePlan<Variant>::~SequencePlan() = default;
+void detail::PressurePlanningSessionImplDeleter<Variant>::operator()(
+    detail::PressurePlanningSessionImpl<Variant>* impl) const noexcept {
+    delete impl;
+}
+
+template <>
+SequencePlan<Variant>::SequencePlan(
+    std::unique_ptr<detail::SequencePlanImpl<Variant>> impl) noexcept
+    : impl_(impl.release()) {}
 
 template <>
 std::uint32_t SequencePlan<Variant>::capacity() const noexcept {
@@ -52,14 +69,7 @@ std::size_t SequencePlan<Variant>::workspace_capacity_bytes() const noexcept {
 template <>
 SequencePlanner<Variant>::SequencePlanner(
     std::unique_ptr<detail::SequencePlannerImpl<Variant>> impl) noexcept
-    : impl_(std::move(impl)) {}
-
-template <>
-SequencePlanner<Variant>::SequencePlanner(SequencePlanner&&) noexcept = default;
-template <>
-SequencePlanner<Variant>& SequencePlanner<Variant>::operator=(SequencePlanner&&) noexcept = default;
-template <>
-SequencePlanner<Variant>::~SequencePlanner() = default;
+    : impl_(impl.release()) {}
 
 template <>
 const runtime::SequenceCapacityCurve& SequencePlanner<Variant>::capacity_curve() const noexcept {
@@ -70,21 +80,15 @@ const runtime::SequenceCapacityCurve& SequencePlanner<Variant>::capacity_curve()
 template <>
 SequencePlan<Variant> SequencePlanner<Variant>::finalize(std::uint32_t main_page_groups) && {
     if (impl_ == nullptr) { throw std::logic_error("sequence planner is empty"); }
+    std::unique_ptr<detail::SequencePlannerImpl<Variant>> impl(impl_.release());
     return SequencePlan<Variant>(detail::NINFER_QWEN36_RUNTIME_NS::finalize_sequence_plan_impl(
-        std::move(impl_), main_page_groups));
+        std::move(impl), main_page_groups));
 }
 
 template <>
 RequestBasePlan<Variant>::RequestBasePlan(
     std::unique_ptr<detail::RequestBasePlanImpl<Variant>> impl) noexcept
-    : impl_(std::move(impl)) {}
-
-template <>
-RequestBasePlan<Variant>::RequestBasePlan(RequestBasePlan&&) noexcept = default;
-template <>
-RequestBasePlan<Variant>& RequestBasePlan<Variant>::operator=(RequestBasePlan&&) noexcept = default;
-template <>
-RequestBasePlan<Variant>::~RequestBasePlan() = default;
+    : impl_(impl.release()) {}
 
 template <>
 const runtime::RequestPlanSummary& RequestBasePlan<Variant>::summary() const noexcept {
@@ -114,18 +118,7 @@ RequestBasePlan<Variant>::prefix_shortlist_key(std::uint32_t frontier) const noe
 template <>
 PressurePlanningSession<Variant>::PressurePlanningSession(
     std::unique_ptr<detail::PressurePlanningSessionImpl<Variant>> impl) noexcept
-    : impl_(std::move(impl)) {}
-
-template <>
-PressurePlanningSession<Variant>::PressurePlanningSession(PressurePlanningSession&&) noexcept =
-    default;
-
-template <>
-PressurePlanningSession<Variant>&
-PressurePlanningSession<Variant>::operator=(PressurePlanningSession&&) noexcept = default;
-
-template <>
-PressurePlanningSession<Variant>::~PressurePlanningSession() = default;
+    : impl_(impl.release()) {}
 
 template <>
 PressureTargetHandle PressurePlanningSession<Variant>::identity_target(

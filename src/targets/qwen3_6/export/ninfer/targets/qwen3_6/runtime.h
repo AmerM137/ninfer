@@ -119,6 +119,30 @@ template <class Variant>
 class ProgramImpl;
 template <class Variant>
 struct RuntimeContractAccess;
+
+// Empty custom deleters keep these owning wrappers pointer-sized while allowing their special
+// members to be compiler-generated in this incomplete-type header. Exact packages define the
+// deletion operations beside each corresponding complete Impl specialization.
+template <class Variant>
+struct SequencePlanImplDeleter {
+    void operator()(SequencePlanImpl<Variant>* impl) const noexcept;
+};
+template <class Variant>
+struct SequencePlannerImplDeleter {
+    void operator()(SequencePlannerImpl<Variant>* impl) const noexcept;
+};
+template <class Variant>
+struct RequestBasePlanImplDeleter {
+    void operator()(RequestBasePlanImpl<Variant>* impl) const noexcept;
+};
+template <class Variant>
+struct AdmissionCandidateImplDeleter {
+    void operator()(AdmissionCandidateImpl<Variant>* impl) const noexcept;
+};
+template <class Variant>
+struct PressurePlanningSessionImplDeleter {
+    void operator()(PressurePlanningSessionImpl<Variant>* impl) const noexcept;
+};
 } // namespace detail
 
 template <class Variant>
@@ -133,9 +157,9 @@ class PressurePlanningSession;
 template <class Variant>
 class SequencePlan {
 public:
-    SequencePlan(SequencePlan&&) noexcept;
-    SequencePlan& operator=(SequencePlan&&) noexcept;
-    ~SequencePlan();
+    SequencePlan(SequencePlan&&) noexcept = default;
+    SequencePlan& operator=(SequencePlan&&) noexcept = default;
+    ~SequencePlan()                                  = default;
 
     SequencePlan(const SequencePlan&)            = delete;
     SequencePlan& operator=(const SequencePlan&) = delete;
@@ -149,7 +173,8 @@ public:
 public:
     // Family-private construction/storage seam; exact packages expose only the completed alias.
     explicit SequencePlan(std::unique_ptr<detail::SequencePlanImpl<Variant>> impl) noexcept;
-    std::unique_ptr<detail::SequencePlanImpl<Variant>> impl_;
+    std::unique_ptr<detail::SequencePlanImpl<Variant>, detail::SequencePlanImplDeleter<Variant>>
+        impl_;
 
     template <class V>
     friend class SequencePlanner;
@@ -160,9 +185,9 @@ public:
 template <class Variant>
 class SequencePlanner {
 public:
-    SequencePlanner(SequencePlanner&&) noexcept;
-    SequencePlanner& operator=(SequencePlanner&&) noexcept;
-    ~SequencePlanner();
+    SequencePlanner(SequencePlanner&&) noexcept = default;
+    SequencePlanner& operator=(SequencePlanner&&) noexcept = default;
+    ~SequencePlanner()                                     = default;
 
     SequencePlanner(const SequencePlanner&)            = delete;
     SequencePlanner& operator=(const SequencePlanner&) = delete;
@@ -172,7 +197,9 @@ public:
 
 public:
     explicit SequencePlanner(std::unique_ptr<detail::SequencePlannerImpl<Variant>> impl) noexcept;
-    std::unique_ptr<detail::SequencePlannerImpl<Variant>> impl_;
+    std::unique_ptr<detail::SequencePlannerImpl<Variant>,
+                    detail::SequencePlannerImplDeleter<Variant>>
+        impl_;
 
     template <class V>
     friend SequencePlanner<V> make_sequence_planner(DeviceContext&, const EngineOptions&,
@@ -182,9 +209,9 @@ public:
 template <class Variant>
 class RequestBasePlan {
 public:
-    RequestBasePlan(RequestBasePlan&&) noexcept;
-    RequestBasePlan& operator=(RequestBasePlan&&) noexcept;
-    ~RequestBasePlan();
+    RequestBasePlan(RequestBasePlan&&) noexcept = default;
+    RequestBasePlan& operator=(RequestBasePlan&&) noexcept = default;
+    ~RequestBasePlan()                                     = default;
 
     RequestBasePlan(const RequestBasePlan&)            = delete;
     RequestBasePlan& operator=(const RequestBasePlan&) = delete;
@@ -196,15 +223,17 @@ public:
 
 public:
     explicit RequestBasePlan(std::unique_ptr<detail::RequestBasePlanImpl<Variant>> impl) noexcept;
-    std::unique_ptr<detail::RequestBasePlanImpl<Variant>> impl_;
+    std::unique_ptr<detail::RequestBasePlanImpl<Variant>,
+                    detail::RequestBasePlanImplDeleter<Variant>>
+        impl_;
 };
 
 template <class Variant>
 class AdmissionCandidate {
 public:
-    AdmissionCandidate(AdmissionCandidate&&) noexcept;
-    AdmissionCandidate& operator=(AdmissionCandidate&&) noexcept;
-    ~AdmissionCandidate();
+    AdmissionCandidate(AdmissionCandidate&&) noexcept = default;
+    AdmissionCandidate& operator=(AdmissionCandidate&&) noexcept = default;
+    ~AdmissionCandidate()                                  = default;
 
     AdmissionCandidate(const AdmissionCandidate&)            = delete;
     AdmissionCandidate& operator=(const AdmissionCandidate&) = delete;
@@ -218,7 +247,9 @@ public:
     // Engine code can inspect summary() but not target planning state.
     explicit AdmissionCandidate(
         std::unique_ptr<detail::AdmissionCandidateImpl<Variant>> impl) noexcept;
-    std::unique_ptr<detail::AdmissionCandidateImpl<Variant>> impl_;
+    std::unique_ptr<detail::AdmissionCandidateImpl<Variant>,
+                    detail::AdmissionCandidateImplDeleter<Variant>>
+        impl_;
 
     friend class Program<Variant>;
     friend class PressurePlanningSession<Variant>;
@@ -401,9 +432,9 @@ struct PressureExpansionView {
 template <class Variant>
 class PressurePlanningSession {
 public:
-    PressurePlanningSession(PressurePlanningSession&&) noexcept;
-    PressurePlanningSession& operator=(PressurePlanningSession&&) noexcept;
-    ~PressurePlanningSession();
+    PressurePlanningSession(PressurePlanningSession&&) noexcept = default;
+    PressurePlanningSession& operator=(PressurePlanningSession&&) noexcept = default;
+    ~PressurePlanningSession()                                  = default;
 
     PressurePlanningSession(const PressurePlanningSession&)            = delete;
     PressurePlanningSession& operator=(const PressurePlanningSession&) = delete;
@@ -424,7 +455,9 @@ private:
     explicit PressurePlanningSession(
         std::unique_ptr<detail::PressurePlanningSessionImpl<Variant>> impl) noexcept;
 
-    std::unique_ptr<detail::PressurePlanningSessionImpl<Variant>> impl_;
+    std::unique_ptr<detail::PressurePlanningSessionImpl<Variant>,
+                    detail::PressurePlanningSessionImplDeleter<Variant>>
+        impl_;
 
     friend class Program<Variant>;
 };
