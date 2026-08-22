@@ -13,24 +13,33 @@ namespace ninfer::targets::qwen3_6 {
 using detail::NINFER_QWEN36_RUNTIME_NS::Variant;
 
 template <>
+void detail::SequencePlanImplDeleter<Variant>::operator()(
+    detail::SequencePlanImpl<Variant>* impl) const noexcept {
+    delete impl;
+}
+
+template <>
+void detail::SequencePlannerImplDeleter<Variant>::operator()(
+    detail::SequencePlannerImpl<Variant>* impl) const noexcept {
+    delete impl;
+}
+
+template <>
+void detail::RequestBasePlanImplDeleter<Variant>::operator()(
+    detail::RequestBasePlanImpl<Variant>* impl) const noexcept {
+    delete impl;
+}
+
+template <>
+void detail::RequestPlanImplDeleter<Variant>::operator()(
+    detail::RequestPlanImpl<Variant>* impl) const noexcept {
+    delete impl;
+}
+
+template <>
 SequencePlan<Variant>::SequencePlan(
     std::unique_ptr<detail::SequencePlanImpl<Variant>> impl) noexcept
-    : impl_(std::move(impl)) {}
-
-// Explicit bodies, not = default: MSVC omits the definition symbol for a
-// trivial defaulted special member on explicit instantiation, while
-// referencing TUs (std::optional in-place construction) still emit external
-// references to it (LNK2019). Moving impl_ is the exact defaulted behavior.
-template <>
-SequencePlan<Variant>::SequencePlan(SequencePlan&& other) noexcept
-    : impl_(std::move(other.impl_)) {}
-template <>
-SequencePlan<Variant>& SequencePlan<Variant>::operator=(SequencePlan&& other) noexcept {
-    impl_ = std::move(other.impl_);
-    return *this;
-}
-template <>
-SequencePlan<Variant>::~SequencePlan() = default;
+    : impl_(impl.release()) {}
 
 template <>
 std::uint32_t SequencePlan<Variant>::capacity() const noexcept {
@@ -65,18 +74,7 @@ std::size_t SequencePlan<Variant>::request_transient_capacity_bytes() const noex
 template <>
 SequencePlanner<Variant>::SequencePlanner(
     std::unique_ptr<detail::SequencePlannerImpl<Variant>> impl) noexcept
-    : impl_(std::move(impl)) {}
-
-template <>
-SequencePlanner<Variant>::SequencePlanner(SequencePlanner&& other) noexcept
-    : impl_(std::move(other.impl_)) {}
-template <>
-SequencePlanner<Variant>& SequencePlanner<Variant>::operator=(SequencePlanner&& other) noexcept {
-    impl_ = std::move(other.impl_);
-    return *this;
-}
-template <>
-SequencePlanner<Variant>::~SequencePlanner() = default;
+    : impl_(impl.release()) {}
 
 template <>
 const runtime::SequenceCapacityCurve& SequencePlanner<Variant>::capacity_curve() const noexcept {
@@ -87,25 +85,15 @@ const runtime::SequenceCapacityCurve& SequencePlanner<Variant>::capacity_curve()
 template <>
 SequencePlan<Variant> SequencePlanner<Variant>::finalize(std::uint32_t main_page_groups) && {
     if (impl_ == nullptr) { throw std::logic_error("sequence planner is empty"); }
+    std::unique_ptr<detail::SequencePlannerImpl<Variant>> impl(impl_.release());
     return SequencePlan<Variant>(detail::NINFER_QWEN36_RUNTIME_NS::finalize_sequence_plan_impl(
-        std::move(impl_), main_page_groups));
+        std::move(impl), main_page_groups));
 }
 
 template <>
 RequestBasePlan<Variant>::RequestBasePlan(
     std::unique_ptr<detail::RequestBasePlanImpl<Variant>> impl) noexcept
-    : impl_(std::move(impl)) {}
-
-template <>
-RequestBasePlan<Variant>::RequestBasePlan(RequestBasePlan&& other) noexcept
-    : impl_(std::move(other.impl_)) {}
-template <>
-RequestBasePlan<Variant>& RequestBasePlan<Variant>::operator=(RequestBasePlan&& other) noexcept {
-    impl_ = std::move(other.impl_);
-    return *this;
-}
-template <>
-RequestBasePlan<Variant>::~RequestBasePlan() = default;
+    : impl_(impl.release()) {}
 
 template <>
 const runtime::RequestPlanSummary& RequestBasePlan<Variant>::summary() const noexcept {
@@ -115,18 +103,7 @@ const runtime::RequestPlanSummary& RequestBasePlan<Variant>::summary() const noe
 
 template <>
 RequestPlan<Variant>::RequestPlan(std::unique_ptr<detail::RequestPlanImpl<Variant>> impl) noexcept
-    : impl_(std::move(impl)) {}
-
-template <>
-RequestPlan<Variant>::RequestPlan(RequestPlan&& other) noexcept
-    : impl_(std::move(other.impl_)) {}
-template <>
-RequestPlan<Variant>& RequestPlan<Variant>::operator=(RequestPlan&& other) noexcept {
-    impl_ = std::move(other.impl_);
-    return *this;
-}
-template <>
-RequestPlan<Variant>::~RequestPlan() = default;
+    : impl_(impl.release()) {}
 
 template <>
 const runtime::RequestPlanSummary& RequestPlan<Variant>::summary() const noexcept {

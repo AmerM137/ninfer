@@ -38,6 +38,26 @@ template <class Variant>
 struct RequestBasePlanImpl;
 template <class Variant>
 class ProgramImpl;
+
+// Empty custom deleters keep the owning wrappers pointer-sized while allowing their special
+// members to be compiler-generated in this incomplete-type header. Exact packages define each
+// deletion operation beside the corresponding complete Impl specialization.
+template <class Variant>
+struct SequencePlanImplDeleter {
+    void operator()(SequencePlanImpl<Variant>* impl) const noexcept;
+};
+template <class Variant>
+struct SequencePlannerImplDeleter {
+    void operator()(SequencePlannerImpl<Variant>* impl) const noexcept;
+};
+template <class Variant>
+struct RequestBasePlanImplDeleter {
+    void operator()(RequestBasePlanImpl<Variant>* impl) const noexcept;
+};
+template <class Variant>
+struct RequestPlanImplDeleter {
+    void operator()(RequestPlanImpl<Variant>* impl) const noexcept;
+};
 } // namespace detail
 
 template <class Variant>
@@ -48,9 +68,9 @@ class SequencePlanner;
 template <class Variant>
 class SequencePlan {
 public:
-    SequencePlan(SequencePlan&&) noexcept;
-    SequencePlan& operator=(SequencePlan&&) noexcept;
-    ~SequencePlan();
+    SequencePlan(SequencePlan&&) noexcept = default;
+    SequencePlan& operator=(SequencePlan&&) noexcept = default;
+    ~SequencePlan()                                  = default;
 
     SequencePlan(const SequencePlan&)            = delete;
     SequencePlan& operator=(const SequencePlan&) = delete;
@@ -65,7 +85,9 @@ public:
 public:
     // Family-private construction/storage seam; exact packages expose only the completed alias.
     explicit SequencePlan(std::unique_ptr<detail::SequencePlanImpl<Variant>> impl) noexcept;
-    std::unique_ptr<detail::SequencePlanImpl<Variant>> impl_;
+    std::unique_ptr<detail::SequencePlanImpl<Variant>,
+                    detail::SequencePlanImplDeleter<Variant>>
+        impl_;
 
     template <class V>
     friend class SequencePlanner;
@@ -76,9 +98,9 @@ public:
 template <class Variant>
 class SequencePlanner {
 public:
-    SequencePlanner(SequencePlanner&&) noexcept;
-    SequencePlanner& operator=(SequencePlanner&&) noexcept;
-    ~SequencePlanner();
+    SequencePlanner(SequencePlanner&&) noexcept = default;
+    SequencePlanner& operator=(SequencePlanner&&) noexcept = default;
+    ~SequencePlanner()                                     = default;
 
     SequencePlanner(const SequencePlanner&)            = delete;
     SequencePlanner& operator=(const SequencePlanner&) = delete;
@@ -88,7 +110,9 @@ public:
 
 public:
     explicit SequencePlanner(std::unique_ptr<detail::SequencePlannerImpl<Variant>> impl) noexcept;
-    std::unique_ptr<detail::SequencePlannerImpl<Variant>> impl_;
+    std::unique_ptr<detail::SequencePlannerImpl<Variant>,
+                    detail::SequencePlannerImplDeleter<Variant>>
+        impl_;
 
     template <class V>
     friend SequencePlanner<V> make_sequence_planner(DeviceContext&, const EngineOptions&,
@@ -98,9 +122,9 @@ public:
 template <class Variant>
 class RequestBasePlan {
 public:
-    RequestBasePlan(RequestBasePlan&&) noexcept;
-    RequestBasePlan& operator=(RequestBasePlan&&) noexcept;
-    ~RequestBasePlan();
+    RequestBasePlan(RequestBasePlan&&) noexcept = default;
+    RequestBasePlan& operator=(RequestBasePlan&&) noexcept = default;
+    ~RequestBasePlan()                                     = default;
 
     RequestBasePlan(const RequestBasePlan&)            = delete;
     RequestBasePlan& operator=(const RequestBasePlan&) = delete;
@@ -109,15 +133,17 @@ public:
 
 public:
     explicit RequestBasePlan(std::unique_ptr<detail::RequestBasePlanImpl<Variant>> impl) noexcept;
-    std::unique_ptr<detail::RequestBasePlanImpl<Variant>> impl_;
+    std::unique_ptr<detail::RequestBasePlanImpl<Variant>,
+                    detail::RequestBasePlanImplDeleter<Variant>>
+        impl_;
 };
 
 template <class Variant>
 class RequestPlan {
 public:
-    RequestPlan(RequestPlan&&) noexcept;
-    RequestPlan& operator=(RequestPlan&&) noexcept;
-    ~RequestPlan();
+    RequestPlan(RequestPlan&&) noexcept = default;
+    RequestPlan& operator=(RequestPlan&&) noexcept = default;
+    ~RequestPlan()                                 = default;
 
     RequestPlan(const RequestPlan&)            = delete;
     RequestPlan& operator=(const RequestPlan&) = delete;
@@ -128,7 +154,8 @@ public:
     // Family-private construction/storage seam. This header is repository-internal; exact
     // packages expose only the completed alias and never inspect this pointer.
     explicit RequestPlan(std::unique_ptr<detail::RequestPlanImpl<Variant>> impl) noexcept;
-    std::unique_ptr<detail::RequestPlanImpl<Variant>> impl_;
+    std::unique_ptr<detail::RequestPlanImpl<Variant>, detail::RequestPlanImplDeleter<Variant>>
+        impl_;
 };
 
 template <class Variant>
