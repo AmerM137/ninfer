@@ -6,6 +6,8 @@
 
 #include <memory>
 #include <optional>
+#include <stdexcept>
+#include <type_traits>
 #include <utility>
 #include <variant>
 
@@ -51,6 +53,21 @@ using ActiveRuntime = std::variant<std::monostate, Qwen3_6_27BRuntime, Qwen3_6_3
 struct EngineState {
     explicit EngineState(EngineOptions engine_options);
     ~EngineState() noexcept;
+
+    template <class Function>
+    decltype(auto) with_active(Function&& function) {
+        using Result = std::invoke_result_t<Function&, Qwen3_6_27BRuntime&>;
+        return std::visit(
+            [&](auto& active) -> Result {
+                using Runtime = std::remove_cvref_t<decltype(active)>;
+                if constexpr (std::is_same_v<Runtime, std::monostate>) {
+                    throw std::logic_error("Engine target is not active");
+                } else {
+                    return function(active);
+                }
+            },
+            runtime);
+    }
 
     EngineOptions options;
     DeviceContext device;

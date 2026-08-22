@@ -114,79 +114,49 @@ PreparedPrompt Engine::prepare(PromptInput input, const PreparationControl& cont
     if (state == nullptr) { throw std::logic_error("Engine is moved from"); }
     const SamplingMode sampling_mode =
         input.options.enable_thinking ? SamplingMode::Thinking : SamplingMode::NonThinking;
-    return std::visit(
-        [&](const auto& active) -> PreparedPrompt {
-            using Runtime = std::remove_cvref_t<decltype(active)>;
-            if constexpr (std::is_same_v<Runtime, std::monostate>) {
-                throw std::logic_error("Engine target is not active");
-            } else {
-                auto prepared =
-                    active.instance->loaded->frontend.prepare(std::move(input), control);
-                PromptSummary info = prepared.summary();
-                if (info.prompt_tokens > active.instance->capacity) {
-                    throw RequestError(
-                        RequestErrorKind::ContextLengthExceeded,
-                        context_capacity_error(info.prompt_tokens, active.instance->capacity));
-                }
-                const PromptPreparationStats preparation = prepared.preparation_stats();
-                return PreparedPrompt(std::make_unique<runtime::PreparedPromptState>(
-                    info, preparation, sampling_mode, std::move(prepared)));
-            }
-        },
-        state->runtime);
+    return state->with_active([&](const auto& active) {
+        auto prepared      = active.instance->frontend.prepare(std::move(input), control);
+        PromptSummary info = prepared.summary();
+        if (info.prompt_tokens > active.instance->capacity) {
+            throw RequestError(
+                RequestErrorKind::ContextLengthExceeded,
+                context_capacity_error(info.prompt_tokens, active.instance->capacity));
+        }
+        const PromptPreparationStats preparation = prepared.preparation_stats();
+        return PreparedPrompt(std::make_unique<runtime::PreparedPromptState>(
+            info, preparation, sampling_mode, std::move(prepared)));
+    });
 }
 
 PreparedPrompt Engine::prepare_tokens(std::vector<TokenId> token_ids,
                                       bool allow_prefix_identity) const {
     if (state == nullptr) { throw std::logic_error("Engine is moved from"); }
-    return std::visit(
-        [&](const auto& active) -> PreparedPrompt {
-            using Runtime = std::remove_cvref_t<decltype(active)>;
-            if constexpr (std::is_same_v<Runtime, std::monostate>) {
-                throw std::logic_error("Engine target is not active");
-            } else {
-                auto prepared = active.instance->loaded->frontend.prepare_tokens(
-                    std::move(token_ids), allow_prefix_identity);
-                PromptSummary info = prepared.summary();
-                if (info.prompt_tokens > active.instance->capacity) {
-                    throw RequestError(
-                        RequestErrorKind::ContextLengthExceeded,
-                        context_capacity_error(info.prompt_tokens, active.instance->capacity));
-                }
-                const PromptPreparationStats preparation = prepared.preparation_stats();
-                return PreparedPrompt(std::make_unique<runtime::PreparedPromptState>(
-                    info, preparation, SamplingMode::Thinking, std::move(prepared)));
-            }
-        },
-        state->runtime);
+    return state->with_active([&](const auto& active) {
+        auto prepared =
+            active.instance->frontend.prepare_tokens(std::move(token_ids), allow_prefix_identity);
+        PromptSummary info = prepared.summary();
+        if (info.prompt_tokens > active.instance->capacity) {
+            throw RequestError(
+                RequestErrorKind::ContextLengthExceeded,
+                context_capacity_error(info.prompt_tokens, active.instance->capacity));
+        }
+        const PromptPreparationStats preparation = prepared.preparation_stats();
+        return PreparedPrompt(std::make_unique<runtime::PreparedPromptState>(
+            info, preparation, SamplingMode::Thinking, std::move(prepared)));
+    });
 }
 
 std::uint32_t Engine::count_tokens(PromptInput input, const PreparationControl& control) const {
     if (state == nullptr) { throw std::logic_error("Engine is moved from"); }
-    return std::visit(
-        [&](const auto& active) -> std::uint32_t {
-            using Runtime = std::remove_cvref_t<decltype(active)>;
-            if constexpr (std::is_same_v<Runtime, std::monostate>) {
-                throw std::logic_error("Engine target is not active");
-            } else {
-                return active.instance->loaded->frontend.count_tokens(std::move(input), control);
-            }
-        },
-        state->runtime);
+    return state->with_active([&](const auto& active) {
+        return active.instance->frontend.count_tokens(std::move(input), control);
+    });
 }
 
 PromptCapabilities Engine::prompt_capabilities() const {
     if (state == nullptr) { throw std::logic_error("Engine is moved from"); }
-    return std::visit(
-        [](const auto& active) -> PromptCapabilities {
-            using Runtime = std::remove_cvref_t<decltype(active)>;
-            if constexpr (std::is_same_v<Runtime, std::monostate>) {
-                throw std::logic_error("Engine target is not active");
-            } else {
-                return active.instance->loaded->frontend.prompt_capabilities();
-            }
-        },
-        state->runtime);
+    return state->with_active(
+        [](const auto& active) { return active.instance->frontend.prompt_capabilities(); });
 }
 
 ModelSamplingDefaults Engine::sampling_defaults() const {
@@ -222,20 +192,13 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
             state, std::move(immediate), resolved_sampling));
     }
 
-    return std::visit(
-        [&](auto& active) -> GenerationHandle {
-            using Runtime = std::remove_cvref_t<decltype(active)>;
-            if constexpr (std::is_same_v<Runtime, std::monostate>) {
-                throw std::logic_error("concurrent Engine executor is unavailable");
-            } else {
-                auto submission = active.executor->submit(
-                    std::move(prompt.state->value), prompt_summary, prepare_seconds,
-                    std::move(resolved_options), pending_deadline);
-                return GenerationHandle(std::make_unique<runtime::GenerationSubmission>(
-                    state, std::move(submission), resolved_sampling));
-            }
-        },
-        state->runtime);
+    return state->with_active([&](auto& active) {
+        auto submission =
+            active.executor->submit(std::move(prompt.state->value), prompt_summary, prepare_seconds,
+                                    std::move(resolved_options), pending_deadline);
+        return GenerationHandle(std::make_unique<runtime::GenerationSubmission>(
+            state, std::move(submission), resolved_sampling));
+    });
 }
 
 GenerationResult Engine::generate(PreparedPrompt prompt, RequestOptions options, OutputSink* sink,
@@ -255,44 +218,18 @@ LoadSummary Engine::load_summary() const {
 
 MemorySummary Engine::memory_summary() const {
     if (state == nullptr) { throw std::logic_error("Engine is moved from"); }
-    return std::visit(
-        [](const auto& active) -> MemorySummary {
-            using Runtime = std::remove_cvref_t<decltype(active)>;
-            if constexpr (std::is_same_v<Runtime, std::monostate>) {
-                throw std::logic_error("concurrent Engine executor is unavailable");
-            } else {
-                return active.executor->memory_summary();
-            }
-        },
-        state->runtime);
+    return state->with_active([](const auto& active) { return active.executor->memory_summary(); });
 }
 
 MediaCacheSummary Engine::media_cache_summary() const {
     if (state == nullptr) { throw std::logic_error("Engine is moved from"); }
-    return std::visit(
-        [](const auto& active) -> MediaCacheSummary {
-            using Runtime = std::remove_cvref_t<decltype(active)>;
-            if constexpr (std::is_same_v<Runtime, std::monostate>) {
-                throw std::logic_error("Engine target is not active");
-            } else {
-                return active.instance->loaded->frontend.media_cache_summary();
-            }
-        },
-        state->runtime);
+    return state->with_active(
+        [](const auto& active) { return active.instance->frontend.media_cache_summary(); });
 }
 
 RuntimeStats Engine::runtime_stats() const {
     if (state == nullptr) { throw std::logic_error("Engine is moved from"); }
-    return std::visit(
-        [](const auto& active) -> RuntimeStats {
-            using Runtime = std::remove_cvref_t<decltype(active)>;
-            if constexpr (std::is_same_v<Runtime, std::monostate>) {
-                throw std::logic_error("concurrent Engine executor is unavailable");
-            } else {
-                return active.executor->runtime_stats();
-            }
-        },
-        state->runtime);
+    return state->with_active([](const auto& active) { return active.executor->runtime_stats(); });
 }
 
 void Engine::reset_memory_peaks() noexcept {

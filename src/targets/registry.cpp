@@ -87,7 +87,7 @@ std::size_t current_free_device_bytes() {
     return free_bytes;
 }
 
-template <class Target, class Loaded, class Instance>
+template <class Target, class Instance>
 ConstructedTarget construct_registered(const EngineOptions& options, DeviceContext& device,
                                        artifact::Reader& reader, Clock::time_point load_start,
                                        std::string_view target_key) {
@@ -117,8 +117,7 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
         sequence_plan.kv_capacity != capacity_resolution.resolved_tokens) {
         throw std::logic_error("resolved KV capacity does not match the finalized target plan");
     }
-    auto loaded   = std::make_unique<Loaded>(std::move(model), options);
-    auto instance = std::make_unique<Instance>(std::move(loaded), capacity_resolution,
+    auto instance = std::make_unique<Instance>(std::move(model), options, capacity_resolution,
                                                std::move(sequence_plan), device);
     device.synchronize();
     instance->kv_capacity_resolution.available_after_startup_bytes = current_free_device_bytes();
@@ -141,37 +140,28 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
 
 } // namespace
 
-LoadedQwen3_6_27B::LoadedQwen3_6_27B(std::unique_ptr<Qwen3_6_27B::LoadedModel> stable_model,
-                                     const EngineOptions& options)
-    : model(std::move(stable_model)), frontend(Qwen3_6_27B::make_frontend(*model, options)) {}
-
-LoadedQwen3_6_27B::~LoadedQwen3_6_27B() = default;
-
-Qwen3_6_27BInstance::Qwen3_6_27BInstance(std::unique_ptr<LoadedQwen3_6_27B> stable_loaded,
+Qwen3_6_27BInstance::Qwen3_6_27BInstance(std::unique_ptr<Qwen3_6_27B::LoadedModel> stable_model,
+                                         const EngineOptions& options,
                                          runtime::KvCapacityResolution resolution,
                                          Qwen3_6_27B::SequencePlan sequence_plan,
                                          DeviceContext& device)
-    : loaded(std::move(stable_loaded)), kv_capacity_resolution(resolution),
+    : model(std::move(stable_model)), frontend(Qwen3_6_27B::make_frontend(*model, options)),
+      kv_capacity_resolution(resolution),
       request_memory(device, sequence_plan.request_transient_capacity_bytes),
       capacity(sequence_plan.capacity),
-      program(Qwen3_6_27B::create_program(*loaded->model, std::move(sequence_plan), device)) {}
+      program(Qwen3_6_27B::create_program(*model, std::move(sequence_plan), device)) {}
 
 Qwen3_6_27BInstance::~Qwen3_6_27BInstance() = default;
 
-LoadedQwen3_6_35BA3B::LoadedQwen3_6_35BA3B(
-    std::unique_ptr<Qwen3_6_35BA3B::LoadedModel> stable_model, const EngineOptions& options)
-    : model(std::move(stable_model)), frontend(Qwen3_6_35BA3B::make_frontend(*model, options)) {}
-
-LoadedQwen3_6_35BA3B::~LoadedQwen3_6_35BA3B() = default;
-
-Qwen3_6_35BA3BInstance::Qwen3_6_35BA3BInstance(std::unique_ptr<LoadedQwen3_6_35BA3B> stable_loaded,
-                                               runtime::KvCapacityResolution resolution,
-                                               Qwen3_6_35BA3B::SequencePlan sequence_plan,
-                                               DeviceContext& device)
-    : loaded(std::move(stable_loaded)), kv_capacity_resolution(resolution),
+Qwen3_6_35BA3BInstance::Qwen3_6_35BA3BInstance(
+    std::unique_ptr<Qwen3_6_35BA3B::LoadedModel> stable_model, const EngineOptions& options,
+    runtime::KvCapacityResolution resolution, Qwen3_6_35BA3B::SequencePlan sequence_plan,
+    DeviceContext& device)
+    : model(std::move(stable_model)), frontend(Qwen3_6_35BA3B::make_frontend(*model, options)),
+      kv_capacity_resolution(resolution),
       request_memory(device, sequence_plan.request_transient_capacity_bytes),
       capacity(sequence_plan.capacity),
-      program(Qwen3_6_35BA3B::create_program(*loaded->model, std::move(sequence_plan), device)) {}
+      program(Qwen3_6_35BA3B::create_program(*model, std::move(sequence_plan), device)) {}
 
 Qwen3_6_35BA3BInstance::~Qwen3_6_35BA3BInstance() = default;
 
@@ -182,15 +172,15 @@ ConstructedTarget construct_target(const EngineOptions& options, DeviceContext& 
     artifact::Reader reader(options.artifact_path);
     const auto& identity = reader.identity();
     if (identity.model_id == Qwen3_6_27B::model_id) {
-        return construct_registered<Qwen3_6_27B, LoadedQwen3_6_27B, Qwen3_6_27BInstance>(
+        return construct_registered<Qwen3_6_27B, Qwen3_6_27BInstance>(
             options, device, reader, load_start, Qwen3_6_27B::target_key);
     }
     if (identity.model_id == Qwen3_6_27B::qwen3_8_model_id) {
-        return construct_registered<Qwen3_6_27B, LoadedQwen3_6_27B, Qwen3_6_27BInstance>(
+        return construct_registered<Qwen3_6_27B, Qwen3_6_27BInstance>(
             options, device, reader, load_start, Qwen3_6_27B::qwen3_8_target_key);
     }
     if (identity.model_id == Qwen3_6_35BA3B::model_id) {
-        return construct_registered<Qwen3_6_35BA3B, LoadedQwen3_6_35BA3B, Qwen3_6_35BA3BInstance>(
+        return construct_registered<Qwen3_6_35BA3B, Qwen3_6_35BA3BInstance>(
             options, device, reader, load_start, Qwen3_6_35BA3B::target_key);
     }
     throw std::runtime_error("artifact identity '" + identity.model_id + "/" + identity.weights_id +

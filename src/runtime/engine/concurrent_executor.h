@@ -145,8 +145,8 @@ public:
 
         std::shared_ptr<Request> request;
         try {
-            auto output = instance_.loaded->frontend.make_output_session(prompt, options.stop,
-                                                                         options.output);
+            auto output =
+                instance_.frontend.make_output_session(prompt, options.stop, options.output);
             request = std::make_shared<Request>(request_id, std::move(prompt), std::move(output),
                                                 prompt_summary, prepare_seconds, std::move(options),
                                                 pending_deadline, submitted);
