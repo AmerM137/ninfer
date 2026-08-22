@@ -1,15 +1,14 @@
 #pragma once
 
+#include "core/arena.h"
 #include "ninfer/types.h"
 #include "runtime/contract/transient_region.h"
 
 #include <cstddef>
-#include <memory>
 
 namespace ninfer {
 
 struct DeviceContext;
-class DeviceArena;
 
 namespace runtime {
 
@@ -36,7 +35,7 @@ public:
 
 private:
     int device = 0;
-    std::unique_ptr<DeviceArena> arena;
+    DeviceBuffer storage;
     std::size_t active_bytes     = 0;
     std::size_t active_alignment = 1;
     std::size_t peak_bytes       = 0;

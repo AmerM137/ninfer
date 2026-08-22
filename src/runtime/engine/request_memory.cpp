@@ -1,11 +1,9 @@
 #include "runtime/engine/request_memory.h"
 
-#include "core/arena.h"
 #include "core/device.h"
 
 #include <algorithm>
 #include <cstddef>
-#include <memory>
 #include <stdexcept>
 
 namespace ninfer::runtime {
@@ -21,15 +19,12 @@ RequestMemory::RequestMemory(DeviceContext& context, std::size_t frozen_capacity
     : device(context.device) {
     if (frozen_capacity_bytes != 0) {
         CUDA_CHECK(cudaSetDevice(device));
-        arena = std::make_unique<DeviceArena>(frozen_capacity_bytes);
+        storage = DeviceBuffer(frozen_capacity_bytes);
     }
 }
 
 RequestMemory::~RequestMemory() {
-    if (arena != nullptr) {
-        (void)cudaSetDevice(device);
-        arena.reset();
-    }
+    if (storage.p != nullptr) { (void)cudaSetDevice(device); }
 }
 
 void RequestMemory::activate(std::size_t bytes, std::size_t alignment) {
@@ -45,7 +40,7 @@ void RequestMemory::activate(std::size_t bytes, std::size_t alignment) {
         throw std::invalid_argument("unsupported transient region alignment");
     }
 
-    if (arena == nullptr || bytes > arena->capacity()) {
+    if (bytes > storage.bytes) {
         throw std::invalid_argument("request transient exceeds its frozen startup capacity");
     }
 
@@ -61,12 +56,12 @@ void RequestMemory::deactivate() noexcept {
 
 TransientRegion RequestMemory::region() const noexcept {
     if (active_bytes == 0) { return {}; }
-    return {static_cast<std::byte*>(arena->base()), active_bytes, active_alignment};
+    return {static_cast<std::byte*>(storage.p), active_bytes, active_alignment};
 }
 
 ArenaMemorySummary RequestMemory::summary() const noexcept {
     return ArenaMemorySummary{
-        arena != nullptr ? arena->capacity() : 0,
+        storage.bytes,
         active_bytes,
         peak_bytes,
     };
