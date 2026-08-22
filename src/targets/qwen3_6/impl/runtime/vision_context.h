@@ -8,7 +8,6 @@
 #include "core/weight.h"
 #include <ninfer/targets/qwen3_6/vision_control.h>
 #include "runtime/contract/transient_region.h"
-#include "targets/qwen3_6/impl/runtime/vision_prefill.h"
 
 #include <array>
 #include <cstddef>

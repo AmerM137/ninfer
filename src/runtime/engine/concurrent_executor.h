@@ -678,7 +678,7 @@ private:
             request->base_plan.emplace(
                 instance_.program->plan_request_base(request->prompt, request->options.execution));
         }
-        const RequestPlanSummary& summary = request->base_plan->summary();
+        const RequestPlanSummary& summary = request->base_plan->summary;
         if (summary.admission.active_lanes != 1 || summary.service_work_quanta == 0) {
             throw std::logic_error("target request plan has invalid admission accounting");
         }
@@ -704,7 +704,7 @@ private:
             if (slots_[lane] != nullptr) { continue; }
             ensure_lane_plan(request, lane);
             const Plan& plan          = *request->lane_plans[lane];
-            const std::uint32_t reuse = plan.summary().reusable_prompt_tokens;
+            const std::uint32_t reuse = plan.summary.reusable_prompt_tokens;
             if (instance_.program->can_admit_lane(lane, plan) &&
                 (!selected || reuse > selected_reuse)) {
                 selected       = LaneChoice{.lane = lane};
@@ -717,7 +717,7 @@ private:
             if (slots_[lane] != nullptr) { continue; }
             ensure_lane_plan(request, lane);
             const Plan& plan          = *request->lane_plans[lane];
-            const std::uint32_t reuse = plan.summary().reusable_prompt_tokens;
+            const std::uint32_t reuse = plan.summary.reusable_prompt_tokens;
             if (instance_.program->can_admit_lane_after_retained_eviction(lane, plan) &&
                 (!selected || reuse > selected_reuse)) {
                 selected = LaneChoice{
@@ -782,7 +782,7 @@ private:
         if (!erase_pending(request)) { return AdmissionProgress::None; }
         release_planning_state(request);
 
-        const RequestPlanSummary summary = selected_plan.summary();
+        const RequestPlanSummary summary = selected_plan.summary;
         if (backfill_class == BackfillClass::Temporal) {
             if (!protection_ || protection_->epoch_id != backfill_epoch ||
                 summary.service_work_quanta > protection_->temporal_credit) {
@@ -874,7 +874,7 @@ private:
                 control_progress = true;
                 continue;
             }
-            const RequestPlanSummary& head_base = head->base_plan->summary();
+            const RequestPlanSummary& head_base = head->base_plan->summary;
             if (!admission_resources_fit(head_base.admission, admission_capacity_)) {
                 (void)remove_pending_error(
                     head, std::make_exception_ptr(RequestError(
@@ -942,7 +942,7 @@ private:
                     control_progress = true;
                     continue;
                 }
-                const RequestPlanSummary& candidate_base = candidate->base_plan->summary();
+                const RequestPlanSummary& candidate_base = candidate->base_plan->summary;
                 if (!admission_resources_fit(candidate_base.admission, admission_capacity_)) {
                     (void)remove_pending_error(
                         candidate, std::make_exception_ptr(RequestError(
@@ -962,7 +962,7 @@ private:
                 }
                 if (!candidate_lane) { continue; }
                 const RequestPlanSummary& candidate_plan =
-                    candidate->lane_plans[candidate_lane->lane]->summary();
+                    candidate->lane_plans[candidate_lane->lane]->summary;
 
                 BackfillClass backfill = BackfillClass::None;
                 if (persistent_backfill_is_safe(*protection_, active.span(),

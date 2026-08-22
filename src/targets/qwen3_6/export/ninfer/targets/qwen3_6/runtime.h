@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ninfer/types.h"
+#include "ninfer/ops/sampling_config.h"
 #include "runtime/contract/transient_region.h"
 #include "runtime/contract/types.h"
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
@@ -8,13 +9,17 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
+#include <vector>
 
 namespace ninfer {
 struct DeviceContext;
 }
 
 namespace ninfer::targets::qwen3_6 {
+
+struct VisionControl;
 
 enum class TextPhase {
     Prefill,
@@ -27,15 +32,36 @@ struct GraphExecutionProfile {
     std::uint32_t topology_class = 0;
 };
 
+enum class RewriteCheckpointAction : std::uint8_t {
+    Drop,
+    KeepExisting,
+    ReclassifyExisting,
+    CaptureNew,
+    DeferCapture,
+};
+
+enum class MtpBridgeMode : std::uint8_t {
+    None,
+    BeforeSuffix,
+    AfterExactHit,
+};
+
+struct VisionUseSpan {
+    std::uint32_t begin      = 0;
+    std::uint32_t end        = 0;
+    std::uint32_t item_index = 0;
+};
+
+struct VisionPrefillPlan {
+    std::shared_ptr<const VisionControl> control;
+    std::vector<VisionUseSpan> uses;
+};
+
 namespace detail {
 template <class Variant>
 struct SequencePlanImpl;
 template <class Variant>
 struct SequencePlannerImpl;
-template <class Variant>
-struct RequestPlanImpl;
-template <class Variant>
-struct RequestBasePlanImpl;
 template <class Variant>
 class ProgramImpl;
 
@@ -46,17 +72,10 @@ template <class Variant>
 struct SequencePlanImplDeleter {
     void operator()(SequencePlanImpl<Variant>* impl) const noexcept;
 };
+
 template <class Variant>
 struct SequencePlannerImplDeleter {
     void operator()(SequencePlannerImpl<Variant>* impl) const noexcept;
-};
-template <class Variant>
-struct RequestBasePlanImplDeleter {
-    void operator()(RequestBasePlanImpl<Variant>* impl) const noexcept;
-};
-template <class Variant>
-struct RequestPlanImplDeleter {
-    void operator()(RequestPlanImpl<Variant>* impl) const noexcept;
 };
 } // namespace detail
 
@@ -68,7 +87,7 @@ class SequencePlanner;
 template <class Variant>
 class SequencePlan {
 public:
-    SequencePlan(SequencePlan&&) noexcept = default;
+    SequencePlan(SequencePlan&&) noexcept            = default;
     SequencePlan& operator=(SequencePlan&&) noexcept = default;
     ~SequencePlan()                                  = default;
 
@@ -85,8 +104,7 @@ public:
 public:
     // Family-private construction/storage seam; exact packages expose only the completed alias.
     explicit SequencePlan(std::unique_ptr<detail::SequencePlanImpl<Variant>> impl) noexcept;
-    std::unique_ptr<detail::SequencePlanImpl<Variant>,
-                    detail::SequencePlanImplDeleter<Variant>>
+    std::unique_ptr<detail::SequencePlanImpl<Variant>, detail::SequencePlanImplDeleter<Variant>>
         impl_;
 
     template <class V>
@@ -98,7 +116,7 @@ public:
 template <class Variant>
 class SequencePlanner {
 public:
-    SequencePlanner(SequencePlanner&&) noexcept = default;
+    SequencePlanner(SequencePlanner&&) noexcept            = default;
     SequencePlanner& operator=(SequencePlanner&&) noexcept = default;
     ~SequencePlanner()                                     = default;
 
@@ -120,42 +138,44 @@ public:
 };
 
 template <class Variant>
-class RequestBasePlan {
-public:
-    RequestBasePlan(RequestBasePlan&&) noexcept = default;
+struct RequestBasePlan {
+    RequestBasePlan() noexcept                             = default;
+    RequestBasePlan(RequestBasePlan&&) noexcept            = default;
     RequestBasePlan& operator=(RequestBasePlan&&) noexcept = default;
-    ~RequestBasePlan()                                     = default;
 
     RequestBasePlan(const RequestBasePlan&)            = delete;
     RequestBasePlan& operator=(const RequestBasePlan&) = delete;
 
-    [[nodiscard]] const runtime::RequestPlanSummary& summary() const noexcept;
-
-public:
-    explicit RequestBasePlan(std::unique_ptr<detail::RequestBasePlanImpl<Variant>> impl) noexcept;
-    std::unique_ptr<detail::RequestBasePlanImpl<Variant>,
-                    detail::RequestBasePlanImplDeleter<Variant>>
-        impl_;
+    runtime::RequestPlanSummary summary;
+    ops::SamplingConfig sampling;
+    std::uint32_t text_kv_page_entitlement    = 0;
+    std::uint32_t backend_kv_page_entitlement = 0;
+    std::shared_ptr<const VisionControl> vision_control;
+    std::size_t vision_transient_bytes = 0;
+    std::optional<RewriteCheckpointSpec> rewrite_checkpoint;
+    bool allow_prefix_reuse = false;
 };
 
 template <class Variant>
-class RequestPlan {
-public:
-    RequestPlan(RequestPlan&&) noexcept = default;
+struct RequestPlan {
+    RequestPlan() noexcept                         = default;
+    RequestPlan(RequestPlan&&) noexcept            = default;
     RequestPlan& operator=(RequestPlan&&) noexcept = default;
-    ~RequestPlan()                                 = default;
 
     RequestPlan(const RequestPlan&)            = delete;
     RequestPlan& operator=(const RequestPlan&) = delete;
 
-    [[nodiscard]] const runtime::RequestPlanSummary& summary() const noexcept;
-
-public:
-    // Family-private construction/storage seam. This header is repository-internal; exact
-    // packages expose only the completed alias and never inspect this pointer.
-    explicit RequestPlan(std::unique_ptr<detail::RequestPlanImpl<Variant>> impl) noexcept;
-    std::unique_ptr<detail::RequestPlanImpl<Variant>, detail::RequestPlanImplDeleter<Variant>>
-        impl_;
+    runtime::RequestPlanSummary summary;
+    PrefixReusePath reuse    = PrefixReusePath::FullReset;
+    std::uint32_t reuse_base = 0;
+    MtpBridgeMode mtp_bridge = MtpBridgeMode::None;
+    bool prepare_mtp         = false;
+    std::optional<VisionPrefillPlan> vision;
+    RewriteCheckpointAction rewrite_checkpoint_action = RewriteCheckpointAction::Drop;
+    std::optional<RewriteCheckpointSpec> rewrite_checkpoint_capture;
+    ops::SamplingConfig sampling;
+    std::uint32_t text_kv_page_entitlement    = 0;
+    std::uint32_t backend_kv_page_entitlement = 0;
 };
 
 template <class Variant>

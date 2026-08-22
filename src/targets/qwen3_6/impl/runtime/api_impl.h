@@ -25,18 +25,6 @@ void detail::SequencePlannerImplDeleter<Variant>::operator()(
 }
 
 template <>
-void detail::RequestBasePlanImplDeleter<Variant>::operator()(
-    detail::RequestBasePlanImpl<Variant>* impl) const noexcept {
-    delete impl;
-}
-
-template <>
-void detail::RequestPlanImplDeleter<Variant>::operator()(
-    detail::RequestPlanImpl<Variant>* impl) const noexcept {
-    delete impl;
-}
-
-template <>
 SequencePlan<Variant>::SequencePlan(
     std::unique_ptr<detail::SequencePlanImpl<Variant>> impl) noexcept
     : impl_(impl.release()) {}
@@ -88,27 +76,6 @@ SequencePlan<Variant> SequencePlanner<Variant>::finalize(std::uint32_t main_page
     std::unique_ptr<detail::SequencePlannerImpl<Variant>> impl(impl_.release());
     return SequencePlan<Variant>(detail::NINFER_QWEN36_RUNTIME_NS::finalize_sequence_plan_impl(
         std::move(impl), main_page_groups));
-}
-
-template <>
-RequestBasePlan<Variant>::RequestBasePlan(
-    std::unique_ptr<detail::RequestBasePlanImpl<Variant>> impl) noexcept
-    : impl_(impl.release()) {}
-
-template <>
-const runtime::RequestPlanSummary& RequestBasePlan<Variant>::summary() const noexcept {
-    static const runtime::RequestPlanSummary empty;
-    return impl_ != nullptr ? impl_->summary : empty;
-}
-
-template <>
-RequestPlan<Variant>::RequestPlan(std::unique_ptr<detail::RequestPlanImpl<Variant>> impl) noexcept
-    : impl_(impl.release()) {}
-
-template <>
-const runtime::RequestPlanSummary& RequestPlan<Variant>::summary() const noexcept {
-    static const runtime::RequestPlanSummary empty;
-    return impl_ != nullptr ? impl_->summary : empty;
 }
 
 template <>

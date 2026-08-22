@@ -15,7 +15,6 @@
 #include "targets/qwen3_6/impl/runtime/text_context.h"
 #include "targets/qwen3_6/impl/runtime/dflash_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
-#include "targets/qwen3_6/impl/runtime/vision_prefill.h"
 
 #include <cstddef>
 #include <cstdint>

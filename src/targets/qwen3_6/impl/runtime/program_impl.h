@@ -313,7 +313,7 @@ ProgramImplCore::~ProgramImplCore() noexcept {
 }
 
 bool ProgramImplCore::can_admit_lane(std::uint32_t lane, const RequestPlan& plan) const noexcept {
-    if (lane >= max_concurrency || plan.impl_ == nullptr) { return false; }
+    if (lane >= max_concurrency) { return false; }
     const RequestControl& request = requests[lane];
     if (request.lifecycle == Lifecycle::Prefilling || request.lifecycle == Lifecycle::Active ||
         request.lifecycle == Lifecycle::Pending) {
@@ -326,19 +326,19 @@ bool ProgramImplCore::can_admit_lane(std::uint32_t lane, const RequestPlan& plan
                new_pages <= pool.page_group_count() - (pool.entitled_pages() - old_pages);
     };
     const std::uint32_t old_text = sequence.kv ? sequence.kv->text.page_entitlement() : 0;
-    if (!can_replace(decoder->text_kv.pool(), old_text, plan.impl_->text_kv_page_entitlement)) {
+    if (!can_replace(decoder->text_kv.pool(), old_text, plan.text_kv_page_entitlement)) {
         return false;
     }
     const qwen3_6::PagedKVCache* backend = backend_kv_cache();
-    if (backend == nullptr) { return plan.impl_->backend_kv_page_entitlement == 0; }
+    if (backend == nullptr) { return plan.backend_kv_page_entitlement == 0; }
     const std::uint32_t old_backend =
         sequence.kv && sequence.kv->backend ? sequence.kv->backend->page_entitlement() : 0;
-    return can_replace(backend->pool(), old_backend, plan.impl_->backend_kv_page_entitlement);
+    return can_replace(backend->pool(), old_backend, plan.backend_kv_page_entitlement);
 }
 
 bool ProgramImplCore::can_admit_lane_after_retained_eviction(
     std::uint32_t lane, const RequestPlan& plan) const noexcept {
-    if (lane >= max_concurrency || plan.impl_ == nullptr) { return false; }
+    if (lane >= max_concurrency) { return false; }
     const RequestControl& request = requests[lane];
     if (request.lifecycle == Lifecycle::Prefilling || request.lifecycle == Lifecycle::Active ||
         request.lifecycle == Lifecycle::Pending) {
@@ -369,16 +369,16 @@ bool ProgramImplCore::can_admit_lane_after_retained_eviction(
     const SequenceState& sequence = sequences[lane];
     const std::uint32_t old_text  = sequence.kv ? sequence.kv->text.page_entitlement() : 0;
     if (!can_replace(decoder->text_kv.pool(), old_text, reclaimable_text,
-                     plan.impl_->text_kv_page_entitlement)) {
+                     plan.text_kv_page_entitlement)) {
         return false;
     }
 
     const qwen3_6::PagedKVCache* backend = backend_kv_cache();
-    if (backend == nullptr) { return plan.impl_->backend_kv_page_entitlement == 0; }
+    if (backend == nullptr) { return plan.backend_kv_page_entitlement == 0; }
     const std::uint32_t old_backend =
         sequence.kv && sequence.kv->backend ? sequence.kv->backend->page_entitlement() : 0;
     return can_replace(backend->pool(), old_backend, reclaimable_backend,
-                       plan.impl_->backend_kv_page_entitlement);
+                       plan.backend_kv_page_entitlement);
 }
 
 runtime::AdmissionResources ProgramImplCore::admission_capacity() const noexcept {
@@ -397,16 +397,14 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
     if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
     SequenceState& sequence = sequences[lane];
     RequestControl& request = requests[lane];
-    if (plan.impl_ == nullptr) { throw std::invalid_argument("request plan is empty"); }
-    RequestPlanImpl& request_plan = *plan.impl_;
     if (request.lifecycle == Lifecycle::Prefilling || request.lifecycle == Lifecycle::Active ||
         request.lifecycle == Lifecycle::Pending) {
         throw std::logic_error("staged prefill requires a free request lane");
     }
 
     const std::uint32_t prompt_tokens = static_cast<std::uint32_t>(prompt.token_ids.size());
-    if (prompt_tokens != request_plan.summary.prompt_tokens ||
-        (request_plan.vision.has_value() && !prompt.has_media())) {
+    if (prompt_tokens != plan.summary.prompt_tokens ||
+        (plan.vision.has_value() && !prompt.has_media())) {
         throw std::invalid_argument("request plan does not describe the prepared prompt");
     }
     if (prompt.identity.rewrite_checkpoint &&
@@ -415,88 +413,88 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         throw std::invalid_argument("prepared prompt has an invalid rewrite checkpoint");
     }
     const bool suffix_has_visual = std::any_of(
-        prompt.token_types.begin() + static_cast<std::ptrdiff_t>(request_plan.reuse_base),
+        prompt.token_types.begin() + static_cast<std::ptrdiff_t>(plan.reuse_base),
         prompt.token_types.end(), [](std::uint8_t type) { return type != 0; });
-    if (suffix_has_visual != request_plan.vision.has_value()) {
+    if (suffix_has_visual != plan.vision.has_value()) {
         throw std::invalid_argument("request plan does not describe the prompt suffix modality");
     }
-    if (request_plan.summary.transient_bytes != 0 &&
-        (transient.data == nullptr || transient.size < request_plan.summary.transient_bytes ||
-         transient.alignment < request_plan.summary.transient_alignment)) {
+    if (plan.summary.transient_bytes != 0 &&
+        (transient.data == nullptr || transient.size < plan.summary.transient_bytes ||
+         transient.alignment < plan.summary.transient_alignment)) {
         throw std::invalid_argument("request transient region does not satisfy the plan");
     }
-    if (request_plan.reuse != ReusePath::FullReset &&
+    if (plan.reuse != ReusePath::FullReset &&
         (!sequence.retained ||
          !qwen3_6::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity,
-                                          request_plan.reuse_base))) {
+                                          plan.reuse_base))) {
         throw std::logic_error("planned resident prefix is no longer reusable");
     }
-    if (is_rewrite_checkpoint_restore(request_plan.reuse) &&
+    if (is_rewrite_checkpoint_restore(plan.reuse) &&
         (!sequence.rewrite_checkpoint.valid ||
-         sequence.rewrite_checkpoint.frontier != request_plan.reuse_base ||
-         request_plan.reuse != restore_path(sequence.rewrite_checkpoint.kind))) {
+         sequence.rewrite_checkpoint.frontier != plan.reuse_base ||
+         plan.reuse != restore_path(sequence.rewrite_checkpoint.kind))) {
         throw std::logic_error("planned rewrite checkpoint is unavailable");
     }
-    if (request_plan.rewrite_checkpoint_action == RewriteCheckpointAction::KeepExisting &&
+    if (plan.rewrite_checkpoint_action == RewriteCheckpointAction::KeepExisting &&
         (!prompt.identity.rewrite_checkpoint || !sequence.rewrite_checkpoint.valid ||
          sequence.rewrite_checkpoint.kind != prompt.identity.rewrite_checkpoint->kind ||
          sequence.rewrite_checkpoint.frontier != prompt.identity.rewrite_checkpoint->frontier ||
-         request_plan.reuse == ReusePath::FullReset ||
+         plan.reuse == ReusePath::FullReset ||
          !qwen3_6::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity,
                                           sequence.rewrite_checkpoint.frontier))) {
         throw std::logic_error("planned rewrite checkpoint retention is unavailable");
     }
-    if (request_plan.rewrite_checkpoint_action == RewriteCheckpointAction::ReclassifyExisting &&
+    if (plan.rewrite_checkpoint_action == RewriteCheckpointAction::ReclassifyExisting &&
         (!prompt.identity.rewrite_checkpoint || !sequence.rewrite_checkpoint.valid ||
          sequence.rewrite_checkpoint.kind == prompt.identity.rewrite_checkpoint->kind ||
          sequence.rewrite_checkpoint.frontier != prompt.identity.rewrite_checkpoint->frontier ||
-         request_plan.reuse == ReusePath::FullReset ||
+         plan.reuse == ReusePath::FullReset ||
          !qwen3_6::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity,
                                           sequence.rewrite_checkpoint.frontier))) {
         throw std::logic_error("planned rewrite checkpoint reclassification is unavailable");
     }
-    if (request_plan.rewrite_checkpoint_action == RewriteCheckpointAction::CaptureNew &&
-        (!request_plan.rewrite_checkpoint_capture || !prompt.identity.rewrite_checkpoint ||
-         request_plan.rewrite_checkpoint_capture->kind !=
+    if (plan.rewrite_checkpoint_action == RewriteCheckpointAction::CaptureNew &&
+        (!plan.rewrite_checkpoint_capture || !prompt.identity.rewrite_checkpoint ||
+         plan.rewrite_checkpoint_capture->kind !=
              prompt.identity.rewrite_checkpoint->kind ||
-         request_plan.rewrite_checkpoint_capture->frontier !=
+         plan.rewrite_checkpoint_capture->frontier !=
              prompt.identity.rewrite_checkpoint->frontier ||
-         request_plan.rewrite_checkpoint_capture->frontier <= request_plan.reuse_base ||
-         request_plan.rewrite_checkpoint_capture->frontier > prompt_tokens)) {
+         plan.rewrite_checkpoint_capture->frontier <= plan.reuse_base ||
+         plan.rewrite_checkpoint_capture->frontier > prompt_tokens)) {
         throw std::logic_error("planned rewrite checkpoint capture is invalid");
     }
-    if (request_plan.rewrite_checkpoint_action == RewriteCheckpointAction::Drop &&
+    if (plan.rewrite_checkpoint_action == RewriteCheckpointAction::Drop &&
         prompt.identity.rewrite_checkpoint) {
         throw std::logic_error("planned rewrite checkpoint drop does not describe the prompt");
     }
-    if (request_plan.rewrite_checkpoint_action == RewriteCheckpointAction::DeferCapture &&
-        (!prompt.identity.rewrite_checkpoint || request_plan.reuse == ReusePath::FullReset ||
-         prompt.identity.rewrite_checkpoint->frontier > request_plan.reuse_base)) {
+    if (plan.rewrite_checkpoint_action == RewriteCheckpointAction::DeferCapture &&
+        (!prompt.identity.rewrite_checkpoint || plan.reuse == ReusePath::FullReset ||
+         prompt.identity.rewrite_checkpoint->frontier > plan.reuse_base)) {
         throw std::logic_error("planned rewrite checkpoint deferral is invalid");
     }
 
     const auto started       = Clock::now();
-    const std::uint32_t base = request_plan.reuse_base;
+    const std::uint32_t base = plan.reuse_base;
     const std::uint32_t initial_mtp_extent =
         speculative_backend == SpeculativeBackend::Mtp
             ? std::min({draft_window,
-                        request_plan.summary.effective_output_tokens > 1
-                            ? request_plan.summary.effective_output_tokens - 2
+                        plan.summary.effective_output_tokens > 1
+                            ? plan.summary.effective_output_tokens - 2
                             : 0U,
                         capacity - prompt_tokens > 0 ? capacity - prompt_tokens - 1 : 0U})
             : 0U;
     request.lifecycle = Lifecycle::Empty;
     sequence.retained = false;
     try {
-        if (request_plan.reuse == ReusePath::FullReset) {
+        if (plan.reuse == ReusePath::FullReset) {
             sequence.kv.reset();
             ordered_reset(sequence);
             sequence.ledger.clear();
             sequence.text_kv_valid = 0;
             sequence.mtp_kv_valid  = 0;
-            reserve_sequence_kv(sequence, request_plan.text_kv_page_entitlement,
-                                request_plan.backend_kv_page_entitlement);
-        } else if (request_plan.reuse == ReusePath::AppendAtFrontier) {
+            reserve_sequence_kv(sequence, plan.text_kv_page_entitlement,
+                                plan.backend_kv_page_entitlement);
+        } else if (plan.reuse == ReusePath::AppendAtFrontier) {
             if (!sequence.kv) {
                 throw std::logic_error("resident prefix has no KV allocation bundle");
             }
@@ -505,7 +503,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             }
             if (speculative_backend == SpeculativeBackend::Mtp) {
                 const std::uint32_t mtp_base = base == 0 ? 0 : base - 1;
-                if (!request_plan.prepare_mtp || sequence.mtp_kv_valid < mtp_base) {
+                if (!plan.prepare_mtp || sequence.mtp_kv_valid < mtp_base) {
                     throw std::logic_error("resident MTP KV is shorter than the bridge frontier");
                 }
                 sequence.mtp_kv_valid = mtp_base;
@@ -514,18 +512,18 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                 throw std::logic_error("resident DFlash context is not at the append frontier");
             }
             trim_sequence_kv(sequence, base, backend_kv_valid(sequence));
-            resize_sequence_kv_entitlement(sequence, request_plan.text_kv_page_entitlement,
-                                           request_plan.backend_kv_page_entitlement);
+            resize_sequence_kv_entitlement(sequence, plan.text_kv_page_entitlement,
+                                           plan.backend_kv_page_entitlement);
             sequence.text_kv_valid = base;
             sequence.ledger.resize(base);
-        } else if (is_rewrite_checkpoint_restore(request_plan.reuse)) {
+        } else if (is_rewrite_checkpoint_restore(plan.reuse)) {
             if (!sequence.kv || sequence.text_kv_valid < base) {
                 throw std::logic_error("resident rewrite checkpoint has no complete KV allocation");
             }
             sequence.text_kv_valid = base;
             if (speculative_backend == SpeculativeBackend::Mtp) {
                 const std::uint32_t mtp_base = base == 0 ? 0 : base - 1;
-                if (!request_plan.prepare_mtp || sequence.mtp_kv_valid < mtp_base) {
+                if (!plan.prepare_mtp || sequence.mtp_kv_valid < mtp_base) {
                     throw std::logic_error(
                         "rewrite-checkpoint MTP KV is shorter than the bridge frontier");
                 }
@@ -539,8 +537,8 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                 sequence.dflash_context_frontier = base;
             }
             trim_sequence_kv(sequence, base, backend_kv_valid(sequence));
-            resize_sequence_kv_entitlement(sequence, request_plan.text_kv_page_entitlement,
-                                           request_plan.backend_kv_page_entitlement);
+            resize_sequence_kv_entitlement(sequence, plan.text_kv_page_entitlement,
+                                           plan.backend_kv_page_entitlement);
             decoder->linear_attention.copy_slot(
                 LinearStateSlots::rewrite_checkpoint_state_slot(sequence.lane, max_concurrency),
                 LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
@@ -560,14 +558,14 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             : speculative_backend == SpeculativeBackend::DFlash ? prompt_tokens
                                                                 : 0U;
         materialize_sequence_kv(sequence, prompt_tokens, backend_materialized);
-        install_sampling(sequence, request, request_plan.sampling);
+        install_sampling(sequence, request, plan.sampling);
         sequence.rope_delta = prompt.rope_delta;
         set_device_i32(io.rope_delta, sequence.rope_delta);
 
-        if (request_plan.rewrite_checkpoint_action == RewriteCheckpointAction::Drop ||
-            request_plan.rewrite_checkpoint_action == RewriteCheckpointAction::CaptureNew) {
+        if (plan.rewrite_checkpoint_action == RewriteCheckpointAction::Drop ||
+            plan.rewrite_checkpoint_action == RewriteCheckpointAction::CaptureNew) {
             sequence.rewrite_checkpoint = {};
-        } else if (request_plan.rewrite_checkpoint_action ==
+        } else if (plan.rewrite_checkpoint_action ==
                    RewriteCheckpointAction::ReclassifyExisting) {
             sequence.rewrite_checkpoint.kind = prompt.identity.rewrite_checkpoint->kind;
         }
@@ -590,9 +588,9 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                                        device.stream));
         }
 
-        if (request_plan.vision) {
+        if (plan.vision) {
             std::vector<bool> used(prompt.media_payloads.size(), false);
-            for (const VisionUseSpan& use : request_plan.vision->uses) {
+            for (const VisionUseSpan& use : plan.vision->uses) {
                 if (use.item_index >= used.size()) {
                     throw std::logic_error("Vision plan references a missing media payload");
                 }
@@ -602,22 +600,22 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                 if (!used[i]) { prompt.media_payloads[i].reset(); }
             }
         }
-        if (prompt.has_media() && !request_plan.vision) { prompt.release_all_media_payloads(); }
+        if (prompt.has_media() && !plan.vision) { prompt.release_all_media_payloads(); }
 
         RequestControl::Prefill prefill{
             .prompt                     = std::move(prompt),
-            .vision_plan                = std::move(request_plan.vision),
+            .vision_plan                = std::move(plan.vision),
             .vision                     = nullptr,
             .transient                  = transient,
-            .rewrite_checkpoint_capture = request_plan.rewrite_checkpoint_capture,
+            .rewrite_checkpoint_capture = plan.rewrite_checkpoint_capture,
             .base                       = base,
             .cursor                     = base,
             .prompt_tokens              = prompt_tokens,
             .initial_mtp_extent         = initial_mtp_extent,
             .elapsed_seconds            = 0.0,
-            .prepare_mtp                = request_plan.prepare_mtp,
-            .reuse                      = request_plan.reuse,
-            .mtp_bridge                 = request_plan.mtp_bridge,
+            .prepare_mtp                = plan.prepare_mtp,
+            .reuse                      = plan.reuse,
+            .mtp_bridge                 = plan.mtp_bridge,
         };
         request.prefill.emplace(std::move(prefill));
         auto& staged = *request.prefill;

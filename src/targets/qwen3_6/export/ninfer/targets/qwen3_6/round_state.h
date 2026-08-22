@@ -2,7 +2,7 @@
 
 #include "core/layout.h"
 #include "core/tensor.h"
-#include "ninfer/ops/sampling.h"
+#include "ninfer/ops/sampling_config.h"
 #include "ninfer/types.h"
 
 #include <array>

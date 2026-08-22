@@ -4,7 +4,7 @@
 
 #include "core/arena.h"
 #include "core/gdn_replay_records.h"
-#include "ninfer/ops/sampling.h"
+#include "ninfer/ops/sampling_config.h"
 #include "core/decode_graph.h"
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
 
@@ -14,7 +14,6 @@
 #include "targets/qwen3_6/impl/runtime/prefix_identity.h"
 #include "targets/qwen3_6/impl/runtime/text_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
-#include "targets/qwen3_6/impl/runtime/vision_prefill.h"
 
 #include <cstdint>
 #include <array>
@@ -40,59 +39,9 @@ using ReusePath = ninfer::PrefixReusePath;
                                                       : ReusePath::RestoreResponseCheckpoint;
 }
 
-enum class RewriteCheckpointAction : std::uint8_t {
-    Drop,
-    KeepExisting,
-    ReclassifyExisting,
-    CaptureNew,
-    DeferCapture,
-};
-
-enum class MtpBridgeMode : std::uint8_t {
-    None,
-    BeforeSuffix,
-    AfterExactHit,
-};
-
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS
 
-namespace ninfer::targets::qwen3_6::detail {
-
-template <>
-struct RequestBasePlanImpl<NINFER_QWEN36_VARIANT> {
-    runtime::RequestPlanSummary summary;
-    ops::SamplingConfig sampling;
-    std::uint32_t text_kv_page_entitlement    = 0;
-    std::uint32_t backend_kv_page_entitlement = 0;
-    std::shared_ptr<const qwen3_6::VisionControl> vision_control;
-    std::size_t vision_transient_bytes = 0;
-    std::optional<qwen3_6::RewriteCheckpointSpec> rewrite_checkpoint;
-    bool allow_prefix_reuse = false;
-};
-
-template <>
-struct RequestPlanImpl<NINFER_QWEN36_VARIANT> {
-    runtime::RequestPlanSummary summary;
-    NINFER_QWEN36_RUNTIME_NS::ReusePath reuse = NINFER_QWEN36_RUNTIME_NS::ReusePath::FullReset;
-    std::uint32_t reuse_base                  = 0;
-    NINFER_QWEN36_RUNTIME_NS::MtpBridgeMode mtp_bridge =
-        NINFER_QWEN36_RUNTIME_NS::MtpBridgeMode::None;
-    bool prepare_mtp = false;
-    std::optional<NINFER_QWEN36_RUNTIME_NS::VisionPrefillPlan> vision;
-    NINFER_QWEN36_RUNTIME_NS::RewriteCheckpointAction rewrite_checkpoint_action =
-        NINFER_QWEN36_RUNTIME_NS::RewriteCheckpointAction::Drop;
-    std::optional<qwen3_6::RewriteCheckpointSpec> rewrite_checkpoint_capture;
-    ops::SamplingConfig sampling;
-    std::uint32_t text_kv_page_entitlement    = 0;
-    std::uint32_t backend_kv_page_entitlement = 0;
-};
-
-} // namespace ninfer::targets::qwen3_6::detail
-
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
-
-using RequestPlanImpl     = qwen3_6::detail::RequestPlanImpl<Variant>;
-using RequestBasePlanImpl = qwen3_6::detail::RequestBasePlanImpl<Variant>;
 
 enum class PendingKind : std::uint8_t {
     None,
