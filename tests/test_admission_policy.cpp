@@ -21,29 +21,31 @@ int check(bool condition, const char* message) {
 
 int main() {
     using ninfer::runtime::ActiveAdmissionSnapshot;
-    using ninfer::runtime::AdmissionResources;
+    using ninfer::runtime::DeviceResources;
     using ninfer::runtime::BackfillClass;
 
     int failures = 0;
-    const AdmissionResources capacity{
+    const DeviceResources capacity{
         .active_lanes     = 4,
+        .state_slots      = 8,
         .main_kv_pages    = 160,
         .backend_kv_pages = 128,
     };
-    const AdmissionResources head{
+    const DeviceResources head{
         .active_lanes     = 1,
+        .state_slots      = 2,
         .main_kv_pages    = 64,
         .backend_kv_pages = 48,
     };
     std::array<ActiveAdmissionSnapshot, 2> incumbents{
         ActiveAdmissionSnapshot{
             .request_id            = 1,
-            .resources             = {1, 64, 32},
+            .resources             = {1, 2, 64, 32},
             .remaining_work_quanta = 100,
         },
         ActiveAdmissionSnapshot{
             .request_id            = 2,
-            .resources             = {1, 48, 64},
+            .resources             = {1, 2, 48, 64},
             .remaining_work_quanta = 20,
         },
     };
@@ -56,12 +58,12 @@ int main() {
     failures += check(ninfer::runtime::protection_frontier_distance(protection, incumbents) == 20,
                       "frontier distance did not follow the frozen donor");
 
-    const AdmissionResources persistent_candidate{1, 24, 40};
+    const DeviceResources persistent_candidate{1, 1, 24, 40};
     failures += check(ninfer::runtime::persistent_backfill_is_safe(protection, incumbents,
                                                                    persistent_candidate, capacity),
                       "future resource surplus rejected a persistent-safe backfill");
     failures += check(!ninfer::runtime::persistent_backfill_is_safe(
-                          protection, incumbents, AdmissionResources{1, 40, 60}, capacity),
+                          protection, incumbents, DeviceResources{1, 1, 40, 60}, capacity),
                       "persistent backfill borrowed protected future capacity");
 
     std::array<ActiveAdmissionSnapshot, 3> with_persistent{
@@ -76,14 +78,14 @@ int main() {
         },
     };
     failures += check(!ninfer::runtime::persistent_backfill_is_safe(
-                          protection, with_persistent, AdmissionResources{1, 9, 9}, capacity),
+                          protection, with_persistent, DeviceResources{1, 1, 9, 9}, capacity),
                       "persistent ledger failed to accumulate earlier backfills");
 
     std::array<ActiveAdmissionSnapshot, 2> after_donor{
         incumbents[0],
         ActiveAdmissionSnapshot{
             .request_id            = 4,
-            .resources             = {1, 32, 64},
+            .resources             = {1, 1, 32, 64},
             .remaining_work_quanta = 8,
             .backfill_epoch        = 7,
             .backfill_class        = BackfillClass::Temporal,
@@ -96,9 +98,10 @@ int main() {
         "released frontier did not mature behind a temporal borrower");
 
     failures += check(
-        !ninfer::runtime::admission_resources_fit(AdmissionResources{1, 161, 1}, capacity) &&
-            !ninfer::runtime::admission_resources_fit(AdmissionResources{1, 1, 129}, capacity),
-        "independent KV pools were incorrectly treated as interchangeable capacity");
+        !ninfer::runtime::admission_resources_fit(DeviceResources{1, 9, 1, 1}, capacity) &&
+            !ninfer::runtime::admission_resources_fit(DeviceResources{1, 1, 161, 1}, capacity) &&
+            !ninfer::runtime::admission_resources_fit(DeviceResources{1, 1, 1, 129}, capacity),
+        "independent Device resource dimensions were treated as interchangeable capacity");
 
     using Scheduler = ninfer::runtime::Scheduler<SchedulerRequest>;
     Scheduler scheduler;
@@ -106,7 +109,7 @@ int main() {
     failures += check(scheduler.protect_blocked_head(10, head, incumbents, capacity),
                       "blocked FIFO head did not open a protection epoch");
 
-    const AdmissionResources persistent_safe_candidate{1, 24, 24};
+    const DeviceResources persistent_safe_candidate{1, 1, 24, 24};
     auto persistent =
         scheduler.qualify_backfill(11, persistent_safe_candidate, 50, incumbents, capacity);
     failures += check(persistent && persistent->backfill_class() == BackfillClass::Persistent &&
@@ -127,7 +130,7 @@ int main() {
             .backfill_class        = BackfillClass::Persistent,
         },
     };
-    const AdmissionResources temporal_candidate{1, 16, 8};
+    const DeviceResources temporal_candidate{1, 1, 16, 8};
     auto temporal =
         scheduler.qualify_backfill(12, temporal_candidate, 8, active_with_persistent, capacity);
     failures += check(temporal && temporal->backfill_class() == BackfillClass::Temporal &&

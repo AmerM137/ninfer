@@ -312,6 +312,16 @@ void StateImageDevicePool::copy_slot(std::int32_t source, std::int32_t destinati
     }
 }
 
+void StateImageDevicePool::copy_dflash_local(std::int32_t source, std::int32_t destination,
+                                             cudaStream_t stream) {
+    validate_slot(source, slot_count(), "StateImage DFlash copy source is out of range");
+    validate_slot(destination, slot_count(), "StateImage DFlash copy destination is out of range");
+    if (!dflash_local_) { throw std::logic_error("StateImage has no DFlash local component"); }
+    if (source != destination) {
+        dflash_local_->copy_slot_from(*dflash_local_, source, destination, stream);
+    }
+}
+
 void StateImageDevicePool::validate_host_layout(const StateImageHostLayout* layout,
                                                 const std::byte* data) const {
     if (layout == nullptr || data == nullptr || !same_host_layout(*layout, host_layout_)) {

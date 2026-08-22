@@ -79,6 +79,12 @@ void ResidentPrefixIdentity::assign(const PreparedPromptData& prompt) {
     vision_items_ = prompt.vision_items;
 }
 
+void ResidentPrefixIdentity::swap(ResidentPrefixIdentity& other) noexcept {
+    token_types_.swap(other.token_types_);
+    positions_.swap(other.positions_);
+    vision_items_.swap(other.vision_items_);
+}
+
 void ResidentPrefixIdentity::append_generated(std::size_t count, std::int32_t rope_delta) {
     const std::size_t begin = size();
     if (count > std::numeric_limits<std::size_t>::max() - begin) {

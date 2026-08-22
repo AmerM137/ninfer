@@ -234,20 +234,19 @@ TextContext::TextContext(DeviceContext& ctx, const LoadedModelData& weights, Wor
     if (mtp_enabled() && !io_.mtp_decode && !io_.mtp) {
         throw std::invalid_argument("MTP TextContext requires MTP round state");
     }
-    set_linear_state_slots(0, state_.slot_count() > 1 ? 1 : 0);
+    set_linear_state_slots(0, 0);
     bind();
 }
 
 TextContext::~TextContext() = default;
 
-void TextContext::set_linear_state_slots(std::int32_t current_slot,
-                                         std::int32_t rewrite_checkpoint_slot) {
-    if (current_slot < 0 || current_slot >= state_.slot_count() || rewrite_checkpoint_slot < 0 ||
-        rewrite_checkpoint_slot >= state_.slot_count() || current_slot == rewrite_checkpoint_slot) {
+void TextContext::set_linear_state_slots(std::int32_t source_slot, std::int32_t destination_slot) {
+    if (source_slot < 0 || source_slot >= state_.slot_count() || destination_slot < 0 ||
+        destination_slot >= state_.slot_count()) {
         throw std::invalid_argument("TextContext Linear Attention slots are invalid");
     }
-    linear_state_current_slot_            = current_slot;
-    linear_state_rewrite_checkpoint_slot_ = rewrite_checkpoint_slot;
+    linear_state_source_slot_      = source_slot;
+    linear_state_destination_slot_ = destination_slot;
 }
 
 void TextContext::set_gdn_state_action(GdnStateAction action,
@@ -642,7 +641,8 @@ void TextContext::mtp_forward_ar_step(const Tensor& token, const Tensor& previou
 
 void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_positions,
                                         const Tensor& rope_positions, const Tensor& kv_table_rows,
-                                        const Tensor& linear_state_slots,
+                                        const Tensor& linear_state_source_slots,
+                                        const Tensor& linear_state_destination_slots,
                                         ops::CausalAttentionExecutionEnvelope envelope,
                                         Tensor& hidden, Tensor& logits) {
     const std::int32_t batch = ids.ne[0];
@@ -653,8 +653,10 @@ void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_p
     require_tensor_shape(cache_positions, DType::I32, {batch}, "ordinary decode cache positions");
     require_tensor_shape(rope_positions, DType::I32, {batch}, "ordinary decode RoPE positions");
     require_tensor_shape(kv_table_rows, DType::I32, {batch}, "ordinary decode KV rows");
-    require_tensor_shape(linear_state_slots, DType::I32, {batch},
-                         "ordinary decode Linear Attention slots");
+    require_tensor_shape(linear_state_source_slots, DType::I32, {batch},
+                         "ordinary decode Linear Attention source slots");
+    require_tensor_shape(linear_state_destination_slots, DType::I32, {batch},
+                         "ordinary decode Linear Attention destination slots");
     require_tensor_shape(hidden, DType::BF16, {kCfg.hidden, batch}, "ordinary decode hidden");
     require_tensor_shape(logits, DType::BF16, {kCfg.vocab, batch}, "ordinary decode logits");
 
@@ -665,7 +667,10 @@ void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_p
         ScopedPositions rope_binding(active_rope_positions_, rope_positions);
         ScopedEnvelope envelope_binding(active_causal_attention_envelope_, envelope);
         ScopedValue<const Tensor*> kv_binding(active_kv_table_rows_, &kv_table_rows);
-        ScopedValue<const Tensor*> state_binding(active_linear_state_slots_, &linear_state_slots);
+        ScopedValue<const Tensor*> source_binding(active_linear_state_source_slots_,
+                                                  &linear_state_source_slots);
+        ScopedValue<const Tensor*> destination_binding(active_linear_state_destination_slots_,
+                                                       &linear_state_destination_slots);
         ScopedValue<std::int32_t> batch_binding(active_sequence_batch_, batch);
         ScopedValue<std::int32_t> width_binding(active_sequence_width_, 1);
 
@@ -683,7 +688,7 @@ template <class Tap>
 void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cache_positions,
                                            const Tensor& rope_positions,
                                            const Tensor& valid_columns, const Tensor& kv_table_rows,
-                                           const Tensor& linear_state_slots,
+                                           const Tensor& linear_state_source_slots,
                                            ops::CausalAttentionExecutionEnvelope envelope,
                                            Tensor& hidden, Tensor& logits, Tensor& target_tokens,
                                            Tap& tap) {
@@ -701,7 +706,7 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
                          "target verify batch RoPE positions");
     require_tensor_shape(valid_columns, DType::I32, {batch}, "target verify batch valid columns");
     require_tensor_shape(kv_table_rows, DType::I32, {batch}, "target verify batch KV rows");
-    require_tensor_shape(linear_state_slots, DType::I32, {batch},
+    require_tensor_shape(linear_state_source_slots, DType::I32, {batch},
                          "target verify batch Linear Attention slots");
     require_tensor_shape(hidden, DType::BF16, {kCfg.hidden, width, batch},
                          "target verify batch hidden");
@@ -716,7 +721,8 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
         ScopedPositions rope_binding(active_rope_positions_, rope_positions);
         ScopedEnvelope envelope_binding(active_causal_attention_envelope_, envelope);
         ScopedValue<const Tensor*> kv_binding(active_kv_table_rows_, &kv_table_rows);
-        ScopedValue<const Tensor*> state_binding(active_linear_state_slots_, &linear_state_slots);
+        ScopedValue<const Tensor*> state_binding(active_linear_state_source_slots_,
+                                                 &linear_state_source_slots);
         ScopedValue<const Tensor*> valid_binding(active_valid_columns_, &valid_columns);
         ScopedValue<std::int32_t> batch_binding(active_sequence_batch_, batch);
         ScopedValue<std::int32_t> width_binding(active_sequence_width_, width);
@@ -741,22 +747,26 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
 
 void TextContext::target_verify_batch(const Tensor& ids, const Tensor& cache_positions,
                                       const Tensor& rope_positions, const Tensor& valid_columns,
-                                      const Tensor& kv_table_rows, const Tensor& linear_state_slots,
+                                      const Tensor& kv_table_rows,
+                                      const Tensor& linear_state_source_slots,
                                       ops::CausalAttentionExecutionEnvelope envelope,
                                       Tensor& hidden, Tensor& logits, Tensor& target_tokens) {
     NullTap tap;
     target_verify_batch_impl(ids, cache_positions, rope_positions, valid_columns, kv_table_rows,
-                             linear_state_slots, envelope, hidden, logits, target_tokens, tap);
+                             linear_state_source_slots, envelope, hidden, logits, target_tokens,
+                             tap);
 }
 
 void TextContext::target_verify_batch(const Tensor& ids, const Tensor& cache_positions,
                                       const Tensor& rope_positions, const Tensor& valid_columns,
-                                      const Tensor& kv_table_rows, const Tensor& linear_state_slots,
+                                      const Tensor& kv_table_rows,
+                                      const Tensor& linear_state_source_slots,
                                       ops::CausalAttentionExecutionEnvelope envelope,
                                       Tensor& hidden, Tensor& logits, Tensor& target_tokens,
                                       DFlashFeatureSink& sink) {
     target_verify_batch_impl(ids, cache_positions, rope_positions, valid_columns, kv_table_rows,
-                             linear_state_slots, envelope, hidden, logits, target_tokens, sink);
+                             linear_state_source_slots, envelope, hidden, logits, target_tokens,
+                             sink);
 }
 
 void TextContext::mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidden,
@@ -879,7 +889,7 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
     Tensor kc             = projection.key;
     Tensor vc             = projection.value;
     if (ph == Phase::Verify) {
-        if (active_sequence_batch_ == 0 || active_linear_state_slots_ == nullptr) {
+        if (active_sequence_batch_ == 0 || active_linear_state_source_slots_ == nullptr) {
             throw std::logic_error(
                 "Verify GDN requires an explicit sequence batch and state slots");
         }
@@ -902,24 +912,26 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
                 throw std::logic_error("Replay-record GDN has no record storage");
             }
             GdnReplayRecordLayer records = replay_records_->layer(gidx, active_sequence_batch_);
-            Variant::gdn_input_projection_record(projection_input, *w.projection, *w.conv1d,
-                                                 conv_states, valid, *active_linear_state_slots_,
-                                                 records.conv, query_output, key_output,
-                                                 value_output, gate_output, ph, work_, s);
+            Variant::gdn_input_projection_record(
+                projection_input, *w.projection, *w.conv1d, conv_states, valid,
+                *active_linear_state_source_slots_, records.conv, query_output, key_output,
+                value_output, gate_output, ph, work_, s);
         } else {
             Variant::gdn_input_projection_snapshot(
                 projection_input, *w.projection, *w.conv1d, conv_states, valid,
-                *active_linear_state_slots_, *active_linear_state_slots_, query_output, key_output,
-                value_output, gate_output, ph, work_, s);
+                *active_linear_state_source_slots_, *active_linear_state_destination_slots_,
+                query_output, key_output, value_output, gate_output, ph, work_, s);
         }
     } else {
         const auto conv = workspace_recipe::gdn_prefill_conv<TextConfig>(work_, T);
         Tensor qkv      = conv.projected;
         Variant::gdn_input_projection(h, *w.projection, qkv, z, ph, work_, s);
         Tensor qkv_c = conv.convolved;
-        Tensor conv_state =
-            state_.conv_slot(static_cast<std::uint32_t>(gidx), linear_state_current_slot_);
-        ops::causal_conv1d_silu(qkv, *w.conv1d, conv_state, conv_state, qkv_c, s);
+        Tensor conv_state_in =
+            state_.conv_slot(static_cast<std::uint32_t>(gidx), linear_state_source_slot_);
+        Tensor conv_state_out =
+            state_.conv_slot(static_cast<std::uint32_t>(gidx), linear_state_destination_slot_);
+        ops::causal_conv1d_silu(qkv, *w.conv1d, conv_state_in, conv_state_out, qkv_c, s);
         ops::extract_bf16_columns(qkv_c, 0, qc, s);
         ops::extract_bf16_columns(qkv_c, kCfg.key_dim, kc, s);
         ops::extract_bf16_columns(qkv_c, 2 * kCfg.key_dim, vc, s);
@@ -948,18 +960,22 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
             GdnReplayRecordLayer records = replay_records_->layer(gidx, active_sequence_batch_);
             ops::gated_delta_net_replay_record(q_batch, k_batch, v_batch, g_batch, beta_batch,
                                                kGdnScale, recurrent_states, valid,
-                                               *active_linear_state_slots_, records.key,
+                                               *active_linear_state_source_slots_, records.key,
                                                records.value, records.gate, out_batch, s);
         } else {
             ops::gated_delta_net_batch_update(
                 q_batch, k_batch, v_batch, g_batch, beta_batch, kGdnScale,
-                /*normalize_qk=*/true, recurrent_states, *active_linear_state_slots_, out_batch, s);
+                /*normalize_qk=*/true, recurrent_states, *active_linear_state_source_slots_,
+                *active_linear_state_destination_slots_, out_batch, s);
         }
     } else {
-        Tensor recurrent_state =
-            state_.recurrent_slot(static_cast<std::uint32_t>(gidx), linear_state_current_slot_);
+        Tensor recurrent_state_in =
+            state_.recurrent_slot(static_cast<std::uint32_t>(gidx), linear_state_source_slot_);
+        Tensor recurrent_state_out =
+            state_.recurrent_slot(static_cast<std::uint32_t>(gidx), linear_state_destination_slot_);
         ops::gated_delta_net(q_recurrent, k_recurrent, vv, g, beta, kGdnScale,
-                             /*normalize_qk=*/true, work_, recurrent_state, o, s);
+                             /*normalize_qk=*/true, work_, recurrent_state_in, recurrent_state_out,
+                             o, s);
     }
 
     Tensor on = workspace_recipe::gdn_normalized_output<TextConfig>(work_, T).view(
@@ -1083,8 +1099,6 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
         checkpoint_abs > base64 && checkpoint_abs <= base64 + static_cast<std::int64_t>(T);
     const int checkpoint_rel =
         has_rewrite_checkpoint ? static_cast<int>(checkpoint_abs - base64) : -1;
-    const std::int32_t rewrite_checkpoint_slot = linear_state_rewrite_checkpoint_slot_;
-
     const bool prepare_mtp_prompt = mtp_enabled() && io_.mtp.has_value();
     if (prepare_mtp_prompt &&
         mtp_proposal_extent_ > static_cast<std::uint32_t>(io_.mtp->draft_tokens.ne[0])) {
@@ -1294,10 +1308,6 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
         if constexpr (requires { tap.consume_prefill_chunk(len, false); }) {
             work_.reset();
             tap.consume_prefill_chunk(len, checkpoint_rel > 0 && t0 + len == checkpoint_rel);
-        }
-
-        if (checkpoint_rel > 0 && t0 + len == checkpoint_rel) {
-            state_.copy_slot(linear_state_current_slot_, rewrite_checkpoint_slot, s);
         }
 
         t0 += len;

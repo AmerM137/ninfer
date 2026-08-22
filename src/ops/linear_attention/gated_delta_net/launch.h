@@ -11,9 +11,11 @@
 
 namespace ninfer::ops::detail::gated_delta_net {
 
-struct alignas(8) GdnReplayFoldKernelRow {
-    std::int32_t linear_state_slot;
+struct alignas(16) GdnReplayFoldKernelRow {
+    std::int32_t source_state_slot;
+    std::int32_t destination_state_slot;
     std::int32_t commit_columns;
+    std::int32_t reserved = 0;
 };
 
 struct alignas(16) GdnReplayFoldKernelRows {
@@ -31,8 +33,10 @@ void launch_recurrent_inout(const Tensor& q, const Tensor& k, const Tensor& v, c
 
 void launch_recurrent_batch_update(const Tensor& q, const Tensor& k, const Tensor& v,
                                    const Tensor& g, const Tensor& beta, float scale,
-                                   bool normalize_qk, Tensor& ssm_states, const Tensor& state_slots,
-                                   Tensor& out, cudaStream_t stream);
+                                   bool normalize_qk, Tensor& ssm_states,
+                                   const Tensor& source_state_slots,
+                                   const Tensor& destination_state_slots, Tensor& out,
+                                   cudaStream_t stream);
 
 void launch_recurrent_record(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
                              const Tensor& beta, float scale, const Tensor& ssm_states,

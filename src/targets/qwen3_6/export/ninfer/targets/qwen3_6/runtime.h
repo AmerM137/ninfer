@@ -127,6 +127,7 @@ public:
     AdmissionPlan& operator=(const AdmissionPlan&) = delete;
 
     [[nodiscard]] const runtime::RequestPlanSummary& summary() const noexcept;
+    [[nodiscard]] const runtime::ResourceDemand& demand() const noexcept;
 
 public:
     // Family-private construction/storage seam. Exact packages expose only the completed alias;
@@ -157,17 +158,37 @@ public:
     ~ContinuationHandle()         = default;
 
     ContinuationHandle(ContinuationHandle&& other) noexcept
-        : owner_(std::exchange(other.owner_, nullptr)), lane_(other.lane_),
-          epoch_(std::exchange(other.epoch_, 0)) {}
+        : owner_(std::exchange(other.owner_, nullptr)), index_(other.index_),
+          generation_(std::exchange(other.generation_, 0)) {}
 
     ContinuationHandle& operator=(ContinuationHandle&&)      = delete;
     ContinuationHandle(const ContinuationHandle&)            = delete;
     ContinuationHandle& operator=(const ContinuationHandle&) = delete;
 
 private:
-    const void* owner_ = nullptr;
-    runtime::LaneId lane_{};
-    std::uint64_t epoch_ = 0;
+    const void* owner_        = nullptr;
+    std::uint32_t index_      = 0;
+    std::uint64_t generation_ = 0;
+
+    friend struct detail::RuntimeContractAccess<Variant>;
+};
+
+template <class Variant>
+class MaterializationTicket {
+public:
+    MaterializationTicket() noexcept = default;
+
+    MaterializationTicket(MaterializationTicket&& other) noexcept
+        : owner_(std::exchange(other.owner_, nullptr)),
+          transaction_(std::exchange(other.transaction_, 0)) {}
+
+    MaterializationTicket& operator=(MaterializationTicket&&)      = delete;
+    MaterializationTicket(const MaterializationTicket&)            = delete;
+    MaterializationTicket& operator=(const MaterializationTicket&) = delete;
+
+private:
+    const void* owner_         = nullptr;
+    std::uint64_t transaction_ = 0;
 
     friend struct detail::RuntimeContractAccess<Variant>;
 };
@@ -223,13 +244,22 @@ struct PrefillProgress {
 template <class Variant>
 struct StartResult {
     SequenceHandle<Variant> sequence;
-    runtime::AdmissionResources active_resources;
-    PrefillProgress<Variant> progress;
+    runtime::DeviceResources active_resources;
+    runtime::ResourceDelta resource_delta;
+};
+
+template <class Variant>
+struct MaterializationResult {
+    runtime::MaterializationStatus status = runtime::MaterializationStatus::Aborted;
+    std::optional<StartResult<Variant>> published;
+    std::optional<ContinuationHandle<Variant>> source;
+    std::array<runtime::DeviceResources, 2 * kMaximumConcurrency> released_victims{};
+    std::size_t victim_count = 0;
 };
 
 struct CommitRowResult {
     runtime::CommitDisposition disposition = runtime::CommitDisposition::Active;
-    runtime::AdmissionResources released_resources;
+    runtime::DeviceResources released_resources;
     GenerationTimings timings;
     SpeculativeStats speculative;
 };
@@ -243,7 +273,7 @@ struct CommitResult {
 template <class Variant>
 struct DiscardResult {
     runtime::ConsumeStatus status = runtime::ConsumeStatus::InvariantMismatch;
-    std::array<runtime::AdmissionResources, kMaximumConcurrency> released_resources{};
+    std::array<runtime::DeviceResources, kMaximumConcurrency> released_resources{};
     std::size_t row_count = 0;
 };
 
@@ -252,8 +282,9 @@ struct FinishResult {
     runtime::ConsumeStatus status = runtime::ConsumeStatus::InvariantMismatch;
     GenerationTimings timings;
     SpeculativeStats speculative;
-    runtime::AdmissionResources released_resources;
-    runtime::AdmissionResources resident_resources;
+    runtime::DeviceResources released_resources;
+    runtime::DeviceResources resident_resources;
+    runtime::ContinuationSummary summary;
     std::optional<ContinuationHandle<Variant>> continuation;
 };
 
@@ -262,13 +293,13 @@ struct AbortResult {
     runtime::ConsumeStatus status = runtime::ConsumeStatus::InvariantMismatch;
     GenerationTimings timings;
     SpeculativeStats speculative;
-    runtime::AdmissionResources released_resources;
+    runtime::DeviceResources released_resources;
 };
 
 template <class Variant>
 struct ReleaseResult {
     runtime::ConsumeStatus status = runtime::ConsumeStatus::InvariantMismatch;
-    runtime::AdmissionResources released_resources;
+    runtime::DeviceResources released_resources;
 };
 
 template <class Variant>
@@ -285,12 +316,24 @@ public:
     // capabilities, model state and one immutable pending transaction at a time.
     [[nodiscard]] RequestBasePlan<Variant>
     plan_request(const PreparedPrompt& prompt, const runtime::ResolvedExecutionOptions& options);
-    [[nodiscard]] AdmissionPlan<Variant>
+    [[nodiscard]] std::optional<AdmissionPlan<Variant>>
     inspect_admission(const PreparedPrompt& prompt, const RequestBasePlan<Variant>& base,
-                      runtime::LaneId destination, const ContinuationHandle<Variant>* source);
-    [[nodiscard]] StartResult<Variant>
-    start_request(AdmissionPlan<Variant>&& plan, PreparedPrompt&& prompt,
-                  std::optional<ContinuationHandle<Variant>>&& source);
+                      runtime::LaneId destination, const ContinuationHandle<Variant>* source,
+                      std::optional<runtime::CheckpointRef> checkpoint);
+    [[nodiscard]] MaterializationTicket<Variant>
+    reserve_materialization(AdmissionPlan<Variant>&& plan, PreparedPrompt&& prompt,
+                            const ContinuationHandle<Variant>* source,
+                            std::span<const ContinuationHandle<Variant>* const> victims);
+    [[nodiscard]] ReleaseResult<Variant>
+    release_materialization_victim(MaterializationTicket<Variant>& ticket,
+                                   ContinuationHandle<Variant>&& victim) noexcept;
+    [[nodiscard]] runtime::ConsumeStatus
+    abort_materialization(MaterializationTicket<Variant>&& ticket) noexcept;
+    void prepare_materialization(MaterializationTicket<Variant>& ticket);
+    [[nodiscard]] MaterializationResult<Variant>
+    publish_materialization(MaterializationTicket<Variant>&& ticket,
+                            std::optional<ContinuationHandle<Variant>>&& source,
+                            runtime::CancellationFlagView cancellation);
     [[nodiscard]] PrefillProgress<Variant> advance_prefill(SequenceHandle<Variant> sequence);
     [[nodiscard]] PendingBatch<Variant> decode(std::span<const SequenceHandle<Variant>> sequences,
                                                std::span<const runtime::RoundBudget> budgets);
@@ -298,14 +341,13 @@ public:
     commit(PendingBatch<Variant>&& pending, std::span<const runtime::CommitDecision> decisions,
            runtime::CommitObservation observation = runtime::CommitObservation::AllRows);
     [[nodiscard]] DiscardResult<Variant> abort_pending(PendingBatch<Variant>&& pending) noexcept;
-    [[nodiscard]] FinishResult<Variant> finish(SequenceHandle<Variant> sequence,
-                                               runtime::RetentionDecision decision) noexcept;
+    [[nodiscard]] FinishResult<Variant> finish(SequenceHandle<Variant> sequence) noexcept;
     [[nodiscard]] AbortResult<Variant> abort(SequenceHandle<Variant> sequence) noexcept;
     [[nodiscard]] ReleaseResult<Variant>
     release_continuation(ContinuationHandle<Variant>&& continuation) noexcept;
     void fail_all_cleanup() noexcept;
 
-    [[nodiscard]] runtime::AdmissionResources admission_capacity() const noexcept;
+    [[nodiscard]] runtime::DeviceResources admission_capacity() const noexcept;
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
     void reset_memory_peaks() noexcept;
 
@@ -333,11 +375,11 @@ struct RuntimeContractAccess {
     }
 
     [[nodiscard]] static ContinuationHandle<Variant>
-    make_continuation(const void* owner, runtime::LaneId lane, std::uint64_t epoch) noexcept {
+    make_continuation(const void* owner, std::uint32_t index, std::uint64_t generation) noexcept {
         ContinuationHandle<Variant> out;
-        out.owner_ = owner;
-        out.lane_  = lane;
-        out.epoch_ = epoch;
+        out.owner_      = owner;
+        out.index_      = index;
+        out.generation_ = generation;
         return out;
     }
 
@@ -357,17 +399,39 @@ struct RuntimeContractAccess {
         return handle.owner_;
     }
 
-    [[nodiscard]] static runtime::LaneId lane(const ContinuationHandle<Variant>& handle) noexcept {
-        return handle.lane_;
+    [[nodiscard]] static std::uint32_t index(const ContinuationHandle<Variant>& handle) noexcept {
+        return handle.index_;
     }
 
     [[nodiscard]] static std::uint64_t epoch(const ContinuationHandle<Variant>& handle) noexcept {
-        return handle.epoch_;
+        return handle.generation_;
     }
 
     static void consume(ContinuationHandle<Variant>& handle) noexcept {
-        handle.owner_ = nullptr;
-        handle.epoch_ = 0;
+        handle.owner_      = nullptr;
+        handle.generation_ = 0;
+    }
+
+    [[nodiscard]] static MaterializationTicket<Variant>
+    make_materialization_ticket(const void* owner, std::uint64_t transaction) noexcept {
+        MaterializationTicket<Variant> out;
+        out.owner_       = owner;
+        out.transaction_ = transaction;
+        return out;
+    }
+
+    [[nodiscard]] static const void* owner(const MaterializationTicket<Variant>& ticket) noexcept {
+        return ticket.owner_;
+    }
+
+    [[nodiscard]] static std::uint64_t
+    transaction(const MaterializationTicket<Variant>& ticket) noexcept {
+        return ticket.transaction_;
+    }
+
+    static void consume(MaterializationTicket<Variant>& ticket) noexcept {
+        ticket.owner_       = nullptr;
+        ticket.transaction_ = 0;
     }
 
     [[nodiscard]] static PendingBatch<Variant>

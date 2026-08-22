@@ -65,14 +65,17 @@ void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Te
 /**
  * One-token update for B independent state-pool slots. q/k are contiguous BF16 [128,Hqk,1,B],
  * v/out are BF16 [128,Hv,1,B], g/beta are FP32 [Hv,1,B], `ssm_states` is contiguous FP32
- * [128,128,Hv,Slots], and `state_slots` is contiguous device I32 [B]. B is in [1,8]. Row b reads
- * and writes state_slots[b], publishing its state after the single transition. The caller supplies
- * distinct active slots. This form uses no arena allocation.
+ * [128,128,Hv,Slots], and both selector tensors are contiguous device I32 [B]. B is in [1,8].
+ * Row b reads source_state_slots[b] and publishes the transition to
+ * destination_state_slots[b]; selectors may be equal for an in-place row. Destination slots are
+ * distinct across active rows. This form uses no arena allocation.
  */
 void gated_delta_net_batch_update(const Tensor& q, const Tensor& k, const Tensor& v,
                                   const Tensor& g, const Tensor& beta, float scale,
-                                  bool normalize_qk, Tensor& ssm_states, const Tensor& state_slots,
-                                  Tensor& out, cudaStream_t stream);
+                                  bool normalize_qk, Tensor& ssm_states,
+                                  const Tensor& source_state_slots,
+                                  const Tensor& destination_state_slots, Tensor& out,
+                                  cudaStream_t stream);
 
 /**
  * Op: gated_delta_net_replay_record

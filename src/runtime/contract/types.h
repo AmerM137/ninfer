@@ -2,9 +2,11 @@
 
 #include "ninfer/types.h"
 
+#include <atomic>
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
 
 namespace ninfer::runtime {
@@ -46,11 +48,6 @@ struct LaneId {
     [[nodiscard]] friend constexpr auto operator<=>(LaneId, LaneId) noexcept = default;
 };
 
-enum class RetentionDecision : std::uint8_t {
-    RetainResident,
-    Release,
-};
-
 enum class ConsumeStatus : std::uint8_t {
     Consumed,
     InvariantMismatch,
@@ -75,25 +72,98 @@ struct CommitDecision {
     bool cancelled                = false;
 };
 
-// Complete request-lifetime ownership in the three independently exhausted admission domains.
-// Values are already rounded to the physical allocation granularity by the target.
-struct AdmissionResources {
+// Device ownership in the independently exhausted runtime resource domains. Values are already
+// rounded to the physical allocation granularity by the target.
+struct DeviceResources {
     std::uint32_t active_lanes     = 0;
+    std::uint32_t state_slots      = 0;
     std::uint32_t main_kv_pages    = 0;
     std::uint32_t backend_kv_pages = 0;
 
-    [[nodiscard]] friend constexpr bool operator==(const AdmissionResources&,
-                                                   const AdmissionResources&) noexcept = default;
+    [[nodiscard]] friend constexpr bool operator==(const DeviceResources&,
+                                                   const DeviceResources&) noexcept = default;
 };
 
-[[nodiscard]] constexpr AdmissionResources operator+(AdmissionResources lhs,
-                                                     AdmissionResources rhs) noexcept {
-    return AdmissionResources{
-        .active_lanes     = lhs.active_lanes + rhs.active_lanes,
-        .main_kv_pages    = lhs.main_kv_pages + rhs.main_kv_pages,
-        .backend_kv_pages = lhs.backend_kv_pages + rhs.backend_kv_pages,
-    };
-}
+// A candidate separates the steady-state active ownership from physical resources which must
+// coexist with an intact source before publication, and from source resources reclassified at
+// publication. None of these fields imply a physical free/reallocate cycle.
+struct ResourceDemand {
+    DeviceResources active_entitlement;
+    DeviceResources prepublish_additional;
+    DeviceResources source_conversions;
+
+    [[nodiscard]] friend constexpr bool operator==(const ResourceDemand&,
+                                                   const ResourceDemand&) noexcept = default;
+};
+
+struct ResourceDelta {
+    DeviceResources removed;
+    DeviceResources added;
+
+    [[nodiscard]] friend constexpr bool operator==(const ResourceDelta&,
+                                                   const ResourceDelta&) noexcept = default;
+};
+
+enum class Readiness : std::uint8_t {
+    Ready,
+    NeedsTransfer,
+    TemporarilyBlocked,
+    PermanentlyInfeasible,
+};
+
+// Non-owning cancellation observation used at the synchronous materialization publication point.
+// The request record owns the flag for longer than the worker can retain this view.
+struct CancellationFlagView {
+    const std::atomic<bool>* flag = nullptr;
+
+    [[nodiscard]] bool requested() const noexcept {
+        return flag != nullptr && flag->load(std::memory_order_acquire);
+    }
+};
+
+enum class MaterializationStatus : std::uint8_t {
+    Published,
+    Aborted,
+};
+
+enum class CheckpointKind : std::uint8_t {
+    SessionEndpoint,
+    TurnClosure,
+    ResponseReplay,
+};
+
+struct CheckpointRef {
+    CheckpointKind kind    = CheckpointKind::SessionEndpoint;
+    std::uint32_t frontier = 0;
+    std::uint32_t ordinal  = 0;
+
+    [[nodiscard]] friend constexpr bool operator==(CheckpointRef, CheckpointRef) noexcept = default;
+};
+
+struct ContinuationSummary {
+    DeviceResources footprint;
+    CheckpointRef endpoint;
+    std::optional<CheckpointRef> rewrite;
+    std::uint64_t rebuild_work_quanta = 0;
+
+    [[nodiscard]] friend bool operator==(const ContinuationSummary&,
+                                         const ContinuationSummary&) noexcept = default;
+};
+
+struct ContinuationId {
+    std::uint64_t value = 0;
+
+    [[nodiscard]] friend constexpr bool operator==(ContinuationId,
+                                                   ContinuationId) noexcept  = default;
+    [[nodiscard]] friend constexpr auto operator<=>(ContinuationId,
+                                                    ContinuationId) noexcept = default;
+};
+
+struct Revision {
+    std::uint64_t value = 0;
+
+    [[nodiscard]] friend constexpr bool operator==(Revision, Revision) noexcept = default;
+};
 
 struct RequestPlanSummary {
     std::uint32_t prompt_tokens           = 0;
@@ -102,7 +172,7 @@ struct RequestPlanSummary {
     std::uint32_t effective_output_tokens = 0;
     FinishReason effective_limit_reason   = FinishReason::None;
     PrefixReusePath prefix_reuse_path     = PrefixReusePath::FullReset;
-    AdmissionResources admission;
+    DeviceResources admission;
     std::uint64_t service_work_quanta = 0;
 };
 

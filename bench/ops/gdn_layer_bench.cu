@@ -341,7 +341,7 @@ Result run_case(Resources& resources, ninfer::DeviceBuffer& flush, cudaStream_t 
         }
         ops::gated_delta_net_batch_update(
             q_recurrent, k_recurrent, v.view({kHeadDim, kValueHeads, tokens}), g, beta, kGdnScale,
-            fused_qk_norm, ssm_states, initial_slot, recurrent_out, s);
+            fused_qk_norm, ssm_states, initial_slot, initial_slot, recurrent_out, s);
         if (options.gated_rms == "dv10-b1024") {
             constexpr int block          = 1024;
             constexpr int rows_per_block = block / 32;

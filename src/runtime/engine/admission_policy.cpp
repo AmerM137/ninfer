@@ -9,29 +9,32 @@ namespace {
 
 struct ResourceTotals {
     std::uint64_t active_lanes     = 0;
+    std::uint64_t state_slots      = 0;
     std::uint64_t main_kv_pages    = 0;
     std::uint64_t backend_kv_pages = 0;
 };
 
-void add(ResourceTotals& total, const AdmissionResources& resources) noexcept {
+void add(ResourceTotals& total, const DeviceResources& resources) noexcept {
     total.active_lanes += resources.active_lanes;
+    total.state_slots += resources.state_slots;
     total.main_kv_pages += resources.main_kv_pages;
     total.backend_kv_pages += resources.backend_kv_pages;
 }
 
-void subtract(ResourceTotals& total, const AdmissionResources& resources) {
-    if (resources.active_lanes > total.active_lanes ||
+void subtract(ResourceTotals& total, const DeviceResources& resources) {
+    if (resources.active_lanes > total.active_lanes || resources.state_slots > total.state_slots ||
         resources.main_kv_pages > total.main_kv_pages ||
         resources.backend_kv_pages > total.backend_kv_pages) {
         throw std::logic_error("admission resource subtraction underflow");
     }
     total.active_lanes -= resources.active_lanes;
+    total.state_slots -= resources.state_slots;
     total.main_kv_pages -= resources.main_kv_pages;
     total.backend_kv_pages -= resources.backend_kv_pages;
 }
 
-bool fits(const ResourceTotals& used, const AdmissionResources& capacity) noexcept {
-    return used.active_lanes <= capacity.active_lanes &&
+bool fits(const ResourceTotals& used, const DeviceResources& capacity) noexcept {
+    return used.active_lanes <= capacity.active_lanes && used.state_slots <= capacity.state_slots &&
            used.main_kv_pages <= capacity.main_kv_pages &&
            used.backend_kv_pages <= capacity.backend_kv_pages;
 }
@@ -53,17 +56,17 @@ bool is_donor(const AdmissionProtection& protection, std::uint64_t id) noexcept 
 
 } // namespace
 
-bool admission_resources_fit(const AdmissionResources& used,
-                             const AdmissionResources& capacity) noexcept {
+bool admission_resources_fit(const DeviceResources& used,
+                             const DeviceResources& capacity) noexcept {
     ResourceTotals total;
     add(total, used);
     return fits(total, capacity);
 }
 
 AdmissionProtection make_admission_protection(std::uint64_t epoch_id, std::uint64_t head_request_id,
-                                              const AdmissionResources& head_resources,
+                                              const DeviceResources& head_resources,
                                               std::span<const ActiveAdmissionSnapshot> active,
-                                              const AdmissionResources& capacity) {
+                                              const DeviceResources& capacity) {
     if (epoch_id == 0 || head_request_id == 0 || active.empty() ||
         active.size() > kMaximumConcurrency || head_resources.active_lanes == 0 ||
         !admission_resources_fit(head_resources, capacity)) {
@@ -111,8 +114,8 @@ AdmissionProtection make_admission_protection(std::uint64_t epoch_id, std::uint6
 
 bool persistent_backfill_is_safe(const AdmissionProtection& protection,
                                  std::span<const ActiveAdmissionSnapshot> active,
-                                 const AdmissionResources& candidate,
-                                 const AdmissionResources& capacity) noexcept {
+                                 const DeviceResources& candidate,
+                                 const DeviceResources& capacity) noexcept {
     ResourceTotals future;
     add(future, protection.head_resources);
     for (const ActiveAdmissionSnapshot& request : active) {
@@ -141,7 +144,7 @@ protection_frontier_distance(const AdmissionProtection& protection,
 
 bool protected_head_safe_without_temporal(const AdmissionProtection& protection,
                                           std::span<const ActiveAdmissionSnapshot> active,
-                                          const AdmissionResources& capacity) noexcept {
+                                          const DeviceResources& capacity) noexcept {
     ResourceTotals used;
     add(used, protection.head_resources);
     for (const ActiveAdmissionSnapshot& request : active) {

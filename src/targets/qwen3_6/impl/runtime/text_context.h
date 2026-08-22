@@ -180,7 +180,7 @@ public:
 
     void set_mtp_proposal_extent(std::uint32_t extent) noexcept { mtp_proposal_extent_ = extent; }
 
-    void set_linear_state_slots(std::int32_t current_slot, std::int32_t rewrite_checkpoint_slot);
+    void set_linear_state_slots(std::int32_t source_slot, std::int32_t destination_slot);
     void set_gdn_state_action(GdnStateAction action, const GdnReplayRecords* replay_records);
 
     [[nodiscard]] const Weight* proposal_head() const noexcept { return proposal_head_; }
@@ -204,17 +204,18 @@ public:
                   std::uint32_t nominal_length, VisionPrefillSession& vision, bool finalize_at_end);
     void ordinary_decode_batch(const Tensor& ids, const Tensor& cache_positions,
                                const Tensor& rope_positions, const Tensor& kv_table_rows,
-                               const Tensor& linear_state_slots,
+                               const Tensor& linear_state_source_slots,
+                               const Tensor& linear_state_destination_slots,
                                ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden,
                                Tensor& logits);
     void target_verify_batch(const Tensor& ids, const Tensor& cache_positions,
                              const Tensor& rope_positions, const Tensor& valid_columns,
-                             const Tensor& kv_table_rows, const Tensor& linear_state_slots,
+                             const Tensor& kv_table_rows, const Tensor& linear_state_source_slots,
                              ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden,
                              Tensor& logits, Tensor& target_tokens);
     void target_verify_batch(const Tensor& ids, const Tensor& cache_positions,
                              const Tensor& rope_positions, const Tensor& valid_columns,
-                             const Tensor& kv_table_rows, const Tensor& linear_state_slots,
+                             const Tensor& kv_table_rows, const Tensor& linear_state_source_slots,
                              ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden,
                              Tensor& logits, Tensor& target_tokens, DFlashFeatureSink& sink);
     void mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidden,
@@ -248,7 +249,8 @@ private:
     template <class Tap>
     void target_verify_batch_impl(const Tensor& ids, const Tensor& cache_positions,
                                   const Tensor& rope_positions, const Tensor& valid_columns,
-                                  const Tensor& kv_table_rows, const Tensor& linear_state_slots,
+                                  const Tensor& kv_table_rows,
+                                  const Tensor& linear_state_source_slots,
                                   ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden,
                                   Tensor& logits, Tensor& target_tokens, Tap& tap);
 
@@ -299,15 +301,16 @@ private:
     const Tensor* active_cache_positions_                                          = nullptr;
     const Tensor* active_rope_positions_                                           = nullptr;
     const Tensor* active_kv_table_rows_                                            = nullptr;
-    const Tensor* active_linear_state_slots_                                       = nullptr;
+    const Tensor* active_linear_state_source_slots_                                = nullptr;
+    const Tensor* active_linear_state_destination_slots_                           = nullptr;
     const Tensor* active_valid_columns_                                            = nullptr;
     const Tensor* active_backend_kv_table_rows_                                    = nullptr;
     const ops::CausalAttentionExecutionEnvelope* active_causal_attention_envelope_ = nullptr;
     std::int32_t active_sequence_batch_                                            = 0;
     std::int32_t active_sequence_width_                                            = 0;
     std::int32_t rope_delta_                                                       = 0;
-    std::int32_t linear_state_current_slot_                                        = 0;
-    std::int32_t linear_state_rewrite_checkpoint_slot_                             = 0;
+    std::int32_t linear_state_source_slot_                                         = 0;
+    std::int32_t linear_state_destination_slot_                                    = 0;
     GdnStateAction gdn_state_action_                  = GdnStateAction::UpdateInPlace;
     const GdnReplayRecords* replay_records_           = nullptr;
     std::int64_t prefill_rewrite_checkpoint_frontier_ = -1;

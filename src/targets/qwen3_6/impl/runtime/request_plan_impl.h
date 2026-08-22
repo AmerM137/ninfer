@@ -55,6 +55,26 @@ std::uint64_t projected_service_work(const runtime::RequestPlanSummary& summary,
     return prefill_units + decode_units;
 }
 
+runtime::DeviceResources convertible_source_resources(runtime::DeviceResources active,
+                                                      runtime::DeviceResources source) noexcept {
+    return runtime::DeviceResources{
+        .active_lanes     = 0,
+        .state_slots      = std::min(active.state_slots, source.state_slots),
+        .main_kv_pages    = std::min(active.main_kv_pages, source.main_kv_pages),
+        .backend_kv_pages = std::min(active.backend_kv_pages, source.backend_kv_pages),
+    };
+}
+
+runtime::DeviceResources additional_resources(runtime::DeviceResources active,
+                                              runtime::DeviceResources converted) noexcept {
+    return runtime::DeviceResources{
+        .active_lanes     = active.active_lanes,
+        .state_slots      = active.state_slots - converted.state_slots,
+        .main_kv_pages    = active.main_kv_pages - converted.main_kv_pages,
+        .backend_kv_pages = active.backend_kv_pages - converted.backend_kv_pages,
+    };
+}
+
 } // namespace
 
 RequestBasePlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
@@ -115,8 +135,9 @@ RequestBasePlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
     } else if (speculative_backend == SpeculativeBackend::DFlash) {
         base->backend_kv_page_entitlement = pages_for_tokens(reserved_context_tokens);
     }
-    base->summary.admission = runtime::AdmissionResources{
+    base->summary.admission = runtime::DeviceResources{
         .active_lanes     = 1,
+        .state_slots      = 1U,
         .main_kv_pages    = base->text_kv_page_entitlement,
         .backend_kv_pages = base->backend_kv_page_entitlement,
     };
@@ -158,24 +179,22 @@ RequestBasePlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
         }
         base->rewrite_checkpoint = candidate;
     }
+    base->summary.admission.state_slots = base->rewrite_checkpoint ? 2U : 1U;
     const std::size_t cold_prefill_splits =
-        (base->vision_control != nullptr ? base->vision_control->items.size() : 0ULL) +
-        (base->rewrite_checkpoint &&
-                 base->rewrite_checkpoint->frontier < base->summary.prompt_tokens
-             ? 1ULL
-             : 0ULL);
+        base->vision_control != nullptr ? base->vision_control->items.size() : 0ULL;
     base->summary.service_work_quanta =
         projected_service_work(base->summary, 0, prefill_chunk, cold_prefill_splits);
     return RequestBasePlan(std::move(base));
 }
 
-AdmissionPlan ProgramImplCore::inspect_lane(std::uint32_t lane, const PreparedPromptData& prompt,
-                                            const RequestBasePlan& base_plan) {
+std::optional<AdmissionPlan>
+ProgramImplCore::inspect_lane(std::uint32_t lane, const PreparedPromptData& prompt,
+                              const RequestBasePlan& base_plan, const SequenceState* source,
+                              std::optional<runtime::CheckpointRef> checkpoint) {
     if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
     const RequestControl& request = requests[lane];
-    const SequenceState& sequence = sequences[lane];
-    if (request.lifecycle != Lifecycle::Empty && request.lifecycle != Lifecycle::Resident) {
-        throw std::logic_error("admission inspection requires a free or resident lane");
+    if (request.lifecycle != Lifecycle::Empty) {
+        throw std::logic_error("admission inspection requires a free active lane");
     }
     if (base_plan.impl_ == nullptr) { throw std::logic_error("request base plan is empty"); }
     const RequestBasePlanImpl& base = *base_plan.impl_;
@@ -185,59 +204,75 @@ AdmissionPlan ProgramImplCore::inspect_lane(std::uint32_t lane, const PreparedPr
     plan->sampling                    = base.sampling;
     plan->text_kv_page_entitlement    = base.text_kv_page_entitlement;
     plan->backend_kv_page_entitlement = base.backend_kv_page_entitlement;
+    plan->root_rebuild_work_quanta    = base.summary.service_work_quanta;
 
-    if (base.allow_prefix_reuse && prompt.identity.reusable &&
-        request.lifecycle == Lifecycle::Resident) {
-        const bool dflash_append_ready =
-            speculative_backend != SpeculativeBackend::DFlash ||
-            sequence.dflash_context_frontier == sequence.execution_frontier;
-        if (sequence.execution_frontier != 0 && dflash_append_ready &&
-            qwen3_6::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity,
-                                            sequence.execution_frontier)) {
+    if ((source == nullptr) != !checkpoint.has_value()) {
+        throw std::invalid_argument("inspection source and checkpoint must be paired");
+    }
+    if (source != nullptr) {
+        const runtime::CheckpointRef selected = *checkpoint;
+        if (selected.ordinal != 0) {
+            throw std::logic_error("private continuation checkpoint ordinal is invalid");
+        }
+        if (!base.allow_prefix_reuse || !prompt.identity.reusable) { return std::nullopt; }
+        if (selected.kind == runtime::CheckpointKind::SessionEndpoint) {
+            if (selected.frontier == 0 || selected.frontier != source->execution_frontier) {
+                throw std::logic_error("catalog endpoint summary disagrees with Program state");
+            }
+            if (!qwen3_6::detail::prefix_matches(prompt, source->ledger, source->prefix_identity,
+                                                 selected.frontier)) {
+                return std::nullopt;
+            }
             plan->reuse      = ReusePath::AppendAtFrontier;
-            plan->reuse_base = sequence.execution_frontier;
-        } else if (sequence.rewrite_checkpoint.valid && sequence.rewrite_checkpoint.frontier != 0 &&
-                   sequence.rewrite_checkpoint.frontier <= prompt.token_ids.size() &&
-                   qwen3_6::detail::prefix_matches(prompt, sequence.ledger,
-                                                   sequence.prefix_identity,
-                                                   sequence.rewrite_checkpoint.frontier)) {
-            plan->reuse      = restore_path(sequence.rewrite_checkpoint.kind);
-            plan->reuse_base = sequence.rewrite_checkpoint.frontier;
+            plan->reuse_base = selected.frontier;
+        } else {
+            if (!source->rewrite_checkpoint.valid ||
+                selected.kind != checkpoint_kind(source->rewrite_checkpoint.kind) ||
+                selected.frontier == 0 ||
+                selected.frontier != source->rewrite_checkpoint.frontier) {
+                throw std::logic_error("catalog rewrite summary disagrees with Program state");
+            }
+            if (!qwen3_6::detail::prefix_matches(prompt, source->ledger, source->prefix_identity,
+                                                 selected.frontier)) {
+                return std::nullopt;
+            }
+            plan->reuse      = restore_path(source->rewrite_checkpoint.kind);
+            plan->reuse_base = selected.frontier;
         }
     }
 
     if (speculative_backend == SpeculativeBackend::Mtp) {
         const bool append_ready =
-            plan->reuse == ReusePath::AppendAtFrontier && sequence.tail_hidden_valid &&
-            decoder->mtp_cache() != nullptr &&
-            (plan->reuse_base == 0 || sequence.mtp_kv_valid >= plan->reuse_base - 1);
+            plan->reuse == ReusePath::AppendAtFrontier && source != nullptr &&
+            source->tail_hidden_valid && decoder->mtp_cache() != nullptr &&
+            (plan->reuse_base == 0 || source->mtp_kv_valid >= plan->reuse_base - 1);
         const bool checkpoint_ready = is_rewrite_checkpoint_restore(plan->reuse) &&
-                                      decoder->mtp_cache() != nullptr && plan->reuse_base != 0 &&
-                                      sequence.mtp_kv_valid >= plan->reuse_base - 1;
+                                      source != nullptr && decoder->mtp_cache() != nullptr &&
+                                      plan->reuse_base != 0 &&
+                                      source->mtp_kv_valid >= plan->reuse_base - 1;
         if (plan->reuse != ReusePath::FullReset && !append_ready && !checkpoint_ready) {
-            plan->reuse      = ReusePath::FullReset;
-            plan->reuse_base = 0;
+            throw std::logic_error("published MTP checkpoint is not materializable");
         }
     }
 
     if (is_rewrite_checkpoint_restore(plan->reuse) &&
         speculative_backend == SpeculativeBackend::DFlash &&
-        (!dflash || !sequence.kv || !sequence.kv->backend ||
-         sequence.dflash_context_frontier < plan->reuse_base)) {
-        plan->reuse      = ReusePath::FullReset;
-        plan->reuse_base = 0;
+        (source == nullptr || !dflash || !source->kv || !source->kv->backend ||
+         source->dflash_context_frontier < plan->reuse_base)) {
+        throw std::logic_error("published DFlash checkpoint is not materializable");
     }
 
     const std::optional<RewriteCheckpointSpec>& desired = base.rewrite_checkpoint;
     const bool existing_checkpoint_matches =
-        desired && plan->reuse != ReusePath::FullReset && sequence.rewrite_checkpoint.valid &&
-        sequence.rewrite_checkpoint.frontier == desired->frontier &&
-        qwen3_6::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity,
+        desired && source != nullptr && plan->reuse != ReusePath::FullReset &&
+        source->rewrite_checkpoint.valid &&
+        source->rewrite_checkpoint.frontier == desired->frontier &&
+        qwen3_6::detail::prefix_matches(prompt, source->ledger, source->prefix_identity,
                                         desired->frontier);
     if (!desired) {
         plan->rewrite_checkpoint_action = RewriteCheckpointAction::Drop;
     } else if (existing_checkpoint_matches) {
-        plan->rewrite_checkpoint_action = sequence.rewrite_checkpoint.kind == desired->kind
+        plan->rewrite_checkpoint_action = source->rewrite_checkpoint.kind == desired->kind
                                               ? RewriteCheckpointAction::KeepExisting
                                               : RewriteCheckpointAction::ReclassifyExisting;
     } else if (desired->frontier > plan->reuse_base) {
@@ -288,14 +323,18 @@ AdmissionPlan ProgramImplCore::inspect_lane(std::uint32_t lane, const PreparedPr
         }
     }
 
-    const std::size_t prefill_splits =
-        (plan->vision ? plan->vision->uses.size() : 0ULL) +
-        (plan->rewrite_checkpoint_capture &&
-                 plan->rewrite_checkpoint_capture->frontier < plan->summary.prompt_tokens
-             ? 1ULL
-             : 0ULL);
+    const std::size_t prefill_splits = plan->vision ? plan->vision->uses.size() : 0ULL;
     plan->summary.service_work_quanta =
         projected_service_work(plan->summary, plan->reuse_base, prefill_chunk, prefill_splits);
+    const runtime::DeviceResources source_resources =
+        source != nullptr ? resident_resources(*source) : runtime::DeviceResources{};
+    const runtime::DeviceResources conversions =
+        convertible_source_resources(plan->summary.admission, source_resources);
+    plan->demand = runtime::ResourceDemand{
+        .active_entitlement    = plan->summary.admission,
+        .prepublish_additional = additional_resources(plan->summary.admission, conversions),
+        .source_conversions    = conversions,
+    };
     return AdmissionPlan(std::move(plan));
 }
 

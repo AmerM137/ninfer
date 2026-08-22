@@ -11,7 +11,8 @@
 
 #include "targets/qwen3_6/impl/runtime/layouts.h"
 #include "targets/qwen3_6/impl/runtime/dflash_context.h"
-#include "targets/qwen3_6/impl/runtime/state_image_slots.h"
+#include "targets/qwen3_6/impl/runtime/logical_kv_store.h"
+#include "targets/qwen3_6/impl/runtime/state_image_store.h"
 #include "targets/qwen3_6/impl/runtime/prefix_identity.h"
 #include "targets/qwen3_6/impl/runtime/text_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
@@ -41,6 +42,12 @@ using ReusePath = ninfer::PrefixReusePath;
 [[nodiscard]] constexpr ReusePath restore_path(RewriteCheckpointKind kind) noexcept {
     return kind == RewriteCheckpointKind::TurnClosure ? ReusePath::RestoreTurnCheckpoint
                                                       : ReusePath::RestoreResponseCheckpoint;
+}
+
+[[nodiscard]] constexpr runtime::CheckpointKind
+checkpoint_kind(RewriteCheckpointKind kind) noexcept {
+    return kind == RewriteCheckpointKind::TurnClosure ? runtime::CheckpointKind::TurnClosure
+                                                      : runtime::CheckpointKind::ResponseReplay;
 }
 
 enum class RewriteCheckpointAction : std::uint8_t {
@@ -76,6 +83,7 @@ struct RequestBasePlanImpl<NINFER_QWEN36_VARIANT> {
 template <>
 struct AdmissionPlanImpl<NINFER_QWEN36_VARIANT> {
     runtime::RequestPlanSummary summary;
+    runtime::ResourceDemand demand;
     NINFER_QWEN36_RUNTIME_NS::ReusePath reuse = NINFER_QWEN36_RUNTIME_NS::ReusePath::FullReset;
     std::uint32_t reuse_base                  = 0;
     NINFER_QWEN36_RUNTIME_NS::MtpBridgeMode mtp_bridge =
@@ -91,9 +99,11 @@ struct AdmissionPlanImpl<NINFER_QWEN36_VARIANT> {
     std::size_t transient_bytes               = 0;
     std::size_t transient_alignment           = 1;
     runtime::LaneId destination{};
-    std::uint64_t destination_epoch = 0;
-    bool has_source                 = false;
-    std::uint64_t source_epoch      = 0;
+    std::uint64_t destination_epoch        = 0;
+    bool has_source                        = false;
+    std::uint32_t source_index             = 0;
+    std::uint64_t source_generation        = 0;
+    std::uint64_t root_rebuild_work_quanta = 0;
 };
 
 } // namespace ninfer::targets::qwen3_6::detail
@@ -124,7 +134,18 @@ enum class Lifecycle : std::uint8_t {
     Active,
     Pending,
     Finishable,
-    Resident,
+};
+
+enum class ContinuationSlotRole : std::uint8_t {
+    Free,
+    ReservedMaterialization,
+    Active,
+    Catalogued,
+};
+
+struct ContinuationSlot {
+    ContinuationSlotRole role = ContinuationSlotRole::Free;
+    std::uint64_t generation  = 1;
 };
 
 struct RewriteCheckpoint {
@@ -133,66 +154,9 @@ struct RewriteCheckpoint {
     std::uint32_t frontier     = 0;
 };
 
-struct PrivateKVMapping {
-    DeviceKVPagePool* pool = nullptr;
-    std::vector<DeviceKVPageLease> pages;
-    DeviceKVPageReservation remaining_growth;
-    std::optional<KVExecutionRowLease> execution_row;
-
-    PrivateKVMapping() noexcept = default;
-
-    PrivateKVMapping(DeviceKVPagePool& page_pool, DeviceKVPageReservation&& reservation,
-                     std::uint32_t page_entitlement)
-        : pool(&page_pool), remaining_growth(std::move(reservation)) {
-        if (!remaining_growth.belongs_to(page_pool) ||
-            remaining_growth.pages() != page_entitlement) {
-            throw std::invalid_argument("Private KV mapping reservation is inconsistent");
-        }
-        pages.reserve(page_entitlement);
-    }
-
-    PrivateKVMapping(const PrivateKVMapping&)                = delete;
-    PrivateKVMapping& operator=(const PrivateKVMapping&)     = delete;
-    PrivateKVMapping(PrivateKVMapping&&) noexcept            = default;
-    PrivateKVMapping& operator=(PrivateKVMapping&&) noexcept = default;
-
-    [[nodiscard]] bool valid() const noexcept {
-        return pool != nullptr && remaining_growth.belongs_to(*pool);
-    }
-
-    [[nodiscard]] std::uint32_t mapped_page_count() const noexcept {
-        return static_cast<std::uint32_t>(pages.size());
-    }
-
-    [[nodiscard]] std::uint32_t mapped_token_capacity() const noexcept {
-        return mapped_page_count() * static_cast<std::uint32_t>(kPagedKVPageSize);
-    }
-
-    [[nodiscard]] std::uint32_t page_entitlement() const noexcept {
-        return mapped_page_count() + remaining_growth.pages();
-    }
-
-    [[nodiscard]] std::int32_t bound_row() const noexcept {
-        return execution_row ? execution_row->row_index() : -1;
-    }
-
-    void trim_pages(std::uint32_t count) {
-        if (!valid() || count > pages.size()) {
-            throw std::invalid_argument("Private KV trim exceeds mapped pages");
-        }
-        pool->dematerialize(remaining_growth, count, pages);
-    }
-
-    void trim_tokens(std::uint32_t tokens) {
-        const std::uint32_t count =
-            tokens == 0 ? 0 : 1U + (tokens - 1U) / static_cast<std::uint32_t>(kPagedKVPageSize);
-        trim_pages(count);
-    }
-};
-
 struct SequenceKVBundle {
-    PrivateKVMapping text;
-    std::optional<PrivateKVMapping> backend;
+    KVAddressSpaceHandle text;
+    std::optional<KVAddressSpaceHandle> backend;
 };
 
 struct DecodeGraphProfile {
@@ -219,6 +183,9 @@ struct DecodeGraphFamily {
 // output, sampling, and round-control state.
 struct SequenceState {
     std::optional<SequenceKVBundle> kv;
+    ActiveStateBinding state;
+    std::optional<StateImageHandle> rewrite_state;
+    std::optional<StateImageHandle> reserved_state;
     Tensor tail_hidden;
     Tensor rewrite_checkpoint_hidden;
     std::uint32_t lane = 0;
@@ -235,6 +202,7 @@ struct SequenceState {
     std::uint32_t mtp_draft_count = 0;
     bool tail_hidden_valid        = false;
     RewriteCheckpoint rewrite_checkpoint;
+    std::uint64_t rebuild_work_quanta = 0;
 };
 
 // Request/round control is not retained with a reusable SequenceState. A later concurrent Engine
@@ -245,7 +213,7 @@ struct RequestControl {
     ops::SamplingConfig sampling_host;
     GenerationTimings timings;
     SpeculativeStats speculative_stats;
-    runtime::AdmissionResources active_resources;
+    runtime::DeviceResources active_resources;
 
     struct Prefill {
         PreparedPromptData prompt;
@@ -274,12 +242,24 @@ public:
 
     [[nodiscard]] RequestBasePlan plan_request(const PreparedPromptData& prompt,
                                                const runtime::ResolvedExecutionOptions& options);
-    [[nodiscard]] AdmissionPlan inspect_admission(const PreparedPromptData& prompt,
-                                                  const RequestBasePlan& base,
-                                                  runtime::LaneId destination,
-                                                  const ContinuationHandle* source);
-    [[nodiscard]] StartResult start_request(AdmissionPlan&& plan, PreparedPromptData&& prompt,
-                                            std::optional<ContinuationHandle>&& source);
+    [[nodiscard]] std::optional<AdmissionPlan>
+    inspect_admission(const PreparedPromptData& prompt, const RequestBasePlan& base,
+                      runtime::LaneId destination, const ContinuationHandle* source,
+                      std::optional<runtime::CheckpointRef> checkpoint);
+    [[nodiscard]] MaterializationTicket
+    reserve_materialization(AdmissionPlan&& plan, PreparedPromptData&& prompt,
+                            const ContinuationHandle* source,
+                            std::span<const ContinuationHandle* const> victims);
+    [[nodiscard]] ReleaseResult
+    release_materialization_victim(MaterializationTicket& ticket,
+                                   ContinuationHandle&& victim) noexcept;
+    [[nodiscard]] runtime::ConsumeStatus
+    abort_materialization(MaterializationTicket&& ticket) noexcept;
+    void prepare_materialization(MaterializationTicket& ticket);
+    [[nodiscard]] MaterializationResult
+    publish_materialization(MaterializationTicket&& ticket,
+                            std::optional<ContinuationHandle>&& source,
+                            runtime::CancellationFlagView cancellation);
     [[nodiscard]] PrefillProgress advance_prefill(SequenceHandle sequence);
     [[nodiscard]] PendingBatch decode(std::span<const SequenceHandle> sequences,
                                       std::span<const runtime::RoundBudget> budgets);
@@ -287,12 +267,11 @@ public:
                                       std::span<const runtime::CommitDecision> decisions,
                                       runtime::CommitObservation observation);
     [[nodiscard]] DiscardResult abort_pending(PendingBatch&& pending) noexcept;
-    [[nodiscard]] FinishResult finish(SequenceHandle sequence,
-                                      runtime::RetentionDecision decision) noexcept;
+    [[nodiscard]] FinishResult finish(SequenceHandle sequence) noexcept;
     [[nodiscard]] AbortResult abort(SequenceHandle sequence) noexcept;
     [[nodiscard]] ReleaseResult release_continuation(ContinuationHandle&& continuation) noexcept;
     void fail_all_cleanup() noexcept;
-    [[nodiscard]] runtime::AdmissionResources admission_capacity() const noexcept;
+    [[nodiscard]] runtime::DeviceResources admission_capacity() const noexcept;
 
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
 
@@ -321,7 +300,12 @@ public:
     WorkspaceArena work;
     RequestTransientArena request_transient;
     std::unique_ptr<qwen3_6::DecoderState> decoder;
+    std::unique_ptr<LogicalKVPageStore> text_kv_pages;
+    std::unique_ptr<KVAddressSpaceStore> text_kv_addresses;
+    std::unique_ptr<LogicalKVPageStore> backend_kv_pages;
+    std::unique_ptr<KVAddressSpaceStore> backend_kv_addresses;
     std::unique_ptr<qwen3_6::StateImageDevicePool> state_images;
+    std::unique_ptr<StateImageStore> state_store;
     std::optional<GdnReplayRecords> replay_records;
     std::optional<DFlashPersistentState> dflash;
     qwen3_6::RoundState io;
@@ -329,7 +313,9 @@ public:
     Tensor sampling_config;
     Tensor token_counts;
 
-    std::array<SequenceState, kMaximumConcurrency> sequences;
+    std::array<SequenceState, 2 * kMaximumConcurrency> continuation_states;
+    std::array<ContinuationSlot, 2 * kMaximumConcurrency> continuation_slots;
+    std::array<std::uint32_t, kMaximumConcurrency> active_continuations{};
     std::array<RequestControl, kMaximumConcurrency> requests;
     std::array<std::uint64_t, kMaximumConcurrency> lane_epochs{};
 
@@ -362,10 +348,43 @@ private:
     std::optional<PendingTransaction> pending_transaction_;
     std::uint64_t next_transaction_id_ = 1;
 
-    [[nodiscard]] AdmissionPlan inspect_lane(std::uint32_t lane, const PreparedPromptData& prompt,
-                                             const RequestBasePlan& base);
-    [[nodiscard]] runtime::PrefillStepResult
-    start_sequence(std::uint32_t lane, PreparedPromptData&& prompt, AdmissionPlan&& plan);
+    struct MaterializationTransaction {
+        std::uint64_t id = 0;
+        runtime::LaneId destination;
+        bool has_source                 = false;
+        std::uint32_t source_index      = 0;
+        std::uint64_t source_generation = 0;
+        std::array<std::uint32_t, 2 * kMaximumConcurrency> victim_indices{};
+        std::array<std::uint64_t, 2 * kMaximumConcurrency> victim_generations{};
+        std::array<runtime::DeviceResources, 2 * kMaximumConcurrency> released_victims{};
+        std::array<bool, 2 * kMaximumConcurrency> victim_released{};
+        std::size_t victim_count = 0;
+        std::optional<AdmissionPlan> plan;
+        std::optional<std::uint32_t> root_continuation_index;
+        bool root_waiting_for_victim = false;
+        std::array<StateImageHandle, 2> reserved_states{};
+        std::size_t reserved_state_count = 0;
+        std::optional<KVAddressSpaceHandle> root_text_address;
+        std::optional<KVAddressSpaceHandle> root_backend_address;
+        std::optional<KVActivationReservation> text_activation;
+        std::optional<KVActivationReservation> backend_activation;
+        bool transient_active = false;
+        bool prepared         = false;
+    };
+
+    std::optional<MaterializationTransaction> materialization_transaction_;
+    std::uint64_t next_materialization_id_ = 1;
+    std::vector<TokenId> materialization_ledger_;
+    qwen3_6::detail::ResidentPrefixIdentity materialization_identity_;
+
+    [[nodiscard]] std::optional<AdmissionPlan>
+    inspect_lane(std::uint32_t lane, const PreparedPromptData& prompt, const RequestBasePlan& base,
+                 const SequenceState* source, std::optional<runtime::CheckpointRef> checkpoint);
+    [[nodiscard]] StartResult start_request(MaterializationTransaction& transaction,
+                                            std::optional<ContinuationHandle>&& source);
+    void start_sequence(std::uint32_t lane, SequenceState& sequence,
+                        MaterializationTransaction& transaction);
+    void release_materialization_staging(MaterializationTransaction& transaction) noexcept;
     [[nodiscard]] runtime::PrefillStepResult advance_prefill_raw(std::uint32_t lane);
     [[nodiscard]] runtime::BatchedGeneratedRound
     decode_raw(std::span<const std::uint32_t> lanes, std::span<const runtime::RoundBudget> budgets);
@@ -376,14 +395,28 @@ private:
                              std::span<const std::uint8_t> cancelled);
     [[nodiscard]] bool valid_sequence(SequenceHandle handle) const noexcept;
     [[nodiscard]] bool valid_continuation(const ContinuationHandle& handle) const noexcept;
+    [[nodiscard]] bool materialization_pins(std::uint32_t index,
+                                            std::uint64_t generation) const noexcept;
     [[nodiscard]] bool valid_pending(const PendingBatch& pending) const noexcept;
-    [[nodiscard]] runtime::AdmissionResources resident_resources(std::uint32_t lane) const noexcept;
+    [[nodiscard]] runtime::DeviceResources
+    resident_resources(const SequenceState& sequence) const noexcept;
     [[nodiscard]] PrefillProgress wrap_prefill(std::uint32_t lane, runtime::PrefillStepResult step);
     [[nodiscard]] PendingBatch wrap_pending(std::span<const std::uint32_t> lanes,
                                             const runtime::BatchedGeneratedRound& round);
     void invalidate_lane(std::uint32_t lane) noexcept;
+    [[nodiscard]] SequenceState& active_sequence(std::uint32_t lane);
+    [[nodiscard]] const SequenceState& active_sequence(std::uint32_t lane) const;
+    [[nodiscard]] std::optional<std::uint32_t> allocate_continuation_slot() noexcept;
+    void release_continuation_slot(std::uint32_t index) noexcept;
     void clear_lane(SequenceState& sequence, RequestControl& request) noexcept;
-    void ordered_reset(SequenceState& sequence);
+    void ordered_reset(SequenceState& sequence, bool state_already_reset = false);
+    [[nodiscard]] StateImageSelectors state_selectors(const SequenceState& sequence) const;
+    [[nodiscard]] std::uint32_t state_footprint(const SequenceState& sequence) const noexcept;
+    void refresh_state_views(SequenceState& sequence);
+    void reserve_state_entitlement(SequenceState& sequence, std::uint32_t slots);
+    void settle_state_fork(SequenceState& sequence);
+    void capture_rewrite_state(SequenceState& sequence, RewriteCheckpointSpec checkpoint);
+    void release_sequence_state(SequenceState& sequence) noexcept;
     void prepare_graphs();
     void install_sampling(SequenceState& sequence, RequestControl& request,
                           const ops::SamplingConfig& config);
@@ -408,8 +441,6 @@ private:
     [[nodiscard]] runtime::BatchedGeneratedRound
     decode_dflash_batch(std::span<const std::uint32_t> lanes,
                         std::span<const runtime::RoundBudget> budgets);
-    void reserve_sequence_kv(SequenceState& sequence, std::uint32_t text_pages,
-                             std::uint32_t backend_pages);
     void resize_sequence_kv_entitlement(SequenceState& sequence, std::uint32_t text_pages,
                                         std::uint32_t backend_pages);
     void bind_sequence_kv(SequenceState& sequence);
@@ -419,6 +450,9 @@ private:
     void trim_sequence_kv(SequenceState& sequence, std::uint32_t main_tokens,
                           std::uint32_t backend_tokens = 0);
     void release_sequence_growth_entitlement(SequenceState& sequence) noexcept;
+    void release_sequence_kv(SequenceState& sequence) noexcept;
+    void commit_sequence_kv(SequenceState& sequence, std::uint32_t main_tokens,
+                            std::uint32_t backend_tokens = 0);
     [[nodiscard]] qwen3_6::PagedKVCache* backend_kv_cache() noexcept;
     [[nodiscard]] const qwen3_6::PagedKVCache* backend_kv_cache() const noexcept;
     [[nodiscard]] std::uint32_t backend_kv_valid(const SequenceState& sequence) const noexcept;

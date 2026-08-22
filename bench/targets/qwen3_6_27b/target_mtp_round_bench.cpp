@@ -161,16 +161,25 @@ int run(const Options& options) {
     execution.requested_output_tokens = 1 + measured_rounds * (options.draft_tokens + 1);
     execution.allow_prefix_reuse      = false;
     auto request_base                 = program->plan_request(prompt, execution);
-    auto request_plan =
-        program->inspect_admission(prompt, request_base, ninfer::runtime::LaneId{0}, nullptr);
-    auto started = program->start_request(std::move(request_plan), std::move(prompt), std::nullopt);
-    if (!started.progress.complete || !started.progress.pending ||
-        started.progress.pending->tokens().size() != 1) {
+    auto request_plan = program->inspect_admission(prompt, request_base, ninfer::runtime::LaneId{0},
+                                                   nullptr, std::nullopt);
+    if (!request_plan) { throw std::runtime_error("benchmark root admission was rejected"); }
+    auto materialization =
+        program->reserve_materialization(std::move(*request_plan), std::move(prompt), nullptr, {});
+    program->prepare_materialization(materialization);
+    auto published = program->publish_materialization(std::move(materialization), std::nullopt, {});
+    if (published.status != ninfer::runtime::MaterializationStatus::Published ||
+        !published.published) {
+        throw std::runtime_error("benchmark root materialization was not published");
+    }
+    auto started  = std::move(*published.published);
+    auto progress = program->advance_prefill(started.sequence);
+    if (!progress.complete || !progress.pending || progress.pending->tokens().size() != 1) {
         throw std::runtime_error("benchmark seed prefill did not complete in one scheduling unit");
     }
     const std::array<ninfer::runtime::CommitDecision, 1> begin_decision{
         ninfer::runtime::CommitDecision{.accepted_tokens = 1}};
-    (void)program->commit(std::move(*started.progress.pending), begin_decision);
+    (void)program->commit(std::move(*progress.pending), begin_decision);
     const auto active_sequence = started.sequence;
 
     constexpr std::uint64_t rounds_before = 0;

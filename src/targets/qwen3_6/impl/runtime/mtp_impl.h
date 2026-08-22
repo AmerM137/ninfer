@@ -25,8 +25,8 @@ void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,
                      state.text_kv, state.execution.linear_attention, state.execution.io,
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
                      state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache);
-    configure_text_card(card, state.execution, state.sampling, state.current_state_slot,
-                        state.rewrite_checkpoint_state_slot, state.mtp_proposal_extent);
+    configure_text_card(card, state.execution, state.sampling, state.state_source_slot,
+                        state.state_destination_slot, state.mtp_proposal_extent);
 
     Tensor position_view = state.execution.io.mtp->target_positions.slice(0, 0, 1);
     ops::set_i32_scalar(position_view, position, state.execution.device.stream);
@@ -85,60 +85,62 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
                          state.execution.linear_attention, state.execution.io,
                          state.execution.prefill_hidden, state.execution.prefill_chunk, 0, {},
                          &state.text_cache, &state.mtp_cache);
-        Tensor anchors           = frame.anchors.slice(0, 0, batch_size);
-        Tensor frontiers         = frame.base_frontiers.slice(0, 0, batch_size);
-        Tensor budgets           = frame.remaining_budgets.slice(0, 0, batch_size);
-        Tensor current_extents   = frame.current_extents.slice(0, 0, batch_size);
-        Tensor target_valid      = frame.target_valid_columns.slice(0, 0, batch_size);
-        Tensor current_drafts    = frame.current_drafts.slice(1, 0, batch_size);
-        Tensor target_rope       = frame.target_rope_positions.slice(1, 0, batch_size);
-        Tensor text_rows         = frame.text_kv_table_rows.slice(0, 0, batch_size);
-        Tensor mtp_rows          = frame.mtp_kv_table_rows.slice(0, 0, batch_size);
-        Tensor lanes             = frame.lanes.slice(0, 0, batch_size);
-        Tensor rope_deltas       = frame.rope_deltas.slice(0, 0, batch_size);
-        Tensor verify_ids        = frame.verify_ids.slice(1, 0, batch_size);
-        Tensor target_positions  = frame.target_positions.slice(1, 0, batch_size);
-        Tensor target_tokens     = frame.target_argmax.slice(1, 0, batch_size);
-        Tensor target_logits     = frame.target_logits.slice(2, 0, batch_size);
-        Tensor target_hidden     = frame.target_hidden.slice(2, 0, batch_size);
-        Tensor selected_hidden   = frame.target_continuation_hidden.slice(1, 0, batch_size);
-        Tensor licensed_tokens   = frame.licensed_tokens.slice(1, 0, batch_size);
-        Tensor licensed_counts   = frame.licensed_counts.slice(0, 0, batch_size);
-        Tensor accepted          = frame.accepted_drafts.slice(0, 0, batch_size);
-        Tensor next_extents      = frame.next_extents.slice(0, 0, batch_size);
-        Tensor alignment_ids     = frame.alignment_ids.slice(1, 0, batch_size);
-        Tensor alignment_hidden  = frame.alignment_hidden.slice(2, 0, batch_size);
-        Tensor ar_hidden         = frame.ar_hidden.slice(1, 0, batch_size);
-        Tensor next_hidden       = frame.next_hidden.slice(1, 0, batch_size);
-        Tensor ar_positions      = frame.ar_positions.slice(0, 0, batch_size);
-        Tensor ar_rope_positions = frame.ar_rope_positions.slice(0, 0, batch_size);
-        Tensor ar_valid_columns  = frame.ar_valid_columns.slice(0, 0, batch_size);
-        Tensor next_drafts       = frame.next_drafts.slice(0, 0, batch_size);
+        Tensor anchors            = frame.anchors.slice(0, 0, batch_size);
+        Tensor frontiers          = frame.base_frontiers.slice(0, 0, batch_size);
+        Tensor budgets            = frame.remaining_budgets.slice(0, 0, batch_size);
+        Tensor current_extents    = frame.current_extents.slice(0, 0, batch_size);
+        Tensor target_valid       = frame.target_valid_columns.slice(0, 0, batch_size);
+        Tensor current_drafts     = frame.current_drafts.slice(1, 0, batch_size);
+        Tensor target_rope        = frame.target_rope_positions.slice(1, 0, batch_size);
+        Tensor text_rows          = frame.text_kv_table_rows.slice(0, 0, batch_size);
+        Tensor mtp_rows           = frame.mtp_kv_table_rows.slice(0, 0, batch_size);
+        Tensor state_sources      = frame.state_source_slots.slice(0, 0, batch_size);
+        Tensor state_destinations = frame.state_destination_slots.slice(0, 0, batch_size);
+        Tensor rope_deltas        = frame.rope_deltas.slice(0, 0, batch_size);
+        Tensor verify_ids         = frame.verify_ids.slice(1, 0, batch_size);
+        Tensor target_positions   = frame.target_positions.slice(1, 0, batch_size);
+        Tensor target_tokens      = frame.target_argmax.slice(1, 0, batch_size);
+        Tensor target_logits      = frame.target_logits.slice(2, 0, batch_size);
+        Tensor target_hidden      = frame.target_hidden.slice(2, 0, batch_size);
+        Tensor selected_hidden    = frame.target_continuation_hidden.slice(1, 0, batch_size);
+        Tensor licensed_tokens    = frame.licensed_tokens.slice(1, 0, batch_size);
+        Tensor licensed_counts    = frame.licensed_counts.slice(0, 0, batch_size);
+        Tensor accepted           = frame.accepted_drafts.slice(0, 0, batch_size);
+        Tensor next_extents       = frame.next_extents.slice(0, 0, batch_size);
+        Tensor alignment_ids      = frame.alignment_ids.slice(1, 0, batch_size);
+        Tensor alignment_hidden   = frame.alignment_hidden.slice(2, 0, batch_size);
+        Tensor ar_hidden          = frame.ar_hidden.slice(1, 0, batch_size);
+        Tensor next_hidden        = frame.next_hidden.slice(1, 0, batch_size);
+        Tensor ar_positions       = frame.ar_positions.slice(0, 0, batch_size);
+        Tensor ar_rope_positions  = frame.ar_rope_positions.slice(0, 0, batch_size);
+        Tensor ar_valid_columns   = frame.ar_valid_columns.slice(0, 0, batch_size);
+        Tensor next_drafts        = frame.next_drafts.slice(0, 0, batch_size);
 
         ops::speculative_prepare_verify_inputs(anchors, current_drafts, frontiers, current_extents,
                                                verify_ids, target_positions,
                                                state.execution.device.stream);
         target_verify_accept(state.execution, state.continuation_hidden_store, card,
                              TargetVerifyFrameView{
-                                 .ids             = verify_ids,
-                                 .cache_positions = target_positions,
-                                 .rope_positions  = target_rope,
-                                 .valid_columns   = target_valid,
-                                 .kv_table_rows   = text_rows,
-                                 .lanes           = lanes,
-                                 .target_hidden   = target_hidden,
-                                 .target_logits   = target_logits,
-                                 .target_tokens   = target_tokens,
-                                 .drafts          = current_drafts,
-                                 .current_extents = current_extents,
-                                 .frontiers       = frontiers,
-                                 .anchors         = anchors,
-                                 .licensed_tokens = licensed_tokens,
-                                 .licensed_counts = licensed_counts,
-                                 .accepted_drafts = accepted,
-                                 .selected_hidden = selected_hidden,
-                                 .replay_records  = state.execution.replay_records,
-                                 .sampling        = frame.sampling,
+                                 .ids                     = verify_ids,
+                                 .cache_positions         = target_positions,
+                                 .rope_positions          = target_rope,
+                                 .valid_columns           = target_valid,
+                                 .kv_table_rows           = text_rows,
+                                 .state_source_slots      = state_sources,
+                                 .state_destination_slots = state_destinations,
+                                 .target_hidden           = target_hidden,
+                                 .target_logits           = target_logits,
+                                 .target_tokens           = target_tokens,
+                                 .drafts                  = current_drafts,
+                                 .current_extents         = current_extents,
+                                 .frontiers               = frontiers,
+                                 .anchors                 = anchors,
+                                 .licensed_tokens         = licensed_tokens,
+                                 .licensed_counts         = licensed_counts,
+                                 .accepted_drafts         = accepted,
+                                 .selected_hidden         = selected_hidden,
+                                 .replay_records          = state.execution.replay_records,
+                                 .sampling                = frame.sampling,
                              },
                              envelopes.target_verify);
 

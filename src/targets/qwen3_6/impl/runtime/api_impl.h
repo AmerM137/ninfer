@@ -116,6 +116,12 @@ const runtime::RequestPlanSummary& AdmissionPlan<Variant>::summary() const noexc
 }
 
 template <>
+const runtime::ResourceDemand& AdmissionPlan<Variant>::demand() const noexcept {
+    static const runtime::ResourceDemand empty;
+    return impl_ != nullptr ? impl_->demand : empty;
+}
+
+template <>
 Program<Variant>::Program(std::unique_ptr<detail::ProgramImpl<Variant>> impl) noexcept
     : impl_(std::move(impl)) {}
 
@@ -130,23 +136,51 @@ Program<Variant>::plan_request(const PreparedPrompt& prompt,
 }
 
 template <>
-AdmissionPlan<Variant> Program<Variant>::inspect_admission(
+std::optional<AdmissionPlan<Variant>> Program<Variant>::inspect_admission(
     const PreparedPrompt& prompt, const RequestBasePlan<Variant>& base, runtime::LaneId destination,
-    const ContinuationHandle<Variant>* source) {
-    return impl_->inspect_admission(PreparedPromptAccess::view(prompt), base, destination, source);
+    const ContinuationHandle<Variant>* source, std::optional<runtime::CheckpointRef> checkpoint) {
+    return impl_->inspect_admission(PreparedPromptAccess::view(prompt), base, destination, source,
+                                    checkpoint);
 }
 
 template <>
-runtime::AdmissionResources Program<Variant>::admission_capacity() const noexcept {
+runtime::DeviceResources Program<Variant>::admission_capacity() const noexcept {
     return impl_->admission_capacity();
 }
 
 template <>
-StartResult<Variant>
-Program<Variant>::start_request(AdmissionPlan<Variant>&& plan, PreparedPrompt&& prompt,
-                                std::optional<ContinuationHandle<Variant>>&& source) {
-    return impl_->start_request(std::move(plan), PreparedPromptAccess::take(std::move(prompt)),
-                                std::move(source));
+MaterializationTicket<Variant> Program<Variant>::reserve_materialization(
+    AdmissionPlan<Variant>&& plan, PreparedPrompt&& prompt,
+    const ContinuationHandle<Variant>* source,
+    std::span<const ContinuationHandle<Variant>* const> victims) {
+    return impl_->reserve_materialization(
+        std::move(plan), PreparedPromptAccess::take(std::move(prompt)), source, victims);
+}
+
+template <>
+ReleaseResult<Variant>
+Program<Variant>::release_materialization_victim(MaterializationTicket<Variant>& ticket,
+                                                 ContinuationHandle<Variant>&& victim) noexcept {
+    return impl_->release_materialization_victim(ticket, std::move(victim));
+}
+
+template <>
+runtime::ConsumeStatus
+Program<Variant>::abort_materialization(MaterializationTicket<Variant>&& ticket) noexcept {
+    return impl_->abort_materialization(std::move(ticket));
+}
+
+template <>
+void Program<Variant>::prepare_materialization(MaterializationTicket<Variant>& ticket) {
+    impl_->prepare_materialization(ticket);
+}
+
+template <>
+MaterializationResult<Variant>
+Program<Variant>::publish_materialization(MaterializationTicket<Variant>&& ticket,
+                                          std::optional<ContinuationHandle<Variant>>&& source,
+                                          runtime::CancellationFlagView cancellation) {
+    return impl_->publish_materialization(std::move(ticket), std::move(source), cancellation);
 }
 
 template <>
@@ -173,9 +207,8 @@ DiscardResult<Variant> Program<Variant>::abort_pending(PendingBatch<Variant>&& p
 }
 
 template <>
-FinishResult<Variant> Program<Variant>::finish(SequenceHandle<Variant> sequence,
-                                               runtime::RetentionDecision decision) noexcept {
-    return impl_->finish(sequence, decision);
+FinishResult<Variant> Program<Variant>::finish(SequenceHandle<Variant> sequence) noexcept {
+    return impl_->finish(sequence);
 }
 
 template <>

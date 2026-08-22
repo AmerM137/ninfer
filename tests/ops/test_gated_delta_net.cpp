@@ -258,10 +258,13 @@ int distinct_state_case(const Case& test_case, std::uint32_t seed) {
     return failures;
 }
 
-int batch_update_case(const Case& test_case, const std::vector<int>& state_slots, int slots,
-                      std::uint32_t seed) {
+int batch_update_case(const Case& test_case, const std::vector<int>& source_slots,
+                      const std::vector<int>& destination_slots, int slots, std::uint32_t seed) {
     if (test_case.tokens != 1) { throw std::logic_error("batch_update_case requires W=1"); }
-    const int batch   = static_cast<int>(state_slots.size());
+    if (source_slots.size() != destination_slots.size()) {
+        throw std::logic_error("batch_update_case selector sizes differ");
+    }
+    const int batch   = static_cast<int>(source_slots.size());
     const int width   = 1;
     const float scale = 1.0f / std::sqrt(static_cast<float>(kStateDim));
     const std::size_t qk_row_size =
@@ -296,7 +299,7 @@ int batch_update_case(const Case& test_case, const std::vector<int>& state_slots
         aggregate.beta.insert(aggregate.beta.end(), input.beta.begin(), input.beta.end());
         std::copy(input.state.begin(), input.state.end(),
                   initial_states.begin() +
-                      static_cast<std::size_t>(state_slots[static_cast<std::size_t>(row)]) *
+                      static_cast<std::size_t>(source_slots[static_cast<std::size_t>(row)]) *
                           state_size);
         rows.push_back(std::move(input));
     }
@@ -311,7 +314,8 @@ int batch_update_case(const Case& test_case, const std::vector<int>& state_slots
                               test_case.normalize_qk);
         std::copy(reference.out.begin(), reference.out.end(),
                   expected_output.begin() + static_cast<std::size_t>(row) * value_row_size);
-        written_slots[static_cast<std::size_t>(state_slots[static_cast<std::size_t>(row)])] = true;
+        written_slots[static_cast<std::size_t>(destination_slots[static_cast<std::size_t>(row)])] =
+            true;
         references.push_back(std::move(reference));
     }
 
@@ -320,7 +324,8 @@ int batch_update_case(const Case& test_case, const std::vector<int>& state_slots
     GuardedDeviceBuffer out(aggregate.v.size() * sizeof(std::uint16_t));
     states.copy_from_host(initial_states.data(), states.bytes());
     out.fill(0xff);
-    DeviceBuffer device_state_slots = to_device(state_slots);
+    DeviceBuffer device_source_slots      = to_device(source_slots);
+    DeviceBuffer device_destination_slots = to_device(destination_slots);
 
     Tensor q(device.q.p, DType::BF16, {kStateDim, test_case.qk_heads, width, batch});
     Tensor k(device.k.p, DType::BF16, {kStateDim, test_case.qk_heads, width, batch});
@@ -329,10 +334,12 @@ int batch_update_case(const Case& test_case, const std::vector<int>& state_slots
     Tensor beta(device.beta.p, DType::FP32, {test_case.value_heads, width, batch});
     Tensor states_tensor(states.data(), DType::FP32,
                          {kStateDim, kStateDim, test_case.value_heads, slots});
-    Tensor state_slots_tensor(device_state_slots.p, DType::I32, {batch});
+    Tensor source_slots_tensor(device_source_slots.p, DType::I32, {batch});
+    Tensor destination_slots_tensor(device_destination_slots.p, DType::I32, {batch});
     Tensor out_tensor(out.data(), DType::BF16, {kStateDim, test_case.value_heads, width, batch});
     ops::gated_delta_net_batch_update(q, k, v, g, beta, scale, test_case.normalize_qk,
-                                      states_tensor, state_slots_tensor, out_tensor, nullptr);
+                                      states_tensor, source_slots_tensor, destination_slots_tensor,
+                                      out_tensor, nullptr);
     cuda_synchronize();
 
     const std::string label =
@@ -345,7 +352,7 @@ int batch_update_case(const Case& test_case, const std::vector<int>& state_slots
     const std::vector<float> got_states = from_device<float>(states.data(), initial_states.size());
     for (int row = 0; row < batch; ++row) {
         const std::size_t begin =
-            static_cast<std::size_t>(state_slots[static_cast<std::size_t>(row)]) * state_size;
+            static_cast<std::size_t>(destination_slots[static_cast<std::size_t>(row)]) * state_size;
         failures +=
             verify_recurrence(label + " row " + std::to_string(row) + " final state",
                               doubles(std::vector<float>(got_states.begin() + begin,
@@ -362,8 +369,12 @@ int batch_update_case(const Case& test_case, const std::vector<int>& state_slots
             std::vector<float>(initial_states.begin() + begin,
                                initial_states.begin() + begin + state_size));
     }
-    failures += verify_exact(label + " state selectors unchanged",
-                             from_device_i32(device_state_slots, state_slots.size()), state_slots);
+    failures +=
+        verify_exact(label + " source selectors unchanged",
+                     from_device_i32(device_source_slots, source_slots.size()), source_slots);
+    failures += verify_exact(label + " destination selectors unchanged",
+                             from_device_i32(device_destination_slots, destination_slots.size()),
+                             destination_slots);
     failures += states.verify_guards((label + " states").c_str());
     failures += out.verify_guards((label + " out").c_str());
     failures += verify_common_inputs_unchanged(label, aggregate, device.q, device.k, device.v,
@@ -458,12 +469,14 @@ int main() {
     failures += inplace_case({"35b two-chunk raw-qk", 16, 32, 128, false}, 12228u);
 
     // The production decode path updates selected state-pool slots in place at width one.
-    failures +=
-        batch_update_case({"27b selected-slot fused-qk-norm", 16, 48, 1, true}, {7}, 8, 12101u);
-    failures +=
-        batch_update_case({"35b selected-slot near-zero", 16, 32, 1, true, true}, {6}, 8, 12201u);
+    failures += batch_update_case({"27b selected-slot fused-qk-norm", 16, 48, 1, true}, {7}, {7}, 8,
+                                  12101u);
+    failures += batch_update_case({"35b selected-slot near-zero", 16, 32, 1, true, true}, {6}, {6},
+                                  8, 12201u);
     failures += batch_update_case({"35b ordinary", 16, 32, 1, true}, {8, 9, 10, 11, 12, 13, 14, 15},
-                                  16, 13001u);
+                                  {8, 9, 10, 11, 12, 13, 14, 15}, 16, 13001u);
+    failures += batch_update_case({"35b mixed fork destinations", 16, 32, 1, true}, {0, 2, 4, 6},
+                                  {1, 3, 5, 7}, 8, 13101u);
 
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gated_delta_net correctness\n";
     return failures == 0 ? 0 : 1;

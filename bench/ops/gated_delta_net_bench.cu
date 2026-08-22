@@ -622,8 +622,8 @@ BenchRow run_batch_update(const Options& options, std::int32_t tokens, DeviceBuf
         const Tensor& q_input = composed ? q_norm : q;
         const Tensor& k_input = composed ? k_norm : k;
         ops::gated_delta_net_batch_update(q_input, k_input, v, g, beta, gated_delta_net_scale(),
-                                                  !composed, ssm_states, selected_slots, out,
-                                                  launch_stream);
+                                                  !composed, ssm_states, selected_slots, selected_slots,
+                                                  out, launch_stream);
     };
     const GraphMeasurement measurement = measure_graph(launch, flush, stream, options);
     const TrafficBytes traffic         = batch_update_traffic(problem, composed);

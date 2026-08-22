@@ -12,9 +12,9 @@
 namespace ninfer::ops::detail::gated_delta_net {
 namespace {
 
-static_assert(sizeof(GdnReplayFoldKernelRow) == 8);
-static_assert(alignof(GdnReplayFoldKernelRow) == 8);
-static_assert(sizeof(GdnReplayFoldKernelRows) == 64);
+static_assert(sizeof(GdnReplayFoldKernelRow) == 16);
+static_assert(alignof(GdnReplayFoldKernelRow) == 16);
+static_assert(sizeof(GdnReplayFoldKernelRows) == 128);
 static_assert(alignof(GdnReplayFoldKernelRows) == 16);
 static_assert(std::is_trivially_copyable_v<GdnReplayFoldKernelRows>);
 
@@ -38,7 +38,8 @@ void launch_recurrent_direct_fixed(const Tensor& q, const Tensor& k, const Tenso
 template <bool NormalizeInputs>
 void launch_recurrent_batch_update_fixed(const Tensor& q, const Tensor& k, const Tensor& v,
                                          const Tensor& g, const Tensor& beta, float scale,
-                                         Tensor& ssm_states, const Tensor& state_slots, Tensor& out,
+                                         Tensor& ssm_states, const Tensor& source_state_slots,
+                                         const Tensor& destination_state_slots, Tensor& out,
                                          cudaStream_t stream) {
     const auto heads = head_map::of(q.ne[1], v.ne[1]);
     const dim3 grid(static_cast<unsigned>(v.ne[1]), static_cast<unsigned>(q.ne[3]),
@@ -52,8 +53,10 @@ void launch_recurrent_batch_update_fixed(const Tensor& q, const Tensor& k, const
         static_cast<const __nv_bfloat16*>(v.data),
         static_cast<const float*>(g.data),
         static_cast<const float*>(beta.data),
+        static_cast<const float*>(ssm_states.data),
         static_cast<float*>(ssm_states.data),
-        static_cast<const std::int32_t*>(state_slots.data),
+        static_cast<const std::int32_t*>(source_state_slots.data),
+        static_cast<const std::int32_t*>(destination_state_slots.data),
         static_cast<__nv_bfloat16*>(out.data),
         heads,
         state_slot_stride,
@@ -153,14 +156,18 @@ void launch_recurrent_inout(const Tensor& q, const Tensor& k, const Tensor& v, c
 
 void launch_recurrent_batch_update(const Tensor& q, const Tensor& k, const Tensor& v,
                                    const Tensor& g, const Tensor& beta, float scale,
-                                   bool normalize_qk, Tensor& ssm_states, const Tensor& state_slots,
-                                   Tensor& out, cudaStream_t stream) {
+                                   bool normalize_qk, Tensor& ssm_states,
+                                   const Tensor& source_state_slots,
+                                   const Tensor& destination_state_slots, Tensor& out,
+                                   cudaStream_t stream) {
     if (normalize_qk) {
-        launch_recurrent_batch_update_fixed<true>(q, k, v, g, beta, scale, ssm_states, state_slots,
-                                                  out, stream);
+        launch_recurrent_batch_update_fixed<true>(q, k, v, g, beta, scale, ssm_states,
+                                                  source_state_slots, destination_state_slots, out,
+                                                  stream);
     } else {
-        launch_recurrent_batch_update_fixed<false>(q, k, v, g, beta, scale, ssm_states, state_slots,
-                                                   out, stream);
+        launch_recurrent_batch_update_fixed<false>(q, k, v, g, beta, scale, ssm_states,
+                                                   source_state_slots, destination_state_slots, out,
+                                                   stream);
     }
 }
 

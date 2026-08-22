@@ -246,13 +246,22 @@ int run(const Options& options) {
     for (std::uint32_t lane = 0; lane < options.batch_size; ++lane) {
         auto prompt       = frontend.prepare_tokens(prompt_tokens(options.context_tokens), false);
         auto request_base = program->plan_request(prompt, execution);
-        auto request_plan = program->inspect_admission(prompt, request_base,
-                                                       ninfer::runtime::LaneId{lane}, nullptr);
-        auto started =
-            program->start_request(std::move(request_plan), std::move(prompt), std::nullopt);
+        auto request_plan = program->inspect_admission(
+            prompt, request_base, ninfer::runtime::LaneId{lane}, nullptr, std::nullopt);
+        if (!request_plan) { throw std::runtime_error("benchmark root admission was rejected"); }
+        auto materialization = program->reserve_materialization(std::move(*request_plan),
+                                                                std::move(prompt), nullptr, {});
+        program->prepare_materialization(materialization);
+        auto published =
+            program->publish_materialization(std::move(materialization), std::nullopt, {});
+        if (published.status != ninfer::runtime::MaterializationStatus::Published ||
+            !published.published) {
+            throw std::runtime_error("benchmark root materialization was not published");
+        }
+        auto started           = std::move(*published.published);
         active_sequences[lane] = started.sequence;
         std::optional<target::Package::PrefillProgress> progress;
-        progress.emplace(std::move(started.progress));
+        progress.emplace(program->advance_prefill(active_sequences[lane]));
         while (!progress->complete) {
             progress.reset();
             progress.emplace(program->advance_prefill(active_sequences[lane]));

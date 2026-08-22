@@ -266,19 +266,25 @@ validate_fold_rows(const GdnReplayRecords& records, LinearAttentionStateAllLayer
     }
     detail::gated_delta_net::GdnReplayFoldKernelRows packed{};
     for (std::size_t row = 0; row < rows.size(); ++row) {
-        if (rows[row].linear_state_slot < 0 ||
-            rows[row].linear_state_slot >= states.spec.slot_count) {
+        if (rows[row].source_state_slot < 0 ||
+            rows[row].source_state_slot >= states.spec.slot_count ||
+            rows[row].destination_state_slot < 0 ||
+            rows[row].destination_state_slot >= states.spec.slot_count) {
             throw std::invalid_argument("gdn_replay_fold: linear state slot is out of range");
         }
         if (rows[row].commit_columns < 0 || rows[row].commit_columns > records.spec.width) {
             throw std::invalid_argument("gdn_replay_fold: commit extent is out of range");
         }
         for (std::size_t previous = 0; previous < row; ++previous) {
-            if (rows[previous].linear_state_slot == rows[row].linear_state_slot) {
-                throw std::invalid_argument("gdn_replay_fold: active state slots must be distinct");
+            if (rows[previous].destination_state_slot == rows[row].destination_state_slot ||
+                rows[previous].destination_state_slot == rows[row].source_state_slot ||
+                rows[row].destination_state_slot == rows[previous].source_state_slot) {
+                throw std::invalid_argument(
+                    "gdn_replay_fold: active state source/destination bindings overlap");
             }
         }
-        packed.row[row] = {rows[row].linear_state_slot, rows[row].commit_columns};
+        packed.row[row] = {rows[row].source_state_slot, rows[row].destination_state_slot,
+                           rows[row].commit_columns, 0};
     }
     return packed;
 }

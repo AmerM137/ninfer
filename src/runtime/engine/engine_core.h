@@ -52,6 +52,7 @@ public:
     using BoundaryAction     = typename Scheduling::BoundaryAction;
     using AdmissionGrant     = typename Scheduling::AdmissionGrant;
     using ResourceManagement = ResourceManager<Package>;
+    using ResourceInspection = typename ResourceManagement::Inspection;
     using Clock              = std::chrono::steady_clock;
 
     EngineCore(Instance& instance, const EngineOptions& options)
@@ -66,6 +67,7 @@ public:
             throw std::invalid_argument("Engine core bounds are invalid");
         }
         if (admission_capacity_.active_lanes != max_concurrency_ ||
+            admission_capacity_.state_slots != 2U * max_concurrency_ ||
             admission_capacity_.main_kv_pages == 0) {
             throw std::logic_error("target admission capacity does not match the Engine");
         }
@@ -618,8 +620,7 @@ private:
                 request->speculative_stats  = std::move(committed.rows[row].speculative);
             } else if (decisions[row].terminal) {
                 auto finished =
-                    resources_.finish(*instance_.program, lanes[row], *request->sequence,
-                                      RetentionDecision::RetainResident);
+                    resources_.finish(*instance_.program, lanes[row], *request->sequence);
                 request->generation_timings = finished.timings;
                 request->speculative_stats  = std::move(finished.speculative);
             }
@@ -712,8 +713,7 @@ private:
         }
     }
 
-    [[nodiscard]] std::optional<typename ResourceManagement::Choice>
-    inspect_admission(const std::shared_ptr<Request>& request) {
+    [[nodiscard]] ResourceInspection inspect_admission(const std::shared_ptr<Request>& request) {
         return resources_.inspect(*instance_.program, request->prompt, *request->base_plan);
     }
 
@@ -757,26 +757,43 @@ private:
             request->generated.reserve(summary.effective_output_tokens);
         } catch (...) { return remove_pending_error(request, std::current_exception()); }
 
-        auto started =
-            resources_.start(*instance_.program, std::move(choice), std::move(request->prompt));
+        auto materialized = resources_.materialize(*instance_.program, std::move(choice),
+                                                   std::move(request->prompt),
+                                                   CancellationFlagView{&request->cancelled});
+        if (materialized.status == MaterializationStatus::Aborted) {
+            if (materialized.activation || !erase_pending(request)) {
+                throw std::logic_error("aborted materialization retained an activation");
+            }
+            on_waiting_removed(request);
+            complete_detached_cancelled(request);
+            publish_runtime_stats();
+            return AdmissionProgress::ControlProgress;
+        }
+        if (materialized.status != MaterializationStatus::Published || !materialized.activation) {
+            throw std::logic_error("published materialization has no adoption token");
+        }
+        auto activation = std::move(*materialized.activation);
+        materialized.activation.reset();
         if (!erase_pending(request)) {
             throw std::logic_error("admitted request disappeared from the FIFO queue");
         }
         release_planning_state(request);
         request->budget.emplace(std::move(prepared_budget));
         request->lane.emplace(destination);
-        request->sequence.emplace(started.sequence);
-        request->admission_resources    = started.active_resources;
+        request->sequence.emplace(activation.sequence());
+        request->admission_resources    = activation.active_resources();
         request->remaining_service_work = summary.service_work_quanta;
         request->backfill_epoch         = grant.protection_epoch();
         request->backfill_class         = grant.backfill_class();
         request->model_state            = EngineRequestState::Prefill;
         slots_[lane]                    = request;
+        resources_.adopt(std::move(activation));
         scheduler_.commit_admission(std::move(grant));
 
         publish_runtime_stats();
-        if (!started.progress.complete) { scheduler_.set_prefill_lane(lane); }
-        resolve_prefill_progress(request, std::move(started.progress));
+        auto progress = instance_.program->advance_prefill(*request->sequence);
+        if (!progress.complete) { scheduler_.set_prefill_lane(lane); }
+        resolve_prefill_progress(request, std::move(progress));
         publish_runtime_stats();
         return AdmissionProgress::RanGpuUnit;
     }
@@ -818,7 +835,8 @@ private:
                 continue;
             }
             const RequestPlanSummary& head_base = head->base_plan->summary();
-            if (!admission_resources_fit(head_base.admission, admission_capacity_)) {
+            auto head_inspection                = inspect_admission(head);
+            if (head_inspection.readiness == Readiness::PermanentlyInfeasible) {
                 (void)remove_pending_error(
                     head, std::make_exception_ptr(RequestError(
                               RequestErrorKind::ContextLengthExceeded,
@@ -826,12 +844,14 @@ private:
                 control_progress = true;
                 continue;
             }
-
-            auto head_choice = inspect_admission(head);
-            if (head_choice) {
-                AdmissionGrant grant =
-                    scheduler_.grant_head(head->id, head_choice->summary().service_work_quanta);
-                return admit_planned_request(head, std::move(*head_choice), std::move(grant));
+            if (head_inspection.readiness == Readiness::Ready) {
+                if (!head_inspection.choice) {
+                    throw std::logic_error("ready resource inspection has no admission choice");
+                }
+                AdmissionGrant grant = scheduler_.grant_head(
+                    head->id, head_inspection.choice->summary().service_work_quanta);
+                return admit_planned_request(head, std::move(*head_inspection.choice),
+                                             std::move(grant));
             }
 
             const ActiveAdmissionSet active =
@@ -871,7 +891,8 @@ private:
                     continue;
                 }
                 const RequestPlanSummary& candidate_base = candidate->base_plan->summary();
-                if (!admission_resources_fit(candidate_base.admission, admission_capacity_)) {
+                auto candidate_inspection                = inspect_admission(candidate);
+                if (candidate_inspection.readiness == Readiness::PermanentlyInfeasible) {
                     (void)remove_pending_error(
                         candidate, std::make_exception_ptr(RequestError(
                                        RequestErrorKind::ContextLengthExceeded,
@@ -879,16 +900,17 @@ private:
                     control_progress = true;
                     continue;
                 }
-
-                auto candidate_choice = inspect_admission(candidate);
-                if (!candidate_choice) { continue; }
-                const RequestPlanSummary& candidate_plan = candidate_choice->summary();
+                if (candidate_inspection.readiness != Readiness::Ready) { continue; }
+                if (!candidate_inspection.choice) {
+                    throw std::logic_error("ready resource inspection has no admission choice");
+                }
+                const RequestPlanSummary& candidate_plan = candidate_inspection.choice->summary();
 
                 auto grant = scheduler_.qualify_backfill(candidate->id, candidate_plan.admission,
                                                          candidate_plan.service_work_quanta,
                                                          active.span(), admission_capacity_);
                 if (grant) {
-                    return admit_planned_request(candidate, std::move(*candidate_choice),
+                    return admit_planned_request(candidate, std::move(*candidate_inspection.choice),
                                                  std::move(*grant));
                 }
             }
@@ -995,7 +1017,7 @@ private:
     const std::uint32_t max_concurrency_;
     const std::size_t max_outstanding_;
     const std::chrono::milliseconds pending_timeout_;
-    const AdmissionResources admission_capacity_;
+    const DeviceResources admission_capacity_;
     ResourceManagement resources_;
 
     mutable std::mutex execution_mutex_;

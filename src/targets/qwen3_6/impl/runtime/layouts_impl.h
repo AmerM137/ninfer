@@ -1,6 +1,5 @@
 #include "targets/qwen3_6/impl/runtime/instance.h"
 #include "targets/qwen3_6/impl/runtime/layouts.h"
-#include "targets/qwen3_6/impl/runtime/state_image_slots.h"
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
 #include "targets/qwen3_6/impl/runtime/workspace_recipe.h"
 
@@ -107,7 +106,8 @@ TensorLayout add_tensor(LayoutBuilder& builder, DType dtype,
 }
 
 PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
-    const std::int32_t state_image_slots = StateImageSlots::state_slot_count(plan.max_concurrency);
+    const std::int32_t state_image_slots =
+        checked_i32(2ULL * plan.max_concurrency, "Qwen3.6 StateImage slot count exceeds int32");
     const auto effective_prefill_chunk =
         static_cast<std::int32_t>(std::min(plan.prefill_chunk, plan.capacity));
     const std::uint32_t logical_pages  = page_count(plan.capacity);

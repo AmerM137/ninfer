@@ -204,6 +204,10 @@ public:
 
     [[nodiscard]] std::optional<DeviceKVPageReservation> reserve(std::uint32_t pages) noexcept;
 
+    [[nodiscard]] DeviceKVPageReservation make_empty_reservation() noexcept {
+        return DeviceKVPageReservation(*this, 0);
+    }
+
     [[nodiscard]] bool can_resize_reservation(const DeviceKVPageReservation& reservation,
                                               std::uint32_t new_reserved_pages) const noexcept;
     void resize_reservation(DeviceKVPageReservation& reservation, std::uint32_t new_reserved_pages);
@@ -211,9 +215,12 @@ public:
     // Grows destination to target_page_count without host allocation or a second capacity check.
     void materialize(DeviceKVPageReservation& reservation, std::uint32_t target_page_count,
                      std::vector<DeviceKVPageLease>& destination);
+    // Single-page forms for fixed-capacity logical stores which do not own a growable lease vector.
+    [[nodiscard]] DeviceKVPageLease materialize_one(DeviceKVPageReservation& reservation);
     // Returns trailing leases to the same entitlement instead of releasing their capacity.
     void dematerialize(DeviceKVPageReservation& reservation, std::uint32_t target_page_count,
                        std::vector<DeviceKVPageLease>& source);
+    void dematerialize_one(DeviceKVPageReservation& reservation, DeviceKVPageLease&& page);
 
     void zero_pages(std::span<const DeviceKVPageHandle> pages, cudaStream_t stream = nullptr) const;
     void copy_page(DeviceKVPageHandle source, DeviceKVPageHandle destination,

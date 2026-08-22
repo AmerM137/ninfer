@@ -221,9 +221,9 @@ public:
     }
 
     [[nodiscard]] bool protect_blocked_head(std::uint64_t request_id,
-                                            const AdmissionResources& head_resources,
+                                            const DeviceResources& head_resources,
                                             std::span<const ActiveAdmissionSnapshot> active,
-                                            const AdmissionResources& capacity) {
+                                            const DeviceResources& capacity) {
         if (!fifo_head_id_ || *fifo_head_id_ != request_id) {
             throw std::logic_error("blocked admission does not match the observed FIFO head");
         }
@@ -242,10 +242,10 @@ public:
     }
 
     [[nodiscard]] std::optional<AdmissionGrant>
-    qualify_backfill(std::uint64_t request_id, const AdmissionResources& resources,
+    qualify_backfill(std::uint64_t request_id, const DeviceResources& resources,
                      std::uint64_t service_work_quanta,
                      std::span<const ActiveAdmissionSnapshot> active,
-                     const AdmissionResources& capacity) const {
+                     const DeviceResources& capacity) const {
         if (!fifo_head_id_ || !protection_ || protection_->phase != ProtectionPhase::Open ||
             protection_->head_request_id != *fifo_head_id_) {
             throw std::logic_error("backfill qualification has no open protected head");

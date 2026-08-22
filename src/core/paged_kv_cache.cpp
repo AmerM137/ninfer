@@ -325,6 +325,22 @@ void DeviceKVPagePool::materialize(DeviceKVPageReservation& reservation,
     reservation.pages_ -= count;
 }
 
+DeviceKVPageLease DeviceKVPagePool::materialize_one(DeviceKVPageReservation& reservation) {
+    if (!reservation.belongs_to(*this) || reservation.pages_ == 0) {
+        throw std::invalid_argument("Paged KV single-page materialization exceeds reservation");
+    }
+    if (free_page_ids_.empty()) {
+        throw std::logic_error("Paged KV reservation invariant was violated");
+    }
+    const std::int32_t page = free_page_ids_.front();
+    free_page_ids_.erase(free_page_ids_.begin());
+    page_allocated_[static_cast<std::size_t>(page)] = true;
+    ++allocated_pages_;
+    --reserved_pages_;
+    --reservation.pages_;
+    return DeviceKVPageLease(*this, page, page_generations_[static_cast<std::size_t>(page)]);
+}
+
 void DeviceKVPagePool::dematerialize(DeviceKVPageReservation& reservation,
                                      std::uint32_t target_page_count,
                                      std::vector<DeviceKVPageLease>& source) {
@@ -348,6 +364,19 @@ void DeviceKVPagePool::dematerialize(DeviceKVPageReservation& reservation,
     source.resize(target_page_count);
     reserved_pages_ += released;
     reservation.pages_ += released;
+}
+
+void DeviceKVPagePool::dematerialize_one(DeviceKVPageReservation& reservation,
+                                         DeviceKVPageLease&& page) {
+    if (!reservation.belongs_to(*this) || !page.belongs_to(*this) || !valid_handle(page.handle()) ||
+        reservation.pages_ == std::numeric_limits<std::uint32_t>::max()) {
+        throw std::invalid_argument("Paged KV single-page dematerialization is invalid");
+    }
+    if (!page.release()) {
+        throw std::logic_error("Paged KV single-page dematerialization lost its lease");
+    }
+    ++reserved_pages_;
+    ++reservation.pages_;
 }
 
 bool DeviceKVPagePool::valid_handle(DeviceKVPageHandle handle) const noexcept {

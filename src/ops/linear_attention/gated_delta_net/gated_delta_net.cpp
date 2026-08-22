@@ -107,8 +107,8 @@ Geometry validate_recurrent(const Tensor& q, const Tensor& k, const Tensor& v, c
 
 Geometry validate_recurrent_batch_update(const Tensor& q, const Tensor& k, const Tensor& v,
                                          const Tensor& g, const Tensor& beta, float scale,
-                                         const Tensor& ssm_states, const Tensor& state_slots,
-                                         const Tensor& out) {
+                                         const Tensor& ssm_states, const Tensor& source_state_slots,
+                                         const Tensor& destination_state_slots, const Tensor& out) {
     constexpr std::int32_t kMaximumBatch = 8;
     require_dtype(q, DType::BF16, "q must be BF16");
     require_dtype(k, DType::BF16, "k must be BF16");
@@ -117,7 +117,8 @@ Geometry validate_recurrent_batch_update(const Tensor& q, const Tensor& k, const
     require_dtype(g, DType::FP32, "g must be FP32");
     require_dtype(beta, DType::FP32, "beta must be FP32");
     require_dtype(ssm_states, DType::FP32, "ssm_states must be FP32");
-    require_dtype(state_slots, DType::I32, "state_slots must be I32");
+    require_dtype(source_state_slots, DType::I32, "source_state_slots must be I32");
+    require_dtype(destination_state_slots, DType::I32, "destination_state_slots must be I32");
 
     const Geometry geometry  = require_geometry(q, v);
     const std::int32_t batch = q.ne[3];
@@ -139,7 +140,8 @@ Geometry validate_recurrent_batch_update(const Tensor& q, const Tensor& k, const
         ssm_states.ne[2] != geometry.value_heads || ssm_states.ne[3] <= 0) {
         throw std::invalid_argument("gated_delta_net: invalid shape for pooled ssm_states");
     }
-    require_shape(state_slots, batch, 1, 1, 1, "state_slots");
+    require_shape(source_state_slots, batch, 1, 1, 1, "source_state_slots");
+    require_shape(destination_state_slots, batch, 1, 1, 1, "destination_state_slots");
 
     require_contiguous_nonnull(q, "q");
     require_contiguous_nonnull(k, "k");
@@ -147,7 +149,8 @@ Geometry validate_recurrent_batch_update(const Tensor& q, const Tensor& k, const
     require_contiguous_nonnull(g, "g");
     require_contiguous_nonnull(beta, "beta");
     require_contiguous_nonnull(ssm_states, "ssm_states");
-    require_contiguous_nonnull(state_slots, "state_slots");
+    require_contiguous_nonnull(source_state_slots, "source_state_slots");
+    require_contiguous_nonnull(destination_state_slots, "destination_state_slots");
     require_contiguous_nonnull(out, "out");
 
     require_scale(scale);
@@ -223,12 +226,16 @@ void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Te
 
 void gated_delta_net_batch_update(const Tensor& q, const Tensor& k, const Tensor& v,
                                   const Tensor& g, const Tensor& beta, float scale,
-                                  bool normalize_qk, Tensor& ssm_states, const Tensor& state_slots,
-                                  Tensor& out, cudaStream_t stream) {
-    validate_recurrent_batch_update(q, k, v, g, beta, scale, ssm_states, state_slots, out);
+                                  bool normalize_qk, Tensor& ssm_states,
+                                  const Tensor& source_state_slots,
+                                  const Tensor& destination_state_slots, Tensor& out,
+                                  cudaStream_t stream) {
+    validate_recurrent_batch_update(q, k, v, g, beta, scale, ssm_states, source_state_slots,
+                                    destination_state_slots, out);
 
     detail::gated_delta_net::launch_recurrent_batch_update(q, k, v, g, beta, scale, normalize_qk,
-                                                           ssm_states, state_slots, out, stream);
+                                                           ssm_states, source_state_slots,
+                                                           destination_state_slots, out, stream);
 }
 
 void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,

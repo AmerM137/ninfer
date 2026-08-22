@@ -80,7 +80,7 @@ struct RequestRecord {
     EngineRequestState model_state = EngineRequestState::Waiting;
 
     std::optional<BasePlan> base_plan;
-    AdmissionResources admission_resources;
+    DeviceResources admission_resources;
     std::uint64_t remaining_service_work = 0;
     std::uint64_t backfill_epoch         = 0;
     BackfillClass backfill_class         = BackfillClass::None;
