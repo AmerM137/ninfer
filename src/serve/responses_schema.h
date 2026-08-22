@@ -9,7 +9,6 @@
 #include <nlohmann/json.hpp>
 
 #include <cstdint>
-#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -77,18 +76,22 @@ struct ResponsesStreamFinish {
     std::vector<std::string> events_before_terminal;
 };
 
+struct ResponsesItemIds {
+    std::string reasoning;
+    std::string message;
+    std::vector<std::string> function_calls;
+};
+
 // Stateful semantic-event encoder for one Responses SSE stream. It assigns
 // stable Item IDs and monotonically increasing sequence_number values.
 class ResponsesEventStream {
 public:
     ResponsesEventStream(std::string response_id, std::int64_t created_at, ResponsesRequest request,
                          ResponsesRuntimeValues runtime);
-    ~ResponsesEventStream();
-    ResponsesEventStream(ResponsesEventStream&&) noexcept;
-    ResponsesEventStream& operator=(ResponsesEventStream&&) noexcept;
-
     ResponsesEventStream(const ResponsesEventStream&)            = delete;
     ResponsesEventStream& operator=(const ResponsesEventStream&) = delete;
+    ResponsesEventStream(ResponsesEventStream&&)                 = delete;
+    ResponsesEventStream& operator=(ResponsesEventStream&&)      = delete;
 
     std::vector<std::string> start();
     std::vector<std::string> reasoning_delta(const std::string& text);
@@ -98,8 +101,32 @@ public:
     std::string failed(const ApiError& error);
 
 private:
-    class Impl;
-    std::unique_ptr<Impl> impl_;
+    nlohmann::json event(std::string type, nlohmann::json fields = nlohmann::json::object());
+    std::vector<std::string> ensure_reasoning();
+    std::vector<std::string> close_reasoning(const std::string& final_text,
+                                             const char* item_status = "completed");
+    std::vector<std::string> ensure_message();
+    std::vector<std::string> close_message(const std::string& final_text,
+                                           const char* item_status = "completed");
+
+    std::string id;
+    std::int64_t created_at = 0;
+    ResponsesRequest request;
+    ResponsesRuntimeValues runtime;
+    std::uint64_t sequence = 0;
+    int next_output_index  = 0;
+    int reasoning_index    = -1;
+    int message_index      = -1;
+    bool started           = false;
+    bool reasoning_started = false;
+    bool reasoning_done    = false;
+    bool message_started   = false;
+    bool message_done      = false;
+    bool finish_built      = false;
+    bool terminal_emitted  = false;
+    std::string reasoning_text;
+    std::string content_text;
+    ResponsesItemIds ids;
 };
 
 std::string new_response_id();

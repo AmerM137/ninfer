@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/host_worker_pool.h"
 #include "targets/qwen3_6/impl/frontend/processor.h"
 
 #include <array>
@@ -24,6 +25,7 @@ struct PreparedMedia {
 };
 
 struct MediaCacheFlight;
+struct MediaCacheState;
 struct MediaPreparationGate;
 
 class MediaPreparationPermit {
@@ -41,7 +43,7 @@ public:
 private:
     explicit MediaPreparationPermit(std::shared_ptr<MediaPreparationGate> gate) noexcept;
     void release() noexcept;
-    std::shared_ptr<MediaPreparationGate> gate_;
+    std::shared_ptr<MediaPreparationGate> gate;
 
     friend class MediaPreprocessCache;
 };
@@ -91,8 +93,6 @@ public:
     MediaPreprocessCache(std::size_t capacity_bytes, std::size_t live_capacity_bytes,
                          std::uint32_t preprocess_threads  = 0,
                          std::size_t maximum_request_bytes = 0);
-    ~MediaPreprocessCache();
-
     MediaPreprocessCache(const MediaPreprocessCache&)            = delete;
     MediaPreprocessCache& operator=(const MediaPreprocessCache&) = delete;
 
@@ -113,8 +113,11 @@ public:
     [[nodiscard]] MediaCacheStats stats() const;
 
 private:
-    struct Impl;
-    std::unique_ptr<Impl> impl_;
+    const std::uint32_t thread_count;
+    std::shared_ptr<MediaCacheState> state;
+    std::shared_ptr<MediaPreparationGate> request_gate;
+    // Declared last so destruction joins workers before releasing shared cache state.
+    HostWorkerPool workers;
 };
 
 void check_preparation_control(const PreparationControl& control,

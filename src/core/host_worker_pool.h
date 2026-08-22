@@ -1,13 +1,17 @@
 #pragma once
 
-#include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <future>
 #include <memory>
+#include <mutex>
+#include <thread>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 namespace ninfer {
 
@@ -44,9 +48,17 @@ public:
 
 private:
     void enqueue(std::function<void()> task, Checkpoint checkpoint);
+    void worker_loop() noexcept;
 
-    struct Impl;
-    std::unique_ptr<Impl> impl_;
+    const std::uint32_t thread_count;
+    const std::size_t queue_capacity;
+    mutable std::mutex mutex;
+    std::condition_variable work_available;
+    std::condition_variable queue_space;
+    std::deque<std::function<void()>> queue;
+    std::vector<std::thread> workers;
+    std::size_t active = 0;
+    bool stopping      = false;
 };
 
 } // namespace ninfer

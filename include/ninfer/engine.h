@@ -7,6 +7,12 @@
 
 namespace ninfer {
 
+namespace runtime {
+struct EngineState;
+struct GenerationSubmission;
+struct PreparedPromptState;
+} // namespace runtime
+
 class PreparedPrompt {
 public:
     PreparedPrompt() noexcept;
@@ -23,9 +29,8 @@ public:
     [[nodiscard]] explicit operator bool() const noexcept;
 
 private:
-    class Impl;
-    explicit PreparedPrompt(std::unique_ptr<Impl> impl) noexcept;
-    std::unique_ptr<Impl> impl_;
+    explicit PreparedPrompt(std::unique_ptr<runtime::PreparedPromptState> state) noexcept;
+    std::unique_ptr<runtime::PreparedPromptState> state;
 
     friend class Engine;
 };
@@ -47,9 +52,8 @@ public:
     GenerationResult wait(OutputSink* sink = nullptr, const CancellationView& cancellation = {});
 
 private:
-    class Impl;
-    explicit GenerationHandle(std::unique_ptr<Impl> impl) noexcept;
-    std::unique_ptr<Impl> impl_;
+    explicit GenerationHandle(std::unique_ptr<runtime::GenerationSubmission> submission) noexcept;
+    std::unique_ptr<runtime::GenerationSubmission> submission;
 
     friend class Engine;
 };
@@ -95,8 +99,7 @@ public:
     void reset_memory_peaks() noexcept;
 
 private:
-    class Impl;
-    std::shared_ptr<Impl> impl_;
+    std::shared_ptr<runtime::EngineState> state;
 };
 
 } // namespace ninfer

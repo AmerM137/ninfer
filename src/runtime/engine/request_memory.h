@@ -9,6 +9,7 @@
 namespace ninfer {
 
 struct DeviceContext;
+class DeviceArena;
 
 namespace runtime {
 
@@ -34,8 +35,11 @@ public:
     void reset_peak() noexcept;
 
 private:
-    class Impl;
-    std::unique_ptr<Impl> impl_;
+    int device = 0;
+    std::unique_ptr<DeviceArena> arena;
+    std::size_t active_bytes     = 0;
+    std::size_t active_alignment = 1;
+    std::size_t peak_bytes       = 0;
 };
 
 } // namespace runtime

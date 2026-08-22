@@ -17,33 +17,20 @@ bool is_power_of_two(std::size_t value) noexcept {
 
 } // namespace
 
-class RequestMemory::Impl {
-public:
-    Impl(DeviceContext& context, std::size_t capacity) : device(context.device) {
-        if (capacity != 0) {
-            CUDA_CHECK(cudaSetDevice(device));
-            arena = std::make_unique<DeviceArena>(capacity);
-        }
+RequestMemory::RequestMemory(DeviceContext& context, std::size_t frozen_capacity_bytes)
+    : device(context.device) {
+    if (frozen_capacity_bytes != 0) {
+        CUDA_CHECK(cudaSetDevice(device));
+        arena = std::make_unique<DeviceArena>(frozen_capacity_bytes);
     }
+}
 
-    ~Impl() {
-        if (arena != nullptr) {
-            (void)cudaSetDevice(device);
-            arena.reset();
-        }
+RequestMemory::~RequestMemory() {
+    if (arena != nullptr) {
+        (void)cudaSetDevice(device);
+        arena.reset();
     }
-
-    int device = 0;
-    std::unique_ptr<DeviceArena> arena;
-    std::size_t active_bytes     = 0;
-    std::size_t active_alignment = 1;
-    std::size_t peak_bytes       = 0;
-};
-
-RequestMemory::RequestMemory(DeviceContext& device, std::size_t frozen_capacity_bytes)
-    : impl_(std::make_unique<Impl>(device, frozen_capacity_bytes)) {}
-
-RequestMemory::~RequestMemory() = default;
+}
 
 void RequestMemory::activate(std::size_t bytes, std::size_t alignment) {
     if (bytes == 0) {
@@ -58,34 +45,33 @@ void RequestMemory::activate(std::size_t bytes, std::size_t alignment) {
         throw std::invalid_argument("unsupported transient region alignment");
     }
 
-    if (impl_->arena == nullptr || bytes > impl_->arena->capacity()) {
+    if (arena == nullptr || bytes > arena->capacity()) {
         throw std::invalid_argument("request transient exceeds its frozen startup capacity");
     }
 
-    impl_->active_bytes     = bytes;
-    impl_->active_alignment = alignment;
-    impl_->peak_bytes       = std::max(impl_->peak_bytes, bytes);
+    active_bytes     = bytes;
+    active_alignment = alignment;
+    peak_bytes       = std::max(peak_bytes, bytes);
 }
 
 void RequestMemory::deactivate() noexcept {
-    impl_->active_bytes     = 0;
-    impl_->active_alignment = 1;
+    active_bytes     = 0;
+    active_alignment = 1;
 }
 
 TransientRegion RequestMemory::region() const noexcept {
-    if (impl_->active_bytes == 0) { return {}; }
-    return {static_cast<std::byte*>(impl_->arena->base()), impl_->active_bytes,
-            impl_->active_alignment};
+    if (active_bytes == 0) { return {}; }
+    return {static_cast<std::byte*>(arena->base()), active_bytes, active_alignment};
 }
 
 ArenaMemorySummary RequestMemory::summary() const noexcept {
     return ArenaMemorySummary{
-        impl_->arena != nullptr ? impl_->arena->capacity() : 0,
-        impl_->active_bytes,
-        impl_->peak_bytes,
+        arena != nullptr ? arena->capacity() : 0,
+        active_bytes,
+        peak_bytes,
     };
 }
 
-void RequestMemory::reset_peak() noexcept { impl_->peak_bytes = impl_->active_bytes; }
+void RequestMemory::reset_peak() noexcept { peak_bytes = active_bytes; }
 
 } // namespace ninfer::runtime

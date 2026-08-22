@@ -1,7 +1,5 @@
 #include "targets/qwen3_6/impl/frontend/media_cache.h"
 
-#include "core/host_worker_pool.h"
-
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
@@ -31,7 +29,7 @@ struct KeyHash {
 };
 
 struct MemoryAccount {
-    explicit MemoryAccount(std::size_t limit_) : limit(limit_) {}
+    explicit MemoryAccount(std::size_t limit_value) : limit(limit_value) {}
 
     bool try_reserve(std::size_t bytes) {
         std::lock_guard lock(mutex);
@@ -89,7 +87,7 @@ struct MediaCacheFlight {
 };
 
 struct MediaPreparationGate {
-    explicit MediaPreparationGate(std::size_t maximum_) : maximum(maximum_) {}
+    explicit MediaPreparationGate(std::size_t maximum_value) : maximum(maximum_value) {}
 
     std::mutex mutex;
     std::condition_variable changed;
@@ -98,17 +96,17 @@ struct MediaPreparationGate {
 };
 
 MediaPreparationPermit::MediaPreparationPermit(std::shared_ptr<MediaPreparationGate> gate) noexcept
-    : gate_(std::move(gate)) {}
+    : gate(std::move(gate)) {}
 
 void MediaPreparationPermit::release() noexcept {
-    if (!gate_) { return; }
+    if (!gate) { return; }
     {
-        std::lock_guard lock(gate_->mutex);
-        if (gate_->active == 0) { std::terminate(); }
-        --gate_->active;
+        std::lock_guard lock(gate->mutex);
+        if (gate->active == 0) { std::terminate(); }
+        --gate->active;
     }
-    gate_->changed.notify_one();
-    gate_.reset();
+    gate->changed.notify_one();
+    gate.reset();
 }
 
 MediaPreparationPermit::~MediaPreparationPermit() { release(); }
@@ -118,7 +116,7 @@ MediaPreparationPermit::MediaPreparationPermit(MediaPreparationPermit&&) noexcep
 MediaPreparationPermit& MediaPreparationPermit::operator=(MediaPreparationPermit&& other) noexcept {
     if (this == &other) { return *this; }
     release();
-    gate_ = std::move(other.gate_);
+    gate = std::move(other.gate);
     return *this;
 }
 
@@ -133,141 +131,120 @@ void check_preparation_control(const PreparationControl& control, std::string_vi
     }
 }
 
-struct MediaPreprocessCache::Impl {
-    struct Ready {
-        PreparedMedia media;
-        std::size_t bytes = 0;
-        std::list<MediaCacheKey>::iterator lru;
-    };
+struct MediaCacheReady {
+    PreparedMedia media;
+    std::size_t bytes = 0;
+    std::list<MediaCacheKey>::iterator lru;
+};
 
-    struct State {
-        State(std::size_t retained_capacity, std::size_t live_capacity)
-            : capacity_bytes(retained_capacity),
-              account(std::make_shared<MemoryAccount>(live_capacity)) {}
+struct MediaCacheState {
+    MediaCacheState(std::size_t retained_capacity, std::size_t live_capacity)
+        : capacity_bytes(retained_capacity),
+          account(std::make_shared<MemoryAccount>(live_capacity)) {}
 
-        bool evict_one_locked() {
-            if (lru.empty()) { return false; }
-            const MediaCacheKey key = lru.back();
-            auto found              = ready.find(key);
-            if (found == ready.end() || found->second.bytes > retained_bytes) { std::terminate(); }
-            retained_bytes -= found->second.bytes;
-            lru.pop_back();
-            ready.erase(found);
-            ++evictions;
-            return true;
-        }
-
-        const std::size_t capacity_bytes;
-        std::shared_ptr<MemoryAccount> account;
-        mutable std::mutex mutex;
-        std::list<MediaCacheKey> lru;
-        std::unordered_map<MediaCacheKey, Ready, KeyHash> ready;
-        std::unordered_map<MediaCacheKey, std::shared_ptr<MediaCacheFlight>, KeyHash> inflight;
-        std::size_t retained_bytes       = 0;
-        std::uint64_t hits               = 0;
-        std::uint64_t misses             = 0;
-        std::uint64_t singleflight_waits = 0;
-        std::uint64_t evictions          = 0;
-        std::uint64_t oversize_bypasses  = 0;
-    };
-
-    Impl(std::size_t capacity_bytes, std::size_t live_capacity_bytes,
-         std::uint32_t requested_threads, std::size_t maximum_request_bytes)
-        : threads(resolve_threads(requested_threads)),
-          state(std::make_shared<State>(capacity_bytes, live_capacity_bytes)),
-          request_gate(std::make_shared<MediaPreparationGate>(
-              maximum_request_bytes == 0
-                  ? 1
-                  : std::max<std::size_t>(1, live_capacity_bytes / maximum_request_bytes))),
-          workers(std::make_shared<HostWorkerPool>(threads,
-                                                   std::max<std::size_t>(64, threads * 8ULL))) {
-        if (live_capacity_bytes == 0) {
-            throw std::invalid_argument("media live-byte capacity must be nonzero");
-        }
-        if (threads == 0 || threads > 64) {
-            throw std::invalid_argument("media preprocessing threads must be in [1,64]");
-        }
-        if (maximum_request_bytes > live_capacity_bytes) {
-            throw std::invalid_argument(
-                "maximum request media payload exceeds media live-byte capacity");
-        }
+    bool evict_one_locked() {
+        if (lru.empty()) { return false; }
+        const MediaCacheKey key = lru.back();
+        auto found              = ready.find(key);
+        if (found == ready.end() || found->second.bytes > retained_bytes) { std::terminate(); }
+        retained_bytes -= found->second.bytes;
+        lru.pop_back();
+        ready.erase(found);
+        ++evictions;
+        return true;
     }
 
-    [[nodiscard]] std::shared_ptr<qwen3_6::PreparedMediaPayload>
-    allocate_payload(std::size_t elements, const PreparationControl& control) {
-        if (elements == 0) {
-            throw std::invalid_argument("prepared media patch allocation must be nonzero");
-        }
-        if (elements > std::numeric_limits<std::size_t>::max() / sizeof(std::uint16_t)) {
-            throw std::overflow_error("prepared media patch allocation overflows size_t");
-        }
-        const std::size_t bytes = elements * sizeof(std::uint16_t);
-        if (bytes > state->account->limit) {
-            throw RequestError(
-                RequestErrorKind::MediaBudgetExceeded,
-                "one prepared media payload exceeds the configured live-byte capacity");
-        }
-        for (;;) {
-            check_preparation_control(control);
-            if (state->account->try_reserve(bytes)) { break; }
-            bool evicted = false;
-            {
-                std::lock_guard lock(state->mutex);
-                evicted = state->evict_one_locked();
-            }
-            if (evicted) { continue; }
-            std::unique_lock lock(state->account->mutex);
-            state->account->changed.wait_for(lock, std::chrono::milliseconds(10));
-        }
-
-        qwen3_6::PreparedMediaPayload* payload = nullptr;
-        try {
-            payload                 = new qwen3_6::PreparedMediaPayload();
-            payload->patches        = std::make_unique<std::uint16_t[]>(elements);
-            payload->patch_elements = elements;
-        } catch (...) {
-            delete payload;
-            state->account->release(bytes);
-            throw;
-        }
-        auto account = state->account;
-        return std::shared_ptr<qwen3_6::PreparedMediaPayload>(
-            payload, [account = std::move(account), bytes](qwen3_6::PreparedMediaPayload* value) {
-                delete value;
-                account->release(bytes);
-            });
-    }
-
-    const std::uint32_t threads;
-    std::shared_ptr<State> state;
-    std::shared_ptr<MediaPreparationGate> request_gate;
-    std::shared_ptr<HostWorkerPool> workers;
+    const std::size_t capacity_bytes;
+    std::shared_ptr<MemoryAccount> account;
+    mutable std::mutex mutex;
+    std::list<MediaCacheKey> lru;
+    std::unordered_map<MediaCacheKey, MediaCacheReady, KeyHash> ready;
+    std::unordered_map<MediaCacheKey, std::shared_ptr<MediaCacheFlight>, KeyHash> inflight;
+    std::size_t retained_bytes       = 0;
+    std::uint64_t hits               = 0;
+    std::uint64_t misses             = 0;
+    std::uint64_t singleflight_waits = 0;
+    std::uint64_t evictions          = 0;
+    std::uint64_t oversize_bypasses  = 0;
 };
 
 MediaPreprocessCache::MediaPreprocessCache(std::size_t capacity_bytes,
                                            std::size_t live_capacity_bytes,
                                            std::uint32_t preprocess_threads,
                                            std::size_t maximum_request_bytes)
-    : impl_(std::make_unique<Impl>(capacity_bytes, live_capacity_bytes, preprocess_threads,
-                                   maximum_request_bytes)) {}
-
-MediaPreprocessCache::~MediaPreprocessCache() = default;
+    : thread_count(resolve_threads(preprocess_threads)),
+      state(std::make_shared<MediaCacheState>(capacity_bytes, live_capacity_bytes)),
+      request_gate(std::make_shared<MediaPreparationGate>(
+          maximum_request_bytes == 0
+              ? 1
+              : std::max<std::size_t>(1, live_capacity_bytes / maximum_request_bytes))),
+      workers(thread_count, std::max<std::size_t>(64, thread_count * 8ULL)) {
+    if (live_capacity_bytes == 0) {
+        throw std::invalid_argument("media live-byte capacity must be nonzero");
+    }
+    if (thread_count == 0 || thread_count > 64) {
+        throw std::invalid_argument("media preprocessing threads must be in [1,64]");
+    }
+    if (maximum_request_bytes > live_capacity_bytes) {
+        throw std::invalid_argument(
+            "maximum request media payload exceeds media live-byte capacity");
+    }
+}
 
 std::shared_ptr<qwen3_6::PreparedMediaPayload>
 MediaPreprocessCache::allocate_payload(std::size_t elements, const PreparationControl& control) {
-    return impl_->allocate_payload(elements, control);
+    if (elements == 0) {
+        throw std::invalid_argument("prepared media patch allocation must be nonzero");
+    }
+    if (elements > std::numeric_limits<std::size_t>::max() / sizeof(std::uint16_t)) {
+        throw std::overflow_error("prepared media patch allocation overflows size_t");
+    }
+    const std::size_t bytes = elements * sizeof(std::uint16_t);
+    if (bytes > state->account->limit) {
+        throw RequestError(RequestErrorKind::MediaBudgetExceeded,
+                           "one prepared media payload exceeds the configured live-byte capacity");
+    }
+    for (;;) {
+        check_preparation_control(control);
+        if (state->account->try_reserve(bytes)) { break; }
+        bool evicted = false;
+        {
+            std::lock_guard lock(state->mutex);
+            evicted = state->evict_one_locked();
+        }
+        if (evicted) { continue; }
+        std::unique_lock lock(state->account->mutex);
+        state->account->changed.wait_for(lock, std::chrono::milliseconds(10));
+    }
+
+    qwen3_6::PreparedMediaPayload* payload = nullptr;
+    try {
+        payload                 = new qwen3_6::PreparedMediaPayload();
+        payload->patches        = std::make_unique<std::uint16_t[]>(elements);
+        payload->patch_elements = elements;
+    } catch (...) {
+        delete payload;
+        state->account->release(bytes);
+        throw;
+    }
+    auto account = state->account;
+    return std::shared_ptr<qwen3_6::PreparedMediaPayload>(
+        payload, [account = std::move(account), bytes](qwen3_6::PreparedMediaPayload* value) {
+            delete value;
+            account->release(bytes);
+        });
 }
 
 MediaPreparationPermit
 MediaPreprocessCache::acquire_request(const PreparationControl& control) const {
     for (;;) {
         check_preparation_control(control);
-        std::unique_lock lock(impl_->request_gate->mutex);
-        if (impl_->request_gate->active < impl_->request_gate->maximum) {
-            ++impl_->request_gate->active;
-            return MediaPreparationPermit(impl_->request_gate);
+        std::unique_lock lock(request_gate->mutex);
+        if (request_gate->active < request_gate->maximum) {
+            ++request_gate->active;
+            return MediaPreparationPermit(request_gate);
         }
-        impl_->request_gate->changed.wait_for(lock, std::chrono::milliseconds(10));
+        request_gate->changed.wait_for(lock, std::chrono::milliseconds(10));
     }
 }
 
@@ -277,33 +254,31 @@ PendingMedia MediaPreprocessCache::begin_prepare(const MediaCacheKey& key,
     check_preparation_control(control);
     PendingMedia pending;
     {
-        std::lock_guard lock(impl_->state->mutex);
-        if (auto found = impl_->state->ready.find(key); found != impl_->state->ready.end()) {
-            impl_->state->lru.splice(impl_->state->lru.begin(), impl_->state->lru,
-                                     found->second.lru);
-            ++impl_->state->hits;
+        std::lock_guard lock(state->mutex);
+        if (auto found = state->ready.find(key); found != state->ready.end()) {
+            state->lru.splice(state->lru.begin(), state->lru, found->second.lru);
+            ++state->hits;
             pending.disposition = MediaCacheDisposition::Hit;
             pending.ready       = found->second.media;
             return pending;
         }
-        if (auto found = impl_->state->inflight.find(key); found != impl_->state->inflight.end()) {
-            ++impl_->state->singleflight_waits;
+        if (auto found = state->inflight.find(key); found != state->inflight.end()) {
+            ++state->singleflight_waits;
             pending.disposition = MediaCacheDisposition::SingleflightWaiter;
             pending.flight      = found->second;
             return pending;
         }
         pending.flight = std::make_shared<MediaCacheFlight>();
-        impl_->state->inflight.emplace(key, pending.flight);
-        ++impl_->state->misses;
+        state->inflight.emplace(key, pending.flight);
+        ++state->misses;
         pending.disposition = MediaCacheDisposition::Producer;
     }
 
     const auto checkpoint = [control] { check_preparation_control(control); };
     try {
-        auto state  = impl_->state;
         auto flight = pending.flight;
-        (void)impl_->workers->submit(
-            [state = std::move(state), key, control, builder = std::move(builder),
+        (void)workers.submit(
+            [state = this->state, key, control, builder = std::move(builder),
              flight = std::move(flight)]() mutable {
                 PreparedMedia built;
                 std::exception_ptr error;
@@ -320,8 +295,8 @@ PendingMedia MediaPreprocessCache::begin_prepare(const MediaCacheKey& key,
                             }
                             if (state->retained_bytes <= state->capacity_bytes - bytes) {
                                 state->lru.push_front(key);
-                                state->ready.emplace(key,
-                                                     Impl::Ready{built, bytes, state->lru.begin()});
+                                state->ready.emplace(
+                                    key, MediaCacheReady{built, bytes, state->lru.begin()});
                                 state->retained_bytes += bytes;
                             } else {
                                 ++state->oversize_bypasses;
@@ -357,8 +332,8 @@ PendingMedia MediaPreprocessCache::begin_prepare(const MediaCacheKey& key,
             pending.flight->done     = true;
         }
         {
-            std::lock_guard lock(impl_->state->mutex);
-            impl_->state->inflight.erase(key);
+            std::lock_guard lock(state->mutex);
+            state->inflight.erase(key);
         }
         pending.flight->changed.notify_all();
         std::rethrow_exception(error);
@@ -405,23 +380,23 @@ PreparedMedia MediaPreprocessCache::await(const PendingMedia& pending,
 MediaCacheStats MediaPreprocessCache::stats() const {
     MediaCacheStats out;
     {
-        std::lock_guard lock(impl_->state->mutex);
-        out.capacity_bytes      = impl_->state->capacity_bytes;
-        out.live_capacity_bytes = impl_->state->account->limit;
-        out.retained_bytes      = impl_->state->retained_bytes;
-        out.entries             = impl_->state->ready.size();
-        out.inflight            = impl_->state->inflight.size();
-        out.hits                = impl_->state->hits;
-        out.misses              = impl_->state->misses;
-        out.singleflight_waits  = impl_->state->singleflight_waits;
-        out.evictions           = impl_->state->evictions;
-        out.oversize_bypasses   = impl_->state->oversize_bypasses;
+        std::lock_guard lock(state->mutex);
+        out.capacity_bytes      = state->capacity_bytes;
+        out.live_capacity_bytes = state->account->limit;
+        out.retained_bytes      = state->retained_bytes;
+        out.entries             = state->ready.size();
+        out.inflight            = state->inflight.size();
+        out.hits                = state->hits;
+        out.misses              = state->misses;
+        out.singleflight_waits  = state->singleflight_waits;
+        out.evictions           = state->evictions;
+        out.oversize_bypasses   = state->oversize_bypasses;
     }
-    out.live_bytes                         = impl_->state->account->current();
-    const HostWorkerPool::Snapshot workers = impl_->workers->snapshot();
-    out.preprocess_threads                 = workers.threads;
-    out.queued_tasks                       = workers.queued;
-    out.active_tasks                       = workers.active;
+    out.live_bytes                          = state->account->current();
+    const HostWorkerPool::Snapshot snapshot = workers.snapshot();
+    out.preprocess_threads                  = snapshot.threads;
+    out.queued_tasks                        = snapshot.queued;
+    out.active_tasks                        = snapshot.active;
     return out;
 }
 
