@@ -33,8 +33,6 @@ namespace ninfer::runtime {
 
 template <class Instance>
 class ConcurrentExecutor {
-    struct Request;
-
 public:
     using Package  = typename Instance::Package;
     using Program  = typename Package::Program;
@@ -42,30 +40,82 @@ public:
     using Plan     = typename Package::RequestPlan;
     using Clock    = std::chrono::steady_clock;
 
+private:
+    struct Request {
+        Request(std::uint64_t request_identity, targets::qwen3_6::PreparedPrompt input,
+                targets::qwen3_6::OutputSession output_session, PromptSummary summary,
+                double frontend_seconds, ResolvedRequestOptions request_options,
+                Clock::time_point limit, Clock::time_point submit_time)
+            : id(request_identity), prompt(std::move(input)), output(std::move(output_session)),
+              prompt_summary(summary), prepare_seconds(frontend_seconds),
+              options(std::move(request_options)), deadline(limit), submitted(submit_time) {}
+
+        // Submitted input and product policy.
+        const std::uint64_t id;
+        targets::qwen3_6::PreparedPrompt prompt;
+        targets::qwen3_6::OutputSession output;
+        PromptSummary prompt_summary;
+        double prepare_seconds = 0.0;
+        ResolvedRequestOptions options;
+        Clock::time_point deadline;
+        Clock::time_point submitted;
+
+        // Active generation state.
+        std::optional<Clock::time_point> first_token;
+        std::optional<GenerationBudget> budget;
+        std::optional<BeginSummary> begin;
+        std::vector<TokenId> generated;
+        std::string content;
+        std::string reasoning;
+        std::optional<std::uint32_t> lane;
+        std::atomic<bool> cancelled{false};
+        bool decode_ready = false;
+
+        // Admission planning and accounting.
+        std::optional<BasePlan> base_plan;
+        std::array<std::optional<Plan>, kMaximumConcurrency> lane_plans{};
+        std::array<std::uint64_t, kMaximumConcurrency> lane_plan_versions{};
+        AdmissionResources admission_resources;
+        std::uint64_t remaining_service_work = 0;
+        std::uint64_t backfill_epoch         = 0;
+        BackfillClass backfill_class         = BackfillClass::None;
+
+        // Consumer handoff.
+        std::mutex mutex;
+        std::condition_variable cv;
+        std::vector<OutputDelta> events;
+        GenerationResult result;
+        std::exception_ptr error;
+        bool done                 = false;
+        bool consumer_released    = false;
+        bool outstanding_released = false;
+    };
+
+public:
     ConcurrentExecutor(Instance& instance, const EngineOptions& options)
-        : instance_(instance), max_concurrency_(options.max_concurrency),
-          max_outstanding_(static_cast<std::size_t>(options.max_concurrency) +
-                           options.max_pending_requests),
-          pending_timeout_(std::chrono::milliseconds(options.pending_timeout_ms)),
-          admission_capacity_(instance.program->admission_capacity()) {
-        if (max_concurrency_ == 0 || max_concurrency_ > kMaximumConcurrency ||
-            options.max_pending_requests == 0 || pending_timeout_.count() <= 0) {
+        : instance(instance), max_concurrency(options.max_concurrency),
+          max_outstanding(static_cast<std::size_t>(options.max_concurrency) +
+                          options.max_pending_requests),
+          pending_timeout(std::chrono::milliseconds(options.pending_timeout_ms)),
+          admission_capacity(instance.program->admission_capacity()) {
+        if (max_concurrency == 0 || max_concurrency > kMaximumConcurrency ||
+            options.max_pending_requests == 0 || pending_timeout.count() <= 0) {
             throw std::invalid_argument("concurrent executor bounds are invalid");
         }
-        if (admission_capacity_.active_lanes != max_concurrency_ ||
-            admission_capacity_.main_kv_pages == 0) {
+        if (admission_capacity.active_lanes != max_concurrency ||
+            admission_capacity.main_kv_pages == 0) {
             throw std::logic_error("target admission capacity does not match the Engine");
         }
-        worker_ = std::thread([this] { worker_loop(); });
+        worker = std::thread([this] { worker_loop(); });
     }
 
     ~ConcurrentExecutor() noexcept {
         {
-            std::lock_guard lock(queue_mutex_);
-            stopping_ = true;
+            std::lock_guard lock(queue_mutex);
+            stopping = true;
         }
-        queue_cv_.notify_all();
-        if (worker_.joinable()) { worker_.join(); }
+        queue_cv.notify_all();
+        if (worker.joinable()) { worker.join(); }
     }
 
     ConcurrentExecutor(const ConcurrentExecutor&)            = delete;
@@ -78,13 +128,13 @@ public:
         ~Submission() { reset(); }
 
         Submission(Submission&& other) noexcept
-            : owner_(std::exchange(other.owner_, nullptr)), request_(std::move(other.request_)) {}
+            : executor(std::exchange(other.executor, nullptr)), request(std::move(other.request)) {}
 
         Submission& operator=(Submission&& other) noexcept {
             if (this != &other) {
                 reset();
-                owner_   = std::exchange(other.owner_, nullptr);
-                request_ = std::move(other.request_);
+                executor = std::exchange(other.executor, nullptr);
+                request  = std::move(other.request);
             }
             return *this;
         }
@@ -93,26 +143,26 @@ public:
         Submission& operator=(const Submission&) = delete;
 
         GenerationResult wait(OutputSink* sink, const CancellationView& cancellation) {
-            if (owner_ == nullptr || request_ == nullptr) {
+            if (executor == nullptr || request == nullptr) {
                 throw std::logic_error("concurrent submission is empty");
             }
-            ConcurrentExecutor* owner = std::exchange(owner_, nullptr);
-            return owner->wait_for_request(std::exchange(request_, nullptr), sink, cancellation);
+            ConcurrentExecutor* current = std::exchange(executor, nullptr);
+            return current->wait_for_request(std::exchange(request, nullptr), sink, cancellation);
         }
 
     private:
-        Submission(ConcurrentExecutor& owner, std::shared_ptr<Request> request) noexcept
-            : owner_(&owner), request_(std::move(request)) {}
+        Submission(ConcurrentExecutor& executor, std::shared_ptr<Request> request) noexcept
+            : executor(&executor), request(std::move(request)) {}
 
         void reset() noexcept {
-            if (owner_ != nullptr && request_ != nullptr) {
-                owner_->abandon_request(std::move(request_));
+            if (executor != nullptr && request != nullptr) {
+                executor->abandon_request(std::move(request));
             }
-            owner_ = nullptr;
+            executor = nullptr;
         }
 
-        ConcurrentExecutor* owner_ = nullptr;
-        std::shared_ptr<Request> request_;
+        ConcurrentExecutor* executor = nullptr;
+        std::shared_ptr<Request> request;
 
         friend class ConcurrentExecutor;
     };
@@ -122,7 +172,7 @@ public:
                       Clock::time_point pending_deadline = {}) {
         const Clock::time_point submitted = Clock::now();
         if (pending_deadline == Clock::time_point{}) {
-            pending_deadline = submitted + pending_timeout_;
+            pending_deadline = submitted + pending_timeout;
         }
         if (submitted >= pending_deadline) {
             throw RequestError(RequestErrorKind::QueueTimeout,
@@ -131,48 +181,48 @@ public:
 
         std::uint64_t request_id = 0;
         {
-            std::lock_guard lock(queue_mutex_);
-            if (stopping_ || failed_) {
+            std::lock_guard lock(queue_mutex);
+            if (stopping || failed) {
                 throw RequestError(RequestErrorKind::Unavailable,
                                    "inference engine is unavailable");
             }
-            if (outstanding_ >= max_outstanding_) {
+            if (outstanding >= max_outstanding) {
                 throw RequestError(RequestErrorKind::Overloaded, "inference request queue is full");
             }
-            ++outstanding_;
-            request_id = next_request_id_++;
+            ++outstanding;
+            request_id = next_request_id++;
         }
 
         std::shared_ptr<Request> request;
         try {
             auto output =
-                instance_.frontend.make_output_session(prompt, options.stop, options.output);
+                instance.frontend.make_output_session(prompt, options.stop, options.output);
             request = std::make_shared<Request>(request_id, std::move(prompt), std::move(output),
                                                 prompt_summary, prepare_seconds, std::move(options),
                                                 pending_deadline, submitted);
         } catch (...) {
-            release_reserved_capacity();
+            release_outstanding_slot();
             throw;
         }
 
         {
-            std::lock_guard lock(queue_mutex_);
-            if (stopping_ || failed_) {
-                --outstanding_;
+            std::lock_guard lock(queue_mutex);
+            if (stopping || failed) {
+                --outstanding;
                 throw RequestError(RequestErrorKind::Unavailable,
                                    "inference engine is unavailable");
             }
-            pending_.push_back(request);
+            pending.push_back(request);
         }
-        queue_cv_.notify_one();
+        queue_cv.notify_one();
         return Submission(*this, std::move(request));
     }
 
     [[nodiscard]] MemorySummary memory_summary() const {
-        std::scoped_lock lock(execution_mutex_);
-        MemorySummary out                      = instance_.program->memory_summary();
-        out.request_transient                  = instance_.request_memory.summary();
-        const KvCapacityResolution& resolution = instance_.kv_capacity_resolution;
+        std::scoped_lock lock(execution_mutex);
+        MemorySummary out                      = instance.program->memory_summary();
+        out.request_transient                  = instance.request_memory.summary();
+        const KvCapacityResolution& resolution = instance.kv_capacity_resolution;
         out.kv_capacity_mode                   = resolution.mode;
         out.kv_capacity_page_groups            = resolution.main_page_groups;
         out.kv_capacity_max_page_groups        = resolution.maximum_main_page_groups;
@@ -187,42 +237,42 @@ public:
     }
 
     [[nodiscard]] RuntimeStats runtime_stats() const {
-        std::lock_guard lock(stats_mutex_);
-        return published_stats_;
+        std::lock_guard lock(stats_mutex);
+        return published_stats;
     }
 
     void reset_memory_peaks() noexcept {
         try {
-            std::scoped_lock lock(execution_mutex_);
-            instance_.program->reset_memory_peaks();
-            instance_.request_memory.reset_peak();
+            std::scoped_lock lock(execution_mutex);
+            instance.program->reset_memory_peaks();
+            instance.request_memory.reset_peak();
         } catch (...) {}
     }
 
 private:
     void publish_runtime_stats() {
-        RuntimeStats snapshot = cumulative_stats_;
+        RuntimeStats snapshot = cumulative_stats;
         {
-            std::lock_guard lock(queue_mutex_);
-            snapshot.waiting_requests = static_cast<std::uint32_t>(pending_.size());
+            std::lock_guard lock(queue_mutex);
+            snapshot.waiting_requests = static_cast<std::uint32_t>(pending.size());
         }
-        snapshot.prefilling_requests = prefill_lane_.has_value() ? 1U : 0U;
-        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
-            if (slots_[lane] == nullptr) { continue; }
+        snapshot.prefilling_requests = prefill_lane.has_value() ? 1U : 0U;
+        for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
+            if (slots[lane] == nullptr) { continue; }
             ++snapshot.running_requests;
-            if (slots_[lane]->decode_ready) { ++snapshot.decode_ready_requests; }
+            if (slots[lane]->decode_ready) { ++snapshot.decode_ready_requests; }
         }
-        std::lock_guard lock(stats_mutex_);
-        published_stats_ = snapshot;
+        std::lock_guard lock(stats_mutex);
+        published_stats = snapshot;
     }
 
     GenerationResult wait_for_request(std::shared_ptr<Request> request, OutputSink* sink,
                                       const CancellationView& cancellation) {
         struct ConsumerGuard {
-            ConcurrentExecutor* owner;
+            ConcurrentExecutor* executor;
             std::shared_ptr<Request> request;
 
-            ~ConsumerGuard() { owner->release_consumer(request); }
+            ~ConsumerGuard() { executor->release_consumer(request); }
         } guard{this, request};
 
         std::exception_ptr caller_error;
@@ -244,7 +294,7 @@ private:
                 } catch (...) {
                     caller_error = std::current_exception();
                     request->cancelled.store(true, std::memory_order_release);
-                    queue_cv_.notify_one();
+                    queue_cv.notify_one();
                 }
             }
 
@@ -252,12 +302,12 @@ private:
                 try {
                     if (cancellation.requested()) {
                         request->cancelled.store(true, std::memory_order_release);
-                        queue_cv_.notify_one();
+                        queue_cv.notify_one();
                     }
                 } catch (...) {
                     caller_error = std::current_exception();
                     request->cancelled.store(true, std::memory_order_release);
-                    queue_cv_.notify_one();
+                    queue_cv.notify_one();
                 }
             }
             if (!done) { continue; }
@@ -268,51 +318,6 @@ private:
             return std::move(request->result);
         }
     }
-
-    struct Request {
-        Request(std::uint64_t request_identity, targets::qwen3_6::PreparedPrompt input,
-                targets::qwen3_6::OutputSession output_session, PromptSummary summary,
-                double frontend_seconds, ResolvedRequestOptions request_options,
-                Clock::time_point limit, Clock::time_point submit_time)
-            : id(request_identity), prompt(std::move(input)), output(std::move(output_session)),
-              prompt_summary(summary), prepare_seconds(frontend_seconds),
-              options(std::move(request_options)), deadline(limit), submitted(submit_time) {}
-
-        const std::uint64_t id;
-        targets::qwen3_6::PreparedPrompt prompt;
-        targets::qwen3_6::OutputSession output;
-        PromptSummary prompt_summary;
-        double prepare_seconds = 0.0;
-        ResolvedRequestOptions options;
-        Clock::time_point deadline;
-        Clock::time_point submitted;
-        std::optional<Clock::time_point> first_token;
-        std::optional<GenerationBudget> budget;
-        std::optional<BeginSummary> begin;
-        std::vector<TokenId> generated;
-        std::string content;
-        std::string reasoning;
-        std::optional<std::uint32_t> lane;
-        std::atomic<bool> cancelled{false};
-        bool decode_ready = false;
-
-        std::optional<BasePlan> base_plan;
-        std::array<std::optional<Plan>, kMaximumConcurrency> lane_plans{};
-        std::array<std::uint64_t, kMaximumConcurrency> lane_plan_versions{};
-        AdmissionResources admission_resources;
-        std::uint64_t remaining_service_work = 0;
-        std::uint64_t backfill_epoch         = 0;
-        BackfillClass backfill_class         = BackfillClass::None;
-
-        std::mutex mutex;
-        std::condition_variable cv;
-        std::vector<OutputDelta> events;
-        GenerationResult result;
-        std::exception_ptr error;
-        bool done              = false;
-        bool consumer_released = false;
-        bool capacity_released = false;
-    };
 
     struct RoundMembership {
         std::array<std::uint32_t, kMaximumConcurrency> lanes{};
@@ -365,9 +370,9 @@ private:
         request->cv.notify_one();
     }
 
-    void release_reserved_capacity() noexcept {
-        std::lock_guard lock(queue_mutex_);
-        if (outstanding_ != 0) { --outstanding_; }
+    void release_outstanding_slot() noexcept {
+        std::lock_guard lock(queue_mutex);
+        if (outstanding != 0) { --outstanding; }
     }
 
     void release_consumer(const std::shared_ptr<Request>& request) noexcept {
@@ -375,39 +380,39 @@ private:
         {
             std::lock_guard lock(request->mutex);
             request->consumer_released = true;
-            if (request->done && !request->capacity_released) {
-                request->capacity_released = true;
-                release                    = true;
+            if (request->done && !request->outstanding_released) {
+                request->outstanding_released = true;
+                release                       = true;
             }
         }
-        if (release) { release_reserved_capacity(); }
+        if (release) { release_outstanding_slot(); }
     }
 
     void abandon_request(std::shared_ptr<Request> request) noexcept {
         request->cancelled.store(true, std::memory_order_release);
-        queue_cv_.notify_one();
+        queue_cv.notify_one();
         release_consumer(request);
     }
 
-    bool mark_completed(const std::shared_ptr<Request>& request) noexcept {
+    bool claim_outstanding_release(const std::shared_ptr<Request>& request) noexcept {
         bool release = false;
         {
             std::lock_guard lock(request->mutex);
-            if (request->consumer_released && !request->capacity_released) {
-                request->capacity_released = true;
-                release                    = true;
+            if (request->consumer_released && !request->outstanding_released) {
+                request->outstanding_released = true;
+                release                       = true;
             }
         }
         return release;
     }
 
-    void release_planning_state(const std::shared_ptr<Request>& request) noexcept {
+    void clear_plans(const std::shared_ptr<Request>& request) noexcept {
         request->base_plan.reset();
         for (auto& plan : request->lane_plans) { plan.reset(); }
     }
 
     void complete_error(const std::shared_ptr<Request>& request, std::exception_ptr error) {
-        release_planning_state(request);
+        clear_plans(request);
         request->prompt = {};
         {
             std::lock_guard lock(request->mutex);
@@ -415,12 +420,12 @@ private:
             request->error = std::move(error);
             request->done  = true;
         }
-        if (mark_completed(request)) { release_reserved_capacity(); }
+        if (claim_outstanding_release(request)) { release_outstanding_slot(); }
         request->cv.notify_one();
     }
 
     void complete_success(const std::shared_ptr<Request>& request, FinishReason reason) {
-        release_planning_state(request);
+        clear_plans(request);
         request->prompt = {};
         GenerationResult result;
         result.prompt                  = request->prompt_summary;
@@ -435,9 +440,9 @@ private:
             result.prefix_reuse_path    = request->begin->prefix_reuse_path;
         }
         if (request->lane) {
-            result.timings = instance_.program->generation_timings_lane(*request->lane);
+            result.timings = instance.program->generation_timings_lane(*request->lane);
             result.timings.prepare_seconds = request->prepare_seconds;
-            result.speculative = instance_.program->speculative_stats_lane(*request->lane);
+            result.speculative = instance.program->speculative_stats_lane(*request->lane);
         }
         if (request->first_token) {
             result.timings.first_token_seconds =
@@ -453,7 +458,7 @@ private:
             request->result = std::move(result);
             request->done   = true;
         }
-        if (mark_completed(request)) { release_reserved_capacity(); }
+        if (claim_outstanding_release(request)) { release_outstanding_slot(); }
         request->cv.notify_one();
     }
 
@@ -468,7 +473,7 @@ private:
         const std::uint32_t lane = *request->lane;
         if (cancel_at_boundary) {
             (void)request->output.preview_terminal(FinishReason::Cancelled);
-            instance_.program->abort_lane(lane);
+            instance.program->abort_lane(lane);
             append_output(request, request->output.commit_preview());
             complete_success(request, FinishReason::Cancelled);
             return true;
@@ -481,7 +486,7 @@ private:
             throw std::logic_error("prefill output policy did not accept its licensed token");
         }
         request->generated.push_back(token);
-        instance_.program->resolve_prefill_lane(lane, decision.finished());
+        instance.program->resolve_prefill_lane(lane, decision.finished());
         request->budget->commit(1);
         auto published = request->output.commit_preview();
         if (!request->first_token) { request->first_token = Clock::now(); }
@@ -493,10 +498,10 @@ private:
         return false;
     }
 
-    void invalidate_lane_plans(std::uint32_t lane) noexcept { ++lane_plan_versions_[lane]; }
+    void invalidate_lane_plans(std::uint32_t lane) noexcept { ++lane_plan_versions[lane]; }
 
     void remove_completed_slot(std::uint32_t lane) {
-        slots_[lane].reset();
+        slots[lane].reset();
         invalidate_lane_plans(lane);
     }
 
@@ -511,9 +516,9 @@ private:
 
     [[nodiscard]] std::array<bool, kMaximumConcurrency> snapshot_cancellations() const noexcept {
         std::array<bool, kMaximumConcurrency> cancelled{};
-        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
-            if (slots_[lane] != nullptr) {
-                cancelled[lane] = slots_[lane]->cancelled.load(std::memory_order_acquire);
+        for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
+            if (slots[lane] != nullptr) {
+                cancelled[lane] = slots[lane]->cancelled.load(std::memory_order_acquire);
             }
         }
         return cancelled;
@@ -522,13 +527,13 @@ private:
     void
     cancel_active_requests(const std::array<bool, kMaximumConcurrency>& cancelled_at_boundary) {
         bool changed = false;
-        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
-            const auto& request = slots_[lane];
+        for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
+            const auto& request = slots[lane];
             if (request == nullptr || !cancelled_at_boundary[lane]) { continue; }
-            instance_.program->abort_lane(lane);
-            if (prefill_lane_ && *prefill_lane_ == lane) {
-                instance_.request_memory.deactivate();
-                prefill_lane_.reset();
+            instance.program->abort_lane(lane);
+            if (prefill_lane && *prefill_lane == lane) {
+                instance.request_memory.deactivate();
+                prefill_lane.reset();
             }
             complete_cancelled(request);
             remove_completed_slot(lane);
@@ -542,28 +547,28 @@ private:
         std::vector<std::shared_ptr<Request>> expired;
         bool have_pending = false;
         {
-            std::lock_guard lock(queue_mutex_);
+            std::lock_guard lock(queue_mutex);
             const auto now = Clock::now();
-            for (auto it = pending_.begin(); it != pending_.end();) {
+            for (auto it = pending.begin(); it != pending.end();) {
                 if ((*it)->cancelled.load(std::memory_order_acquire)) {
                     cancelled.push_back(*it);
-                    it = pending_.erase(it);
+                    it = pending.erase(it);
                 } else if (now >= (*it)->deadline) {
                     expired.push_back(*it);
-                    it = pending_.erase(it);
+                    it = pending.erase(it);
                 } else {
                     ++it;
                 }
             }
-            have_pending = !pending_.empty();
+            have_pending = !pending.empty();
         }
-        if (protection_) {
+        if (protection) {
             const auto removed_protected = [&](const std::shared_ptr<Request>& request) {
-                return request->id == protection_->head_request_id;
+                return request->id == protection->head_request_id;
             };
             if (std::any_of(cancelled.begin(), cancelled.end(), removed_protected) ||
                 std::any_of(expired.begin(), expired.end(), removed_protected)) {
-                protection_.reset();
+                protection.reset();
             }
         }
         for (const auto& request : cancelled) { complete_cancelled(request); }
@@ -578,8 +583,8 @@ private:
 
     [[nodiscard]] RoundMembership build_round_membership() const {
         RoundMembership membership;
-        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
-            const auto& request = slots_[lane];
+        for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
+            const auto& request = slots[lane];
             if (request == nullptr || !request->decode_ready) { continue; }
             if (!request->budget) {
                 throw std::logic_error("decode-ready request has no generation budget");
@@ -593,8 +598,8 @@ private:
 
     [[nodiscard]] ActiveAdmissionSet active_admission_set() const {
         ActiveAdmissionSet active;
-        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
-            const auto& request = slots_[lane];
+        for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
+            const auto& request = slots[lane];
             if (request == nullptr) { continue; }
             if (request->admission_resources.active_lanes == 0 ||
                 request->remaining_service_work == 0) {
@@ -613,25 +618,25 @@ private:
 
     void resolve_prefill_step(const std::shared_ptr<Request>& request,
                               const PrefillStepResult& step, bool cancel_at_boundary) {
-        cumulative_stats_.computed_prefill_tokens += step.processed_prompt_tokens;
+        cumulative_stats.computed_prefill_tokens += step.processed_prompt_tokens;
         consume_service_work(request, 1);
         if (cancel_at_boundary) {
             if (!request->lane) { throw std::logic_error("cancelled prefill has no request lane"); }
             const std::uint32_t lane = *request->lane;
-            if (prefill_lane_ && lane == *prefill_lane_) {
-                instance_.request_memory.deactivate();
-                prefill_lane_.reset();
+            if (prefill_lane && lane == *prefill_lane) {
+                instance.request_memory.deactivate();
+                prefill_lane.reset();
             }
-            instance_.program->abort_lane(lane);
+            instance.program->abort_lane(lane);
             complete_cancelled(request);
             remove_completed_slot(lane);
             return;
         }
         if (!step.complete) { return; }
         if (!request->lane) { throw std::logic_error("completed prefill has no request lane"); }
-        if (prefill_lane_ && *request->lane == *prefill_lane_) {
-            instance_.request_memory.deactivate();
-            prefill_lane_.reset();
+        if (prefill_lane && *request->lane == *prefill_lane) {
+            instance.request_memory.deactivate();
+            prefill_lane.reset();
         }
         request->begin = step.summary;
         if (step.round.tokens.size() != 1) {
@@ -645,39 +650,39 @@ private:
     }
 
     void run_prefill_step() {
-        if (!prefill_lane_) { throw std::logic_error("no request owns staged prefill"); }
-        const std::uint32_t lane = *prefill_lane_;
-        const auto request       = slots_[lane];
+        if (!prefill_lane) { throw std::logic_error("no request owns staged prefill"); }
+        const std::uint32_t lane = *prefill_lane;
+        const auto request       = slots[lane];
         if (request == nullptr || request->decode_ready) {
             throw std::logic_error("staged prefill lane has invalid request state");
         }
-        const PrefillStepResult step  = instance_.program->advance_prefill_lane(lane);
+        const PrefillStepResult step  = instance.program->advance_prefill_lane(lane);
         const bool cancel_at_boundary = request->cancelled.load(std::memory_order_acquire);
         resolve_prefill_step(request, step, cancel_at_boundary);
         publish_runtime_stats();
     }
 
     [[nodiscard]] std::vector<std::shared_ptr<Request>> pending_snapshot() const {
-        std::lock_guard lock(queue_mutex_);
-        return {pending_.begin(), pending_.end()};
+        std::lock_guard lock(queue_mutex);
+        return {pending.begin(), pending.end()};
     }
 
     [[nodiscard]] bool erase_pending(const std::shared_ptr<Request>& request) {
-        std::lock_guard lock(queue_mutex_);
-        const auto it = std::find(pending_.begin(), pending_.end(), request);
-        if (it == pending_.end()) { return false; }
-        pending_.erase(it);
+        std::lock_guard lock(queue_mutex);
+        const auto it = std::find(pending.begin(), pending.end(), request);
+        if (it == pending.end()) { return false; }
+        pending.erase(it);
         return true;
     }
 
     void clear_protection_if_head(const std::shared_ptr<Request>& request) noexcept {
-        if (protection_ && protection_->head_request_id == request->id) { protection_.reset(); }
+        if (protection && protection->head_request_id == request->id) { protection.reset(); }
     }
 
     void ensure_base_plan(const std::shared_ptr<Request>& request) {
         if (!request->base_plan) {
             request->base_plan.emplace(
-                instance_.program->plan_request_base(request->prompt, request->options.execution));
+                instance.program->plan_request_base(request->prompt, request->options.execution));
         }
         const RequestPlanSummary& summary = request->base_plan->summary;
         if (summary.admission.active_lanes != 1 || summary.service_work_quanta == 0) {
@@ -686,27 +691,27 @@ private:
     }
 
     void ensure_lane_plan(const std::shared_ptr<Request>& request, std::uint32_t lane) {
-        if (slots_[lane] != nullptr) { return; }
-        if (request->lane_plan_versions[lane] == lane_plan_versions_[lane] &&
+        if (slots[lane] != nullptr) { return; }
+        if (request->lane_plan_versions[lane] == lane_plan_versions[lane] &&
             request->lane_plans[lane]) {
             return;
         }
         request->lane_plans[lane].reset();
         request->lane_plans[lane].emplace(
-            instance_.program->plan_request_for_lane(lane, request->prompt, *request->base_plan));
-        request->lane_plan_versions[lane] = lane_plan_versions_[lane];
+            instance.program->plan_request_for_lane(lane, request->prompt, *request->base_plan));
+        request->lane_plan_versions[lane] = lane_plan_versions[lane];
     }
 
     [[nodiscard]] std::optional<LaneChoice>
     find_admission_lane(const std::shared_ptr<Request>& request) {
         std::optional<LaneChoice> selected;
         std::uint32_t selected_reuse = 0;
-        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
-            if (slots_[lane] != nullptr) { continue; }
+        for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
+            if (slots[lane] != nullptr) { continue; }
             ensure_lane_plan(request, lane);
             const Plan& plan          = *request->lane_plans[lane];
             const std::uint32_t reuse = plan.summary.reusable_prompt_tokens;
-            if (instance_.program->can_admit_lane(lane, plan) &&
+            if (instance.program->can_admit_lane(lane, plan) &&
                 (!selected || reuse > selected_reuse)) {
                 selected       = LaneChoice{.lane = lane};
                 selected_reuse = reuse;
@@ -714,12 +719,12 @@ private:
         }
         if (selected) { return selected; }
 
-        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
-            if (slots_[lane] != nullptr) { continue; }
+        for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
+            if (slots[lane] != nullptr) { continue; }
             ensure_lane_plan(request, lane);
             const Plan& plan          = *request->lane_plans[lane];
             const std::uint32_t reuse = plan.summary.reusable_prompt_tokens;
-            if (instance_.program->can_admit_lane_after_retained_eviction(lane, plan) &&
+            if (instance.program->can_admit_lane_after_retained_eviction(lane, plan) &&
                 (!selected || reuse > selected_reuse)) {
                 selected = LaneChoice{
                     .lane           = lane,
@@ -764,16 +769,16 @@ private:
         }
         if (choice.evict_retained) {
             for (std::uint32_t retained_lane = 0;
-                 retained_lane < max_concurrency_ &&
-                 !instance_.program->can_admit_lane(lane, *request->lane_plans[lane]);
+                 retained_lane < max_concurrency &&
+                 !instance.program->can_admit_lane(lane, *request->lane_plans[lane]);
                  ++retained_lane) {
-                if (retained_lane != lane && slots_[retained_lane] == nullptr &&
-                    instance_.program->has_retained_lane(retained_lane)) {
-                    instance_.program->evict_retained_lane(retained_lane);
+                if (retained_lane != lane && slots[retained_lane] == nullptr &&
+                    instance.program->has_retained_lane(retained_lane)) {
+                    instance.program->evict_retained_lane(retained_lane);
                     invalidate_lane_plans(retained_lane);
                 }
             }
-            if (!instance_.program->can_admit_lane(lane, *request->lane_plans[lane])) {
+            if (!instance.program->can_admit_lane(lane, *request->lane_plans[lane])) {
                 throw std::logic_error("retained eviction did not make admission feasible");
             }
         }
@@ -781,15 +786,15 @@ private:
         Plan selected_plan = std::move(*request->lane_plans[lane]);
         request->lane_plans[lane].reset();
         if (!erase_pending(request)) { return AdmissionProgress::None; }
-        release_planning_state(request);
+        clear_plans(request);
 
         const RequestPlanSummary summary = selected_plan.summary;
         if (backfill_class == BackfillClass::Temporal) {
-            if (!protection_ || protection_->epoch_id != backfill_epoch ||
-                summary.service_work_quanta > protection_->temporal_credit) {
+            if (!protection || protection->epoch_id != backfill_epoch ||
+                summary.service_work_quanta > protection->temporal_credit) {
                 throw std::logic_error("temporal backfill lost its protected credit");
             }
-            protection_->temporal_credit -= summary.service_work_quanta;
+            protection->temporal_credit -= summary.service_work_quanta;
         }
         clear_protection_if_head(request);
 
@@ -804,21 +809,21 @@ private:
             request->remaining_service_work = summary.service_work_quanta;
             request->backfill_epoch         = backfill_epoch;
             request->backfill_class         = backfill_class;
-            slots_[lane]                    = request;
+            slots[lane]                     = request;
             invalidate_lane_plans(lane);
 
             TransientRegion transient;
             if (needs_prefill) {
-                instance_.request_memory.activate(summary.transient_bytes,
-                                                  summary.transient_alignment);
-                prefill_lane_ = lane;
-                transient     = instance_.request_memory.region();
+                instance.request_memory.activate(summary.transient_bytes,
+                                                 summary.transient_alignment);
+                prefill_lane = lane;
+                transient    = instance.request_memory.region();
             }
             publish_runtime_stats();
             target_started                = true;
-            const PrefillStepResult first = instance_.program->start_prefill_lane(
+            const PrefillStepResult first = instance.program->start_prefill_lane(
                 lane, std::move(request->prompt), std::move(selected_plan), transient);
-            if (!first.complete && (!prefill_lane_ || *prefill_lane_ != lane)) {
+            if (!first.complete && (!prefill_lane || *prefill_lane != lane)) {
                 throw std::logic_error("partial prefill did not retain its execution owner");
             }
             const bool cancel_at_boundary = request->cancelled.load(std::memory_order_acquire);
@@ -826,12 +831,12 @@ private:
             publish_runtime_stats();
         } catch (...) {
             const std::exception_ptr error = std::current_exception();
-            if (target_started) { instance_.program->abort_lane(lane); }
-            if (prefill_lane_ && *prefill_lane_ == lane) {
-                instance_.request_memory.deactivate();
-                prefill_lane_.reset();
+            if (target_started) { instance.program->abort_lane(lane); }
+            if (prefill_lane && *prefill_lane == lane) {
+                instance.request_memory.deactivate();
+                prefill_lane.reset();
             }
-            slots_[lane].reset();
+            slots[lane].reset();
             invalidate_lane_plans(lane);
             complete_error(request, error);
             throw;
@@ -844,12 +849,12 @@ private:
         for (;;) {
             const std::vector<std::shared_ptr<Request>> queued = pending_snapshot();
             if (queued.empty()) {
-                protection_.reset();
+                protection.reset();
                 return control_progress ? AdmissionProgress::ControlProgress
                                         : AdmissionProgress::None;
             }
             const std::shared_ptr<Request>& head = queued.front();
-            if (protection_ && protection_->head_request_id != head->id) { protection_.reset(); }
+            if (protection && protection->head_request_id != head->id) { protection.reset(); }
             if (head->cancelled.load(std::memory_order_acquire)) {
                 if (erase_pending(head)) {
                     clear_protection_if_head(head);
@@ -876,7 +881,7 @@ private:
                 continue;
             }
             const RequestPlanSummary& head_base = head->base_plan->summary;
-            if (!admission_resources_fit(head_base.admission, admission_capacity_)) {
+            if (!admission_resources_fit(head_base.admission, admission_capacity)) {
                 (void)remove_pending_error(
                     head, std::make_exception_ptr(RequestError(
                               RequestErrorKind::ContextLengthExceeded,
@@ -901,22 +906,22 @@ private:
             if (active.size == 0) {
                 throw std::logic_error("exclusive-feasible request cannot enter an idle Engine");
             }
-            if (!protection_) {
-                protection_.emplace(make_admission_protection(next_protection_epoch_++, head->id,
-                                                              head_base.admission, active.span(),
-                                                              admission_capacity_));
+            if (!protection) {
+                protection.emplace(make_admission_protection(next_protection_epoch++, head->id,
+                                                             head_base.admission, active.span(),
+                                                             admission_capacity));
             }
-            if (protected_head_safe_without_temporal(*protection_, active.span(),
-                                                     admission_capacity_)) {
-                protection_->phase = ProtectionPhase::Drain;
+            if (protected_head_safe_without_temporal(*protection, active.span(),
+                                                     admission_capacity)) {
+                protection->phase = ProtectionPhase::Drain;
             }
-            if (protection_->phase == ProtectionPhase::Drain) {
+            if (protection->phase == ProtectionPhase::Drain) {
                 return control_progress ? AdmissionProgress::ControlProgress
                                         : AdmissionProgress::None;
             }
 
             const std::uint64_t frontier_distance =
-                protection_frontier_distance(*protection_, active.span());
+                protection_frontier_distance(*protection, active.span());
             for (std::size_t i = 1; i < queued.size(); ++i) {
                 const std::shared_ptr<Request>& candidate = queued[i];
                 if (candidate->cancelled.load(std::memory_order_acquire)) {
@@ -944,7 +949,7 @@ private:
                     continue;
                 }
                 const RequestPlanSummary& candidate_base = candidate->base_plan->summary;
-                if (!admission_resources_fit(candidate_base.admission, admission_capacity_)) {
+                if (!admission_resources_fit(candidate_base.admission, admission_capacity)) {
                     (void)remove_pending_error(
                         candidate, std::make_exception_ptr(RequestError(
                                        RequestErrorKind::ContextLengthExceeded,
@@ -966,16 +971,16 @@ private:
                     candidate->lane_plans[candidate_lane->lane]->summary;
 
                 BackfillClass backfill = BackfillClass::None;
-                if (persistent_backfill_is_safe(*protection_, active.span(),
-                                                candidate_plan.admission, admission_capacity_)) {
+                if (persistent_backfill_is_safe(*protection, active.span(),
+                                                candidate_plan.admission, admission_capacity)) {
                     backfill = BackfillClass::Persistent;
                 } else if (candidate_plan.service_work_quanta <= frontier_distance &&
-                           candidate_plan.service_work_quanta <= protection_->temporal_credit) {
+                           candidate_plan.service_work_quanta <= protection->temporal_credit) {
                     backfill = BackfillClass::Temporal;
                 }
                 if (backfill != BackfillClass::None) {
                     return admit_planned_request(candidate, *candidate_lane, backfill,
-                                                 protection_->epoch_id);
+                                                 protection->epoch_id);
                 }
             }
             return control_progress ? AdmissionProgress::ControlProgress : AdmissionProgress::None;
@@ -985,12 +990,11 @@ private:
     void run_decode_round(const RoundMembership& membership) {
         const std::span<const std::uint32_t> lanes = membership.lane_span();
         const BatchedGeneratedRound round =
-            instance_.program->decode_batch(lanes, membership.budget_span());
+            instance.program->decode_batch(lanes, membership.budget_span());
 
         std::array<std::uint8_t, kMaximumConcurrency> cancelled{};
         for (std::size_t row = 0; row < lanes.size(); ++row) {
-            cancelled[row] =
-                slots_[lanes[row]]->cancelled.load(std::memory_order_acquire) ? 1U : 0U;
+            cancelled[row] = slots[lanes[row]]->cancelled.load(std::memory_order_acquire) ? 1U : 0U;
         }
 
         if (round.row_stride == 0 ||
@@ -1004,7 +1008,7 @@ private:
         std::array<FinishReason, kMaximumConcurrency> finish_reasons{};
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             const std::uint32_t lane = lanes[row];
-            const auto& request      = slots_[lane];
+            const auto& request      = slots[lane];
             const std::uint32_t count =
                 round.row_counts.empty() ? 1U : static_cast<std::uint32_t>(round.row_counts[row]);
             if (count == 0 || count > round.row_stride) {
@@ -1030,14 +1034,14 @@ private:
             finish_reasons[row] = decision.finish_reason;
         }
 
-        instance_.program->resolve_pending_batch(
+        instance.program->resolve_pending_batch(
             lanes, std::span<const std::uint32_t>(accepted.data(), lanes.size()),
             std::span<const std::uint8_t>(terminal.data(), lanes.size()),
             std::span<const std::uint8_t>(cancelled.data(), lanes.size()));
 
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             const std::uint32_t lane = lanes[row];
-            const auto& request      = slots_[lane];
+            const auto& request      = slots[lane];
             if (!cancelled[row]) {
                 const auto row_tokens = round.tokens.subspan(
                     row * round.row_stride, static_cast<std::size_t>(accepted[row]));
@@ -1056,35 +1060,35 @@ private:
                 remove_completed_slot(lane);
             }
         }
-        ++cumulative_stats_.decode_rounds;
-        cumulative_stats_.decode_row_rounds += lanes.size();
+        ++cumulative_stats.decode_rounds;
+        cumulative_stats.decode_row_rounds += lanes.size();
         for (std::size_t row = 0; row < lanes.size(); ++row) {
-            if (!cancelled[row]) { cumulative_stats_.committed_decode_tokens += accepted[row]; }
+            if (!cancelled[row]) { cumulative_stats.committed_decode_tokens += accepted[row]; }
         }
         publish_runtime_stats();
     }
 
     void fail_all(std::exception_ptr error) noexcept {
-        std::vector<std::shared_ptr<Request>> pending;
+        std::vector<std::shared_ptr<Request>> queued;
         {
-            std::lock_guard lock(queue_mutex_);
-            failed_ = true;
-            pending.assign(pending_.begin(), pending_.end());
-            pending_.clear();
+            std::lock_guard lock(queue_mutex);
+            failed = true;
+            queued.assign(pending.begin(), pending.end());
+            pending.clear();
         }
-        if (prefill_lane_) {
-            instance_.request_memory.deactivate();
-            prefill_lane_.reset();
+        if (prefill_lane) {
+            instance.request_memory.deactivate();
+            prefill_lane.reset();
         }
-        protection_.reset();
-        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
-            if (slots_[lane] != nullptr) {
-                instance_.program->abort_lane(lane);
-                complete_error(slots_[lane], error);
-                slots_[lane].reset();
+        protection.reset();
+        for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
+            if (slots[lane] != nullptr) {
+                instance.program->abort_lane(lane);
+                complete_error(slots[lane], error);
+                slots[lane].reset();
             }
         }
-        for (const auto& request : pending) { complete_error(request, error); }
+        for (const auto& request : queued) { complete_error(request, error); }
         publish_runtime_stats();
     }
 
@@ -1092,17 +1096,17 @@ private:
         bool previous_unit_was_decode = false;
         for (;;) {
             {
-                std::unique_lock lock(queue_mutex_);
-                if (!stopping_ && pending_.empty()) {
+                std::unique_lock lock(queue_mutex);
+                if (!stopping && pending.empty()) {
                     bool active = false;
-                    for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
-                        active = active || slots_[lane] != nullptr;
+                    for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
+                        active = active || slots[lane] != nullptr;
                     }
                     if (!active) {
-                        queue_cv_.wait(lock, [&] { return stopping_ || !pending_.empty(); });
+                        queue_cv.wait(lock, [&] { return stopping || !pending.empty(); });
                     }
                 }
-                if (stopping_) {
+                if (stopping) {
                     lock.unlock();
                     fail_all(std::make_exception_ptr(RequestError(
                         RequestErrorKind::Unavailable, "inference engine is shutting down")));
@@ -1111,13 +1115,13 @@ private:
             }
 
             try {
-                std::scoped_lock execution_lock(execution_mutex_);
+                std::scoped_lock execution_lock(execution_mutex);
                 const bool have_pending          = expire_pending_requests();
                 const auto cancelled_at_boundary = snapshot_cancellations();
                 cancel_active_requests(cancelled_at_boundary);
                 const RoundMembership membership = build_round_membership();
 
-                if (prefill_lane_) {
+                if (prefill_lane) {
                     if (!membership.empty() && !previous_unit_was_decode) {
                         run_decode_round(membership);
                         previous_unit_was_decode = true;
@@ -1151,29 +1155,29 @@ private:
         }
     }
 
-    Instance& instance_;
-    const std::uint32_t max_concurrency_;
-    const std::size_t max_outstanding_;
-    const std::chrono::milliseconds pending_timeout_;
-    const AdmissionResources admission_capacity_;
+    Instance& instance;
+    const std::uint32_t max_concurrency;
+    const std::size_t max_outstanding;
+    const std::chrono::milliseconds pending_timeout;
+    const AdmissionResources admission_capacity;
 
-    mutable std::mutex execution_mutex_;
-    mutable std::mutex queue_mutex_;
-    mutable std::mutex stats_mutex_;
-    std::condition_variable queue_cv_;
-    std::deque<std::shared_ptr<Request>> pending_;
-    std::size_t outstanding_       = 0;
-    std::uint64_t next_request_id_ = 1;
-    std::array<std::shared_ptr<Request>, kMaximumConcurrency> slots_{};
-    std::optional<std::uint32_t> prefill_lane_;
-    std::array<std::uint64_t, kMaximumConcurrency> lane_plan_versions_{};
-    std::optional<AdmissionProtection> protection_;
-    std::uint64_t next_protection_epoch_ = 1;
-    RuntimeStats cumulative_stats_;
-    RuntimeStats published_stats_;
-    bool stopping_ = false;
-    bool failed_   = false;
-    std::thread worker_;
+    mutable std::mutex execution_mutex;
+    mutable std::mutex queue_mutex;
+    mutable std::mutex stats_mutex;
+    std::condition_variable queue_cv;
+    std::deque<std::shared_ptr<Request>> pending;
+    std::size_t outstanding       = 0;
+    std::uint64_t next_request_id = 1;
+    std::array<std::shared_ptr<Request>, kMaximumConcurrency> slots{};
+    std::optional<std::uint32_t> prefill_lane;
+    std::array<std::uint64_t, kMaximumConcurrency> lane_plan_versions{};
+    std::optional<AdmissionProtection> protection;
+    std::uint64_t next_protection_epoch = 1;
+    RuntimeStats cumulative_stats;
+    RuntimeStats published_stats;
+    bool stopping = false;
+    bool failed   = false;
+    std::thread worker;
 };
 
 } // namespace ninfer::runtime
