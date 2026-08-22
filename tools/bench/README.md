@@ -172,14 +172,17 @@ length instead of prefill speed — the prefill stage above is where the rate is
 Indicative numbers only, not the published methodology (`run_serve_corpus.py`).
 
 ```bash
-python tools/bench/quick_serve_bench.py --artifact /path/to/model.ninfer
+python tools/bench/quick_serve_bench.py \
+  --artifact "$HOME/models/ninfer/Qwen3.6-27B-NInfer/qwen3_6_27b.ninfer"
 
 # Prefill only, three repetitions, matching the published rows' KV dtype:
-python tools/bench/quick_serve_bench.py --artifact /path/to/model.ninfer \
+python tools/bench/quick_serve_bench.py \
+  --artifact "$HOME/models/ninfer/Qwen3.6-27B-NInfer/qwen3_6_27b.ninfer" \
   --prefill-fixture long_niah_8k --prefill-reps 3 --kv-dtype int8 --mode mtp0
 
 # Point at a different build tree, skip the prefill stage, run one mode:
-python tools/bench/quick_serve_bench.py --artifact /path/to/model.ninfer \
+python tools/bench/quick_serve_bench.py \
+  --artifact "$HOME/models/ninfer/Qwen3.6-27B-NInfer/qwen3_6_27b.ninfer" \
   --serve build-clangcl/apps/ninfer-serve.exe --no-prefill --mode mtp3
 ```
 

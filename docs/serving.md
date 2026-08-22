@@ -6,7 +6,7 @@ Anthropic-compatible HTTP endpoints over one resident NInfer Engine.
 ## Start the server
 
 ```bash
-./build/apps/ninfer-serve models/qwen3_6_27b.ninfer \
+./build/apps/ninfer-serve "$HOME/models/ninfer/Qwen3.6-27B-NInfer/qwen3_6_27b.ninfer" \
   --host 127.0.0.1 \
   --port 8080 \
   --max-context 16384 \
@@ -20,7 +20,7 @@ For the 35B-A3B artifact, select its artifact path; the public model ID follows 
 identity automatically:
 
 ```bash
-./build/apps/ninfer-serve models/qwen3_6_35b_a3b.ninfer \
+./build/apps/ninfer-serve "$HOME/models/ninfer/Qwen3.6-35B-A3B-NInfer/qwen3_6_35b_a3b.ninfer" \
   --max-context 16384 \
   --spec mtp --draft-tokens 3 \
   --lm-head-draft
@@ -507,7 +507,7 @@ file. The parent directory must already exist. Failure to open the file aborts s
 is also rejected if it resolves to the model artifact.
 
 ```bash
-./build/apps/ninfer-serve models/qwen3_6_27b.ninfer \
+./build/apps/ninfer-serve "$HOME/models/ninfer/Qwen3.6-27B-NInfer/qwen3_6_27b.ninfer" \
   --request-log-jsonl profiles/bench/run/server.requests.jsonl
 ```
 

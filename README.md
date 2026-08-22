@@ -200,13 +200,13 @@ driver, Docker, and the
 docker build --tag ninfer:local .
 ```
 
-Download a model into `models/` as described below, then run the HTTP server:
+Download a model under `~/models/ninfer/` as described below, then run the HTTP server:
 
 ```bash
 docker run --rm \
   --gpus '"device=0"' \
   --publish 8080:8080 \
-  --volume "$PWD/models:/models:ro" \
+  --volume "$HOME/models/ninfer/Qwen3.6-27B-NInfer:/models:ro" \
   ninfer:local \
   ninfer-serve /models/qwen3_6_27b.ninfer \
   --host 0.0.0.0
@@ -217,7 +217,7 @@ Run the CLI from the same image:
 ```bash
 docker run --rm \
   --gpus '"device=0"' \
-  --volume "$PWD/models:/models:ro" \
+  --volume "$HOME/models/ninfer/Qwen3.6-27B-NInfer:/models:ro" \
   ninfer:local \
   ninfer /models/qwen3_6_27b.ninfer \
   --prompt "Explain prefill and decode in three sentences." \
@@ -231,27 +231,27 @@ Use the Hugging Face CLI to download one of the registered artifacts:
 ```bash
 hf download neroued/Qwen3.6-27B-NInfer \
   qwen3_6_27b.ninfer \
-  --local-dir models
+  --local-dir "$HOME/models/ninfer/Qwen3.6-27B-NInfer"
 
 # Or the 27B NVFP4 weight variant:
 hf download neroued/Qwen3.6-27B-nvfp4-NInfer \
   qwen3_6_27b_nvfp4.ninfer \
-  --local-dir models
+  --local-dir "$HOME/models/ninfer/Qwen3.6-27B-NInfer"
 
 # Or Qwen3.8-27B:
 hf download neroued/Qwen3.8-27B-NInfer \
   qwen3_8_27b.ninfer \
-  --local-dir models
+  --local-dir "$HOME/models/ninfer/Qwen3.8-27B-NInfer"
 
 # Or Qwen3.8-27B NVFP4:
 hf download neroued/Qwen3.8-27B-nvfp4-NInfer \
   qwen3_8_27b_nvfp4.ninfer \
-  --local-dir models
+  --local-dir "$HOME/models/ninfer/Qwen3.8-27B-NInfer"
 
 # Or:
 hf download neroued/Qwen3.6-35B-A3B-NInfer \
   qwen3_6_35b_a3b.ninfer \
-  --local-dir models
+  --local-dir "$HOME/models/ninfer/Qwen3.6-35B-A3B-NInfer"
 ```
 
 Current NInfer builds accept only the version-2 artifact container, and all five downloads above
@@ -260,7 +260,8 @@ publication; both Qwen3.8-27B profiles were published directly as version 2. Mig
 local file in place:
 
 ```bash
-python3 -m tools.artifact.migrate_v1_to_v2 models/qwen3_6_27b.ninfer
+python3 -m tools.artifact.migrate_v1_to_v2 \
+  "$HOME/models/ninfer/Qwen3.6-27B-NInfer/qwen3_6_27b.ninfer"
 ```
 
 Use the same command with `qwen3_6_27b_nvfp4.ninfer` or `qwen3_6_35b_a3b.ninfer` for those
@@ -280,7 +281,7 @@ available only for the 35B-A3B target and is text-only.
 ## Run the CLI
 
 ```bash
-./build/apps/ninfer models/qwen3_6_27b.ninfer \
+./build/apps/ninfer "$HOME/models/ninfer/Qwen3.6-27B-NInfer/qwen3_6_27b.ninfer" \
   --prompt "Explain prefill and decode in three sentences." \
   --max-context 16384 \
   --max-new 256 \
@@ -291,7 +292,7 @@ available only for the 35B-A3B target and is text-only.
 Use `--messages FILE` instead of `--prompt` for chat history, images, or videos:
 
 ```bash
-./build/apps/ninfer models/qwen3_6_27b.ninfer \
+./build/apps/ninfer "$HOME/models/ninfer/Qwen3.6-27B-NInfer/qwen3_6_27b.ninfer" \
   --messages examples/cli/messages/image_chart.json \
   --max-context 8192 \
   --max-new 128 \
@@ -305,7 +306,7 @@ speculative-decoding statistics are written to stderr. See the [CLI guide](docs/
 ## Run the HTTP server
 
 ```bash
-./build/apps/ninfer-serve models/qwen3_6_27b.ninfer \
+./build/apps/ninfer-serve "$HOME/models/ninfer/Qwen3.6-27B-NInfer/qwen3_6_27b.ninfer" \
   --max-context 16384 \
   --kv-capacity auto \
   --max-concurrency 2 \
