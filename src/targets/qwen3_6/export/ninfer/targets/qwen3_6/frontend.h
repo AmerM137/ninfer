@@ -2,6 +2,7 @@
 
 #include "ninfer/types.h"
 #include "runtime/contract/types.h"
+#include "targets/qwen3_6/impl/frontend/processor.h"
 
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
 
@@ -113,11 +114,11 @@ private:
 
 class Frontend {
 public:
-    Frontend(const Frontend&);
-    Frontend& operator=(const Frontend&);
-    Frontend(Frontend&&) noexcept;
-    Frontend& operator=(Frontend&&) noexcept;
-    ~Frontend();
+    Frontend(Frontend&&) noexcept = default;
+
+    Frontend(const Frontend&)            = delete;
+    Frontend& operator=(const Frontend&) = delete;
+    Frontend& operator=(Frontend&&)      = delete;
 
     [[nodiscard]] PreparedPrompt prepare(PromptInput input,
                                          const PreparationControl& control = {}) const;
@@ -133,9 +134,15 @@ public:
     [[nodiscard]] const StopPolicy& default_stop_policy() const noexcept;
 
 private:
-    struct FrontendState;
-    explicit Frontend(std::shared_ptr<const FrontendState> state) noexcept;
-    std::shared_ptr<const FrontendState> state;
+    Frontend(const FrontendResources& resources, bool registered_checkpoint,
+             FrontendOptions options);
+
+    frontend_internal::CompiledChatTemplate chat_template;
+    std::shared_ptr<const frontend_internal::Tokenizer> tokenizer;
+    frontend_internal::ProcessorOptions processor_options;
+    std::shared_ptr<frontend_internal::MediaPreprocessCache> media_cache;
+    StopPolicy defaults;
+    bool vision_enabled = true;
 
     friend class FrontendTestAccess;
     friend Frontend make_frontend(const FrontendResources& resources, FrontendOptions options);
