@@ -148,6 +148,34 @@ model graphs, family base classes, plugin discovery, string-driven execution, hi
 allocation, runtime weight repacking, or placeholders for hypothetical models or hardware unless an
 explicitly changed product contract requires them.
 
+## Code shape and ownership style
+
+Prefer concrete values, direct data members, and visible control flow. Internal structs and classes
+should expose their actual state to the implementation that owns them instead of hiding it behind an
+`Impl`, forwarding wrapper, pointer-view schema, bind step, or getter layer. Use a free function for
+a stateless or one-shot transformation; use a class when it owns a real lifetime, invariant, or
+ongoing state machine. Do not preserve a superseded abstraction as a compatibility lane.
+
+Indirection must represent a concrete requirement, not a general C++ design preference. Current
+intentional examples are Engine's shared state, which keeps the executor alive for outstanding
+generation handles; `artifact::Reader::Impl`, which isolates platform file-mapping and direct-I/O
+resources; and the family `Program` implementation allocation, which isolates the large
+target-instantiated CUDA runtime and gives its live state a fixed lifetime and address. Do not
+generalize these exceptions into a default pattern, and do not remove them without addressing the
+requirement they serve. A smart pointer should communicate actual ownership or shared lifetime, not
+merely make a member private or defer construction.
+
+Use plain domain names for data members. Do not add a trailing underscore or other prefix/suffix
+solely to mark a member as private; qualify with `this->` or choose a more descriptive parameter name
+when disambiguation is needed. Likewise, use `const`, accessors, private sections, and `friend` only
+for a real semantic guarantee or access boundary. Do not add ceremonial constness, getters that only
+return a field, or wrapper types that make mutable aliased state merely look immutable.
+
+Keep templates and variants at boundaries where compile-time target specialization or closed target
+selection requires them. Centralize repetitive visitation or type dispatch so ordinary call sites
+show the domain operation. Within a selected target, prefer direct calls and concrete target state
+over type erasure, virtual hierarchies, generic adapters, or repeated template ceremony.
+
 ## Sources of truth
 
 Read only current authorities relevant to a live decision in the task. The following list is a
@@ -182,32 +210,40 @@ them, but must update the corresponding active authorities and affected implemen
 
 - `.ninfer` is the only C++ product artifact. Do not add `.qus` fallback, extension detection,
   compatibility shims, or a second product lane.
-- `include/ninfer/engine.h` and `include/ninfer/types.h` are the opaque Engine interface used by
-  in-tree applications and owning host values. NInfer does not currently install or export a C++
-  SDK. `include/ninfer/ops/` contains repository-internal semantic Op contracts.
+- `include/ninfer/engine.h` and `include/ninfer/types.h` are the compact Engine interface used by
+  in-tree applications and owning host values. The header forward-declares runtime state so Engine
+  internals do not leak into every caller; this is not an installed SDK or a general ABI-stability
+  layer. `include/ninfer/ops/` contains repository-internal semantic Op contracts.
 - `src/core` owns device primitives, tensors/views, checked layouts, arenas, graph RAII, physical
   KV-cache containers, and raw transfer mechanisms.
-- `src/artifact` owns generic `.ninfer` framing, descriptors, binding primitives, and
-  materialization. It has no checkpoint execution semantics.
+- `src/artifact` owns generic `.ninfer` framing, descriptors, binding primitives, materialization,
+  and the platform-specific file access hidden by `artifact::Reader`. It has no checkpoint
+  execution semantics.
 - `src/ops` owns every semantically closed Op implementation, including fused, fixed-shape, and
   device-specialized paths. Op ownership follows the mathematical or state-transition contract,
   not its first model caller or demonstrated cross-target reuse.
 - `src/targets/qwen3_6` owns only the Qwen3.6-family invariants shared by the 27B and 35B-A3B
-  targets: tokenizer/template and output semantics, media preprocessing and MRoPE prompt
-  construction, owning prepared-prompt/output-session types, semantic weight-view schemas, passive
-  Vision definitions, and the fixed
-  planning/Program/Text/Vision/speculative/state/workspace/CUDA-Graph algorithms. It has no target
-  identity, registry entry, artifact binder, target leaf
-  implementation, or storage for a live Program instance.
+  targets: direct tokenizer/template and output-session state, the `process_multimodal_input`
+  transformation, MRoPE prompt construction, owning prepared-prompt types, semantic weight-view
+  schemas, passive Vision definitions, and the fixed planning/Program/Text/Vision/speculative/
+  state/workspace/CUDA-Graph algorithms. Text and Vision contexts read the target model view
+  directly; they do not build parallel pointer-binding schemas. The family has no target identity,
+  registry entry, artifact binder, target leaf implementation, or storage for a live Program
+  instance.
 - `src/targets/<package>` owns its registered checkpoint identities, storage profiles, binder,
   `LoadedModel`, configuration, populated family model-view values and private leaf payloads,
   diagnostics, graph frontier values, and exactly three execution-leaf families: attention
-  projection, GDN projection/control, and post-mixer. It aliases and instantiates the family
-  runtime types; it does not own a copied Program, Text/Vision/speculative schedule, workspace
-  composition, state transaction, or graph-capture algorithm. Leaf Ops remain implemented under
-  `src/ops`.
-- `src/runtime` owns common contracts, generated-token transaction/publication policy, and the
-  public Engine PIMPL. It does not own model mathematics or target state.
+  projection, GDN projection/control, and post-mixer. A `LoadedModel` owns one non-moving data
+  allocation because Program retains references into it; the data itself contains the direct
+  semantic model view and artifact ownership rather than another wrapper graph. The package aliases
+  and instantiates the family runtime types; it does not own a copied Program,
+  Text/Vision/speculative schedule, workspace composition, state transaction, or graph-capture
+  algorithm. Leaf Ops remain implemented under `src/ops`.
+- `src/runtime` owns common contracts, generated-token transaction/publication policy, direct
+  `EngineState`, target selection, and the fixed-capacity `ConcurrentExecutor`. Engine and
+  outstanding generation handles share `EngineState` because submissions refer to the executor;
+  this is lifetime ownership, not an `Impl` facade. Runtime does not own model mathematics or
+  target state.
 - `src/media/decode` consumes already-owned bytes. URL/path/data acquisition belongs to
   `src/product/media_acquire`, CLI, or serving and is not linked into a target.
 - `src/product/prompt_input` owns the shared product-side JSON/message-to-owning-input adapter.
