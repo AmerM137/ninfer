@@ -13,6 +13,78 @@ Each entry records the commit it measured so a later regression has something to
 
 ---
 
+## 2026-08-21 — Windows quick serve bench, MSVC, RTX 5090
+
+Measured the binaries built from `e4676446` (`fix(qwen3.6): make plan moves compiler-generated`).
+Later commits present during measurement were documentation-only. Windows 11, Release / Ninja /
+CUDA 13.3, RTX 5090 32,607 MiB, driver 610.88, cl 19.51.36256. The complete build and its 90-test
+suite passed; six opt-in checkpoint/artifact tests skipped.
+
+```powershell
+python tools/bench/quick_serve_bench.py `
+  --artifact "$HOME\models\ninfer\Qwen3.6-27B-NInfer\qwen3_6_27b.ninfer" `
+  --serve "build\apps\ninfer-serve.exe"
+
+python tools/bench/quick_serve_bench.py `
+  --artifact "$HOME\models\ninfer\Qwen3.6-35B-A3B-NInfer\qwen3_6_35b_a3b.ninfer" `
+  --serve "build\apps\ninfer-serve.exe" `
+  --mode mtp0 --mode mtp3 --mode dflash7
+```
+
+Both artifacts were `groupwise-int`. The tables use the final complete MSVC run for 35B-A3B;
+two earlier decode-only repetitions agreed within 0.4%.
+
+### Prefill
+
+Default stage: prefix reuse off, `--max-context 64768`, 1 output token, 2 reps + discarded warmup.
+
+| model | fixture | prompt tok | prefill s | tok/s | sd | server TTFT ms |
+|---|---|---|---|---|---|---|
+| qwen3.6-27B | long_niah_8k | 7,678 | 2.27 | 3,388.7 | 5.4 | 2,276 |
+| qwen3.6-27B | long_niah_64k | 64,510 | 23.59 | 2,734.4 | 7.7 | 23,675 |
+| qwen3.6-35B-A3B | long_niah_8k | 7,678 | 0.49 | **15,726.2** | 5.8 | 498 |
+| qwen3.6-35B-A3B | long_niah_64k | 64,510 | 6.01 | **10,726.3** | 3.2 | 6,096 |
+
+### Decode
+
+Mode stage on the server default 8192-token context; means over the 2 timed requests. `vs mtp0`
+is within-model and within-build.
+
+| model | mode | decode tok/s | vs mtp0 | prefill ms | TTFT ms | reuse TTFT | tok/round | accept |
+|---|---|---|---|---|---|---|---|---|
+| qwen3.6-27B | mtp0 | 82.2 | 1.00x | 61 | 61 | 16 | – | – |
+| qwen3.6-27B | mtp3 | 210.5 | 2.56x | 63 | 64 | 19 | 3.41 | 80% |
+| qwen3.6-35B-A3B | mtp0 | 329.7 | 1.00x | 24 | 24 | 6 | – | – |
+| qwen3.6-35B-A3B | mtp3 | 677.9 | 2.06x | 26 | 26 | 8 | 3.34 | 78% |
+| qwen3.6-35B-A3B | dflash7 | **707.4** | **2.15x** | 26 | 27 | 6 | 5.03 | 58% |
+
+### What stood out
+
+- **35B-A3B remains much faster than dense 27B on Windows**: 4.6x / 3.9x prefill at the 8k / 64k
+  fixtures, 4.0x mtp0 decode, and 3.2x mtp3 decode.
+- **dflash7 beats mtp3 by 4.4% on Windows** (707.4 vs 677.9), smaller than the Linux quick run's
+  14% gap. Repeated Windows runs were stable (707.4–709.5 dflash7, 677.9–679.3 mtp3), so this is
+  larger than local timing noise, but the quick runs do not isolate an OS, driver, or scheduling
+  cause.
+- **The Windows/Linux ordering is consistent, but Linux is faster in this shakeout.** Windows MSVC
+  trails the corresponding Linux GCC rows by roughly 3–6% for prefill/mtp0/mtp3 and 13% for
+  dflash7. These are separate machines and software stacks, not a controlled compiler comparison.
+- **Prefix reuse works in every Windows mode**, reducing the repeated-prompt TTFT to 6–19 ms.
+
+### Caveats specific to this run
+
+- The general quick-benchmark caveats at the top of this file apply: n=2 timed requests, fixed
+  greedy prompts, default KV dtype, one GPU, no concurrency, and no pre-change baseline.
+- Windows measured qwen3.6-27B and qwen3.6-35B-A3B only; no qwen3.8-27B Windows row was run.
+- The serving path prepared two fewer tokens than each fixture's CLI-basis manifest declaration,
+  as expected and documented; rates use the actually prepared counts.
+
+The request-log JSONL and server stderr remain in the printed
+`%LOCALAPPDATA%\Temp\quick_serve_bench_*` directories on this machine; they were not copied into
+the repository.
+
+---
+
 ## 2026-08-21 — quick serve bench, three artifacts, RTX 5090
 
 Measured `e4676446` (`fix(qwen3.6): make plan moves compiler-generated`). Tree moved to
