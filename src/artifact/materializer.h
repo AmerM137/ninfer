@@ -7,7 +7,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
-#include <memory>
 #include <span>
 #include <string_view>
 #include <vector>
@@ -31,12 +30,11 @@ struct MaterializationStats {
 
 class MaterializedArtifact {
 public:
-    MaterializedArtifact()                                           = default;
-    ~MaterializedArtifact()                                          = default;
-    MaterializedArtifact(MaterializedArtifact&&) noexcept            = default;
-    MaterializedArtifact& operator=(MaterializedArtifact&&) noexcept = default;
-    MaterializedArtifact(const MaterializedArtifact&)                = delete;
-    MaterializedArtifact& operator=(const MaterializedArtifact&)     = delete;
+    ~MaterializedArtifact()                                      = default;
+    MaterializedArtifact(MaterializedArtifact&&) noexcept        = default;
+    MaterializedArtifact& operator=(MaterializedArtifact&&)      = delete;
+    MaterializedArtifact(const MaterializedArtifact&)            = delete;
+    MaterializedArtifact& operator=(const MaterializedArtifact&) = delete;
 
     void* device_data(ObjectHandle handle) const;
     std::span<const std::byte> resource_bytes(ObjectHandle handle) const;
@@ -50,12 +48,14 @@ private:
     friend MaterializedArtifact materialize(const Reader&, const MaterializationPlan&,
                                             DeviceContext&, LoadProgress*);
 
+    MaterializedArtifact(std::size_t device_capacity_bytes, std::size_t object_count);
+
     struct ObjectStorage {
         void* device = nullptr;
         std::vector<std::byte> resource;
     };
 
-    std::unique_ptr<DeviceArena> device_arena_;
+    DeviceArena device_arena_;
     std::vector<ObjectStorage> objects_;
     MaterializationStats stats_;
 };

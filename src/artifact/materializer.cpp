@@ -67,6 +67,10 @@ struct ReadSpan {
 
 } // namespace
 
+MaterializedArtifact::MaterializedArtifact(std::size_t device_capacity_bytes,
+                                           std::size_t object_count)
+    : device_arena_(device_capacity_bytes), objects_(object_count) {}
+
 void* MaterializedArtifact::device_data(ObjectHandle handle) const {
     if (handle.index >= objects_.size() || objects_[handle.index].device == nullptr) {
         throw ArtifactError("object handle does not name a materialized tensor");
@@ -90,20 +94,15 @@ std::vector<std::byte> MaterializedArtifact::take_resource_bytes(ObjectHandle ha
     return std::move(resource);
 }
 
-DeviceArena& MaterializedArtifact::device_arena() {
-    if (!device_arena_) { throw ArtifactError("artifact has no device tensor backing"); }
-    return *device_arena_;
-}
+DeviceArena& MaterializedArtifact::device_arena() { return device_arena_; }
 
 MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan& plan,
                                  DeviceContext& device, LoadProgress* progress) {
-    MaterializedArtifact out;
-    out.objects_.resize(plan.object_count);
     const std::uint64_t capacity = plan.device_capacity_bytes;
     if (capacity == 0 || capacity > static_cast<std::uint64_t>(SIZE_MAX)) {
         throw ArtifactError("artifact tensor backing size is invalid");
     }
-    out.device_arena_ = std::make_unique<DeviceArena>(static_cast<std::size_t>(capacity));
+    MaterializedArtifact out(static_cast<std::size_t>(capacity), plan.object_count);
     out.stats_.device_capacity_bytes = capacity;
     out.stats_.tensor_count          = plan.device_objects.size();
     out.stats_.resource_count        = plan.host_objects.size();
@@ -125,11 +124,11 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
     for (const DeviceMaterialization& placement : plan.device_objects) {
         const PayloadSpan payload = reader.payload(reader.objects().at(placement.object.index));
         DeviceSpan storage =
-            out.device_arena_->alloc_bytes(static_cast<std::size_t>(placement.bytes),
-                                           static_cast<std::size_t>(placement.alignment));
+            out.device_arena_.alloc_bytes(static_cast<std::size_t>(placement.bytes),
+                                          static_cast<std::size_t>(placement.alignment));
         const auto actual_offset =
             static_cast<std::uint64_t>(static_cast<std::byte*>(storage.data) -
-                                       static_cast<std::byte*>(out.device_arena_->base()));
+                                       static_cast<std::byte*>(out.device_arena_.base()));
         if (actual_offset != placement.offset || payload.data.size() != placement.bytes) {
             throw ArtifactError("materialization plan does not match artifact payload");
         }
