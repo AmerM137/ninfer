@@ -28,9 +28,22 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 
+# The supported generator is Ninja. It parallelises by default (no --parallel
+# needed) and it is the only generator that honours the link job pool below,
+# which keeps the memory-hungry CUDA device link from running alongside the
+# executable links. A default `cmake -B build` picks the platform default
+# instead -- Unix Makefiles, which builds single-threaded unless -j is passed --
+# so warn rather than let a 5x slower build look normal.
 if(CMAKE_GENERATOR MATCHES "Ninja")
   set_property(GLOBAL PROPERTY JOB_POOLS cuda_link=1)
   set(CMAKE_JOB_POOL_LINK cuda_link)
+else()
+  message(WARNING
+    "NInfer expects the Ninja generator; this build tree uses "
+    "'${CMAKE_GENERATOR}'. Builds will be serial unless you pass --parallel, "
+    "and the cuda_link job pool that serialises the CUDA device link is "
+    "inactive. Reconfigure with -G Ninja (see README.md), or set the "
+    "CMAKE_GENERATOR environment variable to Ninja.")
 endif()
 
 if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 13.1)
