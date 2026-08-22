@@ -4,7 +4,6 @@
 // NINFER_QWEN36_VARIANT and NINFER_QWEN36_RUNTIME_NS. The body is shared source; the selected
 // Variant is compile-time data and the only target-dependent calls are its three closed leaves.
 
-#include "targets/qwen3_6/impl/runtime/layouts.h"
 #include "targets/qwen3_6/impl/runtime/dflash_context.h"
 #include "targets/qwen3_6/impl/runtime/text_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_context.h"

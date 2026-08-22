@@ -5,6 +5,7 @@
 #include "artifact/reader.h"
 #include "core/device.h"
 #include "runtime/engine/kv_capacity.h"
+#include <ninfer/targets/qwen3_6/runtime.h>
 
 #include <chrono>
 #include <cstdint>
@@ -97,7 +98,7 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     artifact::Binder binder(reader);
     auto load_plan        = Target::plan_load(binder, options, weights_profile);
     auto sequence_planner = Target::make_sequence_planner(device, options, weights_profile);
-    const runtime::SequenceCapacityCurve curve = sequence_planner.capacity_curve();
+    const runtime::SequenceCapacityCurve curve = sequence_planner.curve;
     const std::size_t preflight_runtime_bytes =
         runtime_bytes_after_planned_weights(load_plan.materialization().device_capacity_bytes);
     (void)runtime::resolve_kv_capacity(options.kv_capacity, curve, preflight_runtime_bytes);
@@ -112,8 +113,8 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     runtime::KvCapacityResolution capacity_resolution =
         runtime::resolve_kv_capacity(options.kv_capacity, curve, current_free_device_bytes());
     auto sequence_plan = std::move(sequence_planner).finalize(capacity_resolution.main_page_groups);
-    if (sequence_plan.device_reservation_bytes() != capacity_resolution.runtime_reservation_bytes ||
-        sequence_plan.kv_capacity() != capacity_resolution.resolved_tokens) {
+    if (sequence_plan.device_reservation_bytes != capacity_resolution.runtime_reservation_bytes ||
+        sequence_plan.kv_capacity != capacity_resolution.resolved_tokens) {
         throw std::logic_error("resolved KV capacity does not match the finalized target plan");
     }
     auto loaded   = std::make_unique<Loaded>(std::move(model), options);
@@ -151,8 +152,8 @@ Qwen3_6_27BInstance::Qwen3_6_27BInstance(std::unique_ptr<LoadedQwen3_6_27B> stab
                                          Qwen3_6_27B::SequencePlan sequence_plan,
                                          DeviceContext& device)
     : loaded(std::move(stable_loaded)), kv_capacity_resolution(resolution),
-      request_memory(device, sequence_plan.request_transient_capacity_bytes()),
-      capacity(sequence_plan.capacity()),
+      request_memory(device, sequence_plan.request_transient_capacity_bytes),
+      capacity(sequence_plan.capacity),
       program(Qwen3_6_27B::create_program(*loaded->model, std::move(sequence_plan), device)) {}
 
 Qwen3_6_27BInstance::~Qwen3_6_27BInstance() = default;
@@ -168,8 +169,8 @@ Qwen3_6_35BA3BInstance::Qwen3_6_35BA3BInstance(std::unique_ptr<LoadedQwen3_6_35B
                                                Qwen3_6_35BA3B::SequencePlan sequence_plan,
                                                DeviceContext& device)
     : loaded(std::move(stable_loaded)), kv_capacity_resolution(resolution),
-      request_memory(device, sequence_plan.request_transient_capacity_bytes()),
-      capacity(sequence_plan.capacity()),
+      request_memory(device, sequence_plan.request_transient_capacity_bytes),
+      capacity(sequence_plan.capacity),
       program(Qwen3_6_35BA3B::create_program(*loaded->model, std::move(sequence_plan), device)) {}
 
 Qwen3_6_35BA3BInstance::~Qwen3_6_35BA3BInstance() = default;

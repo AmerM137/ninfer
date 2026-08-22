@@ -8,7 +8,6 @@
 #include "core/decode_graph.h"
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
 
-#include "targets/qwen3_6/impl/runtime/layouts.h"
 #include "targets/qwen3_6/impl/runtime/dflash_context.h"
 #include "targets/qwen3_6/impl/runtime/linear_state_slots.h"
 #include "targets/qwen3_6/impl/runtime/prefix_identity.h"
@@ -150,8 +149,7 @@ struct RequestControl {
 
 class ProgramImplCore {
 public:
-    ProgramImplCore(const LoadedModelData& model, const SequencePlanImpl& plan,
-                    DeviceContext& device);
+    ProgramImplCore(const LoadedModelData& model, const SequencePlan& plan, DeviceContext& device);
     ~ProgramImplCore() noexcept;
 
     [[nodiscard]] RequestBasePlan

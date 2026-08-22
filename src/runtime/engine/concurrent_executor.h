@@ -7,7 +7,8 @@
 #include "runtime/engine/admission_policy.h"
 #include "runtime/engine/request_memory.h"
 #include "runtime/generation/generation_budget.h"
-#include "targets/qwen3_6/export/ninfer/targets/qwen3_6/frontend.h"
+#include <ninfer/targets/qwen3_6/frontend.h>
+#include <ninfer/targets/qwen3_6/runtime.h>
 
 #include <algorithm>
 #include <array>

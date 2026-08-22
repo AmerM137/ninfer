@@ -13,69 +13,9 @@ namespace ninfer::targets::qwen3_6 {
 using detail::NINFER_QWEN36_RUNTIME_NS::Variant;
 
 template <>
-void detail::SequencePlanImplDeleter<Variant>::operator()(
-    detail::SequencePlanImpl<Variant>* impl) const noexcept {
-    delete impl;
-}
-
-template <>
-void detail::SequencePlannerImplDeleter<Variant>::operator()(
-    detail::SequencePlannerImpl<Variant>* impl) const noexcept {
-    delete impl;
-}
-
-template <>
-SequencePlan<Variant>::SequencePlan(
-    std::unique_ptr<detail::SequencePlanImpl<Variant>> impl) noexcept
-    : impl_(impl.release()) {}
-
-template <>
-std::uint32_t SequencePlan<Variant>::capacity() const noexcept {
-    return impl_ != nullptr ? impl_->capacity : 0;
-}
-
-template <>
-std::uint32_t SequencePlan<Variant>::kv_capacity() const noexcept {
-    return impl_ != nullptr ? impl_->kv_capacity : 0;
-}
-
-template <>
-std::uint32_t SequencePlan<Variant>::max_concurrency() const noexcept {
-    return impl_ != nullptr ? impl_->max_concurrency : 0;
-}
-
-template <>
-std::size_t SequencePlan<Variant>::device_reservation_bytes() const noexcept {
-    return impl_ != nullptr ? impl_->device_reservation_bytes : 0;
-}
-
-template <>
-std::size_t SequencePlan<Variant>::workspace_capacity_bytes() const noexcept {
-    return impl_ != nullptr ? impl_->workspace.capacity : 0;
-}
-
-template <>
-std::size_t SequencePlan<Variant>::request_transient_capacity_bytes() const noexcept {
-    return impl_ != nullptr ? impl_->request_transient_capacity_bytes : 0;
-}
-
-template <>
-SequencePlanner<Variant>::SequencePlanner(
-    std::unique_ptr<detail::SequencePlannerImpl<Variant>> impl) noexcept
-    : impl_(impl.release()) {}
-
-template <>
-const runtime::SequenceCapacityCurve& SequencePlanner<Variant>::capacity_curve() const noexcept {
-    static const runtime::SequenceCapacityCurve empty;
-    return impl_ != nullptr ? impl_->curve : empty;
-}
-
-template <>
 SequencePlan<Variant> SequencePlanner<Variant>::finalize(std::uint32_t main_page_groups) && {
-    if (impl_ == nullptr) { throw std::logic_error("sequence planner is empty"); }
-    std::unique_ptr<detail::SequencePlannerImpl<Variant>> impl(impl_.release());
-    return SequencePlan<Variant>(detail::NINFER_QWEN36_RUNTIME_NS::finalize_sequence_plan_impl(
-        std::move(impl), main_page_groups));
+    return detail::NINFER_QWEN36_RUNTIME_NS::finalize_sequence_plan(std::move(*this),
+                                                                    main_page_groups);
 }
 
 template <>
@@ -189,21 +129,21 @@ template <>
 SequencePlanner<Variant> make_sequence_planner<Variant>(DeviceContext& device,
                                                         const EngineOptions& options,
                                                         Variant::WeightsProfile weights_profile) {
-    return SequencePlanner<Variant>(detail::NINFER_QWEN36_RUNTIME_NS::make_sequence_planner_impl(
-        device, options, weights_profile));
+    return detail::NINFER_QWEN36_RUNTIME_NS::build_sequence_planner(device, options,
+                                                                    weights_profile);
 }
 
 template <>
 std::unique_ptr<Program<Variant>>
 create_program<Variant>(const Variant::ModelView& model, Variant::WeightsProfile weights_profile,
                         SequencePlan<Variant>&& plan, DeviceContext& device) {
-    if (plan.impl_ == nullptr) { throw std::invalid_argument("sequence plan is empty"); }
-    if (plan.impl_->weights_profile != weights_profile) {
+    if (plan.capacity == 0) { throw std::invalid_argument("sequence plan is empty"); }
+    if (plan.weights_profile != static_cast<std::uint32_t>(weights_profile)) {
         throw std::invalid_argument(
             "loaded model weights profile does not match the sequence plan");
     }
-    auto impl = std::make_unique<detail::ProgramImpl<Variant>>(model, *plan.impl_, device);
-    plan.impl_.reset();
+    auto impl = std::make_unique<detail::ProgramImpl<Variant>>(model, plan, device);
+    plan      = SequencePlan<Variant>{};
     return std::unique_ptr<Program<Variant>>(new Program<Variant>(std::move(impl)));
 }
 

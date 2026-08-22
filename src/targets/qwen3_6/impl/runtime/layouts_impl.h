@@ -90,7 +90,7 @@ TensorLayout add_tensor(LayoutBuilder& builder, DType dtype,
     return builder.add_tensor(dtype, shape, kArenaAlign, label);
 }
 
-PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
+PersistentLayout persistent_layout(const SequencePlan& plan) {
     const std::int32_t linear_state_slots =
         LinearStateSlots::state_slot_count(plan.max_concurrency);
     const auto effective_prefill_chunk =
@@ -224,7 +224,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     return out;
 }
 
-WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
+WorkspacePlan build_workspace_plan(const SequencePlan& plan) {
     const std::uint32_t chunk_u32 = std::min(plan.prefill_chunk, plan.capacity);
     if (chunk_u32 == 0 ||
         chunk_u32 > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()) ||
@@ -235,6 +235,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     const auto drafts = static_cast<std::int32_t>(plan.draft_window);
     const auto verify = drafts + 1;
     const ops::GqaExecutionEnvelope text_envelope{1, plan.capacity};
+    const auto weights_profile = static_cast<WeightsProfile>(plan.weights_profile);
 
     const auto matrix  = [](WorkspaceLayoutBuilder& layout, DType dtype, std::int32_t rows,
                            std::int32_t tokens) { (void)layout.alloc(dtype, {rows, tokens}); };
@@ -255,14 +256,14 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                      std::int32_t max_width, ops::GqaExecutionEnvelope envelope) {
         auto stage = layout.scope();
         (void)workspace_recipe::text_attention_projection<TextConfig>(layout, last);
-        scratch(layout, Variant::attention_projection_workspace_capacity_bytes(plan.weights_profile,
+        scratch(layout, Variant::attention_projection_workspace_capacity_bytes(weights_profile,
                                                                                phase, first, last));
         (void)workspace_recipe::text_attention_results<TextConfig>(layout, last);
         scratch(layout, ops::gqa_attention_workspace_capacity_bytes(
                             TextConfig::query_heads, plan.kv_dtype, envelope, batch_size, min_width,
                             max_width));
         scratch(layout, Variant::attention_output_projection_workspace_capacity_bytes(
-                            plan.weights_profile, phase, first, last));
+                            weights_profile, phase, first, last));
     };
     const auto gdn_stage = [&](WorkspaceLayoutBuilder& layout, std::int32_t first,
                                std::int32_t last, qwen3_6::TextPhase phase, GdnWorkspacePath path,
@@ -274,14 +275,14 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         (void)workspace_recipe::gdn_projection<TextConfig>(layout, last);
         if (path == GdnWorkspacePath::Snapshot) {
             scratch(layout, Variant::gdn_input_projection_snapshot_workspace_capacity_bytes(
-                                plan.weights_profile, phase, batch_size, min_width, max_width));
+                                weights_profile, phase, batch_size, min_width, max_width));
         } else if (path == GdnWorkspacePath::ReplayRecord) {
             scratch(layout, Variant::gdn_input_projection_record_workspace_capacity_bytes(
-                                plan.weights_profile, phase, batch_size, min_width, max_width));
+                                weights_profile, phase, batch_size, min_width, max_width));
         } else {
             (void)workspace_recipe::gdn_prefill_conv<TextConfig>(layout, last);
             scratch(layout, Variant::gdn_input_projection_workspace_capacity_bytes(
-                                plan.weights_profile, phase, first, last));
+                                weights_profile, phase, first, last));
         }
         (void)workspace_recipe::gdn_recurrent_output<TextConfig>(layout, last);
         if (path == GdnWorkspacePath::Prefill) {
@@ -291,14 +292,14 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         }
         (void)workspace_recipe::gdn_normalized_output<TextConfig>(layout, last);
         scratch(layout, Variant::gdn_output_projection_workspace_capacity_bytes(
-                            plan.weights_profile, phase, first, last));
+                            weights_profile, phase, first, last));
     };
     const auto post_mixer_stage = [&](WorkspaceLayoutBuilder& layout, std::int32_t first,
                                       std::int32_t last, qwen3_6::TextPhase phase) {
         auto stage = layout.scope();
         (void)workspace_recipe::post_mixer_hidden<TextConfig>(layout, last);
-        scratch(layout, Variant::post_mixer_workspace_capacity_bytes(plan.weights_profile, phase,
-                                                                     first, last));
+        scratch(layout,
+                Variant::post_mixer_workspace_capacity_bytes(weights_profile, phase, first, last));
     };
     const auto target_body = [&](WorkspaceLayoutBuilder& layout, std::int32_t first,
                                  std::int32_t last, qwen3_6::TextPhase phase, GdnWorkspacePath path,
@@ -601,95 +602,94 @@ void validate_target_options(DeviceContext& device, const EngineOptions& options
     }
 }
 
-std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlanningInputs& inputs,
-                                                           std::uint32_t main_page_groups) {
+SequencePlan build_sequence_candidate(const SequencePlanningInputs& inputs,
+                                      std::uint32_t main_page_groups) {
     if (main_page_groups == 0) {
         throw std::invalid_argument("Main KV physical page count must be positive");
     }
-    auto impl                 = std::make_unique<SequencePlanImpl>();
-    impl->weights_profile     = inputs.weights_profile;
-    impl->capacity            = inputs.capacity;
-    impl->main_page_groups    = main_page_groups;
-    impl->kv_capacity         = static_cast<std::uint32_t>(checked_i32(
+    SequencePlan plan;
+    plan.weights_profile     = inputs.weights_profile;
+    plan.capacity            = inputs.capacity;
+    plan.main_page_groups    = main_page_groups;
+    plan.kv_capacity         = static_cast<std::uint32_t>(checked_i32(
         static_cast<std::uint64_t>(main_page_groups) * static_cast<std::uint32_t>(kPagedKVPageSize),
         "resolved Paged KV capacity exceeds int32"));
-    impl->max_concurrency     = inputs.max_concurrency;
-    impl->prefill_chunk       = inputs.prefill_chunk;
-    impl->draft_window        = inputs.draft_window;
-    impl->speculative_backend = inputs.speculative_backend;
-    impl->proposal_head       = inputs.proposal_head;
-    impl->features            = inputs.features;
-    impl->use_cuda_graph      = inputs.use_cuda_graph;
-    impl->device              = inputs.device;
-    impl->kv_dtype            = inputs.kv_dtype;
-    impl->kv_quant_group      = inputs.kv_quant_group;
-    impl->persistent          = persistent_layout(*impl);
-    impl->workspace           = build_workspace_plan(*impl);
-    if (impl->features.vision) {
+    plan.max_concurrency     = inputs.max_concurrency;
+    plan.prefill_chunk       = inputs.prefill_chunk;
+    plan.draft_window        = inputs.draft_window;
+    plan.speculative_backend = inputs.speculative_backend;
+    plan.proposal_head       = inputs.proposal_head;
+    plan.features            = inputs.features;
+    plan.use_cuda_graph      = inputs.use_cuda_graph;
+    plan.device              = inputs.device;
+    plan.kv_dtype            = inputs.kv_dtype;
+    plan.kv_quant_group      = inputs.kv_quant_group;
+    plan.persistent          = persistent_layout(plan);
+    plan.workspace           = build_workspace_plan(plan);
+    if (plan.features.vision) {
         constexpr std::uint32_t kFrontendMergedLimit = 32768;
-        const std::uint32_t merged = std::min(impl->capacity, kFrontendMergedLimit);
-        impl->request_transient_capacity_bytes =
+        const std::uint32_t merged = std::min(plan.capacity, kFrontendMergedLimit);
+        plan.request_transient_capacity_bytes =
             schedule::VisionContext::output_transient_bytes(merged);
     }
-    if (impl->use_cuda_graph) {
+    if (plan.use_cuda_graph) {
         // Definitions remain per execution profile, but only one executable is instantiated for
         // each reachable node-topology class. These bounds cover the largest profile installed in
         // each class and the driver/module state materialized while qualifying all definitions.
-        if (impl->speculative_backend == SpeculativeBackend::None) {
-            impl->graph_allowance_bytes = checked_mul(12ULL * kMiB, impl->max_concurrency,
-                                                      "ordinary exact-b graph allowance");
-        } else if (impl->speculative_backend == SpeculativeBackend::Mtp) {
-            const auto profiles = mtp_graph_profiles(impl->capacity, impl->draft_window);
+        if (plan.speculative_backend == SpeculativeBackend::None) {
+            plan.graph_allowance_bytes =
+                checked_mul(12ULL * kMiB, plan.max_concurrency, "ordinary exact-b graph allowance");
+        } else if (plan.speculative_backend == SpeculativeBackend::Mtp) {
+            const auto profiles = mtp_graph_profiles(plan.capacity, plan.draft_window);
             const std::size_t per_batch_allowance = graph_topology_allowance(
                 profiles,
                 [&](GraphExecutionProfile profile) {
                     const std::uint64_t final_visible = std::min<std::uint64_t>(
-                        impl->capacity,
-                        static_cast<std::uint64_t>(profile.max) + 2ULL * impl->draft_window);
+                        plan.capacity,
+                        static_cast<std::uint64_t>(profile.max) + 2ULL * plan.draft_window);
                     return (final_visible <= 4096 ? 12ULL : 82ULL) * kMiB;
                 },
                 "MTP graph allowance");
-            impl->graph_allowance_bytes = checked_mul(per_batch_allowance, impl->max_concurrency,
-                                                      "MTP exact-b graph allowance");
+            plan.graph_allowance_bytes = checked_mul(per_batch_allowance, plan.max_concurrency,
+                                                     "MTP exact-b graph allowance");
         } else {
             const auto class_allowance = [&](std::uint32_t batch_size) {
                 const auto profiles =
-                    dflash_graph_profiles(impl->capacity, impl->draft_window, batch_size);
+                    dflash_graph_profiles(plan.capacity, plan.draft_window, batch_size);
                 return graph_topology_allowance(
                     profiles,
                     [&](GraphExecutionProfile profile) {
                         const std::uint64_t final_visible = std::min<std::uint64_t>(
-                            impl->capacity,
-                            static_cast<std::uint64_t>(profile.max) + impl->draft_window + 1ULL);
+                            plan.capacity,
+                            static_cast<std::uint64_t>(profile.max) + plan.draft_window + 1ULL);
                         return (final_visible <= 4096 ? 64ULL : 96ULL) * kMiB;
                     },
                     "DFlash graph allowance");
             };
-            for (std::uint32_t batch_size = 1; batch_size <= impl->max_concurrency; ++batch_size) {
-                impl->graph_allowance_bytes =
-                    checked_add(impl->graph_allowance_bytes, class_allowance(batch_size),
+            for (std::uint32_t batch_size = 1; batch_size <= plan.max_concurrency; ++batch_size) {
+                plan.graph_allowance_bytes =
+                    checked_add(plan.graph_allowance_bytes, class_allowance(batch_size),
                                 "DFlash exact-b graph allowance");
             }
         }
     }
 
-    impl->device_reservation_bytes = checked_add(
+    plan.device_reservation_bytes = checked_add(
         checked_add(
-            checked_add(impl->persistent.bytes, impl->workspace.capacity, "sequence memory plan"),
-            impl->request_transient_capacity_bytes, "request transient reservation"),
-        impl->graph_allowance_bytes, "sequence graph allowance");
-    return impl;
+            checked_add(plan.persistent.bytes, plan.workspace.capacity, "sequence memory plan"),
+            plan.request_transient_capacity_bytes, "request transient reservation"),
+        plan.graph_allowance_bytes, "sequence graph allowance");
+    return plan;
 }
 
 } // namespace
 
-std::unique_ptr<qwen3_6::detail::SequencePlannerImpl<Variant>>
-make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
-                           WeightsProfile weights_profile) {
+SequencePlanner build_sequence_planner(DeviceContext& device, const EngineOptions& options,
+                                       WeightsProfile weights_profile) {
     validate_target_options(device, options);
 
     SequencePlanningInputs inputs{
-        .weights_profile     = weights_profile,
+        .weights_profile     = static_cast<std::uint32_t>(weights_profile),
         .capacity            = options.max_context,
         .max_concurrency     = options.max_concurrency,
         .prefill_chunk       = std::min(options.prefill_chunk, options.max_context),
@@ -711,41 +711,38 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
     }
     const auto maximum_pages = static_cast<std::uint32_t>(maximum_pages64);
 
-    auto planner     = std::make_unique<qwen3_6::detail::SequencePlannerImpl<Variant>>();
-    planner->inputs  = inputs;
-    planner->minimum = build_sequence_candidate(inputs, minimum_pages);
-    planner->curve   = runtime::SequenceCapacityCurve{
-          .main_page_tokens                     = static_cast<std::uint32_t>(kPagedKVPageSize),
-          .minimum_main_page_groups             = minimum_pages,
-          .maximum_main_page_groups             = maximum_pages,
-          .minimum_device_reservation_bytes     = planner->minimum->device_reservation_bytes,
-          .bytes_per_additional_main_page_group = 0,
+    SequencePlanner planner;
+    planner.inputs  = inputs;
+    planner.minimum = build_sequence_candidate(inputs, minimum_pages);
+    planner.curve   = runtime::SequenceCapacityCurve{
+        .main_page_tokens                     = static_cast<std::uint32_t>(kPagedKVPageSize),
+        .minimum_main_page_groups             = minimum_pages,
+        .maximum_main_page_groups             = maximum_pages,
+        .minimum_device_reservation_bytes     = planner.minimum.device_reservation_bytes,
+        .bytes_per_additional_main_page_group = 0,
     };
     if (minimum_pages < maximum_pages) {
         auto adjacent = build_sequence_candidate(inputs, minimum_pages + 1U);
-        if (adjacent->device_reservation_bytes <= planner->minimum->device_reservation_bytes) {
+        if (adjacent.device_reservation_bytes <= planner.minimum.device_reservation_bytes) {
             throw std::logic_error("Qwen3.6 sequence layout has a nonpositive KV capacity stride");
         }
-        planner->curve.bytes_per_additional_main_page_group =
-            adjacent->device_reservation_bytes - planner->minimum->device_reservation_bytes;
+        planner.curve.bytes_per_additional_main_page_group =
+            adjacent.device_reservation_bytes - planner.minimum.device_reservation_bytes;
     }
     return planner;
 }
 
-std::unique_ptr<SequencePlanImpl>
-finalize_sequence_plan_impl(std::unique_ptr<qwen3_6::detail::SequencePlannerImpl<Variant>> planner,
-                            std::uint32_t main_page_groups) {
-    if (planner == nullptr || planner->minimum == nullptr) {
-        throw std::invalid_argument("Qwen3.6 sequence planner is empty");
-    }
-    const std::size_t expected = planner->curve.reservation_bytes(main_page_groups);
-    std::unique_ptr<SequencePlanImpl> plan;
-    if (main_page_groups == planner->curve.minimum_main_page_groups) {
-        plan = std::move(planner->minimum);
+SequencePlan finalize_sequence_plan(SequencePlanner&& planner, std::uint32_t main_page_groups) {
+    if (planner.finalized) { throw std::logic_error("sequence planner is already finalized"); }
+    planner.finalized          = true;
+    const std::size_t expected = planner.curve.reservation_bytes(main_page_groups);
+    SequencePlan plan;
+    if (main_page_groups == planner.curve.minimum_main_page_groups) {
+        plan = std::move(planner.minimum);
     } else {
-        plan = build_sequence_candidate(planner->inputs, main_page_groups);
+        plan = build_sequence_candidate(planner.inputs, main_page_groups);
     }
-    if (plan->device_reservation_bytes != expected) {
+    if (plan.device_reservation_bytes != expected) {
         throw std::logic_error(
             "Qwen3.6 physical sequence layout is not affine in Main KV page capacity");
     }

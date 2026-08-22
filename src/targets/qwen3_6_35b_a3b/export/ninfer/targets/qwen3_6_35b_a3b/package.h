@@ -4,7 +4,6 @@
 #include "runtime/contract/types.h"
 #include "runtime/contract/transient_region.h"
 #include <ninfer/targets/qwen3_6/frontend.h>
-#include <ninfer/targets/qwen3_6/runtime.h>
 
 #include <cstdint>
 #include <memory>
@@ -20,6 +19,19 @@ class MaterializedArtifact;
 struct ArtifactIdentity;
 struct MaterializationPlan;
 } // namespace artifact
+
+namespace targets::qwen3_6 {
+template <class Variant>
+struct SequencePlanner;
+template <class Variant>
+struct SequencePlan;
+template <class Variant>
+struct RequestBasePlan;
+template <class Variant>
+struct RequestPlan;
+template <class Variant>
+class Program;
+} // namespace targets::qwen3_6
 
 namespace targets::qwen3_6_35b_a3b {
 

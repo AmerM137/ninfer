@@ -181,7 +181,7 @@ int verify_profile_mismatch_rejection() {
     options.use_cuda_graph = false;
     auto planner =
         Package::make_sequence_planner(device, options, WeightsProfile::Qwen36GroupwiseInt);
-    const std::uint32_t pages = planner.capacity_curve().minimum_main_page_groups;
+    const std::uint32_t pages = planner.curve.minimum_main_page_groups;
     auto sequence             = std::move(planner).finalize(pages);
     RuntimeModelView empty_model;
     try {
