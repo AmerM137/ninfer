@@ -3,6 +3,8 @@
 #include "ninfer/types.h"
 #include "runtime/contract/types.h"
 
+#include <ninfer/targets/qwen3_6/prepared_prompt.h>
+
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -23,33 +25,8 @@ struct FrontendOptions {
 };
 
 struct FrontendResources;
-struct PreparedPromptData;
 class Frontend;
 class FrontendTestAccess;
-class PreparedPromptAccess;
-
-class PreparedPrompt {
-public:
-    PreparedPrompt() noexcept;
-    ~PreparedPrompt();
-    PreparedPrompt(PreparedPrompt&&) noexcept;
-    PreparedPrompt& operator=(PreparedPrompt&&) noexcept;
-
-    PreparedPrompt(const PreparedPrompt&)            = delete;
-    PreparedPrompt& operator=(const PreparedPrompt&) = delete;
-
-    [[nodiscard]] PromptSummary summary() const;
-    [[nodiscard]] PromptPreparationStats preparation_stats() const noexcept;
-    [[nodiscard]] explicit operator bool() const noexcept;
-
-private:
-    explicit PreparedPrompt(std::unique_ptr<PreparedPromptData> data) noexcept;
-    std::unique_ptr<PreparedPromptData> data;
-
-    friend class Frontend;
-    friend class FrontendTestAccess;
-    friend class PreparedPromptAccess;
-};
 
 class PublishedOutput {
 public:

@@ -662,24 +662,29 @@ std::span<const std::int32_t> PreparedPromptData::position_axis(int axis) const 
         static_cast<std::size_t>(axis) * token_ids.size(), token_ids.size());
 }
 
-PreparedPrompt::PreparedPrompt() noexcept = default;
+PreparedPrompt::PreparedPrompt(PreparedPromptData value) noexcept : data(std::move(value)) {}
 
-PreparedPrompt::PreparedPrompt(std::unique_ptr<PreparedPromptData> data) noexcept
-    : data(std::move(data)) {}
+PreparedPrompt::PreparedPrompt(PreparedPrompt&& other) noexcept : data(std::move(other.data)) {
+    other.data = {};
+}
 
-PreparedPrompt::~PreparedPrompt()                                    = default;
-PreparedPrompt::PreparedPrompt(PreparedPrompt&&) noexcept            = default;
-PreparedPrompt& PreparedPrompt::operator=(PreparedPrompt&&) noexcept = default;
+PreparedPrompt& PreparedPrompt::operator=(PreparedPrompt&& other) noexcept {
+    if (this != &other) {
+        data       = std::move(other.data);
+        other.data = {};
+    }
+    return *this;
+}
 
-PromptSummary PreparedPrompt::summary() const {
-    if (data == nullptr) { throw std::logic_error("prepared prompt is empty"); }
-    return PromptSummary{.prompt_tokens = checked_token_count(data->token_ids.size()),
-                         .has_media     = data->has_media()};
+PromptSummary PreparedPrompt::summary() const noexcept {
+    if (data.token_ids.empty()) { return {}; }
+    return PromptSummary{.prompt_tokens = static_cast<std::uint32_t>(data.token_ids.size()),
+                         .has_media     = data.has_media()};
 }
 
 PromptPreparationStats PreparedPrompt::preparation_stats() const noexcept {
-    if (data == nullptr) { return {}; }
-    const PrepareStats& stats = data->prepare;
+    if (data.token_ids.empty()) { return {}; }
+    const PrepareStats& stats = data.prepare;
     return PromptPreparationStats{
         .seconds                       = stats.seconds,
         .media_preprocess_seconds      = stats.media_preprocess_seconds,
@@ -698,7 +703,17 @@ PromptPreparationStats PreparedPrompt::preparation_stats() const noexcept {
     };
 }
 
-PreparedPrompt::operator bool() const noexcept { return data != nullptr; }
+const PreparedPromptData& PreparedPrompt::view() const {
+    if (data.token_ids.empty()) { throw std::invalid_argument("prepared prompt is empty"); }
+    return data;
+}
+
+PreparedPromptData PreparedPrompt::take() && {
+    if (data.token_ids.empty()) { throw std::invalid_argument("prepared prompt is empty"); }
+    PreparedPromptData result = std::move(data);
+    data                      = {};
+    return result;
+}
 
 PublishedOutput::PublishedOutput(PublishedOutput&& other) noexcept
     : values(std::move(other.values)), count(std::exchange(other.count, 0)) {}
@@ -855,19 +870,8 @@ Frontend FrontendTestAccess::create_component(const FrontendResources& resources
     return Frontend(std::make_shared<const Frontend::FrontendState>(resources, false, options));
 }
 
-const PreparedPromptData& PreparedPromptAccess::view(const PreparedPrompt& prompt) {
-    if (prompt.data == nullptr) { throw std::invalid_argument("prepared prompt is empty"); }
-    return *prompt.data;
-}
-
-PreparedPromptData PreparedPromptAccess::take(PreparedPrompt&& prompt) {
-    if (prompt.data == nullptr) { throw std::invalid_argument("prepared prompt is empty"); }
-    auto data = std::move(prompt.data);
-    return std::move(*data);
-}
-
 const PreparedPromptData& FrontendTestAccess::inspect(const PreparedPrompt& prompt) {
-    return PreparedPromptAccess::view(prompt);
+    return prompt.view();
 }
 
 PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& control) const {
@@ -882,8 +886,7 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         throw std::invalid_argument("Vision is disabled for this Engine");
     }
 
-    auto prepared              = std::make_unique<PreparedPromptData>();
-    PreparedPromptData& result = *prepared;
+    PreparedPromptData result;
     if (has_media) {
         fi::Processor processor(*state->tokenizer, state->chat_template, state->processor,
                                 state->media_cache);
@@ -932,7 +935,7 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     result.identity.reusable   = true;
     result.starts_in_reasoning = options.add_generation_prompt && options.enable_thinking;
     result.prepare.seconds     = std::chrono::duration<double>(Clock::now() - start).count();
-    return PreparedPrompt(std::move(prepared));
+    return PreparedPrompt(std::move(result));
 }
 
 std::uint32_t Frontend::count_tokens(PromptInput input, const PreparationControl& control) const {
@@ -998,23 +1001,22 @@ PreparedPrompt Frontend::prepare_tokens(std::vector<TokenId> token_ids,
                                     std::to_string(token));
         }
     }
-    auto prepared              = std::make_unique<PreparedPromptData>();
-    PreparedPromptData& result = *prepared;
-    result.token_ids           = std::move(token_ids);
+    PreparedPromptData result;
+    result.token_ids = std::move(token_ids);
     assign_text_positions(result);
     result.identity.reusable = allow_prefix_identity;
     result.prepare.seconds   = std::chrono::duration<double>(Clock::now() - start).count();
-    return PreparedPrompt(std::move(prepared));
+    return PreparedPrompt(std::move(result));
 }
 
 OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,
                                             const StopPolicy& caller_stop,
                                             const OutputOptions& output) const {
-    if (prompt.data == nullptr) { throw std::invalid_argument("prepared prompt is empty"); }
-    StopPolicy policy = merge_stop_policy(*state->tokenizer, caller_stop);
+    const PreparedPromptData& prepared = prompt.view();
+    StopPolicy policy                  = merge_stop_policy(*state->tokenizer, caller_stop);
     if (output.raw) { policy.publish_stop_token = true; }
     return OutputSession(std::make_unique<OutputSession::OutputSessionState>(
-        state->tokenizer, std::move(policy), output, prompt.data->starts_in_reasoning));
+        state->tokenizer, std::move(policy), output, prepared.starts_in_reasoning));
 }
 
 const StopPolicy& Frontend::default_stop_policy() const noexcept { return state->defaults; }

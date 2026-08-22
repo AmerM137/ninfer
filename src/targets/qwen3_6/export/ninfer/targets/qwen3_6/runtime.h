@@ -265,8 +265,8 @@ public:
     void reset_memory_peaks() noexcept;
 
 private:
-    explicit Program(std::unique_ptr<detail::ProgramImpl<Variant>> impl) noexcept;
-    std::unique_ptr<detail::ProgramImpl<Variant>> impl_;
+    explicit Program(std::unique_ptr<detail::ProgramImpl<Variant>> implementation) noexcept;
+    std::unique_ptr<detail::ProgramImpl<Variant>> impl;
 
     template <class V>
     friend std::unique_ptr<Program<V>> create_program(const typename V::ModelView&,

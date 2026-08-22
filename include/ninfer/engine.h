@@ -24,8 +24,8 @@ public:
     PreparedPrompt(const PreparedPrompt&)            = delete;
     PreparedPrompt& operator=(const PreparedPrompt&) = delete;
 
-    [[nodiscard]] const PromptSummary& summary() const noexcept;
-    [[nodiscard]] const PromptPreparationStats& preparation_stats() const noexcept;
+    [[nodiscard]] PromptSummary summary() const noexcept;
+    [[nodiscard]] PromptPreparationStats preparation_stats() const noexcept;
     [[nodiscard]] explicit operator bool() const noexcept;
 
 private:

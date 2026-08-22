@@ -40,14 +40,12 @@ PreparedPrompt& PreparedPrompt::operator=(PreparedPrompt&&) noexcept = default;
 PreparedPrompt::PreparedPrompt(std::unique_ptr<runtime::PreparedPromptState> state) noexcept
     : state(std::move(state)) {}
 
-const PromptSummary& PreparedPrompt::summary() const noexcept {
-    static const PromptSummary empty;
-    return state != nullptr ? state->summary : empty;
+PromptSummary PreparedPrompt::summary() const noexcept {
+    return state != nullptr ? state->value.summary() : PromptSummary{};
 }
 
-const PromptPreparationStats& PreparedPrompt::preparation_stats() const noexcept {
-    static const PromptPreparationStats empty;
-    return state != nullptr ? state->prepare : empty;
+PromptPreparationStats PreparedPrompt::preparation_stats() const noexcept {
+    return state != nullptr ? state->value.preparation_stats() : PromptPreparationStats{};
 }
 
 PreparedPrompt::operator bool() const noexcept { return state != nullptr; }
@@ -115,16 +113,15 @@ PreparedPrompt Engine::prepare(PromptInput input, const PreparationControl& cont
     const SamplingMode sampling_mode =
         input.options.enable_thinking ? SamplingMode::Thinking : SamplingMode::NonThinking;
     return state->with_active([&](const auto& active) {
-        auto prepared      = active.instance->frontend.prepare(std::move(input), control);
-        PromptSummary info = prepared.summary();
-        if (info.prompt_tokens > active.instance->capacity) {
+        auto prepared               = active.instance->frontend.prepare(std::move(input), control);
+        const PromptSummary summary = prepared.summary();
+        if (summary.prompt_tokens > active.instance->capacity) {
             throw RequestError(
                 RequestErrorKind::ContextLengthExceeded,
-                context_capacity_error(info.prompt_tokens, active.instance->capacity));
+                context_capacity_error(summary.prompt_tokens, active.instance->capacity));
         }
-        const PromptPreparationStats preparation = prepared.preparation_stats();
-        return PreparedPrompt(std::make_unique<runtime::PreparedPromptState>(
-            info, preparation, sampling_mode, std::move(prepared)));
+        return PreparedPrompt(
+            std::make_unique<runtime::PreparedPromptState>(sampling_mode, std::move(prepared)));
     });
 }
 
@@ -134,15 +131,14 @@ PreparedPrompt Engine::prepare_tokens(std::vector<TokenId> token_ids,
     return state->with_active([&](const auto& active) {
         auto prepared =
             active.instance->frontend.prepare_tokens(std::move(token_ids), allow_prefix_identity);
-        PromptSummary info = prepared.summary();
-        if (info.prompt_tokens > active.instance->capacity) {
+        const PromptSummary summary = prepared.summary();
+        if (summary.prompt_tokens > active.instance->capacity) {
             throw RequestError(
                 RequestErrorKind::ContextLengthExceeded,
-                context_capacity_error(info.prompt_tokens, active.instance->capacity));
+                context_capacity_error(summary.prompt_tokens, active.instance->capacity));
         }
-        const PromptPreparationStats preparation = prepared.preparation_stats();
-        return PreparedPrompt(std::make_unique<runtime::PreparedPromptState>(
-            info, preparation, SamplingMode::Thinking, std::move(prepared)));
+        return PreparedPrompt(std::make_unique<runtime::PreparedPromptState>(SamplingMode::Thinking,
+                                                                             std::move(prepared)));
     });
 }
 
@@ -173,13 +169,13 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
         state->sampling_defaults, prompt.state->sampling_mode, std::move(options));
     const ResolvedSamplingParameters resolved_sampling = resolved_options.execution.sampling;
 
-    const PromptSummary prompt_summary = prompt.state->summary;
+    const PromptSummary prompt_summary = prompt.state->value.summary();
     if (prompt_summary.prompt_tokens > state->options.max_context) {
         throw RequestError(
             RequestErrorKind::ContextLengthExceeded,
             context_capacity_error(prompt_summary.prompt_tokens, state->options.max_context));
     }
-    const double prepare_seconds = prompt.state->prepare.seconds;
+    const double prepare_seconds = prompt.state->value.view().prepare.seconds;
     if (resolved_options.execution.requested_output_tokens == 0) {
         runtime::ImmediateSubmission immediate;
 

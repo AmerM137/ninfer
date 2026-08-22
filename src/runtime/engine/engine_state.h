@@ -14,13 +14,9 @@
 namespace ninfer::runtime {
 
 struct PreparedPromptState {
-    PreparedPromptState(PromptSummary prompt_summary, PromptPreparationStats preparation,
-                        SamplingMode mode, targets::qwen3_6::PreparedPrompt prepared)
-        : summary(std::move(prompt_summary)), prepare(std::move(preparation)), sampling_mode(mode),
-          value(std::move(prepared)) {}
+    PreparedPromptState(SamplingMode mode, targets::qwen3_6::PreparedPrompt prepared)
+        : sampling_mode(mode), value(std::move(prepared)) {}
 
-    PromptSummary summary;
-    PromptPreparationStats prepare;
     SamplingMode sampling_mode = SamplingMode::Thinking;
     targets::qwen3_6::PreparedPrompt value;
 };

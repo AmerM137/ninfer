@@ -19,8 +19,8 @@ SequencePlan<Variant> SequencePlanner<Variant>::finalize(std::uint32_t main_page
 }
 
 template <>
-Program<Variant>::Program(std::unique_ptr<detail::ProgramImpl<Variant>> impl) noexcept
-    : impl_(std::move(impl)) {}
+Program<Variant>::Program(std::unique_ptr<detail::ProgramImpl<Variant>> implementation) noexcept
+    : impl(std::move(implementation)) {}
 
 template <>
 Program<Variant>::~Program() noexcept = default;
@@ -29,31 +29,31 @@ template <>
 RequestBasePlan<Variant>
 Program<Variant>::plan_request_base(const PreparedPrompt& prompt,
                                     const runtime::ResolvedExecutionOptions& options) {
-    return impl_->plan_request_base(PreparedPromptAccess::view(prompt), options);
+    return impl->plan_request_base(prompt.view(), options);
 }
 
 template <>
 RequestPlan<Variant> Program<Variant>::plan_request_for_lane(std::uint32_t lane,
                                                              const PreparedPrompt& prompt,
                                                              const RequestBasePlan<Variant>& base) {
-    return impl_->plan_request_for_lane(lane, PreparedPromptAccess::view(prompt), base);
+    return impl->plan_request_for_lane(lane, prompt.view(), base);
 }
 
 template <>
 bool Program<Variant>::can_admit_lane(std::uint32_t lane,
                                       const RequestPlan<Variant>& plan) const noexcept {
-    return impl_->can_admit_lane(lane, plan);
+    return impl->can_admit_lane(lane, plan);
 }
 
 template <>
 bool Program<Variant>::can_admit_lane_after_retained_eviction(
     std::uint32_t lane, const RequestPlan<Variant>& plan) const noexcept {
-    return impl_->can_admit_lane_after_retained_eviction(lane, plan);
+    return impl->can_admit_lane_after_retained_eviction(lane, plan);
 }
 
 template <>
 runtime::AdmissionResources Program<Variant>::admission_capacity() const noexcept {
-    return impl_->admission_capacity();
+    return impl->admission_capacity();
 }
 
 template <>
@@ -61,20 +61,19 @@ runtime::PrefillStepResult
 Program<Variant>::start_prefill_lane(std::uint32_t lane, PreparedPrompt&& prompt,
                                      RequestPlan<Variant>&& plan,
                                      runtime::TransientRegion transient) {
-    return impl_->start_prefill_lane(lane, PreparedPromptAccess::take(std::move(prompt)),
-                                     std::move(plan), transient);
+    return impl->start_prefill_lane(lane, std::move(prompt).take(), std::move(plan), transient);
 }
 
 template <>
 runtime::PrefillStepResult Program<Variant>::advance_prefill_lane(std::uint32_t lane) {
-    return impl_->advance_prefill_lane(lane);
+    return impl->advance_prefill_lane(lane);
 }
 
 template <>
 runtime::BatchedGeneratedRound
 Program<Variant>::decode_batch(std::span<const std::uint32_t> lanes,
                                std::span<const runtime::RoundBudget> budgets) {
-    return impl_->decode_batch(lanes, budgets);
+    return impl->decode_batch(lanes, budgets);
 }
 
 template <>
@@ -82,47 +81,47 @@ void Program<Variant>::resolve_pending_batch(std::span<const std::uint32_t> lane
                                              std::span<const std::uint32_t> accepted_tokens,
                                              std::span<const std::uint8_t> terminal,
                                              std::span<const std::uint8_t> cancelled) {
-    impl_->resolve_pending_batch(lanes, accepted_tokens, terminal, cancelled);
+    impl->resolve_pending_batch(lanes, accepted_tokens, terminal, cancelled);
 }
 
 template <>
 void Program<Variant>::resolve_prefill_lane(std::uint32_t lane, bool terminal) {
-    impl_->resolve_prefill_lane(lane, terminal);
+    impl->resolve_prefill_lane(lane, terminal);
 }
 
 template <>
 void Program<Variant>::abort_lane(std::uint32_t lane) noexcept {
-    impl_->abort_lane(lane);
+    impl->abort_lane(lane);
 }
 
 template <>
 bool Program<Variant>::has_retained_lane(std::uint32_t lane) const noexcept {
-    return impl_->has_retained_lane(lane);
+    return impl->has_retained_lane(lane);
 }
 
 template <>
 void Program<Variant>::evict_retained_lane(std::uint32_t lane) noexcept {
-    impl_->evict_retained_lane(lane);
+    impl->evict_retained_lane(lane);
 }
 
 template <>
 GenerationTimings Program<Variant>::generation_timings_lane(std::uint32_t lane) const noexcept {
-    return impl_->generation_timings_lane(lane);
+    return impl->generation_timings_lane(lane);
 }
 
 template <>
 SpeculativeStats Program<Variant>::speculative_stats_lane(std::uint32_t lane) const noexcept {
-    return impl_->speculative_stats_lane(lane);
+    return impl->speculative_stats_lane(lane);
 }
 
 template <>
 MemorySummary Program<Variant>::memory_summary() const noexcept {
-    return impl_->memory_summary();
+    return impl->memory_summary();
 }
 
 template <>
 void Program<Variant>::reset_memory_peaks() noexcept {
-    impl_->reset_memory_peaks();
+    impl->reset_memory_peaks();
 }
 
 template <>

@@ -1,12 +1,12 @@
 #pragma once
 
-#include <ninfer/targets/qwen3_6/frontend.h>
+#include "ninfer/types.h"
 
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <optional>
 #include <memory>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -117,10 +117,33 @@ struct PreparedPromptData {
     }
 };
 
-class PreparedPromptAccess {
+class Frontend;
+
+class PreparedPrompt {
 public:
-    [[nodiscard]] static const PreparedPromptData& view(const PreparedPrompt& prompt);
-    [[nodiscard]] static PreparedPromptData take(PreparedPrompt&& prompt);
+    PreparedPrompt() noexcept = default;
+    ~PreparedPrompt()         = default;
+    PreparedPrompt(PreparedPrompt&& other) noexcept;
+    PreparedPrompt& operator=(PreparedPrompt&& other) noexcept;
+
+    PreparedPrompt(const PreparedPrompt&)            = delete;
+    PreparedPrompt& operator=(const PreparedPrompt&) = delete;
+
+    [[nodiscard]] PromptSummary summary() const noexcept;
+    [[nodiscard]] PromptPreparationStats preparation_stats() const noexcept;
+
+    [[nodiscard]] explicit operator bool() const noexcept { return !data.token_ids.empty(); }
+
+    [[nodiscard]] const PreparedPromptData& view() const;
+    [[nodiscard]] PreparedPromptData take() &&;
+
+private:
+    explicit PreparedPrompt(PreparedPromptData data) noexcept;
+    // Preparation rejects empty token sequences, so an empty vector is the default/moved-from
+    // state.
+    PreparedPromptData data;
+
+    friend class Frontend;
 };
 
 } // namespace ninfer::targets::qwen3_6
