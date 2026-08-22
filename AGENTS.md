@@ -299,6 +299,11 @@ The following are typical choices, not a cumulative checklist:
 Do not replace weak verification with low-value tests. State clearly when a relevant check could not
 run and why.
 
+`ninfer_qwen3_6_frontend_test` is skipped until further notice: it requires an HF checkpoint
+directory via `NINFER_QWEN3_6_27B_HF`, which is not present locally. Treat its SKIP as expected;
+verify frontend changes by running the built CLI against a local `.ninfer` artifact instead (see
+the local model directory in Local environment).
+
 ## Local environment
 
 Use unrestricted build-tool parallelism for repository compilation. Invoke CMake builds as
@@ -312,6 +317,7 @@ These are conventional project resources, not a checklist of resources every tas
 | Python 3.11 | `python3` in the selected maintainer environment |
 | BF16 source checkpoint | explicit local checkpoint directory |
 | product artifact | `out/qwen3_6_27b.ninfer` |
+| local model directory | `~/models/ninfer/` (e.g. `Qwen3.6-27B-NInfer/qwen3_6_27b_nvfp4.ninfer`); other machines may differ |
 | conversion report | `out/qwen3_6_27b.ninfer.conversion.json` |
 | normal build | `build/` |
 | profiler output | `profiles/ncu/`, `profiles/nsys/`, `profiles/bench/` |

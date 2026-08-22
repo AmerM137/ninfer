@@ -333,7 +333,7 @@ StopPolicy merge_stop_policy(const fi::Tokenizer& tokenizer, const StopPolicy& c
     const auto append_token   = [&](TokenId token) {
         if (!tokenizer.is_valid_token(token)) {
             throw std::invalid_argument("stop token id is outside the checkpoint vocabulary: " +
-                                          std::to_string(token));
+                                        std::to_string(token));
         }
         if (std::find(result.token_ids.begin(), result.token_ids.end(), token) ==
             result.token_ids.end()) {
@@ -592,9 +592,9 @@ DecoderState terminal_state(DecoderState state) {
 
 } // namespace
 
-class Frontend::Impl {
-public:
-    Impl(const FrontendResources& resources, bool registered_checkpoint, FrontendOptions options)
+struct Frontend::FrontendState {
+    FrontendState(const FrontendResources& resources, bool registered_checkpoint,
+                  FrontendOptions options)
         : chat_template(compile_chat_template(resources)),
           tokenizer(std::make_shared<const fi::Tokenizer>(
               fi::TokenizerResources{.tokenizer_json         = resources.tokenizer_json,
@@ -637,20 +637,19 @@ public:
     bool vision_enabled = true;
 };
 
-class OutputSession::Impl {
-public:
-    Impl(std::shared_ptr<const fi::Tokenizer> tokenizer_, StopPolicy policy_, OutputOptions output,
-         bool starts_in_reasoning)
-        : tokenizer(std::move(tokenizer_)), policy(std::move(policy_)),
+struct OutputSession::OutputSessionState {
+    OutputSessionState(std::shared_ptr<const fi::Tokenizer> tokenizer, StopPolicy policy,
+                       OutputOptions output, bool starts_in_reasoning)
+        : tokenizer(std::move(tokenizer)), policy(std::move(policy)),
           preserve_special(output.raw || output.preserve_special_tokens) {
-        state.in_reasoning = starts_in_reasoning && !output.raw;
+        decoder.in_reasoning = starts_in_reasoning && !output.raw;
     }
 
     std::shared_ptr<const fi::Tokenizer> tokenizer;
     StopPolicy policy;
     bool preserve_special = false;
-    DecoderState state;
-    DecoderState preview_state;
+    DecoderState decoder;
+    DecoderState preview_decoder;
     PublishedOutput preview_output;
     bool preview_ready = false;
 };
@@ -666,21 +665,21 @@ std::span<const std::int32_t> PreparedPromptData::position_axis(int axis) const 
 PreparedPrompt::PreparedPrompt() noexcept = default;
 
 PreparedPrompt::PreparedPrompt(std::unique_ptr<PreparedPromptData> data) noexcept
-    : data_(std::move(data)) {}
+    : data(std::move(data)) {}
 
 PreparedPrompt::~PreparedPrompt()                                    = default;
 PreparedPrompt::PreparedPrompt(PreparedPrompt&&) noexcept            = default;
 PreparedPrompt& PreparedPrompt::operator=(PreparedPrompt&&) noexcept = default;
 
 PromptSummary PreparedPrompt::summary() const {
-    if (data_ == nullptr) { throw std::logic_error("prepared prompt is empty"); }
-    return PromptSummary{.prompt_tokens = checked_token_count(data_->token_ids.size()),
-                         .has_media     = data_->has_media()};
+    if (data == nullptr) { throw std::logic_error("prepared prompt is empty"); }
+    return PromptSummary{.prompt_tokens = checked_token_count(data->token_ids.size()),
+                         .has_media     = data->has_media()};
 }
 
 PromptPreparationStats PreparedPrompt::preparation_stats() const noexcept {
-    if (data_ == nullptr) { return {}; }
-    const PrepareStats& stats = data_->prepare;
+    if (data == nullptr) { return {}; }
+    const PrepareStats& stats = data->prepare;
     return PromptPreparationStats{
         .seconds                       = stats.seconds,
         .media_preprocess_seconds      = stats.media_preprocess_seconds,
@@ -699,29 +698,29 @@ PromptPreparationStats PreparedPrompt::preparation_stats() const noexcept {
     };
 }
 
-PreparedPrompt::operator bool() const noexcept { return data_ != nullptr; }
+PreparedPrompt::operator bool() const noexcept { return data != nullptr; }
 
 PublishedOutput::PublishedOutput(PublishedOutput&& other) noexcept
-    : values_(std::move(other.values_)), size_(std::exchange(other.size_, 0)) {}
+    : values(std::move(other.values)), count(std::exchange(other.count, 0)) {}
 
 PublishedOutput& PublishedOutput::operator=(PublishedOutput&& other) noexcept {
     if (this != &other) {
-        values_ = std::move(other.values_);
-        size_   = std::exchange(other.size_, 0);
+        values = std::move(other.values);
+        count  = std::exchange(other.count, 0);
     }
     return *this;
 }
 
 void PublishedOutput::clear() noexcept {
-    for (std::size_t index = 0; index < size_; ++index) { values_[index] = {}; }
-    size_ = 0;
+    for (std::size_t index = 0; index < count; ++index) { values[index] = {}; }
+    count = 0;
 }
 
 void PublishedOutput::push_back(OutputDelta value) {
-    if (size_ == values_.size()) {
+    if (count == values.size()) {
         throw std::logic_error("output decoder produced more than two channel transitions");
     }
-    values_[size_++] = std::move(value);
+    values[count++] = std::move(value);
 }
 
 OutputSession::OutputSession() noexcept                           = default;
@@ -729,14 +728,15 @@ OutputSession::~OutputSession()                                   = default;
 OutputSession::OutputSession(OutputSession&&) noexcept            = default;
 OutputSession& OutputSession::operator=(OutputSession&&) noexcept = default;
 
-OutputSession::OutputSession(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
+OutputSession::OutputSession(std::unique_ptr<OutputSessionState> state) noexcept
+    : state(std::move(state)) {}
 
 runtime::OutputDecision OutputSession::preview(std::span<const TokenId> tokens,
                                                std::uint32_t budget_remaining,
                                                FinishReason limit_reason) {
-    if (impl_ == nullptr) { throw std::logic_error("output session is empty"); }
-    if (impl_->state.terminal) { throw std::logic_error("output session is already terminal"); }
-    if (impl_->preview_ready) { throw std::logic_error("output session already has a preview"); }
+    if (state == nullptr) { throw std::logic_error("output session is empty"); }
+    if (state->decoder.terminal) { throw std::logic_error("output session is already terminal"); }
+    if (state->preview_ready) { throw std::logic_error("output session already has a preview"); }
     if (tokens.empty()) {
         throw std::invalid_argument("cannot preview an empty generated-token round");
     }
@@ -748,94 +748,94 @@ runtime::OutputDecision OutputSession::preview(std::span<const TokenId> tokens,
         throw std::invalid_argument("generated-token budget has an invalid limit reason");
     }
 
-    impl_->preview_state = impl_->state;
-    impl_->preview_output.clear();
+    state->preview_decoder = state->decoder;
+    state->preview_output.clear();
 
     const auto complete = [&](std::uint32_t count, FinishReason reason) {
-        impl_->preview_ready = true;
+        state->preview_ready = true;
         return runtime::OutputDecision{.accepted_tokens = count, .finish_reason = reason};
     };
 
     for (std::size_t index = 0; index < tokens.size(); ++index) {
         const std::uint32_t count = static_cast<std::uint32_t>(index + 1);
         const TokenId token       = tokens[index];
-        if (!impl_->tokenizer->is_valid_token(token)) {
+        if (!state->tokenizer->is_valid_token(token)) {
             throw std::out_of_range("generated token is outside the checkpoint vocabulary: " +
                                     std::to_string(token));
         }
 
-        if (impl_->preview_state.in_reasoning) { ++impl_->preview_state.reasoning_tokens; }
+        if (state->preview_decoder.in_reasoning) { ++state->preview_decoder.reasoning_tokens; }
 
         const bool stop_token =
-            std::find(impl_->policy.token_ids.begin(), impl_->policy.token_ids.end(), token) !=
-            impl_->policy.token_ids.end();
+            std::find(state->policy.token_ids.begin(), state->policy.token_ids.end(), token) !=
+            state->policy.token_ids.end();
         DecoderState before_state;
         PublishedOutput before_output;
-        if (stop_token && !impl_->policy.publish_stop_token) {
-            before_state  = impl_->preview_state;
-            before_output = impl_->preview_output;
+        if (stop_token && !state->policy.publish_stop_token) {
+            before_state  = state->preview_decoder;
+            before_output = state->preview_output;
         }
 
         StopMatch match;
         const std::string bytes =
-            impl_->tokenizer->decode_token_bytes(token, !impl_->preserve_special);
-        feed_token_bytes(impl_->preview_state, bytes, impl_->policy, impl_->preview_output, count,
+            state->tokenizer->decode_token_bytes(token, !state->preserve_special);
+        feed_token_bytes(state->preview_decoder, bytes, state->policy, state->preview_output, count,
                          &match);
 
         if (match.found) {
-            impl_->preview_state  = terminal_state(std::move(impl_->preview_state));
-            impl_->preview_output = std::move(match.output);
+            state->preview_decoder = terminal_state(std::move(state->preview_decoder));
+            state->preview_output  = std::move(match.output);
             return complete(match.committed_tokens, FinishReason::StopString);
         }
 
         if (stop_token) {
-            if (!impl_->policy.publish_stop_token) {
-                impl_->preview_state  = std::move(before_state);
-                impl_->preview_output = std::move(before_output);
+            if (!state->policy.publish_stop_token) {
+                state->preview_decoder = std::move(before_state);
+                state->preview_output  = std::move(before_output);
             }
-            terminalize(impl_->preview_state, impl_->policy, impl_->preview_output, count);
+            terminalize(state->preview_decoder, state->policy, state->preview_output, count);
             return complete(count, FinishReason::StopToken);
         }
     }
 
     const auto count = static_cast<std::uint32_t>(tokens.size());
     if (tokens.size() == budget_remaining) {
-        terminalize(impl_->preview_state, impl_->policy, impl_->preview_output, count);
+        terminalize(state->preview_decoder, state->policy, state->preview_output, count);
         return complete(count, limit_reason);
     }
     return complete(count, FinishReason::None);
 }
 
 runtime::OutputDecision OutputSession::preview_terminal(FinishReason reason) {
-    if (impl_ == nullptr) { throw std::logic_error("output session is empty"); }
-    if (impl_->state.terminal) { throw std::logic_error("output session is already terminal"); }
-    if (impl_->preview_ready) { throw std::logic_error("output session already has a preview"); }
+    if (state == nullptr) { throw std::logic_error("output session is empty"); }
+    if (state->decoder.terminal) { throw std::logic_error("output session is already terminal"); }
+    if (state->preview_ready) { throw std::logic_error("output session already has a preview"); }
     if (reason == FinishReason::None || reason == FinishReason::StopString ||
         reason == FinishReason::StopToken) {
         throw std::invalid_argument("invalid between-round terminal decoder reason");
     }
-    impl_->preview_state = impl_->state;
-    impl_->preview_output.clear();
-    terminalize(impl_->preview_state, impl_->policy, impl_->preview_output, 0);
-    impl_->preview_ready = true;
+    state->preview_decoder = state->decoder;
+    state->preview_output.clear();
+    terminalize(state->preview_decoder, state->policy, state->preview_output, 0);
+    state->preview_ready = true;
     return runtime::OutputDecision{.accepted_tokens = 0, .finish_reason = reason};
 }
 
 PublishedOutput OutputSession::commit_preview() noexcept {
-    if (impl_ == nullptr || !impl_->preview_ready) { std::terminate(); }
+    if (state == nullptr || !state->preview_ready) { std::terminate(); }
     using std::swap;
-    swap(impl_->state, impl_->preview_state);
-    PublishedOutput output = std::move(impl_->preview_output);
-    impl_->preview_output.clear();
-    impl_->preview_ready = false;
+    swap(state->decoder, state->preview_decoder);
+    PublishedOutput output = std::move(state->preview_output);
+    state->preview_output.clear();
+    state->preview_ready = false;
     return output;
 }
 
 std::uint32_t OutputSession::reasoning_tokens() const noexcept {
-    return impl_ != nullptr ? impl_->state.reasoning_tokens : 0;
+    return state != nullptr ? state->decoder.reasoning_tokens : 0;
 }
 
-Frontend::Frontend(std::shared_ptr<const Impl> impl) noexcept : impl_(std::move(impl)) {}
+Frontend::Frontend(std::shared_ptr<const FrontendState> state) noexcept : state(std::move(state)) {}
 
 Frontend::Frontend(const Frontend&)                = default;
 Frontend& Frontend::operator=(const Frontend&)     = default;
@@ -844,7 +844,7 @@ Frontend& Frontend::operator=(Frontend&&) noexcept = default;
 Frontend::~Frontend()                              = default;
 
 Frontend make_frontend(const FrontendResources& resources, FrontendOptions options) {
-    return Frontend(std::make_shared<const Frontend::Impl>(resources, true, options));
+    return Frontend(std::make_shared<const Frontend::FrontendState>(resources, true, options));
 }
 
 Frontend FrontendTestAccess::create_component(const FrontendResources& resources,
@@ -852,17 +852,17 @@ Frontend FrontendTestAccess::create_component(const FrontendResources& resources
     FrontendOptions options;
     options.vision_enabled = vision_enabled;
     options.max_context    = static_cast<std::uint32_t>(kMaximumVisionTokens);
-    return Frontend(std::make_shared<const Frontend::Impl>(resources, false, options));
+    return Frontend(std::make_shared<const Frontend::FrontendState>(resources, false, options));
 }
 
 const PreparedPromptData& PreparedPromptAccess::view(const PreparedPrompt& prompt) {
-    if (prompt.data_ == nullptr) { throw std::invalid_argument("prepared prompt is empty"); }
-    return *prompt.data_;
+    if (prompt.data == nullptr) { throw std::invalid_argument("prepared prompt is empty"); }
+    return *prompt.data;
 }
 
 PreparedPromptData PreparedPromptAccess::take(PreparedPrompt&& prompt) {
-    if (prompt.data_ == nullptr) { throw std::invalid_argument("prepared prompt is empty"); }
-    auto data = std::move(prompt.data_);
+    if (prompt.data == nullptr) { throw std::invalid_argument("prepared prompt is empty"); }
+    auto data = std::move(prompt.data);
     return std::move(*data);
 }
 
@@ -878,15 +878,15 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     const bool has_media =
         std::any_of(messages.begin(), messages.end(),
                     [](const fi::ChatMessage& message) { return message.has_media(); });
-    if (has_media && !impl_->vision_enabled) {
+    if (has_media && !state->vision_enabled) {
         throw std::invalid_argument("Vision is disabled for this Engine");
     }
 
     auto prepared              = std::make_unique<PreparedPromptData>();
     PreparedPromptData& result = *prepared;
     if (has_media) {
-        fi::Processor processor(*impl_->tokenizer, impl_->chat_template, impl_->processor,
-                                impl_->media_cache);
+        fi::Processor processor(*state->tokenizer, state->chat_template, state->processor,
+                                state->media_cache);
         fi::ProcessedInput processed;
         try {
             processed = processor.process(std::move(messages), render_options(options), control);
@@ -918,9 +918,9 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         result.identity.rewrite_checkpoint = processed.rewrite_checkpoint;
     } else {
         const fi::RenderedChat rendered =
-            impl_->chat_template.render(messages, render_options(options));
+            state->chat_template.render(messages, render_options(options));
         const auto tokenize_started = Clock::now();
-        fi::EncodedChat encoded     = fi::encode_rendered_chat(*impl_->tokenizer, rendered);
+        fi::EncodedChat encoded     = fi::encode_rendered_chat(*state->tokenizer, rendered);
         result.prepare.tokenize_seconds =
             std::chrono::duration<double>(Clock::now() - tokenize_started).count();
         fi::check_preparation_control(control, "tokenization");
@@ -942,20 +942,20 @@ std::uint32_t Frontend::count_tokens(PromptInput input, const PreparationControl
     const bool has_media =
         std::any_of(messages.begin(), messages.end(),
                     [](const fi::ChatMessage& message) { return message.has_media(); });
-    if (has_media && !impl_->vision_enabled) {
+    if (has_media && !state->vision_enabled) {
         throw std::invalid_argument("Vision is disabled for this Engine");
     }
     if (!has_media) {
         const fi::RenderedChat rendered =
-            impl_->chat_template.render(messages, render_options(options));
+            state->chat_template.render(messages, render_options(options));
         const std::uint32_t count =
-            checked_token_count(impl_->tokenizer->encode(rendered.text).size());
+            checked_token_count(state->tokenizer->encode(rendered.text).size());
         fi::check_preparation_control(control, "tokenization");
         return count;
     }
 
-    fi::Processor processor(*impl_->tokenizer, impl_->chat_template, impl_->processor,
-                            impl_->media_cache);
+    fi::Processor processor(*state->tokenizer, state->chat_template, state->processor,
+                            state->media_cache);
     try {
         return checked_token_count(
             processor.process(std::move(messages), render_options(options), control)
@@ -964,12 +964,12 @@ std::uint32_t Frontend::count_tokens(PromptInput input, const PreparationControl
 }
 
 PromptCapabilities Frontend::prompt_capabilities() const noexcept {
-    return impl_ != nullptr ? impl_->chat_template.capabilities() : PromptCapabilities{};
+    return state != nullptr ? state->chat_template.capabilities() : PromptCapabilities{};
 }
 
 MediaCacheSummary Frontend::media_cache_summary() const {
-    if (impl_ == nullptr || !impl_->media_cache) { return {}; }
-    const fi::MediaCacheStats stats = impl_->media_cache->stats();
+    if (state == nullptr || !state->media_cache) { return {}; }
+    const fi::MediaCacheStats stats = state->media_cache->stats();
     return MediaCacheSummary{
         .capacity_bytes      = stats.capacity_bytes,
         .live_capacity_bytes = stats.live_capacity_bytes,
@@ -993,7 +993,7 @@ PreparedPrompt Frontend::prepare_tokens(std::vector<TokenId> token_ids,
     const auto start = Clock::now();
     (void)checked_token_count(token_ids.size());
     for (const TokenId token : token_ids) {
-        if (!impl_->tokenizer->is_valid_token(token)) {
+        if (!state->tokenizer->is_valid_token(token)) {
             throw std::out_of_range("prompt token is outside the checkpoint vocabulary: " +
                                     std::to_string(token));
         }
@@ -1010,13 +1010,13 @@ PreparedPrompt Frontend::prepare_tokens(std::vector<TokenId> token_ids,
 OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,
                                             const StopPolicy& caller_stop,
                                             const OutputOptions& output) const {
-    if (prompt.data_ == nullptr) { throw std::invalid_argument("prepared prompt is empty"); }
-    StopPolicy policy = merge_stop_policy(*impl_->tokenizer, caller_stop);
+    if (prompt.data == nullptr) { throw std::invalid_argument("prepared prompt is empty"); }
+    StopPolicy policy = merge_stop_policy(*state->tokenizer, caller_stop);
     if (output.raw) { policy.publish_stop_token = true; }
-    return OutputSession(std::make_unique<OutputSession::Impl>(
-        impl_->tokenizer, std::move(policy), output, prompt.data_->starts_in_reasoning));
+    return OutputSession(std::make_unique<OutputSession::OutputSessionState>(
+        state->tokenizer, std::move(policy), output, prompt.data->starts_in_reasoning));
 }
 
-const StopPolicy& Frontend::default_stop_policy() const noexcept { return impl_->defaults; }
+const StopPolicy& Frontend::default_stop_policy() const noexcept { return state->defaults; }
 
 } // namespace ninfer::targets::qwen3_6

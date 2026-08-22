@@ -44,7 +44,7 @@ public:
 
 private:
     explicit PreparedPrompt(std::unique_ptr<PreparedPromptData> data) noexcept;
-    std::unique_ptr<PreparedPromptData> data_;
+    std::unique_ptr<PreparedPromptData> data;
 
     friend class Frontend;
     friend class FrontendTestAccess;
@@ -62,28 +62,28 @@ public:
     PublishedOutput(PublishedOutput&& other) noexcept;
     PublishedOutput& operator=(PublishedOutput&& other) noexcept;
 
-    [[nodiscard]] bool empty() const noexcept { return size_ == 0; }
+    [[nodiscard]] bool empty() const noexcept { return count == 0; }
 
-    [[nodiscard]] std::size_t size() const noexcept { return size_; }
+    [[nodiscard]] std::size_t size() const noexcept { return count; }
 
-    [[nodiscard]] iterator begin() noexcept { return values_.begin(); }
+    [[nodiscard]] iterator begin() noexcept { return values.begin(); }
 
-    [[nodiscard]] const_iterator begin() const noexcept { return values_.begin(); }
+    [[nodiscard]] const_iterator begin() const noexcept { return values.begin(); }
 
-    [[nodiscard]] iterator end() noexcept { return values_.begin() + size_; }
+    [[nodiscard]] iterator end() noexcept { return values.begin() + count; }
 
-    [[nodiscard]] const_iterator end() const noexcept { return values_.begin() + size_; }
+    [[nodiscard]] const_iterator end() const noexcept { return values.begin() + count; }
 
-    [[nodiscard]] OutputDelta& back() noexcept { return values_[size_ - 1]; }
+    [[nodiscard]] OutputDelta& back() noexcept { return values[count - 1]; }
 
-    [[nodiscard]] const OutputDelta& back() const noexcept { return values_[size_ - 1]; }
+    [[nodiscard]] const OutputDelta& back() const noexcept { return values[count - 1]; }
 
     void clear() noexcept;
     void push_back(OutputDelta value);
 
 private:
-    std::array<OutputDelta, 2> values_{};
-    std::size_t size_ = 0;
+    std::array<OutputDelta, 2> values{};
+    std::size_t count = 0;
 };
 
 class OutputSession {
@@ -104,9 +104,9 @@ public:
     [[nodiscard]] std::uint32_t reasoning_tokens() const noexcept;
 
 private:
-    class Impl;
-    explicit OutputSession(std::unique_ptr<Impl> impl) noexcept;
-    std::unique_ptr<Impl> impl_;
+    struct OutputSessionState;
+    explicit OutputSession(std::unique_ptr<OutputSessionState> state) noexcept;
+    std::unique_ptr<OutputSessionState> state;
 
     friend class Frontend;
 };
@@ -133,9 +133,9 @@ public:
     [[nodiscard]] const StopPolicy& default_stop_policy() const noexcept;
 
 private:
-    class Impl;
-    explicit Frontend(std::shared_ptr<const Impl> impl) noexcept;
-    std::shared_ptr<const Impl> impl_;
+    struct FrontendState;
+    explicit Frontend(std::shared_ptr<const FrontendState> state) noexcept;
+    std::shared_ptr<const FrontendState> state;
 
     friend class FrontendTestAccess;
     friend Frontend make_frontend(const FrontendResources& resources, FrontendOptions options);
