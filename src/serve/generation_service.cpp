@@ -360,13 +360,7 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     std::optional<ServiceOutputSink> output_sink;
     if (sink != nullptr) { output_sink.emplace(*sink, prepared.tool_capable); }
     ninfer::OutputSink* public_sink = output_sink ? &*output_sink : nullptr;
-    ninfer::CancellationView cancellation;
-    if (is_cancelled || (sink != nullptr && sink->is_cancelled)) {
-        cancellation = ninfer::CancellationView([external = std::move(is_cancelled), sink]() {
-            return (external && external()) ||
-                   (sink != nullptr && sink->is_cancelled && sink->is_cancelled());
-        });
-    }
+    const ninfer::CancellationView cancellation(std::move(is_cancelled));
 
     ninfer::GenerationResult result;
     try {

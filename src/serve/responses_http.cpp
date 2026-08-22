@@ -312,13 +312,14 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                 output.on_content = [&](const std::string& text) {
                     write_stream_items(sink, *stream, stream->encoder.content_delta(text));
                 };
-                output.is_cancelled = [&] {
+                const auto is_cancelled = [&] {
                     return stream->cancelled.load(std::memory_order_acquire) ||
                            (sink.is_writable && !sink.is_writable());
                 };
 
-                const GenerationOutcome outcome = service->run(stream->prepared, &output);
-                ResponsesStreamFinish finished  = stream->encoder.finish(outcome);
+                const GenerationOutcome outcome =
+                    service->run(stream->prepared, &output, is_cancelled);
+                ResponsesStreamFinish finished = stream->encoder.finish(outcome);
                 if (stream->request.store) {
                     StoredResponse stored;
                     stored.id          = finished.response.body.at("id").get<std::string>();

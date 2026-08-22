@@ -450,12 +450,13 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                         sink, *stream,
                         make_chat_chunk_reasoning(id, model, created, text, include_usage));
                 };
-                output.is_cancelled = [&] {
+                const auto is_cancelled = [&] {
                     return stream->cancelled.load(std::memory_order_acquire) ||
                            (sink.is_writable && !sink.is_writable());
                 };
 
-                const GenerationOutcome outcome = service->run(stream->prepared, &output);
+                const GenerationOutcome outcome =
+                    service->run(stream->prepared, &output, is_cancelled);
                 log_request_done(log_context, outcome);
                 const std::string_view remaining = unstreamed_content(outcome);
                 if (!outcome.tool_calls.empty()) {
@@ -682,12 +683,13 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                     write_stream_item(sink, *stream,
                                       make_content_block_delta_text(text_index, text));
                 };
-                output.is_cancelled = [&] {
+                const auto is_cancelled = [&] {
                     return stream->cancelled.load(std::memory_order_acquire) ||
                            (sink.is_writable && !sink.is_writable());
                 };
 
-                const GenerationOutcome outcome = service->run(stream->prepared, &output);
+                const GenerationOutcome outcome =
+                    service->run(stream->prepared, &output, is_cancelled);
                 log_request_done(log_context, outcome);
                 const std::string_view remaining = unstreamed_content(outcome);
 

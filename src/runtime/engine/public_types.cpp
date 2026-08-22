@@ -5,8 +5,8 @@
 namespace ninfer {
 
 CancellationView::CancellationView(std::function<bool()> requested)
-    : requested_(std::move(requested)) {}
+    : callback(std::move(requested)) {}
 
-bool CancellationView::requested() const { return requested_ && requested_(); }
+bool CancellationView::requested() const { return callback && callback(); }
 
 } // namespace ninfer

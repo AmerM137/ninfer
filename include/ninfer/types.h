@@ -353,7 +353,7 @@ public:
     [[nodiscard]] bool requested() const;
 
 private:
-    std::function<bool()> requested_;
+    std::function<bool()> callback;
 };
 
 // Deadline and cancellation apply to all host-side prompt preparation work. Empty values mean
