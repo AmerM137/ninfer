@@ -36,6 +36,9 @@ out/
 tools/freq_corpus/fixtures/*
 !tools/freq_corpus/fixtures/ranking/
 
+# Scratch
+temp/
+
 # Editor / OS
 .vs/
 .vscode/
