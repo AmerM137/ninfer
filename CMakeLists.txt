@@ -18,6 +18,7 @@ project(ninfer LANGUAGES C CXX CUDA)
 option(NINFER_BUILD_APPS "Build the NInfer CLI and server" ON)
 option(BUILD_TESTING "Build NInfer tests" OFF)
 option(NINFER_BUILD_BENCHMARKS "Build NInfer benchmarks" OFF)
+option(NINFER_USE_CCACHE "Compile through ccache when it is installed" ON)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -31,6 +32,26 @@ set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 # C++ objects uncacheable. Turn it off unless a target ever ships a module.
 set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)        # clangd / IDE tooling
+
+# Compile through ccache when it is present. Every object here is cacheable --
+# nvcc included -- so a rebuilt tree costs the link steps rather than a full
+# compile. Found-not-required: a box without ccache configures unchanged, and
+# an explicit -DCMAKE_<LANG>_COMPILER_LAUNCHER on the command line wins over
+# this. Set -DNINFER_USE_CCACHE=OFF to force uncached compiles, which is what
+# you want when timing a cold build.
+if(NINFER_USE_CCACHE)
+  find_program(NINFER_CCACHE_PROGRAM ccache)
+  if(NINFER_CCACHE_PROGRAM)
+    foreach(lang C CXX CUDA)
+      if(NOT CMAKE_${lang}_COMPILER_LAUNCHER)
+        set(CMAKE_${lang}_COMPILER_LAUNCHER "${NINFER_CCACHE_PROGRAM}")
+      endif()
+    endforeach()
+    message(STATUS "ccache: compiling through ${NINFER_CCACHE_PROGRAM}")
+  else()
+    message(STATUS "ccache: not found, compiling directly")
+  endif()
+endif()
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
