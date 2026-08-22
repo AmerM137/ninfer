@@ -318,6 +318,7 @@ These are conventional project resources, not a checklist of resources every tas
 | BF16 source checkpoint | explicit local checkpoint directory |
 | product artifact | `out/qwen3_6_27b.ninfer` |
 | local model directory | `~/models/ninfer/` (e.g. `Qwen3.6-27B-NInfer/qwen3_6_27b_nvfp4.ninfer`); other machines may differ |
+| artifact test env vars | set `NINFER_QWEN3_6_27B_WEIGHTS`, `NINFER_QWEN3_6_27B_NVFP4_WEIGHTS`, and `NINFER_QWEN3_6_35B_A3B_WEIGHTS` to the `.ninfer` files in the local model directory so the load-plan tests run instead of skipping |
 | conversion report | `out/qwen3_6_27b.ninfer.conversion.json` |
 | normal build | `build/` |
 | profiler output | `profiles/ncu/`, `profiles/nsys/`, `profiles/bench/` |
