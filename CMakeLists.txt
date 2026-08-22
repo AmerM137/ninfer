@@ -23,6 +23,13 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 20)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+
+# CMake scans every C++20 target for module dependencies by default under Ninja.
+# NInfer declares no modules (no `export module`, no `import`), so the scan adds
+# a dependency-scan edge per TU and, worse, puts -fmodules-ts/-fmodule-mapper on
+# every C++ compile line -- flags ccache refuses to cache, which makes all of the
+# C++ objects uncacheable. Turn it off unless a target ever ships a module.
+set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)        # clangd / IDE tooling
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
