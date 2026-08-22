@@ -30,11 +30,18 @@ public:
 };
 
 struct StreamingResponse {
+    StreamingResponse(PreparedRequest prepared_in, ResponsesRequest request_in,
+                      ResponseContext previous_context_in, RequestLogContext log_context_in,
+                      std::string id, std::int64_t created, ResponsesRuntimeValues runtime)
+        : prepared(std::move(prepared_in)), request(std::move(request_in)),
+          previous_context(std::move(previous_context_in)), log_context(std::move(log_context_in)),
+          encoder(std::move(id), created, request, std::move(runtime)) {}
+
     PreparedRequest prepared;
     ResponsesRequest request;
     ResponseContext previous_context;
     RequestLogContext log_context;
-    std::unique_ptr<ResponsesEventStream> encoder;
+    ResponsesEventStream encoder;
     std::atomic<bool> cancelled{false};
     bool started = false;
 };
@@ -208,12 +215,12 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
     ResponseContext previous_context;
     try {
         RequestLimits limits;
-        limits.default_max_tokens = options_.default_max_tokens;
+        limits.default_max_tokens = configuration.default_max_tokens;
         request                   = parse_responses_request(parse_json_body(req), limits);
-        validate_model(request.generation.model, public_model_id_);
+        validate_model(request.generation.model, model_id);
         if (request.previous_response_id) {
             const std::shared_ptr<const StoredResponse> previous =
-                response_store_.get(*request.previous_response_id);
+                response_store.get(*request.previous_response_id);
             if (!previous) {
                 throw ApiException(response_not_found(*request.previous_response_id));
             }
@@ -229,10 +236,10 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
         return;
     }
 
-    const std::uint64_t req_id = ++request_seq_;
+    const std::uint64_t req_id = ++request_sequence;
     PreparedRequest prepared;
     try {
-        prepared = service_->prepare(request.generation, [&req] { return disconnected(req); });
+        prepared = service->prepare(request.generation, [&req] { return disconnected(req); });
     } catch (const ApiException& exception) {
         const ApiError error = responses_error(exception.error());
         log_request_rejected(make_request_rejection_log_context(req_id, "openai_responses",
@@ -247,16 +254,16 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
         return;
     }
 
-    const std::string id       = new_response_id();
+    std::string id             = new_response_id();
     const std::int64_t created = unix_time_now();
-    const RequestLogContext log_context =
+    RequestLogContext log_context =
         make_request_log_context(req_id, "openai_responses", request.generation, prepared);
     log_request_start(log_context);
 
     if (!request.stream) {
         try {
             const GenerationOutcome outcome =
-                service_->run(prepared, nullptr, [&req] { return disconnected(req); });
+                service->run(prepared, nullptr, [&req] { return disconnected(req); });
             const ResponsesRuntimeValues runtime = runtime_values(prepared, &outcome);
             BuiltResponse response = make_response_object(id, created, request, runtime, outcome);
             if (request.store) {
@@ -266,7 +273,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                 stored.input_items       = request.input_items;
                 stored.context           = terminal_context(previous_context, request, response);
                 stored.preserve_thinking = prepared.preserve_thinking;
-                response_store_.put(std::move(stored));
+                response_store.put(std::move(stored));
             }
             log_request_done(log_context, outcome);
             set_owned_content(res, response.body.dump(), prepared.lifetime);
@@ -281,13 +288,10 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
         return;
     }
 
-    auto stream              = std::make_shared<StreamingResponse>();
-    stream->prepared         = std::move(prepared);
-    stream->request          = std::move(request);
-    stream->previous_context = std::move(previous_context);
-    stream->log_context      = log_context;
-    stream->encoder          = std::make_unique<ResponsesEventStream>(id, created, stream->request,
-                                                                      runtime_values(stream->prepared));
+    ResponsesRuntimeValues runtime = runtime_values(prepared);
+    auto stream                    = std::make_shared<StreamingResponse>(
+        std::move(prepared), std::move(request), std::move(previous_context),
+        std::move(log_context), std::move(id), created, std::move(runtime));
 
     res.set_header("Cache-Control", "no-cache");
     res.set_header("X-Accel-Buffering", "no");
@@ -300,21 +304,21 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
             }
             stream->started = true;
             try {
-                write_stream_items(sink, *stream, stream->encoder->start());
+                write_stream_items(sink, *stream, stream->encoder.start());
                 StreamSink output;
                 output.on_reasoning = [&](const std::string& text) {
-                    write_stream_items(sink, *stream, stream->encoder->reasoning_delta(text));
+                    write_stream_items(sink, *stream, stream->encoder.reasoning_delta(text));
                 };
                 output.on_content = [&](const std::string& text) {
-                    write_stream_items(sink, *stream, stream->encoder->content_delta(text));
+                    write_stream_items(sink, *stream, stream->encoder.content_delta(text));
                 };
                 output.is_cancelled = [&] {
                     return stream->cancelled.load(std::memory_order_acquire) ||
                            (sink.is_writable && !sink.is_writable());
                 };
 
-                const GenerationOutcome outcome = service_->run(stream->prepared, &output);
-                ResponsesStreamFinish finished  = stream->encoder->finish(outcome);
+                const GenerationOutcome outcome = service->run(stream->prepared, &output);
+                ResponsesStreamFinish finished  = stream->encoder.finish(outcome);
                 if (stream->request.store) {
                     StoredResponse stored;
                     stored.id          = finished.response.body.at("id").get<std::string>();
@@ -323,11 +327,11 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                     stored.context     = terminal_context(stream->previous_context, stream->request,
                                                           finished.response);
                     stored.preserve_thinking = stream->prepared.preserve_thinking;
-                    response_store_.put(std::move(stored));
+                    response_store.put(std::move(stored));
                 }
                 write_stream_items(sink, *stream, std::move(finished.events_before_terminal));
                 log_request_done(stream->log_context, outcome);
-                write_stream_item(sink, *stream, stream->encoder->terminal(finished.response));
+                write_stream_item(sink, *stream, stream->encoder.terminal(finished.response));
                 sink.done();
                 return true;
             } catch (const ClientDisconnected& exception) {
@@ -337,7 +341,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                 const ApiError error = responses_error(exception.error());
                 log_request_error(stream->log_context, error.message);
                 try {
-                    write_stream_item(sink, *stream, stream->encoder->failed(error));
+                    write_stream_item(sink, *stream, stream->encoder.failed(error));
                     sink.done();
                     return true;
                 } catch (const ClientDisconnected&) { return false; }
@@ -345,7 +349,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                 const ApiError error = internal_error(exception);
                 log_request_error(stream->log_context, error.message);
                 try {
-                    write_stream_item(sink, *stream, stream->encoder->failed(error));
+                    write_stream_item(sink, *stream, stream->encoder.failed(error));
                     sink.done();
                     return true;
                 } catch (const ClientDisconnected&) { return false; }
@@ -357,12 +361,12 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
 void HttpServer::handle_response_input_tokens(const httplib::Request& req, httplib::Response& res) {
     try {
         RequestLimits limits;
-        limits.default_max_tokens = options_.default_max_tokens;
+        limits.default_max_tokens = configuration.default_max_tokens;
         ResponsesRequest request =
             parse_response_input_tokens_request(parse_json_body(req), limits);
-        validate_model(request.generation.model, public_model_id_);
+        validate_model(request.generation.model, model_id);
         const int tokens =
-            service_->count_prompt_tokens(request.generation, [&req] { return disconnected(req); });
+            service->count_prompt_tokens(request.generation, [&req] { return disconnected(req); });
         res.set_content(make_response_input_tokens_body(tokens), "application/json");
     } catch (const ApiException& exception) {
         write_error(res, responses_error(exception.error()));
@@ -371,7 +375,7 @@ void HttpServer::handle_response_input_tokens(const httplib::Request& req, httpl
 
 void HttpServer::handle_response_get(const httplib::Request& req, httplib::Response& res) {
     const std::string id                               = path_response_id(req);
-    const std::shared_ptr<const StoredResponse> stored = response_store_.get(id);
+    const std::shared_ptr<const StoredResponse> stored = response_store.get(id);
     if (!stored) {
         write_error(res, response_not_found(id));
         return;
@@ -381,7 +385,7 @@ void HttpServer::handle_response_get(const httplib::Request& req, httplib::Respo
 
 void HttpServer::handle_response_delete(const httplib::Request& req, httplib::Response& res) {
     const std::string id = path_response_id(req);
-    if (!response_store_.erase(id)) {
+    if (!response_store.erase(id)) {
         write_error(res, response_not_found(id));
         return;
     }
@@ -391,7 +395,7 @@ void HttpServer::handle_response_delete(const httplib::Request& req, httplib::Re
 
 void HttpServer::handle_response_input_items(const httplib::Request& req, httplib::Response& res) {
     const std::string id                               = path_response_id(req);
-    const std::shared_ptr<const StoredResponse> stored = response_store_.get(id);
+    const std::shared_ptr<const StoredResponse> stored = response_store.get(id);
     if (!stored) {
         write_error(res, response_not_found(id));
         return;
@@ -403,7 +407,7 @@ void HttpServer::handle_response_input_items(const httplib::Request& req, httpli
 
 void HttpServer::handle_response_cancel(const httplib::Request& req, httplib::Response& res) {
     const std::string id = path_response_id(req);
-    if (!response_store_.get(id)) {
+    if (!response_store.get(id)) {
         write_error(res, response_not_found(id));
         return;
     }

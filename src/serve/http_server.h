@@ -31,11 +31,11 @@ public:
     // Reserves the configured address before model loading. The service is attached only after its
     // Engine is ready, then listen() enters the blocking accept loop on the already-bound socket.
     bool bind();
-    void attach(GenerationService& service);
+    void attach(GenerationService& generation_service);
     bool listen();
     void stop();
 
-    [[nodiscard]] const std::string& public_model_id() const noexcept { return public_model_id_; }
+    [[nodiscard]] const std::string& public_model_id() const noexcept { return model_id; }
 
 private:
     void register_routes();
@@ -62,17 +62,17 @@ private:
     void run_stats_reporter();
     void stop_stats_reporter();
 
-    GenerationService* service_ = nullptr;
-    ServeOptions options_;
-    std::string public_model_id_;
-    ResponseStore response_store_;
-    JsonlRequestLog request_jsonl_;
-    httplib::Server server_;
-    std::atomic<std::uint64_t> request_seq_{0};
-    std::mutex stats_mutex_;
-    std::condition_variable stats_cv_;
-    std::thread stats_thread_;
-    bool stats_stopping_ = false;
+    GenerationService* service = nullptr;
+    ServeOptions configuration;
+    std::string model_id;
+    ResponseStore response_store;
+    JsonlRequestLog request_log;
+    httplib::Server server;
+    std::atomic<std::uint64_t> request_sequence{0};
+    std::mutex stats_mutex;
+    std::condition_variable stats_condition;
+    std::thread stats_thread;
+    bool stats_stopping = false;
 };
 
 } // namespace ninfer::serve

@@ -35,12 +35,12 @@ struct ApiError {
 class ApiException : public std::runtime_error {
 public:
     explicit ApiException(ApiError error)
-        : std::runtime_error(error.message), error_(std::move(error)) {}
+        : std::runtime_error(error.message), api_error(std::move(error)) {}
 
-    [[nodiscard]] const ApiError& error() const noexcept { return error_; }
+    [[nodiscard]] const ApiError& error() const noexcept { return api_error; }
 
 private:
-    ApiError error_;
+    ApiError api_error;
 };
 
 // Server-side context needed while parsing/validating a request.

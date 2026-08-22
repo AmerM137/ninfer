@@ -84,24 +84,22 @@ class GenerationService {
 public:
     explicit GenerationService(ServeOptions options, LoadProgress load_progress = {});
 
-    [[nodiscard]] const ServeOptions& options() const noexcept { return options_; }
+    [[nodiscard]] ninfer::LoadSummary load_summary() const { return engine.load_summary(); }
 
-    [[nodiscard]] ninfer::LoadSummary load_summary() const { return engine_->load_summary(); }
+    [[nodiscard]] ninfer::MemorySummary memory_summary() const { return engine.memory_summary(); }
 
-    [[nodiscard]] ninfer::MemorySummary memory_summary() const { return engine_->memory_summary(); }
-
-    [[nodiscard]] ninfer::RuntimeStats runtime_stats() const { return engine_->runtime_stats(); }
+    [[nodiscard]] ninfer::RuntimeStats runtime_stats() const { return engine.runtime_stats(); }
 
     [[nodiscard]] ninfer::MediaCacheSummary media_cache_summary() const {
-        return engine_->media_cache_summary();
+        return engine.media_cache_summary();
     }
 
     [[nodiscard]] ninfer::ModelSamplingDefaults sampling_defaults() const {
-        return engine_->sampling_defaults();
+        return engine.sampling_defaults();
     }
 
     [[nodiscard]] PreparedRequest prepare(const GenerationRequest& req,
-                                          std::function<bool()> is_cancelled = {}) const;
+                                          std::function<bool()> is_cancelled = {});
     [[nodiscard]] int count_prompt_tokens(const GenerationRequest& req,
                                           std::function<bool()> is_cancelled = {}) const;
 
@@ -112,12 +110,12 @@ public:
     void warmup();
 
 private:
-    [[nodiscard]] std::shared_ptr<RequestLifetime> acquire_request_lifetime() const;
+    [[nodiscard]] std::shared_ptr<RequestLifetime> acquire_request_lifetime();
 
-    ServeOptions options_;
-    std::unique_ptr<ninfer::Engine> engine_;
-    ninfer::PromptCapabilities prompt_capabilities_;
-    std::shared_ptr<RequestCapacity> request_capacity_;
+    ServeOptions configuration;
+    ninfer::Engine engine;
+    ninfer::PromptCapabilities prompt_capabilities;
+    std::shared_ptr<RequestCapacity> request_capacity;
 };
 
 } // namespace ninfer::serve

@@ -158,53 +158,53 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
 }
 
 std::string ToolCallStreamFilter::feed(std::string_view text) {
-    if (finished_) { throw std::logic_error("tool-call stream filter is already finished"); }
+    if (finished) { throw std::logic_error("tool-call stream filter is already finished"); }
     if (text.empty()) { return {}; }
-    if (saw_tool_marker_) {
-        tool_region_.append(text);
+    if (saw_tool_marker) {
+        tool_region.append(text);
         return {};
     }
 
     constexpr std::string_view kToolOpen = "<tool_call>";
-    pending_.append(text);
-    const std::size_t marker = pending_.find(kToolOpen);
+    pending.append(text);
+    const std::size_t marker = pending.find(kToolOpen);
     if (marker != std::string::npos) {
         std::size_t safe_end = marker;
         while (safe_end != 0 &&
-               std::isspace(static_cast<unsigned char>(pending_[safe_end - 1])) != 0) {
+               std::isspace(static_cast<unsigned char>(pending[safe_end - 1])) != 0) {
             --safe_end;
         }
-        std::string visible = pending_.substr(0, safe_end);
-        tool_region_        = pending_.substr(safe_end);
-        pending_.clear();
-        saw_tool_marker_ = true;
-        emitted_bytes_ += visible.size();
+        std::string visible = pending.substr(0, safe_end);
+        tool_region         = pending.substr(safe_end);
+        pending.clear();
+        saw_tool_marker = true;
+        published_bytes += visible.size();
         return visible;
     }
 
-    const std::size_t prefix = longest_suffix_prefix(pending_, kToolOpen);
-    std::size_t safe_end     = pending_.size() - prefix;
-    while (safe_end != 0 && std::isspace(static_cast<unsigned char>(pending_[safe_end - 1])) != 0) {
+    const std::size_t prefix = longest_suffix_prefix(pending, kToolOpen);
+    std::size_t safe_end     = pending.size() - prefix;
+    while (safe_end != 0 && std::isspace(static_cast<unsigned char>(pending[safe_end - 1])) != 0) {
         --safe_end;
     }
-    std::string visible = pending_.substr(0, safe_end);
-    pending_.erase(0, safe_end);
-    emitted_bytes_ += visible.size();
+    std::string visible = pending.substr(0, safe_end);
+    pending.erase(0, safe_end);
+    published_bytes += visible.size();
     return visible;
 }
 
 std::string ToolCallStreamFilter::finish(bool is_tool_call_response) {
-    if (finished_) { throw std::logic_error("tool-call stream filter is already finished"); }
-    finished_ = true;
+    if (finished) { throw std::logic_error("tool-call stream filter is already finished"); }
+    finished = true;
     if (is_tool_call_response) {
-        pending_.clear();
-        tool_region_.clear();
+        pending.clear();
+        tool_region.clear();
         return {};
     }
-    std::string tail = std::move(pending_);
-    tail += tool_region_;
-    tool_region_.clear();
-    emitted_bytes_ += tail.size();
+    std::string tail = std::move(pending);
+    tail += tool_region;
+    tool_region.clear();
+    published_bytes += tail.size();
     return tail;
 }
 

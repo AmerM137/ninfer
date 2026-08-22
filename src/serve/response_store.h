@@ -39,7 +39,7 @@ struct StoredResponse {
 
 class ResponseStore {
 public:
-    ResponseStore(std::size_t max_records, std::size_t max_bytes);
+    ResponseStore(std::size_t record_limit, std::size_t byte_limit);
 
     // get() refreshes LRU recency. Returned immutable records remain valid if
     // another request evicts or deletes their public store entry.
@@ -59,12 +59,12 @@ private:
     [[nodiscard]] std::size_t recompute_bytes_locked() const;
     void erase_locked(const std::string& id);
 
-    std::size_t max_records_ = 0;
-    std::size_t max_bytes_   = 0;
-    mutable std::mutex mutex_;
-    std::unordered_map<std::string, Entry> records_;
-    std::list<std::string> lru_;
-    std::size_t current_bytes_ = 0;
+    std::size_t max_records = 0;
+    std::size_t max_bytes   = 0;
+    mutable std::mutex mutex;
+    std::unordered_map<std::string, Entry> records;
+    std::list<std::string> lru;
+    std::size_t current_bytes = 0;
 };
 
 } // namespace ninfer::serve

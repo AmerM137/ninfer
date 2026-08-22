@@ -126,17 +126,15 @@ ServerLogEnvironment query_server_log_environment(int device);
 // blocks. Every line carries server_instance_id because request ids restart at one per process.
 class JsonlRequestLog {
 public:
-    explicit JsonlRequestLog(const std::string& path,
+    explicit JsonlRequestLog(const std::string& output_path,
                              const std::string& protected_artifact_path = {});
 
     JsonlRequestLog(const JsonlRequestLog&)            = delete;
     JsonlRequestLog& operator=(const JsonlRequestLog&) = delete;
 
-    [[nodiscard]] bool enabled() const noexcept { return output_.is_open(); }
+    [[nodiscard]] bool enabled() const noexcept { return output.is_open(); }
 
-    [[nodiscard]] const std::string& server_instance_id() const noexcept {
-        return server_instance_id_;
-    }
+    [[nodiscard]] const std::string& server_instance_id() const noexcept { return instance_id; }
 
     void write_server_start(const ServeOptions& options,
                             const ninfer::ModelSamplingDefaults& sampling_defaults,
@@ -151,11 +149,11 @@ public:
 private:
     void append(std::string record);
 
-    std::string path_;
-    std::string server_instance_id_;
-    std::ofstream output_;
-    std::mutex mutex_;
-    bool failed_ = false;
+    std::string path;
+    std::string instance_id;
+    std::ofstream output;
+    std::mutex mutex;
+    bool failed = false;
 };
 
 } // namespace ninfer::serve

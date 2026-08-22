@@ -125,16 +125,16 @@ httplib::Server::HandlerResponse handle_unrendered_http_error(const ServeOptions
 }
 
 HttpServer::HttpServer(ServeOptions options)
-    : options_(std::move(options)),
-      response_store_(options_.response_store_max_records, options_.response_store_max_bytes),
-      request_jsonl_(options_.request_log_jsonl, options_.artifact_path) {
-    const std::size_t queued_requests =
-        static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests;
-    const std::size_t worker_count = queued_requests + 1;
-    server_.new_task_queue         = [queued_requests, worker_count] {
+    : configuration(std::move(options)), response_store(configuration.response_store_max_records,
+                                                        configuration.response_store_max_bytes),
+      request_log(configuration.request_log_jsonl, configuration.artifact_path) {
+    const std::size_t queued_requests = static_cast<std::size_t>(configuration.max_concurrency) +
+                                        configuration.max_pending_requests;
+    const std::size_t worker_count    = queued_requests + 1;
+    server.new_task_queue             = [queued_requests, worker_count] {
         return new httplib::ThreadPool(worker_count, queued_requests);
     };
-    server_.set_payload_max_length(options_.max_request_bytes);
+    server.set_payload_max_length(configuration.max_request_bytes);
     register_routes();
 }
 
@@ -144,43 +144,45 @@ void HttpServer::log_line(const std::string& line) {
 
 void HttpServer::log_request_start(const RequestLogContext& context) {
     log_line(format_request_start(context));
-    request_jsonl_.write_request_start(context);
+    request_log.write_request_start(context);
 }
 
 void HttpServer::log_request_rejected(const RequestRejectionLogContext& context) {
     log_line(format_request_rejected(context));
-    request_jsonl_.write_request_rejected(context);
+    request_log.write_request_rejected(context);
 }
 
 void HttpServer::log_request_done(const RequestLogContext& context,
                                   const GenerationOutcome& outcome) {
     log_line(format_request_done(context, outcome));
-    request_jsonl_.write_request_done(context, outcome);
+    request_log.write_request_done(context, outcome);
 }
 
 void HttpServer::log_request_error(const RequestLogContext& context, const std::string& message) {
     log_line(format_request_error(context, message));
-    request_jsonl_.write_request_error(context, message);
+    request_log.write_request_error(context, message);
 }
 
 void HttpServer::log_throughput(const ThroughputReport& report) {
     log_line(format_throughput(report));
-    request_jsonl_.write_throughput(report);
+    request_log.write_throughput(report);
 }
 
 void HttpServer::run_stats_reporter() {
     using Clock                     = std::chrono::steady_clock;
-    ninfer::RuntimeStats previous   = service_->runtime_stats();
+    ninfer::RuntimeStats previous   = service->runtime_stats();
     Clock::time_point previous_time = Clock::now();
-    const auto interval             = std::chrono::milliseconds(options_.log_stats_interval_ms);
+    const auto interval = std::chrono::milliseconds(configuration.log_stats_interval_ms);
 
     for (;;) {
         {
-            std::unique_lock lock(stats_mutex_);
-            if (stats_cv_.wait_for(lock, interval, [this] { return stats_stopping_; })) { break; }
+            std::unique_lock lock(stats_mutex);
+            if (stats_condition.wait_for(lock, interval, [this] { return stats_stopping; })) {
+                break;
+            }
         }
 
-        const ninfer::RuntimeStats current = service_->runtime_stats();
+        const ninfer::RuntimeStats current = service->runtime_stats();
         const Clock::time_point now        = Clock::now();
         const ThroughputReport report      = make_throughput_report(
             previous, current, std::chrono::duration<double>(now - previous_time).count());
@@ -189,7 +191,7 @@ void HttpServer::run_stats_reporter() {
         previous_time = now;
     }
 
-    const ninfer::RuntimeStats current = service_->runtime_stats();
+    const ninfer::RuntimeStats current = service->runtime_stats();
     const Clock::time_point now        = Clock::now();
     const ThroughputReport tail        = make_throughput_report(
         previous, current, std::chrono::duration<double>(now - previous_time).count());
@@ -200,40 +202,40 @@ void HttpServer::run_stats_reporter() {
 }
 
 void HttpServer::stop_stats_reporter() {
-    if (!stats_thread_.joinable()) { return; }
+    if (!stats_thread.joinable()) { return; }
     {
-        std::lock_guard lock(stats_mutex_);
-        stats_stopping_ = true;
+        std::lock_guard lock(stats_mutex);
+        stats_stopping = true;
     }
-    stats_cv_.notify_one();
-    stats_thread_.join();
+    stats_condition.notify_one();
+    stats_thread.join();
 }
 
 void HttpServer::register_routes() {
-    server_.set_error_handler([this](const httplib::Request& request, httplib::Response& response) {
-        return handle_unrendered_http_error(options_, request, response);
+    server.set_error_handler([this](const httplib::Request& request, httplib::Response& response) {
+        return handle_unrendered_http_error(configuration, request, response);
     });
-    if (options_.enable_cors) {
-        server_.set_default_headers(
+    if (configuration.enable_cors) {
+        server.set_default_headers(
             {{"Access-Control-Allow-Origin", "*"},
              {"Access-Control-Allow-Headers", "Authorization, Content-Type"},
              {"Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS"}});
         // CORS preflight: browsers send OPTIONS with no credentials before the real
         // request; answer it without auth so the actual GET/POST can carry the key.
-        server_.Options(R"(.*)",
-                        [](const httplib::Request&, httplib::Response& res) { res.status = 204; });
+        server.Options(R"(.*)",
+                       [](const httplib::Request&, httplib::Response& res) { res.status = 204; });
     }
 
-    server_.set_pre_routing_handler([this](const httplib::Request& req, httplib::Response& res) {
-        if (options_.api_key.empty() || req.path == "/health" || req.method == "OPTIONS") {
+    server.set_pre_routing_handler([this](const httplib::Request& req, httplib::Response& res) {
+        if (configuration.api_key.empty() || req.path == "/health" || req.method == "OPTIONS") {
             return httplib::Server::HandlerResponse::Unhandled;
         }
         // Accept both the OpenAI-style bearer token and the Anthropic-style
         // x-api-key header so OpenAI clients and Claude Code (ANTHROPIC_API_KEY
         // -> x-api-key, ANTHROPIC_AUTH_TOKEN -> Authorization: Bearer) both work.
         const bool bearer_ok =
-            req.get_header_value("Authorization") == ("Bearer " + options_.api_key);
-        const bool x_api_key_ok = req.get_header_value("x-api-key") == options_.api_key;
+            req.get_header_value("Authorization") == ("Bearer " + configuration.api_key);
+        const bool x_api_key_ok = req.get_header_value("x-api-key") == configuration.api_key;
         if (!bearer_ok && !x_api_key_ok) {
             ApiError error;
             error.status  = 401;
@@ -251,7 +253,7 @@ void HttpServer::register_routes() {
         return httplib::Server::HandlerResponse::Unhandled;
     });
 
-    server_.set_exception_handler(
+    server.set_exception_handler(
         [](const httplib::Request&, httplib::Response& res, std::exception_ptr ep) {
             try {
                 std::rethrow_exception(ep);
@@ -266,62 +268,62 @@ void HttpServer::register_routes() {
             }
         });
 
-    server_.Get("/health", [](const httplib::Request&, httplib::Response& res) {
+    server.Get("/health", [](const httplib::Request&, httplib::Response& res) {
         res.set_content(nlohmann::json{{"status", "ok"}}.dump(), "application/json");
     });
-    server_.Get("/v1/models", [this](const httplib::Request& req, httplib::Response& res) {
+    server.Get("/v1/models", [this](const httplib::Request& req, httplib::Response& res) {
         handle_models(req, res);
     });
-    server_.Get(R"(/v1/models/(.+))", [this](const httplib::Request& req, httplib::Response& res) {
+    server.Get(R"(/v1/models/(.+))", [this](const httplib::Request& req, httplib::Response& res) {
         handle_model(req, res);
     });
-    server_.Post("/v1/chat/completions",
-                 [this](const httplib::Request& req, httplib::Response& res) {
-                     handle_chat_completions(req, res);
-                 });
-    server_.Post("/v1/responses", [this](const httplib::Request& req, httplib::Response& res) {
+    server.Post("/v1/chat/completions",
+                [this](const httplib::Request& req, httplib::Response& res) {
+                    handle_chat_completions(req, res);
+                });
+    server.Post("/v1/responses", [this](const httplib::Request& req, httplib::Response& res) {
         handle_responses(req, res);
     });
-    server_.Post("/v1/responses/input_tokens",
-                 [this](const httplib::Request& req, httplib::Response& res) {
-                     handle_response_input_tokens(req, res);
-                 });
-    server_.Post("/v1/responses/compact",
-                 [this](const httplib::Request& req, httplib::Response& res) {
-                     handle_response_compact(req, res);
-                 });
-    server_.Post(R"(/v1/responses/([^/]+)/cancel)",
-                 [this](const httplib::Request& req, httplib::Response& res) {
-                     handle_response_cancel(req, res);
-                 });
-    server_.Get(R"(/v1/responses/([^/]+)/input_items)",
+    server.Post("/v1/responses/input_tokens",
                 [this](const httplib::Request& req, httplib::Response& res) {
-                    handle_response_input_items(req, res);
+                    handle_response_input_tokens(req, res);
                 });
-    server_.Get(R"(/v1/responses/([^/]+))",
+    server.Post("/v1/responses/compact",
                 [this](const httplib::Request& req, httplib::Response& res) {
-                    handle_response_get(req, res);
+                    handle_response_compact(req, res);
                 });
-    server_.Delete(R"(/v1/responses/([^/]+))",
-                   [this](const httplib::Request& req, httplib::Response& res) {
-                       handle_response_delete(req, res);
-                   });
-    server_.Post("/v1/messages/count_tokens",
-                 [this](const httplib::Request& req, httplib::Response& res) {
-                     handle_count_tokens(req, res);
-                 });
-    server_.Post("/v1/messages", [this](const httplib::Request& req, httplib::Response& res) {
+    server.Post(R"(/v1/responses/([^/]+)/cancel)",
+                [this](const httplib::Request& req, httplib::Response& res) {
+                    handle_response_cancel(req, res);
+                });
+    server.Get(R"(/v1/responses/([^/]+)/input_items)",
+               [this](const httplib::Request& req, httplib::Response& res) {
+                   handle_response_input_items(req, res);
+               });
+    server.Get(R"(/v1/responses/([^/]+))",
+               [this](const httplib::Request& req, httplib::Response& res) {
+                   handle_response_get(req, res);
+               });
+    server.Delete(R"(/v1/responses/([^/]+))",
+                  [this](const httplib::Request& req, httplib::Response& res) {
+                      handle_response_delete(req, res);
+                  });
+    server.Post("/v1/messages/count_tokens",
+                [this](const httplib::Request& req, httplib::Response& res) {
+                    handle_count_tokens(req, res);
+                });
+    server.Post("/v1/messages", [this](const httplib::Request& req, httplib::Response& res) {
         handle_messages(req, res);
     });
 }
 
 void HttpServer::handle_models(const httplib::Request&, httplib::Response& res) const {
-    res.set_content(make_models_list(public_model_id_, unix_time_now()), "application/json");
+    res.set_content(make_models_list(model_id, unix_time_now()), "application/json");
 }
 
 void HttpServer::handle_model(const httplib::Request& req, httplib::Response& res) const {
     const std::string id = req.matches.size() > 1 ? req.matches[1].str() : std::string();
-    if (id != public_model_id_) {
+    if (id != model_id) {
         ApiError error;
         error.status  = 404;
         error.type    = "invalid_request_error";
@@ -330,7 +332,7 @@ void HttpServer::handle_model(const httplib::Request& req, httplib::Response& re
         write_error(res, error);
         return;
     }
-    res.set_content(make_model_object(public_model_id_, unix_time_now()), "application/json");
+    res.set_content(make_model_object(model_id, unix_time_now()), "application/json");
 }
 
 void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::Response& res) {
@@ -348,9 +350,9 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
     GenerationRequest request;
     try {
         RequestLimits limits;
-        limits.default_max_tokens = options_.default_max_tokens;
+        limits.default_max_tokens = configuration.default_max_tokens;
         request                   = parse_chat_completion_request(body, limits);
-        if (request.model != public_model_id_) {
+        if (request.model != model_id) {
             ApiError error;
             error.status  = 404;
             error.type    = "invalid_request_error";
@@ -363,10 +365,10 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
         return;
     }
 
-    const std::uint64_t req_id = ++request_seq_;
+    const std::uint64_t req_id = ++request_sequence;
     PreparedRequest prepared;
     try {
-        prepared = service_->prepare(
+        prepared = service->prepare(
             request, [&req] { return req.is_connection_alive && !req.is_connection_alive(); });
     } catch (const ApiException& e) {
         log_request_rejected(make_request_rejection_log_context(req_id, "openai_chat_completions",
@@ -394,7 +396,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
 
     if (!request.stream) {
         try {
-            const GenerationOutcome outcome = service_->run(prepared, nullptr, [&req] {
+            const GenerationOutcome outcome = service->run(prepared, nullptr, [&req] {
                 return req.is_connection_alive && !req.is_connection_alive();
             });
             log_request_done(log_context, outcome);
@@ -453,7 +455,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                            (sink.is_writable && !sink.is_writable());
                 };
 
-                const GenerationOutcome outcome = service_->run(stream->prepared, &output);
+                const GenerationOutcome outcome = service->run(stream->prepared, &output);
                 log_request_done(log_context, outcome);
                 const std::string_view remaining = unstreamed_content(outcome);
                 if (!outcome.tool_calls.empty()) {
@@ -529,9 +531,9 @@ void HttpServer::handle_count_tokens(const httplib::Request& req, httplib::Respo
     }
     try {
         RequestLimits limits;
-        limits.default_max_tokens       = options_.default_max_tokens;
+        limits.default_max_tokens       = configuration.default_max_tokens;
         const GenerationRequest request = parse_messages_request(body, limits);
-        const int input_tokens          = service_->count_prompt_tokens(
+        const int input_tokens          = service->count_prompt_tokens(
             request, [&req] { return req.is_connection_alive && !req.is_connection_alive(); });
         res.set_content(make_count_tokens_response(input_tokens), "application/json");
     } catch (const ApiException& e) {
@@ -560,7 +562,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
     GenerationRequest request;
     try {
         RequestLimits limits;
-        limits.default_max_tokens = options_.default_max_tokens;
+        limits.default_max_tokens = configuration.default_max_tokens;
         // The Anthropic endpoint accepts any `model` string (Claude Code sends real
         // Claude model names) and echoes it back; it never 404s on model id.
         request = parse_messages_request(body, limits);
@@ -576,10 +578,10 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
         return;
     }
 
-    const std::uint64_t req_id = ++request_seq_;
+    const std::uint64_t req_id = ++request_sequence;
     PreparedRequest prepared;
     try {
-        prepared = service_->prepare(
+        prepared = service->prepare(
             request, [&req] { return req.is_connection_alive && !req.is_connection_alive(); });
     } catch (const ApiException& e) {
         log_request_rejected(
@@ -607,7 +609,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
 
     if (!request.stream) {
         try {
-            const GenerationOutcome outcome = service_->run(prepared, nullptr, [&req] {
+            const GenerationOutcome outcome = service->run(prepared, nullptr, [&req] {
                 return req.is_connection_alive && !req.is_connection_alive();
             });
             log_request_done(log_context, outcome);
@@ -685,7 +687,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                            (sink.is_writable && !sink.is_writable());
                 };
 
-                const GenerationOutcome outcome = service_->run(stream->prepared, &output);
+                const GenerationOutcome outcome = service->run(stream->prepared, &output);
                 log_request_done(log_context, outcome);
                 const std::string_view remaining = unstreamed_content(outcome);
 
@@ -757,30 +759,28 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
         [stream](bool) { stream->cancelled.store(true, std::memory_order_release); });
 }
 
-bool HttpServer::bind() { return server_.bind_to_port(options_.host, options_.port); }
+bool HttpServer::bind() { return server.bind_to_port(configuration.host, configuration.port); }
 
-void HttpServer::attach(GenerationService& service) {
-    if (service_ != nullptr) {
+void HttpServer::attach(GenerationService& generation_service) {
+    if (service != nullptr) {
         throw std::logic_error("HTTP generation service is already attached");
     }
-    const ninfer::LoadSummary load = service.load_summary();
-    public_model_id_               = resolve_public_model_id(options_, load.model_id);
-    service_                       = &service;
-    request_jsonl_.write_server_start(options_, service.sampling_defaults(), public_model_id_, load,
-                                      service.memory_summary());
+    const ninfer::LoadSummary load = generation_service.load_summary();
+    model_id                       = resolve_public_model_id(configuration, load.model_id);
+    service                        = &generation_service;
+    request_log.write_server_start(configuration, generation_service.sampling_defaults(), model_id,
+                                   load, generation_service.memory_summary());
 }
 
 bool HttpServer::listen() {
-    if (service_ == nullptr) { throw std::logic_error("HTTP generation service is not attached"); }
-    if (public_model_id_.empty()) {
-        throw std::logic_error("HTTP public model id is not resolved");
-    }
-    if (options_.log_stats_interval_ms != 0) {
-        stats_stopping_ = false;
-        stats_thread_   = std::thread([this] { run_stats_reporter(); });
+    if (service == nullptr) { throw std::logic_error("HTTP generation service is not attached"); }
+    if (model_id.empty()) { throw std::logic_error("HTTP public model id is not resolved"); }
+    if (configuration.log_stats_interval_ms != 0) {
+        stats_stopping = false;
+        stats_thread   = std::thread([this] { run_stats_reporter(); });
     }
     try {
-        const bool result = server_.listen_after_bind();
+        const bool result = server.listen_after_bind();
         stop_stats_reporter();
         return result;
     } catch (...) {
@@ -789,6 +789,6 @@ bool HttpServer::listen() {
     }
 }
 
-void HttpServer::stop() { server_.stop(); }
+void HttpServer::stop() { server.stop(); }
 
 } // namespace ninfer::serve

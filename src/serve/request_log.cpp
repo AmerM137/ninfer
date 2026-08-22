@@ -475,24 +475,24 @@ std::string format_server_start_json(
                               {"load_seconds", load.load_seconds},
                               {"upload_seconds", load.upload_seconds}};
     record["engine"]   = Json{
-          {"device", options.device},
-          {"max_context", options.max_context},
-          {"kv_capacity_mode", kv_capacity_mode_name(memory.kv_capacity_mode)},
-          {"kv_capacity", memory.kv_capacity},
-          {"kv_capacity_page_groups", memory.kv_capacity_page_groups},
-          {"kv_capacity_max_page_groups", memory.kv_capacity_max_page_groups},
-          {"max_concurrency", options.max_concurrency},
-          {"max_pending_requests", options.max_pending_requests},
-          {"pending_timeout_ms", options.pending_timeout_ms},
-          {"prefill_chunk", options.prefill_chunk},
-          {"log_stats_interval_ms", options.log_stats_interval_ms},
-          {"kv_cache", kv_cache_name(options.kv_cache)},
-          {"vision", options.enable_vision},
-          {"cuda_graph", options.use_cuda_graph},
-          {"prefix_reuse", options.allow_prefix_reuse},
-          {"speculative_backend", product::speculative_backend_name(options.speculative.backend)},
-          {"speculative_draft_window", options.speculative.draft_tokens},
-          {"proposal_head", proposal_head_name(options.speculative.proposal_head)}};
+        {"device", options.device},
+        {"max_context", options.max_context},
+        {"kv_capacity_mode", kv_capacity_mode_name(memory.kv_capacity_mode)},
+        {"kv_capacity", memory.kv_capacity},
+        {"kv_capacity_page_groups", memory.kv_capacity_page_groups},
+        {"kv_capacity_max_page_groups", memory.kv_capacity_max_page_groups},
+        {"max_concurrency", options.max_concurrency},
+        {"max_pending_requests", options.max_pending_requests},
+        {"pending_timeout_ms", options.pending_timeout_ms},
+        {"prefill_chunk", options.prefill_chunk},
+        {"log_stats_interval_ms", options.log_stats_interval_ms},
+        {"kv_cache", kv_cache_name(options.kv_cache)},
+        {"vision", options.enable_vision},
+        {"cuda_graph", options.use_cuda_graph},
+        {"prefix_reuse", options.allow_prefix_reuse},
+        {"speculative_backend", product::speculative_backend_name(options.speculative.backend)},
+        {"speculative_draft_window", options.speculative.draft_tokens},
+        {"proposal_head", proposal_head_name(options.speculative.proposal_head)}};
     record["sampling_defaults"] =
         Json{{"thinking", preset_json(sampling_defaults.thinking)},
              {"non_thinking", preset_json(sampling_defaults.non_thinking)},
@@ -633,20 +633,20 @@ ServerLogEnvironment query_server_log_environment(int device) {
     return environment;
 }
 
-JsonlRequestLog::JsonlRequestLog(const std::string& path,
+JsonlRequestLog::JsonlRequestLog(const std::string& output_path,
                                  const std::string& protected_artifact_path)
-    : path_(path) {
-    if (path_.empty()) { return; }
-    if (!protected_artifact_path.empty() &&
-        normalized_absolute_path(path_) == normalized_absolute_path(protected_artifact_path)) {
+    : path(output_path) {
+    if (output_path.empty()) { return; }
+    if (!protected_artifact_path.empty() && normalized_absolute_path(output_path) ==
+                                                normalized_absolute_path(protected_artifact_path)) {
         throw std::invalid_argument("request JSONL log must not overwrite the model artifact");
     }
-    server_instance_id_ = new_server_instance_id();
+    instance_id = new_server_instance_id();
     // Binary mode: on Windows a text-mode stream would translate the JSONL
     // line terminator \n to \r\n and break the cross-platform byte contract.
-    output_.open(path_, std::ios::out | std::ios::app | std::ios::binary);
-    if (!output_) {
-        throw std::runtime_error("failed to open request JSONL log for append: " + path_);
+    output.open(output_path, std::ios::out | std::ios::app | std::ios::binary);
+    if (!output) {
+        throw std::runtime_error("failed to open request JSONL log for append: " + output_path);
     }
 }
 
@@ -660,46 +660,46 @@ void JsonlRequestLog::write_server_start(const ServeOptions& options,
     const std::uintmax_t size = std::filesystem::file_size(options.artifact_path, error);
     const std::optional<std::uint64_t> artifact_size =
         error ? std::nullopt : std::optional<std::uint64_t>(size);
-    append(format_server_start_json(server_instance_id_, unix_time_ms(), options, sampling_defaults,
+    append(format_server_start_json(instance_id, unix_time_ms(), options, sampling_defaults,
                                     public_model_id, load, memory,
                                     query_server_log_environment(options.device), artifact_size));
 }
 
 void JsonlRequestLog::write_request_start(const RequestLogContext& context) {
     if (!enabled()) { return; }
-    append(format_request_start_json(server_instance_id_, unix_time_ms(), context));
+    append(format_request_start_json(instance_id, unix_time_ms(), context));
 }
 
 void JsonlRequestLog::write_request_rejected(const RequestRejectionLogContext& context) {
     if (!enabled()) { return; }
-    append(format_request_rejected_json(server_instance_id_, unix_time_ms(), context));
+    append(format_request_rejected_json(instance_id, unix_time_ms(), context));
 }
 
 void JsonlRequestLog::write_request_done(const RequestLogContext& context,
                                          const GenerationOutcome& outcome) {
     if (!enabled()) { return; }
-    append(format_request_done_json(server_instance_id_, unix_time_ms(), context, outcome));
+    append(format_request_done_json(instance_id, unix_time_ms(), context, outcome));
 }
 
 void JsonlRequestLog::write_request_error(const RequestLogContext& context,
                                           const std::string& message) {
     if (!enabled()) { return; }
-    append(format_request_error_json(server_instance_id_, unix_time_ms(), context, message));
+    append(format_request_error_json(instance_id, unix_time_ms(), context, message));
 }
 
 void JsonlRequestLog::write_throughput(const ThroughputReport& report) {
     if (!enabled()) { return; }
-    append(format_throughput_json(server_instance_id_, unix_time_ms(), report));
+    append(format_throughput_json(instance_id, unix_time_ms(), report));
 }
 
 void JsonlRequestLog::append(std::string record) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (failed_) { return; }
-    output_ << record << '\n';
-    output_.flush();
-    if (!output_) {
-        failed_ = true;
-        write_console_log(ConsoleLogLevel::Error, "request JSONL logging failed for " + path_);
+    std::lock_guard<std::mutex> lock(mutex);
+    if (failed) { return; }
+    output << record << '\n';
+    output.flush();
+    if (!output) {
+        failed = true;
+        write_console_log(ConsoleLogLevel::Error, "request JSONL logging failed for " + path);
     }
 }
 

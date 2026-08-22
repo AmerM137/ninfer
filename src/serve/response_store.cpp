@@ -72,18 +72,18 @@ std::vector<ChatTurn> flatten_response_context(const ResponseContext& context) {
     return turns;
 }
 
-ResponseStore::ResponseStore(std::size_t max_records, std::size_t max_bytes)
-    : max_records_(max_records), max_bytes_(max_bytes) {
-    if (max_records_ == 0 || max_bytes_ == 0) {
+ResponseStore::ResponseStore(std::size_t record_limit, std::size_t byte_limit)
+    : max_records(record_limit), max_bytes(byte_limit) {
+    if (record_limit == 0 || byte_limit == 0) {
         throw std::invalid_argument("response store limits must be positive");
     }
 }
 
 std::shared_ptr<const StoredResponse> ResponseStore::get(const std::string& id) {
-    std::lock_guard lock(mutex_);
-    const auto found = records_.find(id);
-    if (found == records_.end()) { return {}; }
-    lru_.splice(lru_.begin(), lru_, found->second.lru);
+    std::lock_guard lock(mutex);
+    const auto found = records.find(id);
+    if (found == records.end()) { return {}; }
+    lru.splice(lru.begin(), lru, found->second.lru);
     return found->second.response;
 }
 
@@ -91,52 +91,52 @@ void ResponseStore::put(StoredResponse response) {
     if (response.id.empty() || !response.response.is_object()) {
         throw std::invalid_argument("stored response must have an id and object body");
     }
-    if (standalone_bytes(response) > max_bytes_) { throw_store_capacity(); }
+    if (standalone_bytes(response) > max_bytes) { throw_store_capacity(); }
 
     auto owned = std::make_shared<const StoredResponse>(std::move(response));
-    std::lock_guard lock(mutex_);
-    if (records_.contains(owned->id)) {
+    std::lock_guard lock(mutex);
+    if (records.contains(owned->id)) {
         throw std::logic_error("duplicate response id in response store");
     }
-    lru_.push_front(owned->id);
-    records_.emplace(owned->id, Entry{owned, lru_.begin()});
-    current_bytes_ = recompute_bytes_locked();
+    lru.push_front(owned->id);
+    records.emplace(owned->id, Entry{owned, lru.begin()});
+    current_bytes = recompute_bytes_locked();
 
-    while (records_.size() > max_records_ || current_bytes_ > max_bytes_) {
-        if (lru_.empty()) { throw std::logic_error("response store LRU is empty"); }
-        auto victim = std::prev(lru_.end());
+    while (records.size() > max_records || current_bytes > max_bytes) {
+        if (lru.empty()) { throw std::logic_error("response store LRU is empty"); }
+        auto victim = std::prev(lru.end());
         if (*victim == owned->id) {
-            if (victim == lru_.begin()) { throw_store_capacity(); }
+            if (victim == lru.begin()) { throw_store_capacity(); }
             --victim;
         }
         const std::string victim_id = *victim;
         erase_locked(victim_id);
-        current_bytes_ = recompute_bytes_locked();
+        current_bytes = recompute_bytes_locked();
     }
 }
 
 bool ResponseStore::erase(const std::string& id) {
-    std::lock_guard lock(mutex_);
-    if (!records_.contains(id)) { return false; }
+    std::lock_guard lock(mutex);
+    if (!records.contains(id)) { return false; }
     erase_locked(id);
-    current_bytes_ = recompute_bytes_locked();
+    current_bytes = recompute_bytes_locked();
     return true;
 }
 
 std::size_t ResponseStore::size() const {
-    std::lock_guard lock(mutex_);
-    return records_.size();
+    std::lock_guard lock(mutex);
+    return records.size();
 }
 
 std::size_t ResponseStore::bytes() const {
-    std::lock_guard lock(mutex_);
-    return current_bytes_;
+    std::lock_guard lock(mutex);
+    return current_bytes;
 }
 
 std::size_t ResponseStore::recompute_bytes_locked() const {
     std::size_t bytes = 0;
     std::unordered_set<const ResponseContextNode*> seen;
-    for (const auto& [id, entry] : records_) {
+    for (const auto& [id, entry] : records) {
         (void)id;
         bytes += record_envelope_bytes(*entry.response);
         for (ResponseContext node = entry.response->context; node != nullptr; node = node->parent) {
@@ -147,10 +147,10 @@ std::size_t ResponseStore::recompute_bytes_locked() const {
 }
 
 void ResponseStore::erase_locked(const std::string& id) {
-    const auto found = records_.find(id);
-    if (found == records_.end()) { return; }
-    lru_.erase(found->second.lru);
-    records_.erase(found);
+    const auto found = records.find(id);
+    if (found == records.end()) { return; }
+    lru.erase(found->second.lru);
+    records.erase(found);
 }
 
 } // namespace ninfer::serve

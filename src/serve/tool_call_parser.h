@@ -26,14 +26,14 @@ public:
     std::string feed(std::string_view text);
     std::string finish(bool is_tool_call_response);
 
-    [[nodiscard]] std::size_t emitted_bytes() const noexcept { return emitted_bytes_; }
+    [[nodiscard]] std::size_t emitted_bytes() const noexcept { return published_bytes; }
 
 private:
-    std::string pending_;
-    std::string tool_region_;
-    std::size_t emitted_bytes_ = 0;
-    bool saw_tool_marker_      = false;
-    bool finished_             = false;
+    std::string pending;
+    std::string tool_region;
+    std::size_t published_bytes = 0;
+    bool saw_tool_marker        = false;
+    bool finished               = false;
 };
 
 } // namespace ninfer::serve
