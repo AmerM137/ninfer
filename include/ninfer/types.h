@@ -20,9 +20,11 @@ using TokenId = std::int32_t;
 inline constexpr std::uint32_t kMaximumConcurrency               = 8;
 inline constexpr std::size_t kMaximumContextCacheSessionKeyBytes = 256;
 // Aggregate encoded image/video payload retained by one prompt, independent of item count.
-inline constexpr std::size_t kMaximumPromptMediaBytes = 256ULL << 20;
-inline constexpr std::size_t kDefaultMediaCacheBytes  = 1ULL << 30;
-inline constexpr std::size_t kDefaultMediaLiveBytes   = 2ULL << 30;
+inline constexpr std::size_t kMaximumPromptMediaBytes    = 256ULL << 20;
+inline constexpr std::size_t kDefaultMediaCacheBytes     = 1ULL << 30;
+inline constexpr std::size_t kDefaultMediaLiveBytes      = 2ULL << 30;
+inline constexpr std::uint32_t kDefaultHostStateSlots    = 8;
+inline constexpr std::size_t kDefaultHostKvCapacityBytes = 8ULL << 30;
 
 enum class KvCacheStorage : std::uint8_t {
     BFloat16,
@@ -76,13 +78,14 @@ struct LoadProgress {
 
 struct ContextCacheOptions {
     // Engine resolves every optional once at construction. With C=max_concurrency, the enabled
-    // defaults are H=C, P=2C, S=C, L=2 and M=4; Engine::options() returns those effective values.
+    // defaults are H=C, R=8, Host KV=8 GiB, P=2C, S=C, L=2 and M=4; Engine::options() returns
+    // those effective values.
     bool enabled = true;
     // Extra Device checkpoint StateImage slots H. Total Device StateImage capacity is C + H.
     std::optional<std::uint32_t> device_state_slots;
     // Host StateImages and Host KV bytes are independently configured pinned-memory capacities.
-    std::uint32_t host_state_slots     = 0;
-    std::size_t host_kv_capacity_bytes = 0;
+    std::uint32_t host_state_slots     = kDefaultHostStateSlots;
+    std::size_t host_kv_capacity_bytes = kDefaultHostKvCapacityBytes;
     // Bounded private/shared logical catalogs and per-continuation long-anchor count.
     std::optional<std::uint32_t> max_private_continuations;
     std::optional<std::uint32_t> max_shared_prefixes;

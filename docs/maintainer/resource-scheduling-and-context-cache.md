@@ -2325,8 +2325,8 @@ struct ContextCacheOptions {
     bool enabled = true;
 
     optional<uint32_t> device_state_slots;  // extra Device checkpoint capacity H
-    uint32_t host_state_slots = 0;           // R
-    size_t host_kv_capacity_bytes = 0;
+    uint32_t host_state_slots = 8;           // R
+    size_t host_kv_capacity_bytes = 8ULL << 30;
 
     optional<uint32_t> max_private_continuations;
     optional<uint32_t> max_shared_prefixes;
@@ -2339,8 +2339,8 @@ struct ContextCacheOptions {
 
 ```text
 H = C
-R = 0
-Host KV bytes = 0
+R = 8
+Host KV bytes = 8 GiB
 P = 2C private continuations
 S = C shared prefixes
 L = 2 long anchors per private continuation

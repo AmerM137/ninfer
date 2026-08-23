@@ -44,6 +44,10 @@ int main() {
     failures += check(defaults.kv_capacity.mode == ninfer::KvCapacityMode::Explicit &&
                           defaults.kv_capacity.explicit_tokens == defaults.max_context,
                       "default KV capacity does not follow max context");
+    failures += check(defaults.context_cache.host_state_slots == ninfer::kDefaultHostStateSlots &&
+                          defaults.context_cache.host_kv_capacity_bytes ==
+                              ninfer::kDefaultHostKvCapacityBytes,
+                      "Host context-cache defaults mismatch");
     failures += check(defaults.speculative.backend == ninfer::SpeculativeBackend::None,
                       "speculative decoding is not disabled by default");
     failures += check(defaults.response_store_max_records == kDefaultResponseStoreRecords &&
@@ -123,6 +127,9 @@ int main() {
                                            "6"});
     failures += check(!configured.allow_prefix_reuse,
                       "--no-prefix-reuse did not disable server prefix reuse");
+    failures += check(configured.context_cache.host_state_slots == 0 &&
+                          configured.context_cache.host_kv_capacity_bytes == 0,
+                      "root-only server mode retained default Host capacities");
     failures += check(configured.enable_vision, "--vision did not enable Vision");
     failures +=
         check(configured.preserve_thinking, "--preserve-thinking did not reach serving options");
