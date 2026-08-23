@@ -1949,6 +1949,80 @@ std::optional<runtime::ResourceDelta> ProgramImplCore::combined_pressure_effect(
     std::vector<bool> selected_shared(shared_prefix_capacity, false);
     std::vector<bool> evicted_private(continuation_capacity, false);
     std::vector<bool> evicted_shared(shared_prefix_capacity, false);
+    // Preserving pressure work is published per option. Aliased physical targets would let the
+    // first publication invalidate the next while both effects had already been credited.
+    std::vector<StateImageHandle> pressure_states;
+    std::vector<LogicalKVPageHandle> pressure_pages;
+    const auto append_pressure_targets = [&](const qwen3_6::PressureOption& option,
+                                             const SequenceState* sequence,
+                                             const SharedPrefixState* shared) {
+        std::optional<StateImageHandle> state;
+        switch (option.state) {
+        case qwen3_6::PressureStateAction::None:
+            break;
+        case qwen3_6::PressureStateAction::DropEndpointDeviceDuplicate:
+        case qwen3_6::PressureStateAction::DemoteEndpointToHost:
+        case qwen3_6::PressureStateAction::DropEndpointHostDuplicate:
+            if (sequence == nullptr) { return false; }
+            state = sequence->state.read;
+            break;
+        case qwen3_6::PressureStateAction::DropRewriteDeviceDuplicate:
+        case qwen3_6::PressureStateAction::DemoteRewriteToHost:
+        case qwen3_6::PressureStateAction::DropRewriteHostDuplicate:
+            if (sequence == nullptr || !sequence->rewrite_state) { return false; }
+            state = *sequence->rewrite_state;
+            break;
+        case qwen3_6::PressureStateAction::DropSharedDeviceDuplicate:
+        case qwen3_6::PressureStateAction::DemoteSharedToHost:
+        case qwen3_6::PressureStateAction::DropSharedHostDuplicate:
+            if (shared == nullptr) { return false; }
+            state = shared->state;
+            break;
+        }
+        if (state) {
+            if (!state_store->valid(*state) ||
+                std::find(pressure_states.begin(), pressure_states.end(), *state) !=
+                    pressure_states.end()) {
+                return false;
+            }
+            pressure_states.push_back(*state);
+        }
+
+        const SequenceKVBundle* kv =
+            sequence != nullptr ? (sequence->kv ? &*sequence->kv : nullptr)
+                                : (shared != nullptr && shared->kv ? &*shared->kv : nullptr);
+        const auto append_pages = [&](const KVAddressSpaceStore* addresses,
+                                      std::optional<KVAddressSpaceHandle> address,
+                                      const qwen3_6::PressureKVAction& action) {
+            if (action.kind == qwen3_6::PressureKVActionKind::None) {
+                return action.page_count == 0;
+            }
+            if (addresses == nullptr || !address || !addresses->valid(*address) ||
+                action.page_count == 0) {
+                return false;
+            }
+            const std::uint32_t mapped = addresses->mapped_pages(*address);
+            if (action.begin_page > mapped || action.page_count > mapped - action.begin_page) {
+                return false;
+            }
+            for (std::uint32_t offset = 0; offset < action.page_count; ++offset) {
+                const LogicalKVPageHandle page =
+                    addresses->logical_page(*address, action.begin_page + offset);
+                if (std::find(pressure_pages.begin(), pressure_pages.end(), page) !=
+                    pressure_pages.end()) {
+                    return false;
+                }
+                pressure_pages.push_back(page);
+            }
+            return true;
+        };
+        const std::optional<KVAddressSpaceHandle> text =
+            kv != nullptr ? std::optional<KVAddressSpaceHandle>(kv->text) : std::nullopt;
+        const std::optional<KVAddressSpaceHandle> backend =
+            kv != nullptr ? kv->backend : std::nullopt;
+        return append_pages(text_kv_addresses.get(), text, option.main_kv) &&
+               append_pages(backend_kv_addresses.get(), backend, option.backend_kv);
+    };
     runtime::ResourceDelta effect;
     for (std::size_t position = 0; position < pressure_owners.size(); ++position) {
         const ContinuationHandle* owner       = pressure_owners[position];
@@ -1964,6 +2038,9 @@ std::optional<runtime::ResourceDelta> ProgramImplCore::combined_pressure_effect(
             if (option.effect.added != runtime::ResourceVector{}) { return std::nullopt; }
             evicted_private[index] = true;
         } else {
+            if (!append_pressure_targets(option, &continuation_states[index], nullptr)) {
+                return std::nullopt;
+            }
             effect.removed = checked_resource_sum(effect.removed, option.effect.removed);
             effect.added   = checked_resource_sum(effect.added, option.effect.added);
         }
@@ -1982,6 +2059,9 @@ std::optional<runtime::ResourceDelta> ProgramImplCore::combined_pressure_effect(
             if (option.effect.added != runtime::ResourceVector{}) { return std::nullopt; }
             evicted_shared[index] = true;
         } else {
+            if (!append_pressure_targets(option, nullptr, &shared_prefix_states[index])) {
+                return std::nullopt;
+            }
             effect.removed = checked_resource_sum(effect.removed, option.effect.removed);
             effect.added   = checked_resource_sum(effect.added, option.effect.added);
         }
@@ -6482,9 +6562,8 @@ runtime::PreflightStatus ProgramImplCore::revalidate_replica_transition(
             replacement->shared_owner != (shared_replacement != nullptr) ||
             (state_target && (replacement->effect.removed.host.state_slots == 0 ||
                               replacement->effect.removed.host.kv_bytes != 0)) ||
-            (!state_target &&
-             (replacement->effect.removed.host.state_slots != 0 ||
-              replacement->effect.removed.host.kv_bytes < option.effect.added.host.kv_bytes))) {
+            (!state_target && (replacement->effect.removed.host.state_slots != 0 ||
+                               replacement->effect.removed.host.kv_bytes == 0))) {
             return runtime::PreflightStatus::InvariantFailure;
         }
     }

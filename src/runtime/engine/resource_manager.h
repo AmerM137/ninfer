@@ -2248,7 +2248,8 @@ public:
 
         const auto pure_host_release = [](const auto& option,
                                           const ReplicaTransitionOption& target) {
-            if (option.evicts_continuation || option.effect.added != ResourceVector{} ||
+            if (option.evicts_continuation || option.dropped_checkpoint ||
+                option.effect.added != ResourceVector{} ||
                 option.effect.removed.device != DeviceResources{} ||
                 option.removed_host_replica_impacts.empty()) {
                 return false;
@@ -2278,15 +2279,15 @@ public:
             const auto try_candidate = [&](Candidate candidate,
                                            const ContinuationHandle* private_replacement,
                                            const SharedPrefixHandle* shared_replacement,
-                                           std::uint64_t replacement_loss) {
+                                           std::uint64_t replacement_loss) -> bool {
                 if (replacement_loss > std::numeric_limits<std::uint64_t>::max() -
                                            candidate.option.backup_transfer_ns) {
-                    return;
+                    return false;
                 }
                 const std::uint64_t cost = candidate.option.backup_transfer_ns + replacement_loss;
                 if (target_value.nanoseconds <= cost ||
                     !detail::demand_fits(ledger_.used(), candidate.demand, ledger_.capacity())) {
-                    return;
+                    return false;
                 }
                 const PreflightStatus preflight = program.revalidate_replica_transition(
                     private_owner, shared_owner, candidate.option, private_replacement,
@@ -2294,12 +2295,13 @@ public:
                 if (preflight == PreflightStatus::InvariantFailure) {
                     throw std::logic_error("Program rejected a valid replica-transition shape");
                 }
-                if (preflight != PreflightStatus::Ready) { return; }
+                if (preflight != PreflightStatus::Ready) { return false; }
                 candidate.margin_ns = target_value.nanoseconds - cost;
                 consider(std::move(candidate));
+                return true;
             };
 
-            try_candidate(target, nullptr, nullptr, 0);
+            if (try_candidate(target, nullptr, nullptr, 0)) { return; }
             const ResourceVector deficit = target.option.effect.added;
             for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
                 const CatalogEntry& entry = catalog_[slot];

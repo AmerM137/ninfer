@@ -196,6 +196,7 @@ struct FakePressureOption {
     std::uint64_t id = 0;
     FakePressureKVAction main_kv;
     FakePressureKVAction backend_kv;
+    std::optional<ninfer::runtime::CheckpointRef> dropped_checkpoint;
     ResourceDelta effect;
     std::uint64_t transfer_bytes = 0;
     std::uint32_t copy_runs      = 0;
@@ -813,6 +814,7 @@ public:
             return ninfer::runtime::PreflightStatus::InvariantFailure;
         }
         if (replacement != nullptr) {
+            ++replica_replacement_revalidations;
             const std::vector<FakePressureOption> options =
                 inspect_pressure_options(*private_replacement, option.effect.added);
             if (std::find(options.begin(), options.end(), *replacement) == options.end()) {
@@ -992,14 +994,15 @@ public:
         return {};
     }
 
-    std::uint32_t last_start_lane          = ninfer::kMaximumConcurrency;
-    bool last_start_used_source            = false;
-    std::uint32_t release_count            = 0;
-    std::uint32_t last_released_key        = 0;
-    std::uint32_t last_replica_target_key  = 0;
-    std::uint32_t last_replica_victim_key  = 0;
-    bool emit_state_d2h_observation        = false;
-    std::atomic<bool>* cancel_after_victim = nullptr;
+    std::uint32_t last_start_lane                           = ninfer::kMaximumConcurrency;
+    bool last_start_used_source                             = false;
+    std::uint32_t release_count                             = 0;
+    std::uint32_t last_released_key                         = 0;
+    std::uint32_t last_replica_target_key                   = 0;
+    std::uint32_t last_replica_victim_key                   = 0;
+    mutable std::uint32_t replica_replacement_revalidations = 0;
+    bool emit_state_d2h_observation                         = false;
+    std::atomic<bool>* cancel_after_victim                  = nullptr;
 
 private:
     struct Transaction {
@@ -1353,6 +1356,45 @@ void test_value_positive_replica_replaces_lower_value_host_duplicate() {
            "Host backup replacement did not record the degraded private victim");
 }
 
+void test_ready_replica_transition_skips_dominated_replacements() {
+    FakeProgram program;
+    program.emit_state_d2h_observation = true;
+    FakeManager manager(resources({1, 2, 6, 4}, {.state_slots = 2}), 1, 2, 0, true);
+    manager.observe_prefill({.work = {.text_quanta = 1}, .text_elapsed_ns = 100});
+
+    const auto publish = [&](std::uint32_t key, FakeRequestBasePlan base) {
+        auto inspection = manager.inspect(program, FakePreparedPrompt{key}, base);
+        expect(inspection.readiness == ninfer::runtime::Readiness::Ready && inspection.choice,
+               "ready replica-transition seed was not admitted");
+        auto active = materialize_and_adopt(manager, program, std::move(*inspection.choice),
+                                            FakePreparedPrompt{key});
+        (void)manager.finish(program, LaneId{0}, active.sequence);
+    };
+
+    FakeRequestBasePlan host_resident                                 = make_base(1);
+    host_resident.resources.active_entitlement.host.state_slots       = 1;
+    host_resident.resources.reservation_added.host.state_slots        = 1;
+    host_resident.resources.physical_peak_additional.host.state_slots = 1;
+    host_resident.resources.final_added.host.state_slots              = 1;
+    publish(2, std::move(host_resident));
+    publish(1, make_base(100));
+
+    const auto reserved = manager.reserve_replica_transition(program);
+    expect(reserved == FakeManager::ReplicaTransitionReserveResult::Reserved &&
+               manager.has_replica_transition(),
+           "ready Host backup was not reserved");
+    auto progress =
+        manager.progress_context_transaction(program, ninfer::runtime::CancellationFlagView{});
+    expect(std::holds_alternative<FakeManager::ReplicaTransitionOutcome>(progress),
+           "ready replica transition returned the wrong transaction outcome");
+    const auto outcome = std::get<FakeManager::ReplicaTransitionOutcome>(std::move(progress));
+    expect(outcome.status == ninfer::runtime::ContextTransactionStatus::Published &&
+               program.last_replica_target_key == 1 && program.last_replica_victim_key == 0 &&
+               program.replica_replacement_revalidations == 0 &&
+               manager.ledger().used() == resources({0, 2, 4, 2}, {.state_slots = 2}),
+           "ready Host backup evaluated or consumed a dominated replacement");
+}
+
 } // namespace
 
 int main() {
@@ -1362,6 +1404,7 @@ int main() {
     test_materialization_abort_and_adoption();
     test_retained_private_source_reference();
     test_value_positive_replica_replaces_lower_value_host_duplicate();
+    test_ready_replica_transition_skips_dominated_replacements();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }
