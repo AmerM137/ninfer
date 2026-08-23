@@ -515,8 +515,26 @@ public:
     [[nodiscard]] std::vector<FakePressureOption>
     inspect_pressure_options(const FakeContinuationHandle& continuation,
                              ResourceVector deficit) const {
-        if (!continuation.valid || deficit.host.state_slots == 0 ||
+        if (continuation.valid && demotable_device_state_key == continuation.key &&
+            deficit.device.state_slots != 0 && continuation.resources.device.state_slots != 0 &&
             continuation.resources.host.state_slots == 0) {
+            return {FakePressureOption{
+                .id             = continuation.key,
+                .effect         = {.removed = resources({.state_slots = 1}),
+                                   .added   = resources({}, {.state_slots = 1})},
+                .transfer_bytes = 1,
+                .copy_runs      = 1,
+                .transfer_requirements =
+                    {{.resource  = ninfer::runtime::ContextResourceClass::State,
+                      .direction = ninfer::runtime::ContextTransferDirection::DeviceToHost,
+                      .units     = 1,
+                      .bytes     = 1,
+                      .copy_runs = 1}},
+            }};
+        }
+        if (!continuation.valid || deficit.host.state_slots == 0 ||
+            continuation.resources.host.state_slots == 0 ||
+            continuation.resources.device.state_slots == 0) {
             return {};
         }
         const ninfer::runtime::CheckpointRef checkpoint = continuation_summary().endpoint->ref;
@@ -598,11 +616,14 @@ public:
             !shared_pressure_owners.empty()) {
             throw std::logic_error("fake pressure composition is not row aligned");
         }
+        last_composed_pressure.clear();
         for (std::size_t index = 0; index < pressure_options.size(); ++index) {
             if (pressure_owners[index] == nullptr || !pressure_owners[index]->valid ||
                 pressure_options[index].id != pressure_owners[index]->key) {
                 return std::nullopt;
             }
+            last_composed_pressure.emplace_back(pressure_options[index].id,
+                                                pressure_options[index].evicts_continuation);
             if (!ninfer::runtime::detail::augment_demand(plan.resources,
                                                          pressure_options[index].effect)) {
                 return std::nullopt;
@@ -948,14 +969,15 @@ public:
             return result;
         }
         result.disposition            = ninfer::runtime::FinishDisposition::Catalogued;
+        const bool host_only          = host_only_finish_key == active.key;
         const ResourceVector resident = resources(
             DeviceResources{
-                .state_slots      = 1,
+                .state_slots      = host_only ? 0U : 1U,
                 .main_kv_pages    = std::min(2U, active.resources.device.main_kv_pages),
                 .backend_kv_pages = std::min(1U, active.resources.device.backend_kv_pages),
             },
             HostResources{
-                .state_slots = std::min(1U, active.resources.host.state_slots),
+                .state_slots = host_only ? 1U : std::min(1U, active.resources.host.state_slots),
             });
         result.resource_delta = {
             .removed = active.resources,
@@ -1001,8 +1023,11 @@ public:
     std::uint32_t last_replica_target_key                   = 0;
     std::uint32_t last_replica_victim_key                   = 0;
     mutable std::uint32_t replica_replacement_revalidations = 0;
-    bool emit_state_d2h_observation                         = false;
-    std::atomic<bool>* cancel_after_victim                  = nullptr;
+    mutable std::vector<std::pair<std::uint64_t, bool>> last_composed_pressure;
+    std::optional<std::uint32_t> demotable_device_state_key;
+    std::optional<std::uint32_t> host_only_finish_key;
+    bool emit_state_d2h_observation        = false;
+    std::atomic<bool>* cancel_after_victim = nullptr;
 
 private:
     struct Transaction {
@@ -1086,6 +1111,13 @@ FakeRequestBasePlan make_base(std::uint64_t work = 10) {
                         .active_lanes = 1, .state_slots = 1, .main_kv_pages = 3, .backend_kv_pages = 2});
     base.value.service_work_quanta = work;
     return base;
+}
+
+void add_host_state_entitlement(FakeRequestBasePlan& base) {
+    base.resources.active_entitlement.host.state_slots       = 1;
+    base.resources.reservation_added.host.state_slots        = 1;
+    base.resources.physical_peak_additional.host.state_slots = 1;
+    base.resources.final_added.host.state_slots              = 1;
 }
 
 using FakeManager = ninfer::runtime::ResourceManager<FakePackage>;
@@ -1310,6 +1342,65 @@ void test_retained_private_source_reference() {
            "retained source did not become reusable after branch release");
 }
 
+void test_complete_eviction_closure_competes_with_mixed_closure() {
+    FakeProgram program;
+    program.host_only_finish_key       = 3;
+    program.demotable_device_state_key = 1;
+    FakeManager manager(resources({1, 2, 10, 6}, {.state_slots = 1}), 1, 3, 0, true);
+
+    const auto publish = [&](std::uint32_t key, ninfer::runtime::RetentionClass retention,
+                             bool host_only) {
+        FakeRequestBasePlan base = make_base();
+        base.cache.retention     = retention;
+        if (host_only) { add_host_state_entitlement(base); }
+        auto inspection = manager.inspect(program, FakePreparedPrompt{key}, base);
+        expect(inspection.readiness == ninfer::runtime::Readiness::Ready && inspection.choice,
+               "pressure seed was not admitted");
+        auto active = materialize_and_adopt(manager, program, std::move(*inspection.choice),
+                                            FakePreparedPrompt{key});
+        (void)manager.finish(program, LaneId{0}, active.sequence);
+    };
+
+    publish(3, ninfer::runtime::RetentionClass::LiveSession, true);
+    publish(1, ninfer::runtime::RetentionClass::LiveSession, false);
+    publish(2, ninfer::runtime::RetentionClass::RecentPrivate, false);
+
+    auto inspection = manager.inspect(program, FakePreparedPrompt{4}, make_base());
+    expect(inspection.readiness == ninfer::runtime::Readiness::Ready && inspection.choice,
+           "root request was not closed under combined pressure");
+    expect(
+        program.last_composed_pressure == std::vector<std::pair<std::uint64_t, bool>>{{2, true}},
+        "mixed closure displaced more valuable continuations than the complete eviction closure");
+}
+
+void test_disposable_eviction_beats_cold_start_demotion() {
+    FakeProgram program;
+    program.host_only_finish_key       = 1;
+    program.demotable_device_state_key = 2;
+    FakeManager manager(resources({1, 1, 8, 5}, {.state_slots = 2}), 1, 3, 0, true);
+
+    FakeRequestBasePlan live = make_base();
+    live.cache.retention     = ninfer::runtime::RetentionClass::LiveSession;
+    add_host_state_entitlement(live);
+    auto live_inspection = manager.inspect(program, FakePreparedPrompt{1}, live);
+    auto live_active = materialize_and_adopt(manager, program, std::move(*live_inspection.choice),
+                                             FakePreparedPrompt{1});
+    (void)manager.finish(program, LaneId{0}, live_active.sequence);
+
+    FakeRequestBasePlan disposable = make_base();
+    disposable.cache.retention     = ninfer::runtime::RetentionClass::Disposable;
+    auto disposable_inspection     = manager.inspect(program, FakePreparedPrompt{2}, disposable);
+    auto disposable_active         = materialize_and_adopt(
+        manager, program, std::move(*disposable_inspection.choice), FakePreparedPrompt{2});
+    (void)manager.finish(program, LaneId{0}, disposable_active.sequence);
+
+    auto inspection = manager.inspect(program, FakePreparedPrompt{3}, make_base());
+    expect(inspection.readiness == ninfer::runtime::Readiness::Ready && inspection.choice,
+           "cold-start pressure request was not admitted");
+    expect(program.last_composed_pressure == std::vector<std::pair<std::uint64_t, bool>>{{2, true}},
+           "cold-start cost preferred transferring a Disposable checkpoint over evicting it");
+}
+
 void test_value_positive_replica_replaces_lower_value_host_duplicate() {
     FakeProgram program;
     program.emit_state_d2h_observation = true;
@@ -1403,6 +1494,8 @@ int main() {
     test_root_only_mode_releases_finished_context();
     test_materialization_abort_and_adoption();
     test_retained_private_source_reference();
+    test_complete_eviction_closure_competes_with_mixed_closure();
+    test_disposable_eviction_beats_cold_start_demotion();
     test_value_positive_replica_replaces_lower_value_host_duplicate();
     test_ready_replica_transition_skips_dominated_replacements();
     if (failures == 0) { std::cout << "ok\n"; }

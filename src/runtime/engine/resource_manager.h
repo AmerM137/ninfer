@@ -1274,12 +1274,13 @@ public:
             return candidate_key < current_key;
         };
         std::vector<ClosedCandidate> closed_candidates;
-        closed_candidates.reserve(candidates.size());
+        closed_candidates.reserve(candidates.size() * 2U);
         for (std::size_t candidate_index = 0; candidate_index < candidates.size();
              ++candidate_index) {
-            ClosedCandidate closed = close_candidate(candidate_index, true);
-            if (!closed.found) { closed = close_candidate(candidate_index, false); }
-            if (closed.found) { closed_candidates.push_back(std::move(closed)); }
+            ClosedCandidate mixed = close_candidate(candidate_index, true);
+            if (mixed.found) { closed_candidates.push_back(std::move(mixed)); }
+            ClosedCandidate eviction_only = close_candidate(candidate_index, false);
+            if (eviction_only.found) { closed_candidates.push_back(std::move(eviction_only)); }
         }
         std::sort(closed_candidates.begin(), closed_candidates.end(), better_closed);
 
@@ -3378,13 +3379,13 @@ private:
             cost.dropped_shared_stable,
             cost.dropped_live_session,
             cost.dropped_recent_private,
-            cost.evicted_continuations,
-            cost.dropped_checkpoints,
             cost.remaining_text_prefill,
             cost.remaining_vision_prefill,
             cost.transferred_state_images,
             cost.transferred_bytes,
             cost.copy_runs,
+            cost.evicted_continuations,
+            cost.dropped_checkpoints,
             std::numeric_limits<std::uint32_t>::max() - cost.reused_prompt_tokens,
         };
     }
@@ -3453,14 +3454,27 @@ private:
 
     [[nodiscard]] static CostEstimate weighted_cost(CostEstimate cost,
                                                     std::uint32_t probability_q16) noexcept {
-        if (cost.calibrated) {
+        const auto weighted_u64 = [probability_q16](std::uint64_t value) {
+            if (value == 0 || probability_q16 == 0) { return std::uint64_t{0}; }
             const unsigned __int128 weighted =
-                static_cast<unsigned __int128>(cost.nanoseconds) * probability_q16;
-            const unsigned __int128 value = weighted >> 16U;
-            cost.nanoseconds              = value > std::numeric_limits<std::uint64_t>::max()
-                                                ? std::numeric_limits<std::uint64_t>::max()
-                                                : static_cast<std::uint64_t>(value);
-        }
+                static_cast<unsigned __int128>(value) * probability_q16 + 0xffffU;
+            const unsigned __int128 result = weighted >> 16U;
+            return result > std::numeric_limits<std::uint64_t>::max()
+                       ? std::numeric_limits<std::uint64_t>::max()
+                       : static_cast<std::uint64_t>(result);
+        };
+        const auto weighted_u32 = [&](std::uint32_t value) {
+            return static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                weighted_u64(value), std::numeric_limits<std::uint32_t>::max()));
+        };
+        if (cost.calibrated) { cost.nanoseconds = weighted_u64(cost.nanoseconds); }
+        cost.fallback.remaining_text_prefill = weighted_u64(cost.fallback.remaining_text_prefill);
+        cost.fallback.remaining_vision_prefill =
+            weighted_u64(cost.fallback.remaining_vision_prefill);
+        cost.fallback.transferred_state_images =
+            weighted_u32(cost.fallback.transferred_state_images);
+        cost.fallback.transferred_bytes = weighted_u64(cost.fallback.transferred_bytes);
+        cost.fallback.copy_runs         = weighted_u32(cost.fallback.copy_runs);
         return cost;
     }
 
