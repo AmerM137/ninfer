@@ -1,6 +1,6 @@
 # NInfer 资源调度与上下文缓存架构
 
-**文档状态：** 已选定的目标架构
+**文档状态：** 当前已实现架构
 **目标模型：** 当前注册的 Qwen3.6/Qwen3.8 family variants
 **目标硬件：** 单张 NVIDIA RTX 5090
 **所属层级：** Engine / ResourceManager / Program
@@ -8,7 +8,7 @@
 
 NInfer 面向单张 RTX 5090，并围绕当前注册的混合 GDN/Full Attention variants 深度特化。模型 state 是固定大小的完整 image，而 Main/Backend KV 随上下文线性增长；在权重、最大上下文、workspace 和 CUDA Graph 已占用大量显存的前提下，VRAM 中只能容纳有限的额外 state 和 KV 缓存，因此本架构将有界Host memory定义为可配置的正式后备存储层。
 
-本文是资源调度与上下文缓存实现工作的唯一目标架构，不记录备选设计、测试清单或分阶段实施步骤。在该架构完成代码cutover之前，[Engine架构](engine-architecture.md)与[Paged KV Context Store](paged-kv-cache.md)仍描述当前已落地行为；实现完成时应将两份当前行为文档同步到本文定义的ownership和storage contract。
+本文是当前资源调度与上下文缓存的正式架构，不记录备选设计、测试清单或分阶段实施步骤。顶层请求生命周期与调度边界见[Engine架构](engine-architecture.md)，物理KV容器与consumer contract见[Paged KV Context Store](paged-kv-cache.md)。
 
 ---
 
@@ -383,7 +383,7 @@ N_{\text{device state}} = C + H
 其中：
 
 * (C)：最大 active concurrency；
-* (H)：满并发时仍保证存在的 hot checkpoint capacity。
+* (H)：满并发时仍保证存在的 Device checkpoint capacity。
 
 所有 Device slots 完全同构，不固定划分为：
 
@@ -1568,7 +1568,7 @@ Transaction publication后，request从`MATERIALIZING`转为`Active`；publicati
 
 #### TemporarilyBlocked
 
-Request在Engine空闲或当前active resources释放后可以运行，但此boundary无法取得完整reservation。该结果不claim source、不pin victim、不创建transaction；Scheduler在后续boundary按原有保护与backfill规则重试。
+Request在Engine空闲或当前active resources释放后可以运行，但此boundary无法取得完整reservation。该结果不claim source、不pin victim、不创建transaction，也不会在每个decode boundary轮询。Waiting queue、active entitlement、admission gate或context transaction/capability发生相关变化后，Engine才重新置位admission check；Scheduler随后在下一个符合原有保护、backfill和decode公平性规则的boundary重新执行fresh inspection。
 
 #### PermanentlyInfeasible
 
@@ -2318,21 +2318,37 @@ ResourceManager使用实际观测更新成本估计，但不需要复杂在线�
 
 ## 24. 配置与容量
 
-建议的启动容量概念：
+当前启动配置为：
 
 ```cpp
 struct ContextCacheOptions {
-    bool enabled;
+    bool enabled = true;
 
-    uint32_t hot_state_slots;     // H
-    uint32_t host_state_slots;    // R
+    optional<uint32_t> device_state_slots;  // extra Device checkpoint capacity H
+    uint32_t host_state_slots = 0;           // R
+    size_t host_kv_capacity_bytes = 0;
 
-    size_t host_kv_capacity_bytes;
-
-    uint32_t max_private_continuations;
-    uint32_t max_shared_prefixes;
+    optional<uint32_t> max_private_continuations;
+    optional<uint32_t> max_shared_prefixes;
+    optional<uint32_t> max_long_anchors_per_continuation;
+    optional<uint32_t> max_cache_markers_per_request;
 };
 ```
+
+`Engine`在构造target前只解析一次optional。设`C=max_concurrency`，启用时的有效默认值为：
+
+```text
+H = C
+R = 0
+Host KV bytes = 0
+P = 2C private continuations
+S = C shared prefixes
+L = 2 long anchors per private continuation
+M = 4 caller markers per request
+```
+
+`Engine::options()`返回全部optional已经具体化的有效配置。`enabled=false`解析为root-only：`H/R/Host
+KV/S/L=0`、`P=C`，成功完成的请求不发布continuation；`M`仍约束输入复杂度。
 
 Device state总量：
 
@@ -2340,17 +2356,11 @@ Device state总量：
 C + H
 \]
 
-Agent优先配置通常可以取：
-
-\[
-H=C
-\]
-
-数值上是 `2C` Device state images，但语义是：
+默认数值上是 `2C` Device state images，但语义是：
 
 ```text
 C active guarantee
-+ C global hot-checkpoint capacity
++ C global Device-checkpoint capacity
 ```
 
 而不是每 lane固定 current/rewrite配对。
@@ -2365,22 +2375,23 @@ Host KV按实际 extent bytes计费。
 
 ## 25. Observability
 
-ResourceManager应输出：
+`RuntimeStats`在worker boundary发布三类数据：Engine构造以来的累计counter、当前resource/scheduler
+gauge，以及显式命名的最后一次决策观测。当前字段覆盖：
 
-* endpoint/rewrite/shared/root hit次数；
-* reused prompt tokens；
-* selected checkpoint frontier；
-* state Move/Fork/Restore次数；
-* state D2H/H2D bytes与时间；
-* 每个 KV pool的 D2H/H2D bytes与时间；
-* partial spill pages；
-* full continuation evictions；
-* checkpoint degradations；
-* Device/Host state occupancy；
-* Device/Host KV occupancy；
-* shared page reference count；
-* predicted cost与实际恢复时间；
-* 预计节省的 prefill时间。
+* materializing/capture-pending request gauge与ActiveCapture完成/中止counter；
+* 六类selection counter、累计reused prompt tokens和`last_selected_frontier_tokens`；
+* state Move/Fork/Restore与D2H/H2D/D2D count、bytes、seconds；
+* Main/Backend KV D2H/H2D/D2D pages、bytes、seconds；
+* partial spill、partial-tail COW、private/shared degradation和eviction counter；
+* `device_state_occupied_slots`、`host_state_occupied_slots`、Device Main/Backend pages、Host KV
+  bytes与shared active-reference gauge；
+* historical Fork hit counter；
+* `last_predicted_materialization_ns`及其calibrated bit；
+* 累计actual context-transfer seconds。
+
+`MemorySummary`另行报告启动固定的Host State/KV capacity和调用边界上的physical occupancy。serve
+JSONL把累计counter转换为interval delta，保留当前gauge和last-decision语义；不把进程级delta归因到
+单个request。
 
 这些数据是后续调优 (H)、Host容量和 retention policy 的依据。
 

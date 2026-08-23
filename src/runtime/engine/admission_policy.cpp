@@ -21,18 +21,6 @@ void add(ResourceTotals& total, const DeviceResources& resources) noexcept {
     total.backend_kv_pages += resources.backend_kv_pages;
 }
 
-void subtract(ResourceTotals& total, const DeviceResources& resources) {
-    if (resources.active_lanes > total.active_lanes || resources.state_slots > total.state_slots ||
-        resources.main_kv_pages > total.main_kv_pages ||
-        resources.backend_kv_pages > total.backend_kv_pages) {
-        throw std::logic_error("admission resource subtraction underflow");
-    }
-    total.active_lanes -= resources.active_lanes;
-    total.state_slots -= resources.state_slots;
-    total.main_kv_pages -= resources.main_kv_pages;
-    total.backend_kv_pages -= resources.backend_kv_pages;
-}
-
 bool fits(const ResourceTotals& used, const DeviceResources& capacity) noexcept {
     return used.active_lanes <= capacity.active_lanes && used.state_slots <= capacity.state_slots &&
            used.main_kv_pages <= capacity.main_kv_pages &&
@@ -43,15 +31,32 @@ bool contains(std::span<const std::uint64_t> ids, std::uint64_t id) noexcept {
     return std::find(ids.begin(), ids.end(), id) != ids.end();
 }
 
-bool is_incumbent(const AdmissionProtection& protection, std::uint64_t id) noexcept {
-    return contains(
-        std::span<const std::uint64_t>(protection.incumbent_ids.data(), protection.incumbent_count),
-        id);
-}
-
 bool is_donor(const AdmissionProtection& protection, std::uint64_t id) noexcept {
     return contains(
         std::span<const std::uint64_t>(protection.donor_ids.data(), protection.donor_count), id);
+}
+
+std::uint32_t projection_owner_mask(const ProtectedHeadResourceProjection& projection) noexcept {
+    std::uint32_t mask = 0;
+    for (std::uint32_t owners = 1; owners < projection.release_by_last_owner_mask.size();
+         ++owners) {
+        const DeviceResources& resources = projection.release_by_last_owner_mask[owners];
+        if (resources != DeviceResources{}) { mask |= owners; }
+    }
+    return mask;
+}
+
+ResourceTotals projected_resources(const ProtectedHeadResourceProjection& projection,
+                                   std::uint32_t surviving_owners) noexcept {
+    ResourceTotals total;
+    add(total, projection.fixed_non_reclaimable);
+    for (std::uint32_t owners = 1; owners < projection.release_by_last_owner_mask.size();
+         ++owners) {
+        if ((owners & surviving_owners) != 0) {
+            add(total, projection.release_by_last_owner_mask[owners]);
+        }
+    }
+    return total;
 }
 
 } // namespace
@@ -66,6 +71,7 @@ bool admission_resources_fit(const DeviceResources& used,
 AdmissionProtection make_admission_protection(std::uint64_t epoch_id, std::uint64_t head_request_id,
                                               const DeviceResources& head_resources,
                                               std::span<const ActiveAdmissionSnapshot> active,
+                                              const ProtectedHeadResourceProjection& projection,
                                               const DeviceResources& capacity) {
     if (epoch_id == 0 || head_request_id == 0 || active.empty() ||
         active.size() > kMaximumConcurrency || head_resources.active_lanes == 0 ||
@@ -77,16 +83,19 @@ AdmissionProtection make_admission_protection(std::uint64_t epoch_id, std::uint6
     out.epoch_id        = epoch_id;
     out.head_request_id = head_request_id;
     out.head_resources  = head_resources;
-    out.incumbent_count = active.size();
 
-    ResourceTotals survivors;
+    std::uint32_t surviving_owners = projection_owner_mask(projection);
+    std::uint32_t observed_bits    = 0;
     for (std::size_t i = 0; i < active.size(); ++i) {
-        if (active[i].request_id == 0 || active[i].remaining_work_quanta == 0) {
+        if (active[i].request_id == 0 || active[i].remaining_work_quanta == 0 ||
+            active[i].owner_bit == 0 || (active[i].owner_bit & (active[i].owner_bit - 1U)) != 0 ||
+            (observed_bits & active[i].owner_bit) != 0 ||
+            (surviving_owners & active[i].owner_bit) == 0) {
             throw std::invalid_argument("protected incumbent has invalid progress state");
         }
-        out.incumbent_ids[i] = active[i].request_id;
-        add(survivors, active[i].resources);
+        observed_bits |= active[i].owner_bit;
     }
+    ResourceTotals survivors = projected_resources(projection, surviving_owners);
     add(survivors, head_resources);
     if (fits(survivors, capacity)) {
         throw std::invalid_argument("protected head is not blocked by frozen incumbents");
@@ -104,7 +113,9 @@ AdmissionProtection make_admission_protection(std::uint64_t epoch_id, std::uint6
 
     for (std::size_t i = 0; i < active.size(); ++i) {
         const ActiveAdmissionSnapshot& donor = active[order[i]];
-        subtract(survivors, donor.resources);
+        surviving_owners &= ~donor.owner_bit;
+        survivors = projected_resources(projection, surviving_owners);
+        add(survivors, head_resources);
         out.donor_ids[out.donor_count++] = donor.request_id;
         out.temporal_credit              = donor.remaining_work_quanta;
         if (fits(survivors, capacity)) { return out; }
@@ -114,19 +125,14 @@ AdmissionProtection make_admission_protection(std::uint64_t epoch_id, std::uint6
 
 bool persistent_backfill_is_safe(const AdmissionProtection& protection,
                                  std::span<const ActiveAdmissionSnapshot> active,
-                                 const DeviceResources& candidate,
+                                 const ProtectedHeadResourceProjection& candidate,
                                  const DeviceResources& capacity) noexcept {
-    ResourceTotals future;
-    add(future, protection.head_resources);
+    std::uint32_t surviving_owners = projection_owner_mask(candidate);
     for (const ActiveAdmissionSnapshot& request : active) {
-        if (is_incumbent(protection, request.request_id)) {
-            if (!is_donor(protection, request.request_id)) { add(future, request.resources); }
-        } else if (request.backfill_epoch == protection.epoch_id &&
-                   request.backfill_class == BackfillClass::Persistent) {
-            add(future, request.resources);
-        }
+        if (is_donor(protection, request.request_id)) { surviving_owners &= ~request.owner_bit; }
     }
-    add(future, candidate);
+    ResourceTotals future = projected_resources(candidate, surviving_owners);
+    add(future, protection.head_resources);
     return fits(future, capacity);
 }
 
@@ -144,16 +150,17 @@ protection_frontier_distance(const AdmissionProtection& protection,
 
 bool protected_head_safe_without_temporal(const AdmissionProtection& protection,
                                           std::span<const ActiveAdmissionSnapshot> active,
+                                          const ProtectedHeadResourceProjection& projection,
                                           const DeviceResources& capacity) noexcept {
-    ResourceTotals used;
-    add(used, protection.head_resources);
+    std::uint32_t surviving_owners = projection_owner_mask(projection);
     for (const ActiveAdmissionSnapshot& request : active) {
-        if (is_incumbent(protection, request.request_id) ||
-            request.backfill_epoch != protection.epoch_id ||
-            request.backfill_class != BackfillClass::Temporal) {
-            add(used, request.resources);
+        if (request.backfill_epoch == protection.epoch_id &&
+            request.backfill_class == BackfillClass::Temporal) {
+            surviving_owners &= ~request.owner_bit;
         }
     }
+    ResourceTotals used = projected_resources(projection, surviving_owners);
+    add(used, protection.head_resources);
     return fits(used, capacity);
 }
 

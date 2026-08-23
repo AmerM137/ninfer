@@ -49,9 +49,10 @@ void configure_text_card(TextContext& card, const ExecutionCore& execution,
     }
 }
 
-PrefillChunkResult prefill_text_chunk(
-    PrefillContext& state, std::span<const TokenId> ids, std::uint32_t nominal_length,
-    std::optional<std::uint32_t> rewrite_checkpoint_capture_frontier, bool finalize_at_end) {
+PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const TokenId> ids,
+                                      std::uint32_t nominal_length,
+                                      std::optional<std::uint32_t> split_frontier,
+                                      bool finalize_at_end) {
     TextContext card(state.execution.device, state.execution.model, state.execution.work,
                      state.text_kv, state.execution.linear_attention, state.execution.io,
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
@@ -59,10 +60,8 @@ PrefillChunkResult prefill_text_chunk(
     configure_text_card(card, state.execution, state.sampling, state.state_source_slot,
                         state.state_destination_slot, state.mtp_proposal_extent);
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
-    card.set_prefill_rewrite_checkpoint_frontier(
-        rewrite_checkpoint_capture_frontier
-            ? static_cast<std::int64_t>(*rewrite_checkpoint_capture_frontier)
-            : -1);
+    card.set_prefill_split_frontier(split_frontier ? static_cast<std::int64_t>(*split_frontier)
+                                                   : -1);
     const std::span<const int> prompt(ids.data(), ids.size());
     if (state.dflash != nullptr) {
         DFlashFeatureSink sink = make_dflash_prefill_sink(state);
@@ -72,11 +71,11 @@ PrefillChunkResult prefill_text_chunk(
     return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, finalize_at_end);
 }
 
-PrefillChunkResult
-prefill_multimodal_chunk(PrefillContext& state, const PreparedPromptData& prompt,
-                         VisionPrefillSession& vision, std::uint32_t nominal_length,
-                         std::optional<std::uint32_t> rewrite_checkpoint_capture_frontier,
-                         bool finalize_at_end) {
+PrefillChunkResult prefill_multimodal_chunk(PrefillContext& state, const PreparedPromptData& prompt,
+                                            VisionPrefillSession& vision,
+                                            std::uint32_t nominal_length,
+                                            std::optional<std::uint32_t> split_frontier,
+                                            bool finalize_at_end) {
     if (state.dflash != nullptr) {
         throw std::logic_error("DFlash staged multimodal prefill is unavailable");
     }
@@ -87,10 +86,8 @@ prefill_multimodal_chunk(PrefillContext& state, const PreparedPromptData& prompt
     configure_text_card(card, state.execution, state.sampling, state.state_source_slot,
                         state.state_destination_slot, state.mtp_proposal_extent);
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
-    card.set_prefill_rewrite_checkpoint_frontier(
-        rewrite_checkpoint_capture_frontier
-            ? static_cast<std::int64_t>(*rewrite_checkpoint_capture_frontier)
-            : -1);
+    card.set_prefill_split_frontier(split_frontier ? static_cast<std::int64_t>(*split_frontier)
+                                                   : -1);
     return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, vision, finalize_at_end);
 }
 

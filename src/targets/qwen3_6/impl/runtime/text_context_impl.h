@@ -1093,12 +1093,10 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
     }
     const int base_i = static_cast<int>(base);
 
-    const std::int64_t base64         = static_cast<std::int64_t>(base);
-    const std::int64_t checkpoint_abs = prefill_rewrite_checkpoint_frontier_;
-    const bool has_rewrite_checkpoint =
-        checkpoint_abs > base64 && checkpoint_abs <= base64 + static_cast<std::int64_t>(T);
-    const int checkpoint_rel =
-        has_rewrite_checkpoint ? static_cast<int>(checkpoint_abs - base64) : -1;
+    const std::int64_t base64    = static_cast<std::int64_t>(base);
+    const std::int64_t split_abs = prefill_split_frontier_;
+    const bool has_split = split_abs > base64 && split_abs <= base64 + static_cast<std::int64_t>(T);
+    const int split_rel  = has_split ? static_cast<int>(split_abs - base64) : -1;
     const bool prepare_mtp_prompt = mtp_enabled() && io_.mtp.has_value();
     if (prepare_mtp_prompt &&
         mtp_proposal_extent_ > static_cast<std::uint32_t>(io_.mtp->draft_tokens.ne[0])) {
@@ -1107,9 +1105,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
     int t0 = 0;
     for (; t0 < T;) {
         int len = std::min(chunk, T - t0);
-        if (checkpoint_rel > 0 && t0 < checkpoint_rel && t0 + len > checkpoint_rel) {
-            len = checkpoint_rel - t0;
-        }
+        if (split_rel > 0 && t0 < split_rel && t0 + len > split_rel) { len = split_rel - t0; }
         work_.reset();
 
         VisionChunk vision_chunk;
@@ -1294,7 +1290,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                 }
             }
 
-            if (checkpoint_rel > 0 && t0 + len == checkpoint_rel &&
+            if (split_rel > 0 && t0 + len == split_rel &&
                 rewrite_checkpoint_hidden_output_ != nullptr) {
                 require_tensor_shape(*rewrite_checkpoint_hidden_output_, DType::BF16,
                                      {kCfg.hidden, 1}, "rewrite checkpoint hidden output");
@@ -1307,14 +1303,14 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
 
         if constexpr (requires { tap.consume_prefill_chunk(len, false); }) {
             work_.reset();
-            tap.consume_prefill_chunk(len, checkpoint_rel > 0 && t0 + len == checkpoint_rel);
+            tap.consume_prefill_chunk(len, split_rel > 0 && t0 + len == split_rel);
         }
 
         t0 += len;
         break;
     }
 
-    prefill_rewrite_checkpoint_frontier_ = -1;
+    prefill_split_frontier_ = -1;
 
     ctx_.synchronize();
     work_.reset();

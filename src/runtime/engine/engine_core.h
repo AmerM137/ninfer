@@ -40,6 +40,7 @@ public:
     using BasePlan           = typename Package::RequestBasePlan;
     using Plan               = typename Package::AdmissionPlan;
     using SequenceHandle     = typename Package::SequenceHandle;
+    using CaptureOffer       = typename Package::CaptureOffer;
     using PendingBatch       = typename Package::PendingBatch;
     using PreparedPrompt     = typename Package::PreparedPrompt;
     using OutputSession      = typename Package::OutputSession;
@@ -49,7 +50,7 @@ public:
     using FifoSnapshot       = typename Scheduling::FifoSnapshot;
     using RoundMembership    = typename Scheduling::RoundMembership;
     using ActiveAdmissionSet = typename Scheduling::ActiveAdmissionSet;
-    using BoundaryAction     = typename Scheduling::BoundaryAction;
+    using ExecutionAction    = typename Scheduling::ExecutionAction;
     using AdmissionGrant     = typename Scheduling::AdmissionGrant;
     using ResourceManagement = ResourceManager<Package>;
     using ResourceInspection = typename ResourceManagement::Inspection;
@@ -61,14 +62,20 @@ public:
                            options.max_pending_requests),
           pending_timeout_(std::chrono::milliseconds(options.pending_timeout_ms)),
           admission_capacity_(instance.program->admission_capacity()),
-          resources_(admission_capacity_, max_concurrency_) {
+          resources_(admission_capacity_, max_concurrency_,
+                     options.context_cache.max_private_continuations.value(),
+                     options.context_cache.max_shared_prefixes.value(),
+                     options.context_cache.enabled,
+                     options.context_cache.max_long_anchors_per_continuation.value_or(0)) {
         if (max_concurrency_ == 0 || max_concurrency_ > kMaximumConcurrency ||
             options.max_pending_requests == 0 || pending_timeout_.count() <= 0) {
             throw std::invalid_argument("Engine core bounds are invalid");
         }
-        if (admission_capacity_.active_lanes != max_concurrency_ ||
-            admission_capacity_.state_slots != 2U * max_concurrency_ ||
-            admission_capacity_.main_kv_pages == 0) {
+        if (!options.context_cache.max_private_continuations ||
+            !options.context_cache.max_shared_prefixes ||
+            admission_capacity_.device.active_lanes != max_concurrency_ ||
+            admission_capacity_.device.state_slots < max_concurrency_ ||
+            admission_capacity_.device.main_kv_pages == 0) {
             throw std::logic_error("target admission capacity does not match the Engine");
         }
         worker_ = std::thread([this] { worker_loop(); });
@@ -178,6 +185,7 @@ public:
             }
             pending_.push_back(request);
         }
+        request_admission_check();
         queue_cv_.notify_one();
         return Submission(*this, std::move(request));
     }
@@ -214,18 +222,50 @@ public:
 private:
     void publish_runtime_stats() {
         RuntimeStats snapshot = cumulative_stats_;
+        resources_.populate_runtime_stats(snapshot);
         {
             std::lock_guard lock(queue_mutex_);
             snapshot.waiting_requests = static_cast<std::uint32_t>(pending_.size());
         }
-        snapshot.prefilling_requests = scheduler_.prefill_lane().has_value() ? 1U : 0U;
+        snapshot.prefilling_requests = 0;
+        if (const auto lane = scheduler_.prefill_lane();
+            lane && slots_[*lane] != nullptr && !slots_[*lane]->capture_pending) {
+            snapshot.prefilling_requests = 1;
+        }
+        snapshot.materializing_requests = materializing_.has_value() ? 1U : 0U;
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             if (slots_[lane] == nullptr) { continue; }
             ++snapshot.running_requests;
             if (slots_[lane]->is_decode_ready()) { ++snapshot.decode_ready_requests; }
+            if (slots_[lane]->capture_pending) { ++snapshot.capture_pending_requests; }
         }
         std::lock_guard lock(stats_mutex_);
         published_stats_ = snapshot;
+    }
+
+    void record_prefix_selection(const RequestPlanSummary& summary) noexcept {
+        switch (summary.prefix_reuse_path) {
+        case PrefixReusePath::Root:
+            ++cumulative_stats_.root_selections;
+            break;
+        case PrefixReusePath::PrivateEndpoint:
+            ++cumulative_stats_.private_endpoint_selections;
+            break;
+        case PrefixReusePath::PrivateTurnClosure:
+            ++cumulative_stats_.private_turn_closure_selections;
+            break;
+        case PrefixReusePath::PrivateResponseReplay:
+            ++cumulative_stats_.private_response_replay_selections;
+            break;
+        case PrefixReusePath::PrivateLongAnchor:
+            ++cumulative_stats_.private_long_anchor_selections;
+            break;
+        case PrefixReusePath::SharedStablePrefix:
+            ++cumulative_stats_.shared_stable_prefix_selections;
+            break;
+        }
+        cumulative_stats_.reused_prompt_tokens += summary.reusable_prompt_tokens;
+        cumulative_stats_.last_selected_frontier_tokens = summary.reusable_prompt_tokens;
     }
 
     GenerationResult wait_for_request(std::shared_ptr<Request> request, OutputSink* sink,
@@ -257,6 +297,7 @@ private:
                 } catch (...) {
                     caller_error = std::current_exception();
                     request->cancelled.store(true, std::memory_order_release);
+                    request_admission_check();
                     queue_cv_.notify_one();
                 }
             }
@@ -265,11 +306,13 @@ private:
                 try {
                     if (cancellation.requested()) {
                         request->cancelled.store(true, std::memory_order_release);
+                        request_admission_check();
                         queue_cv_.notify_one();
                     }
                 } catch (...) {
                     caller_error = std::current_exception();
                     request->cancelled.store(true, std::memory_order_release);
+                    request_admission_check();
                     queue_cv_.notify_one();
                 }
             }
@@ -285,7 +328,26 @@ private:
     enum class AdmissionProgress : std::uint8_t {
         None,
         ControlProgress,
-        RanGpuUnit,
+    };
+
+    // Coalesces admission-visible queue/resource changes. Ordinary prefill/decode progress does not
+    // re-arm a temporarily blocked inspection.
+    void request_admission_check() noexcept {
+        admission_check_pending_.store(true, std::memory_order_release);
+    }
+
+    [[nodiscard]] bool consume_admission_check() noexcept {
+        return admission_check_pending_.exchange(false, std::memory_order_acq_rel);
+    }
+
+    struct MaterializingRequest {
+        std::shared_ptr<Request> request;
+        LaneId destination;
+        GenerationBudget budget;
+        RequestPlanSummary summary;
+        BackfillClass backfill_class   = BackfillClass::None;
+        std::uint64_t protection_epoch = 0;
+        Clock::time_point started;
     };
 
     void append_output(const std::shared_ptr<Request>& request, PublishedOutput output) {
@@ -322,6 +384,7 @@ private:
 
     void abandon_request(std::shared_ptr<Request> request) noexcept {
         request->cancelled.store(true, std::memory_order_release);
+        request_admission_check();
         queue_cv_.notify_one();
         release_consumer(request);
     }
@@ -349,7 +412,6 @@ private:
         request->sequence.reset();
         request->lane.reset();
         request->budget.reset();
-        request->admission_resources = {};
         {
             std::lock_guard lock(request->mutex);
             if (request->response_done) { return; }
@@ -390,7 +452,6 @@ private:
         request->sequence.reset();
         request->lane.reset();
         request->budget.reset();
-        request->admission_resources = {};
         {
             std::lock_guard lock(request->mutex);
             if (request->response_done) { return; }
@@ -417,7 +478,10 @@ private:
         }
     }
 
-    void remove_completed_slot(std::uint32_t lane) { slots_[lane].reset(); }
+    void remove_completed_slot(std::uint32_t lane) {
+        slots_[lane].reset();
+        request_admission_check();
+    }
 
     [[nodiscard]] std::array<bool, kMaximumConcurrency> snapshot_cancellations() const noexcept {
         std::array<bool, kMaximumConcurrency> cancelled{};
@@ -435,6 +499,7 @@ private:
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             const auto& request = slots_[lane];
             if (request == nullptr || !cancelled_at_boundary[lane]) { continue; }
+            if (request->capture_pending) { continue; }
             if (!request->sequence || !request->lane || request->lane->value != lane) {
                 throw std::logic_error("active cancellation has no sequence binding");
             }
@@ -487,12 +552,16 @@ private:
             for (const auto& request : expired) { complete_error(request, error); }
             throw;
         }
-        if (!cancelled.empty() || !expired.empty()) { publish_runtime_stats(); }
+        if (!cancelled.empty() || !expired.empty()) {
+            request_admission_check();
+            publish_runtime_stats();
+        }
         return have_pending;
     }
 
     void commit_pending(PendingBatch&& pending, std::span<const std::uint32_t> lane_indices,
-                        bool decode_round) {
+                        bool decode_round,
+                        const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start) {
         const std::size_t row_count = lane_indices.size();
         if (row_count == 0 || row_count != pending.row_count() || pending.row_stride() == 0 ||
             (!pending.row_counts().empty() && pending.row_counts().size() != row_count) ||
@@ -534,7 +603,7 @@ private:
                     request->lane->value != lane || !request->budget) {
                     throw std::logic_error("pending row has no active Engine request");
                 }
-                cancelled[row] = request->cancelled.load(std::memory_order_acquire);
+                cancelled[row] = cancelled_at_unit_start[lane];
                 const std::int32_t raw_count =
                     pending.row_counts().empty() ? 1 : pending.row_counts()[row];
                 if (raw_count <= 0 || raw_count > static_cast<std::int32_t>(pending.row_stride())) {
@@ -588,17 +657,18 @@ private:
             throw;
         }
 
-        typename Package::CommitResult committed;
+        std::optional<typename Package::CommitResult> committed_storage;
         try {
-            committed = instance_.program->commit(
+            committed_storage.emplace(instance_.program->commit(
                 std::move(pending), std::span<const CommitDecision>(decisions.data(), row_count),
-                CommitObservation::ReleasedRowsOnly);
+                CommitObservation::ReleasedRowsOnly));
         } catch (...) {
             rollback_generated();
             resources_.release_failed_commit(std::span<const LaneId>(lanes.data(), row_count));
             throw;
         }
         generated_staged = false;
+        auto& committed  = *committed_storage;
         if (committed.row_count != row_count) {
             throw std::logic_error("Runtime commit result is not row aligned");
         }
@@ -609,6 +679,10 @@ private:
                                                    : CommitDisposition::Active;
             if (committed.rows[row].disposition != expected) {
                 throw std::logic_error("Runtime commit row disposition is invalid");
+            }
+            if (committed.captures[row].has_value() &&
+                (decode_round || expected != CommitDisposition::Active)) {
+                throw std::logic_error("Runtime exposed a capture outside a committed Begin row");
             }
         }
         resources_.apply_commit(std::span<const LaneId>(lanes.data(), row_count), committed);
@@ -643,6 +717,16 @@ private:
             if (decisions[row].terminal) {
                 complete_success(request, finish_reasons[row]);
                 remove_completed_slot(lane);
+            } else if (committed.captures[row]) {
+                if (!request->is_prefilling()) {
+                    throw std::logic_error("prompt-frontier capture lost its prefill owner");
+                }
+                reserve_active_capture(request, std::move(*committed.captures[row]),
+                                       EngineRequestState::DecodeReady);
+                committed.captures[row].reset();
+                if (!request->capture_pending) {
+                    request->model_state = EngineRequestState::DecodeReady;
+                }
             } else if (request->is_prefilling()) {
                 request->model_state = EngineRequestState::DecodeReady;
             }
@@ -653,35 +737,100 @@ private:
         }
     }
 
-    void resolve_prefill_progress(const std::shared_ptr<Request>& request,
-                                  typename Package::PrefillProgress&& progress) {
+    [[nodiscard]] std::shared_ptr<Request> active_capture_owner() const {
+        std::shared_ptr<Request> request;
+        for (std::uint32_t candidate = 0; candidate < max_concurrency_; ++candidate) {
+            if (slots_[candidate] == nullptr || !slots_[candidate]->capture_pending) { continue; }
+            if (request != nullptr) {
+                throw std::logic_error("multiple requests own one active-capture transaction");
+            }
+            request = slots_[candidate];
+            if (!request->lane || request->lane->value != candidate || !request->sequence) {
+                throw std::logic_error("capture-pending request has no active sequence binding");
+            }
+        }
+        return request;
+    }
+
+    void try_start_replica_transition() {
+        if (instance_.program->has_context_transaction() || scheduler_.prefill_lane() ||
+            !pending_snapshot().empty()) {
+            return;
+        }
+        if (resources_.reserve_replica_transition(*instance_.program) ==
+            ResourceManagement::ReplicaTransitionReserveResult::Reserved) {
+            publish_runtime_stats();
+        }
+    }
+
+    void reserve_active_capture(const std::shared_ptr<Request>& request, CaptureOffer&& offer,
+                                EngineRequestState post_capture_state) {
+        if (!request->lane || !request->sequence || request->capture_pending ||
+            post_capture_state == EngineRequestState::Materializing ||
+            post_capture_state == EngineRequestState::Waiting ||
+            post_capture_state == EngineRequestState::ModelFinished) {
+            throw std::logic_error("committed capture offer has invalid Engine ownership");
+        }
+        const bool permit_transfer = pending_snapshot().empty();
+        const auto reserved        = resources_.reserve_active_capture(
+            *instance_.program, *request->lane, std::move(offer), permit_transfer,
+            CancellationFlagView{&request->cancelled});
+        if (reserved == ResourceManagement::ActiveCaptureReserveResult::Skipped) { return; }
+        request->capture_pending    = true;
+        request->post_capture_state = post_capture_state;
+        (void)progress_context_transaction(false);
+    }
+
+    void
+    resolve_prefill_progress(const std::shared_ptr<Request>& request,
+                             typename Package::PrefillProgress&& progress,
+                             const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start) {
         cumulative_stats_.computed_prefill_tokens += progress.processed_prompt_tokens;
         Scheduling::consume_service_work(*request, 1);
+        if (!progress.complete && progress.observation) {
+            throw std::logic_error("incomplete prefill exposed a terminal cost observation");
+        }
+        if (progress.capture) {
+            if (progress.complete || progress.pending) {
+                throw std::logic_error("prefill capture offer overlaps prompt completion");
+            }
+            reserve_active_capture(request, std::move(*progress.capture),
+                                   EngineRequestState::Prefill);
+            progress.capture.reset();
+            return;
+        }
         if (!progress.complete) { return; }
         if (!request->lane || !progress.pending) {
             throw std::logic_error("completed prefill has no lane or pending token");
         }
+        if (!progress.observation) {
+            throw std::logic_error("completed prefill has no cost observation");
+        }
+        resources_.observe_prefill(*progress.observation);
         const std::uint32_t lane = request->lane->value;
-        if (scheduler_.prefill_lane() == lane) { scheduler_.clear_prefill_lane(lane); }
+        if (scheduler_.prefill_lane() == lane) {
+            scheduler_.clear_prefill_lane(lane);
+            request_admission_check();
+        }
         request->begin = progress.summary;
         const std::array<std::uint32_t, 1> lanes{lane};
-        commit_pending(std::move(*progress.pending), lanes, false);
+        commit_pending(std::move(*progress.pending), lanes, false, cancelled_at_unit_start);
         progress.pending.reset();
     }
 
-    void run_prefill_step() {
+    void run_prefill_step(const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start) {
         const auto prefill_lane = scheduler_.prefill_lane();
         if (!prefill_lane) { throw std::logic_error("no request owns staged prefill"); }
         const std::uint32_t lane = *prefill_lane;
         const auto request       = slots_[lane];
-        if (request == nullptr || !request->is_prefilling()) {
+        if (request == nullptr || !request->is_prefilling() || request->capture_pending) {
             throw std::logic_error("staged prefill lane has invalid request state");
         }
         if (!request->sequence) {
             throw std::logic_error("prefill request has no sequence handle");
         }
         auto progress = instance_.program->advance_prefill(*request->sequence);
-        resolve_prefill_progress(request, std::move(progress));
+        resolve_prefill_progress(request, std::move(progress), cancelled_at_unit_start);
         publish_runtime_stats();
     }
 
@@ -708,7 +857,8 @@ private:
                 instance_.program->plan_request(request->prompt, request->options.execution));
         }
         const RequestPlanSummary& summary = request->base_plan->summary();
-        if (summary.admission.active_lanes != 1 || summary.service_work_quanta == 0) {
+        if (request->base_plan->root_demand().active_entitlement.device.active_lanes != 1 ||
+            summary.service_work_quanta == 0) {
             throw std::logic_error("target request plan has invalid admission accounting");
         }
     }
@@ -726,19 +876,149 @@ private:
         return AdmissionProgress::ControlProgress;
     }
 
+    [[nodiscard]] AdmissionProgress progress_context_transaction(bool yield_requested) {
+        const std::optional<ContextTransactionKind> kind = resources_.context_transaction_kind();
+        if (kind.has_value() != instance_.program->has_context_transaction()) {
+            throw std::logic_error("Engine and Program disagree on context-transaction ownership");
+        }
+        if (!kind) { return AdmissionProgress::None; }
+
+        const std::shared_ptr<Request> capture = active_capture_owner();
+        std::atomic<bool> yield{yield_requested};
+        CancellationFlagView cancellation{&yield};
+        switch (*kind) {
+        case ContextTransactionKind::Materialization: {
+            if (!materializing_ || capture || resources_.has_replica_transition()) {
+                throw std::logic_error("materialization has conflicting Engine ownership");
+            }
+            const MaterializingRequest& control = *materializing_;
+            const std::uint32_t lane            = control.destination.value;
+            const auto& request                 = control.request;
+            if (request == nullptr || !request->is_materializing() || request->lane ||
+                request->sequence || request->budget || lane >= max_concurrency_ ||
+                slots_[lane] != nullptr) {
+                throw std::logic_error("materializing request has invalid Engine ownership");
+            }
+            cancellation = CancellationFlagView{&request->cancelled};
+            break;
+        }
+        case ContextTransactionKind::ActiveCapture:
+            if (materializing_ || !capture || resources_.has_replica_transition()) {
+                throw std::logic_error("active capture has conflicting Engine ownership");
+            }
+            cancellation = CancellationFlagView{&capture->cancelled};
+            break;
+        case ContextTransactionKind::ReplicaTransition:
+            if (materializing_ || capture || !resources_.has_replica_transition()) {
+                throw std::logic_error("replica transition has conflicting Engine ownership");
+            }
+            break;
+        }
+
+        auto outcome = resources_.progress_context_transaction(*instance_.program, cancellation);
+        return std::visit(
+            [&](auto&& terminal) -> AdmissionProgress {
+                using Outcome = std::decay_t<decltype(terminal)>;
+                if constexpr (std::is_same_v<Outcome, ContextTransactionInProgress>) {
+                    return AdmissionProgress::ControlProgress;
+                } else if constexpr (std::is_same_v<
+                                         Outcome,
+                                         typename ResourceManagement::MaterializationOutcome>) {
+                    if (*kind != ContextTransactionKind::Materialization || !materializing_) {
+                        throw std::logic_error(
+                            "materialization outcome has no Engine control record");
+                    }
+                    MaterializingRequest& control = *materializing_;
+                    const std::uint32_t lane      = control.destination.value;
+                    const auto request            = control.request;
+                    if (terminal.status == ContextTransactionStatus::Aborted) {
+                        if (terminal.activation) {
+                            throw std::logic_error(
+                                "aborted materialization retained an activation");
+                        }
+                        materializing_.reset();
+                        complete_detached_cancelled(request);
+                        request_admission_check();
+                        publish_runtime_stats();
+                        return AdmissionProgress::ControlProgress;
+                    }
+                    if (terminal.status != ContextTransactionStatus::Published ||
+                        !terminal.activation) {
+                        throw std::logic_error("published materialization has no adoption token");
+                    }
+                    auto activation = std::move(*terminal.activation);
+                    terminal.activation.reset();
+                    if (activation.active_resources() !=
+                        resources_.lane_entitlement(LaneId{lane})) {
+                        throw std::logic_error(
+                            "materialized entitlement changed after admission commit");
+                    }
+                    const SequenceHandle sequence = activation.sequence();
+                    resources_.adopt(*instance_.program, std::move(activation));
+                    request->sequence.emplace(sequence);
+                    request->budget.emplace(std::move(control.budget));
+                    request->lane.emplace(control.destination);
+                    request->remaining_service_work = control.summary.service_work_quanta;
+                    request->backfill_epoch         = control.protection_epoch;
+                    request->backfill_class         = control.backfill_class;
+                    request->model_state            = EngineRequestState::Prefill;
+                    slots_[lane]                    = request;
+                    record_prefix_selection(control.summary);
+                    materializing_.reset();
+                    scheduler_.set_prefill_lane(lane);
+                    request_admission_check();
+                    publish_runtime_stats();
+                    return AdmissionProgress::ControlProgress;
+                } else if constexpr (std::is_same_v<
+                                         Outcome,
+                                         typename ResourceManagement::ActiveCaptureOutcome>) {
+                    if (*kind != ContextTransactionKind::ActiveCapture || !capture) {
+                        throw std::logic_error("active-capture outcome has no Engine owner");
+                    }
+                    if (terminal.status == ContextTransactionStatus::Published) {
+                        ++cumulative_stats_.active_captures_completed;
+                    } else if (terminal.status == ContextTransactionStatus::Aborted) {
+                        ++cumulative_stats_.active_captures_aborted;
+                    } else {
+                        throw std::logic_error("active capture returned an invalid terminal state");
+                    }
+                    capture->capture_pending = false;
+                    capture->model_state     = capture->post_capture_state;
+                    request_admission_check();
+                    publish_runtime_stats();
+                    return AdmissionProgress::ControlProgress;
+                } else {
+                    static_assert(
+                        std::is_same_v<Outcome,
+                                       typename ResourceManagement::ReplicaTransitionOutcome>);
+                    if (*kind != ContextTransactionKind::ReplicaTransition || materializing_ ||
+                        capture || terminal.status == ContextTransactionStatus::InProgress) {
+                        throw std::logic_error("replica-transition outcome is invalid");
+                    }
+                    request_admission_check();
+                    publish_runtime_stats();
+                    return AdmissionProgress::ControlProgress;
+                }
+            },
+            std::move(outcome));
+    }
+
     [[nodiscard]] AdmissionProgress
     admit_planned_request(const std::shared_ptr<Request>& request,
                           typename ResourceManagement::Choice&& choice, AdmissionGrant grant) {
         if (Clock::now() >= request->deadline) {
-            return remove_pending_error(
+            const AdmissionProgress progress = remove_pending_error(
                 request, std::make_exception_ptr(RequestError(
                              RequestErrorKind::QueueTimeout,
                              "inference request expired while waiting for admission")));
+            if (progress == AdmissionProgress::ControlProgress) { request_admission_check(); }
+            return progress;
         }
         if (request->cancelled.load(std::memory_order_acquire)) {
             if (!erase_pending(request)) { return AdmissionProgress::None; }
             on_waiting_removed(request);
             complete_detached_cancelled(request);
+            request_admission_check();
             publish_runtime_stats();
             return AdmissionProgress::ControlProgress;
         }
@@ -755,47 +1035,52 @@ private:
                                          summary.effective_limit_reason);
         try {
             request->generated.reserve(summary.effective_output_tokens);
-        } catch (...) { return remove_pending_error(request, std::current_exception()); }
+        } catch (...) {
+            const AdmissionProgress progress =
+                remove_pending_error(request, std::current_exception());
+            if (progress == AdmissionProgress::ControlProgress) { request_admission_check(); }
+            return progress;
+        }
+        MaterializingRequest control{
+            .request          = request,
+            .destination      = destination,
+            .budget           = std::move(prepared_budget),
+            .summary          = summary,
+            .backfill_class   = grant.backfill_class(),
+            .protection_epoch = grant.protection_epoch(),
+            .started          = Clock::now(),
+        };
 
-        auto materialized = resources_.materialize(*instance_.program, std::move(choice),
-                                                   std::move(request->prompt),
-                                                   CancellationFlagView{&request->cancelled});
-        if (materialized.status == MaterializationStatus::Aborted) {
-            if (materialized.activation || !erase_pending(request)) {
-                throw std::logic_error("aborted materialization retained an activation");
+        const auto reserved = resources_.reserve_materialization(
+            *instance_.program, std::move(choice), std::move(request->prompt),
+            CancellationFlagView{&request->cancelled});
+        if (reserved == ResourceManagement::MaterializationReserveResult::Stale) {
+            request_admission_check();
+            return AdmissionProgress::ControlProgress;
+        }
+        if (reserved == ResourceManagement::MaterializationReserveResult::Aborted) {
+            if (!erase_pending(request)) {
+                throw std::logic_error("aborted materialization lost its waiting request");
             }
             on_waiting_removed(request);
             complete_detached_cancelled(request);
+            request_admission_check();
             publish_runtime_stats();
             return AdmissionProgress::ControlProgress;
         }
-        if (materialized.status != MaterializationStatus::Published || !materialized.activation) {
-            throw std::logic_error("published materialization has no adoption token");
-        }
-        auto activation = std::move(*materialized.activation);
-        materialized.activation.reset();
         if (!erase_pending(request)) {
             throw std::logic_error("admitted request disappeared from the FIFO queue");
         }
         release_planning_state(request);
-        request->budget.emplace(std::move(prepared_budget));
-        request->lane.emplace(destination);
-        request->sequence.emplace(activation.sequence());
-        request->admission_resources    = activation.active_resources();
-        request->remaining_service_work = summary.service_work_quanta;
-        request->backfill_epoch         = grant.protection_epoch();
-        request->backfill_class         = grant.backfill_class();
-        request->model_state            = EngineRequestState::Prefill;
-        slots_[lane]                    = request;
-        resources_.adopt(std::move(activation));
+        if (materializing_ || slots_[lane] != nullptr) {
+            throw std::logic_error("reserved materialization destination is not empty");
+        }
+        request->model_state = EngineRequestState::Materializing;
+        materializing_.emplace(std::move(control));
         scheduler_.commit_admission(std::move(grant));
 
         publish_runtime_stats();
-        auto progress = instance_.program->advance_prefill(*request->sequence);
-        if (!progress.complete) { scheduler_.set_prefill_lane(lane); }
-        resolve_prefill_progress(request, std::move(progress));
-        publish_runtime_stats();
-        return AdmissionProgress::RanGpuUnit;
+        return progress_context_transaction(false);
     }
 
     AdmissionProgress try_admit_one() {
@@ -834,8 +1119,7 @@ private:
                 control_progress = true;
                 continue;
             }
-            const RequestPlanSummary& head_base = head->base_plan->summary();
-            auto head_inspection                = inspect_admission(head);
+            auto head_inspection = inspect_admission(head);
             if (head_inspection.readiness == Readiness::PermanentlyInfeasible) {
                 (void)remove_pending_error(
                     head, std::make_exception_ptr(RequestError(
@@ -844,7 +1128,8 @@ private:
                 control_progress = true;
                 continue;
             }
-            if (head_inspection.readiness == Readiness::Ready) {
+            if (head_inspection.readiness == Readiness::Ready ||
+                head_inspection.readiness == Readiness::NeedsTransfer) {
                 if (!head_inspection.choice) {
                     throw std::logic_error("ready resource inspection has no admission choice");
                 }
@@ -859,8 +1144,11 @@ private:
             if (active.size == 0) {
                 throw std::logic_error("exclusive-feasible request cannot enter an idle Engine");
             }
-            if (!scheduler_.protect_blocked_head(head->id, head_base.admission, active.span(),
-                                                 admission_capacity_)) {
+            const ProtectedHeadResourceProjection current_projection =
+                resources_.protected_head_projection(*instance_.program);
+            if (!scheduler_.protect_blocked_head(
+                    head->id, head->base_plan->root_demand().active_entitlement.device,
+                    active.span(), current_projection, admission_capacity_.device)) {
                 return control_progress ? AdmissionProgress::ControlProgress
                                         : AdmissionProgress::None;
             }
@@ -868,6 +1156,7 @@ private:
             for (const std::shared_ptr<Request>& candidate : queued.backfill_candidates()) {
                 if (candidate->cancelled.load(std::memory_order_acquire)) {
                     if (erase_pending(candidate)) {
+                        on_waiting_removed(candidate);
                         complete_detached_cancelled(candidate);
                         publish_runtime_stats();
                         control_progress = true;
@@ -890,8 +1179,7 @@ private:
                     control_progress = true;
                     continue;
                 }
-                const RequestPlanSummary& candidate_base = candidate->base_plan->summary();
-                auto candidate_inspection                = inspect_admission(candidate);
+                auto candidate_inspection = inspect_admission(candidate);
                 if (candidate_inspection.readiness == Readiness::PermanentlyInfeasible) {
                     (void)remove_pending_error(
                         candidate, std::make_exception_ptr(RequestError(
@@ -900,15 +1188,19 @@ private:
                     control_progress = true;
                     continue;
                 }
-                if (candidate_inspection.readiness != Readiness::Ready) { continue; }
+                if (candidate_inspection.readiness != Readiness::Ready &&
+                    candidate_inspection.readiness != Readiness::NeedsTransfer) {
+                    continue;
+                }
                 if (!candidate_inspection.choice) {
                     throw std::logic_error("ready resource inspection has no admission choice");
                 }
                 const RequestPlanSummary& candidate_plan = candidate_inspection.choice->summary();
 
-                auto grant = scheduler_.qualify_backfill(candidate->id, candidate_plan.admission,
-                                                         candidate_plan.service_work_quanta,
-                                                         active.span(), admission_capacity_);
+                auto grant = scheduler_.qualify_backfill(
+                    candidate->id, candidate_inspection.choice->projection(),
+                    candidate_plan.service_work_quanta, active.span(), admission_capacity_.device,
+                    candidate_inspection.choice->temporal_eligible());
                 if (grant) {
                     return admit_planned_request(candidate, std::move(*candidate_inspection.choice),
                                                  std::move(*grant));
@@ -918,10 +1210,11 @@ private:
         }
     }
 
-    void run_decode_round(const RoundMembership& membership) {
+    void run_decode_round(const RoundMembership& membership,
+                          const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start) {
         auto pending =
             instance_.program->decode(membership.sequence_span(), membership.budget_span());
-        commit_pending(std::move(pending), membership.lane_span(), true);
+        commit_pending(std::move(pending), membership.lane_span(), true, cancelled_at_unit_start);
         publish_runtime_stats();
     }
 
@@ -935,6 +1228,9 @@ private:
             pending.swap(pending_);
         }
         scheduler_.reset();
+        const std::shared_ptr<Request> materializing_request =
+            materializing_ ? materializing_->request : nullptr;
+        materializing_.reset();
         instance_.program->fail_all_cleanup();
         resources_.clear_after_program_cleanup();
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
@@ -943,6 +1239,7 @@ private:
                 slots_[lane].reset();
             }
         }
+        if (materializing_request != nullptr) { complete_error(materializing_request, error); }
         for (const auto& request : pending) { complete_error(request, error); }
         publish_runtime_stats();
     }
@@ -953,7 +1250,7 @@ private:
             {
                 std::unique_lock lock(queue_mutex_);
                 if (!stopping_ && pending_.empty()) {
-                    bool active = false;
+                    bool active = materializing_.has_value() || resources_.has_replica_transition();
                     for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
                         active = active || slots_[lane] != nullptr;
                     }
@@ -973,43 +1270,58 @@ private:
 
             std::unique_lock execution_lock(execution_mutex_);
             try {
-                const bool have_pending          = expire_pending_requests();
+                const bool have_pending = expire_pending_requests();
+                (void)progress_context_transaction(have_pending);
                 const auto cancelled_at_boundary = snapshot_cancellations();
                 cancel_active_requests(cancelled_at_boundary);
-                const RoundMembership membership =
+                RoundMembership membership =
                     scheduler_.build_round_membership(slots_, max_concurrency_);
+                const bool admission_check_pending =
+                    admission_check_pending_.load(std::memory_order_acquire);
+                if (scheduler_.should_attempt_admission(
+                        have_pending, admission_check_pending, !membership.empty(),
+                        previous_unit_was_decode, instance_.program->has_context_transaction()) &&
+                    consume_admission_check()) {
+                    (void)try_admit_one();
+                    membership = scheduler_.build_round_membership(slots_, max_concurrency_);
+                }
 
-                const BoundaryAction action = scheduler_.choose_boundary(
-                    have_pending, !membership.empty(), previous_unit_was_decode);
-                if (action == BoundaryAction::Prefill) {
-                    run_prefill_step();
+                // Cancellation is sampled once for the execution unit. A request arriving while
+                // the GPU unit is in flight is observed at the next worker boundary; commit does
+                // not reinterpret an already-issued unit with a later atomic read.
+                const auto cancelled_at_unit_start = snapshot_cancellations();
+                cancel_active_requests(cancelled_at_unit_start);
+                membership = scheduler_.build_round_membership(slots_, max_concurrency_);
+
+                bool prefill_runnable = false;
+                if (const auto lane = scheduler_.prefill_lane(); lane) {
+                    if (slots_[*lane] == nullptr || !slots_[*lane]->is_prefilling()) {
+                        throw std::logic_error("prefill owner has no active Engine request");
+                    }
+                    prefill_runnable = !slots_[*lane]->capture_pending;
+                }
+                const ExecutionAction action = scheduler_.choose_execution(
+                    !membership.empty(), prefill_runnable, previous_unit_was_decode);
+                if (action == ExecutionAction::Prefill) {
+                    run_prefill_step(cancelled_at_unit_start);
                     previous_unit_was_decode = false;
+                    try_start_replica_transition();
                     continue;
                 }
-                if (action == BoundaryAction::Decode) {
-                    run_decode_round(membership);
+                if (action == ExecutionAction::Decode) {
+                    run_decode_round(membership, cancelled_at_unit_start);
                     previous_unit_was_decode = true;
+                    try_start_replica_transition();
                     continue;
                 }
-                if (action == BoundaryAction::AttemptAdmission) {
-                    const AdmissionProgress progress = try_admit_one();
-                    if (progress == AdmissionProgress::RanGpuUnit) {
-                        previous_unit_was_decode = false;
-                        continue;
-                    }
-                    if (progress == AdmissionProgress::ControlProgress && membership.empty()) {
-                        continue;
-                    }
-                    if (!membership.empty()) {
-                        run_decode_round(membership);
-                        previous_unit_was_decode = true;
-                    }
-                    continue;
-                }
+                try_start_replica_transition();
             } catch (...) {
                 fail_all_locked(std::current_exception());
                 return;
             }
+            execution_lock.unlock();
+            std::unique_lock wait_lock(queue_mutex_);
+            queue_cv_.wait_for(wait_lock, std::chrono::milliseconds(1));
         }
     }
 
@@ -1017,7 +1329,7 @@ private:
     const std::uint32_t max_concurrency_;
     const std::size_t max_outstanding_;
     const std::chrono::milliseconds pending_timeout_;
-    const DeviceResources admission_capacity_;
+    const ResourceVector admission_capacity_;
     ResourceManagement resources_;
 
     mutable std::mutex execution_mutex_;
@@ -1028,7 +1340,9 @@ private:
     std::size_t outstanding_       = 0;
     std::uint64_t next_request_id_ = 1;
     std::array<std::shared_ptr<Request>, kMaximumConcurrency> slots_{};
+    std::optional<MaterializingRequest> materializing_;
     Scheduling scheduler_;
+    std::atomic<bool> admission_check_pending_{false};
     RuntimeStats cumulative_stats_;
     RuntimeStats published_stats_;
     bool stopping_ = false;

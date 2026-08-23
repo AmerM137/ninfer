@@ -350,9 +350,24 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
         rendered += "<|im_end|>\n";
     }
 
+    std::vector<std::optional<std::size_t>> message_boundaries(messages.size() + 1U);
+    if (message_begin == 0) {
+        message_boundaries[0] = rendered.size();
+    } else {
+        // The first instruction message is folded into the system preamble by this template.
+        message_boundaries[1] = rendered.size();
+    }
+
     const long last_query_index  = last_real_user_query(messages);
     const bool preserve_thinking = options.preserve_thinking.value_or(effort_template);
     std::optional<RewriteCheckpointByteSpec> rewrite_checkpoint;
+    std::vector<std::size_t> rewrite_execution_boundaries;
+    const auto add_rewrite_execution_boundary = [&] {
+        if (rewrite_execution_boundaries.empty() ||
+            rewrite_execution_boundaries.back() != rendered.size()) {
+            rewrite_execution_boundaries.push_back(rendered.size());
+        }
+    };
 
     int image_count = 0;
     int video_count = 0;
@@ -366,12 +381,14 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
             rendered += "<|im_start|>system\n";
             rendered += content;
             rendered += "<|im_end|>\n";
+            message_boundaries[i + 1U] = rendered.size();
             continue;
         }
         if (message.role == ChatRole::User) {
             rendered += "<|im_start|>user\n";
             rendered += content;
             rendered += "<|im_end|>\n";
+            message_boundaries[i + 1U] = rendered.size();
             continue;
         }
         if (message.role == ChatRole::Tool) {
@@ -383,6 +400,7 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
             rendered += content;
             rendered += "\n</tool_response>";
             if (closes_group) { rendered += "<|im_end|>\n"; }
+            message_boundaries[i + 1U] = rendered.size();
             continue;
         }
 
@@ -404,14 +422,17 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
 
         const bool keep_thinking = preserve_thinking || (static_cast<long>(i) > last_query_index);
         rendered += "<|im_start|>assistant\n";
+        add_rewrite_execution_boundary();
         if (!preserve_thinking && !rewrite_checkpoint && static_cast<long>(i) > last_query_index) {
             rewrite_checkpoint = RewriteCheckpointByteSpec{
                 .kind = RewriteCheckpointKind::TurnClosure, .offset = rendered.size()};
         }
         if (keep_thinking) {
             rendered += "<think>\n";
+            add_rewrite_execution_boundary();
             rendered += reasoning;
             rendered += "\n</think>\n\n";
+            add_rewrite_execution_boundary();
         }
         rendered += body;
         if (!message.tool_calls.empty()) {
@@ -426,18 +447,24 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
             }
         }
         rendered += "<|im_end|>\n";
+        message_boundaries[i + 1U] = rendered.size();
     }
 
     if (options.add_generation_prompt) {
         rendered += "<|im_start|>assistant\n";
+        add_rewrite_execution_boundary();
         if (!preserve_thinking && !rewrite_checkpoint) {
             rewrite_checkpoint = RewriteCheckpointByteSpec{
                 .kind = RewriteCheckpointKind::TurnClosure, .offset = rendered.size()};
         }
         if (options.enable_thinking) {
             rendered += "<think>\n";
+            add_rewrite_execution_boundary();
         } else {
-            rendered += "<think>\n\n</think>\n\n";
+            rendered += "<think>\n";
+            add_rewrite_execution_boundary();
+            rendered += "\n</think>\n\n";
+            add_rewrite_execution_boundary();
         }
         if (preserve_thinking) {
             // Response replay retains the deterministic generation prologue. This is the prompt
@@ -447,7 +474,10 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
                 .kind = RewriteCheckpointKind::ResponseReplay, .offset = rendered.size()};
         }
     }
-    return RenderedChat{.text = std::move(rendered), .rewrite_checkpoint = rewrite_checkpoint};
+    return RenderedChat{.text                         = std::move(rendered),
+                        .rewrite_checkpoint           = rewrite_checkpoint,
+                        .rewrite_execution_boundaries = std::move(rewrite_execution_boundaries),
+                        .message_boundaries           = std::move(message_boundaries)};
 }
 
 } // namespace ninfer::targets::qwen3_6::frontend_internal

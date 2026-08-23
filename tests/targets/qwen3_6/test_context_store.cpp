@@ -1,4 +1,5 @@
 #include "core/device.h"
+#include "targets/qwen3_6/impl/runtime/host_kv_extent_store.h"
 #include "targets/qwen3_6/impl/runtime/logical_kv_store.h"
 #include "targets/qwen3_6/impl/runtime/state_image_store.h"
 
@@ -6,6 +7,7 @@
 
 #include <cuda_runtime.h>
 
+#include <array>
 #include <cstdint>
 #include <exception>
 #include <iostream>
@@ -49,7 +51,9 @@ void test_state_store(ninfer::DeviceContext& device) {
     const q36::StateImageDeviceLayout layout = q36::plan_state_image_device_pool(builder, spec);
     ninfer::DeviceArena arena(builder.finish(256));
     q36::StateImageDevicePool physical({arena.base(), arena.capacity()}, layout);
-    store::StateImageStore images(physical);
+    q36::HostStatePool host(layout.host, 2);
+    store::StateImageStore images(
+        physical, &host, static_cast<std::uint32_t>(physical.slot_count()) + host.capacity());
 
     const auto source = images.reserve_reset(device.stream);
     expect(source.has_value(), "state source allocation");
@@ -72,21 +76,71 @@ void test_state_store(ninfer::DeviceContext& device) {
     expect(images.role(*source) == store::StateImageRole::CheckpointImmutable &&
                images.role(*destination) == store::StateImageRole::ActiveMutable,
            "fork commit preserves source and activates destination");
-    expect(images.release(*source), "superseded rewrite image releases before rotation");
+    images.retain_checkpoint_reference(*source);
+    const std::uint64_t rewrite_epoch = images.content_epoch(*source);
     images.freeze(*destination);
-    const auto rotated = images.reserve_destination();
-    expect(rotated.has_value(), "rewrite rotation reuses the second-image entitlement");
-    const auto rotated_selectors = images.begin_fork(*destination, *rotated);
+    const std::uint64_t recycled_epoch = images.recycle_checkpoint_destination(*source);
+    const auto rotated_selectors       = images.begin_fork(*destination, *source);
     expect(rotated_selectors.source != rotated_selectors.destination && images.occupied() == 2,
            "rewrite rotation remains within two StateImages");
-    images.commit_fork(*destination, *rotated);
-    expect(images.release(*destination) && images.release(*rotated) && images.occupied() == 0,
+    images.abort_fork(*destination, *source);
+    images.restore_recycled_checkpoint(*source, recycled_epoch);
+    images.thaw(*destination);
+    expect(images.content_epoch(*source) == rewrite_epoch &&
+               images.checkpoint_references(*source) == 1,
+           "aborted rewrite rotation restores the prior checkpoint identity");
+
+    images.freeze(*destination);
+    (void)images.recycle_checkpoint_destination(*source);
+    (void)images.begin_fork(*destination, *source);
+    images.commit_fork(*destination, *source);
+    images.retain_checkpoint_reference(*destination);
+    images.release_checkpoint_reference(*destination);
+    expect(images.release(*destination) && images.release(*source) && images.occupied() == 0,
            "rotated state image ownership closes after release");
     expect(!images.valid(*source), "released state generation becomes stale");
 
     const auto reused = images.reserve_reset(device.stream);
     expect(reused.has_value() && *reused != *source, "state descriptor reuse advances generation");
     expect(images.release(*reused), "reused state image releases");
+
+    const auto host_source = images.reserve_reset(device.stream);
+    expect(host_source.has_value(), "Host state source allocation");
+    device.synchronize();
+    images.freeze(*host_source);
+    auto d2h = images.begin_device_to_host(*host_source, device.transfer_stream);
+    expect(d2h.has_value() &&
+               images.residency(*host_source) == store::StateReplicaResidency::DeviceOnly,
+           "incomplete State D2H does not publish a Host replica");
+    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+    images.publish_transfer(std::move(*d2h), true);
+    expect(images.residency(*host_source) == store::StateReplicaResidency::Both,
+           "State D2H backup publishes stable Both residency");
+
+    const auto moved_device = images.reserve_logical_destination();
+    expect(moved_device.has_value(), "State replica split destination allocation");
+    images.split_device_replica_identity(*host_source, *moved_device);
+    expect(images.residency(*host_source) == store::StateReplicaResidency::HostOnly &&
+               images.residency(*moved_device) == store::StateReplicaResidency::DeviceOnly,
+           "State replica identity split keeps old Host content and moves Device ownership");
+
+    const auto fork_one = images.reserve_logical_destination();
+    const auto fork_two = images.reserve_logical_destination();
+    expect(fork_one && fork_two, "concurrent Host State forks reserve logical destinations");
+    auto h2d_one = images.begin_host_fork(*host_source, *fork_one, device.transfer_stream);
+    auto h2d_two = images.begin_host_fork(*host_source, *fork_two, device.transfer_stream);
+    expect(h2d_one && h2d_two && images.source_pins(*host_source) == 2,
+           "immutable Host State source supports multiple fork pins");
+    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+    images.publish_transfer(std::move(*h2d_one), true);
+    images.publish_transfer(std::move(*h2d_two), true);
+    expect(images.source_pins(*host_source) == 0 &&
+               images.residency(*fork_one) == store::StateReplicaResidency::DeviceOnly &&
+               images.residency(*fork_two) == store::StateReplicaResidency::DeviceOnly,
+           "Host State forks publish independent Device destinations");
+    expect(images.release(*host_source) && images.release(*moved_device) &&
+               images.release(*fork_one) && images.release(*fork_two) && host.occupied() == 0,
+           "State Host/Device replica ownership closes without leaked slots");
 }
 
 void test_kv_store(ninfer::DeviceContext& device) {
@@ -108,7 +162,12 @@ void test_kv_store(ninfer::DeviceContext& device) {
     const ninfer::DeviceSpan backing{arena.base(), arena.capacity()};
     ninfer::DeviceKVPagePool physical_pages(backing, page_layout);
     ninfer::KVExecutionTablePool physical_tables(backing, table_layout, physical_pages);
-    store::LogicalKVPageStore pages(physical_pages);
+    const ninfer::HostKVPageLayout host_layout =
+        ninfer::plan_host_kv_page_layout(physical_pages.geometry());
+    const std::array host_layouts{host_layout};
+    ninfer::HostKVArena host_arena(host_layout.page_stride * 8, host_layouts);
+    store::LogicalKVPageStore pages(physical_pages, physical_pages.capacity_pages() + 8U);
+    store::HostKVExtentStore extents(host_arena, 8);
     store::KVAddressSpaceStore addresses(pages, physical_tables, 4, 4);
 
     const auto address = addresses.create_active(3, 0);
@@ -120,7 +179,12 @@ void test_kv_store(ninfer::DeviceContext& device) {
     expect(addresses.mapped_pages(*address) == 2 && addresses.entitlement(*address) == 3 &&
                addresses.committed_frontier(*address) == 65 && addresses.bound_row(*address) == 0,
            "KV address tracks mapped pages, entitlement, frontier, and execution row");
-    addresses.set_checkpoint_requirements(*address, 65, 32);
+    addresses.materialize_to_tokens(*address, 129, device.stream);
+    addresses.destructive_truncate(*address, 65);
+    expect(addresses.mapped_pages(*address) == 2 && addresses.entitlement(*address) == 3 &&
+               addresses.committed_frontier(*address) == 65,
+           "same-frontier trim releases uncommitted materialized suffix pages");
+    addresses.set_checkpoint_requirement(*address, 65);
     expect(pages.occupied() == 2 && addresses.mapped_pages(*address) == 2,
            "endpoint and rewrite requirements share one ordered page mapping");
     const std::uint64_t old_epoch = addresses.content_epoch(*address, 0);
@@ -128,6 +192,70 @@ void test_kv_store(ninfer::DeviceContext& device) {
     addresses.deactivate(*address);
     expect(addresses.bound_row(*address) == -1 && addresses.entitlement(*address) == 2,
            "catalogued KV address owns no execution row or growth reservation");
+
+    const std::array logical_pages{addresses.logical_page(*address, 0),
+                                   addresses.logical_page(*address, 1)};
+    addresses.set_checkpoint_requirement(*address, 32);
+    expect(pages.protected_columns(logical_pages[0]) == 32 &&
+               pages.protected_columns(logical_pages[1]) == 0,
+           "lowered checkpoint frontier releases stale suffix protection");
+    addresses.set_checkpoint_requirement(*address, 65);
+    auto host_backup = extents.prepare(pages, logical_pages);
+    expect(host_backup.has_value(), "Host KV extent reservation");
+    const std::vector<ninfer::DeviceKVPageHandle> sources = extents.device_sources(*host_backup);
+    physical_pages.copy_to_host(sources, extents.writable_view(*host_backup),
+                                device.transfer_stream);
+    expect(!pages.host_resident(logical_pages[0]) && !pages.host_resident(logical_pages[1]),
+           "incomplete KV D2H does not publish Host replicas");
+    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+    auto host_extent = extents.publish(std::move(*host_backup));
+    expect(pages.host_resident(logical_pages[0]) && pages.host_resident(logical_pages[1]),
+           "KV extent publication attaches every logical Host replica");
+    auto [left_extent, right_extent] = extents.split(host_extent, 1);
+    expect(!extents.valid(host_extent) && extents.valid(left_extent) &&
+               extents.valid(right_extent) &&
+               pages.host_replica(logical_pages[0]).page_offset == 0 &&
+               pages.host_replica(logical_pages[1]).page_offset == 0,
+           "KV extent split rewrites every generation-checked page capability");
+    expect(extents.release(left_extent) && extents.release(right_extent),
+           "Both KV extents release while Device replicas survive");
+
+    auto second_host_backup = extents.prepare(pages, logical_pages);
+    expect(second_host_backup.has_value(), "second Host KV extent reservation");
+    const std::vector<ninfer::DeviceKVPageHandle> second_sources =
+        extents.device_sources(*second_host_backup);
+    physical_pages.copy_to_host(second_sources, extents.writable_view(*second_host_backup),
+                                device.transfer_stream);
+    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+    const auto second_host_extent = extents.publish(std::move(*second_host_backup));
+    expect(pages.drop_device_replica(logical_pages[0]) &&
+               pages.drop_device_replica(logical_pages[1]) && !extents.release(second_host_extent),
+           "Host-only KV pages remain valid and cannot lose their last replica");
+    const std::array last_reference_release{store::HostKVPageReplicaRelease{
+        .pages = &pages,
+        .page  = logical_pages[1],
+    }};
+    const std::array seven_page_request{
+        ninfer::HostKVAllocationRequest{.layout = &host_layout, .pages = 7}};
+    const std::array eight_page_request{
+        ninfer::HostKVAllocationRequest{.layout = &host_layout, .pages = 8}};
+    expect(
+        extents.can_allocate_after_page_releases({}, last_reference_release, seven_page_request) &&
+            !extents.can_allocate_after_page_releases({}, last_reference_release,
+                                                      eight_page_request),
+        "last address-reference release contributes exact Host allocation credit");
+    auto restore_reservation = physical_pages.reserve(2);
+    expect(restore_reservation.has_value(), "KV Host restore Device reservation");
+    const std::array restore_destinations{
+        pages.reserve_device_replica(logical_pages[0], *restore_reservation),
+        pages.reserve_device_replica(logical_pages[1], *restore_reservation)};
+    physical_pages.copy_from_host(extents.view(second_host_extent), restore_destinations,
+                                  device.transfer_stream);
+    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+    pages.publish_device_replica(logical_pages[0]);
+    pages.publish_device_replica(logical_pages[1]);
+    expect(extents.release(second_host_extent) && host_arena.occupied_bytes() == 0,
+           "KV Host restore republishes Device replicas before releasing the extent");
     auto activation = addresses.prepare_activation(*address, 3, 1);
     expect(addresses.bound_row(*address) == -1 && addresses.entitlement(*address) == 2 &&
                physical_pages.reserved_pages() == 1,
@@ -139,10 +267,76 @@ void test_kv_store(ninfer::DeviceContext& device) {
                addresses.content_epoch(*address, 0) != old_epoch,
            "destructive rewrite truncates coverage and advances content epoch");
     addresses.deactivate(*address);
+    const std::array final_logical_page{addresses.logical_page(*address, 0)};
+    auto final_host_backup = extents.prepare(pages, final_logical_page);
+    expect(final_host_backup.has_value(), "final Host KV backup reservation");
+    const auto final_sources = extents.device_sources(*final_host_backup);
+    physical_pages.copy_to_host(final_sources, extents.writable_view(*final_host_backup),
+                                device.transfer_stream);
+    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+    (void)extents.publish(std::move(*final_host_backup));
     expect(addresses.release(*address), "catalogued KV address releases");
+    expect(extents.release_unreferenced() == host_layout.page_stride &&
+               host_arena.occupied_bytes() == 0,
+           "address teardown reclaims its zero-reference Host extent");
     expect(!addresses.valid(*address) && pages.occupied() == 0 &&
                physical_pages.allocated_pages() == 0 && physical_pages.reserved_pages() == 0,
            "KV release invalidates generations and closes physical ownership");
+
+    const auto shared = addresses.create_active(3, 0);
+    expect(shared.has_value(), "shared-prefix source address allocation");
+    addresses.materialize_to_tokens(*shared, 65, device.stream);
+    addresses.commit_frontier(*shared, 65);
+    addresses.set_checkpoint_requirement(*shared, 65);
+    addresses.deactivate(*shared);
+    const auto shared_full = addresses.logical_page(*shared, 0);
+    const auto shared_tail = addresses.logical_page(*shared, 1);
+
+    const auto branch_one = addresses.create_inactive();
+    expect(branch_one.has_value(), "first shared-prefix branch address allocation");
+    auto first_fork = addresses.prepare_prefix_fork(*shared, *branch_one, 65, 3, 1);
+    expect(first_fork.needs_tail_copy() && pages.address_references(shared_full) == 1,
+           "prefix fork remains unpublished while its tail copy is pending");
+    physical_pages.copy_page(addresses.prefix_fork_tail_source(first_fork),
+                             addresses.prefix_fork_tail_destination(first_fork),
+                             device.transfer_stream);
+    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+    addresses.commit_prefix_fork(std::move(first_fork), device.stream);
+    const auto branch_one_tail = addresses.logical_page(*branch_one, 1);
+    expect(addresses.logical_page(*branch_one, 0) == shared_full &&
+               branch_one_tail != shared_tail && pages.address_references(shared_full) == 2 &&
+               pages.address_references(shared_tail) == 1,
+           "shared branch references full pages and publishes a private partial tail");
+    addresses.materialize_to_tokens(*branch_one, 66, device.stream);
+    addresses.commit_frontier(*branch_one, 66);
+    expect(pages.committed_columns(shared_tail) == 1 &&
+               pages.committed_columns(branch_one_tail) == 2,
+           "private branch writes do not extend the shared partial tail");
+    addresses.deactivate(*branch_one);
+    addresses.destructive_truncate_inactive(*branch_one, 65);
+    expect(addresses.committed_frontier(*branch_one) == 65 &&
+               pages.committed_columns(branch_one_tail) == 1 &&
+               pages.address_references(shared_full) == 2,
+           "private suffix truncation retains shared full-prefix pages");
+
+    const auto branch_two = addresses.create_inactive();
+    expect(branch_two.has_value(), "second shared-prefix branch address allocation");
+    auto second_fork = addresses.prepare_prefix_fork(*shared, *branch_two, 65, 3, 1);
+    physical_pages.copy_page(addresses.prefix_fork_tail_source(second_fork),
+                             addresses.prefix_fork_tail_destination(second_fork),
+                             device.transfer_stream);
+    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+    addresses.commit_prefix_fork(std::move(second_fork), device.stream);
+    const auto branch_two_tail = addresses.logical_page(*branch_two, 1);
+    expect(branch_two_tail != shared_tail && branch_two_tail != branch_one_tail &&
+               pages.address_references(shared_full) == 3,
+           "independent shared branches own distinct partial tails and one shared full page");
+    addresses.deactivate(*branch_two);
+    expect(addresses.release(*branch_one) && pages.address_references(shared_full) == 2 &&
+               addresses.release(*branch_two) && pages.address_references(shared_full) == 1 &&
+               addresses.release(*shared) && pages.occupied() == 0 &&
+               physical_pages.allocated_pages() == 0,
+           "shared full-page occupancy survives until its final address reference releases");
 }
 
 } // namespace

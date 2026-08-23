@@ -307,7 +307,7 @@ All three registered model IDs support:
 - BF16, INT8 group-64, and row-scaled FP8 E4M3 KV cache;
 - model- and thinking-mode-aware official sampling defaults, with explicit greedy, temperature,
   top-k, top-p, min-p, and presence/frequency-penalty overrides;
-- compatible-prefix reuse;
+- private and shared compatible-prefix reuse with optional Host-backed retained State/KV;
 - OpenAI Responses Core, OpenAI Chat Completions, and Anthropic Messages, including streaming and
   usage accounting;
 - prompt-rendered function tools and parsed tool calls.
@@ -324,7 +324,8 @@ from one to fifteen.
   Decode-ready requests are compacted at round boundaries and executed in one batched model
   traversal.
 - NInfer does not provide large-scale or preemptive continuous batching, priority/QoS scheduling,
-  multi-GPU execution, CPU/GPU offload, or distributed serving.
+  active-request swapping, weight offload, multi-GPU execution, or distributed serving. Inactive
+  retained context may use explicitly configured pinned Host State/KV backing.
 - `--max-context` is the logical ceiling of each sequence and is configurable up to the registered
   models' native 262,144-token limit. `--kv-capacity N` explicitly sizes the shared Main Text KV
   pool for all active and retained sequences, while `--kv-capacity auto` selects the largest usable

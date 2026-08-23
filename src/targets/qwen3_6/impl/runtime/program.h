@@ -4,6 +4,7 @@
 
 #include "core/arena.h"
 #include "core/gdn_replay_records.h"
+#include "core/host_kv_arena.h"
 #include "core/request_transient_arena.h"
 #include "ninfer/ops/sampling.h"
 #include "core/decode_graph.h"
@@ -11,6 +12,7 @@
 
 #include "targets/qwen3_6/impl/runtime/layouts.h"
 #include "targets/qwen3_6/impl/runtime/dflash_context.h"
+#include "targets/qwen3_6/impl/runtime/host_kv_extent_store.h"
 #include "targets/qwen3_6/impl/runtime/logical_kv_store.h"
 #include "targets/qwen3_6/impl/runtime/state_image_store.h"
 #include "targets/qwen3_6/impl/runtime/prefix_identity.h"
@@ -25,6 +27,7 @@
 #include <span>
 #include <stdexcept>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
@@ -36,12 +39,12 @@ using RewriteCheckpointSpec = qwen3_6::RewriteCheckpointSpec;
 using ReusePath = ninfer::PrefixReusePath;
 
 [[nodiscard]] constexpr bool is_rewrite_checkpoint_restore(ReusePath path) noexcept {
-    return path == ReusePath::RestoreTurnCheckpoint || path == ReusePath::RestoreResponseCheckpoint;
+    return path == ReusePath::PrivateTurnClosure || path == ReusePath::PrivateResponseReplay;
 }
 
 [[nodiscard]] constexpr ReusePath restore_path(RewriteCheckpointKind kind) noexcept {
-    return kind == RewriteCheckpointKind::TurnClosure ? ReusePath::RestoreTurnCheckpoint
-                                                      : ReusePath::RestoreResponseCheckpoint;
+    return kind == RewriteCheckpointKind::TurnClosure ? ReusePath::PrivateTurnClosure
+                                                      : ReusePath::PrivateResponseReplay;
 }
 
 [[nodiscard]] constexpr runtime::CheckpointKind
@@ -50,12 +53,26 @@ checkpoint_kind(RewriteCheckpointKind kind) noexcept {
                                                       : runtime::CheckpointKind::ResponseReplay;
 }
 
-enum class RewriteCheckpointAction : std::uint8_t {
-    Drop,
-    KeepExisting,
-    ReclassifyExisting,
-    CaptureNew,
-    DeferCapture,
+enum class RewriteCheckpointDisposition : std::uint8_t {
+    RetainExisting,
+    ReplaceAtCommittedFrontier,
+    DropOptional,
+};
+
+struct PreparedCaptureIdentity {
+    std::vector<TokenId> ledger;
+    qwen3_6::detail::ResidentPrefixIdentity prefix_identity;
+    qwen3_6::PrefixShortlistKey shortlist_key;
+    runtime::PrefillWork rebuild_work;
+};
+
+struct CaptureGroup {
+    std::shared_ptr<const PreparedCaptureIdentity> identity;
+    std::optional<RewriteCheckpointKind> rewrite;
+    std::uint32_t frontier    = 0;
+    std::uint32_t input_order = 0;
+    bool shared               = false;
+    bool long_anchor          = false;
 };
 
 enum class MtpBridgeMode : std::uint8_t {
@@ -71,12 +88,18 @@ namespace ninfer::targets::qwen3_6::detail {
 template <>
 struct RequestBasePlanImpl<NINFER_QWEN36_VARIANT> {
     runtime::RequestPlanSummary summary;
+    runtime::ResourceDemand root_demand;
+    runtime::PrefillWork root_rebuild_work;
+    qwen3_6::PreparedContextCache context_cache;
     ops::SamplingConfig sampling;
     std::uint32_t text_kv_page_entitlement    = 0;
     std::uint32_t backend_kv_page_entitlement = 0;
     std::shared_ptr<const qwen3_6::VisionControl> vision_control;
     std::size_t vision_transient_bytes = 0;
     std::optional<qwen3_6::RewriteCheckpointSpec> rewrite_checkpoint;
+    std::vector<NINFER_QWEN36_RUNTIME_NS::CaptureGroup> capture_groups;
+    std::vector<qwen3_6::PrefixShortlistKey> shared_shortlist_keys;
+    std::vector<qwen3_6::PrefixShortlistKey> sparse_shortlist_keys;
     bool allow_prefix_reuse = false;
 };
 
@@ -84,26 +107,46 @@ template <>
 struct AdmissionPlanImpl<NINFER_QWEN36_VARIANT> {
     runtime::RequestPlanSummary summary;
     runtime::ResourceDemand demand;
-    NINFER_QWEN36_RUNTIME_NS::ReusePath reuse = NINFER_QWEN36_RUNTIME_NS::ReusePath::FullReset;
+    runtime::ResourceVector source_resources;
+    NINFER_QWEN36_RUNTIME_NS::ReusePath reuse = NINFER_QWEN36_RUNTIME_NS::ReusePath::Root;
     std::uint32_t reuse_base                  = 0;
     NINFER_QWEN36_RUNTIME_NS::MtpBridgeMode mtp_bridge =
         NINFER_QWEN36_RUNTIME_NS::MtpBridgeMode::None;
     bool prepare_mtp = false;
     std::optional<NINFER_QWEN36_RUNTIME_NS::VisionPrefillPlan> vision;
-    NINFER_QWEN36_RUNTIME_NS::RewriteCheckpointAction rewrite_checkpoint_action =
-        NINFER_QWEN36_RUNTIME_NS::RewriteCheckpointAction::Drop;
-    std::optional<qwen3_6::RewriteCheckpointSpec> rewrite_checkpoint_capture;
+    NINFER_QWEN36_RUNTIME_NS::RewriteCheckpointDisposition rewrite_disposition =
+        NINFER_QWEN36_RUNTIME_NS::RewriteCheckpointDisposition::DropOptional;
+    std::vector<NINFER_QWEN36_RUNTIME_NS::CaptureGroup> capture_groups;
     ops::SamplingConfig sampling;
     std::uint32_t text_kv_page_entitlement    = 0;
     std::uint32_t backend_kv_page_entitlement = 0;
     std::size_t transient_bytes               = 0;
     std::size_t transient_alignment           = 1;
     runtime::LaneId destination{};
-    std::uint64_t destination_epoch        = 0;
-    bool has_source                        = false;
+    std::uint64_t destination_epoch = 0;
+    bool has_source                 = false;
+    bool has_shared_source          = false;
+    std::optional<runtime::CheckpointRef> selected_checkpoint;
     std::uint32_t source_index             = 0;
     std::uint64_t source_generation        = 0;
-    std::uint64_t root_rebuild_work_quanta = 0;
+    std::uint32_t shared_source_index      = 0;
+    std::uint64_t shared_source_generation = 0;
+    runtime::PrefillWork root_rebuild_work;
+    runtime::PrefillWork remaining_prefill_work;
+    std::vector<runtime::ContextTransferRequirement> transfer_requirements;
+    runtime::ClaimDisposition source_disposition = runtime::ClaimDisposition::ConsumedToActive;
+    runtime::ResourceVector active_optional_resources;
+    bool state_fork_required          = false;
+    bool text_prefix_fork_required    = false;
+    bool backend_prefix_fork_required = false;
+    bool needs_transfer               = false;
+    bool temporal_eligible            = true;
+    std::vector<qwen3_6::PressureOption> pressure_options;
+    std::vector<std::uint32_t> pressure_indices;
+    std::vector<std::uint64_t> pressure_generations;
+    std::vector<qwen3_6::PressureOption> shared_pressure_options;
+    std::vector<std::uint32_t> shared_pressure_indices;
+    std::vector<std::uint64_t> shared_pressure_generations;
 };
 
 } // namespace ninfer::targets::qwen3_6::detail
@@ -152,6 +195,14 @@ struct RewriteCheckpoint {
     bool valid                 = false;
     RewriteCheckpointKind kind = RewriteCheckpointKind::TurnClosure;
     std::uint32_t frontier     = 0;
+    runtime::PrefillWork rebuild_work;
+};
+
+struct LongAnchorCheckpoint {
+    StateImageHandle state;
+    std::uint32_t frontier = 0;
+    std::uint32_t ordinal  = 0;
+    runtime::PrefillWork rebuild_work;
 };
 
 struct SequenceKVBundle {
@@ -201,8 +252,36 @@ struct SequenceState {
     std::array<TokenId, qwen3_6::kMtpDecodeMaximumDrafts> mtp_drafts{};
     std::uint32_t mtp_draft_count = 0;
     bool tail_hidden_valid        = false;
+    bool state_source_retained    = false;
+    bool endpoint_valid           = false;
     RewriteCheckpoint rewrite_checkpoint;
-    std::uint64_t rebuild_work_quanta = 0;
+    std::vector<LongAnchorCheckpoint> long_anchors;
+    std::vector<std::uint32_t> shared_prefix_references;
+    runtime::PrefillWork rebuild_work;
+};
+
+struct SharedPrefixState {
+    std::optional<SequenceKVBundle> kv;
+    StateImageHandle state;
+    std::shared_ptr<const PreparedCaptureIdentity> identity;
+    std::uint32_t frontier         = 0;
+    std::uint32_t backend_frontier = 0;
+    std::int32_t rope_delta        = 0;
+    bool tail_hidden_valid         = false;
+    runtime::PrefillWork rebuild_work;
+    std::uint32_t active_references = 0;
+};
+
+enum class SharedPrefixSlotRole : std::uint8_t {
+    Free,
+    ReservedCapture,
+    ReservedReplacement,
+    Catalogued,
+};
+
+struct SharedPrefixSlot {
+    SharedPrefixSlotRole role = SharedPrefixSlotRole::Free;
+    std::uint64_t generation  = 1;
 };
 
 // Request/round control is not retained with a reusable SequenceState. A later concurrent Engine
@@ -213,22 +292,27 @@ struct RequestControl {
     ops::SamplingConfig sampling_host;
     GenerationTimings timings;
     SpeculativeStats speculative_stats;
-    runtime::DeviceResources active_resources;
+    runtime::ResourceVector active_resources;
+    runtime::ResourceVector optional_resources;
+    bool publish_continuation = true;
 
     struct Prefill {
         PreparedPromptData prompt;
         std::optional<VisionPrefillPlan> vision_plan;
         std::unique_ptr<schedule::VisionPrefillSession> vision;
         RequestTransientArena::Region transient;
-        std::optional<RewriteCheckpointSpec> rewrite_checkpoint_capture;
-        std::uint32_t base               = 0;
-        std::uint32_t cursor             = 0;
-        std::uint32_t prompt_tokens      = 0;
-        std::uint32_t initial_mtp_extent = 0;
-        double elapsed_seconds           = 0.0;
-        bool prepare_mtp                 = false;
-        ReusePath reuse                  = ReusePath::FullReset;
-        MtpBridgeMode mtp_bridge         = MtpBridgeMode::None;
+        std::vector<CaptureGroup> capture_groups;
+        std::size_t next_capture            = 0;
+        std::uint64_t pending_capture_offer = 0;
+        std::uint32_t base                  = 0;
+        std::uint32_t cursor                = 0;
+        std::uint32_t prompt_tokens         = 0;
+        std::uint32_t initial_mtp_extent    = 0;
+        runtime::PrefillWork rebuild_work;
+        double elapsed_seconds   = 0.0;
+        bool prepare_mtp         = false;
+        ReusePath reuse          = ReusePath::Root;
+        MtpBridgeMode mtp_bridge = MtpBridgeMode::None;
     };
 
     std::optional<Prefill> prefill;
@@ -245,22 +329,73 @@ public:
     [[nodiscard]] std::optional<AdmissionPlan>
     inspect_admission(const PreparedPromptData& prompt, const RequestBasePlan& base,
                       runtime::LaneId destination, const ContinuationHandle* source,
+                      const SharedPrefixHandle* shared_source,
                       std::optional<runtime::CheckpointRef> checkpoint);
-    [[nodiscard]] MaterializationTicket
-    reserve_materialization(AdmissionPlan&& plan, PreparedPromptData&& prompt,
-                            const ContinuationHandle* source,
-                            std::span<const ContinuationHandle* const> victims);
-    [[nodiscard]] ReleaseResult
-    release_materialization_victim(MaterializationTicket& ticket,
-                                   ContinuationHandle&& victim) noexcept;
-    [[nodiscard]] runtime::ConsumeStatus
-    abort_materialization(MaterializationTicket&& ticket) noexcept;
-    void prepare_materialization(MaterializationTicket& ticket);
-    [[nodiscard]] MaterializationResult
-    publish_materialization(MaterializationTicket&& ticket,
-                            std::optional<ContinuationHandle>&& source,
-                            runtime::CancellationFlagView cancellation);
+    [[nodiscard]] std::vector<qwen3_6::PressureOption>
+    inspect_pressure_options(const ContinuationHandle& continuation,
+                             runtime::ResourceVector deficit) const;
+    [[nodiscard]] qwen3_6::PressureOption
+    inspect_eviction_option(const ContinuationHandle& continuation) const;
+    [[nodiscard]] std::vector<qwen3_6::PressureOption>
+    inspect_shared_pressure_options(const SharedPrefixHandle& shared,
+                                    runtime::ResourceVector deficit) const;
+    [[nodiscard]] qwen3_6::PressureOption
+    inspect_shared_eviction_option(const SharedPrefixHandle& shared) const;
+    [[nodiscard]] std::optional<runtime::ResourceDelta> inspect_combined_pressure_effect(
+        std::span<const ContinuationHandle* const> pressure_owners,
+        std::span<const qwen3_6::PressureOption> pressure_options,
+        std::span<const SharedPrefixHandle* const> shared_pressure_owners,
+        std::span<const qwen3_6::PressureOption> shared_pressure_options) const;
+    [[nodiscard]] std::optional<AdmissionPlan>
+    compose_materialization(AdmissionPlan&& admission,
+                            std::span<const ContinuationHandle* const> pressure_owners,
+                            std::span<const qwen3_6::PressureOption> pressure_options,
+                            std::span<const SharedPrefixHandle* const> shared_pressure_owners,
+                            std::span<const qwen3_6::PressureOption> shared_pressure_options);
+    [[nodiscard]] runtime::PreflightStatus
+    revalidate_materialization(const AdmissionPlan& plan, const PreparedPromptData& prompt,
+                               const ContinuationHandle* source,
+                               const SharedPrefixHandle* shared_source,
+                               std::span<const ContinuationHandle* const> victims,
+                               std::span<const SharedPrefixHandle* const> shared_victims) const;
+    [[nodiscard]] runtime::ContextTransactionReserveStatus reserve_materialization(
+        AdmissionPlan&& plan, PreparedPromptData&& prompt, const ContinuationHandle* source,
+        const SharedPrefixHandle* shared_source, std::span<const ContinuationHandle* const> victims,
+        std::span<const SharedPrefixHandle* const> shared_victims,
+        runtime::CancellationFlagView cancellation);
+    [[nodiscard]] ContextTransactionProgress<Variant>
+    progress_context_transaction(runtime::CancellationFlagView cancellation);
+    void finalize_context_transaction() noexcept;
+    [[nodiscard]] bool has_context_transaction() const noexcept;
     [[nodiscard]] PrefillProgress advance_prefill(SequenceHandle sequence);
+    [[nodiscard]] CaptureAssessment
+    inspect_capture(const CaptureOffer& offer, const SharedPrefixHandle* exact_shared,
+                    const SharedPrefixHandle* replacement,
+                    std::optional<runtime::CheckpointRef> private_replacement) const;
+    [[nodiscard]] bool shared_capture_matches(const CaptureOffer& offer,
+                                              const SharedPrefixHandle& shared) const;
+    void skip_capture(CaptureOffer&& offer);
+    [[nodiscard]] runtime::ContextTransactionReserveStatus
+    reserve_active_capture(CaptureOffer&& offer, const SharedPrefixHandle* exact_shared,
+                           const SharedPrefixHandle* replacement,
+                           std::optional<runtime::CheckpointRef> private_replacement,
+                           runtime::CancellationFlagView cancellation);
+    [[nodiscard]] std::optional<qwen3_6::ReplicaTransitionOption>
+    inspect_replica_transition(const ContinuationHandle& owner,
+                               runtime::CheckpointRef checkpoint) const;
+    [[nodiscard]] std::optional<qwen3_6::ReplicaTransitionOption>
+    inspect_replica_transition(const SharedPrefixHandle& owner) const;
+    [[nodiscard]] runtime::PreflightStatus revalidate_replica_transition(
+        const ContinuationHandle* private_owner, const SharedPrefixHandle* shared_owner,
+        const qwen3_6::ReplicaTransitionOption& option,
+        const ContinuationHandle* private_replacement, const SharedPrefixHandle* shared_replacement,
+        const qwen3_6::PressureOption* replacement) const;
+    [[nodiscard]] runtime::ContextTransactionReserveStatus reserve_replica_transition(
+        const ContinuationHandle* private_owner, const SharedPrefixHandle* shared_owner,
+        qwen3_6::ReplicaTransitionOption option, const ContinuationHandle* private_replacement,
+        const SharedPrefixHandle* shared_replacement,
+        std::optional<qwen3_6::PressureOption> replacement,
+        runtime::CancellationFlagView cancellation);
     [[nodiscard]] PendingBatch decode(std::span<const SequenceHandle> sequences,
                                       std::span<const runtime::RoundBudget> budgets);
     [[nodiscard]] CommitResult commit(PendingBatch&& pending,
@@ -270,8 +405,12 @@ public:
     [[nodiscard]] FinishResult finish(SequenceHandle sequence) noexcept;
     [[nodiscard]] AbortResult abort(SequenceHandle sequence) noexcept;
     [[nodiscard]] ReleaseResult release_continuation(ContinuationHandle&& continuation) noexcept;
+    [[nodiscard]] ReleaseResult release_shared_prefix(SharedPrefixHandle&& shared) noexcept;
+    [[nodiscard]] std::array<runtime::DeviceResources, 1U << kMaximumConcurrency>
+    project_protected_resources(std::span<const ProtectedPrivateOwner> private_owners,
+                                std::span<const ProtectedSharedOwner> shared_owners) const;
     void fail_all_cleanup() noexcept;
-    [[nodiscard]] runtime::DeviceResources admission_capacity() const noexcept;
+    [[nodiscard]] runtime::ResourceVector admission_capacity() const noexcept;
 
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
 
@@ -282,6 +421,9 @@ public:
     const std::uint32_t capacity;
     const std::uint32_t kv_capacity;
     const std::uint32_t max_concurrency;
+    const ContextCacheOptions context_cache;
+    const std::uint32_t continuation_capacity;
+    const std::uint32_t shared_prefix_capacity;
     const std::uint32_t prefill_chunk;
     const std::uint32_t draft_window;
     const SpeculativeBackend speculative_backend;
@@ -300,11 +442,16 @@ public:
     WorkspaceArena work;
     RequestTransientArena request_transient;
     std::unique_ptr<qwen3_6::DecoderState> decoder;
+    std::unique_ptr<HostKVArena> host_kv_arena;
     std::unique_ptr<LogicalKVPageStore> text_kv_pages;
     std::unique_ptr<KVAddressSpaceStore> text_kv_addresses;
     std::unique_ptr<LogicalKVPageStore> backend_kv_pages;
     std::unique_ptr<KVAddressSpaceStore> backend_kv_addresses;
+    std::unique_ptr<HostKVExtentStore> host_kv_extents;
+    std::size_t text_host_kv_page_stride    = 0;
+    std::size_t backend_host_kv_page_stride = 0;
     std::unique_ptr<qwen3_6::StateImageDevicePool> state_images;
+    std::unique_ptr<qwen3_6::HostStatePool> host_state_images;
     std::unique_ptr<StateImageStore> state_store;
     std::optional<GdnReplayRecords> replay_records;
     std::optional<DFlashPersistentState> dflash;
@@ -313,8 +460,10 @@ public:
     Tensor sampling_config;
     Tensor token_counts;
 
-    std::array<SequenceState, 2 * kMaximumConcurrency> continuation_states;
-    std::array<ContinuationSlot, 2 * kMaximumConcurrency> continuation_slots;
+    std::vector<SequenceState> continuation_states;
+    std::vector<ContinuationSlot> continuation_slots;
+    std::vector<SharedPrefixState> shared_prefix_states;
+    std::vector<SharedPrefixSlot> shared_prefix_slots;
     std::array<std::uint32_t, kMaximumConcurrency> active_continuations{};
     std::array<RequestControl, kMaximumConcurrency> requests;
     std::array<std::uint64_t, kMaximumConcurrency> lane_epochs{};
@@ -349,39 +498,200 @@ private:
     std::uint64_t next_transaction_id_ = 1;
 
     struct MaterializationTransaction {
+        struct KVRestorePage {
+            LogicalKVPageHandle logical;
+            HostKVExtentCapability extent;
+            std::uint32_t extent_page = 0;
+        };
+
+        struct PressureWork {
+            qwen3_6::PressureOption option;
+            std::uint32_t continuation_index      = 0;
+            std::uint64_t continuation_generation = 0;
+            bool shared_owner                     = false;
+            std::optional<StateImageTransfer> state_transfer;
+            std::optional<HostKVExtentReservation> main_backup;
+            std::optional<HostKVExtentReservation> backend_backup;
+            std::vector<LogicalKVPageHandle> main_pages;
+            std::vector<LogicalKVPageHandle> backend_pages;
+            std::vector<DeviceKVPageHandle> main_sources;
+            std::vector<DeviceKVPageHandle> backend_sources;
+            runtime::ResourceDelta committed_delta;
+            bool submitted             = false;
+            bool completed             = false;
+            bool state_host_released   = false;
+            bool main_host_released    = false;
+            bool backend_host_released = false;
+            std::uint8_t timer_mask    = 0;
+            std::vector<runtime::ContextTransferObservation> observations;
+        };
+
         std::uint64_t id = 0;
         runtime::LaneId destination;
-        bool has_source                 = false;
-        std::uint32_t source_index      = 0;
-        std::uint64_t source_generation = 0;
-        std::array<std::uint32_t, 2 * kMaximumConcurrency> victim_indices{};
-        std::array<std::uint64_t, 2 * kMaximumConcurrency> victim_generations{};
-        std::array<runtime::DeviceResources, 2 * kMaximumConcurrency> released_victims{};
-        std::array<bool, 2 * kMaximumConcurrency> victim_released{};
-        std::size_t victim_count = 0;
+        bool has_source                              = false;
+        bool has_shared_source                       = false;
+        runtime::ClaimDisposition source_disposition = runtime::ClaimDisposition::ConsumedToActive;
+        std::uint32_t source_index                   = 0;
+        std::uint64_t source_generation              = 0;
+        std::uint32_t shared_source_index            = 0;
+        std::uint64_t shared_source_generation       = 0;
+        std::optional<MaterializationSourceResult> source_result;
+        std::optional<MaterializationSharedSourceResult> shared_source_result;
+        std::vector<std::uint32_t> victim_indices;
+        std::vector<std::uint64_t> victim_generations;
+        std::vector<bool> victim_released;
+        std::vector<PressureWork> pressure;
+        std::vector<MaterializationVictimResult> pressure_results;
+        std::size_t pressure_cursor = 0;
+        std::size_t victim_count    = 0;
+        std::vector<std::uint32_t> shared_victim_indices;
+        std::vector<std::uint64_t> shared_victim_generations;
+        std::vector<bool> shared_victim_released;
+        std::vector<MaterializationSharedVictimResult> shared_pressure_results;
+        std::vector<PressureWork> shared_pressure;
+        std::size_t shared_pressure_cursor    = 0;
+        std::size_t shared_victim_count       = 0;
+        bool pressure_host_releases_published = false;
         std::optional<AdmissionPlan> plan;
         std::optional<std::uint32_t> root_continuation_index;
         bool root_waiting_for_victim = false;
         std::array<StateImageHandle, 2> reserved_states{};
         std::size_t reserved_state_count = 0;
+        std::optional<StateImageHandle> state_fork_destination;
         std::optional<KVAddressSpaceHandle> root_text_address;
         std::optional<KVAddressSpaceHandle> root_backend_address;
         std::optional<KVActivationReservation> text_activation;
         std::optional<KVActivationReservation> backend_activation;
-        bool transient_active = false;
-        bool prepared         = false;
+        std::optional<DeviceKVPageReservation> text_source_restore_reservation;
+        std::optional<DeviceKVPageReservation> backend_source_restore_reservation;
+        std::optional<KVPrefixForkReservation> text_prefix_fork;
+        std::optional<KVPrefixForkReservation> backend_prefix_fork;
+        std::optional<std::uint32_t> text_activation_frontier;
+        std::optional<std::uint32_t> backend_activation_frontier;
+        std::optional<StateImageTransfer> state_restore;
+        bool split_state_identity = false;
+        std::vector<KVRestorePage> text_restores;
+        std::vector<DeviceKVPageHandle> text_restore_destinations;
+        std::vector<KVRestorePage> backend_restores;
+        std::vector<DeviceKVPageHandle> backend_restore_destinations;
+        runtime::ResourceDelta source_committed_delta;
+        runtime::ResourceDelta committed_delta;
+        std::vector<runtime::ContextTransferObservation> transfer_observations;
+        runtime::ContextOperationCounts operations;
+        bool state_restored                        = false;
+        bool state_restore_attaches_source_replica = false;
+        bool transfer_submitted                    = false;
+        std::uint8_t transfer_timer_mask           = 0;
+        bool prefix_tail_submitted                 = false;
+        bool prefix_forks_ready                    = false;
+        bool source_prepared                       = false;
+        bool cancel_pending                        = false;
+        bool transient_active                      = false;
+        bool prepared                              = false;
+        bool terminal                              = false;
     };
 
-    std::optional<MaterializationTransaction> materialization_transaction_;
     std::uint64_t next_materialization_id_ = 1;
+    CudaCompletionEvent context_source_ready_;
+    CudaCompletionEvent context_completion_;
     std::vector<TokenId> materialization_ledger_;
     qwen3_6::detail::ResidentPrefixIdentity materialization_identity_;
 
+    struct ActiveCaptureTransaction {
+        std::uint64_t id         = 0;
+        std::uint32_t lane       = 0;
+        std::uint64_t lane_epoch = 0;
+        CaptureGroup group;
+        bool publish_private = false;
+        bool publish_shared  = false;
+        bool replaces_shared = false;
+        std::optional<runtime::CheckpointRef> private_replacement;
+        std::optional<std::uint32_t> shared_index;
+        std::uint64_t replacement_generation = 0;
+        StateImageHandle source_state;
+        StateImageHandle destination_state;
+        std::optional<KVAddressSpaceHandle> active_text_destination;
+        std::optional<KVAddressSpaceHandle> active_backend_destination;
+        std::optional<KVActiveSnapshotReservation> text_snapshot;
+        std::optional<KVActiveSnapshotReservation> backend_snapshot;
+        runtime::ResourceDelta resource_delta;
+        runtime::ResourceDelta active_entitlement_delta;
+        ContinuationSummary active_summary;
+        std::vector<runtime::ContextTransferObservation> transfer_observations;
+        runtime::ContextOperationCounts operations;
+        bool recycles_private_state        = false;
+        std::uint64_t recycled_state_epoch = 0;
+        bool transfer_enqueue_pending      = false;
+        bool transfer_submitted            = false;
+        std::uint8_t transfer_timer_mask   = 0;
+        bool published                     = false;
+    };
+
+    std::uint64_t next_capture_offer_id_ = 1;
+
+    struct ReplicaTransitionTransaction {
+        bool shared_owner         = false;
+        std::uint32_t owner_index = 0;
+        std::uint64_t generation  = 0;
+        qwen3_6::ReplicaTransitionOption option;
+        std::optional<MaterializationTransaction::PressureWork> replacement;
+        runtime::ResourceDelta committed_delta;
+        std::optional<StateImageTransfer> state_transfer;
+        std::optional<HostKVExtentReservation> kv_backup;
+        std::vector<LogicalKVPageHandle> kv_pages;
+        std::vector<DeviceKVPageHandle> kv_sources;
+        std::vector<runtime::ContextTransferObservation> transfer_observations;
+        std::array<bool, 2> owner_shared{};
+        std::array<std::uint32_t, 2> owner_indices{};
+        std::array<std::uint64_t, 2> owner_generations{};
+        std::array<ReplicaTransitionOwnerResult, 2> owner_results;
+        std::size_t owner_count = 0;
+        bool submitted          = false;
+        bool timer_started      = false;
+        bool cancel_pending     = false;
+        bool terminal           = false;
+    };
+
+    using ContextTransaction = std::variant<std::monostate, MaterializationTransaction,
+                                            ActiveCaptureTransaction, ReplicaTransitionTransaction>;
+    ContextTransaction context_transaction_;
+
+    [[nodiscard]] MaterializationResult
+    progress_materialization_transaction(runtime::CancellationFlagView cancellation);
+    [[nodiscard]] ActiveCaptureResult
+    progress_active_capture_transaction(runtime::CancellationFlagView cancellation);
+    [[nodiscard]] qwen3_6::ReplicaTransitionResult
+    progress_replica_transition_transaction(runtime::CancellationFlagView cancellation);
+
+    std::array<CudaEventTimer, 3> context_transfer_timers_;
+
     [[nodiscard]] std::optional<AdmissionPlan>
     inspect_lane(std::uint32_t lane, const PreparedPromptData& prompt, const RequestBasePlan& base,
-                 const SequenceState* source, std::optional<runtime::CheckpointRef> checkpoint);
-    [[nodiscard]] StartResult start_request(MaterializationTransaction& transaction,
-                                            std::optional<ContinuationHandle>&& source);
+                 const SequenceState* source, const SharedPrefixState* shared_source,
+                 std::optional<runtime::CheckpointRef> checkpoint);
+    [[nodiscard]] StartResult start_request(MaterializationTransaction& transaction);
+    void prepare_materialization(MaterializationTransaction& transaction);
+    void enqueue_materialization_transfers(MaterializationTransaction& transaction);
+    void record_materialization_transfer_observations(MaterializationTransaction& transaction);
+    void publish_materialization_transfers(MaterializationTransaction& transaction);
+    void prepare_prefix_forks(MaterializationTransaction& transaction);
+    void prepare_consumed_source(MaterializationTransaction& transaction);
+    void abort_materialization_transfers(MaterializationTransaction& transaction) noexcept;
+    void prepare_pressure_bookkeeping(MaterializationTransaction::PressureWork& work);
+    void prepare_pressure_work(MaterializationTransaction::PressureWork& work);
+    [[nodiscard]] runtime::ResourceDelta
+    publish_pressure_host_releases(MaterializationTransaction::PressureWork& work);
+    void publish_pressure_work(MaterializationTransaction::PressureWork& work) noexcept;
+    void abort_pressure_work(MaterializationTransaction::PressureWork& work) noexcept;
+    void start_context_transfer_timer(runtime::ContextResourceClass resource);
+    void stop_context_transfer_timer(runtime::ContextResourceClass resource);
+    [[nodiscard]] runtime::ContextTransferObservation
+    context_transfer_observation(runtime::ContextResourceClass resource,
+                                 runtime::ContextTransferDirection direction, std::uint64_t bytes,
+                                 std::uint32_t page_count = 0) const;
+    [[nodiscard]] ReleaseResult
+    release_materialization_victim(MaterializationTransaction& transaction,
+                                   std::size_t position) noexcept;
     void start_sequence(std::uint32_t lane, SequenceState& sequence,
                         MaterializationTransaction& transaction);
     void release_materialization_staging(MaterializationTransaction& transaction) noexcept;
@@ -395,11 +705,80 @@ private:
                              std::span<const std::uint8_t> cancelled);
     [[nodiscard]] bool valid_sequence(SequenceHandle handle) const noexcept;
     [[nodiscard]] bool valid_continuation(const ContinuationHandle& handle) const noexcept;
+    [[nodiscard]] bool valid_shared_prefix(const SharedPrefixHandle& handle) const noexcept;
+    [[nodiscard]] bool valid_capture_offer(const CaptureOffer& offer) const noexcept;
     [[nodiscard]] bool materialization_pins(std::uint32_t index,
                                             std::uint64_t generation) const noexcept;
     [[nodiscard]] bool valid_pending(const PendingBatch& pending) const noexcept;
-    [[nodiscard]] runtime::DeviceResources
+    [[nodiscard]] runtime::ResourceVector
     resident_resources(const SequenceState& sequence) const noexcept;
+    [[nodiscard]] runtime::ResourceVector
+    resident_resources(const SharedPrefixState& shared) const noexcept;
+    [[nodiscard]] runtime::ResourceVector physical_occupancy() const noexcept;
+    [[nodiscard]] bool physical_peak_fits(runtime::ResourceVector peak) const noexcept;
+    [[nodiscard]] StateImageHandle
+    selected_state(const SequenceState& sequence, ReusePath reuse,
+                   std::optional<runtime::CheckpointRef> checkpoint) const;
+    [[nodiscard]] bool
+    selected_state_requires_fork(const SequenceState& sequence, ReusePath reuse,
+                                 RewriteCheckpointDisposition rewrite_disposition,
+                                 std::optional<runtime::CheckpointRef> checkpoint,
+                                 std::uint32_t reuse_base) const;
+    [[nodiscard]] bool can_retain_rewrite_checkpoint(const PreparedPromptData& prompt,
+                                                     const RewriteCheckpointSpec& desired,
+                                                     const SequenceState& sequence, ReusePath reuse,
+                                                     std::uint32_t reuse_base) const;
+    [[nodiscard]] std::uint32_t device_kv_prefix_pages(const KVAddressSpaceStore& addresses,
+                                                       KVAddressSpaceHandle address,
+                                                       std::uint32_t frontier) const;
+    [[nodiscard]] std::uint32_t shared_kv_prefix_pages(const KVAddressSpaceStore& addresses,
+                                                       KVAddressSpaceHandle address,
+                                                       std::uint32_t frontier) const;
+    [[nodiscard]] std::uint32_t shared_device_kv_prefix_pages(const KVAddressSpaceStore& addresses,
+                                                              KVAddressSpaceHandle address,
+                                                              std::uint32_t frontier) const;
+    [[nodiscard]] bool partial_tail_cow_required(const KVAddressSpaceStore& addresses,
+                                                 KVAddressSpaceHandle address,
+                                                 std::uint32_t frontier) const;
+    [[nodiscard]] std::uint32_t
+    missing_shared_device_kv_prefix_pages(const KVAddressSpaceStore& addresses,
+                                          KVAddressSpaceHandle address,
+                                          std::uint32_t frontier) const;
+    [[nodiscard]] std::size_t host_kv_prefix_bytes(const KVAddressSpaceStore& addresses,
+                                                   KVAddressSpaceHandle address,
+                                                   std::uint32_t frontier) const noexcept;
+    [[nodiscard]] qwen3_6::CheckpointSummary
+    checkpoint_summary(const SequenceState& sequence, runtime::CheckpointRef checkpoint,
+                       StateImageHandle state, runtime::PrefillWork rebuild_work) const;
+    [[nodiscard]] qwen3_6::ContinuationSummary
+    continuation_summary(const SequenceState& sequence) const;
+    void populate_continuation_summary(const SequenceState& sequence,
+                                       qwen3_6::ContinuationSummary& summary) const;
+    [[nodiscard]] qwen3_6::SharedPrefixSummary
+    shared_prefix_summary(const SharedPrefixState& shared) const;
+    [[nodiscard]] std::optional<qwen3_6::PressureOption>
+    inspect_pressure_option(const SequenceState& sequence, runtime::ResourceVector deficit) const;
+    [[nodiscard]] std::vector<qwen3_6::PressureOption>
+    inspect_pressure_options(const SequenceState& sequence, runtime::ResourceVector deficit) const;
+    [[nodiscard]] std::optional<qwen3_6::PressureOption>
+    inspect_shared_pressure_option(const SharedPrefixState& shared,
+                                   runtime::ResourceVector deficit) const;
+    [[nodiscard]] qwen3_6::PressureOption
+    inspect_eviction_option(const SequenceState& sequence) const;
+    [[nodiscard]] std::optional<qwen3_6::PressureOption>
+    inspect_checkpoint_drop_option(const SequenceState& sequence,
+                                   runtime::CheckpointRef checkpoint) const;
+    [[nodiscard]] std::vector<runtime::ContextTransferRequirement>
+    checkpoint_restore_requirements(const SequenceKVBundle& kv,
+                                    const qwen3_6::TargetKVRequirement& requirement,
+                                    StateImageHandle state) const;
+    [[nodiscard]] std::vector<qwen3_6::ReplicaValueImpact> private_replica_value_impacts(
+        const SequenceState& sequence, std::optional<StateImageHandle> state,
+        qwen3_6::PressureKVAction main_kv = {}, qwen3_6::PressureKVAction backend_kv = {}) const;
+    [[nodiscard]] std::vector<qwen3_6::ReplicaValueImpact> shared_replica_value_impacts(
+        const SharedPrefixState& shared, std::optional<StateImageHandle> state,
+        qwen3_6::PressureKVAction main_kv = {}, qwen3_6::PressureKVAction backend_kv = {}) const;
+    void publish_checkpoint_drop(SequenceState& sequence, runtime::CheckpointRef checkpoint);
     [[nodiscard]] PrefillProgress wrap_prefill(std::uint32_t lane, runtime::PrefillStepResult step);
     [[nodiscard]] PendingBatch wrap_pending(std::span<const std::uint32_t> lanes,
                                             const runtime::BatchedGeneratedRound& round);
@@ -409,13 +788,36 @@ private:
     [[nodiscard]] std::optional<std::uint32_t> allocate_continuation_slot() noexcept;
     void release_continuation_slot(std::uint32_t index) noexcept;
     void clear_lane(SequenceState& sequence, RequestControl& request) noexcept;
-    void ordered_reset(SequenceState& sequence, bool state_already_reset = false);
+    void ordered_reset(SequenceState& sequence);
     [[nodiscard]] StateImageSelectors state_selectors(const SequenceState& sequence) const;
     [[nodiscard]] std::uint32_t state_footprint(const SequenceState& sequence) const noexcept;
+    [[nodiscard]] std::uint32_t owned_checkpoint_references(const SequenceState& sequence,
+                                                            StateImageHandle state) const noexcept;
+    [[nodiscard]] bool state_exclusive_to_sequence(const SequenceState& sequence,
+                                                   StateImageHandle state) const noexcept;
+    [[nodiscard]] std::optional<runtime::ResourceDelta>
+    combined_pressure_effect(std::span<const ContinuationHandle* const> pressure_owners,
+                             std::span<const qwen3_6::PressureOption> pressure_options,
+                             std::span<const SharedPrefixHandle* const> shared_pressure_owners,
+                             std::span<const qwen3_6::PressureOption> shared_pressure_options,
+                             std::vector<HostKVPageReplicaRelease>* released_host_pages) const;
     void refresh_state_views(SequenceState& sequence);
     void reserve_state_entitlement(SequenceState& sequence, std::uint32_t slots);
     void settle_state_fork(SequenceState& sequence);
-    void capture_rewrite_state(SequenceState& sequence, RewriteCheckpointSpec checkpoint);
+    [[nodiscard]] runtime::ResourceVector
+    release_checkpoint_reference(StateImageHandle checkpoint) noexcept;
+    [[nodiscard]] runtime::ResourceVector
+    release_shared_prefix_state(std::uint32_t index, SharedPrefixSlotRole expected_role);
+    [[nodiscard]] runtime::ResourceVector
+    install_private_capture(SequenceState& sequence, const CaptureGroup& group,
+                            StateImageHandle checkpoint,
+                            std::optional<runtime::CheckpointRef> replacement);
+    void enqueue_active_capture_transfers(ActiveCaptureTransaction& transaction);
+    void abort_active_capture(ActiveCaptureTransaction& transaction) noexcept;
+    [[nodiscard]] ActiveCaptureResult publish_active_capture(ActiveCaptureTransaction& transaction);
+    void enqueue_replica_transition(ReplicaTransitionTransaction& transaction);
+    void abort_replica_transition(ReplicaTransitionTransaction& transaction) noexcept;
+    void release_active_shared_references(SequenceState& sequence) noexcept;
     void release_sequence_state(SequenceState& sequence) noexcept;
     void prepare_graphs();
     void install_sampling(SequenceState& sequence, RequestControl& request,

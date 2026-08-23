@@ -82,7 +82,7 @@ int verify_loaded_product(const ninfer::Engine& engine) {
 int exercise_text_mtp_and_prefix(ninfer::Engine& engine) {
     const std::vector<ninfer::TokenId> prompt{248045, 846, 198, 5834, 248046, 198};
     const ninfer::GenerationResult first =
-        engine.generate(engine.prepare_tokens(prompt), greedy_options(5, false));
+        engine.generate(engine.prepare_tokens(prompt), greedy_options(5, true));
     if (first.generated_token_ids.size() != 5 ||
         first.speculative.backend != ninfer::SpeculativeBackend::Mtp ||
         first.speculative.rounds == 0) {
@@ -111,7 +111,7 @@ int exercise_text_mtp_and_prefix(ninfer::Engine& engine) {
         std::cerr << "35B partial-terminal fixture repeats its first token\n";
         return 1;
     }
-    ninfer::RequestOptions stop_options = greedy_options(5, false);
+    ninfer::RequestOptions stop_options = greedy_options(5, true);
     stop_options.stop.token_ids.push_back(first.generated_token_ids[1]);
     const ninfer::GenerationResult stopped =
         engine.generate(engine.prepare_tokens(prompt), stop_options);

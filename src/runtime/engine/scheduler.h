@@ -23,8 +23,7 @@ public:
     using RequestPtr     = std::shared_ptr<Request>;
     using SequenceHandle = typename Request::SequenceHandle;
 
-    enum class BoundaryAction : std::uint8_t {
-        AttemptAdmission,
+    enum class ExecutionAction : std::uint8_t {
         Prefill,
         Decode,
         Wait,
@@ -124,7 +123,9 @@ public:
         RoundMembership membership;
         for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
             const auto& request = slots[lane];
-            if (request == nullptr || !request->is_decode_ready()) { continue; }
+            if (request == nullptr || !request->is_decode_ready() || request->capture_pending) {
+                continue;
+            }
             if (!request->budget) {
                 throw std::logic_error("decode-ready request has no generation budget");
             }
@@ -146,16 +147,15 @@ public:
         for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
             const auto& request = slots[lane];
             if (request == nullptr) { continue; }
-            if (request->admission_resources.active_lanes == 0 ||
-                request->remaining_service_work == 0) {
+            if (request->remaining_service_work == 0) {
                 throw std::logic_error("active request has no admission accounting");
             }
             active.requests[active.size++] = ActiveAdmissionSnapshot{
                 .request_id            = request->id,
-                .resources             = request->admission_resources,
                 .remaining_work_quanta = request->remaining_service_work,
                 .backfill_epoch        = request->backfill_epoch,
                 .backfill_class        = request->backfill_class,
+                .owner_bit             = 1U << lane,
             };
         }
         return active;
@@ -170,16 +170,20 @@ public:
         request.remaining_service_work -= work;
     }
 
-    [[nodiscard]] BoundaryAction choose_boundary(bool have_pending, bool have_decode,
-                                                 bool previous_unit_was_decode) const noexcept {
-        if (prefill_lane_) {
-            return have_decode && !previous_unit_was_decode ? BoundaryAction::Decode
-                                                            : BoundaryAction::Prefill;
+    [[nodiscard]] bool should_attempt_admission(bool have_pending, bool admission_check_pending,
+                                                bool have_decode, bool previous_unit_was_decode,
+                                                bool context_transaction) const noexcept {
+        return have_pending && admission_check_pending && !context_transaction && !prefill_lane_ &&
+               (!have_decode || previous_unit_was_decode);
+    }
+
+    [[nodiscard]] ExecutionAction choose_execution(bool have_decode, bool prefill_runnable,
+                                                   bool previous_unit_was_decode) const noexcept {
+        if (prefill_runnable) {
+            return have_decode && !previous_unit_was_decode ? ExecutionAction::Decode
+                                                            : ExecutionAction::Prefill;
         }
-        if (have_pending && (!have_decode || previous_unit_was_decode)) {
-            return BoundaryAction::AttemptAdmission;
-        }
-        return have_decode ? BoundaryAction::Decode : BoundaryAction::Wait;
+        return have_decode ? ExecutionAction::Decode : ExecutionAction::Wait;
     }
 
     [[nodiscard]] std::optional<std::uint32_t> prefill_lane() const noexcept {
@@ -223,29 +227,31 @@ public:
     [[nodiscard]] bool protect_blocked_head(std::uint64_t request_id,
                                             const DeviceResources& head_resources,
                                             std::span<const ActiveAdmissionSnapshot> active,
+                                            const ProtectedHeadResourceProjection& projection,
                                             const DeviceResources& capacity) {
         if (!fifo_head_id_ || *fifo_head_id_ != request_id) {
             throw std::logic_error("blocked admission does not match the observed FIFO head");
         }
         if (!protection_) {
             protection_.emplace(make_admission_protection(next_protection_epoch_++, request_id,
-                                                          head_resources, active, capacity));
+                                                          head_resources, active, projection,
+                                                          capacity));
         } else if (protection_->head_request_id != request_id ||
                    protection_->head_resources != head_resources) {
             throw std::logic_error("protected head changed without a FIFO transition");
         }
         if (protection_->phase == ProtectionPhase::Open &&
-            protected_head_safe_without_temporal(*protection_, active, capacity)) {
+            protected_head_safe_without_temporal(*protection_, active, projection, capacity)) {
             protection_->phase = ProtectionPhase::Drain;
         }
         return protection_->phase == ProtectionPhase::Open;
     }
 
     [[nodiscard]] std::optional<AdmissionGrant>
-    qualify_backfill(std::uint64_t request_id, const DeviceResources& resources,
+    qualify_backfill(std::uint64_t request_id, const ProtectedHeadResourceProjection& projection,
                      std::uint64_t service_work_quanta,
                      std::span<const ActiveAdmissionSnapshot> active,
-                     const DeviceResources& capacity) const {
+                     const DeviceResources& capacity, bool temporal_eligible = true) const {
         if (!fifo_head_id_ || !protection_ || protection_->phase != ProtectionPhase::Open ||
             protection_->head_request_id != *fifo_head_id_) {
             throw std::logic_error("backfill qualification has no open protected head");
@@ -253,12 +259,12 @@ public:
         if (request_id == 0 || request_id == *fifo_head_id_ || service_work_quanta == 0) {
             throw std::logic_error("backfill candidate has invalid scheduling identity");
         }
-        if (persistent_backfill_is_safe(*protection_, active, resources, capacity)) {
+        if (persistent_backfill_is_safe(*protection_, active, projection, capacity)) {
             return AdmissionGrant(request_id, BackfillClass::Persistent, protection_->epoch_id,
                                   service_work_quanta);
         }
         const std::uint64_t frontier_distance = protection_frontier_distance(*protection_, active);
-        if (service_work_quanta <= frontier_distance &&
+        if (temporal_eligible && service_work_quanta <= frontier_distance &&
             service_work_quanta <= protection_->temporal_credit) {
             return AdmissionGrant(request_id, BackfillClass::Temporal, protection_->epoch_id,
                                   service_work_quanta);

@@ -17,7 +17,8 @@ namespace ninfer {
 
 using TokenId = std::int32_t;
 
-inline constexpr std::uint32_t kMaximumConcurrency = 8;
+inline constexpr std::uint32_t kMaximumConcurrency               = 8;
+inline constexpr std::size_t kMaximumContextCacheSessionKeyBytes = 256;
 // Aggregate encoded image/video payload retained by one prompt, independent of item count.
 inline constexpr std::size_t kMaximumPromptMediaBytes = 256ULL << 20;
 inline constexpr std::size_t kDefaultMediaCacheBytes  = 1ULL << 30;
@@ -73,6 +74,23 @@ struct LoadProgress {
     std::function<void(std::string_view phase, std::uint64_t done, std::uint64_t total)> callback;
 };
 
+struct ContextCacheOptions {
+    // Engine resolves every optional once at construction. With C=max_concurrency, the enabled
+    // defaults are H=C, P=2C, S=C, L=2 and M=4; Engine::options() returns those effective values.
+    bool enabled = true;
+    // Extra Device checkpoint StateImage slots H. Total Device StateImage capacity is C + H.
+    std::optional<std::uint32_t> device_state_slots;
+    // Host StateImages and Host KV bytes are independently configured pinned-memory capacities.
+    std::uint32_t host_state_slots     = 0;
+    std::size_t host_kv_capacity_bytes = 0;
+    // Bounded private/shared logical catalogs and per-continuation long-anchor count.
+    std::optional<std::uint32_t> max_private_continuations;
+    std::optional<std::uint32_t> max_shared_prefixes;
+    std::optional<std::uint32_t> max_long_anchors_per_continuation;
+    // Input-complexity bound; this does not reserve checkpoint storage.
+    std::optional<std::uint32_t> max_cache_markers_per_request;
+};
+
 struct EngineOptions {
     std::filesystem::path artifact_path;
     int device                         = 0;
@@ -90,6 +108,7 @@ struct EngineOptions {
     std::uint32_t media_preprocess_threads = 0;
     bool enable_vision                     = false;
     bool use_cuda_graph                    = true;
+    ContextCacheOptions context_cache;
     LoadProgress load_progress;
 };
 
@@ -262,9 +281,36 @@ struct PromptOptions {
     std::vector<std::string> tool_jsons;
 };
 
+enum class CacheRetentionHint : std::uint8_t {
+    Default,
+    LiveSession,
+    Disposable,
+};
+
+enum class PromptCacheMarkerKind : std::uint8_t {
+    SharedStablePrefix,
+    PrivateLongAnchor,
+};
+
+struct PromptCacheMarker {
+    std::uint32_t after_message_count = 0;
+    PromptCacheMarkerKind kind        = PromptCacheMarkerKind::SharedStablePrefix;
+
+    [[nodiscard]] friend constexpr bool operator==(PromptCacheMarker,
+                                                   PromptCacheMarker) noexcept = default;
+};
+
+struct ContextCacheHints {
+    std::optional<std::string> session_key;
+    CacheRetentionHint retention = CacheRetentionHint::Default;
+    std::vector<PromptCacheMarker> markers;
+    bool update_session_index = true;
+};
+
 struct PromptInput {
     std::vector<ChatMessage> messages;
     PromptOptions options;
+    ContextCacheHints context_cache;
 };
 
 enum class RequestErrorKind : std::uint8_t {
@@ -385,10 +431,12 @@ struct SpeculativeStats {
 };
 
 enum class PrefixReusePath : std::uint8_t {
-    FullReset,
-    AppendAtFrontier,
-    RestoreTurnCheckpoint,
-    RestoreResponseCheckpoint,
+    Root,
+    PrivateEndpoint,
+    PrivateTurnClosure,
+    PrivateResponseReplay,
+    PrivateLongAnchor,
+    SharedStablePrefix,
 };
 
 struct GenerationResult {
@@ -399,7 +447,7 @@ struct GenerationResult {
     std::uint32_t reasoning_tokens     = 0;
     FinishReason finish_reason         = FinishReason::None;
     std::uint32_t reused_prompt_tokens = 0;
-    PrefixReusePath prefix_reuse_path  = PrefixReusePath::FullReset;
+    PrefixReusePath prefix_reuse_path  = PrefixReusePath::Root;
     GenerationTimings timings;
     SpeculativeStats speculative;
 };
@@ -433,22 +481,88 @@ struct MemorySummary {
     std::size_t cuda_graph_allowance_bytes        = 0;
     std::size_t cuda_graph_observed_bytes         = 0;
     std::size_t kv_payload_bytes                  = 0;
+    std::uint32_t host_state_capacity_slots       = 0;
+    std::uint32_t host_state_occupied_slots       = 0;
+    std::size_t host_kv_capacity_bytes            = 0;
+    std::size_t host_kv_occupied_bytes            = 0;
 };
 
-// Monotonic execution counters plus one boundary-consistent scheduler snapshot. Consumers derive
-// interval throughput by subtracting two snapshots and dividing by their own monotonic wall time.
+// Monotonic execution counters, boundary-consistent current gauges, and explicitly named last
+// decision observations. Consumers derive interval counters by subtracting two snapshots.
 struct RuntimeStats {
-    // Actual prompt tokens evaluated by prefill; resident prefix hits are excluded.
+    // Actual prompt tokens evaluated by prefill; reused checkpoint-prefix tokens are excluded.
     std::uint64_t computed_prefill_tokens = 0;
     // Tokens committed by decode rounds; the first token emitted by prefill is excluded.
     std::uint64_t committed_decode_tokens = 0;
     // Decode batch executions and the sum of their batch sizes.
-    std::uint64_t decode_rounds         = 0;
-    std::uint64_t decode_row_rounds     = 0;
-    std::uint32_t running_requests      = 0;
-    std::uint32_t prefilling_requests   = 0;
-    std::uint32_t decode_ready_requests = 0;
-    std::uint32_t waiting_requests      = 0;
+    std::uint64_t decode_rounds             = 0;
+    std::uint64_t decode_row_rounds         = 0;
+    std::uint32_t running_requests          = 0;
+    std::uint32_t prefilling_requests       = 0;
+    std::uint32_t decode_ready_requests     = 0;
+    std::uint32_t waiting_requests          = 0;
+    std::uint32_t materializing_requests    = 0;
+    std::uint32_t capture_pending_requests  = 0;
+    std::uint64_t active_captures_completed = 0;
+    std::uint64_t active_captures_aborted   = 0;
+
+    std::uint64_t root_selections                    = 0;
+    std::uint64_t private_endpoint_selections        = 0;
+    std::uint64_t private_turn_closure_selections    = 0;
+    std::uint64_t private_response_replay_selections = 0;
+    std::uint64_t private_long_anchor_selections     = 0;
+    std::uint64_t shared_stable_prefix_selections    = 0;
+    std::uint64_t reused_prompt_tokens               = 0;
+    std::uint32_t last_selected_frontier_tokens      = 0;
+
+    std::uint64_t state_moves     = 0;
+    std::uint64_t state_forks     = 0;
+    std::uint64_t state_restores  = 0;
+    std::uint64_t state_d2h_count = 0;
+    std::uint64_t state_h2d_count = 0;
+    std::uint64_t state_d2d_count = 0;
+    std::uint64_t state_d2h_bytes = 0;
+    std::uint64_t state_h2d_bytes = 0;
+    std::uint64_t state_d2d_bytes = 0;
+    double state_d2h_seconds      = 0.0;
+    double state_h2d_seconds      = 0.0;
+    double state_d2d_seconds      = 0.0;
+
+    std::uint64_t main_kv_d2h_pages    = 0;
+    std::uint64_t main_kv_h2d_pages    = 0;
+    std::uint64_t main_kv_d2d_pages    = 0;
+    std::uint64_t main_kv_d2h_bytes    = 0;
+    std::uint64_t main_kv_h2d_bytes    = 0;
+    std::uint64_t main_kv_d2d_bytes    = 0;
+    double main_kv_d2h_seconds         = 0.0;
+    double main_kv_h2d_seconds         = 0.0;
+    double main_kv_d2d_seconds         = 0.0;
+    std::uint64_t backend_kv_d2h_pages = 0;
+    std::uint64_t backend_kv_h2d_pages = 0;
+    std::uint64_t backend_kv_d2d_pages = 0;
+    std::uint64_t backend_kv_d2h_bytes = 0;
+    std::uint64_t backend_kv_h2d_bytes = 0;
+    std::uint64_t backend_kv_d2d_bytes = 0;
+    double backend_kv_d2h_seconds      = 0.0;
+    double backend_kv_h2d_seconds      = 0.0;
+    double backend_kv_d2d_seconds      = 0.0;
+
+    std::uint64_t partial_spill_pages               = 0;
+    std::uint64_t partial_tail_cow_pages            = 0;
+    std::uint32_t device_state_occupied_slots       = 0;
+    std::uint32_t host_state_occupied_slots         = 0;
+    std::uint32_t device_main_kv_occupied_pages     = 0;
+    std::uint32_t device_backend_kv_occupied_pages  = 0;
+    std::size_t host_kv_occupied_bytes              = 0;
+    std::uint64_t private_checkpoint_degradations   = 0;
+    std::uint64_t private_checkpoint_evictions      = 0;
+    std::uint64_t shared_checkpoint_degradations    = 0;
+    std::uint64_t shared_checkpoint_evictions       = 0;
+    std::uint32_t shared_active_references          = 0;
+    std::uint64_t historical_fork_hits              = 0;
+    std::uint64_t last_predicted_materialization_ns = 0;
+    bool last_predicted_materialization_calibrated  = false;
+    double actual_context_transfer_seconds          = 0.0;
 };
 
 struct LoadSummary {

@@ -20,6 +20,7 @@ namespace ninfer::runtime {
 
 enum class EngineRequestState : std::uint8_t {
     Waiting,
+    Materializing,
     Prefill,
     DecodeReady,
     ModelFinished,
@@ -52,6 +53,10 @@ struct RequestRecord {
         return model_state == EngineRequestState::Prefill;
     }
 
+    [[nodiscard]] bool is_materializing() const noexcept {
+        return model_state == EngineRequestState::Materializing;
+    }
+
     [[nodiscard]] bool is_decode_ready() const noexcept {
         return model_state == EngineRequestState::DecodeReady;
     }
@@ -77,10 +82,11 @@ struct RequestRecord {
     std::optional<LaneId> lane;
     std::optional<SequenceHandle> sequence;
     std::atomic<bool> cancelled{false};
-    EngineRequestState model_state = EngineRequestState::Waiting;
+    EngineRequestState model_state        = EngineRequestState::Waiting;
+    bool capture_pending                  = false;
+    EngineRequestState post_capture_state = EngineRequestState::Prefill;
 
     std::optional<BasePlan> base_plan;
-    DeviceResources admission_resources;
     std::uint64_t remaining_service_work = 0;
     std::uint64_t backfill_epoch         = 0;
     BackfillClass backfill_class         = BackfillClass::None;

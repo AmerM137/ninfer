@@ -6,6 +6,7 @@
 #include "runtime/engine/engine_core.h"
 #include "targets/registry.h"
 
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -14,6 +15,60 @@
 
 namespace ninfer {
 namespace {
+
+EngineOptions normalize_engine_options(EngineOptions options) {
+    if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
+        throw std::invalid_argument("Engine max_concurrency must be in [1,8]");
+    }
+
+    ContextCacheOptions& cache      = options.context_cache;
+    const std::uint32_t concurrency = options.max_concurrency;
+    if (!cache.enabled) {
+        if ((cache.device_state_slots && *cache.device_state_slots != 0) ||
+            cache.host_state_slots != 0 || cache.host_kv_capacity_bytes != 0 ||
+            (cache.max_private_continuations && *cache.max_private_continuations != concurrency) ||
+            (cache.max_shared_prefixes && *cache.max_shared_prefixes != 0) ||
+            (cache.max_long_anchors_per_continuation &&
+             *cache.max_long_anchors_per_continuation != 0)) {
+            throw std::invalid_argument("disabled context cache accepts only root-only capacities");
+        }
+        cache.device_state_slots                = 0;
+        cache.max_private_continuations         = concurrency;
+        cache.max_shared_prefixes               = 0;
+        cache.max_long_anchors_per_continuation = 0;
+        cache.max_cache_markers_per_request     = cache.max_cache_markers_per_request.value_or(4U);
+        return options;
+    }
+
+    cache.device_state_slots            = cache.device_state_slots.value_or(concurrency);
+    const std::uint64_t default_private = 2ULL * concurrency;
+    cache.max_private_continuations =
+        cache.max_private_continuations.value_or(static_cast<std::uint32_t>(default_private));
+    cache.max_shared_prefixes               = cache.max_shared_prefixes.value_or(concurrency);
+    cache.max_long_anchors_per_continuation = cache.max_long_anchors_per_continuation.value_or(2U);
+    cache.max_cache_markers_per_request     = cache.max_cache_markers_per_request.value_or(4U);
+
+    if (*cache.max_private_continuations < concurrency) {
+        throw std::invalid_argument(
+            "context cache max_private_continuations must cover every active request");
+    }
+    const std::uint64_t total_device_state_slots =
+        static_cast<std::uint64_t>(concurrency) + *cache.device_state_slots;
+    if (total_device_state_slots > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::overflow_error("context cache Device state capacity exceeds uint32");
+    }
+    const std::uint64_t address_spaces =
+        static_cast<std::uint64_t>(*cache.max_private_continuations) + *cache.max_shared_prefixes;
+    if (address_spaces > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::overflow_error("context cache address-space capacity exceeds uint32");
+    }
+    if (*cache.max_long_anchors_per_continuation != 0 &&
+        *cache.max_private_continuations >
+            std::numeric_limits<std::size_t>::max() / *cache.max_long_anchors_per_continuation) {
+        throw std::overflow_error("context cache long-anchor capacity exceeds size_t");
+    }
+    return options;
+}
 
 runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefaults& defaults,
                                                         SamplingMode mode, RequestOptions options) {
@@ -135,7 +190,7 @@ public:
     using Core   = std::variant<std::monostate, std::unique_ptr<Core27>, std::unique_ptr<Core35>>;
 
     explicit Impl(EngineOptions engine_options)
-        : options(std::move(engine_options)), device(options.device) {
+        : options(normalize_engine_options(std::move(engine_options))), device(options.device) {
         auto constructed  = targets::construct_target(options, device);
         active            = std::move(constructed.active);
         load              = std::move(constructed.load);

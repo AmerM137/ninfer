@@ -33,6 +33,7 @@ struct StreamingResponse {
     PreparedRequest prepared;
     ResponsesRequest request;
     ResponseContext previous_context;
+    std::string session_key;
     RequestLogContext log_context;
     std::unique_ptr<ResponsesEventStream> encoder;
     std::atomic<bool> cancelled{false};
@@ -206,6 +207,7 @@ Json paginated_input_items(const httplib::Request& request, const std::vector<Js
 void HttpServer::handle_responses(const httplib::Request& req, httplib::Response& res) {
     ResponsesRequest request;
     ResponseContext previous_context;
+    std::string session_key;
     try {
         RequestLimits limits;
         limits.default_max_tokens = options_.default_max_tokens;
@@ -219,6 +221,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
             }
             inherit_responses_preserve_thinking(request, previous->preserve_thinking);
             previous_context = previous->context;
+            session_key      = previous->session_key;
         }
         compose_responses_generation_messages(request, flatten_response_context(previous_context));
     } catch (const ApiException& exception) {
@@ -229,10 +232,19 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
         return;
     }
 
+    const std::string id = new_response_id();
+    if (session_key.empty() && request.store) { session_key = id; }
+    ContextCacheHints cache_hints;
+    if (!session_key.empty()) { cache_hints.session_key = session_key; }
+    cache_hints.retention =
+        request.store ? CacheRetentionHint::LiveSession : CacheRetentionHint::Disposable;
+    cache_hints.update_session_index = request.store;
+
     const std::uint64_t req_id = ++request_seq_;
     PreparedRequest prepared;
     try {
-        prepared = service_->prepare(request.generation, [&req] { return disconnected(req); });
+        prepared = service_->prepare(
+            request.generation, [&req] { return disconnected(req); }, std::move(cache_hints));
     } catch (const ApiException& exception) {
         const ApiError error = responses_error(exception.error());
         log_request_rejected(make_request_rejection_log_context(req_id, "openai_responses",
@@ -247,7 +259,6 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
         return;
     }
 
-    const std::string id       = new_response_id();
     const std::int64_t created = unix_time_now();
     const RequestLogContext log_context =
         make_request_log_context(req_id, "openai_responses", request.generation, prepared);
@@ -262,6 +273,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
             if (request.store) {
                 StoredResponse stored;
                 stored.id                = id;
+                stored.session_key       = session_key;
                 stored.response          = response.body;
                 stored.input_items       = request.input_items;
                 stored.context           = terminal_context(previous_context, request, response);
@@ -285,6 +297,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
     stream->prepared         = std::move(prepared);
     stream->request          = std::move(request);
     stream->previous_context = std::move(previous_context);
+    stream->session_key      = std::move(session_key);
     stream->log_context      = log_context;
     stream->encoder          = std::make_unique<ResponsesEventStream>(id, created, stream->request,
                                                                       runtime_values(stream->prepared));
@@ -318,6 +331,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                 if (stream->request.store) {
                     StoredResponse stored;
                     stored.id          = finished.response.body.at("id").get<std::string>();
+                    stored.session_key = stream->session_key;
                     stored.response    = finished.response.body;
                     stored.input_items = stream->request.input_items;
                     stored.context     = terminal_context(stream->previous_context, stream->request,

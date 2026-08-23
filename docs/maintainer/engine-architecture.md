@@ -10,9 +10,10 @@
 3. admission、batch transaction、continuation 和 response lifetime 如何闭合；
 4. 当前边界如何保持单 GPU 小并发场景的正确性和性能。
 
-Paged KV 的页几何、物理 layout、allocator 和 consumer contract 由
-[Paged KV Context Store](paged-kv-cache.md)定义。模型数学、Artifact、Op 和外部协议也分别由文末列出的
-专项文档定义；本文不复制这些内容。
+ResourceManager 的checkpoint、Device/Host replica和materialization contract由
+[资源调度与上下文缓存架构](resource-scheduling-and-context-cache.md)定义；Paged KV的页几何、物理layout、
+allocator和consumer contract由[Paged KV Context Store](paged-kv-cache.md)定义。模型数学、Artifact、Op和
+外部协议也分别由文末列出的专项文档定义；本文不复制这些内容。
 
 ---
 
@@ -32,7 +33,8 @@ NInfer 的运行期模型是：
 - 35B-A3B target 还可以在 text-only 模式使用 DFlash。
 
 `max_concurrency` 是同时 active 的请求上限，不是 shared KV capacity 的等分因子。单个请求可以使用
-shared pool 的大部分容量，只要当前 active/resident entitlement 总和仍然可满足。
+shared pool 的大部分容量，只要当前 active、catalogued 和transaction reservation的aggregate unique
+occupancy仍然可满足。
 
 ### 1.2 当前非目标
 
@@ -41,8 +43,8 @@ shared pool 的大部分容量，只要当前 active/resident entitlement 总和
 - 大规模或抢占式 continuous batching；
 - priority/QoS、多租户公平性或跨 Engine 调度；
 - 多 GPU sequence placement；
-- KV swap/offload；
-- 多请求共享同一可写 prefix、page reference counting 或 copy-on-write；
+- active request preemption或swap；
+- weight offload、跨Engine context storage或后台不可观察的cache worker；
 - runtime model discovery 或字符串驱动的通用执行图；
 - 为未注册模型、其他 GPU 架构或未来 storage tier 预留占位接口。
 
@@ -135,7 +137,7 @@ MTP state selector 或 graph capture 实现。
 Runtime 的入口是 exact package 暴露的 `Program` contract。它负责：
 
 - physical lane 与 lane epoch；
-- active sequence、resident continuation 和 target persistent state；
+- active sequence、catalogued continuation/checkpoint 和 target persistent state；
 - Main/backend KV allocation、frontier 和 block-table binding；
 - prefill、ordinary decode、MTP/DFlash speculative schedule；
 - provisional model writes、accepted-prefix commit 和 rollback；
@@ -225,7 +227,7 @@ decode graph storage 都在启动期建立。请求期间可以改变 logical ow
 | prompt construction、stop/output 语义 | Frontend |
 | pending queue、RequestRecord、active slots、event publication | EngineCore |
 | FIFO head、protection epoch、backfill、prefill owner、round membership | Scheduler |
-| Free/Active/Resident ledger、continuation catalog、candidate choice | ResourceManager |
+| active/catalog ownership、unique-occupancy ledger、candidate/pressure choice | ResourceManager |
 | physical lane epoch、model/KV state、PendingBatch、GPU execution | Program |
 
 “唯一 authority”不表示只有一个对象读取该信息，而是只有表中的 owner 可以定义其状态转换。其他组件通过
@@ -243,8 +245,8 @@ EngineCore 持有：
 - Program 的稳定引用。
 
 EngineCore 是 orchestration owner。它调用 Scheduler 取得 boundary decision，调用 ResourceManager 完成逻辑
-资源转换，再调用 Program 执行 physical work。它不能绕过 ResourceManager 直接以 raw lane 修改 Program
-resident state。
+资源转换，再调用 Program 执行 physical work。它不能绕过 ResourceManager 直接以 raw lane 修改 Program-owned
+physical state。
 
 ### 4.3 Scheduler
 
@@ -265,23 +267,22 @@ reuse 后的 service work 和当前 active projection。
 
 ResourceManager 拥有 logical resource policy：
 
-- 每个 lane 的 `Free | Active | Resident` 逻辑状态；
-- active/resident entitlement ledger；
-- move-only ContinuationHandle catalog；
-- continuation identity 与 logical revision；
-- candidate 的 reuse/eviction 比较；
-- Program 返回的 resource acknowledgement 校验。
+- active lane ownership与private/shared continuation catalogs；
+- Device/Host State、Main/Backend KV的aggregate unique-occupancy ledger；
+- continuation identity、revision、Session/Shared/Sparse indices与retention observations；
+- root/private/shared candidate、pressure、replica-transition与capture选择；
+- Program terminal acknowledgement和resource delta校验。
 
 ResourceManager 不保存 physical epoch，不解释 KV page mapping，也不运行模型。Physical epoch 只由 Program
 铸造和验证。
 
 ### 4.5 Program
 
-Program 是 physical execution owner。它维护固定数量的 lanes，每个 lane 的 epoch、persistent state、
-KV allocations 和 execution metadata。AdmissionPlan 由同一 Program 的 inspect path 产生并绑定
-destination/source epoch；SequenceHandle、ContinuationHandle 和 PendingBatch 还携带显式 owner/epoch 或
-transaction identity。Capability owner、epoch 或 transaction 不匹配属于内部 invariant failure，而不是
-一种正常 cache miss。
+Program 是 physical execution owner。它维护固定数量的active control lanes、StateImage/Device KV/Host KV
+containers、execution metadata和唯一context transaction。AdmissionPlan由同一Program的inspect path产生并
+绑定source/destination capability revision；SequenceHandle、ContinuationHandle、SharedPrefixHandle和
+PendingBatch携带显式owner/epoch或transaction identity。Capability owner、epoch或transaction不匹配属于内部
+invariant failure，而不是正常cache miss。
 
 Program 同时是 Runtime transaction 的 mutation owner。`PendingBatch` 不携带反向可调用的 Program 指针；
 只有 `Program::commit` 或 `Program::abort_pending` 可以消费它。
@@ -310,22 +311,24 @@ request accepted
 
 ### 5.2 Engine model request lifecycle
 
-已提交到 EngineCore 的 `RequestRecord` 使用四个模型状态：
+已提交到EngineCore的`RequestRecord`使用以下模型状态；`capture_pending`是叠加在已发布Active状态上的
+transaction flag：
 
 ```text
-WAITING -> PREFILL -> DECODE_READY -> MODEL_FINISHED
+WAITING -> MATERIALIZING -> PREFILL -> DECODE_READY -> MODEL_FINISHED
 ```
 
 | 状态 | Runtime binding | 允许的下一步 |
 |---|---|---|
 | `WAITING` | 无 lane、SequenceHandle 或 active entitlement | plan/inspect、取消、超时、admit |
-| `PREFILL` | 已安装 lane、SequenceHandle、budget 和 active entitlement | advance prefill；或处理 start 返回的 completed pending |
+| `MATERIALIZING` | destination reservation和context transaction；尚无published active slot | progress/abort materialization |
+| `PREFILL` | 已安装 lane、SequenceHandle、budget 和 active entitlement | advance prefill或active capture |
 | `DECODE_READY` | 同一 active binding | 加入下一次 compact decode batch |
-| `MODEL_FINISHED` | 无 active sequence；可能已有独立 resident continuation | response completion/consumer drain |
+| `MODEL_FINISHED` | 无 active sequence；可能已发布独立catalog continuation | response completion/consumer drain |
 
-任意 successful `start_request` 返回后，Engine 先安装 sequence、budget 和 admission resources，把
-`WAITING` 转成 `PREFILL`，随后才解释 `PrefillProgress`。因此即使 start 的首个 GPU unit 已经完成 prefill
-并返回 PendingBatch，也不存在“物理 active、逻辑仍 waiting”的中间状态。
+只有materialization terminal acknowledgement被ResourceManager采用后，Engine才安装sequence、budget和
+active entitlement，并按返回的PrefillProgress进入`PREFILL`或完成finalization。Program已经reserve但尚未
+publish期间保持`MATERIALIZING`，不会出现“物理destination已预留、逻辑却伪装成Active”的中间状态。
 
 Successful terminal row 的顺序是 `commit -> finish -> MODEL_FINISHED`。取消和错误使用各自明确的 Runtime
 release 路径后才进入 `MODEL_FINISHED`。
@@ -358,28 +361,23 @@ release_capacity := response_done && consumer_released && !capacity_released
 请求的 `requested_output_tokens==0` 是公共 Engine 的非执行旁路：它直接返回 immediate result，不创建
 RequestRecord、不进入 pending queue，也不占用 Engine outstanding permit。
 
-### 5.4 Lane 与 continuation lifecycle
+### 5.4 Active lane 与 continuation lifecycle
 
-ResourceManager 对每个 lane 维护一个互斥状态：
-
-```text
-Free
-Active(SequenceHandle, A)
-Resident(ContinuationId, ContinuationHandle, R)
-```
-
-合法转换为：
+Active lane与catalog descriptor是两个独立维度。每个lane只处于`Free | Materializing | Active`；private
+continuation descriptor从root admission开始随lineage保留，active时不同时构造第二个catalog object。Shared
+prefix有独立的定容catalog，允许多个active owners引用同一immutable full-page prefix。
 
 ```text
-Free/Resident -> Active        start/claim
-Active        -> Resident      finish(RetainResident)
-Active        -> Free          finish(Release), abort, cancelled commit
-Resident      -> Free          eviction/release
+Waiting
+  -> Materializing(destination reservation + exact source/pressure claims)
+  -> Active(SequenceHandle + completion entitlement)
+  -> Catalogued private endpoint | Released
 ```
 
-Resident continuation 已脱离 RequestRecord 和 active slot。它不占 active-lane entitlement，仍持有 Program
-中完整、可继续的 physical state，并固定在原 physical lane；后续 request 可以 claim，或在 active admission
-需要容量时将其完整驱逐。
+Materialization、active capture和inactive replica transition共享Program唯一context transaction，但各自具有
+独立terminal acknowledgement。一个private source可以被destructive Move消费，也可以在Fork时继续
+catalogued；shared source只能Fork。Catalogued continuation已脱离RequestRecord和active slot，其State/KV
+replicas可独立位于Device、Host或Both，不绑定原active lane。
 
 ### 5.5 Runtime local transaction
 
@@ -415,77 +413,70 @@ CUDA 或 Program mutation；Engine 的控制流负责线性消费。
 
 ### 6.2 完整生命周期 entitlement
 
-AdmissionResources 是逐维资源向量：
+ResourceVector按层级和resource class逐维记账：
 
 ```text
-A = (active_lanes, main_kv_pages, backend_kv_pages)
-R = (0,            main_kv_pages, backend_kv_pages)
-C = Engine admission capacity
+Device = (active_lanes, state_slots, main_kv_pages, backend_kv_pages)
+Host   = (state_slots, kv_bytes)
 ```
 
-`A` 表示请求从 admission 到 terminal 的完整峰值 entitlement，而不是下一次 GPU unit 的增量。它覆盖最终
-完整 context、requested/effective output、selected speculative backend 和 page rounding。请求一旦 admitted，
-正常执行不再因另一个请求增长而失去 completion capacity。
+`active_entitlement`表示请求从publication到terminal的完整completion guarantee，而不是下一次GPU unit的
+增量。它覆盖active lane、可写State destination、最终Main/Backend KV范围、selected speculative backend和
+page rounding。请求一旦published Active，正常执行不再因另一个请求增长而失去completion capacity。
 
-Resource ledger 始终满足逐维不变量：
+Demand同时描述reserve peak和terminal ownership delta：
 
 ```text
-sum(active A) + sum(resident R) <= C
+reservation_credit / reservation_added / physical_peak_additional
+final_removed / final_added / active_entitlement
 ```
 
-Program 的 `StartResult.active_resources` 与 selected AdmissionPlan 的 `A` 相等；`finish(RetainResident)` 返回
-的 `R` 满足 `R <= A` 且 `R.active_lanes == 0`。Release/abort/cancel acknowledgement 表示本次从 ledger
-移除的 entitlement，而不是操作后的剩余资源。
+Ledger按unique physical ownership聚合；共享page/state被多个catalog或active reference持有时只计一次。
+Program在reserve前给出完整peak，在terminal acknowledgement中返回精确delta；ResourceManager只在
+acknowledgement通过后发布logical ownership。
 
 ### 6.3 Candidate inspection
 
-ResourceManager 对每个非 Active destination 请求 Program 做 read-only inspection：
+Scheduler先选定当前有资格admit的request；ResourceManager随后建立有界shortlist：
 
-- Free lane 使用 cold/full-reset source；
-- Resident lane 同时传入该 lane 的 ContinuationHandle；
-- Program 返回 opaque AdmissionPlan 和 Engine 可读 `RequestPlanSummary`；
-- summary 包含 `A`、reuse path/count 和 candidate-specific service work。
+- SessionIndex指向的private endpoint/rewrite；
+- marker与SharedPrefixIndex命中的shared stable prefixes；
+- matching private long anchors与bounded anonymous private candidates；
+- 永久存在的root/no-capture fallback。
 
-Inspection 不修改 Program 或 catalog。Scheduler 拒绝一个 choice 时，销毁 choice 没有 physical side effect。
+Program对每个候选执行target exact verification，并返回opaque AdmissionPlan、资源demand、reuse path/frontier、
+remaining service work和typed transfer requirements。Session key、hash、marker或KV token match都不能替代
+verification。Inspection不修改Program、catalog或ledger。
 
 ### 6.4 Candidate selection
 
-对候选 destination `d`，ResourceManager 使用纯逻辑方程判断可行性：
+ResourceManager使用实测prefill/transfer成本与有界retention observation比较候选，并在资源不足时组合Program
+提供的preserving degradation或eviction pressure option。比较对象包含完整reservation peak和publication后
+unique occupancy，不用“释放后最终净值”代替物理可行性。
+
+Choice固定source/victim IDs与revisions、pressure effects、destination、demand、projection和cost observation。
+Program在reserve前重新验证全部capabilities。无候选当前可行时返回temporary blocked；root entitlement本身
+永久不可行才是配置/内部错误，不把资源不足伪装成cache miss。
+
+### 6.5 Materialization 与 ledger adoption
+
+Accepted choice的mutation顺序是：
 
 ```text
-used - source(d).R - sum(evictions.R) + candidate(d).A <= capacity
-```
-
-选择分两轮完成：
-
-1. 先比较所有不需要非 source eviction 的候选；
-2. 若均不可行，再为每个候选按 resident lane 升序取最短 eviction prefix，直到方程成立。
-
-同一轮中的候选按 `reused_prompt_tokens` 最大优先，平局选择较小 destination lane。第一轮有解时不进入
-第二轮，因此不为更多 reuse 主动驱逐一个原本无需驱逐即可运行的 resident entry。
-
-Choice 固化 destination AdmissionPlan、source catalog identity/revision 和 eviction identities/revisions。
-同一个 worker boundary 在第一次 mutation 前统一复核 choice，随后立即 start，不跨 GPU unit 缓存。
-
-### 6.5 Start 与 ledger adoption
-
-Accepted choice 的 mutation 顺序是：
-
-```text
-validate logical choice
-  -> release selected non-source residents
-  -> claim optional source resident
-  -> Program::start_request(plan, prompt, source)
-  -> validate returned A
-  -> ResourceManager Free/Resident -> Active
+revalidate exact source/victims and reserve demand
+  -> Program reserve_materialization
+  -> progress zero or more transfer/physical steps
+  -> Program terminal acknowledgement
+  -> ResourceManager atomically adopts source/victim/resource deltas
+  -> publish Active SequenceHandle
   -> Engine installs RequestRecord binding
   -> Scheduler commits AdmissionGrant
-  -> interpret returned PrefillProgress
 ```
 
-Program 在 `start_request` 中执行恰好一个 prefill/finalization GPU unit。它消费 AdmissionPlan、PreparedPrompt
-和 optional source，返回新的 SequenceHandle、active entitlement 与 progress。Mutation 开始后的 Program
-异常不是可重新选择另一个 lane 的 cache miss；worker 进入全局 cleanup。
+NeedsTransfer request在此期间处于`Materializing`，不占active slot的published ownership；transfer完成后才能
+成为Prefill或DecodeReady。Ready candidate也经过同一transaction contract，只是可以在一个boundary完成。
+Terminal acknowledgement adoption前不能Finalize，adoption后恰好Finalize一次。Mutation开始后的Program异常
+不是可重新选择另一个候选的cache miss；worker进入全局cleanup。
 
 ---
 
@@ -495,7 +486,7 @@ Program 在 `start_request` 中执行恰好一个 prefill/finalization GPU unit�
 
 Scheduler 调度的是完整 GPU execution unit，而不是 kernel：
 
-- 一次 successful start 的首个 prefill/finalization unit；
+- 一个materialization、active-capture或replica-transition progress unit；
 - 一个 staged prefill chunk；
 - 一个包含全部 decode-ready rows 的 decode round。
 
@@ -508,10 +499,12 @@ worker 在每个 boundary 执行：
 
 ```text
 expire/cancel waiting requests
+  -> progress/finalize the unique context transaction when present
   -> freeze active cancellation snapshot
   -> abort boundary-cancelled active requests
   -> build compact decode membership
-  -> choose admission / prefill / decode / wait
+  -> consume one pending admission check when its fairness gate is open
+  -> choose prefill / decode / replica transition / wait
   -> run at most one GPU unit
   -> commit Runtime and output state
   -> publish stats/events
@@ -526,16 +519,22 @@ Program introspection 与 fail-all cleanup。
 
 - 最多一个 request 拥有 staged prefill；
 - prefill 和 decode 都存在时，不连续用 prefill 饿死 decode；
-- pending admission 与 decode 都存在时，在 boundary 交替给 admission 机会；
-- successful admission 已执行一个 GPU unit，因此下一次选择将它视为 prefill-side progress；
-- admission 暂时不可行时，已有 decode membership 继续执行。
+- pending admission check 与 decode 都存在时，只在decode之后给该check一次公平机会；
+- materialization publication后才把request安装为active prefill/decode owner；
+- active capture在自己的transaction完成前阻止该request越过记录的post-capture phase；
+- admission 暂时不可行时，已有decode membership继续执行，且不在后续decode boundary重复inspection。
+
+EngineCore用一个合并的invalidation latch记录尚未处理的admission check。Waiting queue变化、active
+entitlement释放、prefill gate重新打开以及context transaction terminal会置位；普通decode commit、未完成的
+prefill chunk、输出和统计发布不会置位。`TemporarilyBlocked`消费当前check后保持静默，直到新的相关事件发生；
+任何accepted choice仍在同一worker boundary立即reserve，不跨boundary缓存未pin的choice。
 
 当 `RoundMembership` 建立后，它包含所有且仅包含当前 decode-ready slots。Program 收到 compact
 `SequenceHandle[B]` 和 `RoundBudget[B]`；inactive lanes 不以 padding row 加入本轮。
 
 ### 7.4 FIFO head protection
 
-FIFO head 在 exclusive-feasible、但因当前 active incumbents 暂时无法 admission 时进入 protection epoch。
+FIFO head 在root entitlement本身可行、但因当前active incumbents暂时无法admission时进入protection epoch。
 Scheduler 冻结：
 
 - head 的 cold/base entitlement；
@@ -560,7 +559,7 @@ borrowers 完成后 head 获得 admission。FIFO head 变化会清除旧 protect
 
 Service work 是 Scheduler 的完成距离单位：
 
-- 每个 start/prefill unit 消耗一个 quantum；
+- 每个materialized start/prefill unit消耗一个quantum；
 - decode 消耗该 row 本轮实际 commit 的非取消 token 数；
 - prefix reuse 通过 candidate summary 减少剩余 work；
 - speculative round 的 produced width 不直接等于 service work，accepted token 数才推进请求。
@@ -578,19 +577,22 @@ Program contract 的请求路径为：
 ```text
 plan_request
   -> inspect_admission
-  -> start_request
+  -> compose/revalidate/reserve/progress materialization
   -> advance_prefill (zero or more)
+  -> optional active capture transaction
   -> decode (zero or more)
   -> commit / abort_pending
-  -> finish / abort
+  -> finish / abort / replica transition / release
 ```
 
-`plan_request` 产生与 lane 无关的 BasePlan 和 cold entitlement。`inspect_admission` 将它与 destination physical
-epoch、optional continuation 和 target reuse facts 合成 move-only AdmissionPlan。
+`plan_request`产生与lane无关的BasePlan和root demand。`inspect_admission`将它与destination、optional
+private/shared source及checkpoint facts合成move-only AdmissionPlan；ResourceManager可再组合pressure effects，
+但不能改写Program给出的source ownership或terminal delta。
 
-Start 和每次 advance prefill 都运行一个 GPU unit。未完成 progress 保持 `PREFILL`；完成 progress 携带一个
-单 row PendingBatch，走与 decode 相同的 output transaction。Exact prefix hit 可以省略 suffix prefill，仍
-通过 finalization unit 产生正确 anchor 和 pending output。
+Materialization publication产生SequenceHandle和首个PrefillProgress；后续每次advance prefill运行一个GPU
+unit。未完成progress保持`PREFILL`；完成progress携带单row PendingBatch，走与decode相同的output
+transaction。Exact prefix hit可以省略suffix prefill，仍通过finalization unit产生正确anchor和pending
+output。
 
 ### 8.2 Decode 与 PendingBatch
 
@@ -664,26 +666,25 @@ Program commit 中推进到同一个 accepted frontier。Engine 不分别提交�
 
 ### 8.5 Finish 与 retention
 
-ResourceManager 在调用 finish 前给出 `RetainResident` 或 `Release`。当前正常成功请求选择
-`RetainResident`，以便后续 prefix reuse；取消路径直接 release，不创建 continuation。
-
-Retain 的顺序是：
+允许reuse的成功请求在finish时把active mutable state冻结为private endpoint；root-only或request-level
+reuse关闭时直接释放。顺序是：
 
 ```text
-Program::finish(sequence, RetainResident)
-  -> return ContinuationHandle + resident R + final stats
-  -> ResourceManager validates R <= A
-  -> ledger Active(A) -> Resident(R)
-  -> assign ContinuationId/revision and adopt handle into catalog
+Program::finish(sequence)
+  -> return Released | Catalogued + continuation summary/handle + exact resource delta
+  -> ResourceManager validates terminal delta and checkpoint completeness
+  -> reclassify active private descriptor as catalogued, or release it
+  -> atomically publish/replace optional SessionIndex endpoint
 ```
 
-Catalog entry 在 Program finish 成功前不存在。Catalog 是按 lane 固定容量的 storage，正常 adoption 不做
-动态分配；`Active` lane 的不变量同时保证该位置没有旧 handle。Move-only ContinuationHandle 的析构不会
-隐式触发 CUDA mutation，正常 claim、eviction 和 shutdown 路径都通过 Program 显式消费它。
+Private descriptor在admission时已经保留，finish不临时搜索catalog slot。Typed rewrite、long anchor和shared
+stable prefix由更早的committed boundary通过ActiveCapture发布；它们与endpoint一起组成完整checkpoint
+summary。一个checkpoint只有State、Main/Backend KV、hidden/position和selected speculative state全部对应同一
+frontier时才可发布。
 
-`finish(Release)`、`abort`、`release_continuation` 和 `abort_pending` 是 consuming operations，并通过
-`ConsumeStatus` 与 released entitlement 区分成功和 epoch/owner mismatch。Mismatch 不伪装成空资源成功；
-Engine 将其提升为 invariant failure，由 Program teardown cleanup 兜底。
+`finish`、`abort`、`release_continuation`、`release_shared_prefix`和`abort_pending`是consuming operations，
+并通过`ConsumeStatus`与resource delta区分成功和owner/epoch mismatch。Mismatch不伪装成空资源成功；Engine
+将其提升为invariant failure，由Program teardown cleanup兜底。
 
 ---
 
@@ -755,8 +756,9 @@ metadata 的 home；compact batch row 是一次 decode round 的临时 ordinal�
 compact row b -> SequenceHandle -> physical lane -> block-table row/state selectors
 ```
 
-因此，active lanes 可以稀疏，GPU launch 仍使用精确 `B` 的 compact tensors。Resident continuation 保留原
-lane physical state，但不出现在 active slots 或 decode membership 中。
+因此，active lanes可以稀疏，GPU launch仍使用精确`B`的compact tensors。Catalogued continuation不占
+active control lane；materialization把选中的Device-ready或Host-backed checkpoint安装到一个free lane的稳定
+execution metadata中。
 
 ### 10.2 Workspace 与 request transient
 
@@ -799,7 +801,7 @@ Speculative backend 可以扩大每行 provisional width，但不会改变以下
 - 每行 output policy 独立；
 - Program 一次 commit 全部 target state；
 - 只有 accepted tokens 推进 GenerationBudget 和 service work；
-- partial terminal prefix 与 retained continuation frontier 一致。
+- partial terminal prefix 与最终 committed/published continuation frontier 一致。
 
 ---
 
@@ -822,7 +824,7 @@ Gateway/product adapter
   -> DECODE_READY
   -> repeated maximal compact decode + commit
   -> terminal Program finish
-  -> optional Resident continuation catalog entry
+  -> optional catalogued private endpoint and shared/checkpoint references
   -> OutputSession commit and response_done
   -> GenerationHandle consumer release
   -> exactly-once outstanding capacity release
@@ -834,28 +836,22 @@ publication path。
 
 ---
 
-## 12. 演进边界
+## 12. 当前扩展边界
 
-当前架构为下一阶段提供的是 ownership seam，而不是预先定义的功能接口。
+### 12.1 Host backing 与 replica transition
 
-### 12.1 KV offload
+Inactive private/shared checkpoints可以分别持有Device、Host或Both replicas。ResourceManager选择logical
+residency、成本与pressure intent；Program拥有State/KV transfer correctness、physical layouts、events和
+terminal acknowledgement。Host State按完整image计费，Host KV按实际extent bytes计费；active request不被
+swap，只有inactive ownership参加background-free replica transition。
 
-如果产品加入 KV offload：
+### 12.2 Fork、COW 与 shared prefix
 
-- Program 仍拥有 physical state、transfer correctness 和 device/host representation；
-- ResourceManager 扩展 logical residency、cost 与 candidate resource accounting；
-- Scheduler 只在 transfer 成为真实 scheduling unit 时扩展其顺序/服务工作 policy；
-- Gateway、Frontend 和 OutputSession contract 不因 storage tier 改变。
-
-Host bank、transfer action、异步 overlap 和 failure policy 应基于届时实现与测量决定；当前文档不固定其
-类型或状态机。
-
-### 12.2 Copy-on-write 与 shared prefix
-
-当前 ContinuationHandle 是 unique move-only capability，一个 resident bundle 同时只能被一个 request claim。
-COW 会改变 physical ownership、complete-state clone、page lifetime 和 mutation isolation，必须同时重新设计
-Program capability 与 ResourceManager ledger；仅给 Main KV page 增加 refcount 不足以复制 Linear
-Attention/backend continuation state。
+Private continuation保持single-claim，但可以从immutable source Fork到新的active StateImage；shared prefix只
+能Fork。Main/Backend KV的immutable full pages可以跨catalog和active owners共享，非page-aligned branch对部分
+tail执行private COW。ResourceManager ledger按unique occupancy计费，Program阻止任一writer覆盖surviving
+checkpoint保护的prefix。Linear Attention、hidden和selected backend StateImage仍按完整image Fork，不能用KV
+page refcount替代完整continuation state。
 
 ### 12.3 保持边界清晰
 

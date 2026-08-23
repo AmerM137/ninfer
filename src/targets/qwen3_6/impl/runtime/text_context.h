@@ -170,8 +170,8 @@ public:
 
     void set_sampling(const ops::SamplingConfig* config) noexcept { sampling_config_ = config; }
 
-    void set_prefill_rewrite_checkpoint_frontier(std::int64_t position) noexcept {
-        prefill_rewrite_checkpoint_frontier_ = position;
+    void set_prefill_split_frontier(std::int64_t position) noexcept {
+        prefill_split_frontier_ = position;
     }
 
     void set_rewrite_checkpoint_hidden_output(Tensor* output) noexcept {
@@ -311,11 +311,11 @@ private:
     std::int32_t rope_delta_                                                       = 0;
     std::int32_t linear_state_source_slot_                                         = 0;
     std::int32_t linear_state_destination_slot_                                    = 0;
-    GdnStateAction gdn_state_action_                  = GdnStateAction::UpdateInPlace;
-    const GdnReplayRecords* replay_records_           = nullptr;
-    std::int64_t prefill_rewrite_checkpoint_frontier_ = -1;
-    Tensor* rewrite_checkpoint_hidden_output_         = nullptr;
-    std::uint32_t mtp_proposal_extent_                = 0;
+    GdnStateAction gdn_state_action_          = GdnStateAction::UpdateInPlace;
+    const GdnReplayRecords* replay_records_   = nullptr;
+    std::int64_t prefill_split_frontier_      = -1;
+    Tensor* rewrite_checkpoint_hidden_output_ = nullptr;
+    std::uint32_t mtp_proposal_extent_        = 0;
 
     const Weight* embed_                        = nullptr;
     const Tensor* final_norm_                   = nullptr;

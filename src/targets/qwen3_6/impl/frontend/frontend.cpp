@@ -590,6 +590,110 @@ DecoderState terminal_state(DecoderState state) {
     return state;
 }
 
+std::optional<std::uint32_t> automatic_stable_boundary(std::span<const ChatRole> roles,
+                                                       bool has_tools) {
+    std::uint32_t leading = 0;
+    while (leading < roles.size() &&
+           (roles[leading] == ChatRole::System || roles[leading] == ChatRole::Developer)) {
+        ++leading;
+    }
+    return has_tools || leading != 0 ? std::optional<std::uint32_t>(leading) : std::nullopt;
+}
+
+PreparedContextCache
+prepare_context_cache(ContextCacheHints hints, std::size_t message_count,
+                      std::span<const std::optional<std::uint32_t>> message_boundaries,
+                      std::optional<std::uint32_t> automatic_boundary,
+                      std::uint32_t maximum_markers) {
+    if (hints.markers.size() > maximum_markers) {
+        throw std::invalid_argument("context cache marker count exceeds Engine capacity");
+    }
+
+    PreparedContextCache out;
+    if (hints.session_key) {
+        if (hints.session_key->empty() || hints.session_key->size() > kPreparedSessionKeyCapacity) {
+            throw std::invalid_argument("context cache session_key must contain 1 to 256 bytes");
+        }
+        PreparedSessionKey key;
+        key.size = static_cast<std::uint16_t>(hints.session_key->size());
+        std::copy(hints.session_key->begin(), hints.session_key->end(), key.bytes.begin());
+        out.session_key = key;
+    }
+    switch (hints.retention) {
+    case CacheRetentionHint::Default:
+        out.retention = out.session_key ? runtime::RetentionClass::LiveSession
+                                        : runtime::RetentionClass::RecentPrivate;
+        break;
+    case CacheRetentionHint::LiveSession:
+        if (!out.session_key) {
+            throw std::invalid_argument("LiveSession retention requires a session_key");
+        }
+        out.retention = runtime::RetentionClass::LiveSession;
+        break;
+    case CacheRetentionHint::Disposable:
+        out.retention = runtime::RetentionClass::Disposable;
+        break;
+    default:
+        throw std::invalid_argument("context cache retention hint is invalid");
+    }
+    out.update_session_index = hints.update_session_index;
+
+    std::vector<PromptCacheMarker> markers;
+    markers.reserve(hints.markers.size() +
+                    static_cast<std::size_t>(automatic_boundary.has_value()));
+    for (const PromptCacheMarker marker : hints.markers) {
+        switch (marker.kind) {
+        case PromptCacheMarkerKind::SharedStablePrefix:
+        case PromptCacheMarkerKind::PrivateLongAnchor:
+            break;
+        default:
+            throw std::invalid_argument("context cache marker kind is invalid");
+        }
+        if (marker.after_message_count > message_count) {
+            throw std::invalid_argument("context cache marker exceeds the message count");
+        }
+        if (std::find(markers.begin(), markers.end(), marker) == markers.end()) {
+            markers.push_back(marker);
+        }
+    }
+    if (automatic_boundary && markers.size() < maximum_markers) {
+        const PromptCacheMarker automatic{.after_message_count = *automatic_boundary,
+                                          .kind = PromptCacheMarkerKind::SharedStablePrefix};
+        if (std::find(markers.begin(), markers.end(), automatic) == markers.end()) {
+            markers.push_back(automatic);
+        }
+    }
+
+    out.opportunities.reserve(markers.size());
+    for (std::size_t index = 0; index < markers.size(); ++index) {
+        const PromptCacheMarker marker = markers[index];
+        const bool automatic =
+            std::find(hints.markers.begin(), hints.markers.end(), marker) == hints.markers.end();
+        if (marker.after_message_count >= message_boundaries.size() ||
+            !message_boundaries[marker.after_message_count]) {
+            if (automatic) { continue; }
+            throw std::invalid_argument(
+                "context cache marker is not an exact serialized message boundary");
+        }
+        const std::uint32_t frontier = *message_boundaries[marker.after_message_count];
+        if (frontier == 0) {
+            if (automatic) { continue; }
+            throw std::invalid_argument("context cache marker has an empty token prefix");
+        }
+        const auto duplicate = std::find_if(
+            out.opportunities.begin(), out.opportunities.end(), [&](const auto& existing) {
+                return existing.kind == marker.kind && existing.frontier == frontier;
+            });
+        if (duplicate == out.opportunities.end()) {
+            out.opportunities.push_back(
+                PreparedCacheOpportunity{.kind        = marker.kind,
+                                         .frontier    = frontier,
+                                         .input_order = static_cast<std::uint32_t>(index)});
+        }
+    }
+    return out;
+}
+
 } // namespace
 
 class Frontend::Impl {
@@ -600,7 +704,8 @@ public:
               fi::TokenizerResources{.tokenizer_json         = resources.tokenizer_json,
                                      .tokenizer_config_json  = resources.tokenizer_config_json,
                                      .generation_config_json = resources.generation_config_json})),
-          processor(processor_options(resources)), vision_enabled(options.vision_enabled) {
+          processor(processor_options(resources)), vision_enabled(options.vision_enabled),
+          max_cache_markers_per_request(options.max_cache_markers_per_request) {
         if (options.max_context == 0) {
             throw std::invalid_argument("frontend max_context must be nonzero");
         }
@@ -634,7 +739,8 @@ public:
     fi::ProcessorOptions processor;
     std::shared_ptr<fi::MediaPreprocessCache> media_cache;
     StopPolicy defaults;
-    bool vision_enabled = true;
+    bool vision_enabled                         = true;
+    std::uint32_t max_cache_markers_per_request = 0;
 };
 
 class OutputSession::Impl {
@@ -872,8 +978,15 @@ const PreparedPromptData& FrontendTestAccess::inspect(const PreparedPrompt& prom
 
 PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& control) const {
     fi::check_preparation_control(control);
-    const auto start                      = Clock::now();
-    const PromptOptions options           = input.options;
+    const auto start              = Clock::now();
+    const PromptOptions options   = input.options;
+    ContextCacheHints cache_hints = std::move(input.context_cache);
+    std::vector<ChatRole> message_roles;
+    message_roles.reserve(input.messages.size());
+    for (const ChatMessage& message : input.messages) { message_roles.push_back(message.role); }
+    const std::optional<std::uint32_t> automatic_boundary =
+        automatic_stable_boundary(message_roles, !options.tool_jsons.empty());
+    const std::size_t message_count       = input.messages.size();
     std::vector<fi::ChatMessage> messages = convert_messages(std::move(input.messages));
     const bool has_media =
         std::any_of(messages.begin(), messages.end(),
@@ -884,6 +997,7 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
 
     auto prepared              = std::make_unique<PreparedPromptData>();
     PreparedPromptData& result = *prepared;
+    std::vector<std::optional<std::uint32_t>> message_boundaries;
     if (has_media) {
         fi::Processor processor(*impl_->tokenizer, impl_->chat_template, impl_->processor,
                                 impl_->media_cache);
@@ -916,6 +1030,9 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
             processed.stats.media_preprocess_work_seconds;
         result.prepare.tokenize_seconds    = processed.stats.tokenize_seconds;
         result.identity.rewrite_checkpoint = processed.rewrite_checkpoint;
+        result.identity.rewrite_execution_frontiers =
+            std::move(processed.rewrite_execution_frontiers);
+        message_boundaries = std::move(processed.message_boundaries);
     } else {
         const fi::RenderedChat rendered =
             impl_->chat_template.render(messages, render_options(options));
@@ -926,10 +1043,16 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         fi::check_preparation_control(control, "tokenization");
         result.token_ids                   = std::move(encoded.input_ids);
         result.identity.rewrite_checkpoint = encoded.rewrite_checkpoint;
+        result.identity.rewrite_execution_frontiers =
+            std::move(encoded.rewrite_execution_frontiers);
+        message_boundaries = std::move(encoded.message_boundaries);
         assign_text_positions(result);
     }
     (void)checked_token_count(result.token_ids.size());
-    result.identity.reusable   = true;
+    result.identity.reusable = true;
+    result.context_cache =
+        prepare_context_cache(std::move(cache_hints), message_count, message_boundaries,
+                              automatic_boundary, impl_->max_cache_markers_per_request);
     result.starts_in_reasoning = options.add_generation_prompt && options.enable_thinking;
     result.prepare.seconds     = std::chrono::duration<double>(Clock::now() - start).count();
     return PreparedPrompt(std::move(prepared));
@@ -1002,8 +1125,10 @@ PreparedPrompt Frontend::prepare_tokens(std::vector<TokenId> token_ids,
     PreparedPromptData& result = *prepared;
     result.token_ids           = std::move(token_ids);
     assign_text_positions(result);
-    result.identity.reusable = allow_prefix_identity;
-    result.prepare.seconds   = std::chrono::duration<double>(Clock::now() - start).count();
+    result.identity.reusable                  = allow_prefix_identity;
+    result.context_cache.retention            = runtime::RetentionClass::RecentPrivate;
+    result.context_cache.update_session_index = false;
+    result.prepare.seconds = std::chrono::duration<double>(Clock::now() - start).count();
     return PreparedPrompt(std::move(prepared));
 }
 

@@ -1,8 +1,8 @@
 #pragma once
 
-// Process-local bounded storage for OpenAI Responses objects and their
-// previous_response_id context DAG. The Engine remains stateless; stored
-// contexts are flattened only when a continuation is submitted.
+// Process-local bounded storage for OpenAI Responses objects and their previous_response_id
+// context DAG. Stored contexts are flattened when a continuation is submitted; the bounded session
+// key is only an Engine lookup/retention hint and this store owns no Program capability.
 
 #include "serve/request.h"
 
@@ -31,6 +31,7 @@ std::vector<ChatTurn> flatten_response_context(const ResponseContext& context);
 
 struct StoredResponse {
     std::string id;
+    std::string session_key;
     nlohmann::json response;
     std::vector<nlohmann::json> input_items;
     ResponseContext context;

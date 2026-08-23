@@ -133,15 +133,16 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
                           TextContext& card, TargetVerifyFrameView frame,
                           ops::CausalAttentionExecutionEnvelope envelope);
 
-[[nodiscard]] PrefillChunkResult prefill_text_chunk(
-    PrefillContext& state, std::span<const TokenId> ids, std::uint32_t nominal_length,
-    std::optional<std::uint32_t> rewrite_checkpoint_capture_frontier, bool finalize_at_end);
+[[nodiscard]] PrefillChunkResult prefill_text_chunk(PrefillContext& state,
+                                                    std::span<const TokenId> ids,
+                                                    std::uint32_t nominal_length,
+                                                    std::optional<std::uint32_t> split_frontier,
+                                                    bool finalize_at_end);
 
 [[nodiscard]] PrefillChunkResult
 prefill_multimodal_chunk(PrefillContext& state, const PreparedPromptData& prompt,
                          VisionPrefillSession& vision, std::uint32_t nominal_length,
-                         std::optional<std::uint32_t> rewrite_checkpoint_capture_frontier,
-                         bool finalize_at_end);
+                         std::optional<std::uint32_t> split_frontier, bool finalize_at_end);
 
 struct MtpBridgeInput {
     const Tensor* previous_hidden = nullptr;

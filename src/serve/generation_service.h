@@ -37,7 +37,7 @@ struct GenerationMetrics {
     std::uint64_t speculative_fallback_steps  = 0;
     std::vector<std::uint64_t> speculative_accepted_per_position;
     std::uint32_t prefix_cache_hit_tokens     = 0;
-    ninfer::PrefixReusePath prefix_reuse_path = ninfer::PrefixReusePath::FullReset;
+    ninfer::PrefixReusePath prefix_reuse_path = ninfer::PrefixReusePath::Root;
 };
 
 struct GenerationOutcome {
@@ -86,6 +86,10 @@ public:
 
     [[nodiscard]] const ServeOptions& options() const noexcept { return options_; }
 
+    // Engine owns the once-normalized startup configuration. Serving diagnostics must use this
+    // value instead of reinterpreting optional defaults from ServeOptions.
+    [[nodiscard]] const ninfer::EngineOptions& engine_options() const { return engine_->options(); }
+
     [[nodiscard]] ninfer::LoadSummary load_summary() const { return engine_->load_summary(); }
 
     [[nodiscard]] ninfer::MemorySummary memory_summary() const { return engine_->memory_summary(); }
@@ -101,7 +105,8 @@ public:
     }
 
     [[nodiscard]] PreparedRequest prepare(const GenerationRequest& req,
-                                          std::function<bool()> is_cancelled = {}) const;
+                                          std::function<bool()> is_cancelled = {},
+                                          ContextCacheHints context_cache    = {}) const;
     [[nodiscard]] int count_prompt_tokens(const GenerationRequest& req,
                                           std::function<bool()> is_cancelled = {}) const;
 

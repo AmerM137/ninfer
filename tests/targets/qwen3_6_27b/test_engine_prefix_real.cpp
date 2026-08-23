@@ -11,16 +11,38 @@ namespace {
 
 ninfer::EngineOptions engine_options(const char* artifact) {
     ninfer::EngineOptions options;
-    options.artifact_path             = artifact;
-    options.max_context               = 4096;
-    options.kv_capacity               = ninfer::KvCapacityPolicy::explicit_capacity(4096);
-    options.prefill_chunk             = 1024;
-    options.speculative.backend       = ninfer::SpeculativeBackend::Mtp;
-    options.speculative.draft_tokens  = 3;
-    options.speculative.proposal_head = ninfer::ProposalHead::Optimized;
-    options.enable_vision             = true;
-    options.max_concurrency           = 1;
-    options.max_pending_requests      = 1;
+    options.artifact_path                    = artifact;
+    options.max_context                      = 4096;
+    options.kv_capacity                      = ninfer::KvCapacityPolicy::explicit_capacity(4096);
+    options.prefill_chunk                    = 1024;
+    options.speculative.backend              = ninfer::SpeculativeBackend::Mtp;
+    options.speculative.draft_tokens         = 3;
+    options.speculative.proposal_head        = ninfer::ProposalHead::Optimized;
+    options.enable_vision                    = true;
+    options.max_concurrency                  = 1;
+    options.max_pending_requests             = 1;
+    options.context_cache.device_state_slots = 4;
+    return options;
+}
+
+ninfer::EngineOptions host_restore_engine_options(const char* artifact) {
+    ninfer::EngineOptions options;
+    options.artifact_path                        = artifact;
+    options.max_context                          = 512;
+    options.kv_capacity                          = ninfer::KvCapacityPolicy::explicit_capacity(512);
+    options.prefill_chunk                        = 256;
+    options.speculative.backend                  = ninfer::SpeculativeBackend::Mtp;
+    options.speculative.draft_tokens             = 3;
+    options.speculative.proposal_head            = ninfer::ProposalHead::Optimized;
+    options.max_concurrency                      = 1;
+    options.max_pending_requests                 = 1;
+    options.context_cache.device_state_slots     = 1;
+    options.context_cache.host_state_slots       = 2;
+    options.context_cache.host_kv_capacity_bytes = 256ULL << 20;
+    options.context_cache.max_private_continuations         = 2;
+    options.context_cache.max_shared_prefixes               = 0;
+    options.context_cache.max_long_anchors_per_continuation = 0;
+    options.context_cache.max_cache_markers_per_request     = 0;
     return options;
 }
 
@@ -125,7 +147,7 @@ int exercise_zero_suffix_reuse(ninfer::Engine& engine, const std::vector<ninfer:
     ninfer::RequestOptions baseline_options;
     baseline_options.execution.requested_output_tokens = 8;
     baseline_options.execution.sampling.temperature    = 0.0F;
-    baseline_options.execution.allow_prefix_reuse      = false;
+    baseline_options.execution.allow_prefix_reuse      = true;
     baseline_options.stop.include_model_defaults       = false;
     const ninfer::GenerationResult baseline =
         engine.generate(engine.prepare_tokens(prompt), baseline_options);
@@ -200,6 +222,114 @@ int exercise_prefix(ninfer::Engine& engine) {
     return 0;
 }
 
+int exercise_host_restore(const char* artifact) {
+    ninfer::Engine engine(host_restore_engine_options(artifact));
+    auto options = [](std::uint32_t outputs, bool reuse) {
+        ninfer::RequestOptions request;
+        request.execution.requested_output_tokens = outputs;
+        request.execution.sampling.temperature    = 0.0F;
+        request.execution.allow_prefix_reuse      = reuse;
+        request.stop.include_model_defaults       = false;
+        return request;
+    };
+
+    const auto retained_input = [] {
+        std::string text;
+        text.reserve(6U * 300U);
+        for (std::uint32_t index = 0; index < 300; ++index) { text += "alpha "; }
+        ninfer::ChatMessage message;
+        message.role = ninfer::ChatRole::User;
+        message.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text, .text = std::move(text), .media = {}});
+        ninfer::PromptInput input;
+        input.messages.push_back(std::move(message));
+        input.options.enable_thinking   = false;
+        input.context_cache.session_key = "host-restore-real";
+        input.context_cache.retention   = ninfer::CacheRetentionHint::LiveSession;
+        return input;
+    };
+
+    const ninfer::GenerationResult retained =
+        engine.generate(engine.prepare(retained_input()), options(5, true));
+    if (retained.prompt.prompt_tokens <= 256 || retained.generated_token_ids.size() != 5) {
+        std::cerr << "Host-restore source request did not complete\n";
+        return 1;
+    }
+
+    ninfer::PromptInput continuation = retained_input();
+    ninfer::ChatMessage assistant;
+    assistant.role              = ninfer::ChatRole::Assistant;
+    assistant.reasoning_content = retained.reasoning;
+    assistant.parts.push_back(ninfer::MessagePart{
+        .kind = ninfer::MessagePartKind::Text, .text = retained.content, .media = {}});
+    continuation.messages.push_back(std::move(assistant));
+    ninfer::ChatMessage followup;
+    followup.role = ninfer::ChatRole::User;
+    followup.parts.push_back(ninfer::MessagePart{
+        .kind = ninfer::MessagePartKind::Text, .text = "Continue briefly.", .media = {}});
+    continuation.messages.push_back(std::move(followup));
+
+    const ninfer::RuntimeStats before_pressure = engine.runtime_stats();
+    const ninfer::GenerationResult baseline =
+        engine.generate(engine.prepare(continuation), options(2, false));
+    const ninfer::RuntimeStats after_pressure = engine.runtime_stats();
+    if (baseline.generated_token_ids.size() != 2 ||
+        after_pressure.state_d2h_count <= before_pressure.state_d2h_count ||
+        after_pressure.main_kv_d2h_pages <= before_pressure.main_kv_d2h_pages ||
+        after_pressure.backend_kv_d2h_pages <= before_pressure.backend_kv_d2h_pages) {
+        std::cerr << "Host pressure did not demote the complete MTP checkpoint: state="
+                  << after_pressure.state_d2h_count << " main=" << after_pressure.main_kv_d2h_pages
+                  << " backend=" << after_pressure.backend_kv_d2h_pages
+                  << " degraded=" << after_pressure.private_checkpoint_degradations
+                  << " evicted=" << after_pressure.private_checkpoint_evictions << '\n';
+        return 1;
+    }
+
+    const ninfer::GenerationResult restored =
+        engine.generate(engine.prepare(std::move(continuation)), options(2, true));
+    const ninfer::RuntimeStats after_restore = engine.runtime_stats();
+    if (restored.prefix_reuse_path != ninfer::PrefixReusePath::PrivateTurnClosure ||
+        restored.reused_prompt_tokens == 0 ||
+        after_restore.state_h2d_count <= after_pressure.state_h2d_count ||
+        after_restore.main_kv_h2d_pages <= after_pressure.main_kv_h2d_pages ||
+        after_restore.backend_kv_h2d_pages <= after_pressure.backend_kv_h2d_pages) {
+        std::cerr << "Host checkpoint was not restored exactly: path="
+                  << static_cast<int>(restored.prefix_reuse_path)
+                  << " reused=" << restored.reused_prompt_tokens
+                  << " state=" << after_restore.state_h2d_count
+                  << " main=" << after_restore.main_kv_h2d_pages
+                  << " backend=" << after_restore.backend_kv_h2d_pages
+                  << " degraded=" << after_restore.private_checkpoint_degradations
+                  << " evicted=" << after_restore.private_checkpoint_evictions << '\n';
+        return 1;
+    }
+
+    if (restored.generated_token_ids != baseline.generated_token_ids) {
+        std::cerr << "Host checkpoint restore changed greedy output: restored=";
+        for (const ninfer::TokenId token : restored.generated_token_ids) {
+            std::cerr << token << ',';
+        }
+        std::cerr << " baseline=";
+        for (const ninfer::TokenId token : baseline.generated_token_ids) {
+            std::cerr << token << ',';
+        }
+        std::cerr << " restored_spec=" << restored.speculative.rounds << '/'
+                  << restored.speculative.drafted_tokens << '/'
+                  << restored.speculative.accepted_tokens << '/'
+                  << restored.speculative.fallback_steps
+                  << " baseline_spec=" << baseline.speculative.rounds << '/'
+                  << baseline.speculative.drafted_tokens << '/'
+                  << baseline.speculative.accepted_tokens << '/'
+                  << baseline.speculative.fallback_steps
+                  << " reused=" << restored.reused_prompt_tokens
+                  << " transfers=" << after_restore.state_d2h_count << '/'
+                  << after_restore.state_h2d_count << '/' << after_restore.main_kv_d2h_pages << '/'
+                  << after_restore.main_kv_h2d_pages << '\n';
+        return 1;
+    }
+    return 0;
+}
+
 int exercise_rewrite_checkpoints(ninfer::Engine& engine) {
     auto text_message = [](ninfer::ChatRole role, std::string text) {
         ninfer::ChatMessage message;
@@ -250,9 +380,9 @@ int exercise_rewrite_checkpoints(ninfer::Engine& engine) {
     };
 
     const ninfer::GenerationResult first =
-        engine.generate(engine.prepare(input_with_history(0, true)), options(false));
+        engine.generate(engine.prepare(input_with_history(0, true)), options(true));
     if (first.generated_token_ids.size() != 4 ||
-        first.prefix_reuse_path != ninfer::PrefixReusePath::FullReset) {
+        first.prefix_reuse_path != ninfer::PrefixReusePath::Root) {
         std::cerr << "response-checkpoint source request did not complete from a cold lane\n";
         return 1;
     }
@@ -260,16 +390,48 @@ int exercise_rewrite_checkpoints(ninfer::Engine& engine) {
     const ninfer::GenerationResult exact_replay =
         engine.generate(engine.prepare(input_with_history(0, false)), options(true));
     if (exact_replay.generated_token_ids.size() != 4 ||
-        exact_replay.prefix_reuse_path != ninfer::PrefixReusePath::RestoreResponseCheckpoint ||
+        exact_replay.prefix_reuse_path != ninfer::PrefixReusePath::PrivateResponseReplay ||
         exact_replay.reused_prompt_tokens == 0) {
-        std::cerr << "prompt-frontier response checkpoint was not restored on an exact replay\n";
+        const ninfer::RuntimeStats stats = engine.runtime_stats();
+        std::cerr << "prompt-frontier response checkpoint was not restored on an exact replay: "
+                  << "path=" << static_cast<int>(exact_replay.prefix_reuse_path)
+                  << " reused=" << exact_replay.reused_prompt_tokens
+                  << " captures=" << stats.active_captures_completed
+                  << " capture_aborts=" << stats.active_captures_aborted << '\n';
+        return 1;
+    }
+    const ninfer::GenerationResult exact_baseline =
+        engine.generate(engine.prepare(input_with_history(0, false)), options(false));
+    if (exact_replay.generated_token_ids != exact_baseline.generated_token_ids) {
+        std::cerr << "Device rewrite restore changed greedy output: restored=";
+        for (const ninfer::TokenId token : exact_replay.generated_token_ids) {
+            std::cerr << token << ',';
+        }
+        std::cerr << " baseline=";
+        for (const ninfer::TokenId token : exact_baseline.generated_token_ids) {
+            std::cerr << token << ',';
+        }
+        std::cerr << " source=";
+        for (const ninfer::TokenId token : first.generated_token_ids) { std::cerr << token << ','; }
+        std::cerr << " restored_spec=" << exact_replay.speculative.rounds << '/'
+                  << exact_replay.speculative.drafted_tokens << '/'
+                  << exact_replay.speculative.accepted_tokens << '/'
+                  << exact_replay.speculative.fallback_steps
+                  << " baseline_spec=" << exact_baseline.speculative.rounds << '/'
+                  << exact_baseline.speculative.drafted_tokens << '/'
+                  << exact_baseline.speculative.accepted_tokens << '/'
+                  << exact_baseline.speculative.fallback_steps
+                  << " source_prompt=" << first.prompt.prompt_tokens
+                  << " restored_prompt=" << exact_replay.prompt.prompt_tokens
+                  << " baseline_prompt=" << exact_baseline.prompt.prompt_tokens
+                  << " reused=" << exact_replay.reused_prompt_tokens << '\n';
         return 1;
     }
 
     const ninfer::GenerationResult first_replay =
         engine.generate(engine.prepare(input_with_history(1, true)), options(true));
     if (first_replay.generated_token_ids.size() != 4 ||
-        first_replay.prefix_reuse_path != ninfer::PrefixReusePath::RestoreResponseCheckpoint ||
+        first_replay.prefix_reuse_path != ninfer::PrefixReusePath::PrivateResponseReplay ||
         first_replay.reused_prompt_tokens == 0) {
         std::cerr << "normalized first response did not restore its response checkpoint: path="
                   << static_cast<int>(first_replay.prefix_reuse_path)
@@ -280,18 +442,21 @@ int exercise_rewrite_checkpoints(ninfer::Engine& engine) {
     const ninfer::GenerationResult second_replay =
         engine.generate(engine.prepare(input_with_history(2, true)), options(true));
     if (second_replay.generated_token_ids.size() != 4 ||
-        second_replay.prefix_reuse_path != ninfer::PrefixReusePath::RestoreResponseCheckpoint ||
+        second_replay.prefix_reuse_path != ninfer::PrefixReusePath::PrivateResponseReplay ||
         second_replay.reused_prompt_tokens <= first_replay.reused_prompt_tokens) {
+        const ninfer::RuntimeStats stats = engine.runtime_stats();
         std::cerr << "rolling response checkpoint did not advance across the tool loop: first="
                   << first_replay.reused_prompt_tokens
-                  << " second=" << second_replay.reused_prompt_tokens << '\n';
+                  << " second=" << second_replay.reused_prompt_tokens
+                  << " captures=" << stats.active_captures_completed
+                  << " capture_aborts=" << stats.active_captures_aborted << '\n';
         return 1;
     }
 
     const ninfer::GenerationResult mode_change =
         engine.generate(engine.prepare(input_with_history(2, false)), options(true));
     if (mode_change.generated_token_ids.size() != 4 ||
-        mode_change.prefix_reuse_path != ninfer::PrefixReusePath::RestoreResponseCheckpoint ||
+        mode_change.prefix_reuse_path != ninfer::PrefixReusePath::PrivateResponseReplay ||
         mode_change.reused_prompt_tokens == 0) {
         std::cerr << "preserve-thinking policy change discarded a compatible response checkpoint: "
                   << "path=" << static_cast<int>(mode_change.prefix_reuse_path)
@@ -328,7 +493,9 @@ int exercise_vision(ninfer::Engine& engine) {
             .kind = ninfer::MessagePartKind::Text, .text = "What is visible?", .media = {}});
         ninfer::PromptInput input;
         input.messages.push_back(std::move(message));
-        input.options.enable_thinking = false;
+        input.options.enable_thinking   = false;
+        input.context_cache.session_key = "vision-prefix-real";
+        input.context_cache.retention   = ninfer::CacheRetentionHint::LiveSession;
         return input;
     };
     auto followup_input = [&](const std::vector<std::uint8_t>& bytes,
@@ -378,7 +545,7 @@ int exercise_vision(ninfer::Engine& engine) {
     }
 
     const ninfer::GenerationResult first =
-        engine.generate(engine.prepare(first_input(image_bytes)), options(false));
+        engine.generate(engine.prepare(first_input(image_bytes)), options(true));
     if (!first.prompt.has_media || first.generated_token_ids.size() != 2 ||
         first.finish_reason != ninfer::FinishReason::OutputLimit) {
         std::cerr << "real Vision request did not complete through the public Engine\n";
@@ -435,7 +602,8 @@ int exercise_vision(ninfer::Engine& engine) {
         std::cerr << "multimodal stop fixture did not produce distinct leading tokens\n";
         return 1;
     }
-    ninfer::RequestOptions stop_options = mtp_options;
+    ninfer::RequestOptions stop_options       = mtp_options;
+    stop_options.execution.allow_prefix_reuse = true;
     stop_options.stop.token_ids.push_back(mtp_baseline.generated_token_ids[1]);
     const ninfer::GenerationResult stopped =
         engine.generate(engine.prepare(first_input(image_bytes)), stop_options);
@@ -459,7 +627,7 @@ int exercise_vision(ninfer::Engine& engine) {
     // <|im_start|>user\n<|vision_start|>. Reusing it places the MTP bridge directly on the first
     // Vision merger column rather than on an ordinary token embedding.
     const std::vector<ninfer::TokenId> visual_prefix{248045, 846, 198, 248053};
-    ninfer::RequestOptions source_options            = options(false);
+    ninfer::RequestOptions source_options            = options(true);
     source_options.execution.requested_output_tokens = 1;
     const ninfer::GenerationResult bridge_source =
         engine.generate(engine.prepare_tokens(visual_prefix), source_options);
@@ -514,16 +682,25 @@ int verify_loaded_product(const ninfer::Engine& engine) {
 } // namespace
 
 int exercise_artifact(const char* artifact) {
-    ninfer::Engine engine(engine_options(artifact));
-    if (const int result = verify_loaded_product(engine); result != 0) { return result; }
-    if (const int result = exercise_registered_frontend(engine); result != 0) { return result; }
-    if (const int result = exercise_full_prefill_chunk(engine); result != 0) { return result; }
-    if (const int result = exercise_prefix(engine); result != 0) { return result; }
-    if (const int result = exercise_rewrite_checkpoints(engine); result != 0) { return result; }
-    if (const int result = exercise_vision(engine); result != 0) { return result; }
-    if (const int result = exercise_abandoned_handle_capacity(engine); result != 0) {
-        return result;
+    {
+        ninfer::EngineOptions options             = engine_options(artifact);
+        options.context_cache.device_state_slots  = 1;
+        options.context_cache.max_shared_prefixes = 0;
+        ninfer::Engine engine(std::move(options));
+        if (const int result = verify_loaded_product(engine); result != 0) { return result; }
+        if (const int result = exercise_registered_frontend(engine); result != 0) { return result; }
+        if (const int result = exercise_full_prefill_chunk(engine); result != 0) { return result; }
+        if (const int result = exercise_rewrite_checkpoints(engine); result != 0) { return result; }
+        if (const int result = exercise_prefix(engine); result != 0) { return result; }
+        if (const int result = exercise_abandoned_handle_capacity(engine); result != 0) {
+            return result;
+        }
     }
+    {
+        ninfer::Engine engine(engine_options(artifact));
+        if (const int result = exercise_vision(engine); result != 0) { return result; }
+    }
+    if (const int result = exercise_host_restore(artifact); result != 0) { return result; }
     return 0;
 }
 

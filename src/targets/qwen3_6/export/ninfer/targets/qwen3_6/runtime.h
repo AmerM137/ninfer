@@ -11,6 +11,8 @@
 #include <optional>
 #include <span>
 #include <utility>
+#include <variant>
+#include <vector>
 
 namespace ninfer {
 struct DeviceContext;
@@ -27,6 +29,155 @@ struct GraphExecutionProfile {
     std::uint32_t min            = 0;
     std::uint32_t max            = 0;
     std::uint32_t topology_class = 0;
+};
+
+// Program-minted shortlist metadata. It only narrows catalog inspection; Program still performs
+// exact token, position, media and runtime-mode verification before a checkpoint can be selected.
+struct PrefixShortlistKey {
+    std::uint64_t digest       = 0;
+    std::uint32_t frontier     = 0;
+    std::uint32_t identity_tag = 0;
+
+    [[nodiscard]] friend constexpr bool operator==(PrefixShortlistKey,
+                                                   PrefixShortlistKey) noexcept = default;
+};
+
+struct TargetKVRequirement {
+    std::uint32_t main_frontier    = 0;
+    std::uint32_t backend_frontier = 0;
+    std::uint32_t main_pages       = 0;
+    std::uint32_t backend_pages    = 0;
+
+    [[nodiscard]] friend constexpr bool operator==(TargetKVRequirement,
+                                                   TargetKVRequirement) noexcept = default;
+};
+
+struct CheckpointSummary {
+    runtime::CheckpointRef ref;
+    runtime::CheckpointScope scope = runtime::CheckpointScope::Private;
+    PrefixShortlistKey shortlist_key;
+    runtime::ReplicaResidency state_residency = runtime::ReplicaResidency::DeviceOnly;
+    TargetKVRequirement required_kv;
+    runtime::PrefillWork rebuild_work;
+
+    [[nodiscard]] friend bool operator==(const CheckpointSummary&,
+                                         const CheckpointSummary&) noexcept = default;
+};
+
+struct ContinuationSummary {
+    std::optional<CheckpointSummary> endpoint;
+    std::optional<CheckpointSummary> rewrite;
+    std::vector<CheckpointSummary> long_anchors;
+    std::uint32_t active_references = 0;
+
+    [[nodiscard]] friend bool operator==(const ContinuationSummary&,
+                                         const ContinuationSummary&) noexcept = default;
+};
+
+struct SharedPrefixSummary {
+    CheckpointSummary checkpoint;
+    std::uint32_t active_references = 0;
+
+    [[nodiscard]] friend bool operator==(const SharedPrefixSummary&,
+                                         const SharedPrefixSummary&) noexcept = default;
+};
+
+enum class PressureStateAction : std::uint8_t {
+    None,
+    DropEndpointDeviceDuplicate,
+    DemoteEndpointToHost,
+    DropEndpointHostDuplicate,
+    DropRewriteDeviceDuplicate,
+    DemoteRewriteToHost,
+    DropRewriteHostDuplicate,
+    DropSharedDeviceDuplicate,
+    DemoteSharedToHost,
+    DropSharedHostDuplicate,
+};
+
+enum class PressureKVActionKind : std::uint8_t {
+    None,
+    DropDeviceDuplicate,
+    DemoteToHost,
+    DropHostDuplicate,
+};
+
+struct PressureKVAction {
+    std::uint32_t begin_page  = 0;
+    std::uint32_t page_count  = 0;
+    PressureKVActionKind kind = PressureKVActionKind::None;
+
+    [[nodiscard]] friend constexpr bool operator==(PressureKVAction,
+                                                   PressureKVAction) noexcept = default;
+};
+
+// Program-owned description of the policy loss caused by one pressure action. The common
+// ResourceManager owns observations and rates, but never reconstructs which target-private
+// checkpoint depends on a StateImage or typed KV region.
+struct PressureCheckpointImpact {
+    runtime::CheckpointRef checkpoint;
+    runtime::PrefillWork fallback_rebuild_work;
+    std::vector<runtime::ContextTransferRequirement> current_restore_requirements;
+    std::vector<runtime::ContextTransferRequirement> fallback_restore_requirements;
+    std::vector<runtime::ContextTransferRequirement> added_restore_requirements;
+    bool drops_checkpoint = false;
+
+    [[nodiscard]] friend bool operator==(const PressureCheckpointImpact&,
+                                         const PressureCheckpointImpact&) noexcept = default;
+};
+
+// The marginal recovery value contributed by one Host replica. Program supplies the exact
+// affected checkpoint and its nearest surviving fallback; ResourceManager applies the
+// checkpoint's retention observation and measured transfer/prefill rates.
+struct ReplicaValueImpact {
+    runtime::CheckpointRef checkpoint;
+    runtime::PrefillWork fallback_rebuild_work;
+    std::vector<runtime::ContextTransferRequirement> fallback_restore_requirements;
+    std::vector<runtime::ContextTransferRequirement> host_restore_requirements;
+
+    [[nodiscard]] friend bool operator==(const ReplicaValueImpact&,
+                                         const ReplicaValueImpact&) noexcept = default;
+};
+
+// A target-minted, side-effect-free pressure alternative for one private continuation. Common
+// policy compares only its exact effect/cost fields and returns the value unchanged to Program;
+// page positions and state disposition remain Qwen-family semantics.
+struct PressureOption {
+    std::uint64_t id          = 0;
+    PressureStateAction state = PressureStateAction::None;
+    PressureKVAction main_kv;
+    PressureKVAction backend_kv;
+    std::optional<runtime::CheckpointRef> dropped_checkpoint;
+    runtime::ResourceDelta effect;
+    std::uint64_t transfer_bytes = 0;
+    std::uint32_t copy_runs      = 0;
+    runtime::PrefillWork rebuild_work;
+    std::vector<runtime::ContextTransferRequirement> transfer_requirements;
+    std::vector<PressureCheckpointImpact> checkpoint_impacts;
+    std::vector<ReplicaValueImpact> removed_host_replica_impacts;
+    bool evicts_continuation = false;
+    bool shared_owner        = false;
+
+    [[nodiscard]] friend constexpr bool operator==(const PressureOption&,
+                                                   const PressureOption&) noexcept = default;
+};
+
+struct ReplicaTransitionOption {
+    runtime::ContextResourceClass resource = runtime::ContextResourceClass::State;
+    runtime::CheckpointRef checkpoint;
+    std::uint32_t begin_page = 0;
+    std::uint32_t page_count = 0;
+    runtime::ResourceDelta effect;
+    std::uint64_t transfer_bytes = 0;
+    std::uint32_t copy_runs      = 0;
+    runtime::PrefillWork rebuild_work;
+    std::vector<ReplicaValueImpact> added_host_replica_impacts;
+    bool shared_owner                = false;
+    bool calibrated                  = false;
+    std::uint64_t backup_transfer_ns = 0;
+
+    [[nodiscard]] friend constexpr bool
+    operator==(const ReplicaTransitionOption&, const ReplicaTransitionOption&) noexcept = default;
 };
 
 namespace detail {
@@ -110,6 +261,10 @@ public:
     RequestBasePlan& operator=(const RequestBasePlan&) = delete;
 
     [[nodiscard]] const runtime::RequestPlanSummary& summary() const noexcept;
+    [[nodiscard]] const runtime::ResourceDemand& root_demand() const noexcept;
+    [[nodiscard]] const PreparedContextCache& context_cache() const noexcept;
+    [[nodiscard]] std::span<const PrefixShortlistKey> shared_shortlist_keys() const noexcept;
+    [[nodiscard]] std::span<const PrefixShortlistKey> sparse_shortlist_keys() const noexcept;
 
 public:
     explicit RequestBasePlan(std::unique_ptr<detail::RequestBasePlanImpl<Variant>> impl) noexcept;
@@ -128,6 +283,13 @@ public:
 
     [[nodiscard]] const runtime::RequestPlanSummary& summary() const noexcept;
     [[nodiscard]] const runtime::ResourceDemand& demand() const noexcept;
+    [[nodiscard]] runtime::ResourceVector source_resources() const noexcept;
+    [[nodiscard]] runtime::ClaimDisposition source_disposition() const noexcept;
+    [[nodiscard]] bool needs_transfer() const noexcept;
+    [[nodiscard]] bool temporal_eligible() const noexcept;
+    [[nodiscard]] runtime::PrefillWork remaining_prefill_work() const noexcept;
+    [[nodiscard]] std::span<const runtime::ContextTransferRequirement>
+    transfer_requirements() const noexcept;
 
 public:
     // Family-private construction/storage seam. Exact packages expose only the completed alias;
@@ -174,23 +336,60 @@ private:
 };
 
 template <class Variant>
-class MaterializationTicket {
+class SharedPrefixHandle {
 public:
-    MaterializationTicket() noexcept = default;
+    SharedPrefixHandle() noexcept = default;
+    ~SharedPrefixHandle()         = default;
 
-    MaterializationTicket(MaterializationTicket&& other) noexcept
-        : owner_(std::exchange(other.owner_, nullptr)),
-          transaction_(std::exchange(other.transaction_, 0)) {}
+    SharedPrefixHandle(SharedPrefixHandle&& other) noexcept
+        : owner_(std::exchange(other.owner_, nullptr)), index_(other.index_),
+          generation_(std::exchange(other.generation_, 0)) {}
 
-    MaterializationTicket& operator=(MaterializationTicket&&)      = delete;
-    MaterializationTicket(const MaterializationTicket&)            = delete;
-    MaterializationTicket& operator=(const MaterializationTicket&) = delete;
+    SharedPrefixHandle& operator=(SharedPrefixHandle&&)      = delete;
+    SharedPrefixHandle(const SharedPrefixHandle&)            = delete;
+    SharedPrefixHandle& operator=(const SharedPrefixHandle&) = delete;
 
 private:
-    const void* owner_         = nullptr;
-    std::uint64_t transaction_ = 0;
+    const void* owner_        = nullptr;
+    std::uint32_t index_      = 0;
+    std::uint64_t generation_ = 0;
 
     friend struct detail::RuntimeContractAccess<Variant>;
+};
+
+template <class Variant>
+class CaptureOffer {
+public:
+    CaptureOffer() noexcept = default;
+    ~CaptureOffer()         = default;
+
+    CaptureOffer(CaptureOffer&& other) noexcept
+        : owner_(std::exchange(other.owner_, nullptr)), lane_(other.lane_), epoch_(other.epoch_),
+          id_(std::exchange(other.id_, 0)) {}
+
+    CaptureOffer& operator=(CaptureOffer&&)      = delete;
+    CaptureOffer(const CaptureOffer&)            = delete;
+    CaptureOffer& operator=(const CaptureOffer&) = delete;
+
+private:
+    const void* owner_ = nullptr;
+    runtime::LaneId lane_{};
+    std::uint64_t epoch_ = 0;
+    std::uint64_t id_    = 0;
+
+    friend struct detail::RuntimeContractAccess<Variant>;
+};
+
+template <class Variant>
+struct ProtectedPrivateOwner {
+    const ContinuationHandle<Variant>* handle = nullptr;
+    std::uint32_t owner_mask                  = 0;
+};
+
+template <class Variant>
+struct ProtectedSharedOwner {
+    const SharedPrefixHandle<Variant>* handle = nullptr;
+    std::uint32_t owner_mask                  = 0;
 };
 
 template <class Variant>
@@ -238,28 +437,109 @@ struct PrefillProgress {
     runtime::BeginSummary summary;
     std::uint32_t processed_prompt_tokens = 0;
     bool complete                         = false;
+    std::optional<runtime::PrefillObservation> observation;
     std::optional<PendingBatch<Variant>> pending;
+    std::optional<CaptureOffer<Variant>> capture;
+};
+
+struct CaptureAssessment {
+    runtime::ResourceDemand demand;
+    runtime::ResourceDelta active_entitlement_delta;
+    PrefixShortlistKey shortlist_key;
+    runtime::PrefillWork protected_rebuild_work;
+    std::vector<runtime::ContextTransferRequirement> transfer_requirements;
+    std::vector<PressureCheckpointImpact> replacement_impacts;
+    std::vector<runtime::CheckpointRef> private_replacement_candidates;
+    std::uint32_t frontier      = 0;
+    bool publishes_private      = false;
+    bool publishes_shared       = false;
+    bool needs_transfer         = false;
+    bool recycles_private_state = false;
+};
+
+template <class Variant>
+struct SharedPrefixPublication {
+    SharedPrefixHandle<Variant> handle;
+    SharedPrefixSummary summary;
+};
+
+template <class Variant>
+struct ActiveCaptureResult {
+    runtime::ContextTransactionStatus status = runtime::ContextTransactionStatus::Aborted;
+    runtime::ResourceDelta resource_delta;
+    runtime::ResourceDelta active_entitlement_delta;
+    ContinuationSummary active_summary;
+    std::optional<SharedPrefixPublication<Variant>> shared;
+    std::vector<runtime::ContextTransferObservation> transfer_observations;
+    runtime::ContextOperationCounts operations;
 };
 
 template <class Variant>
 struct StartResult {
     SequenceHandle<Variant> sequence;
-    runtime::DeviceResources active_resources;
+    runtime::ResourceVector active_resources;
+};
+
+struct MaterializationVictimResult {
+    runtime::ClaimDisposition disposition = runtime::ClaimDisposition::Retained;
+    std::optional<ContinuationSummary> final_summary;
+    runtime::ResourceDelta resource_delta;
+};
+
+struct MaterializationSharedVictimResult {
+    runtime::ClaimDisposition disposition = runtime::ClaimDisposition::Retained;
+    std::optional<SharedPrefixSummary> final_summary;
+    runtime::ResourceDelta resource_delta;
+};
+
+struct MaterializationSourceResult {
+    runtime::ClaimDisposition disposition = runtime::ClaimDisposition::Retained;
+    std::optional<ContinuationSummary> final_summary;
+    runtime::ResourceDelta resource_delta;
+};
+
+struct MaterializationSharedSourceResult {
+    runtime::ClaimDisposition disposition = runtime::ClaimDisposition::Retained;
+    std::optional<SharedPrefixSummary> final_summary;
     runtime::ResourceDelta resource_delta;
 };
 
 template <class Variant>
 struct MaterializationResult {
-    runtime::MaterializationStatus status = runtime::MaterializationStatus::Aborted;
+    runtime::ContextTransactionStatus status = runtime::ContextTransactionStatus::Aborted;
     std::optional<StartResult<Variant>> published;
-    std::optional<ContinuationHandle<Variant>> source;
-    std::array<runtime::DeviceResources, 2 * kMaximumConcurrency> released_victims{};
-    std::size_t victim_count = 0;
+    std::optional<MaterializationSourceResult> source;
+    std::optional<MaterializationSharedSourceResult> shared_source;
+    std::vector<MaterializationVictimResult> victims;
+    std::vector<MaterializationSharedVictimResult> shared_victims;
+    runtime::ResourceDelta resource_delta;
+    std::vector<runtime::ContextTransferObservation> transfer_observations;
+    runtime::ContextOperationCounts operations;
 };
+
+struct ReplicaTransitionOwnerResult {
+    bool shared_owner = false;
+    std::optional<ContinuationSummary> private_summary;
+    std::optional<SharedPrefixSummary> shared_summary;
+    runtime::ResourceDelta resource_delta;
+};
+
+struct ReplicaTransitionResult {
+    runtime::ContextTransactionStatus status = runtime::ContextTransactionStatus::Aborted;
+    std::array<ReplicaTransitionOwnerResult, 2> owners;
+    std::size_t owner_count = 0;
+    runtime::ResourceDelta resource_delta;
+    std::vector<runtime::ContextTransferObservation> transfer_observations;
+};
+
+template <class Variant>
+using ContextTransactionProgress =
+    std::variant<runtime::ContextTransactionInProgress, MaterializationResult<Variant>,
+                 ActiveCaptureResult<Variant>, ReplicaTransitionResult>;
 
 struct CommitRowResult {
     runtime::CommitDisposition disposition = runtime::CommitDisposition::Active;
-    runtime::DeviceResources released_resources;
+    runtime::ResourceDelta resource_delta;
     GenerationTimings timings;
     SpeculativeStats speculative;
 };
@@ -267,24 +547,27 @@ struct CommitRowResult {
 template <class Variant>
 struct CommitResult {
     std::array<CommitRowResult, kMaximumConcurrency> rows{};
+    // A prompt-frontier capture becomes valid only after the generated Begin token is committed.
+    // Keeping the move-only capability row-aligned avoids exposing provisional prompt state.
+    std::array<std::optional<CaptureOffer<Variant>>, kMaximumConcurrency> captures{};
     std::size_t row_count = 0;
 };
 
 template <class Variant>
 struct DiscardResult {
     runtime::ConsumeStatus status = runtime::ConsumeStatus::InvariantMismatch;
-    std::array<runtime::DeviceResources, kMaximumConcurrency> released_resources{};
+    std::array<runtime::ResourceDelta, kMaximumConcurrency> resource_deltas{};
     std::size_t row_count = 0;
 };
 
 template <class Variant>
 struct FinishResult {
-    runtime::ConsumeStatus status = runtime::ConsumeStatus::InvariantMismatch;
+    runtime::ConsumeStatus status          = runtime::ConsumeStatus::InvariantMismatch;
+    runtime::FinishDisposition disposition = runtime::FinishDisposition::Released;
     GenerationTimings timings;
     SpeculativeStats speculative;
-    runtime::DeviceResources released_resources;
-    runtime::DeviceResources resident_resources;
-    runtime::ContinuationSummary summary;
+    runtime::ResourceDelta resource_delta;
+    ContinuationSummary summary;
     std::optional<ContinuationHandle<Variant>> continuation;
 };
 
@@ -293,13 +576,13 @@ struct AbortResult {
     runtime::ConsumeStatus status = runtime::ConsumeStatus::InvariantMismatch;
     GenerationTimings timings;
     SpeculativeStats speculative;
-    runtime::DeviceResources released_resources;
+    runtime::ResourceDelta resource_delta;
 };
 
 template <class Variant>
 struct ReleaseResult {
     runtime::ConsumeStatus status = runtime::ConsumeStatus::InvariantMismatch;
-    runtime::DeviceResources released_resources;
+    runtime::ResourceDelta resource_delta;
 };
 
 template <class Variant>
@@ -319,22 +602,78 @@ public:
     [[nodiscard]] std::optional<AdmissionPlan<Variant>>
     inspect_admission(const PreparedPrompt& prompt, const RequestBasePlan<Variant>& base,
                       runtime::LaneId destination, const ContinuationHandle<Variant>* source,
+                      const SharedPrefixHandle<Variant>* shared_source,
                       std::optional<runtime::CheckpointRef> checkpoint);
-    [[nodiscard]] MaterializationTicket<Variant>
+    [[nodiscard]] std::vector<PressureOption>
+    inspect_pressure_options(const ContinuationHandle<Variant>& continuation,
+                             runtime::ResourceVector deficit) const;
+    [[nodiscard]] PressureOption
+    inspect_eviction_option(const ContinuationHandle<Variant>& continuation) const;
+    [[nodiscard]] std::vector<PressureOption>
+    inspect_shared_pressure_options(const SharedPrefixHandle<Variant>& shared,
+                                    runtime::ResourceVector deficit) const;
+    [[nodiscard]] PressureOption
+    inspect_shared_eviction_option(const SharedPrefixHandle<Variant>& shared) const;
+    [[nodiscard]] std::optional<runtime::ResourceDelta> inspect_combined_pressure_effect(
+        std::span<const ContinuationHandle<Variant>* const> pressure_owners,
+        std::span<const PressureOption> pressure_options,
+        std::span<const SharedPrefixHandle<Variant>* const> shared_pressure_owners,
+        std::span<const PressureOption> shared_pressure_options) const;
+    [[nodiscard]] std::optional<AdmissionPlan<Variant>> compose_materialization(
+        AdmissionPlan<Variant>&& admission,
+        std::span<const ContinuationHandle<Variant>* const> pressure_owners,
+        std::span<const PressureOption> pressure_options,
+        std::span<const SharedPrefixHandle<Variant>* const> shared_pressure_owners,
+        std::span<const PressureOption> shared_pressure_options);
+    [[nodiscard]] runtime::PreflightStatus revalidate_materialization(
+        const AdmissionPlan<Variant>& plan, const PreparedPrompt& prompt,
+        const ContinuationHandle<Variant>* source, const SharedPrefixHandle<Variant>* shared_source,
+        std::span<const ContinuationHandle<Variant>* const> victims,
+        std::span<const SharedPrefixHandle<Variant>* const> shared_victims) const;
+    [[nodiscard]] runtime::ContextTransactionReserveStatus
     reserve_materialization(AdmissionPlan<Variant>&& plan, PreparedPrompt&& prompt,
                             const ContinuationHandle<Variant>* source,
-                            std::span<const ContinuationHandle<Variant>* const> victims);
-    [[nodiscard]] ReleaseResult<Variant>
-    release_materialization_victim(MaterializationTicket<Variant>& ticket,
-                                   ContinuationHandle<Variant>&& victim) noexcept;
-    [[nodiscard]] runtime::ConsumeStatus
-    abort_materialization(MaterializationTicket<Variant>&& ticket) noexcept;
-    void prepare_materialization(MaterializationTicket<Variant>& ticket);
-    [[nodiscard]] MaterializationResult<Variant>
-    publish_materialization(MaterializationTicket<Variant>&& ticket,
-                            std::optional<ContinuationHandle<Variant>>&& source,
+                            const SharedPrefixHandle<Variant>* shared_source,
+                            std::span<const ContinuationHandle<Variant>* const> victims,
+                            std::span<const SharedPrefixHandle<Variant>* const> shared_victims,
                             runtime::CancellationFlagView cancellation);
+    [[nodiscard]] ContextTransactionProgress<Variant>
+    progress_context_transaction(runtime::CancellationFlagView cancellation);
+    void finalize_context_transaction() noexcept;
+    [[nodiscard]] bool has_context_transaction() const noexcept;
     [[nodiscard]] PrefillProgress<Variant> advance_prefill(SequenceHandle<Variant> sequence);
+    [[nodiscard]] CaptureAssessment
+    inspect_capture(const CaptureOffer<Variant>& offer,
+                    const SharedPrefixHandle<Variant>* exact_shared,
+                    const SharedPrefixHandle<Variant>* replacement,
+                    std::optional<runtime::CheckpointRef> private_replacement) const;
+    [[nodiscard]] bool shared_capture_matches(const CaptureOffer<Variant>& offer,
+                                              const SharedPrefixHandle<Variant>& shared) const;
+    void skip_capture(CaptureOffer<Variant>&& offer);
+    [[nodiscard]] runtime::ContextTransactionReserveStatus
+    reserve_active_capture(CaptureOffer<Variant>&& offer,
+                           const SharedPrefixHandle<Variant>* exact_shared,
+                           const SharedPrefixHandle<Variant>* replacement,
+                           std::optional<runtime::CheckpointRef> private_replacement,
+                           runtime::CancellationFlagView cancellation);
+    [[nodiscard]] std::optional<ReplicaTransitionOption>
+    inspect_replica_transition(const ContinuationHandle<Variant>& owner,
+                               runtime::CheckpointRef checkpoint) const;
+    [[nodiscard]] std::optional<ReplicaTransitionOption>
+    inspect_replica_transition(const SharedPrefixHandle<Variant>& owner) const;
+    [[nodiscard]] runtime::PreflightStatus
+    revalidate_replica_transition(const ContinuationHandle<Variant>* private_owner,
+                                  const SharedPrefixHandle<Variant>* shared_owner,
+                                  const ReplicaTransitionOption& option,
+                                  const ContinuationHandle<Variant>* private_replacement,
+                                  const SharedPrefixHandle<Variant>* shared_replacement,
+                                  const PressureOption* replacement) const;
+    [[nodiscard]] runtime::ContextTransactionReserveStatus reserve_replica_transition(
+        const ContinuationHandle<Variant>* private_owner,
+        const SharedPrefixHandle<Variant>* shared_owner, ReplicaTransitionOption option,
+        const ContinuationHandle<Variant>* private_replacement,
+        const SharedPrefixHandle<Variant>* shared_replacement,
+        std::optional<PressureOption> replacement, runtime::CancellationFlagView cancellation);
     [[nodiscard]] PendingBatch<Variant> decode(std::span<const SequenceHandle<Variant>> sequences,
                                                std::span<const runtime::RoundBudget> budgets);
     [[nodiscard]] CommitResult<Variant>
@@ -345,9 +684,14 @@ public:
     [[nodiscard]] AbortResult<Variant> abort(SequenceHandle<Variant> sequence) noexcept;
     [[nodiscard]] ReleaseResult<Variant>
     release_continuation(ContinuationHandle<Variant>&& continuation) noexcept;
+    [[nodiscard]] ReleaseResult<Variant>
+    release_shared_prefix(SharedPrefixHandle<Variant>&& shared) noexcept;
+    [[nodiscard]] std::array<runtime::DeviceResources, 1U << kMaximumConcurrency>
+    project_protected_resources(std::span<const ProtectedPrivateOwner<Variant>> private_owners,
+                                std::span<const ProtectedSharedOwner<Variant>> shared_owners) const;
     void fail_all_cleanup() noexcept;
 
-    [[nodiscard]] runtime::DeviceResources admission_capacity() const noexcept;
+    [[nodiscard]] runtime::ResourceVector admission_capacity() const noexcept;
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
     void reset_memory_peaks() noexcept;
 
@@ -383,8 +727,50 @@ struct RuntimeContractAccess {
         return out;
     }
 
+    [[nodiscard]] static SharedPrefixHandle<Variant>
+    make_shared_prefix(const void* owner, std::uint32_t index, std::uint64_t generation) noexcept {
+        SharedPrefixHandle<Variant> out;
+        out.owner_      = owner;
+        out.index_      = index;
+        out.generation_ = generation;
+        return out;
+    }
+
+    [[nodiscard]] static CaptureOffer<Variant> make_capture_offer(const void* owner,
+                                                                  runtime::LaneId lane,
+                                                                  std::uint64_t epoch,
+                                                                  std::uint64_t id) noexcept {
+        CaptureOffer<Variant> out;
+        out.owner_ = owner;
+        out.lane_  = lane;
+        out.epoch_ = epoch;
+        out.id_    = id;
+        return out;
+    }
+
     [[nodiscard]] static const void* owner(const SequenceHandle<Variant>& handle) noexcept {
         return handle.owner_;
+    }
+
+    [[nodiscard]] static const void* owner(const CaptureOffer<Variant>& offer) noexcept {
+        return offer.owner_;
+    }
+
+    [[nodiscard]] static runtime::LaneId lane(const CaptureOffer<Variant>& offer) noexcept {
+        return offer.lane_;
+    }
+
+    [[nodiscard]] static std::uint64_t epoch(const CaptureOffer<Variant>& offer) noexcept {
+        return offer.epoch_;
+    }
+
+    [[nodiscard]] static std::uint64_t id(const CaptureOffer<Variant>& offer) noexcept {
+        return offer.id_;
+    }
+
+    static void consume(CaptureOffer<Variant>& offer) noexcept {
+        offer.owner_ = nullptr;
+        offer.id_    = 0;
     }
 
     [[nodiscard]] static runtime::LaneId lane(const SequenceHandle<Variant>& handle) noexcept {
@@ -412,26 +798,21 @@ struct RuntimeContractAccess {
         handle.generation_ = 0;
     }
 
-    [[nodiscard]] static MaterializationTicket<Variant>
-    make_materialization_ticket(const void* owner, std::uint64_t transaction) noexcept {
-        MaterializationTicket<Variant> out;
-        out.owner_       = owner;
-        out.transaction_ = transaction;
-        return out;
+    [[nodiscard]] static const void* owner(const SharedPrefixHandle<Variant>& handle) noexcept {
+        return handle.owner_;
     }
 
-    [[nodiscard]] static const void* owner(const MaterializationTicket<Variant>& ticket) noexcept {
-        return ticket.owner_;
+    [[nodiscard]] static std::uint32_t index(const SharedPrefixHandle<Variant>& handle) noexcept {
+        return handle.index_;
     }
 
-    [[nodiscard]] static std::uint64_t
-    transaction(const MaterializationTicket<Variant>& ticket) noexcept {
-        return ticket.transaction_;
+    [[nodiscard]] static std::uint64_t epoch(const SharedPrefixHandle<Variant>& handle) noexcept {
+        return handle.generation_;
     }
 
-    static void consume(MaterializationTicket<Variant>& ticket) noexcept {
-        ticket.owner_       = nullptr;
-        ticket.transaction_ = 0;
+    static void consume(SharedPrefixHandle<Variant>& handle) noexcept {
+        handle.owner_      = nullptr;
+        handle.generation_ = 0;
     }
 
     [[nodiscard]] static PendingBatch<Variant>

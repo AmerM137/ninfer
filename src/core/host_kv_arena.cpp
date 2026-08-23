@@ -3,6 +3,7 @@
 #include "core/dtype.h"
 
 #include <algorithm>
+#include <exception>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -197,6 +198,14 @@ HostKVArena::find_layout(const HostKVPageLayout& layout) const noexcept {
     return static_cast<std::uint32_t>(it - layouts_.begin());
 }
 
+const HostKVPageLayout* HostKVArena::layout_for(const KVPageGeometry& geometry) const noexcept {
+    const auto layout =
+        std::find_if(layouts_.begin(), layouts_.end(), [&](const HostKVPageLayout& candidate) {
+            return candidate.geometry == geometry;
+        });
+    return layout == layouts_.end() ? nullptr : &*layout;
+}
+
 std::optional<std::size_t> HostKVArena::find_free_extent(std::size_t bytes) const noexcept {
     for (std::size_t index = 0; index < free_extents_.size(); ++index) {
         if (free_extents_[index].bytes >= bytes) { return index; }
@@ -240,7 +249,243 @@ std::optional<HostKVAllocation> HostKVArena::allocate(const HostKVPageLayout& la
     descriptor.pages       = pages;
     descriptor.active      = true;
     occupied_bytes_ += bytes;
+    bump_revision();
     return HostKVAllocation(*this, descriptor_index, descriptor.generation);
+}
+
+std::optional<HostKVAllocationRecipe> HostKVArena::plan_after_releases(
+    std::span<const HostKVAllocationHandle> proposed_releases,
+    std::span<const HostKVAllocationRequest> target_allocations) const {
+    if (proposed_releases.empty() && target_allocations.empty()) { return std::nullopt; }
+    if (target_allocations.size() > free_descriptors_.size() + proposed_releases.size()) {
+        return std::nullopt;
+    }
+
+    HostKVAllocationRecipe recipe;
+    recipe.owner_          = this;
+    recipe.arena_revision_ = revision_;
+    recipe.releases_.reserve(proposed_releases.size());
+    recipe.targets_.reserve(target_allocations.size());
+
+    std::vector<FreeExtent> simulated = free_extents_;
+    const auto insert_extent          = [&](FreeExtent extent) {
+        const auto position = std::lower_bound(simulated.begin(), simulated.end(), extent.offset,
+                                                        [](const FreeExtent& candidate, std::size_t offset) {
+                                                   return candidate.offset < offset;
+                                               });
+        auto inserted       = simulated.insert(position, extent);
+        if (inserted != simulated.begin()) {
+            auto previous = inserted - 1;
+            if (previous->offset + previous->bytes == inserted->offset) {
+                previous->bytes += inserted->bytes;
+                inserted = simulated.erase(inserted);
+                inserted = previous;
+            }
+        }
+        const auto next = inserted + 1;
+        if (next != simulated.end() && inserted->offset + inserted->bytes == next->offset) {
+            inserted->bytes += next->bytes;
+            simulated.erase(next);
+        }
+    };
+
+    for (std::size_t index = 0; index < proposed_releases.size(); ++index) {
+        const HostKVAllocationHandle handle = proposed_releases[index];
+        if (!valid_handle(handle) ||
+            std::find(proposed_releases.begin(),
+                      proposed_releases.begin() + static_cast<std::ptrdiff_t>(index),
+                      handle) != proposed_releases.begin() + static_cast<std::ptrdiff_t>(index)) {
+            return std::nullopt;
+        }
+        const Descriptor& descriptor = descriptors_[handle.descriptor_];
+        insert_extent({descriptor.offset, descriptor.bytes});
+        recipe.releases_.push_back(handle);
+    }
+
+    for (const HostKVAllocationRequest& request : target_allocations) {
+        if (request.layout == nullptr || request.pages == 0) { return std::nullopt; }
+        const std::optional<std::uint32_t> layout_index = find_layout(*request.layout);
+        if (!layout_index ||
+            request.layout->page_stride > std::numeric_limits<std::size_t>::max() / request.pages) {
+            return std::nullopt;
+        }
+        const std::size_t bytes =
+            request.layout->page_stride * static_cast<std::size_t>(request.pages);
+        const auto extent =
+            std::find_if(simulated.begin(), simulated.end(),
+                         [&](const FreeExtent& free) { return free.bytes >= bytes; });
+        if (extent == simulated.end()) { return std::nullopt; }
+        const std::size_t offset = extent->offset;
+        extent->offset += bytes;
+        extent->bytes -= bytes;
+        if (extent->bytes == 0) { simulated.erase(extent); }
+        recipe.targets_.push_back(HostKVAllocationRecipe::Target{
+            .layout = *layout_index,
+            .pages  = request.pages,
+            .offset = offset,
+            .bytes  = bytes,
+        });
+    }
+    return recipe;
+}
+
+bool HostKVArena::can_allocate_after_suballocation_releases(
+    std::span<const HostKVSuballocationRelease> proposed_releases,
+    std::span<const HostKVAllocationRequest> target_allocations) const {
+    if (proposed_releases.empty() && target_allocations.empty()) { return true; }
+
+    std::vector<FreeExtent> simulated = free_extents_;
+    const auto insert_extent          = [&](FreeExtent extent) {
+        const auto position = std::lower_bound(simulated.begin(), simulated.end(), extent.offset,
+                                                        [](const FreeExtent& candidate, std::size_t offset) {
+                                                   return candidate.offset < offset;
+                                               });
+        auto inserted       = simulated.insert(position, extent);
+        if (inserted != simulated.begin()) {
+            auto previous = inserted - 1;
+            if (previous->offset + previous->bytes == inserted->offset) {
+                previous->bytes += inserted->bytes;
+                inserted = simulated.erase(inserted);
+                inserted = previous;
+            }
+        }
+        const auto next = inserted + 1;
+        if (next != simulated.end() && inserted->offset + inserted->bytes == next->offset) {
+            inserted->bytes += next->bytes;
+            simulated.erase(next);
+        }
+    };
+
+    for (std::size_t index = 0; index < proposed_releases.size(); ++index) {
+        const HostKVSuballocationRelease& release = proposed_releases[index];
+        if (!valid_handle(release.allocation) || release.page_count == 0) { return false; }
+        const Descriptor& descriptor = descriptors_[release.allocation.descriptor_];
+        if (release.begin_page > descriptor.pages ||
+            release.page_count > descriptor.pages - release.begin_page) {
+            return false;
+        }
+        const std::uint32_t end = release.begin_page + release.page_count;
+        for (std::size_t prior = 0; prior < index; ++prior) {
+            const HostKVSuballocationRelease& other = proposed_releases[prior];
+            if (other.allocation != release.allocation) { continue; }
+            const std::uint32_t other_end = other.begin_page + other.page_count;
+            if (release.begin_page < other_end && other.begin_page < end) { return false; }
+        }
+        const std::size_t stride = layouts_[descriptor.layout].page_stride;
+        insert_extent(FreeExtent{
+            .offset = checked_add(descriptor.offset,
+                                  checked_mul(static_cast<std::size_t>(release.begin_page), stride,
+                                              "Host KV suballocation release offset overflow"),
+                                  "Host KV suballocation release offset overflow"),
+            .bytes  = checked_mul(static_cast<std::size_t>(release.page_count), stride,
+                                  "Host KV suballocation release size overflow"),
+        });
+    }
+
+    std::size_t available_descriptors = free_descriptors_.size();
+    std::size_t required_descriptors  = target_allocations.size();
+    for (std::size_t index = 0; index < proposed_releases.size(); ++index) {
+        const HostKVAllocationHandle allocation = proposed_releases[index].allocation;
+        bool first                              = true;
+        for (std::size_t prior = 0; prior < index; ++prior) {
+            if (proposed_releases[prior].allocation == allocation) {
+                first = false;
+                break;
+            }
+        }
+        if (!first) { continue; }
+
+        std::vector<std::pair<std::uint32_t, std::uint32_t>> intervals;
+        for (const HostKVSuballocationRelease& release : proposed_releases) {
+            if (release.allocation == allocation) {
+                intervals.emplace_back(release.begin_page, release.begin_page + release.page_count);
+            }
+        }
+        std::sort(intervals.begin(), intervals.end());
+        const Descriptor& descriptor = descriptors_[allocation.descriptor_];
+        std::uint32_t cursor         = 0;
+        std::size_t retained_runs    = 0;
+        for (const auto [begin, end] : intervals) {
+            if (begin > cursor) { ++retained_runs; }
+            cursor = end;
+        }
+        if (cursor < descriptor.pages) { ++retained_runs; }
+        if (retained_runs == 0) {
+            ++available_descriptors;
+        } else if (retained_runs > 1) {
+            required_descriptors += retained_runs - 1U;
+        }
+    }
+    if (required_descriptors > available_descriptors) { return false; }
+
+    for (const HostKVAllocationRequest& request : target_allocations) {
+        if (request.layout == nullptr || request.pages == 0) { return false; }
+        const std::optional<std::uint32_t> layout_index = find_layout(*request.layout);
+        if (!layout_index ||
+            request.layout->page_stride > std::numeric_limits<std::size_t>::max() / request.pages) {
+            return false;
+        }
+        const std::size_t bytes =
+            request.layout->page_stride * static_cast<std::size_t>(request.pages);
+        const auto extent =
+            std::find_if(simulated.begin(), simulated.end(),
+                         [&](const FreeExtent& free) { return free.bytes >= bytes; });
+        if (extent == simulated.end()) { return false; }
+        extent->offset += bytes;
+        extent->bytes -= bytes;
+        if (extent->bytes == 0) { simulated.erase(extent); }
+    }
+    return true;
+}
+
+bool HostKVArena::apply_recipe(HostKVAllocationRecipe&& recipe,
+                               std::span<HostKVAllocation* const> proposed_releases,
+                               std::span<HostKVAllocation> target_allocations) noexcept {
+    if (recipe.owner_ != this || recipe.arena_revision_ != revision_ ||
+        recipe.releases_.size() != proposed_releases.size() ||
+        recipe.targets_.size() != target_allocations.size()) {
+        return false;
+    }
+    for (std::size_t index = 0; index < proposed_releases.size(); ++index) {
+        const HostKVAllocation* allocation = proposed_releases[index];
+        if (allocation == nullptr || allocation->handle() != recipe.releases_[index] ||
+            !valid_handle(recipe.releases_[index])) {
+            return false;
+        }
+    }
+    for (std::size_t index = 0; index < target_allocations.size(); ++index) {
+        const HostKVAllocationRecipe::Target& target = recipe.targets_[index];
+        if (target_allocations[index].valid() || target.layout >= layouts_.size() ||
+            target.pages == 0 ||
+            layouts_[target.layout].page_stride >
+                std::numeric_limits<std::size_t>::max() / target.pages ||
+            layouts_[target.layout].page_stride * static_cast<std::size_t>(target.pages) !=
+                target.bytes) {
+            return false;
+        }
+    }
+
+    // All generations and outputs are validated before the first mutation. The recipe was minted
+    // from this exact revision, so every operation below is an invariant-preserving adoption.
+    for (HostKVAllocation* allocation : proposed_releases) {
+        if (!allocation->release()) { std::terminate(); }
+    }
+    for (std::size_t index = 0; index < recipe.targets_.size(); ++index) {
+        const HostKVAllocationRecipe::Target& target = recipe.targets_[index];
+        std::optional<HostKVAllocation> allocation =
+            allocate(layouts_[target.layout], target.pages);
+        if (!allocation) { std::terminate(); }
+        const Descriptor& descriptor = descriptors_[allocation->descriptor_];
+        if (descriptor.offset != target.offset || descriptor.bytes != target.bytes) {
+            std::terminate();
+        }
+        target_allocations[index] = std::move(*allocation);
+    }
+    recipe.owner_          = nullptr;
+    recipe.arena_revision_ = 0;
+    recipe.releases_.clear();
+    recipe.targets_.clear();
+    return true;
 }
 
 std::pair<HostKVAllocation, HostKVAllocation> HostKVArena::split(HostKVAllocation&& allocation,
@@ -273,6 +518,7 @@ std::pair<HostKVAllocation, HostKVAllocation> HostKVArena::split(HostKVAllocatio
     const std::uint32_t right_generation = right.generation;
     const std::uint32_t left_index       = allocation.descriptor_;
     allocation.disarm();
+    bump_revision();
     return {HostKVAllocation(*this, left_index, left_generation),
             HostKVAllocation(*this, right_index, right_generation)};
 }
@@ -323,6 +569,7 @@ bool HostKVArena::release_descriptor(std::uint32_t descriptor_index,
     increment_generation(descriptor.generation);
     free_descriptors_.push_back(descriptor_index);
     insert_free_extent(released);
+    bump_revision();
     return true;
 }
 
@@ -349,6 +596,11 @@ void HostKVArena::insert_free_extent(FreeExtent extent) noexcept {
 std::byte* HostKVArena::allocation_data(const Descriptor& descriptor) const noexcept {
     if (!backing_) { return nullptr; }
     return static_cast<std::byte*>(backing_->data()) + descriptor.offset;
+}
+
+void HostKVArena::bump_revision() noexcept {
+    ++revision_;
+    if (revision_ == 0) { ++revision_; }
 }
 
 } // namespace ninfer

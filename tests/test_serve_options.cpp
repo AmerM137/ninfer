@@ -143,6 +143,26 @@ int main() {
                           configured.media_preprocess_threads == 6,
                       "media preparation limits did not reach serving options");
 
+    const ServeOptions context_cache = parse(
+        {"ninfer-serve", "model.ninfer", "--device-state-slots", "3", "--host-state-slots", "5",
+         "--host-kv-mib", "64", "--max-private-continuations", "9", "--max-shared-prefixes", "4",
+         "--max-long-anchors-per-continuation", "2", "--max-cache-markers-per-request", "6"});
+    failures += check(context_cache.context_cache.enabled &&
+                          context_cache.context_cache.device_state_slots == 3 &&
+                          context_cache.context_cache.host_state_slots == 5 &&
+                          context_cache.context_cache.host_kv_capacity_bytes == (64ULL << 20) &&
+                          context_cache.context_cache.max_private_continuations == 9 &&
+                          context_cache.context_cache.max_shared_prefixes == 4 &&
+                          context_cache.context_cache.max_long_anchors_per_continuation == 2 &&
+                          context_cache.context_cache.max_cache_markers_per_request == 6,
+                      "context-cache capacities did not reach serving options");
+    bool disabled_cache_capacity_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--no-prefix-reuse", "--host-kv-mib", "64"});
+    } catch (const std::invalid_argument&) { disabled_cache_capacity_rejected = true; }
+    failures += check(disabled_cache_capacity_rejected,
+                      "root-only server mode accepted context-cache capacity options");
+
     const ServeOptions response_store =
         parse({"ninfer-serve", "model.ninfer", "--response-store-max-records", "42",
                "--response-store-max-mib", "8"});
@@ -190,6 +210,11 @@ int main() {
     failures +=
         check(serve_usage_text("ninfer-serve").find("--no-prefix-reuse") != std::string::npos,
               "serve help omits --no-prefix-reuse");
+    failures += check(serve_usage_text("ninfer-serve").find("--host-kv-mib") != std::string::npos,
+                      "serve help omits context-cache capacities");
+    failures += check(serve_usage_text("ninfer-serve").find("device-state=max-concurrency") !=
+                          std::string::npos,
+                      "serve help omits context-cache defaults");
     failures +=
         check(serve_usage_text("ninfer-serve").find("--preserve-thinking") != std::string::npos,
               "serve help omits --preserve-thinking");

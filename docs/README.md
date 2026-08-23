@@ -40,14 +40,16 @@ API documentation.
 Runtime and Op references:
 
 - [Engine architecture, execution ownership, scheduling, and request lifecycles](maintainer/engine-architecture.md)
+- [Resource scheduling, continuation/checkpoint, and Device/Host context-cache contracts](maintainer/resource-scheduling-and-context-cache.md)
 - [Paged KV context storage, ownership, and capacity model](maintainer/paged-kv-cache.md)
 - [Op admission, contracts, ownership, qualification, and performance rules](maintainer/op-development.md)
 - [ReplaySSM GDN technical reference](maintainer/replayssm-gdn.md)
 - [Linear benchmark contract and registered suites](maintainer/linear-benchmark.md)
 
-`engine-architecture.md` is the sole top-level Engine architecture reference. The remaining files
-define narrower physical-storage, model, artifact, Op, or measurement contracts rather than
-parallel architecture variants.
+`engine-architecture.md` is the sole top-level Engine architecture reference.
+`resource-scheduling-and-context-cache.md` is its narrower authority for resource selection,
+materialization, checkpoint ownership, and replica policy. The remaining files define physical
+storage, model, artifact, Op, or measurement contracts rather than parallel architecture variants.
 
 Artifact and model references:
 
@@ -59,18 +61,3 @@ Artifact and model references:
 - [Qwen3.8-27B artifact contracts, including the NVFP4 target](maintainer/qwen3.8-27b-artifact.md)
 - [Qwen3.6-35B-A3B model semantics](maintainer/qwen3.6-35b-a3b-model.md)
 - [Qwen3.6-35B-A3B artifact contracts](maintainer/qwen3.6-35b-a3b-artifact.md)
-
-Pending implementation work:
-
-- [Resource scheduling and context-cache target architecture](maintainer/resource-scheduling-and-context-cache.md)
-  defines the selected continuation, checkpoint, state/KV residency, materialization, and ownership
-  contracts for the upcoming context-cache implementation; it does not describe the current Engine.
-- [Resource scheduling and context-cache implementation record](maintainer/resource-scheduling-and-context-cache-implementation-record.md)
-  tracks the ordered implementation steps, decisions, actual changes, verification, and commits for
-  that architecture; Steps 1 and 2 are complete.
-- [StateImage physical-container implementation plan](maintainer/state-image-container-implementation-plan.md)
-  records the completed Linear Attention, continuation-hidden, DFlash fixed-state, and Host-image
-  container step; it is not a second architecture reference.
-- [Paged KV physical-container implementation plan](maintainer/paged-kv-physical-container-implementation-plan.md)
-  records the completed Device page ownership, execution mapping, packed Host allocation, physical
-  transfer, and current Program-cutover step.

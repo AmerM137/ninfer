@@ -98,6 +98,32 @@ const runtime::RequestPlanSummary& RequestBasePlan<Variant>::summary() const noe
 }
 
 template <>
+const runtime::ResourceDemand& RequestBasePlan<Variant>::root_demand() const noexcept {
+    static const runtime::ResourceDemand empty;
+    return impl_ != nullptr ? impl_->root_demand : empty;
+}
+
+template <>
+const PreparedContextCache& RequestBasePlan<Variant>::context_cache() const noexcept {
+    static const PreparedContextCache empty;
+    return impl_ != nullptr ? impl_->context_cache : empty;
+}
+
+template <>
+std::span<const PrefixShortlistKey>
+RequestBasePlan<Variant>::shared_shortlist_keys() const noexcept {
+    return impl_ != nullptr ? std::span<const PrefixShortlistKey>(impl_->shared_shortlist_keys)
+                            : std::span<const PrefixShortlistKey>{};
+}
+
+template <>
+std::span<const PrefixShortlistKey>
+RequestBasePlan<Variant>::sparse_shortlist_keys() const noexcept {
+    return impl_ != nullptr ? std::span<const PrefixShortlistKey>(impl_->sparse_shortlist_keys)
+                            : std::span<const PrefixShortlistKey>{};
+}
+
+template <>
 AdmissionPlan<Variant>::AdmissionPlan(
     std::unique_ptr<detail::AdmissionPlanImpl<Variant>> impl) noexcept
     : impl_(std::move(impl)) {}
@@ -122,6 +148,40 @@ const runtime::ResourceDemand& AdmissionPlan<Variant>::demand() const noexcept {
 }
 
 template <>
+runtime::ResourceVector AdmissionPlan<Variant>::source_resources() const noexcept {
+    return impl_ != nullptr ? impl_->source_resources : runtime::ResourceVector{};
+}
+
+template <>
+runtime::ClaimDisposition AdmissionPlan<Variant>::source_disposition() const noexcept {
+    return impl_ != nullptr ? impl_->source_disposition
+                            : runtime::ClaimDisposition::ConsumedToActive;
+}
+
+template <>
+bool AdmissionPlan<Variant>::needs_transfer() const noexcept {
+    return impl_ != nullptr && impl_->needs_transfer;
+}
+
+template <>
+bool AdmissionPlan<Variant>::temporal_eligible() const noexcept {
+    return impl_ != nullptr && impl_->temporal_eligible;
+}
+
+template <>
+runtime::PrefillWork AdmissionPlan<Variant>::remaining_prefill_work() const noexcept {
+    return impl_ != nullptr ? impl_->remaining_prefill_work : runtime::PrefillWork{};
+}
+
+template <>
+std::span<const runtime::ContextTransferRequirement>
+AdmissionPlan<Variant>::transfer_requirements() const noexcept {
+    return impl_ != nullptr
+               ? std::span<const runtime::ContextTransferRequirement>(impl_->transfer_requirements)
+               : std::span<const runtime::ContextTransferRequirement>{};
+}
+
+template <>
 Program<Variant>::Program(std::unique_ptr<detail::ProgramImpl<Variant>> impl) noexcept
     : impl_(std::move(impl)) {}
 
@@ -138,54 +198,172 @@ Program<Variant>::plan_request(const PreparedPrompt& prompt,
 template <>
 std::optional<AdmissionPlan<Variant>> Program<Variant>::inspect_admission(
     const PreparedPrompt& prompt, const RequestBasePlan<Variant>& base, runtime::LaneId destination,
-    const ContinuationHandle<Variant>* source, std::optional<runtime::CheckpointRef> checkpoint) {
+    const ContinuationHandle<Variant>* source, const SharedPrefixHandle<Variant>* shared_source,
+    std::optional<runtime::CheckpointRef> checkpoint) {
     return impl_->inspect_admission(PreparedPromptAccess::view(prompt), base, destination, source,
-                                    checkpoint);
+                                    shared_source, checkpoint);
 }
 
 template <>
-runtime::DeviceResources Program<Variant>::admission_capacity() const noexcept {
+std::vector<PressureOption>
+Program<Variant>::inspect_pressure_options(const ContinuationHandle<Variant>& continuation,
+                                           runtime::ResourceVector deficit) const {
+    return impl_->inspect_pressure_options(continuation, deficit);
+}
+
+template <>
+PressureOption
+Program<Variant>::inspect_eviction_option(const ContinuationHandle<Variant>& continuation) const {
+    return impl_->inspect_eviction_option(continuation);
+}
+
+template <>
+std::vector<PressureOption>
+Program<Variant>::inspect_shared_pressure_options(const SharedPrefixHandle<Variant>& shared,
+                                                  runtime::ResourceVector deficit) const {
+    return impl_->inspect_shared_pressure_options(shared, deficit);
+}
+
+template <>
+PressureOption
+Program<Variant>::inspect_shared_eviction_option(const SharedPrefixHandle<Variant>& shared) const {
+    return impl_->inspect_shared_eviction_option(shared);
+}
+
+template <>
+std::optional<runtime::ResourceDelta> Program<Variant>::inspect_combined_pressure_effect(
+    std::span<const ContinuationHandle<Variant>* const> pressure_owners,
+    std::span<const PressureOption> pressure_options,
+    std::span<const SharedPrefixHandle<Variant>* const> shared_pressure_owners,
+    std::span<const PressureOption> shared_pressure_options) const {
+    return impl_->inspect_combined_pressure_effect(pressure_owners, pressure_options,
+                                                   shared_pressure_owners, shared_pressure_options);
+}
+
+template <>
+std::optional<AdmissionPlan<Variant>> Program<Variant>::compose_materialization(
+    AdmissionPlan<Variant>&& admission,
+    std::span<const ContinuationHandle<Variant>* const> pressure_owners,
+    std::span<const PressureOption> pressure_options,
+    std::span<const SharedPrefixHandle<Variant>* const> shared_pressure_owners,
+    std::span<const PressureOption> shared_pressure_options) {
+    return impl_->compose_materialization(std::move(admission), pressure_owners, pressure_options,
+                                          shared_pressure_owners, shared_pressure_options);
+}
+
+template <>
+runtime::ResourceVector Program<Variant>::admission_capacity() const noexcept {
     return impl_->admission_capacity();
 }
 
 template <>
-MaterializationTicket<Variant> Program<Variant>::reserve_materialization(
+runtime::PreflightStatus Program<Variant>::revalidate_materialization(
+    const AdmissionPlan<Variant>& plan, const PreparedPrompt& prompt,
+    const ContinuationHandle<Variant>* source, const SharedPrefixHandle<Variant>* shared_source,
+    std::span<const ContinuationHandle<Variant>* const> victims,
+    std::span<const SharedPrefixHandle<Variant>* const> shared_victims) const {
+    return impl_->revalidate_materialization(plan, PreparedPromptAccess::view(prompt), source,
+                                             shared_source, victims, shared_victims);
+}
+
+template <>
+runtime::ContextTransactionReserveStatus Program<Variant>::reserve_materialization(
     AdmissionPlan<Variant>&& plan, PreparedPrompt&& prompt,
-    const ContinuationHandle<Variant>* source,
-    std::span<const ContinuationHandle<Variant>* const> victims) {
-    return impl_->reserve_materialization(
-        std::move(plan), PreparedPromptAccess::take(std::move(prompt)), source, victims);
+    const ContinuationHandle<Variant>* source, const SharedPrefixHandle<Variant>* shared_source,
+    std::span<const ContinuationHandle<Variant>* const> victims,
+    std::span<const SharedPrefixHandle<Variant>* const> shared_victims,
+    runtime::CancellationFlagView cancellation) {
+    return impl_->reserve_materialization(std::move(plan),
+                                          PreparedPromptAccess::take(std::move(prompt)), source,
+                                          shared_source, victims, shared_victims, cancellation);
 }
 
 template <>
-ReleaseResult<Variant>
-Program<Variant>::release_materialization_victim(MaterializationTicket<Variant>& ticket,
-                                                 ContinuationHandle<Variant>&& victim) noexcept {
-    return impl_->release_materialization_victim(ticket, std::move(victim));
+ContextTransactionProgress<Variant>
+Program<Variant>::progress_context_transaction(runtime::CancellationFlagView cancellation) {
+    return impl_->progress_context_transaction(cancellation);
 }
 
 template <>
-runtime::ConsumeStatus
-Program<Variant>::abort_materialization(MaterializationTicket<Variant>&& ticket) noexcept {
-    return impl_->abort_materialization(std::move(ticket));
+void Program<Variant>::finalize_context_transaction() noexcept {
+    impl_->finalize_context_transaction();
 }
 
 template <>
-void Program<Variant>::prepare_materialization(MaterializationTicket<Variant>& ticket) {
-    impl_->prepare_materialization(ticket);
-}
-
-template <>
-MaterializationResult<Variant>
-Program<Variant>::publish_materialization(MaterializationTicket<Variant>&& ticket,
-                                          std::optional<ContinuationHandle<Variant>>&& source,
-                                          runtime::CancellationFlagView cancellation) {
-    return impl_->publish_materialization(std::move(ticket), std::move(source), cancellation);
+bool Program<Variant>::has_context_transaction() const noexcept {
+    return impl_->has_context_transaction();
 }
 
 template <>
 PrefillProgress<Variant> Program<Variant>::advance_prefill(SequenceHandle<Variant> sequence) {
     return impl_->advance_prefill(sequence);
+}
+
+template <>
+CaptureAssessment
+Program<Variant>::inspect_capture(const CaptureOffer<Variant>& offer,
+                                  const SharedPrefixHandle<Variant>* exact_shared,
+                                  const SharedPrefixHandle<Variant>* replacement,
+                                  std::optional<runtime::CheckpointRef> private_replacement) const {
+    return impl_->inspect_capture(offer, exact_shared, replacement, private_replacement);
+}
+
+template <>
+bool Program<Variant>::shared_capture_matches(const CaptureOffer<Variant>& offer,
+                                              const SharedPrefixHandle<Variant>& shared) const {
+    return impl_->shared_capture_matches(offer, shared);
+}
+
+template <>
+void Program<Variant>::skip_capture(CaptureOffer<Variant>&& offer) {
+    impl_->skip_capture(std::move(offer));
+}
+
+template <>
+runtime::ContextTransactionReserveStatus
+Program<Variant>::reserve_active_capture(CaptureOffer<Variant>&& offer,
+                                         const SharedPrefixHandle<Variant>* exact_shared,
+                                         const SharedPrefixHandle<Variant>* replacement,
+                                         std::optional<runtime::CheckpointRef> private_replacement,
+                                         runtime::CancellationFlagView cancellation) {
+    return impl_->reserve_active_capture(std::move(offer), exact_shared, replacement,
+                                         private_replacement, cancellation);
+}
+
+template <>
+std::optional<ReplicaTransitionOption>
+Program<Variant>::inspect_replica_transition(const ContinuationHandle<Variant>& owner,
+                                             runtime::CheckpointRef checkpoint) const {
+    return impl_->inspect_replica_transition(owner, checkpoint);
+}
+
+template <>
+std::optional<ReplicaTransitionOption>
+Program<Variant>::inspect_replica_transition(const SharedPrefixHandle<Variant>& owner) const {
+    return impl_->inspect_replica_transition(owner);
+}
+
+template <>
+runtime::PreflightStatus Program<Variant>::revalidate_replica_transition(
+    const ContinuationHandle<Variant>* private_owner,
+    const SharedPrefixHandle<Variant>* shared_owner, const ReplicaTransitionOption& option,
+    const ContinuationHandle<Variant>* private_replacement,
+    const SharedPrefixHandle<Variant>* shared_replacement,
+    const PressureOption* replacement) const {
+    return impl_->revalidate_replica_transition(
+        private_owner, shared_owner, option, private_replacement, shared_replacement, replacement);
+}
+
+template <>
+runtime::ContextTransactionReserveStatus Program<Variant>::reserve_replica_transition(
+    const ContinuationHandle<Variant>* private_owner,
+    const SharedPrefixHandle<Variant>* shared_owner, ReplicaTransitionOption option,
+    const ContinuationHandle<Variant>* private_replacement,
+    const SharedPrefixHandle<Variant>* shared_replacement,
+    std::optional<PressureOption> replacement, runtime::CancellationFlagView cancellation) {
+    return impl_->reserve_replica_transition(private_owner, shared_owner, std::move(option),
+                                             private_replacement, shared_replacement,
+                                             std::move(replacement), cancellation);
 }
 
 template <>
@@ -220,6 +398,20 @@ template <>
 ReleaseResult<Variant>
 Program<Variant>::release_continuation(ContinuationHandle<Variant>&& continuation) noexcept {
     return impl_->release_continuation(std::move(continuation));
+}
+
+template <>
+ReleaseResult<Variant>
+Program<Variant>::release_shared_prefix(SharedPrefixHandle<Variant>&& shared) noexcept {
+    return impl_->release_shared_prefix(std::move(shared));
+}
+
+template <>
+std::array<runtime::DeviceResources, 1U << kMaximumConcurrency>
+Program<Variant>::project_protected_resources(
+    std::span<const ProtectedPrivateOwner<Variant>> private_owners,
+    std::span<const ProtectedSharedOwner<Variant>> shared_owners) const {
+    return impl_->project_protected_resources(private_owners, shared_owners);
 }
 
 template <>

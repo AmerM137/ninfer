@@ -41,6 +41,8 @@ GPU residency is frozen when the Engine starts:
 - Vision is disabled by default, omitting its weights, Vision scratch phase, and frozen
   request-transient allocation;
 - `--vision` loads those allocations and enables image/video input.
+- the one-request CLI uses root-only context mode, so it does not reserve an extra Device
+  checkpoint StateImage or capture a continuation that no later request could consume.
 
 The complete `.ninfer` inventory is still validated. These choices are not lazy loading: a
 text-only Engine rejects media and cannot enable Vision later. DFlash and Vision are mutually
@@ -201,7 +203,8 @@ separate CUDA Graph driver allowance. Scratch is the maximum of the enabled Text
 Vision phases, not their sum. Its prefill bound uses
 `min(--prefill-chunk,--max-context)`. The request-transient buffer is also frozen at startup; a
 media request activates only the needed prefix and performs no project-owned device allocation or
-growth.
+growth. Context-cache capacity controls are intentionally absent from this one-request interface;
+the persistent Engine and server routes own cross-request reuse and optional Host backing.
 
 All weight, sequence, workspace, request-transient, and graph allocations are released when the
 Engine is destroyed.

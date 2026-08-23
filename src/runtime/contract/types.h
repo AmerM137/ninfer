@@ -84,24 +84,100 @@ struct DeviceResources {
                                                    const DeviceResources&) noexcept = default;
 };
 
-// A candidate separates the steady-state active ownership from physical resources which must
-// coexist with an intact source before publication, and from source resources reclassified at
-// publication. None of these fields imply a physical free/reallocate cycle.
+struct HostResources {
+    std::uint32_t state_slots = 0;
+    std::size_t kv_bytes      = 0;
+
+    [[nodiscard]] friend constexpr bool operator==(const HostResources&,
+                                                   const HostResources&) noexcept = default;
+};
+
+struct ResourceVector {
+    DeviceResources device;
+    HostResources host;
+
+    [[nodiscard]] friend constexpr bool operator==(const ResourceVector&,
+                                                   const ResourceVector&) noexcept = default;
+};
+
+// The ResourceManager ledger records unique published occupancy plus one exclusive transaction
+// reservation. Program supplies both steady-state deltas and the actual dependency-aware physical
+// peak; callers must not derive either by summing logical checkpoint summaries.
 struct ResourceDemand {
-    DeviceResources active_entitlement;
-    DeviceResources prepublish_additional;
-    DeviceResources source_conversions;
+    ResourceVector active_entitlement;
+    ResourceVector reservation_added;
+    ResourceVector reservation_credit;
+    ResourceVector physical_peak_additional;
+    ResourceVector final_removed;
+    ResourceVector final_added;
 
     [[nodiscard]] friend constexpr bool operator==(const ResourceDemand&,
                                                    const ResourceDemand&) noexcept = default;
 };
 
 struct ResourceDelta {
-    DeviceResources removed;
-    DeviceResources added;
+    ResourceVector removed;
+    ResourceVector added;
 
     [[nodiscard]] friend constexpr bool operator==(const ResourceDelta&,
                                                    const ResourceDelta&) noexcept = default;
+};
+
+// Target-defined prefill work is kept separate from Scheduler service work. Text quanta count
+// decoder-context columns and Vision quanta count encoded input patches; neither includes decode
+// service units.
+struct PrefillWork {
+    std::uint64_t text_quanta   = 0;
+    std::uint64_t vision_quanta = 0;
+
+    [[nodiscard]] friend constexpr bool operator==(PrefillWork, PrefillWork) noexcept = default;
+};
+
+struct PrefillObservation {
+    PrefillWork work;
+    std::uint64_t text_elapsed_ns   = 0;
+    std::uint64_t vision_elapsed_ns = 0;
+};
+
+enum class ContextResourceClass : std::uint8_t {
+    State,
+    MainKV,
+    BackendKV,
+};
+
+enum class ContextTransferDirection : std::uint8_t {
+    DeviceToHost,
+    HostToDevice,
+    DeviceToDevice,
+};
+
+struct ContextTransferObservation {
+    ContextResourceClass resource      = ContextResourceClass::State;
+    ContextTransferDirection direction = ContextTransferDirection::DeviceToHost;
+    std::uint64_t units                = 0; // State images for State; bytes for typed KV.
+    std::uint64_t bytes                = 0;
+    std::uint32_t page_count           = 0;
+    std::uint64_t elapsed_ns           = 0;
+};
+
+struct ContextTransferRequirement {
+    ContextResourceClass resource      = ContextResourceClass::State;
+    ContextTransferDirection direction = ContextTransferDirection::DeviceToHost;
+    std::uint64_t units                = 0;
+    std::uint64_t bytes                = 0;
+    std::uint32_t page_count           = 0;
+    std::uint32_t copy_runs            = 0;
+
+    [[nodiscard]] friend constexpr bool operator==(ContextTransferRequirement,
+                                                   ContextTransferRequirement) noexcept = default;
+};
+
+struct ContextOperationCounts {
+    std::uint64_t state_moves            = 0;
+    std::uint64_t state_forks            = 0;
+    std::uint64_t state_restores         = 0;
+    std::uint64_t partial_tail_cow_pages = 0;
+    std::uint64_t historical_fork_hits   = 0;
 };
 
 enum class Readiness : std::uint8_t {
@@ -111,8 +187,8 @@ enum class Readiness : std::uint8_t {
     PermanentlyInfeasible,
 };
 
-// Non-owning cancellation observation used at the synchronous materialization publication point.
-// The request record owns the flag for longer than the worker can retain this view.
+// Non-owning cancellation observation used while the worker advances a context transaction. The
+// request record owns the flag for longer than Program can retain this view.
 struct CancellationFlagView {
     const std::atomic<bool>* flag = nullptr;
 
@@ -121,15 +197,66 @@ struct CancellationFlagView {
     }
 };
 
-enum class MaterializationStatus : std::uint8_t {
+enum class ContextTransactionStatus : std::uint8_t {
+    InProgress,
     Published,
     Aborted,
+};
+
+enum class ContextTransactionReserveStatus : std::uint8_t {
+    Reserved,
+    Aborted,
+};
+
+struct ContextTransactionInProgress {};
+
+enum class ContextTransactionKind : std::uint8_t {
+    Materialization,
+    ActiveCapture,
+    ReplicaTransition,
+};
+
+enum class PreflightStatus : std::uint8_t {
+    Ready,
+    StalePolicyState,
+    InvariantFailure,
 };
 
 enum class CheckpointKind : std::uint8_t {
     SessionEndpoint,
     TurnClosure,
     ResponseReplay,
+    SharedStablePrefix,
+    LongAnchor,
+};
+
+enum class CheckpointScope : std::uint8_t {
+    Private,
+    Shared,
+};
+
+enum class ReplicaResidency : std::uint8_t {
+    DeviceOnly,
+    HostOnly,
+    Both,
+};
+
+enum class RetentionClass : std::uint8_t {
+    SharedStable,
+    LiveSession,
+    RecentPrivate,
+    Disposable,
+};
+
+enum class ClaimDisposition : std::uint8_t {
+    Retained,
+    ConsumedToActive,
+    Evicted,
+};
+
+enum class FinishDisposition : std::uint8_t {
+    Catalogued,
+    Released,
 };
 
 struct CheckpointRef {
@@ -138,25 +265,6 @@ struct CheckpointRef {
     std::uint32_t ordinal  = 0;
 
     [[nodiscard]] friend constexpr bool operator==(CheckpointRef, CheckpointRef) noexcept = default;
-};
-
-struct ContinuationSummary {
-    DeviceResources footprint;
-    CheckpointRef endpoint;
-    std::optional<CheckpointRef> rewrite;
-    std::uint64_t rebuild_work_quanta = 0;
-
-    [[nodiscard]] friend bool operator==(const ContinuationSummary&,
-                                         const ContinuationSummary&) noexcept = default;
-};
-
-struct ContinuationId {
-    std::uint64_t value = 0;
-
-    [[nodiscard]] friend constexpr bool operator==(ContinuationId,
-                                                   ContinuationId) noexcept  = default;
-    [[nodiscard]] friend constexpr auto operator<=>(ContinuationId,
-                                                    ContinuationId) noexcept = default;
 };
 
 struct Revision {
@@ -171,15 +279,15 @@ struct RequestPlanSummary {
     std::uint32_t requested_output_tokens = 0;
     std::uint32_t effective_output_tokens = 0;
     FinishReason effective_limit_reason   = FinishReason::None;
-    PrefixReusePath prefix_reuse_path     = PrefixReusePath::FullReset;
-    DeviceResources admission;
-    std::uint64_t service_work_quanta = 0;
+    PrefixReusePath prefix_reuse_path     = PrefixReusePath::Root;
+    std::uint64_t service_work_quanta     = 0;
+    bool publish_continuation             = true;
 };
 
 struct BeginSummary {
     std::uint32_t prompt_tokens        = 0;
     std::uint32_t reused_prompt_tokens = 0;
-    PrefixReusePath prefix_reuse_path  = PrefixReusePath::FullReset;
+    PrefixReusePath prefix_reuse_path  = PrefixReusePath::Root;
 };
 
 struct GeneratedRound {
@@ -197,6 +305,7 @@ struct PrefillStepResult {
     GeneratedRound round;
     std::uint32_t processed_prompt_tokens = 0;
     bool complete                         = false;
+    std::optional<PrefillObservation> observation;
 };
 
 struct RoundBudget {

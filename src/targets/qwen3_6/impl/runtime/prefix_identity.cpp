@@ -1,6 +1,7 @@
 #include "targets/qwen3_6/impl/runtime/prefix_identity.h"
 
 #include <algorithm>
+#include <iterator>
 #include <limits>
 #include <stdexcept>
 
@@ -64,6 +65,7 @@ void ResidentPrefixIdentity::clear() noexcept {
     token_types_.clear();
     for (auto& axis : positions_) { axis.clear(); }
     vision_items_.clear();
+    rewrite_execution_frontiers_.clear();
 }
 
 void ResidentPrefixIdentity::assign(const PreparedPromptData& prompt) {
@@ -76,13 +78,15 @@ void ResidentPrefixIdentity::assign(const PreparedPromptData& prompt) {
         const auto begin = prompt.positions.begin() + static_cast<std::ptrdiff_t>(axis * tokens);
         positions_[axis].assign(begin, begin + static_cast<std::ptrdiff_t>(tokens));
     }
-    vision_items_ = prompt.vision_items;
+    vision_items_                = prompt.vision_items;
+    rewrite_execution_frontiers_ = prompt.identity.rewrite_execution_frontiers;
 }
 
 void ResidentPrefixIdentity::swap(ResidentPrefixIdentity& other) noexcept {
     token_types_.swap(other.token_types_);
     positions_.swap(other.positions_);
     vision_items_.swap(other.vision_items_);
+    rewrite_execution_frontiers_.swap(other.rewrite_execution_frontiers_);
 }
 
 void ResidentPrefixIdentity::append_generated(std::size_t count, std::int32_t rope_delta) {
@@ -116,6 +120,9 @@ void ResidentPrefixIdentity::truncate(std::size_t tokens) {
     token_types_.resize(tokens);
     for (auto& axis : positions_) { axis.resize(tokens); }
     vision_items_.resize(retained_items);
+    rewrite_execution_frontiers_.erase(std::upper_bound(rewrite_execution_frontiers_.begin(),
+                                                        rewrite_execution_frontiers_.end(), tokens),
+                                       rewrite_execution_frontiers_.end());
 }
 
 bool ResidentPrefixIdentity::matches(const PreparedPromptData& prompt, std::size_t count) const {
@@ -148,7 +155,55 @@ bool ResidentPrefixIdentity::matches(const PreparedPromptData& prompt, std::size
     for (std::size_t i = 0; i < incoming_items; ++i) {
         if (!same_item(prompt.vision_items[i], vision_items_[i])) { return false; }
     }
+    const auto incoming_end =
+        std::upper_bound(prompt.identity.rewrite_execution_frontiers.begin(),
+                         prompt.identity.rewrite_execution_frontiers.end(), count);
+    const auto resident_end = std::upper_bound(rewrite_execution_frontiers_.begin(),
+                                               rewrite_execution_frontiers_.end(), count);
+    return std::distance(prompt.identity.rewrite_execution_frontiers.begin(), incoming_end) ==
+               std::distance(rewrite_execution_frontiers_.begin(), resident_end) &&
+           std::equal(prompt.identity.rewrite_execution_frontiers.begin(), incoming_end,
+                      rewrite_execution_frontiers_.begin());
+}
+
+bool ResidentPrefixIdentity::equals(const ResidentPrefixIdentity& other) const {
+    if (token_types_ != other.token_types_ || positions_ != other.positions_ ||
+        rewrite_execution_frontiers_ != other.rewrite_execution_frontiers_ ||
+        vision_items_.size() != other.vision_items_.size()) {
+        return false;
+    }
+    for (std::size_t index = 0; index < vision_items_.size(); ++index) {
+        if (!same_item(vision_items_[index], other.vision_items_[index])) { return false; }
+    }
     return true;
+}
+
+std::uint64_t ResidentPrefixIdentity::shortlist_digest(std::span<const TokenId> tokens,
+                                                       std::size_t count) const {
+    if (count > tokens.size() || count > size()) {
+        throw std::out_of_range("shortlist digest frontier exceeds resident identity");
+    }
+    std::uint64_t digest = 1469598103934665603ULL;
+    const auto mix       = [&](std::uint64_t value) {
+        for (std::uint32_t byte = 0; byte < 8; ++byte) {
+            digest ^= static_cast<std::uint8_t>(value >> (8U * byte));
+            digest *= 1099511628211ULL;
+        }
+    };
+    mix(count);
+    for (std::size_t index = 0; index < count; ++index) {
+        mix(static_cast<std::uint32_t>(tokens[index]));
+        mix(token_types_[index]);
+        for (const auto& axis : positions_) { mix(static_cast<std::uint32_t>(axis[index])); }
+    }
+    const auto frontier_end = std::upper_bound(rewrite_execution_frontiers_.begin(),
+                                               rewrite_execution_frontiers_.end(), count);
+    mix(static_cast<std::uint64_t>(frontier_end - rewrite_execution_frontiers_.begin()));
+    for (auto frontier = rewrite_execution_frontiers_.begin(); frontier != frontier_end;
+         ++frontier) {
+        mix(*frontier);
+    }
+    return digest == 0 ? 1 : digest;
 }
 
 bool prefix_matches(const PreparedPromptData& prompt, const std::vector<TokenId>& resident_tokens,

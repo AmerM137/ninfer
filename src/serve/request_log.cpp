@@ -22,6 +22,11 @@ namespace {
 
 using Json = nlohmann::json;
 
+template <class T>
+T monotonic_delta(T previous, T current) noexcept {
+    return current >= previous ? current - previous : T{};
+}
+
 std::uint64_t unix_time_ms() {
     const auto now = std::chrono::system_clock::now().time_since_epoch();
     return static_cast<std::uint64_t>(
@@ -113,14 +118,18 @@ const char* proposal_head_name(ninfer::ProposalHead proposal) {
 
 const char* prefix_reuse_path_name(ninfer::PrefixReusePath path) {
     switch (path) {
-    case ninfer::PrefixReusePath::FullReset:
-        return "full_reset";
-    case ninfer::PrefixReusePath::AppendAtFrontier:
-        return "append_frontier";
-    case ninfer::PrefixReusePath::RestoreTurnCheckpoint:
-        return "restore_turn_checkpoint";
-    case ninfer::PrefixReusePath::RestoreResponseCheckpoint:
-        return "restore_response_checkpoint";
+    case ninfer::PrefixReusePath::Root:
+        return "root";
+    case ninfer::PrefixReusePath::PrivateEndpoint:
+        return "private_endpoint";
+    case ninfer::PrefixReusePath::PrivateTurnClosure:
+        return "private_turn_closure";
+    case ninfer::PrefixReusePath::PrivateResponseReplay:
+        return "private_response_replay";
+    case ninfer::PrefixReusePath::PrivateLongAnchor:
+        return "private_long_anchor";
+    case ninfer::PrefixReusePath::SharedStablePrefix:
+        return "shared_stable_prefix";
     }
     return "unknown";
 }
@@ -426,10 +435,12 @@ std::string format_throughput(const ThroughputReport& report) {
     std::ostringstream out;
     out << "throughput interval=" << std::fixed << std::setprecision(3) << report.interval_seconds
         << "s prefill=" << std::setprecision(1) << prefill_rate << "tok/s decode=" << decode_rate
-        << "tok/s running=" << report.scheduler.running_requests
-        << " prefilling=" << report.scheduler.prefilling_requests
-        << " decode_ready=" << report.scheduler.decode_ready_requests
-        << " waiting=" << report.scheduler.waiting_requests << " avg_decode_batch=";
+        << "tok/s running=" << report.current.running_requests
+        << " prefilling=" << report.current.prefilling_requests
+        << " decode_ready=" << report.current.decode_ready_requests
+        << " waiting=" << report.current.waiting_requests
+        << " materializing=" << report.current.materializing_requests
+        << " capture_pending=" << report.current.capture_pending_requests << " avg_decode_batch=";
     if (report.decode_rounds == 0) {
         out << "n/a";
     } else {
@@ -442,6 +453,7 @@ std::string format_throughput(const ThroughputReport& report) {
 
 std::string format_server_start_json(
     const std::string& server_instance_id, std::uint64_t timestamp, const ServeOptions& options,
+    const ninfer::EngineOptions& engine_options,
     const ninfer::ModelSamplingDefaults& sampling_defaults, const std::string& public_model_id,
     const ninfer::LoadSummary& load, const ninfer::MemorySummary& memory,
     const ServerLogEnvironment& environment, std::optional<std::uint64_t> artifact_size_bytes) {
@@ -450,49 +462,65 @@ std::string format_server_start_json(
     Json artifact_size = nullptr;
     if (artifact_size_bytes.has_value()) { artifact_size = *artifact_size_bytes; }
 
-    record["server"]   = Json{{"host", options.host},
-                              {"port", options.port},
-                              {"public_model_id", public_model_id},
-                              {"api_key_configured", !options.api_key.empty()},
-                              {"cors_enabled", options.enable_cors},
-                              {"max_request_bytes", options.max_request_bytes},
-                              {"media_cache_bytes", options.media_cache_bytes},
-                              {"media_live_bytes", options.media_live_bytes},
-                              {"media_preprocess_threads", options.media_preprocess_threads},
-                              {"request_log_jsonl", options.request_log_jsonl},
-                              {"default_output_tokens", options.default_max_tokens},
-                              {"default_thinking", options.enable_thinking},
-                              {"default_preserve_thinking", options.preserve_thinking}};
-    record["artifact"] = Json{{"path", options.artifact_path},
-                              {"size_bytes", std::move(artifact_size)},
-                              {"target", load.target},
-                              {"weights_id", load.weights_id},
-                              {"bytes_read", load.artifact_bytes_read},
-                              {"host_to_device_bytes", load.host_to_device_bytes},
-                              {"peak_staging_bytes", load.peak_staging_bytes},
-                              {"tensor_count", load.tensor_count},
-                              {"resource_count", load.resource_count},
-                              {"load_seconds", load.load_seconds},
-                              {"upload_seconds", load.upload_seconds}};
-    record["engine"]   = Json{
-          {"device", options.device},
-          {"max_context", options.max_context},
-          {"kv_capacity_mode", kv_capacity_mode_name(memory.kv_capacity_mode)},
-          {"kv_capacity", memory.kv_capacity},
-          {"kv_capacity_page_groups", memory.kv_capacity_page_groups},
-          {"kv_capacity_max_page_groups", memory.kv_capacity_max_page_groups},
-          {"max_concurrency", options.max_concurrency},
-          {"max_pending_requests", options.max_pending_requests},
-          {"pending_timeout_ms", options.pending_timeout_ms},
-          {"prefill_chunk", options.prefill_chunk},
-          {"log_stats_interval_ms", options.log_stats_interval_ms},
-          {"kv_cache", kv_cache_name(options.kv_cache)},
-          {"vision", options.enable_vision},
-          {"cuda_graph", options.use_cuda_graph},
-          {"prefix_reuse", options.allow_prefix_reuse},
-          {"speculative_backend", product::speculative_backend_name(options.speculative.backend)},
-          {"speculative_draft_window", options.speculative.draft_tokens},
-          {"proposal_head", proposal_head_name(options.speculative.proposal_head)}};
+    record["server"]                         = Json{{"host", options.host},
+                                                    {"port", options.port},
+                                                    {"public_model_id", public_model_id},
+                                                    {"api_key_configured", !options.api_key.empty()},
+                                                    {"cors_enabled", options.enable_cors},
+                                                    {"max_request_bytes", options.max_request_bytes},
+                                                    {"media_cache_bytes", options.media_cache_bytes},
+                                                    {"media_live_bytes", options.media_live_bytes},
+                                                    {"media_preprocess_threads", options.media_preprocess_threads},
+                                                    {"request_log_jsonl", options.request_log_jsonl},
+                                                    {"default_output_tokens", options.default_max_tokens},
+                                                    {"default_thinking", options.enable_thinking},
+                                                    {"default_preserve_thinking", options.preserve_thinking}};
+    record["artifact"]                       = Json{{"path", options.artifact_path},
+                                                    {"size_bytes", std::move(artifact_size)},
+                                                    {"target", load.target},
+                                                    {"weights_id", load.weights_id},
+                                                    {"bytes_read", load.artifact_bytes_read},
+                                                    {"host_to_device_bytes", load.host_to_device_bytes},
+                                                    {"peak_staging_bytes", load.peak_staging_bytes},
+                                                    {"tensor_count", load.tensor_count},
+                                                    {"resource_count", load.resource_count},
+                                                    {"load_seconds", load.load_seconds},
+                                                    {"upload_seconds", load.upload_seconds}};
+    const ninfer::ContextCacheOptions& cache = engine_options.context_cache;
+    const std::uint64_t total_device_state_slots =
+        static_cast<std::uint64_t>(engine_options.max_concurrency) +
+        cache.device_state_slots.value();
+    record["engine"] = Json{
+        {"device", engine_options.device},
+        {"max_context", engine_options.max_context},
+        {"kv_capacity_mode", kv_capacity_mode_name(memory.kv_capacity_mode)},
+        {"kv_capacity", memory.kv_capacity},
+        {"kv_capacity_page_groups", memory.kv_capacity_page_groups},
+        {"kv_capacity_max_page_groups", memory.kv_capacity_max_page_groups},
+        {"max_concurrency", engine_options.max_concurrency},
+        {"max_pending_requests", engine_options.max_pending_requests},
+        {"pending_timeout_ms", engine_options.pending_timeout_ms},
+        {"prefill_chunk", engine_options.prefill_chunk},
+        {"log_stats_interval_ms", options.log_stats_interval_ms},
+        {"kv_cache", kv_cache_name(engine_options.kv_cache)},
+        {"vision", engine_options.enable_vision},
+        {"cuda_graph", engine_options.use_cuda_graph},
+        {"prefix_reuse", options.allow_prefix_reuse},
+        {"speculative_backend",
+         product::speculative_backend_name(engine_options.speculative.backend)},
+        {"speculative_draft_window", engine_options.speculative.draft_tokens},
+        {"proposal_head", proposal_head_name(engine_options.speculative.proposal_head)},
+        {"context_cache",
+         Json{
+             {"enabled", cache.enabled},
+             {"device_state_slots", cache.device_state_slots.value()},
+             {"total_device_state_slots", total_device_state_slots},
+             {"host_state_slots", cache.host_state_slots},
+             {"host_kv_capacity_bytes", cache.host_kv_capacity_bytes},
+             {"max_private_continuations", cache.max_private_continuations.value()},
+             {"max_shared_prefixes", cache.max_shared_prefixes.value()},
+             {"max_long_anchors_per_continuation", cache.max_long_anchors_per_continuation.value()},
+             {"max_cache_markers_per_request", cache.max_cache_markers_per_request.value()}}}};
     record["sampling_defaults"] =
         Json{{"thinking", preset_json(sampling_defaults.thinking)},
              {"non_thinking", preset_json(sampling_defaults.non_thinking)},
@@ -513,7 +541,11 @@ std::string format_server_start_json(
              {"planned_slack_bytes", memory.planned_slack_bytes},
              {"cuda_graph_allowance_bytes", memory.cuda_graph_allowance_bytes},
              {"cuda_graph_observed_bytes", memory.cuda_graph_observed_bytes},
-             {"kv_payload_bytes", memory.kv_payload_bytes}};
+             {"kv_payload_bytes", memory.kv_payload_bytes},
+             {"host_state_capacity_slots", memory.host_state_capacity_slots},
+             {"host_state_occupied_slots", memory.host_state_occupied_slots},
+             {"host_kv_capacity_bytes", memory.host_kv_capacity_bytes},
+             {"host_kv_occupied_bytes", memory.host_kv_occupied_bytes}};
     record["environment"] =
         Json{{"device", environment.device},
              {"gpu_name", environment.gpu_name},
@@ -580,7 +612,9 @@ std::string format_request_error_json(const std::string& server_instance_id,
 
 std::string format_throughput_json(const std::string& server_instance_id, std::uint64_t timestamp,
                                    const ThroughputReport& report) {
-    Json record = event_base(server_instance_id, timestamp, "throughput");
+    Json record                          = event_base(server_instance_id, timestamp, "throughput");
+    const ninfer::RuntimeStats& previous = report.previous;
+    const ninfer::RuntimeStats& current  = report.current;
     const double prefill_rate =
         report.interval_seconds > 0.0
             ? static_cast<double>(report.computed_prefill_tokens) / report.interval_seconds
@@ -599,13 +633,121 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
                                       {"committed_decode", report.committed_decode_tokens}};
     record["throughput_tokens_per_second"] =
         Json{{"prefill", prefill_rate}, {"decode", decode_rate}};
-    record["scheduler"]    = Json{{"running", report.scheduler.running_requests},
-                                  {"prefilling", report.scheduler.prefilling_requests},
-                                  {"decode_ready", report.scheduler.decode_ready_requests},
-                                  {"waiting", report.scheduler.waiting_requests}};
-    record["decode_batch"] = Json{{"rounds", report.decode_rounds},
-                                  {"row_rounds", report.decode_row_rounds},
-                                  {"average_size", std::move(average_batch)}};
+    record["scheduler"]     = Json{{"running", current.running_requests},
+                                   {"prefilling", current.prefilling_requests},
+                                   {"decode_ready", current.decode_ready_requests},
+                                   {"waiting", current.waiting_requests},
+                                   {"materializing", current.materializing_requests},
+                                   {"capture_pending", current.capture_pending_requests}};
+    record["decode_batch"]  = Json{{"rounds", report.decode_rounds},
+                                   {"row_rounds", report.decode_row_rounds},
+                                   {"average_size", std::move(average_batch)}};
+    record["context_cache"] = Json{
+        {"captures", Json{{"completed", monotonic_delta(previous.active_captures_completed,
+                                                        current.active_captures_completed)},
+                          {"aborted", monotonic_delta(previous.active_captures_aborted,
+                                                      current.active_captures_aborted)}}},
+        {"selections",
+         Json{{"root", monotonic_delta(previous.root_selections, current.root_selections)},
+              {"private_endpoint", monotonic_delta(previous.private_endpoint_selections,
+                                                   current.private_endpoint_selections)},
+              {"private_turn_closure", monotonic_delta(previous.private_turn_closure_selections,
+                                                       current.private_turn_closure_selections)},
+              {"private_response_replay",
+               monotonic_delta(previous.private_response_replay_selections,
+                               current.private_response_replay_selections)},
+              {"private_long_anchor", monotonic_delta(previous.private_long_anchor_selections,
+                                                      current.private_long_anchor_selections)},
+              {"shared_stable_prefix", monotonic_delta(previous.shared_stable_prefix_selections,
+                                                       current.shared_stable_prefix_selections)},
+              {"reused_prompt_tokens",
+               monotonic_delta(previous.reused_prompt_tokens, current.reused_prompt_tokens)}}},
+        {"last_selection", Json{{"frontier_tokens", current.last_selected_frontier_tokens}}},
+        {"state_operations",
+         Json{{"moves", monotonic_delta(previous.state_moves, current.state_moves)},
+              {"forks", monotonic_delta(previous.state_forks, current.state_forks)},
+              {"restores", monotonic_delta(previous.state_restores, current.state_restores)}}},
+        {"state_transfers",
+         Json{{"d2h",
+               Json{{"count", monotonic_delta(previous.state_d2h_count, current.state_d2h_count)},
+                    {"bytes", monotonic_delta(previous.state_d2h_bytes, current.state_d2h_bytes)},
+                    {"seconds",
+                     monotonic_delta(previous.state_d2h_seconds, current.state_d2h_seconds)}}},
+              {"h2d",
+               Json{{"count", monotonic_delta(previous.state_h2d_count, current.state_h2d_count)},
+                    {"bytes", monotonic_delta(previous.state_h2d_bytes, current.state_h2d_bytes)},
+                    {"seconds",
+                     monotonic_delta(previous.state_h2d_seconds, current.state_h2d_seconds)}}},
+              {"d2d",
+               Json{{"count", monotonic_delta(previous.state_d2d_count, current.state_d2d_count)},
+                    {"bytes", monotonic_delta(previous.state_d2d_bytes, current.state_d2d_bytes)},
+                    {"seconds",
+                     monotonic_delta(previous.state_d2d_seconds, current.state_d2d_seconds)}}}}},
+        {"main_kv_transfers",
+         Json{
+             {"d2h",
+              Json{
+                  {"pages", monotonic_delta(previous.main_kv_d2h_pages, current.main_kv_d2h_pages)},
+                  {"bytes", monotonic_delta(previous.main_kv_d2h_bytes, current.main_kv_d2h_bytes)},
+                  {"seconds",
+                   monotonic_delta(previous.main_kv_d2h_seconds, current.main_kv_d2h_seconds)}}},
+             {"h2d",
+              Json{
+                  {"pages", monotonic_delta(previous.main_kv_h2d_pages, current.main_kv_h2d_pages)},
+                  {"bytes", monotonic_delta(previous.main_kv_h2d_bytes, current.main_kv_h2d_bytes)},
+                  {"seconds",
+                   monotonic_delta(previous.main_kv_h2d_seconds, current.main_kv_h2d_seconds)}}},
+             {"d2d",
+              Json{
+                  {"pages", monotonic_delta(previous.main_kv_d2d_pages, current.main_kv_d2d_pages)},
+                  {"bytes", monotonic_delta(previous.main_kv_d2d_bytes, current.main_kv_d2d_bytes)},
+                  {"seconds",
+                   monotonic_delta(previous.main_kv_d2d_seconds, current.main_kv_d2d_seconds)}}}}},
+        {"backend_kv_transfers",
+         Json{{"d2h", Json{{"pages", monotonic_delta(previous.backend_kv_d2h_pages,
+                                                     current.backend_kv_d2h_pages)},
+                           {"bytes", monotonic_delta(previous.backend_kv_d2h_bytes,
+                                                     current.backend_kv_d2h_bytes)},
+                           {"seconds", monotonic_delta(previous.backend_kv_d2h_seconds,
+                                                       current.backend_kv_d2h_seconds)}}},
+              {"h2d", Json{{"pages", monotonic_delta(previous.backend_kv_h2d_pages,
+                                                     current.backend_kv_h2d_pages)},
+                           {"bytes", monotonic_delta(previous.backend_kv_h2d_bytes,
+                                                     current.backend_kv_h2d_bytes)},
+                           {"seconds", monotonic_delta(previous.backend_kv_h2d_seconds,
+                                                       current.backend_kv_h2d_seconds)}}},
+              {"d2d", Json{{"pages", monotonic_delta(previous.backend_kv_d2d_pages,
+                                                     current.backend_kv_d2d_pages)},
+                           {"bytes", monotonic_delta(previous.backend_kv_d2d_bytes,
+                                                     current.backend_kv_d2d_bytes)},
+                           {"seconds", monotonic_delta(previous.backend_kv_d2d_seconds,
+                                                       current.backend_kv_d2d_seconds)}}}}},
+        {"pressure",
+         Json{{"partial_spill_pages",
+               monotonic_delta(previous.partial_spill_pages, current.partial_spill_pages)},
+              {"partial_tail_cow_pages",
+               monotonic_delta(previous.partial_tail_cow_pages, current.partial_tail_cow_pages)},
+              {"private_degradations", monotonic_delta(previous.private_checkpoint_degradations,
+                                                       current.private_checkpoint_degradations)},
+              {"private_evictions", monotonic_delta(previous.private_checkpoint_evictions,
+                                                    current.private_checkpoint_evictions)},
+              {"shared_degradations", monotonic_delta(previous.shared_checkpoint_degradations,
+                                                      current.shared_checkpoint_degradations)},
+              {"shared_evictions", monotonic_delta(previous.shared_checkpoint_evictions,
+                                                   current.shared_checkpoint_evictions)},
+              {"historical_fork_hits",
+               monotonic_delta(previous.historical_fork_hits, current.historical_fork_hits)}}},
+        {"occupancy", Json{{"device_state_slots", current.device_state_occupied_slots},
+                           {"host_state_slots", current.host_state_occupied_slots},
+                           {"device_main_kv_pages", current.device_main_kv_occupied_pages},
+                           {"device_backend_kv_pages", current.device_backend_kv_occupied_pages},
+                           {"host_kv_bytes", current.host_kv_occupied_bytes},
+                           {"shared_active_references", current.shared_active_references}}},
+        {"last_materialization",
+         Json{{"cost_calibrated", current.last_predicted_materialization_calibrated},
+              {"predicted_nanoseconds", current.last_predicted_materialization_ns}}},
+        {"actual_transfer_seconds", monotonic_delta(previous.actual_context_transfer_seconds,
+                                                    current.actual_context_transfer_seconds)}};
     return record.dump();
 }
 
@@ -649,6 +791,7 @@ JsonlRequestLog::JsonlRequestLog(const std::string& path,
 }
 
 void JsonlRequestLog::write_server_start(const ServeOptions& options,
+                                         const ninfer::EngineOptions& engine_options,
                                          const ninfer::ModelSamplingDefaults& sampling_defaults,
                                          const std::string& public_model_id,
                                          const ninfer::LoadSummary& load,
@@ -658,8 +801,8 @@ void JsonlRequestLog::write_server_start(const ServeOptions& options,
     const std::uintmax_t size = std::filesystem::file_size(options.artifact_path, error);
     const std::optional<std::uint64_t> artifact_size =
         error ? std::nullopt : std::optional<std::uint64_t>(size);
-    append(format_server_start_json(server_instance_id_, unix_time_ms(), options, sampling_defaults,
-                                    public_model_id, load, memory,
+    append(format_server_start_json(server_instance_id_, unix_time_ms(), options, engine_options,
+                                    sampling_defaults, public_model_id, load, memory,
                                     query_server_log_environment(options.device), artifact_size));
 }
 

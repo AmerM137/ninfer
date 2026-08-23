@@ -701,6 +701,22 @@ int test_rewrite_checkpoint_trace() {
     return failures;
 }
 
+int test_adjacent_tool_message_boundary() {
+    fi::ChatMessage assistant = chat_message(ninfer::ChatRole::Assistant, "");
+    assistant.tool_calls.push_back(
+        {.id = "", .name = "lookup", .arguments_json = R"({"city":"Paris"})"});
+    const fi::RenderedChat rendered =
+        render_chat({chat_message(ninfer::ChatRole::User, "weather?"), std::move(assistant),
+                     chat_message(ninfer::ChatRole::Tool, "sunny"),
+                     chat_message(ninfer::ChatRole::Tool, "20C")});
+    const fi::EncodedChat encoded = fi::encode_rendered_chat(official_tokenizer(), rendered);
+    return check(rendered.message_boundaries.size() == 5 && rendered.message_boundaries[3] &&
+                     encoded.message_boundaries.size() == 5 && encoded.message_boundaries[3] &&
+                     encoded.message_boundaries[4] &&
+                     *encoded.message_boundaries[3] < *encoded.message_boundaries[4],
+                 "adjacent Tool messages lost their exact intermediate message boundary");
+}
+
 int test_official_resource_guards() {
     FrontendResources stale_pad     = resources();
     nlohmann::json tokenizer_config = nlohmann::json::parse(stale_pad.tokenizer_config_json);
@@ -1314,6 +1330,7 @@ int main() {
     failures += test_ordered_instruction_turns();
     failures += test_reasoning_effort_chat_template();
     failures += test_rewrite_checkpoint_trace();
+    failures += test_adjacent_tool_message_boundary();
     failures += test_official_resource_guards();
     failures += test_text_and_image_prepare(frontend);
     failures += test_media_admission_uses_aggregate_resources(frontend);

@@ -343,6 +343,56 @@ int exercise_layout_and_transfer(ninfer::DeviceContext& context, ninfer::KVPageG
     middle.release();
     std::optional<ninfer::HostKVAllocation> reused = host_arena.allocate(host_layout, 1);
     failures += expect(reused.has_value(), label + " released Host subextent was not reusable");
+
+    ninfer::HostKVArena recipe_arena(host_layout.page_stride * 8,
+                                     std::span<const ninfer::HostKVPageLayout>(layouts));
+    auto recipe_left   = recipe_arena.allocate(host_layout, 2);
+    auto recipe_middle = recipe_arena.allocate(host_layout, 3);
+    auto recipe_right  = recipe_arena.allocate(host_layout, 2);
+    failures += expect(recipe_left && recipe_middle && recipe_right,
+                       label + " release-aware recipe fixture allocation failed");
+    const std::array release_handles{recipe_middle->handle(), recipe_right->handle()};
+    const std::array target_requests{
+        ninfer::HostKVAllocationRequest{.layout = &host_layout, .pages = 5}};
+    auto recipe = recipe_arena.plan_after_releases(release_handles, target_requests);
+    failures += expect(recipe.has_value(), label + " release-aware Host recipe was not planned");
+    auto revision_probe = recipe_arena.allocate(host_layout, 1);
+    failures += expect(revision_probe.has_value(), label + " Host recipe revision probe failed");
+    std::array<ninfer::HostKVAllocation*, 2> release_allocations{&*recipe_middle, &*recipe_right};
+    std::array<ninfer::HostKVAllocation, 1> recipe_targets;
+    failures +=
+        expect(!recipe_arena.apply_recipe(std::move(*recipe), release_allocations, recipe_targets),
+               label + " stale Host recipe changed the arena");
+    failures += expect(recipe_middle->valid() && recipe_right->valid(),
+                       label + " stale Host recipe consumed a release");
+    revision_probe->release();
+    recipe = recipe_arena.plan_after_releases(release_handles, target_requests);
+    failures += expect(recipe && recipe_arena.apply_recipe(std::move(*recipe), release_allocations,
+                                                           recipe_targets),
+                       label + " release-aware Host recipe adoption failed");
+    failures += expect(recipe_targets[0].page_count() == 5 && !recipe_middle->valid() &&
+                           !recipe_right->valid(),
+                       label + " release-aware Host recipe published an invalid result");
+
+    ninfer::HostKVArena subrelease_arena(host_layout.page_stride * 8,
+                                         std::span<const ninfer::HostKVPageLayout>(layouts));
+    auto subrelease_left   = subrelease_arena.allocate(host_layout, 2);
+    auto subrelease_middle = subrelease_arena.allocate(host_layout, 4);
+    auto subrelease_right  = subrelease_arena.allocate(host_layout, 2);
+    failures += expect(subrelease_left && subrelease_middle && subrelease_right,
+                       label + " Host suballocation release fixture failed");
+    const std::array subrelease{ninfer::HostKVSuballocationRelease{
+        .allocation = subrelease_middle->handle(), .begin_page = 1, .page_count = 2}};
+    const std::array two_page_target{
+        ninfer::HostKVAllocationRequest{.layout = &host_layout, .pages = 2}};
+    const std::array three_page_target{
+        ninfer::HostKVAllocationRequest{.layout = &host_layout, .pages = 3}};
+    failures += expect(!subrelease_arena.can_allocate(host_layout, 1) &&
+                           subrelease_arena.can_allocate_after_suballocation_releases(
+                               subrelease, two_page_target) &&
+                           !subrelease_arena.can_allocate_after_suballocation_releases(
+                               subrelease, three_page_target),
+                       label + " Host suballocation release feasibility is not extent exact");
     (void)left;
     (void)tail;
     (void)blockers;
