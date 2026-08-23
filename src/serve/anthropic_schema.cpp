@@ -109,6 +109,16 @@ std::string require_string_field(const Json& block, const char* field, const cha
     return block.at(field).get<std::string>();
 }
 
+bool has_ephemeral_cache_control(const Json& value, const char* param) {
+    if (!value.contains("cache_control") || value.at("cache_control").is_null()) { return false; }
+    const Json& control = value.at("cache_control");
+    if (!control.is_object() || !control.contains("type") || !control.at("type").is_string() ||
+        control.at("type").get<std::string>() != "ephemeral") {
+        bad_request("cache_control must be an object with type 'ephemeral'", param);
+    }
+    return true;
+}
+
 ninfer::product::media_acquire::Source parse_image_source(const Json& block) {
     if (!block.contains("source") || !block.at("source").is_object()) {
         bad_request("image block must contain a source object", "messages");
@@ -170,6 +180,7 @@ void parse_tools(const Json& body, GenerationRequest& out) {
         // Normalized OpenAI-style function tool object consumed verbatim by the
         // Qwen chat template's <tools> block (render_tools_system_block).
         tool.definition_json = Json{{"type", "function"}, {"function", std::move(function)}}.dump();
+        tool.cache_boundary_after = has_ephemeral_cache_control(item, "tools");
         out.tools.push_back(std::move(tool));
     }
 }
@@ -204,29 +215,42 @@ void parse_tool_choice(const Json& body, GenerationRequest& out) {
 
 // Flatten only the content blocks within one system value. Callers preserve the
 // containing turn and its position in the conversation.
-std::string flatten_system_value(const Json& value, const char* param) {
+struct FlattenedSystemValue {
     std::string text;
+    std::vector<std::uint32_t> cache_boundaries;
+};
+
+FlattenedSystemValue flatten_system_value(const Json& value, const char* param) {
+    FlattenedSystemValue out;
     if (value.is_string()) {
-        text = value.get<std::string>();
+        out.text = value.get<std::string>();
     } else if (value.is_array()) {
         for (const Json& block : value) {
             if (require_block_type(block, param) != "text") {
                 bad_request("only text system blocks are supported", param);
             }
-            append_text(text, require_string_field(block, "text", "system text block"));
+            append_text(out.text, require_string_field(block, "text", "system text block"));
+            if (has_ephemeral_cache_control(block, param)) {
+                if (out.text.empty() ||
+                    out.text.size() > std::numeric_limits<std::uint32_t>::max()) {
+                    bad_request("cacheable system prefix is empty or too large", param);
+                }
+                out.cache_boundaries.push_back(static_cast<std::uint32_t>(out.text.size()));
+            }
         }
     } else {
         bad_request("system content must be a string or an array of text blocks", param);
     }
-    return text;
+    return out;
 }
 
 void parse_system(const Json& body, GenerationRequest& out) {
     if (!body.contains("system") || body.at("system").is_null()) { return; }
+    FlattenedSystemValue system = flatten_system_value(body.at("system"), "system");
     ChatTurn turn;
     turn.role = ChatRole::System;
-    turn.content.push_back(
-        ContentPart{ContentKind::Text, flatten_system_value(body.at("system"), "system"), "text"});
+    turn.content.push_back(ContentPart{ContentKind::Text, std::move(system.text), "text"});
+    turn.shared_cache_boundaries_after_text_bytes = std::move(system.cache_boundaries);
     out.messages.push_back(std::move(turn));
 }
 
@@ -400,10 +424,11 @@ void parse_messages(const Json& body, GenerationRequest& out) {
         const ChatRole role = roles[i];
         const Json& content = item.at("content");
         if (role == ChatRole::System) {
+            FlattenedSystemValue system = flatten_system_value(content, "messages");
             ChatTurn turn;
             turn.role = ChatRole::System;
-            turn.content.push_back(
-                ContentPart{ContentKind::Text, flatten_system_value(content, "messages"), "text"});
+            turn.content.push_back(ContentPart{ContentKind::Text, std::move(system.text), "text"});
+            turn.shared_cache_boundaries_after_text_bytes = std::move(system.cache_boundaries);
             out.messages.push_back(std::move(turn));
             continue;
         }

@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <exception>
 #include <iostream>
+#include <new>
 #include <string_view>
 
 namespace {
@@ -337,6 +338,62 @@ void test_kv_store(ninfer::DeviceContext& device) {
                addresses.release(*shared) && pages.occupied() == 0 &&
                physical_pages.allocated_pages() == 0,
            "shared full-page occupancy survives until its final address reference releases");
+
+    const auto filler = addresses.create_active(4, 0);
+    expect(filler.has_value(), "full-capacity staged-fork filler allocation");
+    addresses.materialize_to_tokens(*filler, 193, device.stream);
+    addresses.commit_frontier(*filler, 193);
+    addresses.set_checkpoint_requirement(*filler, 193);
+    addresses.deactivate(*filler);
+
+    const auto retained = addresses.create_active(4, 0);
+    expect(retained.has_value(), "full-capacity retained source allocation");
+    addresses.materialize_to_tokens(*retained, 65, device.stream);
+    addresses.commit_frontier(*retained, 65);
+    addresses.set_checkpoint_requirement(*retained, 65);
+    addresses.deactivate(*retained);
+    const auto staged_destination = addresses.create_inactive();
+    expect(staged_destination.has_value(), "full-capacity staged-fork destination allocation");
+    expect(physical_pages.allocated_pages() == 6 && physical_pages.available_pages() == 2,
+           "full-capacity staged-fork fixture leaves only the transient tail headroom");
+
+    bool ordinary_fork_rejected = false;
+    try {
+        auto ordinary = addresses.prepare_prefix_fork(*retained, *staged_destination, 65, 4, 1);
+        (void)ordinary;
+    } catch (const std::bad_alloc&) { ordinary_fork_rejected = true; }
+    expect(ordinary_fork_rejected,
+           "ordinary retained prefix fork cannot reserve the one-page-over capacity shape");
+
+    auto staged = addresses.prepare_prefix_fork(*retained, *staged_destination, 65, 4, 1, true);
+    const auto retained_tail = addresses.prefix_fork_tail_logical_source(staged);
+    physical_pages.copy_page(addresses.prefix_fork_tail_source(staged),
+                             addresses.prefix_fork_tail_destination(staged),
+                             device.transfer_stream);
+    const std::array retained_tail_membership{retained_tail};
+    auto retained_tail_backup = extents.prepare(pages, retained_tail_membership);
+    expect(retained_tail_backup.has_value(), "retained tail Host backup reservation");
+    const auto retained_tail_sources = extents.device_sources(*retained_tail_backup);
+    physical_pages.copy_to_host(retained_tail_sources, extents.writable_view(*retained_tail_backup),
+                                device.transfer_stream);
+    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+    (void)extents.publish(std::move(*retained_tail_backup));
+    addresses.settle_prefix_fork_tail_source(staged);
+    expect(pages.drop_device_replica(retained_tail),
+           "retained tail Device replica releases after both copies complete");
+    addresses.complete_prefix_fork_after_tail_release(staged);
+    addresses.commit_prefix_fork(std::move(staged), device.stream);
+    expect(!pages.device_resident(retained_tail) && pages.host_resident(retained_tail) &&
+               addresses.entitlement(*staged_destination) == 4 &&
+               physical_pages.allocated_pages() == 6 && physical_pages.reserved_pages() == 2,
+           "staged retained fork transfers the old tail capacity to the active entitlement");
+
+    addresses.deactivate(*staged_destination);
+    expect(addresses.release(*staged_destination) && addresses.release(*retained) &&
+               addresses.release(*filler) &&
+               extents.release_unreferenced() == host_layout.page_stride && pages.occupied() == 0 &&
+               physical_pages.allocated_pages() == 0 && physical_pages.reserved_pages() == 0,
+           "staged retained fork closes Device and Host ownership without leaks");
 }
 
 } // namespace

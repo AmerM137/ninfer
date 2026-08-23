@@ -212,6 +212,14 @@ Program<Variant>::inspect_pressure_options(const ContinuationHandle<Variant>& co
 }
 
 template <>
+std::vector<PressureOption>
+Program<Variant>::inspect_pressure_options(const AdmissionPlan<Variant>& admission,
+                                           const ContinuationHandle<Variant>& continuation,
+                                           runtime::ResourceVector deficit) const {
+    return impl_->inspect_pressure_options(admission, continuation, deficit);
+}
+
+template <>
 PressureOption
 Program<Variant>::inspect_eviction_option(const ContinuationHandle<Variant>& continuation) const {
     return impl_->inspect_eviction_option(continuation);
@@ -225,6 +233,14 @@ Program<Variant>::inspect_shared_pressure_options(const SharedPrefixHandle<Varia
 }
 
 template <>
+std::vector<PressureOption>
+Program<Variant>::inspect_shared_pressure_options(const AdmissionPlan<Variant>& admission,
+                                                  const SharedPrefixHandle<Variant>& shared,
+                                                  runtime::ResourceVector deficit) const {
+    return impl_->inspect_shared_pressure_options(admission, shared, deficit);
+}
+
+template <>
 PressureOption
 Program<Variant>::inspect_shared_eviction_option(const SharedPrefixHandle<Variant>& shared) const {
     return impl_->inspect_shared_eviction_option(shared);
@@ -232,11 +248,12 @@ Program<Variant>::inspect_shared_eviction_option(const SharedPrefixHandle<Varian
 
 template <>
 std::optional<runtime::ResourceDelta> Program<Variant>::inspect_combined_pressure_effect(
+    const AdmissionPlan<Variant>& admission,
     std::span<const ContinuationHandle<Variant>* const> pressure_owners,
     std::span<const PressureOption> pressure_options,
     std::span<const SharedPrefixHandle<Variant>* const> shared_pressure_owners,
     std::span<const PressureOption> shared_pressure_options) const {
-    return impl_->inspect_combined_pressure_effect(pressure_owners, pressure_options,
+    return impl_->inspect_combined_pressure_effect(admission, pressure_owners, pressure_options,
                                                    shared_pressure_owners, shared_pressure_options);
 }
 

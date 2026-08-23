@@ -863,6 +863,70 @@ ProgramImplCore::inspect_lane(std::uint32_t lane, const PreparedPromptData& prom
             }
             source_replica_additions.device.backend_kv_pages = backend_required - backend_device;
         }
+        runtime::ResourceVector retained_tail_added;
+        runtime::ResourceVector retained_tail_removed;
+        runtime::ResourceVector retained_tail_preparation_peak;
+        const auto plan_retained_tail_release =
+            [&](KVAddressSpaceStore& addresses, LogicalKVPageStore& pages,
+                KVAddressSpaceHandle address, std::uint32_t frontier, std::uint32_t active_pages,
+                std::uint32_t missing_source_pages, bool prefix_fork, bool& staged,
+                runtime::ContextResourceClass resource) {
+                const std::uint32_t required = pages_for_tokens(frontier);
+                const std::uint64_t final_without_release =
+                    static_cast<std::uint64_t>(required) + active_pages;
+                const std::uint32_t capacity = pages.physical_pool().capacity_pages();
+                if (final_without_release <= capacity) { return true; }
+                if (!prefix_fork || frontier == 0 ||
+                    frontier % static_cast<std::uint32_t>(kPagedKVPageSize) == 0 ||
+                    final_without_release != static_cast<std::uint64_t>(capacity) + 1U ||
+                    required > addresses.mapped_pages(address)) {
+                    return false;
+                }
+                const LogicalKVPageHandle tail = addresses.logical_page(address, required - 1U);
+                if (pages.address_references(tail) != 1 || pages.writer_references(tail) != 0 ||
+                    addresses.has_active_reference(tail)) {
+                    return false;
+                }
+                staged                 = true;
+                const bool backend     = resource == runtime::ContextResourceClass::BackendKV;
+                std::uint32_t& removed = backend ? retained_tail_removed.device.backend_kv_pages
+                                                 : retained_tail_removed.device.main_kv_pages;
+                std::uint32_t& preparation =
+                    backend ? retained_tail_preparation_peak.device.backend_kv_pages
+                            : retained_tail_preparation_peak.device.main_kv_pages;
+                removed     = 1;
+                preparation = missing_source_pages + 1U;
+                if (!pages.host_resident(tail)) {
+                    const std::size_t stride =
+                        plan_host_kv_page_layout(pages.physical_pool().geometry()).page_stride;
+                    if (stride > std::numeric_limits<std::size_t>::max() -
+                                     retained_tail_added.host.kv_bytes) {
+                        throw std::overflow_error("retained KV tail Host backup size overflow");
+                    }
+                    retained_tail_added.host.kv_bytes += stride;
+                    add_transfer(resource, runtime::ContextTransferDirection::DeviceToHost, stride,
+                                 1);
+                    plan->needs_transfer = true;
+                }
+                return true;
+            };
+        if (!plan_retained_tail_release(
+                *text_kv_addresses, *text_kv_pages, source_kv->text, plan->reuse_base,
+                active_resources.device.main_kv_pages,
+                source_replica_additions.device.main_kv_pages, plan->text_prefix_fork_required,
+                plan->text_retained_tail_release, runtime::ContextResourceClass::MainKV)) {
+            return std::nullopt;
+        }
+        if (source_kv->backend) {
+            if (!plan_retained_tail_release(
+                    *backend_kv_addresses, *backend_kv_pages, *source_kv->backend, backend_frontier,
+                    active_resources.device.backend_kv_pages,
+                    source_replica_additions.device.backend_kv_pages,
+                    plan->backend_prefix_fork_required, plan->backend_retained_tail_release,
+                    runtime::ContextResourceClass::BackendKV)) {
+                return std::nullopt;
+            }
+        }
         const bool splits_private_state = [&] {
             if (source == nullptr) { return false; }
             const StateImageHandle selected =
@@ -878,6 +942,7 @@ ProgramImplCore::inspect_lane(std::uint32_t lane, const PreparedPromptData& prom
         }
         added.device.main_kv_pages += source_replica_additions.device.main_kv_pages;
         added.device.backend_kv_pages += source_replica_additions.device.backend_kv_pages;
+        added.host.kv_bytes = retained_tail_added.host.kv_bytes;
         runtime::ResourceVector credit;
         runtime::ResourceVector removed;
         runtime::ResourceVector physical_peak = added;
@@ -888,6 +953,26 @@ ProgramImplCore::inspect_lane(std::uint32_t lane, const PreparedPromptData& prom
                 throw std::logic_error("StateImage identity split has no active destination");
             }
             --physical_peak.device.state_slots;
+        }
+        credit.device.main_kv_pages     = retained_tail_removed.device.main_kv_pages;
+        credit.device.backend_kv_pages  = retained_tail_removed.device.backend_kv_pages;
+        removed.device.main_kv_pages    = retained_tail_removed.device.main_kv_pages;
+        removed.device.backend_kv_pages = retained_tail_removed.device.backend_kv_pages;
+        const auto stage_peak           = [](std::uint32_t added_pages, std::uint32_t removed_pages,
+                                   std::uint32_t preparation_pages) {
+            const std::uint32_t settled =
+                added_pages > removed_pages ? added_pages - removed_pages : 0U;
+            return std::max(settled, preparation_pages);
+        };
+        if (plan->text_retained_tail_release) {
+            physical_peak.device.main_kv_pages =
+                stage_peak(added.device.main_kv_pages, retained_tail_removed.device.main_kv_pages,
+                           retained_tail_preparation_peak.device.main_kv_pages);
+        }
+        if (plan->backend_retained_tail_release) {
+            physical_peak.device.backend_kv_pages = stage_peak(
+                added.device.backend_kv_pages, retained_tail_removed.device.backend_kv_pages,
+                retained_tail_preparation_peak.device.backend_kv_pages);
         }
         plan->demand = runtime::ResourceDemand{
             .active_entitlement       = active_resources,

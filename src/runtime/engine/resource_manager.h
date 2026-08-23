@@ -1035,7 +1035,7 @@ public:
         };
 
         const auto inspect_combined_pressure_effect =
-            [&](const std::vector<std::uint32_t>& private_slots,
+            [&](const AdmissionPlan& admission, const std::vector<std::uint32_t>& private_slots,
                 const std::vector<typename Package::PressureOption>& private_options,
                 const std::vector<std::uint32_t>& shared_slots,
                 const std::vector<typename Package::PressureOption>& shared_options)
@@ -1058,8 +1058,8 @@ public:
                 }
                 shared_handles.push_back(&*shared_catalog_[slot].handle);
             }
-            return program.inspect_combined_pressure_effect(private_handles, private_options,
-                                                            shared_handles, shared_options);
+            return program.inspect_combined_pressure_effect(
+                admission, private_handles, private_options, shared_handles, shared_options);
         };
 
         const auto close_candidate = [&](std::size_t candidate_index,
@@ -1121,9 +1121,9 @@ public:
                         next_private_slots.push_back(slot);
                         next_private_options.push_back(option);
                     }
-                    const std::optional<ResourceDelta> combined =
-                        inspect_combined_pressure_effect(next_private_slots, next_private_options,
-                                                           next_shared_slots, next_shared_options);
+                    const std::optional<ResourceDelta> combined = inspect_combined_pressure_effect(
+                        *plans[candidate_index], next_private_slots, next_private_options,
+                        next_shared_slots, next_shared_options);
                     if (!combined) { return; }
                     ResourceDemand next_demand = candidates[candidate_index].demand;
                     if (!detail::augment_demand(next_demand, *combined)) { return; }
@@ -1181,7 +1181,8 @@ public:
                     const CatalogEntry& entry = catalog_[resident];
                     if (allow_preserving) {
                         std::vector<typename Package::PressureOption> preserving =
-                            program.inspect_pressure_options(*entry.handle, deficit);
+                            program.inspect_pressure_options(*plans[candidate_index], *entry.handle,
+                                                             deficit);
                         for (typename Package::PressureOption& option : preserving) {
                             if (option.evicts_continuation) {
                                 throw std::logic_error(
@@ -1213,7 +1214,8 @@ public:
                     }
                     if (allow_preserving) {
                         std::vector<typename Package::PressureOption> preserving =
-                            program.inspect_shared_pressure_options(*entry.handle, deficit);
+                            program.inspect_shared_pressure_options(*plans[candidate_index],
+                                                                    *entry.handle, deficit);
                         for (typename Package::PressureOption& option : preserving) {
                             if (option.evicts_continuation) {
                                 throw std::logic_error(
@@ -1995,20 +1997,25 @@ public:
                     add_cost(cost, pressure_cost(eviction, nullptr, shared_victim));
                 }
 
-                bool positive         = false;
+                const bool retain =
+                    candidate.publishes_shared || active.retention != RetentionClass::Disposable;
+                if (!retain) { continue; }
+
                 std::uint64_t margin  = 0;
                 const bool calibrated = saving.calibrated && cost.calibrated;
-                if (calibrated) {
-                    positive = saving.nanoseconds > cost.nanoseconds;
-                    margin   = positive ? saving.nanoseconds - cost.nanoseconds : 0;
-                } else {
-                    const bool non_disposable = candidate.publishes_shared ||
-                                                active.retention != RetentionClass::Disposable;
-                    positive = non_disposable && shared_victim == nullptr &&
-                               candidate.replacement_impacts.empty() &&
-                               candidate.demand.final_removed == ResourceVector{};
+                if (calibrated && saving.nanoseconds > cost.nanoseconds) {
+                    margin = saving.nanoseconds - cost.nanoseconds;
                 }
-                if (!positive) { continue; }
+
+                // Rolling private captures are the current request's retention observation and
+                // must be allowed to advance.  A full shared catalog likewise must be able to
+                // replace a prefix that has never produced a hit; otherwise its first entry owns a
+                // one-slot catalog forever.  Once a shared prefix has demonstrated reuse, preserve
+                // it unless the calibrated value model prefers the new prefix.
+                if (shared_victim != nullptr &&
+                    shared_victim->observation.selected_hit_count != 0 && margin == 0) {
+                    continue;
+                }
 
                 CaptureSelection choice{
                     .assessment          = std::move(candidate),
@@ -2095,9 +2102,20 @@ private:
         }
         ActiveCaptureRecord& record = *record_ptr;
         if (result.status == ContextTransactionStatus::Aborted) {
-            if (result.resource_delta != ResourceDelta{} ||
+            const bool preparation_committed = result.capacity_preparation_committed;
+            const ResourceDelta expected_delta{
+                .removed = result.capacity_preparation_removed,
+            };
+            if ((preparation_committed && record.replacement_id == 0) ||
+                (preparation_committed && result.capacity_preparation_removed !=
+                                              record.assessment.capacity_preparation_removed) ||
+                (!preparation_committed &&
+                 result.capacity_preparation_removed != ResourceVector{}) ||
+                result.resource_delta != expected_delta ||
                 result.active_entitlement_delta != ResourceDelta{} || result.shared ||
-                !ledger_.cancel_active_capture(record.lane)) {
+                (preparation_committed ? !ledger_.complete_active_capture(
+                                             record.lane, result.resource_delta, ResourceDelta{})
+                                       : !ledger_.cancel_active_capture(record.lane))) {
                 throw std::logic_error("aborted active capture violated its reservation");
             }
             if (record.publication_slot != kInvalidCatalogSlot) {
@@ -2109,7 +2127,11 @@ private:
                         throw std::logic_error(
                             "aborted shared replacement changed before adoption");
                     }
-                    publication.state = SharedCatalogState::Catalogued;
+                    if (preparation_committed) {
+                        clear_shared_catalog_entry(publication);
+                    } else {
+                        publication.state = SharedCatalogState::Catalogued;
+                    }
                 } else {
                     clear_shared_catalog_entry(publication);
                 }
@@ -2124,6 +2146,8 @@ private:
             result.resource_delta.removed != record.assessment.demand.final_removed ||
             result.resource_delta.added != record.assessment.demand.final_added ||
             result.active_entitlement_delta != record.assessment.active_entitlement_delta ||
+            result.capacity_preparation_removed != record.assessment.capacity_preparation_removed ||
+            result.capacity_preparation_committed != (record.replacement_id != 0) ||
             result.shared.has_value() != record.assessment.publishes_shared) {
             throw std::logic_error("active capture publication violated its selected plan");
         }
@@ -4132,12 +4156,17 @@ private:
                                             const CaptureAssessment& assessment) const noexcept {
         const std::uint64_t removed =
             assessment.active_entitlement_delta.removed.device.state_slots;
-        if (removed > current_protected_state_slots) { return false; }
-        std::uint64_t projected   = current_protected_state_slots - removed;
+        const std::uint64_t preparation_removed =
+            assessment.capacity_preparation_removed.device.state_slots;
+        if (removed > current_protected_state_slots ||
+            preparation_removed > current_protected_state_slots - removed) {
+            return false;
+        }
+        std::uint64_t projected   = current_protected_state_slots - removed - preparation_removed;
         const std::uint64_t added = assessment.active_entitlement_delta.added.device.state_slots;
         if (added > std::numeric_limits<std::uint64_t>::max() - projected) { return false; }
         projected += added;
-        if (assessment.publishes_shared) {
+        if (assessment.publishes_shared && assessment.demand.final_added.device.state_slots != 0) {
             if (projected == std::numeric_limits<std::uint64_t>::max()) { return false; }
             ++projected;
         }

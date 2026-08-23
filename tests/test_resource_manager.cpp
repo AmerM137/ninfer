@@ -307,6 +307,7 @@ struct FakeSharedPrefixSummary {
 struct FakeCaptureAssessment {
     ResourceDemand demand;
     ResourceDelta active_entitlement_delta;
+    ResourceVector capacity_preparation_removed;
     FakeShortlistKey shortlist_key;
     ninfer::runtime::PrefillWork protected_rebuild_work;
     std::vector<ninfer::runtime::ContextTransferRequirement> transfer_requirements;
@@ -328,6 +329,8 @@ struct FakeActiveCaptureResult {
         ninfer::runtime::ContextTransactionStatus::Aborted;
     ResourceDelta resource_delta;
     ResourceDelta active_entitlement_delta;
+    ResourceVector capacity_preparation_removed;
+    bool capacity_preparation_committed = false;
     FakeContinuationSummary active_summary;
     std::optional<FakeSharedPrefixPublication> shared;
     std::vector<ninfer::runtime::ContextTransferObservation> transfer_observations;
@@ -554,6 +557,17 @@ public:
         }};
     }
 
+    [[nodiscard]] std::vector<FakePressureOption>
+    inspect_pressure_options(const FakeAdmissionPlan& admission,
+                             const FakeContinuationHandle& continuation,
+                             ResourceVector deficit) const {
+        if (admission.source && pressure_alias_source_key == admission.key &&
+            pressure_alias_owner_key == continuation.key) {
+            return {};
+        }
+        return inspect_pressure_options(continuation, deficit);
+    }
+
     [[nodiscard]] FakePressureOption
     inspect_eviction_option(const FakeContinuationHandle& continuation) const {
         if (!continuation.valid) { throw std::logic_error("fake eviction source is stale"); }
@@ -570,6 +584,12 @@ public:
         return {};
     }
 
+    [[nodiscard]] std::vector<FakePressureOption>
+    inspect_shared_pressure_options(const FakeAdmissionPlan&, const FakeSharedPrefixHandle& shared,
+                                    ResourceVector deficit) const {
+        return inspect_shared_pressure_options(shared, deficit);
+    }
+
     [[nodiscard]] FakePressureOption
     inspect_shared_eviction_option(const FakeSharedPrefixHandle&) const {
         return FakePressureOption{
@@ -580,6 +600,7 @@ public:
     }
 
     [[nodiscard]] std::optional<ResourceDelta> inspect_combined_pressure_effect(
+        const FakeAdmissionPlan& admission,
         std::span<const FakeContinuationHandle* const> pressure_owners,
         std::span<const FakePressureOption> pressure_options,
         std::span<const FakeSharedPrefixHandle* const> shared_pressure_owners,
@@ -593,6 +614,11 @@ public:
         for (std::size_t index = 0; index < pressure_options.size(); ++index) {
             if (pressure_owners[index] == nullptr || !pressure_owners[index]->valid ||
                 pressure_options[index].id != pressure_owners[index]->key) {
+                return std::nullopt;
+            }
+            if (!pressure_options[index].evicts_continuation && admission.source &&
+                pressure_alias_source_key == admission.key &&
+                pressure_alias_owner_key == pressure_owners[index]->key) {
                 return std::nullopt;
             }
             ResourceDelta next;
@@ -1026,6 +1052,8 @@ public:
     mutable std::vector<std::pair<std::uint64_t, bool>> last_composed_pressure;
     std::optional<std::uint32_t> demotable_device_state_key;
     std::optional<std::uint32_t> host_only_finish_key;
+    std::optional<std::uint32_t> pressure_alias_source_key;
+    std::optional<std::uint32_t> pressure_alias_owner_key;
     bool emit_state_d2h_observation        = false;
     std::atomic<bool>* cancel_after_victim = nullptr;
 
@@ -1401,6 +1429,35 @@ void test_disposable_eviction_beats_cold_start_demotion() {
            "cold-start cost preferred transferring a Disposable checkpoint over evicting it");
 }
 
+void test_source_alias_filters_only_the_unsafe_pressure_action() {
+    FakeProgram program;
+    program.demotable_device_state_key = 2;
+    program.pressure_alias_source_key  = 1;
+    program.pressure_alias_owner_key   = 2;
+    FakeManager manager(resources({1, 2, 10, 6}), 1, 3, 0, true);
+
+    FakeRequestBasePlan source = make_base();
+    source.cache.session_key   = FakeCacheSessionKey{1};
+    auto source_inspection     = manager.inspect(program, FakePreparedPrompt{1}, source);
+    auto source_active         = materialize_and_adopt(
+        manager, program, std::move(*source_inspection.choice), FakePreparedPrompt{1});
+    (void)manager.finish(program, LaneId{0}, source_active.sequence);
+
+    auto victim_inspection = manager.inspect(program, FakePreparedPrompt{2}, make_base());
+    auto victim_active     = materialize_and_adopt(
+        manager, program, std::move(*victim_inspection.choice), FakePreparedPrompt{2});
+    (void)manager.finish(program, LaneId{0}, victim_active.sequence);
+
+    FakeRequestBasePlan branch        = source;
+    branch.cache.update_session_index = false;
+    auto inspection                   = manager.inspect(program, FakePreparedPrompt{1}, branch);
+    expect(inspection.readiness == ninfer::runtime::Readiness::Ready && inspection.choice &&
+               inspection.choice->summary().reusable_prompt_tokens == 16,
+           "source alias discarded a feasible cache-hit candidate");
+    expect(program.last_composed_pressure == std::vector<std::pair<std::uint64_t, bool>>{{2, true}},
+           "source alias did not replace only the unsafe preserving action with exact eviction");
+}
+
 void test_value_positive_replica_replaces_lower_value_host_duplicate() {
     FakeProgram program;
     program.emit_state_d2h_observation = true;
@@ -1496,6 +1553,7 @@ int main() {
     test_retained_private_source_reference();
     test_complete_eviction_closure_competes_with_mixed_closure();
     test_disposable_eviction_beats_cold_start_demotion();
+    test_source_alias_filters_only_the_unsafe_pressure_action();
     test_value_positive_replica_replaces_lower_value_host_duplicate();
     test_ready_replica_transition_skips_dominated_replacements();
     if (failures == 0) { std::cout << "ok\n"; }

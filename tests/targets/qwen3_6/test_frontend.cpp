@@ -865,6 +865,49 @@ int test_text_and_image_prepare(const Frontend& frontend) {
     return failures;
 }
 
+int test_explicit_leading_instruction_cache_boundary() {
+    FrontendResources official = resources();
+    official.tokenizer_json =
+        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/tokenizer.json");
+    official.tokenizer_config_json =
+        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/tokenizer_config.json");
+    official.generation_config_json =
+        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/generation_config.json");
+    const Frontend frontend           = FrontendFactory::create_component(official, false);
+    constexpr std::string_view stable = "stable cache section.";
+    ninfer::ChatMessage system;
+    system.role = ninfer::ChatRole::System;
+    system.parts.push_back(ninfer::MessagePart{
+        .kind = ninfer::MessagePartKind::Text, .text = std::string(stable), .media = {}});
+    system.parts.push_back(ninfer::MessagePart{
+        .kind = ninfer::MessagePartKind::Text, .text = "\ndynamic working directory", .media = {}});
+    ninfer::ChatMessage user;
+    user.role = ninfer::ChatRole::User;
+    user.parts.push_back(ninfer::MessagePart{
+        .kind = ninfer::MessagePartKind::Text, .text = "question", .media = {}});
+
+    ninfer::PromptInput input;
+    input.messages.push_back(std::move(system));
+    input.messages.push_back(std::move(user));
+    input.options.tool_jsons.push_back(
+        R"({"type":"function","function":{"name":"inspect","parameters":{"type":"object"}}})");
+    input.context_cache.markers.push_back(ninfer::PromptCacheMarker{
+        .kind                      = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+        .location                  = ninfer::PromptCacheMarkerLocation::LeadingInstructionBoundary,
+        .leading_instruction_bytes = static_cast<std::uint32_t>(stable.size()),
+    });
+
+    const auto prepared = frontend.prepare(std::move(input));
+    const auto& data    = FrontendFactory::inspect(prepared);
+    return check(data.context_cache.opportunities.size() == 1 &&
+                     data.context_cache.opportunities[0].kind ==
+                         ninfer::PromptCacheMarkerKind::SharedStablePrefix &&
+                     data.context_cache.opportunities[0].frontier != 0 &&
+                     data.context_cache.opportunities[0].frontier < data.token_ids.size(),
+                 "explicit leading-system cache boundary was lost or shadowed by the automatic "
+                 "full-system marker");
+}
+
 int test_media_admission_uses_aggregate_resources(const Frontend& frontend) {
     constexpr std::size_t kMediaItems     = 17;
     const std::vector<std::uint8_t> bytes = gradient_ppm();
@@ -1333,6 +1376,7 @@ int main() {
     failures += test_adjacent_tool_message_boundary();
     failures += test_official_resource_guards();
     failures += test_text_and_image_prepare(frontend);
+    failures += test_explicit_leading_instruction_cache_boundary();
     failures += test_media_admission_uses_aggregate_resources(frontend);
     failures += test_multimodal_prompt_over_removed_32k_cap(frontend);
     failures += test_attention_pairs_are_diagnostic(frontend);

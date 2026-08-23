@@ -442,19 +442,26 @@ struct PrefillProgress {
     std::optional<CaptureOffer<Variant>> capture;
 };
 
+enum class CaptureStatePlacement : std::uint8_t {
+    DeviceFork,
+    HostSnapshot,
+};
+
 struct CaptureAssessment {
     runtime::ResourceDemand demand;
     runtime::ResourceDelta active_entitlement_delta;
+    runtime::ResourceVector capacity_preparation_removed;
     PrefixShortlistKey shortlist_key;
     runtime::PrefillWork protected_rebuild_work;
     std::vector<runtime::ContextTransferRequirement> transfer_requirements;
     std::vector<PressureCheckpointImpact> replacement_impacts;
     std::vector<runtime::CheckpointRef> private_replacement_candidates;
-    std::uint32_t frontier      = 0;
-    bool publishes_private      = false;
-    bool publishes_shared       = false;
-    bool needs_transfer         = false;
-    bool recycles_private_state = false;
+    std::uint32_t frontier                = 0;
+    bool publishes_private                = false;
+    bool publishes_shared                 = false;
+    bool needs_transfer                   = false;
+    bool recycles_private_state           = false;
+    CaptureStatePlacement state_placement = CaptureStatePlacement::DeviceFork;
 };
 
 template <class Variant>
@@ -468,6 +475,8 @@ struct ActiveCaptureResult {
     runtime::ContextTransactionStatus status = runtime::ContextTransactionStatus::Aborted;
     runtime::ResourceDelta resource_delta;
     runtime::ResourceDelta active_entitlement_delta;
+    runtime::ResourceVector capacity_preparation_removed;
+    bool capacity_preparation_committed = false;
     ContinuationSummary active_summary;
     std::optional<SharedPrefixPublication<Variant>> shared;
     std::vector<runtime::ContextTransferObservation> transfer_observations;
@@ -607,14 +616,23 @@ public:
     [[nodiscard]] std::vector<PressureOption>
     inspect_pressure_options(const ContinuationHandle<Variant>& continuation,
                              runtime::ResourceVector deficit) const;
+    [[nodiscard]] std::vector<PressureOption>
+    inspect_pressure_options(const AdmissionPlan<Variant>& admission,
+                             const ContinuationHandle<Variant>& continuation,
+                             runtime::ResourceVector deficit) const;
     [[nodiscard]] PressureOption
     inspect_eviction_option(const ContinuationHandle<Variant>& continuation) const;
     [[nodiscard]] std::vector<PressureOption>
     inspect_shared_pressure_options(const SharedPrefixHandle<Variant>& shared,
                                     runtime::ResourceVector deficit) const;
+    [[nodiscard]] std::vector<PressureOption>
+    inspect_shared_pressure_options(const AdmissionPlan<Variant>& admission,
+                                    const SharedPrefixHandle<Variant>& shared,
+                                    runtime::ResourceVector deficit) const;
     [[nodiscard]] PressureOption
     inspect_shared_eviction_option(const SharedPrefixHandle<Variant>& shared) const;
     [[nodiscard]] std::optional<runtime::ResourceDelta> inspect_combined_pressure_effect(
+        const AdmissionPlan<Variant>& admission,
         std::span<const ContinuationHandle<Variant>* const> pressure_owners,
         std::span<const PressureOption> pressure_options,
         std::span<const SharedPrefixHandle<Variant>* const> shared_pressure_owners,

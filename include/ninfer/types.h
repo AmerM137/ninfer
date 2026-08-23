@@ -295,9 +295,19 @@ enum class PromptCacheMarkerKind : std::uint8_t {
     PrivateLongAnchor,
 };
 
+enum class PromptCacheMarkerLocation : std::uint8_t {
+    MessageBoundary,
+    LeadingInstructionBoundary,
+    ToolBoundary,
+};
+
 struct PromptCacheMarker {
-    std::uint32_t after_message_count = 0;
-    PromptCacheMarkerKind kind        = PromptCacheMarkerKind::SharedStablePrefix;
+    std::uint32_t after_message_count  = 0;
+    PromptCacheMarkerKind kind         = PromptCacheMarkerKind::SharedStablePrefix;
+    PromptCacheMarkerLocation location = PromptCacheMarkerLocation::MessageBoundary;
+    // Byte count within the untrimmed leading System/Developer message.
+    std::uint32_t leading_instruction_bytes = 0;
+    std::uint32_t after_tool_count          = 0;
 
     [[nodiscard]] friend constexpr bool operator==(PromptCacheMarker,
                                                    PromptCacheMarker) noexcept = default;

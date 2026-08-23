@@ -136,11 +136,13 @@ struct AdmissionPlanImpl<NINFER_QWEN36_VARIANT> {
     std::vector<runtime::ContextTransferRequirement> transfer_requirements;
     runtime::ClaimDisposition source_disposition = runtime::ClaimDisposition::ConsumedToActive;
     runtime::ResourceVector active_optional_resources;
-    bool state_fork_required          = false;
-    bool text_prefix_fork_required    = false;
-    bool backend_prefix_fork_required = false;
-    bool needs_transfer               = false;
-    bool temporal_eligible            = true;
+    bool state_fork_required           = false;
+    bool text_prefix_fork_required     = false;
+    bool backend_prefix_fork_required  = false;
+    bool text_retained_tail_release    = false;
+    bool backend_retained_tail_release = false;
+    bool needs_transfer                = false;
+    bool temporal_eligible             = true;
     std::vector<qwen3_6::PressureOption> pressure_options;
     std::vector<std::uint32_t> pressure_indices;
     std::vector<std::uint64_t> pressure_generations;
@@ -334,15 +336,22 @@ public:
     [[nodiscard]] std::vector<qwen3_6::PressureOption>
     inspect_pressure_options(const ContinuationHandle& continuation,
                              runtime::ResourceVector deficit) const;
+    [[nodiscard]] std::vector<qwen3_6::PressureOption>
+    inspect_pressure_options(const AdmissionPlan& admission, const ContinuationHandle& continuation,
+                             runtime::ResourceVector deficit) const;
     [[nodiscard]] qwen3_6::PressureOption
     inspect_eviction_option(const ContinuationHandle& continuation) const;
     [[nodiscard]] std::vector<qwen3_6::PressureOption>
     inspect_shared_pressure_options(const SharedPrefixHandle& shared,
                                     runtime::ResourceVector deficit) const;
+    [[nodiscard]] std::vector<qwen3_6::PressureOption>
+    inspect_shared_pressure_options(const AdmissionPlan& admission,
+                                    const SharedPrefixHandle& shared,
+                                    runtime::ResourceVector deficit) const;
     [[nodiscard]] qwen3_6::PressureOption
     inspect_shared_eviction_option(const SharedPrefixHandle& shared) const;
     [[nodiscard]] std::optional<runtime::ResourceDelta> inspect_combined_pressure_effect(
-        std::span<const ContinuationHandle* const> pressure_owners,
+        const AdmissionPlan& admission, std::span<const ContinuationHandle* const> pressure_owners,
         std::span<const qwen3_6::PressureOption> pressure_options,
         std::span<const SharedPrefixHandle* const> shared_pressure_owners,
         std::span<const qwen3_6::PressureOption> shared_pressure_options) const;
@@ -487,6 +496,14 @@ public:
     std::size_t workspace_logical_peak_bytes = 0;
 
 private:
+    struct MaterializationSourceProtection {
+        std::optional<StateImageHandle> state;
+        std::optional<KVAddressSpaceHandle> text;
+        std::uint32_t text_pages = 0;
+        std::optional<KVAddressSpaceHandle> backend;
+        std::uint32_t backend_pages = 0;
+    };
+
     struct PendingTransaction {
         std::uint64_t id = 0;
         std::array<std::uint32_t, kMaximumConcurrency> lanes{};
@@ -566,6 +583,10 @@ private:
         std::optional<DeviceKVPageReservation> backend_source_restore_reservation;
         std::optional<KVPrefixForkReservation> text_prefix_fork;
         std::optional<KVPrefixForkReservation> backend_prefix_fork;
+        std::optional<LogicalKVPageHandle> text_retained_tail;
+        std::optional<LogicalKVPageHandle> backend_retained_tail;
+        std::optional<HostKVExtentReservation> text_retained_tail_backup;
+        std::optional<HostKVExtentReservation> backend_retained_tail_backup;
         std::optional<std::uint32_t> text_activation_frontier;
         std::optional<std::uint32_t> backend_activation_frontier;
         std::optional<StateImageTransfer> state_restore;
@@ -583,6 +604,7 @@ private:
         bool transfer_submitted                    = false;
         std::uint8_t transfer_timer_mask           = 0;
         bool prefix_tail_submitted                 = false;
+        bool retained_tail_backup_submitted        = false;
         bool prefix_forks_ready                    = false;
         bool source_prepared                       = false;
         bool cancel_pending                        = false;
@@ -610,16 +632,21 @@ private:
         std::uint64_t replacement_generation = 0;
         StateImageHandle source_state;
         StateImageHandle destination_state;
+        qwen3_6::CaptureStatePlacement state_placement = qwen3_6::CaptureStatePlacement::DeviceFork;
+        std::optional<StateImageTransfer> state_snapshot;
         std::optional<KVAddressSpaceHandle> active_text_destination;
         std::optional<KVAddressSpaceHandle> active_backend_destination;
         std::optional<KVActiveSnapshotReservation> text_snapshot;
         std::optional<KVActiveSnapshotReservation> backend_snapshot;
         runtime::ResourceDelta resource_delta;
         runtime::ResourceDelta active_entitlement_delta;
+        runtime::ResourceVector capacity_preparation_removed;
         ContinuationSummary active_summary;
         std::vector<runtime::ContextTransferObservation> transfer_observations;
         runtime::ContextOperationCounts operations;
         bool recycles_private_state        = false;
+        bool replacement_removed           = false;
+        bool prepared                      = false;
         std::uint64_t recycled_state_epoch = 0;
         bool transfer_enqueue_pending      = false;
         bool transfer_submitted            = false;
@@ -756,13 +783,21 @@ private:
                                        qwen3_6::ContinuationSummary& summary) const;
     [[nodiscard]] qwen3_6::SharedPrefixSummary
     shared_prefix_summary(const SharedPrefixState& shared) const;
+    [[nodiscard]] std::optional<MaterializationSourceProtection>
+    materialization_source_protection(const AdmissionPlanImpl& admission) const;
+    [[nodiscard]] bool
+    protected_materialization_page(const MaterializationSourceProtection* protection,
+                                   const KVAddressSpaceStore& addresses, std::uint32_t page_offset,
+                                   LogicalKVPageHandle page, bool backend) const;
     [[nodiscard]] std::optional<qwen3_6::PressureOption>
-    inspect_pressure_option(const SequenceState& sequence, runtime::ResourceVector deficit) const;
+    inspect_pressure_option(const SequenceState& sequence, runtime::ResourceVector deficit,
+                            const MaterializationSourceProtection* protection = nullptr) const;
     [[nodiscard]] std::vector<qwen3_6::PressureOption>
-    inspect_pressure_options(const SequenceState& sequence, runtime::ResourceVector deficit) const;
-    [[nodiscard]] std::optional<qwen3_6::PressureOption>
-    inspect_shared_pressure_option(const SharedPrefixState& shared,
-                                   runtime::ResourceVector deficit) const;
+    inspect_pressure_options(const SequenceState& sequence, runtime::ResourceVector deficit,
+                             const MaterializationSourceProtection* protection = nullptr) const;
+    [[nodiscard]] std::optional<qwen3_6::PressureOption> inspect_shared_pressure_option(
+        const SharedPrefixState& shared, runtime::ResourceVector deficit,
+        const MaterializationSourceProtection* protection = nullptr) const;
     [[nodiscard]] qwen3_6::PressureOption
     inspect_eviction_option(const SequenceState& sequence) const;
     [[nodiscard]] std::optional<qwen3_6::PressureOption>
@@ -796,7 +831,8 @@ private:
     [[nodiscard]] bool state_exclusive_to_sequence(const SequenceState& sequence,
                                                    StateImageHandle state) const noexcept;
     [[nodiscard]] std::optional<runtime::ResourceDelta>
-    combined_pressure_effect(std::span<const ContinuationHandle* const> pressure_owners,
+    combined_pressure_effect(const MaterializationSourceProtection* protection,
+                             std::span<const ContinuationHandle* const> pressure_owners,
                              std::span<const qwen3_6::PressureOption> pressure_options,
                              std::span<const SharedPrefixHandle* const> shared_pressure_owners,
                              std::span<const qwen3_6::PressureOption> shared_pressure_options,
@@ -812,6 +848,7 @@ private:
     install_private_capture(SequenceState& sequence, const CaptureGroup& group,
                             StateImageHandle checkpoint,
                             std::optional<runtime::CheckpointRef> replacement);
+    void prepare_active_capture(ActiveCaptureTransaction& transaction);
     void enqueue_active_capture_transfers(ActiveCaptureTransaction& transaction);
     void abort_active_capture(ActiveCaptureTransaction& transaction) noexcept;
     [[nodiscard]] ActiveCaptureResult publish_active_capture(ActiveCaptureTransaction& transaction);

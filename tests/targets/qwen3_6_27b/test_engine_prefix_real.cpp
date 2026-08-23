@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <string>
 #include <utility>
 #include <vector>
@@ -43,6 +44,27 @@ ninfer::EngineOptions host_restore_engine_options(const char* artifact) {
     options.context_cache.max_shared_prefixes               = 0;
     options.context_cache.max_long_anchors_per_continuation = 0;
     options.context_cache.max_cache_markers_per_request     = 0;
+    return options;
+}
+
+ninfer::EngineOptions shared_replacement_engine_options(const char* artifact) {
+    ninfer::EngineOptions options;
+    options.artifact_path                        = artifact;
+    options.max_context                          = 512;
+    options.kv_capacity                          = ninfer::KvCapacityPolicy::explicit_capacity(512);
+    options.prefill_chunk                        = 256;
+    options.speculative.backend                  = ninfer::SpeculativeBackend::Mtp;
+    options.speculative.draft_tokens             = 3;
+    options.speculative.proposal_head            = ninfer::ProposalHead::Optimized;
+    options.max_concurrency                      = 1;
+    options.max_pending_requests                 = 1;
+    options.context_cache.device_state_slots     = 1;
+    options.context_cache.host_state_slots       = 4;
+    options.context_cache.host_kv_capacity_bytes = 256ULL << 20;
+    options.context_cache.max_private_continuations         = 2;
+    options.context_cache.max_shared_prefixes               = 1;
+    options.context_cache.max_long_anchors_per_continuation = 0;
+    options.context_cache.max_cache_markers_per_request     = 1;
     return options;
 }
 
@@ -325,6 +347,89 @@ int exercise_host_restore(const char* artifact) {
                   << " transfers=" << after_restore.state_d2h_count << '/'
                   << after_restore.state_h2d_count << '/' << after_restore.main_kv_d2h_pages << '/'
                   << after_restore.main_kv_h2d_pages << '\n';
+        return 1;
+    }
+    return 0;
+}
+
+int exercise_shared_replacement_and_full_capacity_reuse(const char* artifact) {
+    ninfer::EngineOptions engine_options = shared_replacement_engine_options(artifact);
+    engine_options.context_cache.max_private_continuations = 1;
+    ninfer::Engine engine(std::move(engine_options));
+    ninfer::RequestOptions capture_request;
+    capture_request.execution.requested_output_tokens = 1;
+    capture_request.execution.sampling.temperature    = 0.0F;
+    capture_request.execution.allow_prefix_reuse      = true;
+    capture_request.stop.include_model_defaults       = false;
+
+    const auto tool_prompt = [](std::string tool_json, std::string question) {
+        ninfer::PromptInput input;
+        ninfer::ChatMessage user;
+        user.role = ninfer::ChatRole::User;
+        user.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text, .text = std::move(question), .media = {}});
+        input.messages.push_back(std::move(user));
+        input.options.enable_thinking = false;
+        input.options.tool_jsons.push_back(std::move(tool_json));
+        input.context_cache.retention = ninfer::CacheRetentionHint::Disposable;
+        return input;
+    };
+
+    const std::string alpha_tool =
+        R"({"type":"function","function":{"name":"alpha","description":"stable lookup schema","parameters":{"type":"object","properties":{"key":{"type":"string"}},"required":["key"]}}})";
+    const std::string bravo_tool =
+        R"({"type":"function","function":{"name":"bravo","description":"stable lookup schema","parameters":{"type":"object","properties":{"key":{"type":"string"}},"required":["key"]}}})";
+
+    const ninfer::GenerationResult first = engine.generate(
+        engine.prepare(tool_prompt(alpha_tool, "Use alpha once.")), capture_request);
+    const ninfer::GenerationResult replacement = engine.generate(
+        engine.prepare(tool_prompt(bravo_tool, "Use bravo once.")), capture_request);
+    const ninfer::RuntimeStats after_replacement = engine.runtime_stats();
+    if (replacement.generated_token_ids.size() != 1) {
+        std::cerr << "shared replacement fixture did not produce its deterministic stop token\n";
+        return 1;
+    }
+    // Remove the exact private endpoint without publishing another shared marker. The following
+    // identical Bravo prompt must therefore materialize from the retained shared prefix.
+    ninfer::PromptInput filler;
+    ninfer::ChatMessage filler_user;
+    filler_user.role = ninfer::ChatRole::User;
+    filler_user.parts.push_back(ninfer::MessagePart{
+        .kind = ninfer::MessagePartKind::Text, .text = "Unrelated private endpoint.", .media = {}});
+    filler.messages.push_back(std::move(filler_user));
+    filler.options.enable_thinking = false;
+    filler.context_cache.retention = ninfer::CacheRetentionHint::Disposable;
+    const ninfer::GenerationResult filled =
+        engine.generate(engine.prepare(std::move(filler)), capture_request);
+    if (filled.generated_token_ids.size() != 1) {
+        std::cerr << "shared replacement fixture did not displace the exact private endpoint\n";
+        return 1;
+    }
+    ninfer::RequestOptions full_capacity_request = capture_request;
+    full_capacity_request.execution.requested_output_tokens =
+        std::numeric_limits<std::uint32_t>::max();
+    full_capacity_request.stop.token_ids          = {replacement.generated_token_ids.front()};
+    full_capacity_request.stop.publish_stop_token = true;
+    const ninfer::GenerationResult reused         = engine.generate(
+        engine.prepare(tool_prompt(bravo_tool, "Use bravo once.")), full_capacity_request);
+    const ninfer::RuntimeStats after_reuse = engine.runtime_stats();
+
+    if (first.generated_token_ids.size() != 1 || reused.generated_token_ids.size() != 1) {
+        std::cerr << "shared replacement fixture did not complete all requests\n";
+        return 1;
+    }
+    if (reused.prefix_reuse_path != ninfer::PrefixReusePath::SharedStablePrefix ||
+        reused.reused_prompt_tokens == 0 || reused.reused_prompt_tokens % 64U == 0) {
+        std::cerr << "single-slot shared replacement was not reusable at a non-aligned frontier: "
+                  << "path=" << static_cast<int>(reused.prefix_reuse_path)
+                  << " reused=" << reused.reused_prompt_tokens << '\n';
+        return 1;
+    }
+    if (after_replacement.active_captures_completed < 2 ||
+        after_reuse.active_captures_completed < after_replacement.active_captures_completed) {
+        std::cerr << "shared replacement capture was skipped under full State/KV capacity: "
+                  << after_replacement.active_captures_completed << '/'
+                  << after_reuse.active_captures_completed << '\n';
         return 1;
     }
     return 0;
@@ -701,6 +806,16 @@ int exercise_artifact(const char* artifact) {
         if (const int result = exercise_vision(engine); result != 0) { return result; }
     }
     if (const int result = exercise_host_restore(artifact); result != 0) { return result; }
+    {
+        // Production C=1/H=1 topology: the shared prefix occupies the only cache Device slot,
+        // while the prompt-frontier ResponseReplay must still rotate without a session identity.
+        ninfer::Engine engine(shared_replacement_engine_options(artifact));
+        if (const int result = exercise_rewrite_checkpoints(engine); result != 0) { return result; }
+    }
+    if (const int result = exercise_shared_replacement_and_full_capacity_reuse(artifact);
+        result != 0) {
+        return result;
+    }
     return 0;
 }
 

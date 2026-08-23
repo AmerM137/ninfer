@@ -452,6 +452,9 @@ RenderedChat expand_placeholders(RenderedChat rendered, const std::vector<Vision
         for (std::optional<std::size_t>& boundary : rendered.message_boundaries) {
             if (boundary) { adjust_boundary(*boundary, "message boundary"); }
         }
+        for (std::optional<std::size_t>& boundary : rendered.cache_boundaries) {
+            if (boundary) { adjust_boundary(*boundary, "cache boundary"); }
+        }
         rendered.text.replace(position, needle.size(), replacement);
         search = position + replacement.size();
     }
@@ -619,6 +622,25 @@ EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat&
         }
         return *frontier;
     };
+    const auto encode_stable_prefix_boundary = [&](std::size_t offset, std::string_view kind) {
+        if (offset > rendered.text.size()) {
+            throw std::logic_error(std::string(kind) + " byte offset exceeds rendered chat");
+        }
+        const std::vector<int> prefix =
+            tokenizer.encode(std::string_view(rendered.text).substr(0, offset));
+        const std::size_t compared = std::min(prefix.size(), encoded.input_ids.size());
+        std::size_t frontier       = 0;
+        while (frontier < compared && prefix[frontier] == encoded.input_ids[frontier]) {
+            ++frontier;
+        }
+        if (frontier > std::numeric_limits<std::uint32_t>::max()) {
+            throw std::overflow_error(std::string(kind) + " token frontier exceeds uint32");
+        }
+        // A tokenizer may merge bytes across an internal Anthropic cache-control boundary. The
+        // common token prefix is the largest checkpoint that depends only on the marked stable
+        // bytes; retaining it loses at most the crossing token and remains exact for later reuse.
+        return static_cast<std::uint32_t>(frontier);
+    };
     if (rendered.rewrite_checkpoint) {
         const std::uint32_t frontier =
             encode_boundary(rendered.rewrite_checkpoint->offset, "rewrite checkpoint");
@@ -643,6 +665,13 @@ EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat&
         if (rendered.message_boundaries[index]) {
             encoded.message_boundaries[index] =
                 try_encode_boundary(*rendered.message_boundaries[index], "message boundary");
+        }
+    }
+    encoded.cache_boundaries.resize(rendered.cache_boundaries.size());
+    for (std::size_t index = 0; index < rendered.cache_boundaries.size(); ++index) {
+        if (rendered.cache_boundaries[index]) {
+            encoded.cache_boundaries[index] =
+                encode_stable_prefix_boundary(*rendered.cache_boundaries[index], "cache boundary");
         }
     }
     return encoded;
@@ -812,6 +841,7 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
     output.rewrite_checkpoint          = encoded.rewrite_checkpoint;
     output.rewrite_execution_frontiers = std::move(encoded.rewrite_execution_frontiers);
     output.message_boundaries          = std::move(encoded.message_boundaries);
+    output.cache_boundaries            = std::move(encoded.cache_boundaries);
     output.token_types.resize(output.input_ids.size(), 0);
     for (std::size_t i = 0; i < output.input_ids.size(); ++i) {
         if (output.input_ids[i] == kImageToken) {

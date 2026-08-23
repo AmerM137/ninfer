@@ -175,10 +175,11 @@ int verify_rejection() {
 int verify_profile_mismatch_rejection() {
     ninfer::DeviceContext device(0);
     ninfer::EngineOptions options;
-    options.max_context    = 128;
-    options.kv_capacity    = ninfer::KvCapacityPolicy::explicit_capacity(128);
-    options.prefill_chunk  = 128;
-    options.use_cuda_graph = false;
+    options.max_context                      = 128;
+    options.kv_capacity                      = ninfer::KvCapacityPolicy::explicit_capacity(128);
+    options.prefill_chunk                    = 128;
+    options.use_cuda_graph                   = false;
+    options.context_cache.device_state_slots = options.max_concurrency;
     auto planner =
         Package::make_sequence_planner(device, options, WeightsProfile::Qwen36GroupwiseInt);
     const std::uint32_t pages = planner.capacity_curve().minimum_main_page_groups;

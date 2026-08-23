@@ -137,7 +137,9 @@ public:
           full_pages_(other.full_pages_), tail_columns_(other.tail_columns_),
           requested_entitlement_(other.requested_entitlement_),
           page_reservation_(std::move(other.page_reservation_)), row_(std::move(other.row_)),
-          tail_destination_(other.tail_destination_) {
+          tail_destination_(other.tail_destination_),
+          staged_tail_release_(other.staged_tail_release_),
+          tail_source_settled_(other.tail_source_settled_) {
         other.tail_destination_.reset();
     }
 
@@ -153,12 +155,13 @@ private:
                             std::uint32_t full_pages, std::uint32_t tail_columns,
                             std::uint32_t requested_entitlement,
                             DeviceKVPageReservation&& page_reservation, KVExecutionRowLease&& row,
-                            std::optional<LogicalKVPageHandle> tail_destination) noexcept
+                            std::optional<LogicalKVPageHandle> tail_destination,
+                            bool staged_tail_release) noexcept
         : owner_(&owner), source_(source), destination_(destination), frontier_(frontier),
           full_pages_(full_pages), tail_columns_(tail_columns),
           requested_entitlement_(requested_entitlement),
           page_reservation_(std::move(page_reservation)), row_(std::move(row)),
-          tail_destination_(tail_destination) {}
+          tail_destination_(tail_destination), staged_tail_release_(staged_tail_release) {}
 
     KVAddressSpaceStore* owner_ = nullptr;
     KVAddressSpaceHandle source_;
@@ -170,6 +173,8 @@ private:
     DeviceKVPageReservation page_reservation_;
     std::optional<KVExecutionRowLease> row_;
     std::optional<LogicalKVPageHandle> tail_destination_;
+    bool staged_tail_release_ = false;
+    bool tail_source_settled_ = false;
 
     friend class KVAddressSpaceStore;
 };
@@ -912,7 +917,7 @@ public:
     [[nodiscard]] KVPrefixForkReservation
     prepare_prefix_fork(KVAddressSpaceHandle source_handle, KVAddressSpaceHandle destination_handle,
                         std::uint32_t frontier, std::uint32_t entitlement,
-                        std::int32_t execution_row) {
+                        std::int32_t execution_row, bool staged_tail_release = false) {
         Address& source      = require(source_handle);
         Address& destination = require(destination_handle);
         if (source.active || source.row || source.reservation.valid()) {
@@ -932,6 +937,9 @@ public:
         const std::uint32_t page_size    = static_cast<std::uint32_t>(kPagedKVPageSize);
         const std::uint32_t full_pages   = frontier / page_size;
         const std::uint32_t tail_columns = frontier % page_size;
+        if (staged_tail_release && tail_columns == 0) {
+            throw std::invalid_argument("staged KV prefix fork has no partial tail");
+        }
         for (std::uint32_t page = 0; page < required_pages; ++page) {
             const LogicalKVPageHandle logical = membership(source, page);
             const std::uint32_t required      = page < full_pages ? page_size : tail_columns;
@@ -943,7 +951,8 @@ public:
         }
 
         DeviceKVPageReservation reservation = pages_->physical_pool().make_empty_reservation();
-        pages_->physical_pool().resize_reservation(reservation, entitlement - full_pages);
+        pages_->physical_pool().resize_reservation(
+            reservation, staged_tail_release ? 1U : entitlement - full_pages);
         KVExecutionRowLease row = tables_->acquire(execution_row);
         std::optional<LogicalKVPageHandle> tail_destination;
         if (tail_columns != 0) {
@@ -954,7 +963,8 @@ public:
         }
         return KVPrefixForkReservation(*this, source_handle, destination_handle, frontier,
                                        full_pages, tail_columns, entitlement,
-                                       std::move(reservation), std::move(row), tail_destination);
+                                       std::move(reservation), std::move(row), tail_destination,
+                                       staged_tail_release);
     }
 
     [[nodiscard]] DeviceKVPageHandle
@@ -976,6 +986,47 @@ public:
         return pages_->physical(*fork.tail_destination_);
     }
 
+    [[nodiscard]] LogicalKVPageHandle
+    prefix_fork_tail_logical_source(const KVPrefixForkReservation& fork) const {
+        require_prefix_fork(fork);
+        if (fork.tail_columns_ == 0) {
+            throw std::logic_error("page-aligned KV prefix fork has no logical tail source");
+        }
+        const Address& source = require(fork.source_);
+        return membership(source, fork.full_pages_);
+    }
+
+    void settle_prefix_fork_tail_source(KVPrefixForkReservation& fork) {
+        require_prefix_fork(fork);
+        if (!fork.staged_tail_release_ || fork.tail_source_settled_ || fork.tail_columns_ == 0) {
+            throw std::logic_error("KV prefix-fork tail is not stage-releasable");
+        }
+        Address& source                   = require(fork.source_);
+        const LogicalKVPageHandle logical = membership(source, fork.full_pages_);
+        if (!pages_->valid(logical) || pages_->source_pins(logical) == 0 ||
+            !pages_->device_resident(logical)) {
+            throw std::logic_error("KV prefix-fork tail source changed before settlement");
+        }
+        pages_->unpin_source(logical);
+        fork.tail_source_settled_ = true;
+    }
+
+    void complete_prefix_fork_after_tail_release(KVPrefixForkReservation& fork) {
+        require_prefix_fork(fork);
+        if (!fork.staged_tail_release_ || !fork.tail_source_settled_ || fork.tail_columns_ == 0) {
+            throw std::logic_error("KV prefix-fork staged release is incomplete");
+        }
+        const Address& source             = require(fork.source_);
+        const LogicalKVPageHandle logical = membership(source, fork.full_pages_);
+        if (!pages_->valid(logical) || pages_->device_resident(logical) ||
+            !pages_->host_resident(logical)) {
+            throw std::logic_error("KV prefix-fork retained tail was not moved to Host");
+        }
+        const std::uint32_t required_pages = pages_for_tokens(fork.frontier_);
+        const std::uint32_t growth         = fork.requested_entitlement_ - required_pages;
+        pages_->physical_pool().resize_reservation(fork.page_reservation_, growth);
+    }
+
     void commit_prefix_fork(KVPrefixForkReservation&& fork, cudaStream_t stream = nullptr) {
         require_prefix_fork(fork);
         Address& source                    = require(fork.source_);
@@ -989,7 +1040,11 @@ public:
         }
         for (std::uint32_t page = 0; page < required_pages; ++page) {
             const LogicalKVPageHandle logical = membership(source, page);
-            if (pages_->source_pins(logical) == 0 || !pages_->device_resident(logical) ||
+            const bool settled_tail = page == fork.full_pages_ && fork.tail_source_settled_;
+            if ((!settled_tail &&
+                 (pages_->source_pins(logical) == 0 || !pages_->device_resident(logical))) ||
+                (settled_tail && (!fork.staged_tail_release_ || pages_->device_resident(logical) ||
+                                  !pages_->host_resident(logical))) ||
                 (page < fork.full_pages_ && !pages_->can_retain_reference(logical, false))) {
                 throw std::logic_error("KV prefix-fork source changed before publication");
             }
@@ -1026,6 +1081,7 @@ public:
         fork.row_.reset();
         destination.active = true;
         for (std::uint32_t page = 0; page < required_pages; ++page) {
+            if (page == fork.full_pages_ && fork.tail_source_settled_) { continue; }
             pages_->unpin_source(membership(source, page));
         }
         fork.owner_ = nullptr;
@@ -1037,6 +1093,7 @@ public:
             Address& source                    = addresses_[fork.source_.index_];
             const std::uint32_t required_pages = pages_for_tokens(fork.frontier_);
             for (std::uint32_t page = 0; page < required_pages; ++page) {
+                if (page == fork.full_pages_ && fork.tail_source_settled_) { continue; }
                 const LogicalKVPageHandle logical = membership(source, page);
                 if (pages_->valid(logical) && pages_->source_pins(logical) != 0) {
                     pages_->unpin_source(logical);

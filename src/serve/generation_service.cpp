@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
+#include <iterator>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -299,7 +300,11 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request,
                 return acquire_media(part, prepared.lifetime->deadline, is_cancelled,
                                      remaining_media_bytes);
             });
-        input.context_cache = std::move(context_cache);
+        std::vector<PromptCacheMarker> protocol_markers = std::move(input.context_cache.markers);
+        input.context_cache                             = std::move(context_cache);
+        input.context_cache.markers.insert(input.context_cache.markers.end(),
+                                           std::make_move_iterator(protocol_markers.begin()),
+                                           std::make_move_iterator(protocol_markers.end()));
         prepared.acquisition_seconds =
             std::chrono::duration<double>(Clock::now() - acquisition_started).count();
         check_preparation_control(prepared.lifetime->deadline, is_cancelled);

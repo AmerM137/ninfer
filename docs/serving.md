@@ -419,6 +419,12 @@ the top-level system instruction. A system section must follow a user/tool-resul
 final or immediately precede an assistant message; it cannot interrupt a tool-use/tool-result pair.
 Consecutive system messages remain separate ordered turns.
 
+Anthropic ephemeral `cache_control` on top-level system text blocks and client tool definitions
+marks a shared stable-prefix boundary. Because the Qwen prompt renders tools before the leading
+system instruction, NInfer retains the last marked tool boundary unless a later marked system
+boundary exists; when several system blocks are marked, it retains the last one. The boundary is a
+retention hint rather than a forced hit: reuse still requires exact rendered-token compatibility.
+
 `thinking.type: "disabled"` disables thinking; other supported values enable it.
 The independent top-level `preserve_thinking` boolean controls closed-turn history and otherwise
 uses the server default.
