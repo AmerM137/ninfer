@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cstddef>
+#include <limits>
 #include <span>
 #include <string>
 #include <string_view>
@@ -12,6 +13,7 @@ namespace ninfer::targets::qwen3_6::frontend_internal {
 
 struct EncodeOptions {
     bool parse_added_tokens = true;
+    std::size_t max_tokens  = std::numeric_limits<std::size_t>::max();
 };
 
 struct DecodeOptions {

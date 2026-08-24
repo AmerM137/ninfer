@@ -8,6 +8,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <span>
 #include <optional>
@@ -22,6 +23,7 @@ class MediaPreprocessCache;
 
 enum class ProcessorErrorKind {
     BudgetExceeded,
+    ContextLengthExceeded,
 };
 
 class ProcessorError final : public std::runtime_error {
@@ -126,15 +128,19 @@ struct EncodedChat {
     std::vector<std::optional<std::uint32_t>> cache_boundaries;
 };
 
-EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat& rendered);
+EncodedChat
+encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat& rendered,
+                     std::size_t maximum_tokens = std::numeric_limits<std::size_t>::max());
 
 class Processor {
 public:
     Processor(const Tokenizer& tokenizer, const CompiledChatTemplate& chat_template,
               ProcessorOptions options, std::shared_ptr<MediaPreprocessCache> media_cache);
 
-    ProcessedInput process(std::vector<ChatMessage> messages, ChatRenderOptions render_options = {},
-                           const PreparationControl& control = {}) const;
+    ProcessedInput
+    process(std::vector<ChatMessage> messages, ChatRenderOptions render_options = {},
+            const PreparationControl& control = {},
+            std::size_t maximum_prompt_tokens = std::numeric_limits<std::size_t>::max()) const;
 
 private:
     const Tokenizer& tokenizer_;

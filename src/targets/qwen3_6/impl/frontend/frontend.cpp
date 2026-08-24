@@ -217,8 +217,15 @@ fi::CompiledChatTemplate compile_chat_template(const FrontendResources& resource
     switch (error.kind()) {
     case fi::ProcessorErrorKind::BudgetExceeded:
         throw RequestError(RequestErrorKind::MediaBudgetExceeded, error.what());
+    case fi::ProcessorErrorKind::ContextLengthExceeded:
+        throw RequestError(RequestErrorKind::ContextLengthExceeded, error.what());
     }
     throw std::logic_error("unknown Qwen3.6 processor error kind");
+}
+
+[[noreturn]] void throw_context_length_exceeded(std::uint32_t max_context) {
+    throw RequestError(RequestErrorKind::ContextLengthExceeded,
+                       "prepared prompt exceeds Engine max_context " + std::to_string(max_context));
 }
 
 void validate_registered_tokenizer(const fi::Tokenizer& tokenizer) {
@@ -775,6 +782,7 @@ public:
                                      .tokenizer_config_json  = resources.tokenizer_config_json,
                                      .generation_config_json = resources.generation_config_json})),
           processor(processor_options(resources)), vision_enabled(options.vision_enabled),
+          max_context(options.max_context),
           max_cache_markers_per_request(options.max_cache_markers_per_request) {
         if (options.max_context == 0) {
             throw std::invalid_argument("frontend max_context must be nonzero");
@@ -832,6 +840,7 @@ public:
     StopPolicy defaults;
     std::shared_ptr<const std::vector<TokenId>> thinking_control_tokens;
     bool vision_enabled                         = true;
+    std::uint32_t max_context                   = 0;
     std::uint32_t max_cache_markers_per_request = 0;
 };
 
@@ -1180,7 +1189,12 @@ Frontend FrontendTestAccess::create_component(const FrontendResources& resources
                                               bool vision_enabled) {
     FrontendOptions options;
     options.vision_enabled = vision_enabled;
-    options.max_context    = static_cast<std::uint32_t>(kMaximumVisionTokens);
+    options.max_context    = std::numeric_limits<std::uint32_t>::max();
+    return create_component(resources, options);
+}
+
+Frontend FrontendTestAccess::create_component(const FrontendResources& resources,
+                                              FrontendOptions options) {
     return Frontend(std::make_shared<const Frontend::Impl>(resources, false, options));
 }
 
@@ -1230,8 +1244,9 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
                                 impl_->media_cache);
         fi::ProcessedInput processed;
         try {
-            processed = processor.process(std::move(messages),
-                                          render_options(options, cache_hints.markers), control);
+            processed =
+                processor.process(std::move(messages), render_options(options, cache_hints.markers),
+                                  control, impl_->max_context);
         } catch (const fi::ProcessorError& error) { throw_processor_error(error); }
         result.token_ids.assign(processed.input_ids.begin(), processed.input_ids.end());
         result.token_types    = std::move(processed.token_types);
@@ -1266,10 +1281,14 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         const fi::RenderedChat rendered =
             impl_->chat_template.render(messages, render_options(options, cache_hints.markers));
         const auto tokenize_started = Clock::now();
-        fi::EncodedChat encoded     = fi::encode_rendered_chat(*impl_->tokenizer, rendered);
+        fi::EncodedChat encoded     = fi::encode_rendered_chat(
+            *impl_->tokenizer, rendered, static_cast<std::size_t>(impl_->max_context) + 1U);
         result.prepare.tokenize_seconds =
             std::chrono::duration<double>(Clock::now() - tokenize_started).count();
         fi::check_preparation_control(control, "tokenization");
+        if (encoded.input_ids.size() > impl_->max_context) {
+            throw_context_length_exceeded(impl_->max_context);
+        }
         result.token_ids                   = std::move(encoded.input_ids);
         result.identity.rewrite_checkpoint = encoded.rewrite_checkpoint;
         result.identity.rewrite_execution_frontiers =
@@ -1344,6 +1363,9 @@ MediaCacheSummary Frontend::media_cache_summary() const {
 PreparedPrompt Frontend::prepare_tokens(std::vector<TokenId> token_ids,
                                         bool allow_prefix_identity) const {
     const auto start = Clock::now();
+    if (token_ids.size() > impl_->max_context) {
+        throw_context_length_exceeded(impl_->max_context);
+    }
     (void)checked_token_count(token_ids.size());
     for (const TokenId token : token_ids) {
         if (!impl_->tokenizer->is_valid_token(token)) {

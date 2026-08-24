@@ -87,7 +87,7 @@ runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefau
     return resolved;
 }
 
-std::string context_capacity_error(std::uint32_t prompt_tokens, std::uint32_t max_context) {
+std::string context_capacity_error(std::size_t prompt_tokens, std::uint32_t max_context) {
     return "prepared prompt has " + std::to_string(prompt_tokens) +
            " tokens, exceeding Engine max_context " + std::to_string(max_context);
 }
@@ -246,9 +246,7 @@ PreparedPrompt Engine::prepare(PromptInput input, const PreparationControl& cont
             auto prepared      = target_ptr->loaded->frontend.prepare(std::move(input), control);
             PromptSummary info = prepared.summary();
             if (info.prompt_tokens > target_ptr->capacity) {
-                throw RequestError(
-                    RequestErrorKind::ContextLengthExceeded,
-                    context_capacity_error(info.prompt_tokens, target_ptr->capacity));
+                throw std::logic_error("target Frontend admitted a prompt beyond Engine capacity");
             }
             const PromptPreparationStats preparation = prepared.preparation_stats();
             return PreparedPrompt(std::make_unique<PreparedPrompt::Impl>(
@@ -263,13 +261,15 @@ PreparedPrompt Engine::prepare_tokens(std::vector<TokenId> token_ids,
     return std::visit(
         [&](const auto& target_ptr) -> PreparedPrompt {
             if (target_ptr == nullptr) { throw std::logic_error("Engine target is not active"); }
+            if (token_ids.size() > target_ptr->capacity) {
+                throw RequestError(RequestErrorKind::ContextLengthExceeded,
+                                   context_capacity_error(token_ids.size(), target_ptr->capacity));
+            }
             auto prepared      = target_ptr->loaded->frontend.prepare_tokens(std::move(token_ids),
                                                                              allow_prefix_identity);
             PromptSummary info = prepared.summary();
             if (info.prompt_tokens > target_ptr->capacity) {
-                throw RequestError(
-                    RequestErrorKind::ContextLengthExceeded,
-                    context_capacity_error(info.prompt_tokens, target_ptr->capacity));
+                throw std::logic_error("target Frontend admitted prompt tokens beyond capacity");
             }
             const PromptPreparationStats preparation = prepared.preparation_stats();
             return PreparedPrompt(std::make_unique<PreparedPrompt::Impl>(

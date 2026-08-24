@@ -287,6 +287,16 @@ bool throws_processor_budget(Callable&& callable) {
     return false;
 }
 
+template <class Callable>
+bool throws_context_length(Callable&& callable) {
+    try {
+        callable();
+    } catch (const ninfer::RequestError& error) {
+        return error.kind() == ninfer::RequestErrorKind::ContextLengthExceeded;
+    }
+    return false;
+}
+
 int test_official_tokenizer_merge() {
     const fi::Tokenizer& tokenizer = official_tokenizer();
 
@@ -331,6 +341,65 @@ int test_repeated_special_tokens_scan_linearly() {
     return check(encoded.size() == 5'000 && std::all_of(encoded.begin(), encoded.end(),
                                                         [](int id) { return id == 248056; }),
                  "repeated special-token scan changed tokenization semantics");
+}
+
+int test_bounded_tokenizer_prefix() {
+    const fi::Tokenizer& tokenizer = official_tokenizer();
+    const std::string text =
+        "<|im_start|>user\nA bounded tokenizer must preserve the exact ordinary and special-token "
+        "prefix.<|im_end|>\n";
+    const std::vector<int> full    = tokenizer.encode(text);
+    constexpr std::size_t limit    = 7;
+    const std::vector<int> bounded = tokenizer.encode(text, fi::EncodeOptions{.max_tokens = limit});
+    const std::vector<int> roomy =
+        tokenizer.encode(text, fi::EncodeOptions{.max_tokens = full.size() + 1U});
+    return check(full.size() > limit && bounded.size() == limit &&
+                     std::equal(bounded.begin(), bounded.end(), full.begin()) && roomy == full,
+                 "bounded tokenizer output is not the exact prefix of unbounded tokenization");
+}
+
+int test_context_capacity_guard() {
+    ninfer::PromptInput input;
+    ninfer::ChatMessage message;
+    message.role = ninfer::ChatRole::User;
+    message.parts.push_back(
+        ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
+    input.messages.push_back(std::move(message));
+
+    const Frontend counting         = FrontendFactory::create_component(resources(), false);
+    const std::uint32_t exact_count = counting.count_tokens(input);
+    ninfer::targets::qwen3_6::FrontendOptions exact_options;
+    exact_options.vision_enabled = false;
+    exact_options.max_context    = exact_count;
+    const Frontend exact         = FrontendFactory::create_component(resources(), exact_options);
+    int failures = check(exact.prepare(input).summary().prompt_tokens == exact_count,
+                         "Frontend rejected a prompt exactly at max_context");
+
+    ninfer::targets::qwen3_6::FrontendOptions short_options = exact_options;
+    short_options.max_context                               = exact_count - 1U;
+    const Frontend short_frontend = FrontendFactory::create_component(resources(), short_options);
+    failures += check(short_frontend.count_tokens(input) == exact_count,
+                      "exact token counting was incorrectly bounded by max_context");
+    failures += check(throws_context_length([&] { (void)short_frontend.prepare(input); }),
+                      "Frontend accepted a text prompt at max_context + 1");
+
+    std::vector<ninfer::TokenId> exact_tokens(exact_count, 0);
+    failures += check(exact.prepare_tokens(exact_tokens).summary().prompt_tokens == exact_count,
+                      "prepare_tokens rejected an exact-capacity token vector");
+    exact_tokens.push_back(0);
+    failures +=
+        check(throws_context_length([&] { (void)exact.prepare_tokens(std::move(exact_tokens)); }),
+              "prepare_tokens accepted a token vector at max_context + 1");
+
+    ninfer::targets::qwen3_6::FrontendOptions media_options = short_options;
+    media_options.vision_enabled                            = true;
+    const Frontend media_frontend = FrontendFactory::create_component(resources(), media_options);
+    failures += check(throws_context_length([&] {
+                          (void)media_frontend.prepare(
+                              image_text_input({0}, std::string(64, 'x'), "must-not-decode.bin"));
+                      }),
+                      "over-capacity media prompt was not rejected before media decoding");
+    return failures;
 }
 
 int test_official_chat_template() {
@@ -1499,6 +1568,8 @@ int main() {
     int failures                  = 0;
     failures += test_official_tokenizer_merge();
     failures += test_repeated_special_tokens_scan_linearly();
+    failures += test_bounded_tokenizer_prefix();
+    failures += test_context_capacity_guard();
     failures += test_official_chat_template();
     failures += test_ordered_instruction_turns();
     failures += test_reasoning_effort_chat_template();

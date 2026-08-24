@@ -407,111 +407,72 @@ bool ascii_ci_matches(std::string_view text, std::size_t offset, std::string_vie
     return true;
 }
 
-std::size_t span_end_offset(std::string_view text, const std::vector<uni::CodepointSpan>& spans,
-                            std::size_t end) {
-    if (end == spans.size()) { return text.size(); }
-    return spans.at(end).offset;
+uni::CodepointSpan qwen_codepoint_at(std::string_view text, std::size_t offset) {
+    return uni::utf8_codepoint_at(text, offset, "Tokenizer::encode input");
 }
 
-std::vector<std::string_view> qwen_split_words(std::string_view text) {
-    const std::vector<uni::CodepointSpan> spans =
-        uni::utf8_codepoints(text, "Tokenizer::encode input");
-    std::vector<std::string_view> words;
-    for (std::size_t i = 0; i < spans.size();) {
-        const std::size_t begin_offset = spans[i].offset;
-        const std::int32_t cp          = spans[i].value;
+std::size_t qwen_word_end(std::string_view text, std::size_t begin) {
+    const uni::CodepointSpan first = qwen_codepoint_at(text, begin);
+    const std::size_t after_first  = begin + first.length;
+    const std::int32_t cp          = first.value;
 
-        if (cp == '\'') {
-            constexpr std::string_view suffixes[] = {"s", "t", "re", "ve", "m", "ll", "d"};
-            for (std::string_view suffix : suffixes) {
-                if (ascii_ci_matches(text, begin_offset + 1, suffix)) {
-                    std::size_t end = i + 1;
-                    while (end < spans.size() &&
-                           spans[end].offset < begin_offset + 1 + suffix.size()) {
-                        ++end;
-                    }
-                    words.emplace_back(text.substr(begin_offset, span_end_offset(text, spans, end) -
-                                                                     begin_offset));
-                    i = end;
-                    goto next_word;
-                }
-            }
+    if (cp == '\'') {
+        constexpr std::string_view suffixes[] = {"s", "t", "re", "ve", "m", "ll", "d"};
+        for (std::string_view suffix : suffixes) {
+            if (ascii_ci_matches(text, after_first, suffix)) { return after_first + suffix.size(); }
         }
-
-        if (is_letter_or_mark(cp) ||
-            (is_non_newline_non_letter_non_number(cp) && i + 1 < spans.size() &&
-             is_letter_or_mark(spans[i + 1].value))) {
-            std::size_t end = i;
-            if (!is_letter_or_mark(spans[end].value)) { ++end; }
-            while (end < spans.size() && is_letter_or_mark(spans[end].value)) { ++end; }
-            words.emplace_back(
-                text.substr(begin_offset, span_end_offset(text, spans, end) - begin_offset));
-            i = end;
-            goto next_word;
-        }
-
-        if (uni::is_number(cp)) {
-            words.emplace_back(text.substr(begin_offset, spans[i].length));
-            ++i;
-            goto next_word;
-        }
-
-        if ((cp == ' ' && i + 1 < spans.size() &&
-             is_non_space_non_letter_mark_number(spans[i + 1].value)) ||
-            is_non_space_non_letter_mark_number(cp)) {
-            std::size_t end = i;
-            if (spans[end].value == ' ') { ++end; }
-            while (end < spans.size() && is_non_space_non_letter_mark_number(spans[end].value)) {
-                ++end;
-            }
-            while (end < spans.size() && is_newline(spans[end].value)) { ++end; }
-            words.emplace_back(
-                text.substr(begin_offset, span_end_offset(text, spans, end) - begin_offset));
-            i = end;
-            goto next_word;
-        }
-
-        if (uni::is_whitespace(cp)) {
-            std::size_t run_end      = i;
-            std::size_t last_newline = std::string_view::npos;
-            while (run_end < spans.size() && uni::is_whitespace(spans[run_end].value)) {
-                if (is_newline(spans[run_end].value)) { last_newline = run_end; }
-                ++run_end;
-            }
-            if (last_newline != std::string_view::npos) {
-                const std::size_t end = last_newline + 1;
-                words.emplace_back(
-                    text.substr(begin_offset, span_end_offset(text, spans, end) - begin_offset));
-                i = end;
-                goto next_word;
-            }
-
-            if (run_end == spans.size()) {
-                words.emplace_back(text.substr(begin_offset));
-                i = run_end;
-                goto next_word;
-            }
-
-            if (run_end - i >= 2) {
-                const std::size_t end = run_end - 1;
-                words.emplace_back(
-                    text.substr(begin_offset, span_end_offset(text, spans, end) - begin_offset));
-                i = end;
-                goto next_word;
-            }
-
-            words.emplace_back(
-                text.substr(begin_offset, span_end_offset(text, spans, run_end) - begin_offset));
-            i = run_end;
-            goto next_word;
-        }
-
-        words.emplace_back(text.substr(begin_offset, spans[i].length));
-        ++i;
-
-    next_word:;
     }
-    return words;
+
+    const bool has_next     = after_first < text.size();
+    const std::int32_t next = has_next ? qwen_codepoint_at(text, after_first).value : 0;
+    if (is_letter_or_mark(cp) ||
+        (is_non_newline_non_letter_non_number(cp) && has_next && is_letter_or_mark(next))) {
+        std::size_t end = is_letter_or_mark(cp) ? begin : after_first;
+        while (end < text.size()) {
+            const uni::CodepointSpan value = qwen_codepoint_at(text, end);
+            if (!is_letter_or_mark(value.value)) { break; }
+            end += value.length;
+        }
+        return end;
+    }
+
+    if (uni::is_number(cp)) { return after_first; }
+
+    if ((cp == ' ' && has_next && is_non_space_non_letter_mark_number(next)) ||
+        is_non_space_non_letter_mark_number(cp)) {
+        std::size_t end = cp == ' ' ? after_first : begin;
+        while (end < text.size()) {
+            const uni::CodepointSpan value = qwen_codepoint_at(text, end);
+            if (!is_non_space_non_letter_mark_number(value.value)) { break; }
+            end += value.length;
+        }
+        while (end < text.size()) {
+            const uni::CodepointSpan value = qwen_codepoint_at(text, end);
+            if (!is_newline(value.value)) { break; }
+            end += value.length;
+        }
+        return end;
+    }
+
+    if (uni::is_whitespace(cp)) {
+        std::size_t end              = begin;
+        std::size_t last_begin       = begin;
+        std::size_t last_newline_end = std::string_view::npos;
+        std::size_t count            = 0;
+        while (end < text.size()) {
+            const uni::CodepointSpan value = qwen_codepoint_at(text, end);
+            if (!uni::is_whitespace(value.value)) { break; }
+            last_begin = end;
+            end += value.length;
+            ++count;
+            if (is_newline(value.value)) { last_newline_end = end; }
+        }
+        if (last_newline_end != std::string_view::npos) { return last_newline_end; }
+        if (end == text.size()) { return end; }
+        return count >= 2 ? last_begin : end;
+    }
+
+    return after_first;
 }
 
 std::string byte_level_encode(std::string_view text) {
@@ -543,13 +504,14 @@ bool is_stop_token_id(std::span<const int> stop_token_ids, int id) {
     return std::find(stop_token_ids.begin(), stop_token_ids.end(), id) != stop_token_ids.end();
 }
 
-void append_symbol_id(std::vector<int>& ids,
+bool append_symbol_id(std::vector<int>& ids,
                       const std::unordered_map<std::string, int>& token_to_id,
-                      std::string_view symbol) {
+                      std::string_view symbol, std::size_t max_tokens) {
+    if (ids.size() == max_tokens) { return false; }
     const auto direct = token_to_id.find(std::string(symbol));
     if (direct != token_to_id.end()) {
         ids.push_back(direct->second);
-        return;
+        return ids.size() != max_tokens;
     }
 
     const std::vector<std::string> bytes = byte_level_symbols(symbol);
@@ -564,20 +526,26 @@ void append_symbol_id(std::vector<int>& ids,
                 "Tokenizer::encode produced byte symbol outside vocabulary: " + byte_symbol);
         }
         ids.push_back(byte_id->second);
+        if (ids.size() == max_tokens) { return false; }
     }
+    return true;
 }
 
-void append_bpe_ids(std::vector<int>& ids, std::string_view text, bool has_bpe_merges,
+bool append_bpe_ids(std::vector<int>& ids, std::string_view text, bool has_bpe_merges,
                     const std::unordered_map<std::string, int>& merge_ranks,
-                    const std::unordered_map<std::string, int>& token_to_id) {
-    if (text.empty()) { return; }
+                    const std::unordered_map<std::string, int>& token_to_id,
+                    std::size_t max_tokens) {
+    if (text.empty()) { return true; }
+    if (ids.size() == max_tokens) { return false; }
     if (!has_bpe_merges) {
         throw std::invalid_argument(
             "Tokenizer::encode ordinary BPE text requires embedded merges.txt");
     }
 
     const std::string normalized = uni::normalize_nfc(text);
-    for (const std::string_view word : qwen_split_words(normalized)) {
+    for (std::size_t begin = 0; begin < normalized.size();) {
+        const std::size_t end = qwen_word_end(normalized, begin);
+        const std::string_view word(normalized.data() + begin, end - begin);
         std::vector<std::string> symbols = byte_level_symbols(byte_level_encode(word));
         while (symbols.size() > 1) {
             int best_rank              = std::numeric_limits<int>::max();
@@ -593,8 +561,12 @@ void append_bpe_ids(std::vector<int>& ids, std::string_view text, bool has_bpe_m
             symbols[best_pair_left] += symbols[best_pair_left + 1];
             symbols.erase(symbols.begin() + static_cast<std::ptrdiff_t>(best_pair_left + 1));
         }
-        for (const std::string& symbol : symbols) { append_symbol_id(ids, token_to_id, symbol); }
+        for (const std::string& symbol : symbols) {
+            if (!append_symbol_id(ids, token_to_id, symbol, max_tokens)) { return false; }
+        }
+        begin = end;
     }
+    return true;
 }
 
 } // namespace
@@ -640,10 +612,11 @@ Tokenizer::Tokenizer(TokenizerResources resources) {
 }
 
 std::vector<int> Tokenizer::encode(std::string_view text, EncodeOptions options) const {
-    if (text.empty()) { return {}; }
+    if (text.empty() || options.max_tokens == 0) { return {}; }
     if (!options.parse_added_tokens) {
         std::vector<int> ids;
-        append_bpe_ids(ids, text, has_bpe_merges_, bpe_merge_ranks_, vocab_token_to_id_);
+        (void)append_bpe_ids(ids, text, has_bpe_merges_, bpe_merge_ranks_, vocab_token_to_id_,
+                             options.max_tokens);
         return ids;
     }
 
@@ -668,17 +641,21 @@ std::vector<int> Tokenizer::encode(std::string_view text, EncodeOptions options)
         }
 
         if (pos > ordinary_begin) {
-            append_bpe_ids(ids, text.substr(ordinary_begin, pos - ordinary_begin), has_bpe_merges_,
-                           bpe_merge_ranks_, vocab_token_to_id_);
+            if (!append_bpe_ids(ids, text.substr(ordinary_begin, pos - ordinary_begin),
+                                has_bpe_merges_, bpe_merge_ranks_, vocab_token_to_id_,
+                                options.max_tokens)) {
+                return ids;
+            }
         }
 
         ids.push_back(match_token->id);
+        if (ids.size() == options.max_tokens) { return ids; }
         pos += match_token->content.size();
         ordinary_begin = pos;
     }
     if (ordinary_begin < text.size()) {
-        append_bpe_ids(ids, text.substr(ordinary_begin), has_bpe_merges_, bpe_merge_ranks_,
-                       vocab_token_to_id_);
+        (void)append_bpe_ids(ids, text.substr(ordinary_begin), has_bpe_merges_, bpe_merge_ranks_,
+                             vocab_token_to_id_, options.max_tokens);
     }
     return ids;
 }

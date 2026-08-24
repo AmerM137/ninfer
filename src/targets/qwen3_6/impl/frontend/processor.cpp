@@ -596,9 +596,12 @@ std::span<const std::int32_t> ProcessedInput::position_axis(int axis) const {
         static_cast<std::size_t>(axis) * input_ids.size(), input_ids.size());
 }
 
-EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat& rendered) {
+EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat& rendered,
+                                 std::size_t maximum_tokens) {
     EncodedChat encoded;
-    encoded.input_ids              = tokenizer.encode(rendered.text);
+    encoded.input_ids =
+        tokenizer.encode(rendered.text, EncodeOptions{.max_tokens = maximum_tokens});
+    if (encoded.input_ids.size() == maximum_tokens) { return encoded; }
     const auto try_encode_boundary = [&](std::size_t offset,
                                          std::string_view kind) -> std::optional<std::uint32_t> {
         if (offset > rendered.text.size()) {
@@ -698,7 +701,8 @@ Processor::Processor(const Tokenizer& tokenizer, const CompiledChatTemplate& cha
 
 ProcessedInput Processor::process(std::vector<ChatMessage> messages,
                                   ChatRenderOptions render_options,
-                                  const PreparationControl& control) const {
+                                  const PreparationControl& control,
+                                  std::size_t maximum_prompt_tokens) const {
     check_preparation_control(control);
     const std::vector<ChatPart*> parts = media_parts(messages);
     const std::uint64_t maximum_items_from_extents =
@@ -715,8 +719,25 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
         }
         remaining_media_bytes -= part->media.bytes.size();
     }
-    MediaPreparationPermit request_permit = media_cache_->acquire_request(control);
     RenderedChat rendered = chat_template_.render(messages, std::move(render_options));
+    const std::size_t encode_limit =
+        maximum_prompt_tokens == std::numeric_limits<std::size_t>::max()
+            ? maximum_prompt_tokens
+            : maximum_prompt_tokens + 1U;
+    double preliminary_tokenize_seconds = 0.0;
+    if (maximum_prompt_tokens != std::numeric_limits<std::size_t>::max()) {
+        const auto preliminary_started = Clock::now();
+        const std::size_t preliminary_tokens =
+            tokenizer_.encode(rendered.text, EncodeOptions{.max_tokens = encode_limit}).size();
+        preliminary_tokenize_seconds =
+            std::chrono::duration<double>(Clock::now() - preliminary_started).count();
+        if (preliminary_tokens > maximum_prompt_tokens) {
+            throw ProcessorError(ProcessorErrorKind::ContextLengthExceeded,
+                                 "prepared prompt exceeds Engine max_context " +
+                                     std::to_string(maximum_prompt_tokens));
+        }
+    }
+    MediaPreparationPermit request_permit = media_cache_->acquire_request(control);
     std::atomic<bool> stop_preparation{false};
     const PreparationControl worker_control{
         .deadline     = control.deadline,
@@ -735,8 +756,9 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
     std::vector<VisionItem> items;
     items.reserve(parts.size());
     PreprocessStats stats;
-    stats.media_items = parts.size();
-    stats.media_bytes = options_.max_encoded_media_bytes - remaining_media_bytes;
+    stats.media_items      = parts.size();
+    stats.media_bytes      = options_.max_encoded_media_bytes - remaining_media_bytes;
+    stats.tokenize_seconds = preliminary_tokenize_seconds;
 
     std::vector<PendingMedia> pending_items;
     pending_items.reserve(parts.size());
@@ -834,9 +856,15 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
     check_preparation_control(control);
     rendered                    = expand_placeholders(std::move(rendered), items);
     const auto tokenize_started = Clock::now();
-    EncodedChat encoded         = encode_rendered_chat(tokenizer_, rendered);
-    stats.tokenize_seconds = std::chrono::duration<double>(Clock::now() - tokenize_started).count();
+    EncodedChat encoded         = encode_rendered_chat(tokenizer_, rendered, encode_limit);
+    stats.tokenize_seconds +=
+        std::chrono::duration<double>(Clock::now() - tokenize_started).count();
     check_preparation_control(control, "tokenization");
+    if (encoded.input_ids.size() > maximum_prompt_tokens) {
+        throw ProcessorError(ProcessorErrorKind::ContextLengthExceeded,
+                             "prepared prompt exceeds Engine max_context " +
+                                 std::to_string(maximum_prompt_tokens));
+    }
     output.input_ids                   = std::move(encoded.input_ids);
     output.rewrite_checkpoint          = encoded.rewrite_checkpoint;
     output.rewrite_execution_frontiers = std::move(encoded.rewrite_execution_frontiers);
