@@ -163,7 +163,7 @@ int run(const Options& options) {
     execution.allow_prefix_reuse      = false;
     auto request_base                 = program->plan_request(prompt, execution);
     auto request_plan = program->inspect_admission(prompt, request_base, ninfer::runtime::LaneId{0},
-                                                   nullptr, nullptr, std::nullopt);
+                                                   nullptr, nullptr, std::nullopt, false);
     if (!request_plan) { throw std::runtime_error("benchmark root admission was rejected"); }
     const auto reserved = program->reserve_materialization(
         std::move(*request_plan), std::move(prompt), nullptr, nullptr, {}, {}, {});

@@ -247,8 +247,9 @@ int run(const Options& options) {
     for (std::uint32_t lane = 0; lane < options.batch_size; ++lane) {
         auto prompt       = frontend.prepare_tokens(prompt_tokens(options.context_tokens), false);
         auto request_base = program->plan_request(prompt, execution);
-        auto request_plan = program->inspect_admission(
-            prompt, request_base, ninfer::runtime::LaneId{lane}, nullptr, nullptr, std::nullopt);
+        auto request_plan =
+            program->inspect_admission(prompt, request_base, ninfer::runtime::LaneId{lane}, nullptr,
+                                       nullptr, std::nullopt, false);
         if (!request_plan) { throw std::runtime_error("benchmark root admission was rejected"); }
         const auto reserved = program->reserve_materialization(
             std::move(*request_plan), std::move(prompt), nullptr, nullptr, {}, {}, {});
