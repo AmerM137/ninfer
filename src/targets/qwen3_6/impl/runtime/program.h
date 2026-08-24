@@ -5,7 +5,6 @@
 #include "core/arena.h"
 #include "core/gdn_replay_records.h"
 #include "core/host_kv_arena.h"
-#include "core/request_transient_arena.h"
 #include "ninfer/ops/gdn_replay.h"
 #include "ninfer/ops/sampling.h"
 #include "core/decode_graph.h"
@@ -145,8 +144,6 @@ struct AdmissionPlanImpl<NINFER_QWEN36_VARIANT> {
     ops::SamplingConfig sampling;
     std::uint32_t text_kv_page_entitlement    = 0;
     std::uint32_t backend_kv_page_entitlement = 0;
-    std::size_t transient_bytes               = 0;
-    std::size_t transient_alignment           = 1;
     runtime::LaneId destination{};
     std::uint64_t destination_epoch = 0;
     bool has_source                 = false;
@@ -330,7 +327,6 @@ struct RequestControl {
         PreparedPromptData prompt;
         std::optional<VisionPrefillPlan> vision_plan;
         std::unique_ptr<schedule::VisionPrefillSession> vision;
-        RequestTransientArena::Region transient;
         std::vector<CaptureGroup> capture_groups;
         std::size_t next_capture            = 0;
         std::uint64_t pending_capture_offer = 0;
@@ -483,7 +479,6 @@ public:
     DeviceArena persistent;
     DeviceArena workspace_storage;
     WorkspaceArena work;
-    RequestTransientArena request_transient;
     std::unique_ptr<qwen3_6::DecoderState> decoder;
     std::unique_ptr<HostKVArena> host_kv_arena;
     std::unique_ptr<LogicalKVPageStore> text_kv_pages;
@@ -529,6 +524,7 @@ public:
     qwen3_6::DFlashDecodeEgress* dflash_host_egress   = nullptr;
 
     std::size_t workspace_logical_peak_bytes = 0;
+    std::size_t vision_handoff_peak_bytes    = 0;
 
 private:
     template <typename Handle>
@@ -693,7 +689,6 @@ private:
         bool prefix_forks_ready                    = false;
         bool source_prepared                       = false;
         bool cancel_pending                        = false;
-        bool transient_active                      = false;
         bool prepared                              = false;
         bool terminal                              = false;
     };

@@ -95,8 +95,8 @@ struct ProcessorOptions {
     std::uint64_t max_decoded_video_pixels = 128ULL * 1024ULL * 1024ULL;
     int max_video_source_frames            = 100'000;
     double max_video_duration_seconds      = 600.0;
-    std::uint64_t max_raw_patches          = kMaximumVisionRawPatches;
-    std::uint64_t max_vision_tokens        = kMaximumVisionTokens;
+    std::uint64_t max_raw_patches          = kMaximumPromptVisionRawPatches;
+    std::uint64_t max_vision_tokens        = kMaximumPromptVisionTokens;
     double video_fps                       = 2.0;
     int video_min_frames                   = 4;
     int video_max_frames                   = 768;

@@ -106,16 +106,25 @@ int main() {
     };
 
     ninfer::MemorySummary memory;
-    memory.max_context                       = 262144;
-    memory.kv_capacity_mode                  = ninfer::KvCapacityMode::Explicit;
-    memory.kv_capacity                       = 524288;
-    memory.kv_capacity_page_groups           = 8192;
-    memory.kv_capacity_max_page_groups       = 16384;
-    memory.kv_cache                          = ninfer::KvCacheStorage::Fp8E4M3Row256;
-    memory.weights.capacity_bytes            = 100;
-    memory.sequence.capacity_bytes           = 200;
-    memory.workspace.capacity_bytes          = 300;
-    memory.request_transient                 = {500, 0, 450};
+    memory.max_context                 = 262144;
+    memory.kv_capacity_mode            = ninfer::KvCapacityMode::Explicit;
+    memory.kv_capacity                 = 524288;
+    memory.kv_capacity_page_groups     = 8192;
+    memory.kv_capacity_max_page_groups = 16384;
+    memory.kv_cache                    = ninfer::KvCacheStorage::Fp8E4M3Row256;
+    memory.weights.capacity_bytes      = 100;
+    memory.sequence.capacity_bytes     = 200;
+    memory.workspace.capacity_bytes    = 500;
+    memory.vision_workspace            = ninfer::VisionWorkspaceMemorySummary{
+                   .aggregate_prompt_tokens = 32768,
+                   .max_item_tokens         = 16384,
+                   .general_capacity_bytes  = 300,
+                   .encode_peak_bytes       = 400,
+                   .handoff_offset_bytes    = 300,
+                   .handoff_capacity_bytes  = 200,
+                   .handoff_active_bytes    = 0,
+                   .handoff_peak_bytes      = 150,
+    };
     memory.minimum_runtime_reservation_bytes = 1300;
     memory.kv_capacity_increment_bytes       = 100;
     memory.runtime_reservation_bytes         = 1600;
@@ -202,9 +211,12 @@ int main() {
         "server sampling overrides lost omission state");
     failures += check(server.at("environment").at("gpu_name") == "NVIDIA GeForce RTX 5090",
                       "GPU name missing");
-    failures += check(server.at("memory").at("request_transient").at("capacity_bytes") == 500 &&
-                          server.at("memory").at("request_transient").at("peak_used_bytes") == 450,
-                      "request transient memory missing");
+    failures +=
+        check(server.at("memory").at("workspace").at("capacity_bytes") == 500 &&
+                  server.at("memory").at("vision_workspace").at("general_capacity_bytes") == 300 &&
+                  server.at("memory").at("vision_workspace").at("handoff_capacity_bytes") == 200 &&
+                  server.at("memory").at("vision_workspace").at("handoff_peak_bytes") == 150,
+              "Vision workspace layout missing");
     failures += check(server.at("memory").at("cuda_graph_allowance_bytes") == 600,
                       "CUDA Graph allowance missing");
     failures += check(server.at("memory").at("runtime_reservation_bytes") == 1600 &&

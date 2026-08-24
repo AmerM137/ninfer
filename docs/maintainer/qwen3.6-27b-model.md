@@ -421,8 +421,7 @@ Let `C=max_concurrency`.
 | ReplaySSM records | 48 layers × `C` rows × `draft_window+1` convolution/key/value/gate columns | Program lifetime when MTP enabled; one pending round |
 | Continuation hidden | current and turn-checkpoint `[5120,C]` BF16 stores | Program lifetime |
 | Text step buffers | token, positions, logits, verify/draft/sampling tensors | Program lifetime |
-| Program scratch | Text/MTP/Vision phase temporaries | one phase in the shared workspace arena |
-| Vision request transient | encoded Vision output `[8192,V]` | active prefix during request begin |
+| Unified Program workspace | Text/MTP/Vision phase temporaries plus fixed Vision handoff `[5120,V]` | one physical allocation; `V<=min(max_context,16384)` per item |
 
 KV memory grows with configured context. The fixed GDN state pool depends only on `C` and always has
 the two current/turn-checkpoint planes; it is independent of the speculative window. Enabling MTP
@@ -430,17 +429,20 @@ adds the separate ReplaySSM arena, whose capacity is `C*(draft_window+1)` record
 
 The Program freezes its feature set and memory plan at startup. The Qwen3.6 family builds named
 Text-prefill, ordinary-round, MTP-prefill, MTP-round, and Vision phase capacities from the
-configured execution domains and reserves the maximum as one pure scratch arena. Sequential
-phases and scoped child Ops reuse it. Prefill allocations use
-`min(prefill_chunk,max_context)`; Vision is bounded by both the registered frontend geometry and
-`max_context`.
+configured execution domains. The one workspace preserves a general execution prefix while a
+Vision item output is live; before that output is produced, Vision encode may reuse the complete
+backing according to checked patch/position, attention, MLP, and merger lifetimes. The registered
+Frontend retains an aggregate prompt budget of `min(max_context,32768)` Vision tokens, while the
+sequential Vision tower and `[5120,V]` handoff use the registered single-item bound
+`V<=min(max_context,16384)`. Multiple items reuse the same handoff after the previous scatter span
+is complete. Text prefill allocations use `min(prefill_chunk,max_context)`.
 
-Vision encoded output is not part of that arena: its separate request-transient allocation is
-reserved at startup and only an active prefix is exposed to a request. A zero MTP draft window has
-no MTP weight view, MTP KV cache, or optimized proposal head. With Vision disabled, it has no
-Vision weight view, Vision scratch phase, or request-transient allocation; media is rejected by the
-matching Frontend. CUDA Graph driver allowance is budgeted separately from both arenas. The
-complete artifact inventory is still validated before these resident views are published.
+A zero MTP draft window has no MTP weight view, MTP KV cache, or optimized proposal head. With
+Vision disabled, the Program has no Vision weight view or Vision-specific workspace extent; media
+is rejected by the matching Frontend. CUDA Graph driver allowance is budgeted separately from the
+workspace. `MemorySummary.vision_workspace` describes logical regions inside
+`MemorySummary.workspace` and is not an additional allocation. The complete artifact inventory is
+still validated before these resident views are published.
 
 ## 14. Implementation map
 

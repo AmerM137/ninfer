@@ -109,10 +109,11 @@ Use `--resume` to skip completed JSON reports in an existing `--output-dir`, and
 for a minimal script/runner check. `--no-build` uses the binary supplied by `--bench` without
 building it.
 
-Each raw report must be `ninfer_bench_report` schema v11. The flattened summary and schema-v3 matrix
+Each raw report must be `ninfer_bench_report` schema v12. The flattened summary and schema-v3 matrix
 manifest carry native names from the report: selected target, canonical `weights_id`, artifact,
-load/read/upload/staging values, Engine memory arenas including request transient and CUDA Graph
-allowance, per-test planned logical and allocator-observed workspace peaks, KV capacity and
+load/read/upload/staging values, Engine memory arenas including the non-additive Vision layout
+inside the unified workspace and CUDA Graph allowance, per-test planned logical and
+allocator-observed workspace peaks, KV capacity and
 payload, configured proposal head and graph mode, phase timings and throughput, and speculative
 rounds/drafts/acceptance/fallbacks. The matrix manifest is descriptive and records the commands and
 selected local inputs; it does not make repository state part of report validity.
@@ -123,7 +124,7 @@ artifacts are supplied. Pass one `--artifact` to select a single target and `--m
 decode corpus with DFlash block=8 (`k=7`) and the optimized proposal head. Add
 `--sampling greedy` to force exact argmax while retaining the same fixtures and repetition count.
 Its schema-v6 result and flattened summaries retain the canonical `weights_id`, request Host
-exposure, and decode Host/Device-wait time per round received from the schema-v14 serving records.
+exposure, and decode Host/Device-wait time per round received from the schema-v15 serving records.
 Request exposure is a latency distribution value and is never summed across concurrent requests;
 worker aggregation uses the serving `throughput.host_work` interval deltas. The stochastic route pins its complete
 temperature/top-p/top-k/min-p/presence/frequency profile explicitly, so model-default changes do

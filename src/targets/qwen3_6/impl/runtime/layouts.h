@@ -43,15 +43,25 @@ struct PersistentLayout {
     std::size_t kv_payload_bytes = 0;
 };
 
+struct VisionWorkspacePlan {
+    std::uint32_t max_merged_tokens    = 0;
+    std::size_t general_capacity_bytes = 0;
+    std::size_t encode_peak_bytes      = 0;
+    std::size_t handoff_offset_bytes   = 0;
+    std::size_t handoff_capacity_bytes = 0;
+    std::size_t capacity_bytes         = 0;
+};
+
 struct WorkspacePlan {
-    std::size_t text_prefill   = 0;
-    std::size_t ordinary_round = 0;
-    std::size_t mtp_prefill    = 0;
-    std::size_t mtp_round      = 0;
-    std::size_t dflash_context = 0;
-    std::size_t dflash_round   = 0;
-    std::size_t vision_encode  = 0;
-    std::size_t capacity       = 0;
+    std::size_t text_prefill     = 0;
+    std::size_t ordinary_round   = 0;
+    std::size_t mtp_prefill      = 0;
+    std::size_t mtp_round        = 0;
+    std::size_t dflash_context   = 0;
+    std::size_t dflash_round     = 0;
+    std::size_t general_capacity = 0;
+    std::optional<VisionWorkspacePlan> vision;
+    std::size_t capacity = 0;
 };
 
 struct SequencePlanningInputs {
@@ -93,9 +103,8 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     ContextCacheOptions context_cache;
     NINFER_QWEN36_RUNTIME_NS::PersistentLayout persistent;
     NINFER_QWEN36_RUNTIME_NS::WorkspacePlan workspace;
-    std::size_t request_transient_capacity_bytes = 0;
-    std::size_t graph_allowance_bytes            = 0;
-    std::size_t device_reservation_bytes         = 0;
+    std::size_t graph_allowance_bytes    = 0;
+    std::size_t device_reservation_bytes = 0;
 };
 
 template <>

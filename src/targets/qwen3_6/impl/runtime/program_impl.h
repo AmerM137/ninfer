@@ -516,8 +516,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
       kv_payload_bytes(plan.persistent.kv_payload_bytes),
       graph_allowance_bytes(plan.graph_allowance_bytes), workspace_plan(plan.workspace),
       persistent(plan.persistent.bytes), workspace_storage(plan.workspace.capacity),
-      work(DeviceSpan{workspace_storage.base(), workspace_storage.capacity()}),
-      request_transient(device_in, plan.request_transient_capacity_bytes),
+      work(DeviceSpan{workspace_storage.base(), plan.workspace.general_capacity}),
       continuation_states(continuation_capacity), continuation_slots(continuation_capacity),
       shared_prefix_states(shared_prefix_capacity), shared_prefix_slots(shared_prefix_capacity),
       round_host(sizeof(TokenId)),
@@ -553,6 +552,12 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     }
     if (model.dflash.has_value() && model.vision.has_value()) {
         throw std::invalid_argument("DFlash and Vision model views are mutually exclusive");
+    }
+    if (workspace_plan.general_capacity == 0 ||
+        workspace_plan.vision.has_value() != vision_enabled ||
+        (workspace_plan.vision &&
+         workspace_plan.vision->general_capacity_bytes != workspace_plan.general_capacity)) {
+        throw std::invalid_argument("Qwen3.6 workspace plan does not match startup features");
     }
     const DeviceSpan backing = persistent.alloc_bytes(plan.persistent.bytes, 256);
     if (!plan.context_cache.max_private_continuations || !plan.context_cache.max_shared_prefixes) {
@@ -3078,9 +3083,6 @@ runtime::ContextTransactionReserveStatus ProgramImplCore::reserve_materializatio
             }
         }
 
-        request_transient.activate(request_plan.transient_bytes, request_plan.transient_alignment);
-        transaction.transient_active                  = true;
-        const RequestTransientArena::Region transient = request_transient.region();
         if (request.prefill) {
             throw std::logic_error("free request lane retained prefill bookkeeping");
         }
@@ -3135,7 +3137,6 @@ runtime::ContextTransactionReserveStatus ProgramImplCore::reserve_materializatio
             .prompt             = std::move(prompt),
             .vision_plan        = std::move(request_plan.vision),
             .vision             = nullptr,
-            .transient          = transient,
             .capture_groups     = std::move(request_plan.capture_groups),
             .base               = request_plan.reuse_base,
             .cursor             = request_plan.reuse_base,
@@ -3148,9 +3149,13 @@ runtime::ContextTransactionReserveStatus ProgramImplCore::reserve_materializatio
         };
         request.prefill.emplace(std::move(prefill));
         if (request.prefill->vision_plan) {
+            if (!workspace_plan.vision) {
+                throw std::logic_error("Vision prefill has no startup workspace plan");
+            }
             request.prefill->vision = std::make_unique<schedule::VisionPrefillSession>(
-                device, model, work, request.prefill->prompt, *request.prefill->vision_plan,
-                request.prefill->transient);
+                device, model, DeviceSpan{workspace_storage.base(), workspace_storage.capacity()},
+                *workspace_plan.vision, request.prefill->prompt, *request.prefill->vision_plan,
+                vision_handoff_peak_bytes);
         }
         request.prefill->elapsed_seconds =
             std::chrono::duration<double>(Clock::now() - host_started).count();
@@ -3177,11 +3182,6 @@ void ProgramImplCore::release_materialization_staging(
     if (lane < max_concurrency && requests[lane].lifecycle == Lifecycle::Empty) {
         requests[lane].prefill.reset();
     }
-    if (transaction.transient_active) {
-        request_transient.deactivate();
-        transaction.transient_active = false;
-    }
-
     for (std::size_t position = transaction.shared_pressure_cursor;
          position < transaction.shared_pressure.size(); ++position) {
         MaterializationTransaction::PressureWork& work = transaction.shared_pressure[position];
@@ -4992,7 +4992,6 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
         materialization_ledger_.clear();
         materialization_identity_.clear();
         materialization_prefix_digests_.clear();
-        transaction.transient_active = false;
     } catch (...) {
         release_materialization_staging(transaction);
         throw;
@@ -5790,7 +5789,6 @@ StartResult ProgramImplCore::start_request(MaterializationTransaction& transacti
         SequenceState& sequence              = continuation_states[*continuation_index];
         sequence.lane                        = lane;
         transaction.root_continuation_index.reset();
-        transaction.transient_active = false;
         start_sequence(lane, sequence, transaction);
         runtime::ResourceVector actual         = resident_resources(sequence);
         actual.device.active_lanes             = 1;
@@ -8722,7 +8720,6 @@ runtime::ExecutionTiming ProgramImplCore::resolve_pending_raw(
 }
 
 void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& request) noexcept {
-    if (request.prefill) { request_transient.deactivate(); }
     request.prefill.reset();
     request.lifecycle            = Lifecycle::Empty;
     request.pending              = {};
@@ -9718,7 +9715,10 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                 schedule::PrefillChunkResult result;
                 timing.pause();
                 if (staged.vision) {
-                    mark_workspace_usage(workspace_plan.vision_encode);
+                    if (!workspace_plan.vision) {
+                        throw std::logic_error("active Vision prefill lost its workspace plan");
+                    }
+                    mark_workspace_usage(workspace_plan.vision->capacity_bytes);
                     result = schedule::prefill_multimodal_chunk(schedule_state, staged.prompt,
                                                                 *staged.vision, remaining,
                                                                 split_frontier, final_candidate);
@@ -9852,11 +9852,11 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
         request.timings.vision_seconds  = vision_seconds;
         request.timings.prefill_seconds = std::max(0.0, staged.elapsed_seconds - vision_seconds);
         staged.prompt.release_all_media_payloads();
+        if (staged.vision) { staged.vision->retire_handoff(); }
 
         const bool prompt_frontier_capture =
             staged.next_capture < staged.capture_groups.size() &&
             staged.capture_groups[staged.next_capture].frontier == prompt_tokens;
-        request_transient.deactivate();
         if (!prompt_frontier_capture) { request.prefill.reset(); }
         request.pending   = PendingCandidate{.kind          = PendingKind::Begin,
                                              .base_E        = 0,
@@ -10453,8 +10453,34 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
     out.weights = ArenaMemorySummary{weights.capacity(), weights.used(), weights.peak_used()};
     out.sequence =
         ArenaMemorySummary{persistent.capacity(), persistent.used(), persistent.peak_used()};
-    out.workspace = ArenaMemorySummary{workspace_storage.capacity(), work.used(), work.peak_used()};
-    out.request_transient            = request_transient.summary();
+    std::size_t active_handoff_bytes = 0;
+    for (const RequestControl& request : requests) {
+        if (request.prefill && request.prefill->vision) {
+            active_handoff_bytes =
+                std::max(active_handoff_bytes, request.prefill->vision->active_handoff_bytes());
+        }
+    }
+    std::size_t active_workspace_bytes = work.used();
+    if (workspace_plan.vision && active_handoff_bytes != 0) {
+        active_workspace_bytes =
+            std::max(active_workspace_bytes,
+                     workspace_plan.vision->handoff_offset_bytes + active_handoff_bytes);
+    }
+    out.workspace = ArenaMemorySummary{workspace_storage.capacity(), active_workspace_bytes,
+                                       std::max(work.peak_used(), workspace_logical_peak_bytes)};
+    if (workspace_plan.vision) {
+        out.vision_workspace = VisionWorkspaceMemorySummary{
+            .aggregate_prompt_tokens = static_cast<std::uint32_t>(
+                std::min<std::uint64_t>(capacity, kMaximumPromptVisionTokens)),
+            .max_item_tokens        = workspace_plan.vision->max_merged_tokens,
+            .general_capacity_bytes = workspace_plan.vision->general_capacity_bytes,
+            .encode_peak_bytes      = workspace_plan.vision->encode_peak_bytes,
+            .handoff_offset_bytes   = workspace_plan.vision->handoff_offset_bytes,
+            .handoff_capacity_bytes = workspace_plan.vision->handoff_capacity_bytes,
+            .handoff_active_bytes   = active_handoff_bytes,
+            .handoff_peak_bytes     = vision_handoff_peak_bytes,
+        };
+    }
     out.workspace_logical_peak_bytes = workspace_logical_peak_bytes;
     out.cuda_graph_allowance_bytes   = graph_allowance_bytes;
     out.cuda_graph_observed_bytes    = graph_observed_bytes;
@@ -10474,8 +10500,20 @@ void ProgramImplCore::reset_memory_peaks() noexcept {
     model.weights_arena->reset_peak();
     persistent.reset_peak();
     work.reset_peak();
-    request_transient.reset_peak();
-    workspace_logical_peak_bytes = 0;
+    std::size_t active_handoff_bytes = 0;
+    for (const RequestControl& request : requests) {
+        if (request.prefill && request.prefill->vision) {
+            active_handoff_bytes =
+                std::max(active_handoff_bytes, request.prefill->vision->active_handoff_bytes());
+        }
+    }
+    vision_handoff_peak_bytes    = active_handoff_bytes;
+    workspace_logical_peak_bytes = work.used();
+    if (workspace_plan.vision && active_handoff_bytes != 0) {
+        workspace_logical_peak_bytes =
+            std::max(workspace_logical_peak_bytes,
+                     workspace_plan.vision->handoff_offset_bytes + active_handoff_bytes);
+    }
 }
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS

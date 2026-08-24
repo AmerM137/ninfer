@@ -40,10 +40,14 @@ constexpr std::string_view kThinkClose = "</think>";
 constexpr std::string_view kThinkingControl =
     "\n\n Considering the limited time by the user, I have to give the solution based on the "
     "thinking directly now.\n</think>\n\n";
-constexpr double kRescaleFactor = 1.0 / 255.0;
-constexpr double kVideoFps      = 2.0;
-constexpr int kVideoMinFrames   = 4;
-constexpr int kVideoMaxFrames   = 768;
+constexpr double kRescaleFactor                       = 1.0 / 255.0;
+constexpr double kVideoFps                            = 2.0;
+constexpr int kVideoMinFrames                         = 4;
+constexpr int kVideoMaxFrames                         = 768;
+constexpr std::uint64_t kRegisteredImageMinimumPixels = 65'536;
+constexpr std::uint64_t kRegisteredImageMaximumPixels = 16'777'216;
+constexpr std::uint64_t kRegisteredVideoMinimumPixels = 4'096;
+constexpr std::uint64_t kRegisteredVideoMaximumPixels = 25'165'824;
 
 constexpr std::array<std::pair<std::string_view, TokenId>, 4> kVisionSpecialTokens = {{
     {"<|vision_start|>", 248053},
@@ -181,6 +185,16 @@ fi::ProcessorOptions processor_options(const FrontendResources& resources) {
     }
 
     return options;
+}
+
+void validate_registered_processor(const fi::ProcessorOptions& options) {
+    if (options.image_min_pixels != kRegisteredImageMinimumPixels ||
+        options.image_max_pixels != kRegisteredImageMaximumPixels ||
+        options.video_min_pixels != kRegisteredVideoMinimumPixels ||
+        options.video_max_pixels != kRegisteredVideoMaximumPixels) {
+        throw std::invalid_argument(
+            "registered processor pixel bounds do not match the compiled Vision item capacity");
+    }
 }
 
 void validate_tokenizer_config(const FrontendResources& resources) {
@@ -788,7 +802,7 @@ public:
             throw std::invalid_argument("frontend max_context must be nonzero");
         }
         const std::uint64_t vision_tokens =
-            std::min<std::uint64_t>(options.max_context, kMaximumVisionTokens);
+            std::min<std::uint64_t>(options.max_context, kMaximumPromptVisionTokens);
         processor.max_vision_tokens = vision_tokens;
         processor.max_raw_patches   = vision_tokens * kRawPatchesPerVisionToken;
         if (vision_enabled) {
@@ -802,7 +816,10 @@ public:
                 options.media_cache_bytes, options.media_live_bytes,
                 options.media_preprocess_threads, static_cast<std::size_t>(minimum_live));
         }
-        if (registered_checkpoint) { validate_registered_tokenizer(*tokenizer); }
+        if (registered_checkpoint) {
+            validate_registered_processor(processor);
+            validate_registered_tokenizer(*tokenizer);
+        }
         for (const int token : tokenizer->default_stop_token_ids()) {
             if (!tokenizer->is_valid_token(token)) {
                 throw std::invalid_argument(

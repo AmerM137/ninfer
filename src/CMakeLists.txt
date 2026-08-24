@@ -25,7 +25,6 @@ add_library(ninfer_core STATIC
   core/paged_kv_cache.cpp
   core/linear_attention_state.cpp
   core/layout.cpp
-  core/request_transient_arena.cpp
   core/tensor.cpp
   core/decode_graph.cpp
   runtime/engine/admission_policy.cpp

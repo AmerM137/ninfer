@@ -772,12 +772,19 @@ int verify_loaded_product(const ninfer::Engine& engine) {
         return 1;
     }
     const ninfer::MemorySummary memory = engine.memory_summary();
+    const auto* vision = memory.vision_workspace ? &*memory.vision_workspace : nullptr;
     if (memory.weights.capacity_bytes == 0 || memory.weights.used_bytes == 0 ||
         memory.weights.used_bytes > memory.weights.capacity_bytes ||
         memory.sequence.capacity_bytes == 0 || memory.sequence.used_bytes == 0 ||
         memory.sequence.used_bytes > memory.sequence.capacity_bytes ||
-        memory.workspace.capacity_bytes == 0 || memory.request_transient.capacity_bytes == 0 ||
-        memory.request_transient.used_bytes != 0 || memory.cuda_graph_allowance_bytes == 0) {
+        memory.workspace.capacity_bytes == 0 || vision == nullptr ||
+        vision->aggregate_prompt_tokens != 4096 || vision->max_item_tokens != 4096 ||
+        vision->general_capacity_bytes == 0 || vision->encode_peak_bytes == 0 ||
+        vision->handoff_offset_bytes > memory.workspace.capacity_bytes ||
+        vision->handoff_capacity_bytes == 0 ||
+        vision->handoff_capacity_bytes >
+            memory.workspace.capacity_bytes - vision->handoff_offset_bytes ||
+        vision->handoff_active_bytes != 0 || memory.cuda_graph_allowance_bytes == 0) {
         std::cerr << "Engine construction has incomplete materialized backing\n";
         return 1;
     }

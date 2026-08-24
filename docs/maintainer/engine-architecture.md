@@ -147,7 +147,7 @@ Runtime 的入口是 exact package 暴露的 `Program` contract。它负责：
 - Main/backend KV allocation、frontier 和 block-table binding；
 - prefill、ordinary decode、MTP/DFlash speculative schedule；
 - provisional model writes、accepted-prefix commit 和 rollback；
-- workspace、request transient arena 和 CUDA Graph；
+- unified workspace、其中的 Vision handoff lifecycle 和 CUDA Graph；
 - generation timings、speculative statistics 和 physical memory summary。
 
 Program execution/commit capability 同时返回结构化 `submit_host/device_wait/post_host`
@@ -214,15 +214,15 @@ validate EngineOptions
   -> construct EngineCore, Scheduler and ResourceManager
 ```
 
-`SequencePlan` 是 target 对完整 physical runtime 的启动期规划，包含 fixed state、KV pool、workspace、
-request transient 和 graph 所需容量。`Program::admission_capacity()` 产生运行期 ledger 的总容量；
+`SequencePlan` 是 target 对完整 physical runtime 的启动期规划，包含 fixed state、KV pool、unified
+workspace 和 graph 所需容量。`Program::admission_capacity()` 产生运行期 ledger 的总容量；
 ResourceManager 不从模型 geometry 重算它。
 
 ### 3.3 Engine-lifetime resources
 
-权重、KV slabs、fixed per-lane state、device block tables、shared workspace、request transient backing 和
-decode graph storage 都在启动期建立。请求期间可以改变 logical ownership、page mapping 和 frontier，但不
-重新建立这些 device allocations。
+权重、KV slabs、fixed per-lane state、device block tables、unified workspace 和 decode graph storage 都在
+启动期建立。请求期间可以改变 logical ownership、page mapping 和 frontier，但不重新建立这些 device
+allocations。
 
 `memory_summary()` 和 `reset_memory_peaks()` 通过 Engine 的 execution ownership 与 Program mutation 串行，
 不会并发观察正在提交或清理的 physical state。
@@ -840,16 +840,25 @@ compact row b -> SequenceHandle -> physical lane -> block-table row/state select
 active control lane；materialization把选中的Device-ready或Host-backed checkpoint安装到一个free lane的稳定
 execution metadata中。
 
-### 10.2 Workspace 与 request transient
+### 10.2 Unified workspace 与 Vision handoff
 
-Program 拥有两类复用内存：
+Program 只拥有一个 startup-frozen workspace allocation。规划先求出所有普通 Text/MTP/DFlash、control 和
+decode-graph 路径的最大容量 `G`；这些 consumer 只能看到 `[0,G)` 的 `WorkspaceArena`。启用 Vision 时，
+同一 backing 还包含单 item encode peak 和固定 handoff region：
 
-- whole-model/shared workspace：服务 prefill/decode schedule 和 Ops；
-- request transient arena：服务单请求 preparation-to-prefill bridge，尤其 Vision 临时张量。
+```text
+handoff_offset = align256(max(G, maximum merger-hidden bytes))
+capacity = max(maximum Vision encode peak, handoff_offset + maximum item output bytes)
+```
 
-它们的 backing 在 startup 分配，Program 在明确的 request phase activate/deactivate。Engine 不持有 device
-arena，也不向 Program 传 raw transient region。一个 staged prefill owner 与一个 Program mutation owner
-使该 arena 不需要变成 per-request allocator。
+一个 prompt 的媒体合计仍可达到 `min(max_context,32768)` 个 Vision tokens；注册 processor 能产生的单
+item 上界为 `min(max_context,16384)`，而 Vision tower 与 handoff 都只按这个单 item 上界规划。Vision encode
+在 output 尚未产生时可复用完整 backing；output active 后，交错的 prefill/decode/control 只写 `[0,G)`，
+因此不会覆盖 handoff。item 切换、完成、取消和异常沿现有单 Program mutation 与 stream completion 边界
+释放逻辑 ownership，不增加同步、kernel 或请求期 Device allocation。
+
+`MemorySummary.workspace` 是唯一可相加的物理容量；`vision_workspace` 只描述该 allocation 内的 layout 与
+active/peak extent，不能再次计入总显存。
 
 ### 10.3 Paged KV
 

@@ -527,6 +527,19 @@ struct ArenaMemorySummary {
     std::size_t peak_used_bytes = 0;
 };
 
+// Logical regions within the one physical workspace allocation. These byte values describe
+// layout and live extents and must not be added to workspace.capacity_bytes.
+struct VisionWorkspaceMemorySummary {
+    std::uint32_t aggregate_prompt_tokens = 0;
+    std::uint32_t max_item_tokens         = 0;
+    std::size_t general_capacity_bytes    = 0;
+    std::size_t encode_peak_bytes         = 0;
+    std::size_t handoff_offset_bytes      = 0;
+    std::size_t handoff_capacity_bytes    = 0;
+    std::size_t handoff_active_bytes      = 0;
+    std::size_t handoff_peak_bytes        = 0;
+};
+
 struct MemorySummary {
     int device                                = 0;
     std::uint32_t max_context                 = 0;
@@ -538,7 +551,7 @@ struct MemorySummary {
     ArenaMemorySummary weights;
     ArenaMemorySummary sequence;
     ArenaMemorySummary workspace;
-    ArenaMemorySummary request_transient;
+    std::optional<VisionWorkspaceMemorySummary> vision_workspace;
     std::size_t minimum_runtime_reservation_bytes = 0;
     std::size_t kv_capacity_increment_bytes       = 0;
     std::size_t runtime_reservation_bytes         = 0;

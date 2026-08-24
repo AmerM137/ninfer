@@ -818,12 +818,12 @@ test shapes exercise the scalar fallbacks.
 
 Table, JSON, and CSV reports all identify the selected target, artifact, Engine configuration,
 load summary, memory capacity, KV payload, workspace peak, phase throughput, and speculative
-statistics. JSON schema version 10 records the public value objects directly:
+statistics. JSON schema version 12 records the public value objects directly:
 
 - `load`: target, `weights_id`, load/upload time, file/H2D/staging bytes, tensor count, and resource
   count;
-- `memory`: weights/sequence/workspace/request-transient arenas, planned context, KV storage,
-  CUDA Graph allowance, and KV payload;
+- `memory`: weights/sequence/unified-workspace arenas, the optional non-additive Vision layout,
+  planned context, KV storage, CUDA Graph allowance, and KV payload;
 - each repetition's `timings`: prepare, Vision, prefill, decode, and total seconds;
 - each repetition's `speculative`: window, rounds, drafted/accepted tokens, fallbacks, and per-position
 acceptance.

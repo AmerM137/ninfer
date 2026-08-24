@@ -197,6 +197,26 @@ void append_arena_json(std::ostringstream& out, std::string_view name,
     out << '\n';
 }
 
+void append_vision_workspace_json(std::ostringstream& out,
+                                  const std::optional<VisionWorkspaceMemorySummary>& vision,
+                                  std::string_view indent, bool trailing_comma) {
+    out << indent << "\"vision_workspace\": ";
+    if (!vision) {
+        out << "null";
+    } else {
+        out << "{\"aggregate_prompt_tokens\": " << vision->aggregate_prompt_tokens
+            << ", \"max_item_tokens\": " << vision->max_item_tokens
+            << ", \"general_capacity_bytes\": " << vision->general_capacity_bytes
+            << ", \"encode_peak_bytes\": " << vision->encode_peak_bytes
+            << ", \"handoff_offset_bytes\": " << vision->handoff_offset_bytes
+            << ", \"handoff_capacity_bytes\": " << vision->handoff_capacity_bytes
+            << ", \"handoff_active_bytes\": " << vision->handoff_active_bytes
+            << ", \"handoff_peak_bytes\": " << vision->handoff_peak_bytes << '}';
+    }
+    if (trailing_comma) { out << ','; }
+    out << '\n';
+}
+
 void append_speculative_json(std::ostringstream& out, const SpeculativeStats& stats,
                              std::string_view indent) {
     out << indent << "\"speculative\": {\n"
@@ -560,8 +580,11 @@ std::string format_table(const BenchEnvironment& env, const std::vector<TestResu
         << format_bytes(env.load.peak_staging_bytes) << '\n'
         << "  memory:     weights " << format_bytes(env.memory.weights.capacity_bytes)
         << ", sequence " << format_bytes(env.memory.sequence.capacity_bytes) << ", workspace "
-        << format_bytes(env.memory.workspace.capacity_bytes) << ", request transient "
-        << format_bytes(env.memory.request_transient.capacity_bytes) << ", graph allowance "
+        << format_bytes(env.memory.workspace.capacity_bytes) << ", Vision handoff "
+        << (env.memory.vision_workspace
+                ? format_bytes(env.memory.vision_workspace->handoff_capacity_bytes)
+                : "disabled")
+        << " (within workspace), graph allowance "
         << format_bytes(env.memory.cuda_graph_allowance_bytes) << ", KV payload "
         << format_bytes(env.memory.kv_payload_bytes) << '\n'
         << "  corpus:     " << env.corpus_path << " (" << env.corpus_tokens << " tokens)\n"
@@ -653,7 +676,7 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
     append_arena_json(out, "weights", env.memory.weights, "    ", true);
     append_arena_json(out, "sequence", env.memory.sequence, "    ", true);
     append_arena_json(out, "workspace", env.memory.workspace, "    ", true);
-    append_arena_json(out, "request_transient", env.memory.request_transient, "    ", true);
+    append_vision_workspace_json(out, env.memory.vision_workspace, "    ", true);
     out << "    \"minimum_runtime_reservation_bytes\": "
         << env.memory.minimum_runtime_reservation_bytes << ",\n"
         << "    \"kv_capacity_increment_bytes\": " << env.memory.kv_capacity_increment_bytes
@@ -741,7 +764,8 @@ std::string format_csv(const BenchEnvironment& env, const std::vector<TestResult
     out << "label,kind,n_prompt,n_gen,target,weights_id,max_context,prefill_chunk,mtp_draft_tokens,"
            "proposal_head,decode_path,kv_cache,kv_payload_bytes,load_host_to_device_bytes,"
            "weights_capacity_bytes,sequence_capacity_bytes,workspace_capacity_bytes,"
-           "request_transient_capacity_bytes,cuda_graph_allowance_bytes,"
+           "workspace_general_capacity_bytes,vision_handoff_capacity_bytes,"
+           "cuda_graph_allowance_bytes,"
            "workspace_peak_bytes,workspace_allocator_peak_bytes,"
            "spec_rounds,spec_fallback_steps,spec_acceptance_rate,"
            "repetitions,prefill_tok_s_mean,prefill_tok_s_stddev,decode_output_tok_s_mean,"
@@ -767,9 +791,16 @@ std::string format_csv(const BenchEnvironment& env, const std::vector<TestResult
             << kv_cache_name(env.kv_cache) << ',' << env.memory.kv_payload_bytes << ','
             << env.load.host_to_device_bytes << ',' << env.memory.weights.capacity_bytes << ','
             << env.memory.sequence.capacity_bytes << ',' << env.memory.workspace.capacity_bytes
-            << ',' << env.memory.request_transient.capacity_bytes << ','
-            << env.memory.cuda_graph_allowance_bytes << ',' << result.workspace_peak_bytes << ','
-            << result.workspace_allocator_peak_bytes << ',' << spec.rounds << ','
+            << ','
+            << (env.memory.vision_workspace
+                    ? std::to_string(env.memory.vision_workspace->general_capacity_bytes)
+                    : std::to_string(env.memory.workspace.capacity_bytes))
+            << ','
+            << (env.memory.vision_workspace
+                    ? std::to_string(env.memory.vision_workspace->handoff_capacity_bytes)
+                    : std::string())
+            << ',' << env.memory.cuda_graph_allowance_bytes << ',' << result.workspace_peak_bytes
+            << ',' << result.workspace_allocator_peak_bytes << ',' << spec.rounds << ','
             << spec.fallback_steps << ',' << acceptance << ',' << result.reps.size() << ','
             << mean(prefill_tok_s_series(result)) << ',' << stddev(prefill_tok_s_series(result))
             << ',' << mean(decode_output_tok_s_series(result)) << ','

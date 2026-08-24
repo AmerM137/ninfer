@@ -558,14 +558,15 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         }
     }
 
+    out.general_capacity = std::max({out.text_prefill, out.ordinary_round, out.mtp_prefill,
+                                     out.mtp_round, out.dflash_context, out.dflash_round});
+    out.capacity         = out.general_capacity;
     if (plan.features.vision) {
-        constexpr std::uint32_t kFrontendMergedLimit = 32768;
-        const std::uint32_t merged = std::min(plan.capacity, kFrontendMergedLimit);
-        out.vision_encode          = schedule::VisionContext::workspace_capacity_bytes(merged);
+        const std::uint32_t merged = static_cast<std::uint32_t>(
+            std::min<std::uint64_t>(plan.capacity, kMaximumVisionItemTokens));
+        out.vision   = schedule::VisionContext::plan_workspace(merged, out.general_capacity);
+        out.capacity = std::max(out.capacity, out.vision->capacity_bytes);
     }
-
-    out.capacity = std::max({out.text_prefill, out.ordinary_round, out.mtp_prefill, out.mtp_round,
-                             out.dflash_context, out.dflash_round, out.vision_encode});
     return out;
 }
 
@@ -660,12 +661,6 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->kv_quant_group      = inputs.kv_quant_group;
     impl->persistent          = persistent_layout(*impl);
     impl->workspace           = build_workspace_plan(*impl);
-    if (impl->features.vision) {
-        constexpr std::uint32_t kFrontendMergedLimit = 32768;
-        const std::uint32_t merged = std::min(impl->capacity, kFrontendMergedLimit);
-        impl->request_transient_capacity_bytes =
-            schedule::VisionContext::output_transient_bytes(merged);
-    }
     if (impl->use_cuda_graph) {
         // Definitions remain per execution profile, but only one executable is instantiated for
         // each reachable node-topology class. These bounds cover the largest profile installed in
@@ -709,9 +704,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     }
 
     impl->device_reservation_bytes = checked_add(
-        checked_add(
-            checked_add(impl->persistent.bytes, impl->workspace.capacity, "sequence memory plan"),
-            impl->request_transient_capacity_bytes, "request transient reservation"),
+        checked_add(impl->persistent.bytes, impl->workspace.capacity, "sequence memory plan"),
         impl->graph_allowance_bytes, "sequence graph allowance");
     return impl;
 }

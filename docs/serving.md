@@ -30,8 +30,8 @@ When `--model-id` is omitted, the server advertises and accepts the loaded conta
 `identity.model_id`. An explicit `--model-id` remains a public HTTP alias override and does not
 select or alter the artifact.
 
-Vision is disabled by default: its weights, Vision scratch phase, and frozen request-transient
-buffer are not allocated, and media
+Vision is disabled by default: its weights and Vision-specific unified-workspace extent are not
+allocated, and media
 requests and token-count requests fail with HTTP 400 `vision_disabled`. Add `--vision` when the
 server must accept image or video input. Speculative residency is likewise frozen by
 `--spec mtp|dflash` and `--draft-tokens`; omitting `--spec` loads neither backend.
@@ -575,7 +575,7 @@ is also rejected if it resolves to the model artifact.
   --request-log-jsonl profiles/bench/run/server.requests.jsonl
 ```
 
-Every line is one `ninfer_serve_request_log` schema-v14 JSON object. All events carry
+Every line is one `ninfer_serve_request_log` schema-v15 JSON object. All events carry
 `timestamp_unix_ms` and a process-unique `server_instance_id`; request IDs are monotonic only within
 that server instance. Successful request-start records include request-scoped acquisition,
 media-preprocessing wall/work, tokenizer, cache hit/miss/single-flight, and payload-size fields;
@@ -583,7 +583,7 @@ they do not infer request behavior from process-global counter deltas.
 
 | Event | Contents |
 |---|---|
-| `server_start` | target/weights identity and artifact, resolved Engine and context-cache capacities, registered thinking/non-thinking sampler defaults plus process overrides, thinking-history and thinking-budget defaults, Device arenas, Host State/KV capacity and occupancy, KV sizing ledger, CUDA Graph observed/allowance bytes, CUDA/GPU environment, and redacted argv |
+| `server_start` | target/weights identity and artifact, resolved Engine and context-cache capacities, registered thinking/non-thinking sampler defaults plus process overrides, thinking-history and thinking-budget defaults, Device arenas, the optional non-additive Vision layout inside the unified workspace, Host State/KV capacity and occupancy, KV sizing ledger, CUDA Graph observed/allowance bytes, CUDA/GPU environment, and redacted argv |
 | `request_start` | protocol, resolved sampler and seed, thinking mode and optional budget, Responses semantic-change flag, output budget, stream/message/tool shape |
 | `request_rejected` | parsed request shape, media-item count, `phase: "prepare"`, and the exact HTTP status/type/code/parameter/message for a synchronous preparation rejection |
 | `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, thinking-budget application counters, unrounded request-stage seconds, per-request Engine Host exposure, and complete speculative-decoding counters |
@@ -594,6 +594,11 @@ they do not infer request behavior from process-global counter deltas.
 as full-precision JSON numbers. Its `speculative` object contains `backend`, `draft_window`, `rounds`,
 `drafted_tokens`, `accepted_tokens`, `fallback_steps`, and `accepted_per_position`. Rates can be
 derived downstream from raw token counts and seconds instead of rounded stderr strings.
+
+For `server_start.memory`, `workspace.capacity_bytes` is the only physical workspace allocation.
+When Vision is enabled, `vision_workspace` reports the aggregate prompt and maximum-item token
+bounds plus encode peak and handoff layout/usage within that same allocation; these bytes must not
+be added to `workspace.capacity_bytes`. The field is `null` when Vision is disabled.
 
 `request_done.engine_timing` separates FIFO `queue_wait_seconds`, blocking
 `device_wait_exposed_seconds`, and five mutually exclusive Host-active exposure phases under

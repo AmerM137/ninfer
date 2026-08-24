@@ -136,7 +136,7 @@ Explicit policy 使用 `M=ceil(K_main/P_main)`。Automatic policy 带有必须�
 Exact target 用同一个完整 physical candidate builder 得到：
 
 ```text
-B(M)     = persistent + workspace + request transient + CUDA Graph allowance
+B(M)     = persistent + unified workspace + CUDA Graph allowance
 B_min    = B(M_min)
 B_step   = B(M_min+1) - B(M_min)
 M_auto   = min(M_max, M_min + floor((F-R-B_min)/B_step))

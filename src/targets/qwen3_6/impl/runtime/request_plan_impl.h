@@ -274,6 +274,9 @@ RequestBasePlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
         .backend_kv_pages = base->backend_kv_page_entitlement,
     };
     if (prompt.has_media()) {
+        if (!workspace_plan.vision) {
+            throw std::logic_error("Vision prompt has no startup workspace plan");
+        }
         auto vision =
             std::make_shared<qwen3_6::VisionControlPlan>(qwen3_6::plan_vision_control(prompt));
         std::uint32_t previous_end = 0;
@@ -286,8 +289,10 @@ RequestBasePlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
             if (begin < previous_end) {
                 throw std::invalid_argument("vision item consumer spans overlap");
             }
-            if (schedule::VisionContext::workspace_bytes(prompt.vision_items[index].patch_count,
-                                                         item.merged_count) > work.capacity()) {
+            if (item.merged_count > workspace_plan.vision->max_merged_tokens ||
+                schedule::VisionContext::workspace_bytes(prompt.vision_items[index].patch_count,
+                                                         item.merged_count) >
+                    workspace_plan.vision->encode_peak_bytes) {
                 throw std::invalid_argument("vision item exceeds the Program workspace envelope");
             }
             previous_end = item.token_end;
@@ -692,9 +697,8 @@ std::optional<AdmissionPlan> ProgramImplCore::inspect_lane(
             max_merged = std::max(max_merged, item.merged_count);
         }
         if (!vision.uses.empty()) {
-            plan->transient_alignment = 256;
-            plan->transient_bytes     = schedule::VisionContext::output_transient_bytes(max_merged);
-            plan->vision              = std::move(vision);
+            vision.max_merged_count = max_merged;
+            plan->vision            = std::move(vision);
         }
     }
 

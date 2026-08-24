@@ -108,7 +108,7 @@ int verify_dflash_load(const ninfer::Engine& engine) {
         memory.weights.used_bytes > memory.weights.capacity_bytes ||
         memory.sequence.capacity_bytes == 0 || memory.sequence.used_bytes == 0 ||
         memory.sequence.used_bytes > memory.sequence.capacity_bytes ||
-        memory.workspace.capacity_bytes == 0 || memory.request_transient.capacity_bytes != 0 ||
+        memory.workspace.capacity_bytes == 0 || memory.vision_workspace.has_value() ||
         memory.workspace_logical_peak_bytes != 0 || memory.cuda_graph_allowance_bytes == 0) {
         std::cerr << "DFlash Engine has an invalid frozen memory layout\n";
         return 1;

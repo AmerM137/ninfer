@@ -251,6 +251,18 @@ Json arena_json(const ninfer::ArenaMemorySummary& arena) {
                 {"peak_used_bytes", arena.peak_used_bytes}};
 }
 
+Json vision_workspace_json(const std::optional<ninfer::VisionWorkspaceMemorySummary>& vision) {
+    if (!vision) { return nullptr; }
+    return Json{{"aggregate_prompt_tokens", vision->aggregate_prompt_tokens},
+                {"max_item_tokens", vision->max_item_tokens},
+                {"general_capacity_bytes", vision->general_capacity_bytes},
+                {"encode_peak_bytes", vision->encode_peak_bytes},
+                {"handoff_offset_bytes", vision->handoff_offset_bytes},
+                {"handoff_capacity_bytes", vision->handoff_capacity_bytes},
+                {"handoff_active_bytes", vision->handoff_active_bytes},
+                {"handoff_peak_bytes", vision->handoff_peak_bytes}};
+}
+
 Json speculative_json(const GenerationMetrics& metrics) {
     return Json{{"backend", product::speculative_backend_name(metrics.speculative_backend)},
                 {"draft_window", metrics.speculative_draft_window},
@@ -668,7 +680,7 @@ std::string format_server_start_json(
         Json{{"weights", arena_json(memory.weights)},
              {"sequence", arena_json(memory.sequence)},
              {"workspace", arena_json(memory.workspace)},
-             {"request_transient", arena_json(memory.request_transient)},
+             {"vision_workspace", vision_workspace_json(memory.vision_workspace)},
              {"minimum_runtime_reservation_bytes", memory.minimum_runtime_reservation_bytes},
              {"kv_capacity_increment_bytes", memory.kv_capacity_increment_bytes},
              {"runtime_reservation_bytes", memory.runtime_reservation_bytes},
