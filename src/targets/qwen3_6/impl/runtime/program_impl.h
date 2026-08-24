@@ -7509,9 +7509,8 @@ ProgramImplCore::append_forced_tokens(std::span<const SequenceHandle> members,
             materialize_sequence_kv(sequence, end,
                                     speculative_backend == SpeculativeBackend::None ? 0U : end);
 
-            std::vector<TokenId> continuation = sequence.ledger;
-            continuation.insert(continuation.end(), forced.begin(), forced.end());
-            if (continuation.size() != static_cast<std::size_t>(end) + 1U) {
+            sequence.ledger.insert(sequence.ledger.end(), forced.begin(), forced.end());
+            if (sequence.ledger.size() != static_cast<std::size_t>(end) + 1U) {
                 throw std::logic_error("forced-token continuation ledger has an invalid shape");
             }
 
@@ -7558,7 +7557,7 @@ ProgramImplCore::append_forced_tokens(std::span<const SequenceHandle> members,
                     mark_workspace_usage(workspace_plan.dflash_context);
                 }
                 const schedule::PrefillChunkResult result = schedule::prefill_text_chunk(
-                    schedule_state, continuation, count, std::nullopt, false);
+                    schedule_state, sequence.ledger, count, std::nullopt, false);
                 if (result.finalized || result.processed_tokens == 0 ||
                     result.processed_tokens > count) {
                     throw std::logic_error("forced-token prefill made invalid progress");
@@ -7581,7 +7580,6 @@ ProgramImplCore::append_forced_tokens(std::span<const SequenceHandle> members,
             timing.end_wait();
             work.reset();
 
-            sequence.ledger.insert(sequence.ledger.end(), forced.begin(), forced.end());
             sequence.prefix_identity.append_generated(row_stride, sequence.rope_delta);
             advance_rebuild_work(sequence, end, prefill_chunk);
             sequence.execution_frontier = end;

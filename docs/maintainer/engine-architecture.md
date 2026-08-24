@@ -721,6 +721,9 @@ Program 把一行 control 前的 sequence invariant
 `E'=E+K, S'=E'+1`，最后的 `F[K-1]` 成为下一普通 decode 的 anchor。同一 family 算法更新 Main KV、GDN
 state/fork、tail hidden、position/rope delta、prefix identity、MTP KV 与 draft reset，以及 DFlash
 feature/context frontier。控制预算值本身不进入 prefix identity；已提交的 forced token IDs 进入。
+Sequence ledger在Program构造时已按max context预留；control transaction直接向该ledger追加suffix，不能
+复制完整历史作为临时输入。追加后的ledger只在同一worker transaction内可见，后续失败会清理整个sequence，
+成功后再原子推进其余frontier/identity metadata。
 
 若有效输出容量 `M` 大于 budget `B`，planning 要求 `M-B >= K+1`；额外一个槽位只提供一次 post-close
 模型执行机会，不保证可见正文或工具调用。`M<=B` 时普通 output/context limit 可以先结束请求。
