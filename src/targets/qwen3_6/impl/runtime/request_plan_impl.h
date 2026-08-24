@@ -285,10 +285,8 @@ RequestBasePlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
             if (begin < previous_end) {
                 throw std::invalid_argument("vision item consumer spans overlap");
             }
-            if (schedule::VisionContext::workspace_bytes(
-                    prompt.vision_items[index].patch_count, item.merged_count,
-                    static_cast<std::size_t>(prompt.vision_items[index].grid.temporal)) >
-                work.capacity()) {
+            if (schedule::VisionContext::workspace_bytes(prompt.vision_items[index].patch_count,
+                                                         item.merged_count) > work.capacity()) {
                 throw std::invalid_argument("vision item exceeds the Program workspace envelope");
             }
             previous_end = item.token_end;

@@ -129,15 +129,15 @@ VisionControl build_vision_control(const PreparedPromptData& prompt, const Visio
         control.patch_begin    = item.patch_begin;
         control.patch_count    = item.patch_count;
         control.merged_count   = input.merged_count;
-        control.segment_length = h * w;
-        control.segment_count  = t;
+        control.segment_length = checked_i32(
+            checked_mul(static_cast<std::size_t>(h), static_cast<std::size_t>(w), "segment length"),
+            "segment length");
+        control.segment_count = t;
         control.position_ids.resize(checked_mul(item_patches, 2, "position id count"));
         control.position_table_indices.reserve(
             checked_mul(item_patches, 4, "position table index count"));
         control.position_table_weights.reserve(
             checked_mul(item_patches, 4, "position table weight count"));
-        control.cu_seqlens.push_back(0);
-
         const auto expected = static_cast<std::uint8_t>(item.modality);
         for (const TokenSpan& span : item.token_spans) {
             if (!std::all_of(prompt.token_types.begin() + static_cast<std::ptrdiff_t>(span.begin),
@@ -153,12 +153,6 @@ VisionControl build_vision_control(const PreparedPromptData& prompt, const Visio
 
         std::size_t position_cursor = 0;
         for (std::int32_t temporal = 0; temporal < t; ++temporal) {
-            const std::int64_t next = static_cast<std::int64_t>(control.cu_seqlens.back()) +
-                                      static_cast<std::int64_t>(h) * w;
-            if (next > std::numeric_limits<std::int32_t>::max()) {
-                throw std::overflow_error("vision control cu_seqlens exceeds int32");
-            }
-            control.cu_seqlens.push_back(static_cast<std::int32_t>(next));
             for (std::int32_t block_y = 0; block_y < h / kMerge; ++block_y) {
                 for (std::int32_t block_x = 0; block_x < w / kMerge; ++block_x) {
                     for (std::int32_t inner_y = 0; inner_y < kMerge; ++inner_y) {
@@ -195,7 +189,9 @@ VisionControl build_vision_control(const PreparedPromptData& prompt, const Visio
             control.position_table_indices.size() != item_patches * 4 ||
             control.position_table_weights.size() != item_patches * 4 ||
             control.scatter_indices.size() != input.merged_count ||
-            control.cu_seqlens.back() != checked_i32(item_patches, "item patch count")) {
+            checked_mul(static_cast<std::size_t>(control.segment_length),
+                        static_cast<std::size_t>(control.segment_count),
+                        "segmented patch count") != item_patches) {
             throw std::invalid_argument("vision item control metadata is incomplete");
         }
         out.items.push_back(std::move(control));

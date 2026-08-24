@@ -199,7 +199,6 @@ void test_vision_control() {
     expect(control.items[0].patch_begin == 0 && control.items[0].patch_count == 4 &&
                control.items[0].merged_count == 1 && control.items[0].segment_length == 4 &&
                control.items[0].segment_count == 1 &&
-               control.items[0].cu_seqlens == std::vector<std::int32_t>({0, 4}) &&
                control.items[0].scatter_indices == std::vector<std::int32_t>({1}) &&
                control.items[0].position_ids.size() == 8 &&
                control.items[0].position_table_indices.size() == 16 &&
@@ -208,7 +207,6 @@ void test_vision_control() {
     expect(control.items[1].patch_begin == 4 && control.items[1].patch_count == 8 &&
                control.items[1].merged_count == 2 && control.items[1].segment_length == 4 &&
                control.items[1].segment_count == 2 &&
-               control.items[1].cu_seqlens == std::vector<std::int32_t>({0, 4, 8}) &&
                control.items[1].scatter_indices == std::vector<std::int32_t>({3, 5}) &&
                control.items[1].position_ids.size() == 16 &&
                control.items[1].position_table_indices.size() == 32 &&

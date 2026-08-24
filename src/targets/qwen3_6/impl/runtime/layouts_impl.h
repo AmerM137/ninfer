@@ -559,11 +559,9 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     }
 
     if (plan.features.vision) {
-        constexpr std::uint32_t kFrontendMergedLimit  = 32768;
-        constexpr std::uint32_t kFrontendSegmentLimit = 768 / 2;
+        constexpr std::uint32_t kFrontendMergedLimit = 32768;
         const std::uint32_t merged = std::min(plan.capacity, kFrontendMergedLimit);
-        out.vision_encode          = schedule::VisionContext::workspace_capacity_bytes(
-            merged, std::min(merged, kFrontendSegmentLimit));
+        out.vision_encode          = schedule::VisionContext::workspace_capacity_bytes(merged);
     }
 
     out.capacity = std::max({out.text_prefill, out.ordinary_round, out.mtp_prefill, out.mtp_round,
