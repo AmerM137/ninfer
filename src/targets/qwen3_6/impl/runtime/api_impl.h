@@ -313,7 +313,7 @@ bool Program<Variant>::has_context_transaction() const noexcept {
 template <>
 PrefillProgress<Variant>
 Program<Variant>::advance_prefill(SequenceHandle<Variant> sequence,
-                                  runtime::ExecutionTiming& failed_timing) {
+                                  runtime::ExecutionTiming* failed_timing) {
     return impl_->advance_prefill(sequence, failed_timing);
 }
 
@@ -387,14 +387,14 @@ runtime::ContextTransactionReserveStatus Program<Variant>::reserve_prevalidated_
 template <>
 PendingBatch<Variant> Program<Variant>::decode(std::span<const SequenceHandle<Variant>> sequences,
                                                std::span<const runtime::RoundBudget> budgets,
-                                               runtime::ExecutionTiming& failed_timing) {
+                                               runtime::ExecutionTiming* failed_timing) {
     return impl_->decode(sequences, budgets, failed_timing);
 }
 
 template <>
 runtime::ExecutionTiming Program<Variant>::append_forced_tokens(
     std::span<const SequenceHandle<Variant>> sequences, std::span<const TokenId> row_major_tokens,
-    std::uint32_t row_stride, runtime::ExecutionTiming& failed_timing) {
+    std::uint32_t row_stride, runtime::ExecutionTiming* failed_timing) {
     return impl_->append_forced_tokens(sequences, row_major_tokens, row_stride, failed_timing);
 }
 
@@ -402,7 +402,7 @@ template <>
 CommitResult<Variant> Program<Variant>::commit(PendingBatch<Variant>&& pending,
                                                std::span<const runtime::CommitDecision> decisions,
                                                runtime::CommitObservation observation,
-                                               runtime::ExecutionTiming& failed_timing) {
+                                               runtime::ExecutionTiming* failed_timing) {
     return impl_->commit(std::move(pending), decisions, observation, failed_timing);
 }
 

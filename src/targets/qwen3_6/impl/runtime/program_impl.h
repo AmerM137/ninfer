@@ -5977,7 +5977,7 @@ ProgramImplCore::shared_prefix_summary(const SharedPrefixState& shared) const {
 }
 
 PrefillProgress ProgramImplCore::advance_prefill(SequenceHandle sequence,
-                                                 runtime::ExecutionTiming& failed_timing) {
+                                                 runtime::ExecutionTiming* failed_timing) {
     if (pending_transaction_ || !valid_sequence(sequence)) {
         throw std::logic_error("prefill sequence capability is invalid");
     }
@@ -5986,14 +5986,16 @@ PrefillProgress ProgramImplCore::advance_prefill(SequenceHandle sequence,
         throw std::logic_error("prefill advance requires a prefilling sequence");
     }
     try {
-        runtime::PrefillStepResult step = advance_prefill_raw(lane, &failed_timing);
-        failed_timing += step.timing;
+        runtime::PrefillStepResult step = advance_prefill_raw(lane, failed_timing);
+        if (failed_timing != nullptr) { *failed_timing += step.timing; }
         return wrap_prefill(lane, std::move(step));
     } catch (...) {
         const Clock::time_point cleanup_started = Clock::now();
         clear_lane(active_sequence(lane), requests[lane]);
         invalidate_lane(lane);
-        failed_timing.post_host_ns += elapsed_ns(cleanup_started);
+        if (failed_timing != nullptr) {
+            failed_timing->post_host_ns += elapsed_ns(cleanup_started);
+        }
         throw;
     }
 }
@@ -7404,7 +7406,7 @@ qwen3_6::ReplicaTransitionResult ProgramImplCore::progress_replica_transition_tr
 
 PendingBatch ProgramImplCore::decode(std::span<const SequenceHandle> members,
                                      std::span<const runtime::RoundBudget> budgets,
-                                     runtime::ExecutionTiming& failed_timing) {
+                                     runtime::ExecutionTiming* failed_timing) {
     if (pending_transaction_ || members.empty() || members.size() > max_concurrency ||
         budgets.size() != members.size()) {
         throw std::invalid_argument("decode membership is invalid");
@@ -7424,8 +7426,8 @@ PendingBatch ProgramImplCore::decode(std::span<const SequenceHandle> members,
     }
     const auto lane_span = std::span<const std::uint32_t>(lanes.data(), members.size());
     try {
-        runtime::BatchedGeneratedRound round = decode_raw(lane_span, budgets, &failed_timing);
-        failed_timing += round.timing;
+        runtime::BatchedGeneratedRound round = decode_raw(lane_span, budgets, failed_timing);
+        if (failed_timing != nullptr) { *failed_timing += round.timing; }
         return wrap_pending(lane_span, std::move(round));
     } catch (...) {
         const Clock::time_point cleanup_started = Clock::now();
@@ -7434,15 +7436,17 @@ PendingBatch ProgramImplCore::decode(std::span<const SequenceHandle> members,
             invalidate_lane(lane);
         }
         pending_transaction_.reset();
-        failed_timing.post_host_ns += elapsed_ns(cleanup_started);
+        if (failed_timing != nullptr) {
+            failed_timing->post_host_ns += elapsed_ns(cleanup_started);
+        }
         throw;
     }
 }
 
 runtime::ExecutionTiming ProgramImplCore::append_forced_tokens(
     std::span<const SequenceHandle> members, std::span<const TokenId> row_major_tokens,
-    std::uint32_t row_stride, runtime::ExecutionTiming& failed_timing) {
-    runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Submit, &failed_timing);
+    std::uint32_t row_stride, runtime::ExecutionTiming* failed_timing) {
+    runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Submit, failed_timing);
     if (pending_transaction_ || members.empty() || members.size() > max_concurrency ||
         row_stride == 0 ||
         row_major_tokens.size() != static_cast<std::size_t>(row_stride) * members.size()) {
@@ -7620,8 +7624,8 @@ runtime::ExecutionTiming ProgramImplCore::append_forced_tokens(
 CommitResult ProgramImplCore::commit(PendingBatch&& pending,
                                      std::span<const runtime::CommitDecision> decisions,
                                      runtime::CommitObservation observation,
-                                     runtime::ExecutionTiming& failed_timing) {
-    runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Post, &failed_timing);
+                                     runtime::ExecutionTiming* failed_timing) {
+    runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Post, failed_timing);
     std::array<SequenceHandle, kMaximumConcurrency> members{};
     const auto input_rows       = ContractAccess::rows(pending);
     const std::size_t row_count = input_rows.size();
@@ -7680,7 +7684,7 @@ CommitResult ProgramImplCore::commit(PendingBatch&& pending,
             std::span<const std::uint32_t>(lanes.data(), row_count),
             std::span<const std::uint32_t>(accepted.data(), row_count),
             std::span<const std::uint8_t>(terminal.data(), row_count),
-            std::span<const std::uint8_t>(cancelled.data(), row_count), &failed_timing));
+            std::span<const std::uint8_t>(cancelled.data(), row_count), failed_timing));
         timing.resume_post();
         pending_transaction_.reset();
 

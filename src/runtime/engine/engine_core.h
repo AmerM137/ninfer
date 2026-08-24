@@ -961,7 +961,7 @@ private:
             ProgramCallScope program_call(*this);
             auto committed = instance_.program->commit(
                 std::move(pending), std::span<const CommitDecision>(decisions.data(), row_count),
-                CommitObservation::ReleasedRowsOnly, program_call.failed_timing());
+                CommitObservation::ReleasedRowsOnly, &program_call.failed_timing());
             program_call.finish(committed.timing);
             committed_storage.emplace(std::move(committed));
             phase.resume_range();
@@ -1166,7 +1166,7 @@ private:
         setup.finish();
         ProgramCallScope program_call(*this);
         auto progress =
-            instance_.program->advance_prefill(*request->sequence, program_call.failed_timing());
+            instance_.program->advance_prefill(*request->sequence, &program_call.failed_timing());
         program_call.finish(progress.timing);
         resolve_prefill_progress(request, std::move(progress), cancelled_at_unit_start);
         publish_runtime_stats();
@@ -1567,7 +1567,7 @@ private:
                           const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start) {
         ProgramCallScope program_call(*this);
         auto pending = instance_.program->decode(
-            membership.sequence_span(), membership.budget_span(), program_call.failed_timing());
+            membership.sequence_span(), membership.budget_span(), &program_call.failed_timing());
         program_call.finish(pending.execution_timing());
         commit_pending(std::move(pending), membership.lane_span(), true, cancelled_at_unit_start);
         publish_runtime_stats();
@@ -1631,7 +1631,7 @@ private:
             ProgramCallScope program_call(*this);
             const runtime::ExecutionTiming timing = instance_.program->append_forced_tokens(
                 membership.sequence_span(), membership.tokens, membership.row_stride,
-                program_call.failed_timing());
+                &program_call.failed_timing());
             program_call.finish(timing);
             phase.resume_range();
         } catch (...) {

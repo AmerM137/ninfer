@@ -404,7 +404,7 @@ public:
     void finalize_context_transaction() noexcept;
     [[nodiscard]] bool has_context_transaction() const noexcept;
     [[nodiscard]] PrefillProgress advance_prefill(SequenceHandle sequence,
-                                                  runtime::ExecutionTiming& failed_timing);
+                                                  runtime::ExecutionTiming* failed_timing);
     [[nodiscard]] CaptureAssessment
     inspect_capture(const CaptureOffer& offer, const SharedPrefixHandle* exact_shared,
                     const SharedPrefixHandle* replacement,
@@ -435,15 +435,15 @@ public:
         runtime::CancellationFlagView cancellation);
     [[nodiscard]] PendingBatch decode(std::span<const SequenceHandle> sequences,
                                       std::span<const runtime::RoundBudget> budgets,
-                                      runtime::ExecutionTiming& failed_timing);
+                                      runtime::ExecutionTiming* failed_timing);
     [[nodiscard]] runtime::ExecutionTiming
     append_forced_tokens(std::span<const SequenceHandle> sequences,
                          std::span<const TokenId> row_major_tokens, std::uint32_t row_stride,
-                         runtime::ExecutionTiming& failed_timing);
+                         runtime::ExecutionTiming* failed_timing);
     [[nodiscard]] CommitResult commit(PendingBatch&& pending,
                                       std::span<const runtime::CommitDecision> decisions,
                                       runtime::CommitObservation observation,
-                                      runtime::ExecutionTiming& failed_timing);
+                                      runtime::ExecutionTiming* failed_timing);
     [[nodiscard]] DiscardResult abort_pending(PendingBatch&& pending) noexcept;
     [[nodiscard]] FinishResult finish(SequenceHandle sequence) noexcept;
     [[nodiscard]] AbortResult abort(SequenceHandle sequence) noexcept;

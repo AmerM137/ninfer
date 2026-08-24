@@ -659,8 +659,9 @@ public:
     progress_context_transaction(runtime::CancellationFlagView cancellation);
     void finalize_context_transaction() noexcept;
     [[nodiscard]] bool has_context_transaction() const noexcept;
-    [[nodiscard]] PrefillProgress<Variant> advance_prefill(SequenceHandle<Variant> sequence,
-                                                           runtime::ExecutionTiming& failed_timing);
+    [[nodiscard]] PrefillProgress<Variant>
+    advance_prefill(SequenceHandle<Variant> sequence,
+                    runtime::ExecutionTiming* failed_timing = nullptr);
     [[nodiscard]] CaptureAssessment
     inspect_capture(const CaptureOffer<Variant>& offer,
                     const SharedPrefixHandle<Variant>* exact_shared,
@@ -697,17 +698,17 @@ public:
         std::optional<PressureOption> replacement, runtime::CancellationFlagView cancellation);
     [[nodiscard]] PendingBatch<Variant> decode(std::span<const SequenceHandle<Variant>> sequences,
                                                std::span<const runtime::RoundBudget> budgets,
-                                               runtime::ExecutionTiming& failed_timing);
+                                               runtime::ExecutionTiming* failed_timing = nullptr);
     // Advance each live sequence with its exact target-owned token row. This does not sample or
     // advance sampler RNG/occurrence state; callers own output publication and budget accounting.
     [[nodiscard]] runtime::ExecutionTiming
     append_forced_tokens(std::span<const SequenceHandle<Variant>> sequences,
                          std::span<const TokenId> row_major_tokens, std::uint32_t row_stride,
-                         runtime::ExecutionTiming& failed_timing);
-    [[nodiscard]] CommitResult<Variant> commit(PendingBatch<Variant>&& pending,
-                                               std::span<const runtime::CommitDecision> decisions,
-                                               runtime::CommitObservation observation,
-                                               runtime::ExecutionTiming& failed_timing);
+                         runtime::ExecutionTiming* failed_timing = nullptr);
+    [[nodiscard]] CommitResult<Variant>
+    commit(PendingBatch<Variant>&& pending, std::span<const runtime::CommitDecision> decisions,
+           runtime::CommitObservation observation  = runtime::CommitObservation::AllRows,
+           runtime::ExecutionTiming* failed_timing = nullptr);
     [[nodiscard]] DiscardResult<Variant> abort_pending(PendingBatch<Variant>&& pending) noexcept;
     [[nodiscard]] FinishResult<Variant> finish(SequenceHandle<Variant> sequence) noexcept;
     [[nodiscard]] AbortResult<Variant> abort(SequenceHandle<Variant> sequence) noexcept;
