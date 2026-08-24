@@ -13,6 +13,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <iomanip>
+#include <iterator>
 #include <limits>
 #include <mutex>
 #include <sstream>
@@ -395,73 +396,120 @@ std::vector<ChatPart*> media_parts(std::vector<ChatMessage>& messages) {
     return out;
 }
 
-std::string repeat(std::string_view value, std::uint64_t count) {
-    if (count > std::numeric_limits<std::size_t>::max() / value.size()) {
+void append_repeated(std::string& out, std::string_view value, std::uint64_t count) {
+    if (count > (std::numeric_limits<std::size_t>::max() - out.size()) / value.size()) {
         throw std::invalid_argument("vision placeholder expansion is too large");
     }
-    std::string out;
-    out.reserve(static_cast<std::size_t>(count) * value.size());
     for (std::uint64_t i = 0; i < count; ++i) { out += value; }
-    return out;
 }
 
-std::string placeholder(const VisionItem& item) {
+void append_placeholder(std::string& out, const VisionItem& item) {
     const std::uint64_t frame_tokens =
         static_cast<std::uint64_t>(item.grid.h / kMerge) * (item.grid.w / kMerge);
-    if (item.modality == Modality::Image) { return repeat(kImagePad, frame_tokens); }
+    if (item.modality == Modality::Image) {
+        append_repeated(out, kImagePad, frame_tokens);
+        return;
+    }
     if (item.timestamps.size() != static_cast<std::size_t>(item.grid.t)) {
         throw std::logic_error("video timestamp count does not match grid");
     }
-    std::string out;
     for (double timestamp : item.timestamps) {
         std::ostringstream time;
         time << '<' << std::fixed << std::setprecision(1) << timestamp << " seconds>";
         out += time.str();
         out += kVisionStart;
-        out += repeat(kVideoPad, frame_tokens);
+        append_repeated(out, kVideoPad, frame_tokens);
         out += kVisionEnd;
     }
-    return out;
+}
+
+struct PlaceholderMatch {
+    std::size_t position = 0;
+    Modality modality    = Modality::Image;
+};
+
+std::optional<PlaceholderMatch> find_next_placeholder(std::string_view text, std::size_t begin) {
+    constexpr std::string_view prefix = "<|";
+    while ((begin = text.find(prefix, begin)) != std::string_view::npos) {
+        if (text.substr(begin).starts_with(kImagePad)) {
+            return PlaceholderMatch{.position = begin, .modality = Modality::Image};
+        }
+        if (text.substr(begin).starts_with(kVideoPad)) {
+            return PlaceholderMatch{.position = begin, .modality = Modality::Video};
+        }
+        begin += prefix.size();
+    }
+    return std::nullopt;
+}
+
+struct PlaceholderExpansion {
+    std::size_t source_begin = 0;
+    std::size_t source_end   = 0;
+    std::size_t rendered_end = 0;
+};
+
+std::size_t map_expanded_boundary(std::size_t boundary, std::size_t source_size,
+                                  std::span<const PlaceholderExpansion> expansions,
+                                  std::string_view kind) {
+    if (boundary > source_size) {
+        throw std::logic_error(std::string(kind) + " byte offset exceeds rendered chat");
+    }
+    const auto first_incomplete =
+        std::upper_bound(expansions.begin(), expansions.end(), boundary,
+                         [](std::size_t value, const PlaceholderExpansion& expansion) {
+                             return value < expansion.source_end;
+                         });
+    if (first_incomplete != expansions.end() && first_incomplete->source_begin < boundary) {
+        throw std::logic_error(std::string(kind) + " intersects a media placeholder");
+    }
+    if (first_incomplete == expansions.begin()) { return boundary; }
+    const PlaceholderExpansion& completed = *std::prev(first_incomplete);
+    return completed.rendered_end + boundary - completed.source_end;
 }
 
 RenderedChat expand_placeholders(RenderedChat rendered, const std::vector<VisionItem>& items) {
-    std::size_t search = 0;
+    std::string source = std::move(rendered.text);
+    std::string expanded;
+    expanded.reserve(source.size());
+    std::vector<PlaceholderExpansion> expansions;
+    expansions.reserve(items.size());
+    std::size_t source_cursor = 0;
     for (const VisionItem& item : items) {
-        const std::string_view needle    = item.modality == Modality::Image ? kImagePad : kVideoPad;
-        const std::size_t position       = rendered.text.find(needle, search);
-        const std::string_view other     = item.modality == Modality::Image ? kVideoPad : kImagePad;
-        const std::size_t other_position = rendered.text.find(other, search);
-        if (position == std::string::npos ||
-            (other_position != std::string::npos && other_position < position)) {
+        const std::optional<PlaceholderMatch> match = find_next_placeholder(source, source_cursor);
+        if (!match || match->modality != item.modality) {
             throw std::invalid_argument("chat media order does not match rendered placeholders");
         }
-        const std::string replacement = placeholder(item);
-        const auto adjust_boundary    = [&](std::size_t& boundary, std::string_view kind) {
-            const std::size_t end = position + needle.size();
-            if (position < boundary && boundary < end) {
-                throw std::logic_error(std::string(kind) + " intersects a media placeholder");
-            }
-            if (end <= boundary) { boundary = boundary - needle.size() + replacement.size(); }
-        };
-        if (rendered.rewrite_checkpoint) {
-            adjust_boundary(rendered.rewrite_checkpoint->offset, "rewrite checkpoint");
-        }
-        for (std::size_t& boundary : rendered.rewrite_execution_boundaries) {
-            adjust_boundary(boundary, "rewrite execution boundary");
-        }
-        for (std::optional<std::size_t>& boundary : rendered.message_boundaries) {
-            if (boundary) { adjust_boundary(*boundary, "message boundary"); }
-        }
-        for (std::optional<std::size_t>& boundary : rendered.cache_boundaries) {
-            if (boundary) { adjust_boundary(*boundary, "cache boundary"); }
-        }
-        rendered.text.replace(position, needle.size(), replacement);
-        search = position + replacement.size();
+        const std::string_view needle = item.modality == Modality::Image ? kImagePad : kVideoPad;
+        expanded.append(source, source_cursor, match->position - source_cursor);
+        append_placeholder(expanded, item);
+        const std::size_t source_end = match->position + needle.size();
+        expansions.push_back(PlaceholderExpansion{.source_begin = match->position,
+                                                  .source_end   = source_end,
+                                                  .rendered_end = expanded.size()});
+        source_cursor = source_end;
     }
-    if (rendered.text.find(kImagePad, search) != std::string::npos ||
-        rendered.text.find(kVideoPad, search) != std::string::npos) {
+    if (find_next_placeholder(source, source_cursor)) {
         throw std::invalid_argument("rendered chat has unbound vision placeholders");
     }
+    expanded.append(source, source_cursor, source.size() - source_cursor);
+
+    const auto map_boundary = [&](std::size_t boundary, std::string_view kind) {
+        return map_expanded_boundary(boundary, source.size(), expansions, kind);
+    };
+    if (rendered.rewrite_checkpoint) {
+        rendered.rewrite_checkpoint->offset =
+            map_boundary(rendered.rewrite_checkpoint->offset, "rewrite checkpoint");
+    }
+    for (std::size_t& boundary : rendered.rewrite_execution_boundaries) {
+        boundary = map_boundary(boundary, "rewrite execution boundary");
+    }
+    for (std::optional<std::size_t>& boundary : rendered.message_boundaries) {
+        if (boundary) { *boundary = map_boundary(*boundary, "message boundary"); }
+    }
+    for (std::optional<std::size_t>& boundary : rendered.cache_boundaries) {
+        if (boundary) { *boundary = map_boundary(*boundary, "cache boundary"); }
+    }
+    rendered.text = std::move(expanded);
     return rendered;
 }
 

@@ -955,6 +955,10 @@ int test_text_and_image_prepare(const Frontend& frontend) {
     image_message.parts.push_back(std::move(image));
     ninfer::PromptInput image_input;
     image_input.messages.push_back(std::move(image_message));
+    image_input.context_cache.markers.push_back(ninfer::PromptCacheMarker{
+        .after_message_count = 1,
+        .kind                = ninfer::PromptCacheMarkerKind::PrivateLongAnchor,
+    });
     auto prepared             = frontend.prepare(std::move(image_input));
     const auto& prepared_data = FrontendFactory::inspect(prepared);
     failures += check(prepared_data.has_media() && prepared_data.vision_items.size() == 1,
@@ -990,6 +994,16 @@ int test_text_and_image_prepare(const Frontend& frontend) {
                 ninfer::targets::qwen3_6::RewriteCheckpointKind::TurnClosure &&
             prepared_data.identity.rewrite_checkpoint->frontier < prepared_data.token_ids.size(),
         "image frontend did not own the expected patch payload and identity");
+    if (!prepared_data.vision_items.empty() &&
+        !prepared_data.vision_items.front().token_spans.empty()) {
+        const auto span = prepared_data.vision_items.front().token_spans.front();
+        failures += check(prepared_data.context_cache.opportunities.size() == 1 &&
+                              prepared_data.context_cache.opportunities.front().frontier >=
+                                  span.begin + span.count &&
+                              prepared_data.context_cache.opportunities.front().frontier <
+                                  prepared_data.token_ids.size(),
+                          "media expansion did not remap the following message cache boundary");
+    }
     if (image_patches.size() == 16 * 1536) {
         failures += check(image_patches[0] == bf16_bits(-1.0F) &&
                               image_patches[1] == bf16_bits(1.0F / 127.5F - 1.0F) &&
