@@ -238,6 +238,19 @@ std::size_t DeviceKVPagePool::plane_count() const noexcept { return planes_.size
 
 const Tensor& DeviceKVPagePool::plane(std::size_t index) const { return planes_.at(index); }
 
+std::uint32_t
+DeviceKVPagePool::contiguous_run_count(std::span<const DeviceKVPageHandle> pages) const {
+    if (pages.empty()) { return 0; }
+    std::uint32_t runs    = 0;
+    std::int32_t previous = -2;
+    for (const DeviceKVPageHandle page : pages) {
+        const std::int32_t current = physical_index(page);
+        if (runs == 0 || current != previous + 1) { ++runs; }
+        previous = current;
+    }
+    return runs;
+}
+
 std::optional<DeviceKVPageReservation> DeviceKVPagePool::reserve(std::uint32_t pages) noexcept {
     if (pages == 0 || pages > available_pages()) { return std::nullopt; }
     reserved_pages_ += pages;

@@ -6,7 +6,6 @@
 #include "ninfer/ops/prepare_ragged_prefix.h"
 #include "ninfer/ops/scatter.h"
 #include "ninfer/ops/speculative_round.h"
-
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -57,18 +56,26 @@ std::size_t context_resource_index(runtime::ContextResourceClass resource) {
     throw std::logic_error("unknown context resource class");
 }
 
-std::uint64_t seconds_to_ns(double seconds) noexcept {
-    if (!(seconds > 0.0)) { return 0; }
-    const double value = seconds * 1'000'000'000.0;
-    return value >= static_cast<double>(std::numeric_limits<std::uint64_t>::max())
-               ? std::numeric_limits<std::uint64_t>::max()
-               : std::max<std::uint64_t>(1, static_cast<std::uint64_t>(value + 0.5));
+runtime::PrefillWork validated_rebuild_work(runtime::PrefillWork work, std::uint32_t frontier) {
+    if (work.tokens != frontier) {
+        throw std::logic_error("checkpoint rebuild work does not match its frontier");
+    }
+    return work;
 }
 
-runtime::PrefillWork normalized_rebuild_work(runtime::PrefillWork work,
-                                             std::uint32_t frontier = 1) noexcept {
-    work.text_quanta = std::max<std::uint64_t>(work.text_quanta, frontier);
-    return work;
+runtime::PrefillWork interval_rebuild_work(std::uint32_t begin_frontier,
+                                           runtime::PrefillWork begin_work,
+                                           std::uint32_t end_frontier,
+                                           runtime::PrefillWork end_work,
+                                           std::uint32_t prefill_chunk) {
+    if (end_frontier < begin_frontier || end_work.vision_items < begin_work.vision_items ||
+        end_work.vision_patches < begin_work.vision_patches) {
+        throw std::logic_error("checkpoint rebuild interval is not monotonic");
+    }
+    return runtime::make_prefill_work(begin_frontier, end_frontier - begin_frontier,
+                                      end_work.vision_items - begin_work.vision_items,
+                                      end_work.vision_patches - begin_work.vision_patches,
+                                      prefill_chunk);
 }
 
 std::optional<qwen3_6::TargetKVRequirement>
@@ -101,19 +108,55 @@ retained_requirement_after_drop(const qwen3_6::ContinuationSummary& summary,
     return requirement;
 }
 
-void append_pressure_transfer(qwen3_6::PressureOption& option,
-                              runtime::ContextResourceClass resource,
-                              runtime::ContextTransferDirection direction, std::uint64_t bytes,
-                              std::uint32_t pages) {
-    if (bytes == 0) { return; }
-    option.transfer_requirements.push_back(runtime::ContextTransferRequirement{
+runtime::ContextTransferRequirement
+state_transfer_requirement(const StateImageHostLayout& layout,
+                           runtime::ContextTransferDirection direction,
+                           bool dflash_local_only = false) {
+    return runtime::ContextTransferRequirement{
+        .resource   = runtime::ContextResourceClass::State,
+        .direction  = direction,
+        .units      = 1,
+        .page_count = 0,
+        .work       = dflash_local_only ? dflash_local_transfer_work(layout)
+                                        : state_image_transfer_work(layout),
+    };
+}
+
+runtime::ContextTransferRequirement
+kv_transfer_requirement(runtime::ContextResourceClass resource,
+                        runtime::ContextTransferDirection direction, const HostKVPageLayout& layout,
+                        std::uint32_t pages, std::uint32_t contiguous_runs = 1) {
+    const TransferWork work = direction == runtime::ContextTransferDirection::DeviceToDevice
+                                  ? plan_device_kv_copy_work(layout, pages)
+                                  : plan_host_kv_transfer_work(layout, pages, contiguous_runs);
+    return runtime::ContextTransferRequirement{
         .resource   = resource,
         .direction  = direction,
-        .units      = resource == runtime::ContextResourceClass::State ? 1U : bytes,
-        .bytes      = bytes,
+        .units      = work.payload_bytes,
         .page_count = pages,
-        .copy_runs  = 1,
-    });
+        .work       = work,
+    };
+}
+
+std::uint32_t physical_kv_runs(const KVAddressSpaceStore& addresses,
+                               const LogicalKVPageStore& pages, KVAddressSpaceHandle address,
+                               std::uint32_t begin, std::uint32_t count) {
+    if (count == 0) { return 0; }
+    if (begin > addresses.mapped_pages(address) ||
+        count > addresses.mapped_pages(address) - begin) {
+        throw std::logic_error("physical KV run range is outside its address space");
+    }
+    std::vector<DeviceKVPageHandle> physical;
+    physical.reserve(count);
+    for (std::uint32_t offset = 0; offset < count; ++offset) {
+        physical.push_back(pages.physical(addresses.logical_page(address, begin + offset)));
+    }
+    return pages.physical_pool().contiguous_run_count(physical);
+}
+
+void append_pressure_transfer(qwen3_6::PressureOption& option,
+                              runtime::ContextTransferRequirement requirement) {
+    if (requirement.units != 0) { option.transfer_requirements.push_back(std::move(requirement)); }
 }
 
 qwen3_6::PressureCheckpointImpact& pressure_impact(qwen3_6::PressureOption& option,
@@ -128,18 +171,10 @@ qwen3_6::PressureCheckpointImpact& pressure_impact(qwen3_6::PressureOption& opti
 }
 
 void append_restore_impact(qwen3_6::PressureOption& option, runtime::CheckpointRef checkpoint,
-                           runtime::ContextResourceClass resource, std::uint64_t bytes,
-                           std::uint32_t pages) {
-    if (bytes == 0) { return; }
+                           runtime::ContextTransferRequirement requirement) {
+    if (requirement.units == 0) { return; }
     pressure_impact(option, checkpoint)
-        .added_restore_requirements.push_back(runtime::ContextTransferRequirement{
-            .resource   = resource,
-            .direction  = runtime::ContextTransferDirection::HostToDevice,
-            .units      = resource == runtime::ContextResourceClass::State ? 1U : bytes,
-            .bytes      = bytes,
-            .page_count = pages,
-            .copy_runs  = 1,
-        });
+        .added_restore_requirements.push_back(std::move(requirement));
 }
 
 void append_drop_impact(qwen3_6::PressureOption& option,
@@ -705,7 +740,7 @@ void ProgramImplCore::stop_context_transfer_timer(runtime::ContextResourceClass 
 runtime::ContextTransferObservation
 ProgramImplCore::context_transfer_observation(runtime::ContextResourceClass resource,
                                               runtime::ContextTransferDirection direction,
-                                              std::uint64_t bytes, std::uint32_t page_count) const {
+                                              TransferWork work, std::uint32_t page_count) const {
     const double elapsed_ns =
         static_cast<double>(
             context_transfer_timers_[context_resource_index(resource)].elapsed_ms()) *
@@ -717,9 +752,9 @@ ProgramImplCore::context_transfer_observation(runtime::ContextResourceClass reso
     return runtime::ContextTransferObservation{
         .resource   = resource,
         .direction  = direction,
-        .units      = resource == runtime::ContextResourceClass::State ? 1U : bytes,
-        .bytes      = bytes,
+        .units      = resource == runtime::ContextResourceClass::State ? 1U : work.payload_bytes,
         .page_count = page_count,
+        .work       = work,
         .elapsed_ns = measured_ns,
     };
 }
@@ -850,7 +885,6 @@ ProgramImplCore::inspect_shared_eviction_option(const SharedPrefixHandle& shared
     qwen3_6::PressureOption option;
     option.id                                   = std::numeric_limits<std::uint64_t>::max() - 1U;
     option.effect.removed                       = resident_resources(state);
-    option.rebuild_work                         = normalized_rebuild_work(state.rebuild_work);
     const qwen3_6::CheckpointSummary checkpoint = shared_prefix_summary(state).checkpoint;
     append_drop_impact(
         option, checkpoint,
@@ -883,23 +917,7 @@ ProgramImplCore::inspect_replica_transition(const ContinuationHandle& owner,
     } catch (const std::logic_error&) { return std::nullopt; }
 
     qwen3_6::ReplicaTransitionOption option;
-    option.checkpoint = checkpoint;
-    if (checkpoint.kind == runtime::CheckpointKind::SessionEndpoint) {
-        option.rebuild_work             = sequence.rebuild_work;
-        option.rebuild_work.text_quanta = checkpoint.frontier;
-    } else if (checkpoint.kind == runtime::CheckpointKind::TurnClosure ||
-               checkpoint.kind == runtime::CheckpointKind::ResponseReplay) {
-        option.rebuild_work = sequence.rewrite_checkpoint.rebuild_work;
-    } else {
-        const auto anchor = std::find_if(sequence.long_anchors.begin(), sequence.long_anchors.end(),
-                                         [&](const LongAnchorCheckpoint& candidate) {
-                                             return candidate.frontier == checkpoint.frontier &&
-                                                    candidate.ordinal == checkpoint.ordinal;
-                                         });
-        if (anchor == sequence.long_anchors.end()) { return std::nullopt; }
-        option.rebuild_work = anchor->rebuild_work;
-    }
-    option.rebuild_work = normalized_rebuild_work(option.rebuild_work, checkpoint.frontier);
+    option.checkpoint                 = checkpoint;
     const StateReplicaResidency state = state_store->residency(checkpoint_state);
     if (state == StateReplicaResidency::DeviceOnly && host_state_images != nullptr &&
         host_state_images->capacity() != 0 && state_store->source_pins(checkpoint_state) == 0 &&
@@ -907,7 +925,7 @@ ProgramImplCore::inspect_replica_transition(const ContinuationHandle& owner,
         option.resource                      = runtime::ContextResourceClass::State;
         option.effect.added.host.state_slots = 1;
         option.transfer_bytes                = host_state_images->layout().image_bytes;
-        option.copy_runs                     = 1;
+        option.transfer_work = state_image_transfer_work(host_state_images->layout());
         option.added_host_replica_impacts =
             private_replica_value_impacts(sequence, checkpoint_state);
         return option;
@@ -952,7 +970,8 @@ ProgramImplCore::inspect_replica_transition(const ContinuationHandle& owner,
         candidate.page_count                       = count;
         candidate.transfer_bytes             = layout.page_stride * static_cast<std::size_t>(count);
         candidate.effect.added.host.kv_bytes = candidate.transfer_bytes;
-        candidate.copy_runs                  = 1;
+        candidate.transfer_work              = plan_host_kv_transfer_work(
+            layout, count, physical_kv_runs(addresses, pages, address, begin, count));
         const qwen3_6::PressureKVAction backed{
             .begin_page = begin,
             .page_count = count,
@@ -986,10 +1005,9 @@ ProgramImplCore::inspect_replica_transition(const SharedPrefixHandle& owner) con
     if (shared.active_references != 0 || !shared.kv) { return std::nullopt; }
 
     qwen3_6::ReplicaTransitionOption option;
-    option.shared_owner = true;
-    option.checkpoint   = {.kind     = runtime::CheckpointKind::SharedStablePrefix,
-                           .frontier = shared.frontier};
-    option.rebuild_work = normalized_rebuild_work(shared.rebuild_work, shared.frontier);
+    option.shared_owner               = true;
+    option.checkpoint                 = {.kind     = runtime::CheckpointKind::SharedStablePrefix,
+                                         .frontier = shared.frontier};
     const StateReplicaResidency state = state_store->residency(shared.state);
     if (state == StateReplicaResidency::DeviceOnly && host_state_images != nullptr &&
         host_state_images->capacity() != 0 && state_store->source_pins(shared.state) == 0 &&
@@ -997,8 +1015,8 @@ ProgramImplCore::inspect_replica_transition(const SharedPrefixHandle& owner) con
         option.resource                      = runtime::ContextResourceClass::State;
         option.effect.added.host.state_slots = 1;
         option.transfer_bytes                = host_state_images->layout().image_bytes;
-        option.copy_runs                     = 1;
-        option.added_host_replica_impacts    = shared_replica_value_impacts(shared, shared.state);
+        option.transfer_work              = state_image_transfer_work(host_state_images->layout());
+        option.added_host_replica_impacts = shared_replica_value_impacts(shared, shared.state);
         return option;
     }
 
@@ -1041,7 +1059,8 @@ ProgramImplCore::inspect_replica_transition(const SharedPrefixHandle& owner) con
         candidate.page_count                       = count;
         candidate.transfer_bytes             = layout.page_stride * static_cast<std::size_t>(count);
         candidate.effect.added.host.kv_bytes = candidate.transfer_bytes;
-        candidate.copy_runs                  = 1;
+        candidate.transfer_work              = plan_host_kv_transfer_work(
+            layout, count, physical_kv_runs(addresses, pages, address, begin, count));
         const qwen3_6::PressureKVAction backed{
             .begin_page = begin,
             .page_count = count,
@@ -1131,8 +1150,7 @@ std::optional<qwen3_6::PressureOption> ProgramImplCore::inspect_shared_pressure_
     }
 
     qwen3_6::PressureOption option;
-    option.shared_owner = true;
-    option.rebuild_work = normalized_rebuild_work(shared.rebuild_work, shared.frontier);
+    option.shared_owner                        = true;
     const qwen3_6::SharedPrefixSummary summary = shared_prefix_summary(shared);
     std::uint64_t identity                     = 1099511628211ULL;
     const auto mix                             = [&](std::uint64_t value) {
@@ -1157,17 +1175,17 @@ std::optional<qwen3_6::PressureOption> ProgramImplCore::inspect_shared_pressure_
             option.state                         = qwen3_6::PressureStateAction::DemoteSharedToHost;
             option.effect.added.host.state_slots = 1;
             option.transfer_bytes += host_state_images->layout().image_bytes;
-            ++option.copy_runs;
-            append_pressure_transfer(option, runtime::ContextResourceClass::State,
-                                     runtime::ContextTransferDirection::DeviceToHost,
-                                     host_state_images->layout().image_bytes, 0);
+            append_pressure_transfer(option, state_transfer_requirement(
+                                                 host_state_images->layout(),
+                                                 runtime::ContextTransferDirection::DeviceToHost));
         }
         if (option.state != qwen3_6::PressureStateAction::None) {
             if (option.state != qwen3_6::PressureStateAction::DropSharedHostDuplicate) {
                 option.effect.removed.device.state_slots = 1;
-                append_restore_impact(option, summary.checkpoint.ref,
-                                      runtime::ContextResourceClass::State,
-                                      state_images->host_layout().image_bytes, 0);
+                append_restore_impact(
+                    option, summary.checkpoint.ref,
+                    state_transfer_requirement(state_images->host_layout(),
+                                               runtime::ContextTransferDirection::HostToDevice));
             }
             mix(static_cast<std::uint8_t>(option.state));
         }
@@ -1244,17 +1262,20 @@ std::optional<qwen3_6::PressureOption> ProgramImplCore::inspect_shared_pressure_
                 layout.page_stride * static_cast<std::size_t>(action.page_count);
             option.effect.added.host.kv_bytes += bytes;
             option.transfer_bytes += bytes;
-            ++option.copy_runs;
-            append_pressure_transfer(option, resource,
-                                     runtime::ContextTransferDirection::DeviceToHost, bytes,
-                                     action.page_count);
+            append_pressure_transfer(
+                option,
+                kv_transfer_requirement(resource, runtime::ContextTransferDirection::DeviceToHost,
+                                        layout, action.page_count,
+                                        physical_kv_runs(addresses, pages, address,
+                                                         action.begin_page, action.page_count)));
         }
         removed_dimension += action.page_count;
-        const std::uint64_t bytes =
-            static_cast<std::uint64_t>(
-                plan_host_kv_page_layout(pages.physical_pool().geometry()).page_stride) *
-            action.page_count;
-        append_restore_impact(option, summary.checkpoint.ref, resource, bytes, action.page_count);
+        const HostKVPageLayout restore_layout =
+            plan_host_kv_page_layout(pages.physical_pool().geometry());
+        append_restore_impact(
+            option, summary.checkpoint.ref,
+            kv_transfer_requirement(resource, runtime::ContextTransferDirection::HostToDevice,
+                                    restore_layout, action.page_count));
         mix(tag);
         mix(action.begin_page);
         mix(action.page_count);
@@ -1299,8 +1320,6 @@ ProgramImplCore::inspect_pressure_option(const SequenceState& sequence,
     if (!sequence.kv || deficit.device.active_lanes != 0) { return std::nullopt; }
 
     qwen3_6::PressureOption option;
-    option.rebuild_work =
-        normalized_rebuild_work(sequence.rebuild_work, sequence.execution_frontier);
     const qwen3_6::ContinuationSummary summary = continuation_summary(sequence);
     std::uint64_t identity                     = 1469598103934665603ULL;
     const auto mix                             = [&](std::uint64_t value) {
@@ -1329,10 +1348,9 @@ ProgramImplCore::inspect_pressure_option(const SequenceState& sequence,
                                    : qwen3_6::PressureStateAction::DemoteEndpointToHost;
             option.effect.added.host.state_slots = 1;
             option.transfer_bytes += host_state_images->layout().image_bytes;
-            ++option.copy_runs;
-            append_pressure_transfer(option, runtime::ContextResourceClass::State,
-                                     runtime::ContextTransferDirection::DeviceToHost,
-                                     host_state_images->layout().image_bytes, 0);
+            append_pressure_transfer(option, state_transfer_requirement(
+                                                 host_state_images->layout(),
+                                                 runtime::ContextTransferDirection::DeviceToHost));
         } else {
             return false;
         }
@@ -1342,8 +1360,10 @@ ProgramImplCore::inspect_pressure_option(const SequenceState& sequence,
         if (!drops_host) {
             option.effect.removed.device.state_slots = 1;
             const auto append_checkpoint = [&](const qwen3_6::CheckpointSummary& checkpoint) {
-                append_restore_impact(option, checkpoint.ref, runtime::ContextResourceClass::State,
-                                      state_images->host_layout().image_bytes, 0);
+                append_restore_impact(
+                    option, checkpoint.ref,
+                    state_transfer_requirement(state_images->host_layout(),
+                                               runtime::ContextTransferDirection::HostToDevice));
             };
             if (sequence.state.read == state && summary.endpoint) {
                 append_checkpoint(*summary.endpoint);
@@ -1441,14 +1461,16 @@ ProgramImplCore::inspect_pressure_option(const SequenceState& sequence,
                 layout.page_stride * static_cast<std::size_t>(action.page_count);
             option.effect.added.host.kv_bytes += bytes;
             option.transfer_bytes += bytes;
-            ++option.copy_runs;
-            append_pressure_transfer(option, resource,
-                                     runtime::ContextTransferDirection::DeviceToHost, bytes,
-                                     action.page_count);
+            append_pressure_transfer(
+                option,
+                kv_transfer_requirement(resource, runtime::ContextTransferDirection::DeviceToHost,
+                                        layout, action.page_count,
+                                        physical_kv_runs(addresses, pages, address,
+                                                         action.begin_page, action.page_count)));
         }
         removed_dimension += action.page_count;
-        const std::uint64_t stride =
-            plan_host_kv_page_layout(pages.physical_pool().geometry()).page_stride;
+        const HostKVPageLayout restore_layout =
+            plan_host_kv_page_layout(pages.physical_pool().geometry());
         const auto append_checkpoint = [&](const qwen3_6::CheckpointSummary& checkpoint) {
             const std::uint32_t required = resource == runtime::ContextResourceClass::MainKV
                                                ? checkpoint.required_kv.main_pages
@@ -1456,7 +1478,10 @@ ProgramImplCore::inspect_pressure_option(const SequenceState& sequence,
             if (action.begin_page >= required) { return; }
             const std::uint32_t affected =
                 std::min(action.page_count, required - action.begin_page);
-            append_restore_impact(option, checkpoint.ref, resource, stride * affected, affected);
+            append_restore_impact(
+                option, checkpoint.ref,
+                kv_transfer_requirement(resource, runtime::ContextTransferDirection::HostToDevice,
+                                        restore_layout, affected));
         };
         if (summary.endpoint) { append_checkpoint(*summary.endpoint); }
         if (summary.rewrite) { append_checkpoint(*summary.rewrite); }
@@ -1549,14 +1574,8 @@ ProgramImplCore::checkpoint_restore_requirements(const SequenceKVBundle& kv,
         if (host_state_images == nullptr) {
             throw std::logic_error("Host-only checkpoint has no Host StateImage pool");
         }
-        requirements.push_back(runtime::ContextTransferRequirement{
-            .resource   = runtime::ContextResourceClass::State,
-            .direction  = runtime::ContextTransferDirection::HostToDevice,
-            .units      = 1,
-            .bytes      = host_state_images->layout().image_bytes,
-            .page_count = 0,
-            .copy_runs  = 1,
-        });
+        requirements.push_back(state_transfer_requirement(
+            host_state_images->layout(), runtime::ContextTransferDirection::HostToDevice));
     }
     const auto append_kv = [&](const KVAddressSpaceStore& addresses,
                                const LogicalKVPageStore& pages, KVAddressSpaceHandle address,
@@ -1583,20 +1602,9 @@ ProgramImplCore::checkpoint_restore_requirements(const SequenceKVBundle& kv,
             ++missing;
         }
         if (missing == 0) { return; }
-        const std::uint64_t stride =
-            plan_host_kv_page_layout(pages.physical_pool().geometry()).page_stride;
-        if (stride > std::numeric_limits<std::uint64_t>::max() / missing) {
-            throw std::overflow_error("checkpoint KV restore size overflow");
-        }
-        const std::uint64_t bytes = stride * missing;
-        requirements.push_back(runtime::ContextTransferRequirement{
-            .resource   = resource,
-            .direction  = runtime::ContextTransferDirection::HostToDevice,
-            .units      = bytes,
-            .bytes      = bytes,
-            .page_count = missing,
-            .copy_runs  = runs,
-        });
+        const HostKVPageLayout layout = plan_host_kv_page_layout(pages.physical_pool().geometry());
+        requirements.push_back(kv_transfer_requirement(
+            resource, runtime::ContextTransferDirection::HostToDevice, layout, missing, runs));
     };
     append_kv(*text_kv_addresses, *text_kv_pages, kv.text, requirement.main_pages,
               runtime::ContextResourceClass::MainKV);
@@ -1653,34 +1661,18 @@ std::vector<qwen3_6::ReplicaValueImpact> ProgramImplCore::private_replica_value_
             if (host_state_images == nullptr) {
                 throw std::logic_error("StateImage replica value has no Host pool");
             }
-            impact.host_restore_requirements.push_back(runtime::ContextTransferRequirement{
-                .resource   = runtime::ContextResourceClass::State,
-                .direction  = runtime::ContextTransferDirection::HostToDevice,
-                .units      = 1,
-                .bytes      = host_state_images->layout().image_bytes,
-                .page_count = 0,
-                .copy_runs  = 1,
-            });
+            impact.host_restore_requirements.push_back(state_transfer_requirement(
+                host_state_images->layout(), runtime::ContextTransferDirection::HostToDevice));
         }
         const auto append_kv = [&](const qwen3_6::PressureKVAction& action, std::uint32_t required,
                                    const LogicalKVPageStore& pages,
                                    runtime::ContextResourceClass resource) {
             if (!overlaps(action, required)) { return; }
             const std::uint32_t count = std::min(action.page_count, required - action.begin_page);
-            const std::uint64_t stride =
-                plan_host_kv_page_layout(pages.physical_pool().geometry()).page_stride;
-            if (count != 0 && stride > std::numeric_limits<std::uint64_t>::max() / count) {
-                throw std::overflow_error("replica-value Host KV size overflow");
-            }
-            const std::uint64_t bytes = stride * count;
-            impact.host_restore_requirements.push_back(runtime::ContextTransferRequirement{
-                .resource   = resource,
-                .direction  = runtime::ContextTransferDirection::HostToDevice,
-                .units      = bytes,
-                .bytes      = bytes,
-                .page_count = count,
-                .copy_runs  = 1,
-            });
+            const HostKVPageLayout layout =
+                plan_host_kv_page_layout(pages.physical_pool().geometry());
+            impact.host_restore_requirements.push_back(kv_transfer_requirement(
+                resource, runtime::ContextTransferDirection::HostToDevice, layout, count));
         };
         append_kv(main_kv, candidate.checkpoint->required_kv.main_pages, *text_kv_pages,
                   runtime::ContextResourceClass::MainKV);
@@ -1706,36 +1698,31 @@ std::vector<qwen3_6::ReplicaValueImpact> ProgramImplCore::private_replica_value_
                 possible.checkpoint->ref.frontier > candidate.checkpoint->ref.frontier) {
                 continue;
             }
-            const auto key = std::tuple{
-                std::numeric_limits<std::uint32_t>::max() - possible.checkpoint->ref.frontier,
-                possible.checkpoint->rebuild_work.text_quanta,
-                possible.checkpoint->rebuild_work.vision_quanta, possible.checkpoint->ref.kind,
-                possible.checkpoint->ref.ordinal};
+            const auto key = std::tuple{std::numeric_limits<std::uint32_t>::max() -
+                                            possible.checkpoint->ref.frontier,
+                                        possible.checkpoint->rebuild_work.tokens,
+                                        possible.checkpoint->rebuild_work.vision_items,
+                                        possible.checkpoint->rebuild_work.vision_patches,
+                                        possible.checkpoint->ref.kind,
+                                        possible.checkpoint->ref.ordinal};
             const auto fallback_key =
-                fallback != nullptr
-                    ? std::tuple{std::numeric_limits<std::uint32_t>::max() -
-                                     fallback->checkpoint->ref.frontier,
-                                 fallback->checkpoint->rebuild_work.text_quanta,
-                                 fallback->checkpoint->rebuild_work.vision_quanta,
-                                 fallback->checkpoint->ref.kind, fallback->checkpoint->ref.ordinal}
-                    : key;
+                fallback != nullptr ? std::tuple{std::numeric_limits<std::uint32_t>::max() -
+                                                     fallback->checkpoint->ref.frontier,
+                                                 fallback->checkpoint->rebuild_work.tokens,
+                                                 fallback->checkpoint->rebuild_work.vision_items,
+                                                 fallback->checkpoint->rebuild_work.vision_patches,
+                                                 fallback->checkpoint->ref.kind,
+                                                 fallback->checkpoint->ref.ordinal}
+                                    : key;
             if (fallback == nullptr || key < fallback_key) { fallback = &possible; }
         }
         if (fallback != nullptr) {
             impact.fallback_restore_requirements = checkpoint_restore_requirements(
                 *sequence.kv, fallback->checkpoint->required_kv, fallback->state);
-            impact.fallback_rebuild_work = runtime::PrefillWork{
-                .text_quanta   = candidate.checkpoint->rebuild_work.text_quanta >
-                                       fallback->checkpoint->rebuild_work.text_quanta
-                                     ? candidate.checkpoint->rebuild_work.text_quanta -
-                                         fallback->checkpoint->rebuild_work.text_quanta
-                                     : 0,
-                .vision_quanta = candidate.checkpoint->rebuild_work.vision_quanta >
-                                         fallback->checkpoint->rebuild_work.vision_quanta
-                                     ? candidate.checkpoint->rebuild_work.vision_quanta -
-                                           fallback->checkpoint->rebuild_work.vision_quanta
-                                     : 0,
-            };
+            impact.fallback_rebuild_work = interval_rebuild_work(
+                fallback->checkpoint->ref.frontier, fallback->checkpoint->rebuild_work,
+                candidate.checkpoint->ref.frontier, candidate.checkpoint->rebuild_work,
+                prefill_chunk);
         } else {
             impact.fallback_rebuild_work = candidate.checkpoint->rebuild_work;
         }
@@ -1759,34 +1746,17 @@ std::vector<qwen3_6::ReplicaValueImpact> ProgramImplCore::shared_replica_value_i
         if (*state != shared.state || host_state_images == nullptr) {
             throw std::logic_error("shared StateImage replica-value source is invalid");
         }
-        impact.host_restore_requirements.push_back(runtime::ContextTransferRequirement{
-            .resource   = runtime::ContextResourceClass::State,
-            .direction  = runtime::ContextTransferDirection::HostToDevice,
-            .units      = 1,
-            .bytes      = host_state_images->layout().image_bytes,
-            .page_count = 0,
-            .copy_runs  = 1,
-        });
+        impact.host_restore_requirements.push_back(state_transfer_requirement(
+            host_state_images->layout(), runtime::ContextTransferDirection::HostToDevice));
     }
     const auto append_kv = [&](const qwen3_6::PressureKVAction& action, std::uint32_t required,
                                const LogicalKVPageStore& pages,
                                runtime::ContextResourceClass resource) {
         if (action.page_count == 0 || action.begin_page >= required) { return; }
-        const std::uint32_t count = std::min(action.page_count, required - action.begin_page);
-        const std::uint64_t stride =
-            plan_host_kv_page_layout(pages.physical_pool().geometry()).page_stride;
-        if (count != 0 && stride > std::numeric_limits<std::uint64_t>::max() / count) {
-            throw std::overflow_error("shared replica-value Host KV size overflow");
-        }
-        const std::uint64_t bytes = stride * count;
-        impact.host_restore_requirements.push_back(runtime::ContextTransferRequirement{
-            .resource   = resource,
-            .direction  = runtime::ContextTransferDirection::HostToDevice,
-            .units      = bytes,
-            .bytes      = bytes,
-            .page_count = count,
-            .copy_runs  = 1,
-        });
+        const std::uint32_t count     = std::min(action.page_count, required - action.begin_page);
+        const HostKVPageLayout layout = plan_host_kv_page_layout(pages.physical_pool().geometry());
+        impact.host_restore_requirements.push_back(kv_transfer_requirement(
+            resource, runtime::ContextTransferDirection::HostToDevice, layout, count));
     };
     append_kv(main_kv, checkpoint.required_kv.main_pages, *text_kv_pages,
               runtime::ContextResourceClass::MainKV);
@@ -1927,20 +1897,12 @@ ProgramImplCore::inspect_checkpoint_drop_option(const SequenceState& sequence,
     if (fallback != nullptr) {
         impact.fallback_restore_requirements =
             checkpoint_restore_requirements(*sequence.kv, fallback->required_kv, fallback_state);
-        impact.fallback_rebuild_work = runtime::PrefillWork{
-            .text_quanta =
-                dropped->rebuild_work.text_quanta > fallback->rebuild_work.text_quanta
-                    ? dropped->rebuild_work.text_quanta - fallback->rebuild_work.text_quanta
-                    : 0,
-            .vision_quanta =
-                dropped->rebuild_work.vision_quanta > fallback->rebuild_work.vision_quanta
-                    ? dropped->rebuild_work.vision_quanta - fallback->rebuild_work.vision_quanta
-                    : 0,
-        };
+        impact.fallback_rebuild_work =
+            interval_rebuild_work(fallback->ref.frontier, fallback->rebuild_work,
+                                  dropped->ref.frontier, dropped->rebuild_work, prefill_chunk);
     } else {
         impact.fallback_rebuild_work = dropped->rebuild_work;
     }
-    option.rebuild_work = impact.fallback_rebuild_work;
     option.checkpoint_impacts.push_back(std::move(impact));
     return option;
 }
@@ -2031,10 +1993,8 @@ void ProgramImplCore::publish_checkpoint_drop(SequenceState& sequence,
 qwen3_6::PressureOption
 ProgramImplCore::inspect_eviction_option(const SequenceState& sequence) const {
     qwen3_6::PressureOption option;
-    option.id             = std::numeric_limits<std::uint64_t>::max();
-    option.effect.removed = resident_resources(sequence);
-    option.rebuild_work =
-        normalized_rebuild_work(sequence.rebuild_work, sequence.execution_frontier);
+    option.id                                  = std::numeric_limits<std::uint64_t>::max();
+    option.effect.removed                      = resident_resources(sequence);
     const qwen3_6::ContinuationSummary summary = continuation_summary(sequence);
     if (!sequence.kv || summary.long_anchors.size() != sequence.long_anchors.size()) {
         throw std::logic_error("eviction owner checkpoint inventory is incomplete");
@@ -3100,7 +3060,6 @@ runtime::ContextTransactionReserveStatus ProgramImplCore::reserve_materializatio
         if (request.prefill) {
             throw std::logic_error("free request lane retained prefill bookkeeping");
         }
-        std::uint64_t suffix_vision_quanta = 0;
         if (request_plan.vision) {
             std::vector<bool> used(prompt.media_payloads.size(), false);
             for (const VisionUseSpan& use : request_plan.vision->uses) {
@@ -3114,12 +3073,6 @@ runtime::ContextTransactionReserveStatus ProgramImplCore::reserve_materializatio
                     prompt.media_payloads[index].reset();
                     continue;
                 }
-                if (prompt.vision_items[index].patch_count >
-                    std::numeric_limits<std::uint64_t>::max() - suffix_vision_quanta) {
-                    throw std::overflow_error("Vision prefill work exceeds uint64");
-                }
-                suffix_vision_quanta +=
-                    static_cast<std::uint64_t>(prompt.vision_items[index].patch_count);
             }
         }
         if (prompt.has_media() && !request_plan.vision) { prompt.release_all_media_payloads(); }
@@ -3145,15 +3098,10 @@ runtime::ContextTransactionReserveStatus ProgramImplCore::reserve_materializatio
             .cursor             = request_plan.reuse_base,
             .prompt_tokens      = prompt_tokens,
             .initial_mtp_extent = initial_mtp_extent,
-            .rebuild_work =
-                {
-                    .text_quanta   = prompt_tokens - request_plan.reuse_base,
-                    .vision_quanta = suffix_vision_quanta,
-                },
-            .elapsed_seconds = 0.0,
-            .prepare_mtp     = request_plan.prepare_mtp,
-            .reuse           = request_plan.reuse,
-            .mtp_bridge      = request_plan.mtp_bridge,
+            .elapsed_seconds    = 0.0,
+            .prepare_mtp        = request_plan.prepare_mtp,
+            .reuse              = request_plan.reuse,
+            .mtp_bridge         = request_plan.mtp_bridge,
         };
         request.prefill.emplace(std::move(prefill));
         if (request.prefill->vision_plan) {
@@ -3868,56 +3816,83 @@ void ProgramImplCore::record_materialization_transfer_observations(
         throw std::logic_error("materialization transfer observation is not complete");
     }
     const auto record = [&](runtime::ContextResourceClass resource,
-                            runtime::ContextTransferDirection direction, std::uint64_t bytes,
+                            runtime::ContextTransferDirection direction, TransferWork transfer_work,
                             std::uint32_t pages) {
         const std::uint8_t bit = static_cast<std::uint8_t>(1U << context_resource_index(resource));
         if ((transaction.transfer_timer_mask & bit) == 0) { return; }
         transaction.transfer_observations.push_back(
-            context_transfer_observation(resource, direction, bytes, pages));
+            context_transfer_observation(resource, direction, transfer_work, pages));
         transaction.transfer_timer_mask &= static_cast<std::uint8_t>(~bit);
     };
-    const auto page_stride = [&](const LogicalKVPageStore& pages) {
-        return static_cast<std::uint64_t>(
-            &pages == text_kv_pages.get() ? text_host_kv_page_stride : backend_host_kv_page_stride);
+    const auto host_layout = [](const LogicalKVPageStore& pages) {
+        return plan_host_kv_page_layout(pages.physical_pool().geometry());
+    };
+    const auto restore_copy_runs = [](const auto& restores, const auto& destinations,
+                                      const LogicalKVPageStore& pages) {
+        if (restores.size() != destinations.size()) {
+            throw std::logic_error("KV restore observation is not row aligned");
+        }
+        std::uint32_t runs = 0;
+        std::size_t begin  = 0;
+        while (begin < restores.size()) {
+            std::size_t end = begin + 1U;
+            while (end < restores.size() && restores[end].extent == restores[begin].extent &&
+                   restores[end].extent_page == restores[end - 1U].extent_page + 1U) {
+                ++end;
+            }
+            runs += pages.physical_pool().contiguous_run_count(
+                std::span<const DeviceKVPageHandle>(destinations.data() + begin, end - begin));
+            begin = end;
+        }
+        return runs;
     };
     if (transaction.prefix_tail_submitted) {
         if (transaction.text_prefix_fork && transaction.text_prefix_fork->needs_tail_copy()) {
             record(runtime::ContextResourceClass::MainKV,
-                   runtime::ContextTransferDirection::DeviceToDevice, page_stride(*text_kv_pages),
-                   1);
+                   runtime::ContextTransferDirection::DeviceToDevice,
+                   plan_device_kv_copy_work(host_layout(*text_kv_pages), 1), 1);
         }
         if (backend_kv_pages && transaction.backend_prefix_fork &&
             transaction.backend_prefix_fork->needs_tail_copy()) {
             record(runtime::ContextResourceClass::BackendKV,
                    runtime::ContextTransferDirection::DeviceToDevice,
-                   page_stride(*backend_kv_pages), 1);
+                   plan_device_kv_copy_work(host_layout(*backend_kv_pages), 1), 1);
         }
         return;
     }
     if (transaction.retained_tail_backup_submitted) {
         if (transaction.text_retained_tail_backup) {
             record(runtime::ContextResourceClass::MainKV,
-                   runtime::ContextTransferDirection::DeviceToHost, page_stride(*text_kv_pages), 1);
+                   runtime::ContextTransferDirection::DeviceToHost,
+                   plan_host_kv_transfer_work(host_layout(*text_kv_pages), 1, 1), 1);
         }
         if (backend_kv_pages && transaction.backend_retained_tail_backup) {
             record(runtime::ContextResourceClass::BackendKV,
-                   runtime::ContextTransferDirection::DeviceToHost, page_stride(*backend_kv_pages),
-                   1);
+                   runtime::ContextTransferDirection::DeviceToHost,
+                   plan_host_kv_transfer_work(host_layout(*backend_kv_pages), 1, 1), 1);
         }
         return;
     }
     if (transaction.state_restore) {
         record(runtime::ContextResourceClass::State,
                runtime::ContextTransferDirection::HostToDevice,
-               host_state_images != nullptr ? host_state_images->layout().image_bytes : 0, 0);
+               state_image_transfer_work(host_state_images->layout()), 0);
     }
     record(runtime::ContextResourceClass::MainKV, runtime::ContextTransferDirection::HostToDevice,
-           page_stride(*text_kv_pages) * transaction.text_restores.size(),
+           plan_host_kv_transfer_work(host_layout(*text_kv_pages),
+                                      static_cast<std::uint32_t>(transaction.text_restores.size()),
+                                      restore_copy_runs(transaction.text_restores,
+                                                        transaction.text_restore_destinations,
+                                                        *text_kv_pages)),
            static_cast<std::uint32_t>(transaction.text_restores.size()));
     if (backend_kv_pages) {
         record(runtime::ContextResourceClass::BackendKV,
                runtime::ContextTransferDirection::HostToDevice,
-               page_stride(*backend_kv_pages) * transaction.backend_restores.size(),
+               plan_host_kv_transfer_work(
+                   host_layout(*backend_kv_pages),
+                   static_cast<std::uint32_t>(transaction.backend_restores.size()),
+                   restore_copy_runs(transaction.backend_restores,
+                                     transaction.backend_restore_destinations, *backend_kv_pages)),
                static_cast<std::uint32_t>(transaction.backend_restores.size()));
     }
 }
@@ -4492,28 +4467,32 @@ void ProgramImplCore::publish_pressure_work(
             publish_kv(*backend_kv_pages, work.backend_pages, work.backend_backup,
                        work.option.backend_kv, work.backend_host_released);
         }
-        const auto record = [&](runtime::ContextResourceClass resource, std::uint64_t bytes,
+        const auto record = [&](runtime::ContextResourceClass resource, TransferWork transfer_work,
                                 std::uint32_t pages) {
             const std::uint8_t bit =
                 static_cast<std::uint8_t>(1U << context_resource_index(resource));
             if ((work.timer_mask & bit) == 0) { return; }
             work.observations.push_back(context_transfer_observation(
-                resource, runtime::ContextTransferDirection::DeviceToHost, bytes, pages));
+                resource, runtime::ContextTransferDirection::DeviceToHost, transfer_work, pages));
             work.timer_mask &= static_cast<std::uint8_t>(~bit);
         };
-        record(runtime::ContextResourceClass::State,
-               host_state_images != nullptr ? host_state_images->layout().image_bytes : 0, 0);
-        const auto kv_bytes = [&](const LogicalKVPageStore& pages, std::size_t count) {
-            const std::size_t stride = &pages == text_kv_pages.get() ? text_host_kv_page_stride
-                                                                     : backend_host_kv_page_stride;
-            return static_cast<std::uint64_t>(stride) * count;
+        const auto planned_work = [&](runtime::ContextResourceClass resource) {
+            const auto found = std::find_if(
+                work.option.transfer_requirements.begin(), work.option.transfer_requirements.end(),
+                [&](const auto& requirement) {
+                    return requirement.resource == resource &&
+                           requirement.direction == runtime::ContextTransferDirection::DeviceToHost;
+                });
+            return found == work.option.transfer_requirements.end() ? TransferWork{} : found->work;
         };
+        record(runtime::ContextResourceClass::State,
+               planned_work(runtime::ContextResourceClass::State), 0);
         record(runtime::ContextResourceClass::MainKV,
-               kv_bytes(*text_kv_pages, work.main_pages.size()),
+               planned_work(runtime::ContextResourceClass::MainKV),
                static_cast<std::uint32_t>(work.main_pages.size()));
         if (backend_kv_pages) {
             record(runtime::ContextResourceClass::BackendKV,
-                   kv_bytes(*backend_kv_pages, work.backend_pages.size()),
+                   planned_work(runtime::ContextResourceClass::BackendKV),
                    static_cast<std::uint32_t>(work.backend_pages.size()));
         }
         work.submitted = false;
@@ -5725,7 +5704,6 @@ PrefillProgress ProgramImplCore::wrap_prefill(std::uint32_t lane, runtime::Prefi
     out.summary                 = step.summary;
     out.processed_prompt_tokens = step.processed_prompt_tokens;
     out.complete                = step.complete;
-    out.observation             = step.observation;
     if (step.complete) {
         const std::array<std::uint32_t, 1> lanes{lane};
         const runtime::BatchedGeneratedRound round{
@@ -5876,7 +5854,7 @@ ProgramImplCore::checkpoint_summary(const SequenceState& sequence,
                 .main_pages       = kv_pages_for_frontier(checkpoint.frontier),
                 .backend_pages    = kv_pages_for_frontier(backend_frontier),
             },
-        .rebuild_work = normalized_rebuild_work(rebuild_work, checkpoint.frontier),
+        .rebuild_work = validated_rebuild_work(rebuild_work, checkpoint.frontier),
     };
 }
 
@@ -5903,7 +5881,6 @@ void ProgramImplCore::populate_continuation_summary(const SequenceState& sequenc
             .frontier = sequence.execution_frontier,
         };
         runtime::PrefillWork endpoint_work = sequence.rebuild_work;
-        endpoint_work.text_quanta          = sequence.execution_frontier;
         summary.endpoint =
             checkpoint_summary(sequence, endpoint, sequence.state.read, endpoint_work);
     }
@@ -5971,7 +5948,7 @@ ProgramImplCore::shared_prefix_summary(const SharedPrefixState& shared) const {
                         .main_pages       = kv_pages_for_frontier(shared.frontier),
                         .backend_pages    = kv_pages_for_frontier(shared.backend_frontier),
                     },
-                .rebuild_work = normalized_rebuild_work(shared.rebuild_work, shared.frontier),
+                .rebuild_work = validated_rebuild_work(shared.rebuild_work, shared.frontier),
             },
         .active_references = shared.active_references,
     };
@@ -6041,7 +6018,7 @@ ProgramImplCore::inspect_capture(const CaptureOffer& offer, const SharedPrefixHa
     CaptureAssessment assessment{
         .shortlist_key = group.identity->shortlist_key,
         .protected_rebuild_work =
-            normalized_rebuild_work(group.identity->rebuild_work, group.frontier),
+            validated_rebuild_work(group.identity->rebuild_work, group.frontier),
         .frontier          = group.frontier,
         .publishes_private = publish_private,
         .publishes_shared  = publish_shared,
@@ -6260,42 +6237,27 @@ ProgramImplCore::inspect_capture(const CaptureOffer& offer, const SharedPrefixHa
     assessment.active_entitlement_delta.removed =
         checked_resource_sum(active_removed, replaced_private);
     if (publish_private && !publish_shared) { assessment.active_entitlement_delta.added = added; }
-    const auto append_transfer = [&](runtime::ContextResourceClass resource,
-                                     runtime::ContextTransferDirection direction,
-                                     std::uint64_t bytes, std::uint32_t pages) {
-        if (bytes == 0) { return; }
-        assessment.transfer_requirements.push_back(runtime::ContextTransferRequirement{
-            .resource   = resource,
-            .direction  = direction,
-            .units      = resource == runtime::ContextResourceClass::State ? 1U : bytes,
-            .bytes      = bytes,
-            .page_count = pages,
-            .copy_runs  = 1,
-        });
-    };
     assessment.transfer_requirements.reserve(3);
     if (assessment.state_placement == qwen3_6::CaptureStatePlacement::HostSnapshot) {
-        append_transfer(runtime::ContextResourceClass::State,
-                        runtime::ContextTransferDirection::DeviceToHost,
-                        state_images->host_layout().image_bytes, 0);
+        assessment.transfer_requirements.push_back(state_transfer_requirement(
+            state_images->host_layout(), runtime::ContextTransferDirection::DeviceToHost));
     } else if (speculative_backend == SpeculativeBackend::DFlash) {
-        append_transfer(runtime::ContextResourceClass::State,
-                        runtime::ContextTransferDirection::DeviceToDevice,
-                        state_images->host_layout().image_bytes, 0);
+        assessment.transfer_requirements.push_back(state_transfer_requirement(
+            state_images->host_layout(), runtime::ContextTransferDirection::DeviceToDevice, true));
     }
     if (added.device.main_kv_pages != 0) {
-        append_transfer(
+        assessment.transfer_requirements.push_back(kv_transfer_requirement(
             runtime::ContextResourceClass::MainKV,
             runtime::ContextTransferDirection::DeviceToDevice,
-            plan_host_kv_page_layout(text_kv_pages->physical_pool().geometry()).page_stride,
-            added.device.main_kv_pages);
+            plan_host_kv_page_layout(text_kv_pages->physical_pool().geometry()),
+            added.device.main_kv_pages));
     }
     if (added.device.backend_kv_pages != 0) {
-        append_transfer(
+        assessment.transfer_requirements.push_back(kv_transfer_requirement(
             runtime::ContextResourceClass::BackendKV,
             runtime::ContextTransferDirection::DeviceToDevice,
-            plan_host_kv_page_layout(backend_kv_pages->physical_pool().geometry()).page_stride,
-            added.device.backend_kv_pages);
+            plan_host_kv_page_layout(backend_kv_pages->physical_pool().geometry()),
+            added.device.backend_kv_pages));
     }
     assessment.needs_transfer = !assessment.transfer_requirements.empty();
     return assessment;
@@ -6356,6 +6318,7 @@ ProgramImplCore::reserve_active_capture(CaptureOffer&& offer,
     transaction.capacity_preparation_removed = assessment.capacity_preparation_removed;
     transaction.recycles_private_state       = assessment.recycles_private_state;
     transaction.state_placement              = assessment.state_placement;
+    transaction.transfer_requirements        = assessment.transfer_requirements;
     if (transaction.publish_private) {
         transaction.active_summary.long_anchors.reserve(sequence.long_anchors.capacity());
     }
@@ -6441,7 +6404,7 @@ ProgramImplCore::install_private_capture(SequenceState& sequence, const CaptureG
             .valid        = true,
             .kind         = *group.rewrite,
             .frontier     = group.frontier,
-            .rebuild_work = normalized_rebuild_work(group.identity->rebuild_work, group.frontier),
+            .rebuild_work = validated_rebuild_work(group.identity->rebuild_work, group.frontier),
         };
     }
     if (group.long_anchor && context_cache.max_long_anchors_per_continuation.value_or(0) != 0) {
@@ -6481,7 +6444,7 @@ ProgramImplCore::install_private_capture(SequenceState& sequence, const CaptureG
             .state        = checkpoint,
             .frontier     = group.frontier,
             .ordinal      = ordinal,
-            .rebuild_work = normalized_rebuild_work(group.identity->rebuild_work, group.frontier),
+            .rebuild_work = validated_rebuild_work(group.identity->rebuild_work, group.frontier),
         });
     }
     return removed;
@@ -6842,8 +6805,8 @@ ActiveCaptureResult ProgramImplCore::publish_active_capture(ActiveCaptureTransac
                                                                 : 0U;
         shared.rope_delta        = sequence.rope_delta;
         shared.tail_hidden_valid = sequence.tail_hidden_valid;
-        shared.rebuild_work      = normalized_rebuild_work(transaction.group.identity->rebuild_work,
-                                                           transaction.group.frontier);
+        shared.rebuild_work      = validated_rebuild_work(transaction.group.identity->rebuild_work,
+                                                          transaction.group.frontier);
         shared.active_references = 1;
         sequence.shared_prefix_references.push_back(index);
         slot.role = SharedPrefixSlotRole::Catalogued;
@@ -6923,25 +6886,40 @@ ProgramImplCore::progress_active_capture_transaction(runtime::CancellationFlagVi
     }
     if (transaction.transfer_submitted) {
         const auto record = [&](runtime::ContextResourceClass resource,
-                                runtime::ContextTransferDirection direction, std::uint64_t bytes,
+                                runtime::ContextTransferDirection direction, TransferWork work,
                                 std::uint32_t pages) {
             const std::uint8_t bit =
                 static_cast<std::uint8_t>(1U << context_resource_index(resource));
             if ((transaction.transfer_timer_mask & bit) == 0) { return; }
             transaction.transfer_observations.push_back(
-                context_transfer_observation(resource, direction, bytes, pages));
+                context_transfer_observation(resource, direction, work, pages));
             transaction.transfer_timer_mask &= static_cast<std::uint8_t>(~bit);
         };
-        record(runtime::ContextResourceClass::State,
-               transaction.state_placement == qwen3_6::CaptureStatePlacement::HostSnapshot
-                   ? runtime::ContextTransferDirection::DeviceToHost
-                   : runtime::ContextTransferDirection::DeviceToDevice,
-               state_images->host_layout().image_bytes, 0);
+        const auto planned_work = [&](runtime::ContextResourceClass resource,
+                                      runtime::ContextTransferDirection direction) {
+            const auto found = std::find_if(
+                transaction.transfer_requirements.begin(), transaction.transfer_requirements.end(),
+                [&](const auto& requirement) {
+                    return requirement.resource == resource && requirement.direction == direction;
+                });
+            return found == transaction.transfer_requirements.end() ? TransferWork{} : found->work;
+        };
+        const runtime::ContextTransferDirection state_direction =
+            transaction.state_placement == qwen3_6::CaptureStatePlacement::HostSnapshot
+                ? runtime::ContextTransferDirection::DeviceToHost
+                : runtime::ContextTransferDirection::DeviceToDevice;
+        record(runtime::ContextResourceClass::State, state_direction,
+               planned_work(runtime::ContextResourceClass::State, state_direction), 0);
         record(runtime::ContextResourceClass::MainKV,
-               runtime::ContextTransferDirection::DeviceToDevice, text_host_kv_page_stride, 1);
+               runtime::ContextTransferDirection::DeviceToDevice,
+               planned_work(runtime::ContextResourceClass::MainKV,
+                            runtime::ContextTransferDirection::DeviceToDevice),
+               1);
         if (backend_kv_pages) {
             record(runtime::ContextResourceClass::BackendKV,
-                   runtime::ContextTransferDirection::DeviceToDevice, backend_host_kv_page_stride,
+                   runtime::ContextTransferDirection::DeviceToDevice,
+                   planned_work(runtime::ContextResourceClass::BackendKV,
+                                runtime::ContextTransferDirection::DeviceToDevice),
                    1);
         }
         transaction.transfer_submitted = false;
@@ -6984,12 +6962,7 @@ runtime::PreflightStatus ProgramImplCore::revalidate_replica_transition(
         shared_state = &shared_prefix_states[ContractAccess::index(*shared_owner)];
         expected     = inspect_replica_transition(*shared_owner);
     }
-    qwen3_6::ReplicaTransitionOption physical_option = option;
-    physical_option.calibrated                       = false;
-    physical_option.backup_transfer_ns               = 0;
-    if (!expected || *expected != physical_option) {
-        return runtime::PreflightStatus::StalePolicyState;
-    }
+    if (!expected || *expected != option) { return runtime::PreflightStatus::StalePolicyState; }
     if (option.effect.removed != runtime::ResourceVector{} ||
         option.effect.added.device != runtime::DeviceResources{} ||
         option.added_host_replica_impacts.empty()) {
@@ -7389,7 +7362,7 @@ qwen3_6::ReplicaTransitionResult ProgramImplCore::progress_replica_transition_tr
     if (transaction.timer_started) {
         transaction.transfer_observations.push_back(context_transfer_observation(
             transaction.option.resource, runtime::ContextTransferDirection::DeviceToHost,
-            transaction.option.transfer_bytes, transaction.option.page_count));
+            transaction.option.transfer_work, transaction.option.page_count));
         transaction.timer_started = false;
     }
     if (transaction.state_transfer) {
@@ -9631,11 +9604,6 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
         sequence.tail_hidden_valid      = true;
         request.timings.vision_seconds  = vision_seconds;
         request.timings.prefill_seconds = std::max(0.0, staged.elapsed_seconds - vision_seconds);
-        const runtime::PrefillObservation prefill_observation{
-            .work              = staged.rebuild_work,
-            .text_elapsed_ns   = seconds_to_ns(request.timings.prefill_seconds),
-            .vision_elapsed_ns = seconds_to_ns(request.timings.vision_seconds),
-        };
         staged.prompt.release_all_media_payloads();
 
         const bool prompt_frontier_capture =
@@ -9654,7 +9622,6 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             .round   = runtime::GeneratedRound{.tokens = std::span<const TokenId>(host_tokens, 1)},
             .processed_prompt_tokens = processed_prompt_tokens,
             .complete                = true,
-            .observation             = prefill_observation,
         };
     } catch (...) {
         try {

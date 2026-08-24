@@ -476,6 +476,7 @@ curl http://127.0.0.1:8080/v1/models \
 | `--prefill-chunk N` | text-prefill chunk | `1024` |
 | `--log-stats-interval-ms N` | aggregate throughput report interval; `0` disables it | `5000` |
 | `--device N` | CUDA device index | `0` |
+| `--context-cost-presets FILE` | optional runtime context-cost preset registry | generic + compiled defaults |
 | `--max-request-mib N` | body-size limit before JSON parsing | `384` |
 | `--media-cache-mib N` | LRU-retained prepared BF16 media payloads; `0` disables retention | `1024` |
 | `--media-live-mib N` | all live prepared BF16 media payloads | `2048` |
@@ -510,6 +511,16 @@ curl http://127.0.0.1:8080/v1/models \
 | `--seed N` | fixed seed when a request omits one | fresh random seed per request |
 | `--greedy` | force exact argmax for all requests | off |
 
+Context-cost coefficients are selected once during startup and never learned from live requests.
+An always-available generic numerical model is first refined by matching compiled defaults.
+`--context-cost-presets FILE` adds runtime overrides without recompilation: transfer is matched by
+GPU class, while prefill is matched by GPU class and artifact `model_id/weights_id`. The two
+components layer independently. A malformed file fails during startup; a valid file with no
+matching machine or artifact entry simply leaves the preceding numerical layer in use. KV dtype,
+speculative backend, and prefill chunk are not lookup dimensions. The server-start console line and
+JSONL record report `generic-default`, `compiled-default`, or `external` independently for transfer
+and prefill, together with the resolved hardware/artifact identity.
+
 Engine selects sampling defaults from the loaded model and the request's resolved thinking mode.
 Qwen3.6-27B and Qwen3.8-27B use `1.0/0.95/20/0/0` for
 temperature/top-p/top-k/min-p/presence penalty in thinking mode and `0.7/0.80/20/0/1.5` in
@@ -538,7 +549,7 @@ is also rejected if it resolves to the model artifact.
   --request-log-jsonl profiles/bench/run/server.requests.jsonl
 ```
 
-Every line is one `ninfer_serve_request_log` schema-v11 JSON object. All events carry
+Every line is one `ninfer_serve_request_log` schema-v12 JSON object. All events carry
 `timestamp_unix_ms` and a process-unique `server_instance_id`; request IDs are monotonic only within
 that server instance. Successful request-start records include request-scoped acquisition,
 media-preprocessing wall/work, tokenizer, cache hit/miss/single-flight, and payload-size fields;
@@ -577,7 +588,8 @@ and DFlash this is the accepted committed output, not draft or rejected tokens.
 the Engine scheduler snapshot at the end of the interval. The JSONL `context_cache` object reports
 selection, capture, transfer, COW/spill, degradation, eviction, and historical-fork counters as
 interval deltas; `occupancy`, `last_selection`, and `last_materialization` are end-of-interval
-gauges. An uncalibrated last materialization is distinguished from a calibrated zero-cost choice.
+gauges. `last_materialization.predicted_nanoseconds` is always produced by the startup-selected
+numerical model.
 Intervals with context materialization or retention activity are retained even when they contain no
 token execution; only fully idle intervals are omitted. Downstream measurement should prefer the
 raw counters and seconds over rounded stderr rates.

@@ -310,11 +310,10 @@ struct RequestControl {
         std::uint32_t cursor                = 0;
         std::uint32_t prompt_tokens         = 0;
         std::uint32_t initial_mtp_extent    = 0;
-        runtime::PrefillWork rebuild_work;
-        double elapsed_seconds   = 0.0;
-        bool prepare_mtp         = false;
-        ReusePath reuse          = ReusePath::Root;
-        MtpBridgeMode mtp_bridge = MtpBridgeMode::None;
+        double elapsed_seconds              = 0.0;
+        bool prepare_mtp                    = false;
+        ReusePath reuse                     = ReusePath::Root;
+        MtpBridgeMode mtp_bridge            = MtpBridgeMode::None;
     };
 
     std::optional<Prefill> prefill;
@@ -642,6 +641,7 @@ private:
         runtime::ResourceDelta active_entitlement_delta;
         runtime::ResourceVector capacity_preparation_removed;
         ContinuationSummary active_summary;
+        std::vector<runtime::ContextTransferRequirement> transfer_requirements;
         std::vector<runtime::ContextTransferObservation> transfer_observations;
         runtime::ContextOperationCounts operations;
         bool recycles_private_state        = false;
@@ -714,7 +714,7 @@ private:
     void stop_context_transfer_timer(runtime::ContextResourceClass resource);
     [[nodiscard]] runtime::ContextTransferObservation
     context_transfer_observation(runtime::ContextResourceClass resource,
-                                 runtime::ContextTransferDirection direction, std::uint64_t bytes,
+                                 runtime::ContextTransferDirection direction, TransferWork work,
                                  std::uint32_t page_count = 0) const;
     [[nodiscard]] ReleaseResult
     release_materialization_victim(MaterializationTransaction& transaction,

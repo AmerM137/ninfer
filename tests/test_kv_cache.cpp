@@ -261,6 +261,11 @@ int exercise_layout_and_transfer(ninfer::DeviceContext& context, ninfer::KVPageG
         read_mapping(tables.row(row.handle()), source_handles.size());
     failures += expect(physical_mapping == std::vector<std::int32_t>({0, 1, 2, 6, 7}),
                        label + " execution row differs from logical page order");
+    failures += expect(source.contiguous_run_count(source_handles) == 2,
+                       label + " physical KV run count missed allocator fragmentation");
+    failures +=
+        expect(source.contiguous_run_count(std::span<const ninfer::DeviceKVPageHandle>{}) == 0,
+               label + " empty physical KV range has a copy run");
     const std::uint32_t allocated_before_row_release = source.allocated_pages();
     row.release();
     failures += expect_size(source.allocated_pages(), allocated_before_row_release,

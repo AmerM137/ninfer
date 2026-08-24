@@ -94,6 +94,13 @@ struct ContextCacheOptions {
     std::optional<std::uint32_t> max_cache_markers_per_request;
 };
 
+struct ContextCostOptions {
+    // Empty selects generic defaults plus any matching values compiled into the binary. A
+    // nonempty runtime preset independently overrides its matching machine transfer and
+    // artifact-prefill components; absent entries retain the preceding numerical layer.
+    std::filesystem::path preset_path;
+};
+
 struct EngineOptions {
     std::filesystem::path artifact_path;
     int device                         = 0;
@@ -112,6 +119,7 @@ struct EngineOptions {
     bool enable_vision                     = false;
     bool use_cuda_graph                    = true;
     ContextCacheOptions context_cache;
+    ContextCostOptions context_cost;
     LoadProgress load_progress;
 };
 
@@ -574,8 +582,35 @@ struct RuntimeStats {
     std::uint32_t shared_active_references          = 0;
     std::uint64_t historical_fork_hits              = 0;
     std::uint64_t last_predicted_materialization_ns = 0;
-    bool last_predicted_materialization_calibrated  = false;
     double actual_context_transfer_seconds          = 0.0;
+};
+
+enum class ContextCostPresetSource : std::uint8_t {
+    GenericDefault,
+    CompiledDefault,
+    External,
+};
+
+[[nodiscard]] inline constexpr const char*
+context_cost_preset_source_name(ContextCostPresetSource source) noexcept {
+    switch (source) {
+    case ContextCostPresetSource::GenericDefault:
+        return "generic-default";
+    case ContextCostPresetSource::CompiledDefault:
+        return "compiled-default";
+    case ContextCostPresetSource::External:
+        return "external";
+    }
+    return "unknown";
+}
+
+struct ContextCostSummary {
+    ContextCostPresetSource transfer_source = ContextCostPresetSource::GenericDefault;
+    ContextCostPresetSource prefill_source  = ContextCostPresetSource::GenericDefault;
+    std::string hardware_class;
+    std::string model_id;
+    std::string weights_id;
+    std::filesystem::path preset_path;
 };
 
 struct LoadSummary {
@@ -589,6 +624,7 @@ struct LoadSummary {
     std::uint64_t peak_staging_bytes   = 0;
     std::size_t tensor_count           = 0;
     std::size_t resource_count         = 0;
+    ContextCostSummary context_cost;
 };
 
 } // namespace ninfer

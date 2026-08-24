@@ -24,6 +24,19 @@ using ninfer::runtime::ResourceDelta;
 using ninfer::runtime::ResourceDemand;
 using ninfer::runtime::ResourceVector;
 
+ninfer::runtime::ContextCostModel test_cost_model() {
+    ninfer::runtime::ContextCostModel model;
+    for (auto& transfer : model.transfer) {
+        transfer.batch_ns        = 1;
+        transfer.operation_ns    = 1;
+        transfer.ns_per_byte_q32 = ninfer::runtime::kContextCostQ32One;
+    }
+    model.prefill.token_ns_q32        = 100ULL * ninfer::runtime::kContextCostQ32One;
+    model.prefill.vision_item_ns      = 1;
+    model.prefill.vision_patch_ns_q32 = ninfer::runtime::kContextCostQ32One;
+    return model;
+}
+
 int failures = 0;
 
 void expect(bool condition, const char* message) {
@@ -147,7 +160,7 @@ struct FakeAdmissionPlan {
     [[nodiscard]] bool temporal_eligible() const noexcept { return transfers.empty(); }
 
     [[nodiscard]] ninfer::runtime::PrefillWork remaining_prefill_work() const noexcept {
-        return {.text_quanta = value.service_work_quanta};
+        return {.tokens = value.service_work_quanta};
     }
 
     [[nodiscard]] std::span<const ninfer::runtime::ContextTransferRequirement>
@@ -199,8 +212,6 @@ struct FakePressureOption {
     std::optional<ninfer::runtime::CheckpointRef> dropped_checkpoint;
     ResourceDelta effect;
     std::uint64_t transfer_bytes = 0;
-    std::uint32_t copy_runs      = 0;
-    ninfer::runtime::PrefillWork rebuild_work;
     std::vector<ninfer::runtime::ContextTransferRequirement> transfer_requirements;
     std::vector<FakePressureCheckpointImpact> checkpoint_impacts;
     std::vector<FakeReplicaValueImpact> removed_host_replica_impacts;
@@ -343,7 +354,7 @@ FakeContinuationSummary continuation_summary(std::uint64_t rebuild_work = 1) {
             FakeCheckpointSummary{
                 .ref = {.kind = ninfer::runtime::CheckpointKind::SessionEndpoint, .frontier = 16},
                 .required_kv  = {.main_pages = 2, .backend_pages = 1},
-                .rebuild_work = {.text_quanta = rebuild_work},
+                .rebuild_work = {.tokens = rebuild_work},
             },
     };
 }
@@ -404,11 +415,9 @@ struct FakeReplicaTransitionOption {
     ResourceDelta effect;
     std::uint64_t transfer_bytes = 1;
     std::uint32_t page_count     = 0;
-    ninfer::runtime::PrefillWork rebuild_work;
+    ninfer::TransferWork transfer_work{.payload_bytes = 1, .copy_operations = 1};
     std::vector<FakeReplicaValueImpact> added_host_replica_impacts;
-    bool shared_owner                = false;
-    bool calibrated                  = false;
-    std::uint64_t backup_transfer_ns = 0;
+    bool shared_owner = false;
 
     friend bool operator==(const FakeReplicaTransitionOption&,
                            const FakeReplicaTransitionOption&) = default;
@@ -526,13 +535,11 @@ public:
                 .effect         = {.removed = resources({.state_slots = 1}),
                                    .added   = resources({}, {.state_slots = 1})},
                 .transfer_bytes = 1,
-                .copy_runs      = 1,
                 .transfer_requirements =
                     {{.resource  = ninfer::runtime::ContextResourceClass::State,
                       .direction = ninfer::runtime::ContextTransferDirection::DeviceToHost,
                       .units     = 1,
-                      .bytes     = 1,
-                      .copy_runs = 1}},
+                      .work      = {.payload_bytes = 1, .copy_operations = 1}}},
             }};
         }
         if (!continuation.valid || deficit.host.state_slots == 0 ||
@@ -546,13 +553,12 @@ public:
             .effect                       = {.removed = resources({}, {.state_slots = 1})},
             .removed_host_replica_impacts = {FakeReplicaValueImpact{
                 .checkpoint            = checkpoint,
-                .fallback_rebuild_work = {.text_quanta = continuation.rebuild_work},
+                .fallback_rebuild_work = {.tokens = continuation.rebuild_work},
                 .host_restore_requirements =
                     {{.resource  = ninfer::runtime::ContextResourceClass::State,
                       .direction = ninfer::runtime::ContextTransferDirection::HostToDevice,
                       .units     = 1,
-                      .bytes     = 1,
-                      .copy_runs = 1}},
+                      .work      = {.payload_bytes = 1, .copy_operations = 1}}},
             }},
         }};
     }
@@ -571,10 +577,15 @@ public:
     [[nodiscard]] FakePressureOption
     inspect_eviction_option(const FakeContinuationHandle& continuation) const {
         if (!continuation.valid) { throw std::logic_error("fake eviction source is stale"); }
+        const ninfer::runtime::CheckpointRef checkpoint = continuation_summary().endpoint->ref;
         return FakePressureOption{
             .id                  = continuation.key,
             .effect              = {.removed = continuation.resources},
-            .rebuild_work        = {.text_quanta = continuation.rebuild_work},
+            .checkpoint_impacts  = {FakePressureCheckpointImpact{
+                 .checkpoint            = checkpoint,
+                 .fallback_rebuild_work = {.tokens = continuation.rebuild_work},
+                 .drops_checkpoint      = true,
+            }},
             .evicts_continuation = true,
         };
     }
@@ -592,8 +603,14 @@ public:
 
     [[nodiscard]] FakePressureOption
     inspect_shared_eviction_option(const FakeSharedPrefixHandle&) const {
+        const ninfer::runtime::CheckpointRef checkpoint = continuation_summary().endpoint->ref;
         return FakePressureOption{
             .id                  = std::numeric_limits<std::uint64_t>::max() - 1U,
+            .checkpoint_impacts  = {FakePressureCheckpointImpact{
+                 .checkpoint            = checkpoint,
+                 .fallback_rebuild_work = {.tokens = 1},
+                 .drops_checkpoint      = true,
+            }},
             .evicts_continuation = true,
             .shared_owner        = true,
         };
@@ -789,7 +806,7 @@ public:
                 {.resource   = ninfer::runtime::ContextResourceClass::State,
                  .direction  = ninfer::runtime::ContextTransferDirection::DeviceToHost,
                  .units      = 1,
-                 .bytes      = 1,
+                 .work       = {.payload_bytes = 1, .copy_operations = 1},
                  .elapsed_ns = 1});
         }
         transaction_->terminal = true;
@@ -820,13 +837,12 @@ public:
             .effect                     = {.added = resources({}, {.state_slots = 1})},
             .added_host_replica_impacts = {FakeReplicaValueImpact{
                 .checkpoint            = checkpoint,
-                .fallback_rebuild_work = {.text_quanta = owner.rebuild_work},
+                .fallback_rebuild_work = {.tokens = owner.rebuild_work},
                 .host_restore_requirements =
                     {{.resource  = ninfer::runtime::ContextResourceClass::State,
                       .direction = ninfer::runtime::ContextTransferDirection::HostToDevice,
                       .units     = 1,
-                      .bytes     = 1,
-                      .copy_runs = 1}},
+                      .work      = {.payload_bytes = 1, .copy_operations = 1}}},
             }},
         };
     }
@@ -851,10 +867,7 @@ public:
         }
         const std::optional<FakeReplicaTransitionOption> expected =
             inspect_replica_transition(*private_owner, option.checkpoint);
-        FakeReplicaTransitionOption physical_option = option;
-        physical_option.calibrated                  = false;
-        physical_option.backup_transfer_ns          = 0;
-        if (!expected || *expected != physical_option) {
+        if (!expected || *expected != option) {
             return ninfer::runtime::PreflightStatus::StalePolicyState;
         }
         if ((private_replacement == nullptr) != (replacement == nullptr)) {
@@ -933,7 +946,7 @@ public:
             {.resource   = ninfer::runtime::ContextResourceClass::State,
              .direction  = ninfer::runtime::ContextTransferDirection::DeviceToHost,
              .units      = 1,
-             .bytes      = transaction.option.transfer_bytes,
+             .work       = transaction.option.transfer_work,
              .elapsed_ns = 1});
         last_replica_target_key = transaction.target->key;
         last_replica_victim_key =
@@ -1181,7 +1194,7 @@ FakeStartResult materialize_and_adopt(FakeManager& manager, FakeProgram& program
 void test_global_catalog_lifecycle() {
     using Manager = ninfer::runtime::ResourceManager<FakePackage>;
     FakeProgram program;
-    Manager manager(resources({2, 4, 12, 8}), 2, 4, 0, true);
+    Manager manager(resources({2, 4, 12, 8}), 2, 4, 0, true, 0, test_cost_model());
     const FakeRequestBasePlan base = make_base();
 
     auto first = manager.inspect(program, FakePreparedPrompt{1}, base);
@@ -1215,7 +1228,7 @@ void test_global_catalog_lifecycle() {
 void test_catalog_pressure_reserves_publication() {
     using Manager = ninfer::runtime::ResourceManager<FakePackage>;
     FakeProgram program;
-    Manager manager(resources({1, 2, 6, 4}), 1, 2, 0, true);
+    Manager manager(resources({1, 2, 6, 4}), 1, 2, 0, true, 0, test_cost_model());
 
     const auto publish_root = [&](std::uint32_t key, std::uint64_t work) {
         const FakeRequestBasePlan base = make_base(work);
@@ -1239,7 +1252,7 @@ void test_catalog_pressure_reserves_publication() {
 
 void test_root_only_mode_releases_finished_context() {
     FakeProgram program;
-    FakeManager manager(resources({1, 1, 3, 2}), 1, 1, 0, false);
+    FakeManager manager(resources({1, 1, 3, 2}), 1, 1, 0, false, 0, test_cost_model());
     FakeRequestBasePlan base        = make_base();
     base.cache.session_key          = FakeCacheSessionKey{7};
     base.value.publish_continuation = false;
@@ -1266,7 +1279,7 @@ void test_root_only_mode_releases_finished_context() {
 
 void test_materialization_abort_and_adoption() {
     FakeProgram program;
-    FakeManager manager(resources({1, 2, 4, 2}), 1, 2, 0, true);
+    FakeManager manager(resources({1, 2, 4, 2}), 1, 2, 0, true, 0, test_cost_model());
 
     FakeRequestBasePlan seed = make_base();
     seed.resources           = demand({1, 1, 2, 1});
@@ -1335,7 +1348,7 @@ void test_materialization_abort_and_adoption() {
 
 void test_retained_private_source_reference() {
     FakeProgram program;
-    FakeManager manager(resources({2, 4, 12, 8}), 2, 4, 0, true);
+    FakeManager manager(resources({2, 4, 12, 8}), 2, 4, 0, true, 0, test_cost_model());
 
     FakeRequestBasePlan seed = make_base();
     seed.cache.session_key   = FakeCacheSessionKey{42};
@@ -1374,7 +1387,8 @@ void test_complete_eviction_closure_competes_with_mixed_closure() {
     FakeProgram program;
     program.host_only_finish_key       = 3;
     program.demotable_device_state_key = 1;
-    FakeManager manager(resources({1, 2, 10, 6}, {.state_slots = 1}), 1, 3, 0, true);
+    FakeManager manager(resources({1, 2, 10, 6}, {.state_slots = 1}), 1, 3, 0, true, 0,
+                        test_cost_model());
 
     const auto publish = [&](std::uint32_t key, ninfer::runtime::RetentionClass retention,
                              bool host_only) {
@@ -1401,11 +1415,12 @@ void test_complete_eviction_closure_competes_with_mixed_closure() {
         "mixed closure displaced more valuable continuations than the complete eviction closure");
 }
 
-void test_disposable_eviction_beats_cold_start_demotion() {
+void test_generic_numeric_cost_prefers_disposable_eviction() {
     FakeProgram program;
     program.host_only_finish_key       = 1;
     program.demotable_device_state_key = 2;
-    FakeManager manager(resources({1, 1, 8, 5}, {.state_slots = 2}), 1, 3, 0, true);
+    FakeManager manager(resources({1, 1, 8, 5}, {.state_slots = 2}), 1, 3, 0, true, 0,
+                        test_cost_model());
 
     FakeRequestBasePlan live = make_base();
     live.cache.retention     = ninfer::runtime::RetentionClass::LiveSession;
@@ -1424,9 +1439,10 @@ void test_disposable_eviction_beats_cold_start_demotion() {
 
     auto inspection = manager.inspect(program, FakePreparedPrompt{3}, make_base());
     expect(inspection.readiness == ninfer::runtime::Readiness::Ready && inspection.choice,
-           "cold-start pressure request was not admitted");
-    expect(program.last_composed_pressure == std::vector<std::pair<std::uint64_t, bool>>{{2, true}},
-           "cold-start cost preferred transferring a Disposable checkpoint over evicting it");
+           "generic-cost pressure request was not admitted");
+    expect(
+        program.last_composed_pressure == std::vector<std::pair<std::uint64_t, bool>>{{2, true}},
+        "generic numerical cost preferred transferring a Disposable checkpoint over evicting it");
 }
 
 void test_source_alias_filters_only_the_unsafe_pressure_action() {
@@ -1434,7 +1450,7 @@ void test_source_alias_filters_only_the_unsafe_pressure_action() {
     program.demotable_device_state_key = 2;
     program.pressure_alias_source_key  = 1;
     program.pressure_alias_owner_key   = 2;
-    FakeManager manager(resources({1, 2, 10, 6}), 1, 3, 0, true);
+    FakeManager manager(resources({1, 2, 10, 6}), 1, 3, 0, true, 0, test_cost_model());
 
     FakeRequestBasePlan source = make_base();
     source.cache.session_key   = FakeCacheSessionKey{1};
@@ -1461,8 +1477,8 @@ void test_source_alias_filters_only_the_unsafe_pressure_action() {
 void test_value_positive_replica_replaces_lower_value_host_duplicate() {
     FakeProgram program;
     program.emit_state_d2h_observation = true;
-    FakeManager manager(resources({1, 2, 6, 4}, {.state_slots = 1}), 1, 2, 0, true);
-    manager.observe_prefill({.work = {.text_quanta = 1}, .text_elapsed_ns = 100});
+    FakeManager manager(resources({1, 2, 6, 4}, {.state_slots = 1}), 1, 2, 0, true, 0,
+                        test_cost_model());
 
     const auto publish = [&](std::uint32_t key, FakeRequestBasePlan base) {
         auto inspection = manager.inspect(program, FakePreparedPrompt{key}, base);
@@ -1507,8 +1523,8 @@ void test_value_positive_replica_replaces_lower_value_host_duplicate() {
 void test_ready_replica_transition_skips_dominated_replacements() {
     FakeProgram program;
     program.emit_state_d2h_observation = true;
-    FakeManager manager(resources({1, 2, 6, 4}, {.state_slots = 2}), 1, 2, 0, true);
-    manager.observe_prefill({.work = {.text_quanta = 1}, .text_elapsed_ns = 100});
+    FakeManager manager(resources({1, 2, 6, 4}, {.state_slots = 2}), 1, 2, 0, true, 0,
+                        test_cost_model());
 
     const auto publish = [&](std::uint32_t key, FakeRequestBasePlan base) {
         auto inspection = manager.inspect(program, FakePreparedPrompt{key}, base);
@@ -1552,7 +1568,7 @@ int main() {
     test_materialization_abort_and_adoption();
     test_retained_private_source_reference();
     test_complete_eviction_closure_competes_with_mixed_closure();
-    test_disposable_eviction_beats_cold_start_demotion();
+    test_generic_numeric_cost_prefers_disposable_eviction();
     test_source_alias_filters_only_the_unsafe_pressure_action();
     test_value_positive_replica_replaces_lower_value_host_duplicate();
     test_ready_replica_transition_skips_dominated_replacements();

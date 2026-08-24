@@ -50,11 +50,45 @@ std::uint32_t backend_frontier_at(SpeculativeBackend backend,
     return backend == SpeculativeBackend::DFlash ? main_frontier : 0U;
 }
 
-std::uint64_t checked_transfer_bytes(std::size_t stride, std::uint32_t pages, const char* label) {
-    if (pages != 0 && stride > std::numeric_limits<std::uint64_t>::max() / pages) {
-        throw std::overflow_error(label);
+std::uint64_t segmented_prefill_chunks(std::uint32_t begin, std::uint32_t end,
+                                       std::uint32_t prefill_chunk,
+                                       std::span<const CaptureGroup> captures,
+                                       std::span<const std::uint32_t> rewrite_frontiers) noexcept {
+    if (begin >= end || prefill_chunk == 0) { return 0; }
+    std::uint64_t chunks        = 0;
+    std::uint32_t segment_begin = begin;
+    std::size_t capture_index   = 0;
+    std::size_t rewrite_index   = 0;
+    while (capture_index < captures.size() || rewrite_index < rewrite_frontiers.size()) {
+        const std::uint32_t capture_frontier = capture_index < captures.size()
+                                                   ? captures[capture_index].frontier
+                                                   : std::numeric_limits<std::uint32_t>::max();
+        const std::uint32_t rewrite_frontier = rewrite_index < rewrite_frontiers.size()
+                                                   ? rewrite_frontiers[rewrite_index]
+                                                   : std::numeric_limits<std::uint32_t>::max();
+        const std::uint32_t frontier         = std::min(capture_frontier, rewrite_frontier);
+        if (capture_frontier == frontier) { ++capture_index; }
+        if (rewrite_frontier == frontier) { ++rewrite_index; }
+        if (frontier <= segment_begin || frontier >= end) { continue; }
+        const std::uint64_t segment = frontier - segment_begin;
+        chunks += 1U + (segment - 1U) / prefill_chunk;
+        segment_begin = frontier;
     }
-    return static_cast<std::uint64_t>(stride) * pages;
+    const std::uint64_t suffix = end - segment_begin;
+    return chunks + 1U + (suffix - 1U) / prefill_chunk;
+}
+
+runtime::PrefillWork scheduled_prefill_work(std::uint32_t begin, std::uint32_t end,
+                                            std::uint64_t vision_items,
+                                            std::uint64_t vision_patches,
+                                            std::uint32_t prefill_chunk,
+                                            std::span<const CaptureGroup> captures,
+                                            std::span<const std::uint32_t> rewrite_frontiers) {
+    if (end < begin) { throw std::logic_error("prefill work interval is reversed"); }
+    runtime::PrefillWork work =
+        runtime::make_prefill_work(begin, end - begin, vision_items, vision_patches, prefill_chunk);
+    work.chunks = segmented_prefill_chunks(begin, end, prefill_chunk, captures, rewrite_frontiers);
+    return work;
 }
 
 std::uint64_t projected_service_work(const runtime::RequestPlanSummary& summary,
@@ -96,8 +130,11 @@ std::uint32_t capture_identity_tag(SpeculativeBackend backend, ProposalHead prop
 }
 
 runtime::PrefillWork rebuild_work_at_frontier(const PreparedPromptData& prompt,
-                                              std::uint32_t frontier) {
-    runtime::PrefillWork work{.text_quanta = frontier};
+                                              std::uint32_t frontier, std::uint32_t prefill_chunk,
+                                              std::span<const CaptureGroup> captures,
+                                              std::span<const std::uint32_t> rewrite_frontiers) {
+    std::uint64_t vision_items   = 0;
+    std::uint64_t vision_patches = 0;
     for (const qwen3_6::VisionItem& item : prompt.vision_items) {
         bool fully_consumed = !item.token_spans.empty();
         for (const qwen3_6::TokenSpan& span : item.token_spans) {
@@ -108,12 +145,17 @@ runtime::PrefillWork rebuild_work_at_frontier(const PreparedPromptData& prompt,
             }
         }
         if (!fully_consumed) { continue; }
-        if (item.patch_count > std::numeric_limits<std::uint64_t>::max() - work.vision_quanta) {
+        if (vision_items == std::numeric_limits<std::uint64_t>::max()) {
+            throw std::overflow_error("Vision rebuild item count exceeds uint64");
+        }
+        ++vision_items;
+        if (item.patch_count > std::numeric_limits<std::uint64_t>::max() - vision_patches) {
             throw std::overflow_error("Vision rebuild work exceeds uint64");
         }
-        work.vision_quanta += static_cast<std::uint64_t>(item.patch_count);
+        vision_patches += static_cast<std::uint64_t>(item.patch_count);
     }
-    return work;
+    return scheduled_prefill_work(0, frontier, vision_items, vision_patches, prefill_chunk,
+                                  captures, rewrite_frontiers);
 }
 
 runtime::DeviceResources convertible_source_resources(runtime::DeviceResources active,
@@ -321,7 +363,9 @@ RequestBasePlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
                                         static_cast<std::ptrdiff_t>(group.frontier));
             identity->prefix_identity.assign(prompt);
             identity->prefix_identity.truncate(group.frontier);
-            identity->rebuild_work  = rebuild_work_at_frontier(prompt, group.frontier);
+            identity->rebuild_work = rebuild_work_at_frontier(
+                prompt, group.frontier, prefill_chunk, base->capture_groups,
+                prompt.identity.rewrite_execution_frontiers);
             identity->shortlist_key = qwen3_6::PrefixShortlistKey{
                 .digest =
                     identity->prefix_identity.shortlist_digest(identity->ledger, group.frontier),
@@ -354,7 +398,9 @@ RequestBasePlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
     base->summary.service_work_quanta =
         projected_service_work(base->summary, 0, prefill_chunk, cold_prefill_splits,
                                base->capture_groups, prompt.identity.rewrite_execution_frontiers);
-    base->root_rebuild_work = rebuild_work_at_frontier(prompt, base->summary.prompt_tokens);
+    base->root_rebuild_work =
+        rebuild_work_at_frontier(prompt, base->summary.prompt_tokens, prefill_chunk,
+                                 base->capture_groups, prompt.identity.rewrite_execution_frontiers);
     return RequestBasePlan(std::move(base));
 }
 
@@ -649,7 +695,8 @@ ProgramImplCore::inspect_lane(std::uint32_t lane, const PreparedPromptData& prom
     plan->summary.service_work_quanta =
         projected_service_work(plan->summary, plan->reuse_base, prefill_chunk, prefill_splits,
                                plan->capture_groups, prompt.identity.rewrite_execution_frontiers);
-    plan->remaining_prefill_work.text_quanta = plan->summary.prompt_tokens - plan->reuse_base;
+    std::uint64_t remaining_vision_items   = 0;
+    std::uint64_t remaining_vision_patches = 0;
     if (plan->vision) {
         std::vector<bool> counted(prompt.vision_items.size(), false);
         for (const VisionUseSpan& use : plan->vision->uses) {
@@ -657,27 +704,52 @@ ProgramImplCore::inspect_lane(std::uint32_t lane, const PreparedPromptData& prom
                 throw std::logic_error("Vision cost input references a missing item");
             }
             if (counted[use.item_index]) { continue; }
-            counted[use.item_index]   = true;
+            counted[use.item_index] = true;
+            if (remaining_vision_items == std::numeric_limits<std::uint64_t>::max()) {
+                throw std::overflow_error("Vision prefill item count exceeds uint64");
+            }
+            ++remaining_vision_items;
             const std::size_t patches = prompt.vision_items[use.item_index].patch_count;
-            if (patches > std::numeric_limits<std::uint64_t>::max() -
-                              plan->remaining_prefill_work.vision_quanta) {
+            if (patches > std::numeric_limits<std::uint64_t>::max() - remaining_vision_patches) {
                 throw std::overflow_error("Vision prefill cost input exceeds uint64");
             }
-            plan->remaining_prefill_work.vision_quanta += static_cast<std::uint64_t>(patches);
+            remaining_vision_patches += static_cast<std::uint64_t>(patches);
         }
     }
+    plan->remaining_prefill_work =
+        scheduled_prefill_work(plan->reuse_base, plan->summary.prompt_tokens,
+                               remaining_vision_items, remaining_vision_patches, prefill_chunk,
+                               plan->capture_groups, prompt.identity.rewrite_execution_frontiers);
     plan->transfer_requirements.reserve(4);
-    const auto add_transfer = [&](runtime::ContextResourceClass resource,
-                                  runtime::ContextTransferDirection direction, std::uint64_t bytes,
-                                  std::uint32_t pages, std::uint32_t copy_runs = 1) {
-        if (bytes == 0) { return; }
+    const auto add_state_transfer = [&](runtime::ContextTransferDirection direction,
+                                        bool dflash_local_only = false) {
+        const TransferWork work = dflash_local_only
+                                      ? dflash_local_transfer_work(state_images->host_layout())
+                                      : state_image_transfer_work(state_images->host_layout());
+        plan->transfer_requirements.push_back(runtime::ContextTransferRequirement{
+            .resource   = runtime::ContextResourceClass::State,
+            .direction  = direction,
+            .units      = 1,
+            .page_count = 0,
+            .work       = work,
+        });
+    };
+    const auto add_kv_transfer = [&](runtime::ContextResourceClass resource,
+                                     runtime::ContextTransferDirection direction,
+                                     const LogicalKVPageStore& pages, std::uint32_t page_count,
+                                     std::uint32_t contiguous_runs = 1) {
+        if (page_count == 0) { return; }
+        const HostKVPageLayout layout = plan_host_kv_page_layout(pages.physical_pool().geometry());
+        const TransferWork work =
+            direction == runtime::ContextTransferDirection::DeviceToDevice
+                ? plan_device_kv_copy_work(layout, page_count)
+                : plan_host_kv_transfer_work(layout, page_count, contiguous_runs);
         plan->transfer_requirements.push_back(runtime::ContextTransferRequirement{
             .resource   = resource,
             .direction  = direction,
-            .units      = resource == runtime::ContextResourceClass::State ? 1U : bytes,
-            .bytes      = bytes,
-            .page_count = pages,
-            .copy_runs  = copy_runs,
+            .units      = work.payload_bytes,
+            .page_count = page_count,
+            .work       = work,
         });
     };
     const auto missing_kv_restore = [&](const KVAddressSpaceStore& addresses,
@@ -714,22 +786,22 @@ ProgramImplCore::inspect_lane(std::uint32_t lane, const PreparedPromptData& prom
         const StateReplicaResidency selected_state_residency = state_store->residency(selected);
         plan->needs_transfer = selected_state_residency == StateReplicaResidency::HostOnly;
         if (plan->needs_transfer) {
-            add_transfer(runtime::ContextResourceClass::State,
-                         runtime::ContextTransferDirection::HostToDevice,
-                         state_images->host_layout().image_bytes, 0);
+            add_state_transfer(runtime::ContextTransferDirection::HostToDevice);
         }
         const bool splits_private_both =
             source != nullptr && selected_state_residency == StateReplicaResidency::Both;
-        if (plan->source_disposition == runtime::ClaimDisposition::Retained &&
-            speculative_backend == SpeculativeBackend::DFlash &&
-            selected_state_residency != StateReplicaResidency::HostOnly && !splits_private_both) {
+        const bool forks_device_state =
+            (plan->source_disposition == runtime::ClaimDisposition::Retained &&
+             !splits_private_both) ||
+            (plan->source_disposition == runtime::ClaimDisposition::ConsumedToActive &&
+             plan->state_fork_required);
+        if (speculative_backend == SpeculativeBackend::DFlash && forks_device_state &&
+            selected_state_residency != StateReplicaResidency::HostOnly) {
             // DFlash has lane-local recurrent state which is copied eagerly when a retained
             // checkpoint forks. The copy completes on the compute stream in the publication
             // boundary, so it contributes candidate cost without turning the plan into an
             // asynchronous materialization.
-            add_transfer(runtime::ContextResourceClass::State,
-                         runtime::ContextTransferDirection::DeviceToDevice,
-                         state_images->host_layout().image_bytes, 0);
+            add_state_transfer(runtime::ContextTransferDirection::DeviceToDevice, true);
         }
         const SequenceKVBundle* source_kv =
             source != nullptr ? (source->kv ? &*source->kv : nullptr)
@@ -754,20 +826,16 @@ ProgramImplCore::inspect_lane(std::uint32_t lane, const PreparedPromptData& prom
         if (main_device > main_required) {
             throw std::logic_error("Text KV resident prefix exceeds checkpoint requirement");
         }
-        const auto [main_missing, main_copy_runs] =
+        const auto [main_missing, main_contiguous_runs] =
             missing_kv_restore(*text_kv_addresses, *text_kv_pages, source_kv->text, main_required);
         if (main_missing != main_required - main_device) {
             throw std::logic_error("Text KV restore inventory is inconsistent");
         }
         plan->needs_transfer = plan->needs_transfer || main_missing != 0;
         if (main_missing != 0) {
-            const std::uint64_t stride =
-                plan_host_kv_page_layout(text_kv_pages->physical_pool().geometry()).page_stride;
-            add_transfer(
-                runtime::ContextResourceClass::MainKV,
-                runtime::ContextTransferDirection::HostToDevice,
-                checked_transfer_bytes(stride, main_missing, "Text KV transfer size overflow"),
-                main_missing, main_copy_runs);
+            add_kv_transfer(runtime::ContextResourceClass::MainKV,
+                            runtime::ContextTransferDirection::HostToDevice, *text_kv_pages,
+                            main_missing, main_contiguous_runs);
         }
         if (source_kv->backend && backend_frontier != 0) {
             const std::uint32_t backend_required = pages_for_tokens(backend_frontier);
@@ -776,38 +844,30 @@ ProgramImplCore::inspect_lane(std::uint32_t lane, const PreparedPromptData& prom
             if (backend_device > backend_required) {
                 throw std::logic_error("Backend KV resident prefix exceeds checkpoint requirement");
             }
-            const auto [backend_missing, backend_copy_runs] = missing_kv_restore(
+            const auto [backend_missing, backend_contiguous_runs] = missing_kv_restore(
                 *backend_kv_addresses, *backend_kv_pages, *source_kv->backend, backend_required);
             if (backend_missing != backend_required - backend_device) {
                 throw std::logic_error("Backend KV restore inventory is inconsistent");
             }
             plan->needs_transfer = plan->needs_transfer || backend_missing != 0;
             if (backend_missing != 0) {
-                const std::uint64_t stride =
-                    plan_host_kv_page_layout(backend_kv_pages->physical_pool().geometry())
-                        .page_stride;
-                add_transfer(runtime::ContextResourceClass::BackendKV,
-                             runtime::ContextTransferDirection::HostToDevice,
-                             checked_transfer_bytes(stride, backend_missing,
-                                                    "Backend KV transfer size overflow"),
-                             backend_missing, backend_copy_runs);
+                add_kv_transfer(runtime::ContextResourceClass::BackendKV,
+                                runtime::ContextTransferDirection::HostToDevice, *backend_kv_pages,
+                                backend_missing, backend_contiguous_runs);
             }
         }
         if (plan->text_prefix_fork_required) {
             const std::uint32_t page_size = static_cast<std::uint32_t>(kPagedKVPageSize);
             if (plan->reuse_base % page_size != 0) {
-                const std::uint64_t stride =
-                    plan_host_kv_page_layout(text_kv_pages->physical_pool().geometry()).page_stride;
-                add_transfer(runtime::ContextResourceClass::MainKV,
-                             runtime::ContextTransferDirection::DeviceToDevice, stride, 1);
+                add_kv_transfer(runtime::ContextResourceClass::MainKV,
+                                runtime::ContextTransferDirection::DeviceToDevice, *text_kv_pages,
+                                1);
                 plan->needs_transfer = true;
             }
             if (plan->backend_prefix_fork_required && backend_frontier % page_size != 0) {
-                const std::uint64_t stride =
-                    plan_host_kv_page_layout(backend_kv_pages->physical_pool().geometry())
-                        .page_stride;
-                add_transfer(runtime::ContextResourceClass::BackendKV,
-                             runtime::ContextTransferDirection::DeviceToDevice, stride, 1);
+                add_kv_transfer(runtime::ContextResourceClass::BackendKV,
+                                runtime::ContextTransferDirection::DeviceToDevice,
+                                *backend_kv_pages, 1);
                 plan->needs_transfer = true;
             }
         }
@@ -904,8 +964,8 @@ ProgramImplCore::inspect_lane(std::uint32_t lane, const PreparedPromptData& prom
                         throw std::overflow_error("retained KV tail Host backup size overflow");
                     }
                     retained_tail_added.host.kv_bytes += stride;
-                    add_transfer(resource, runtime::ContextTransferDirection::DeviceToHost, stride,
-                                 1);
+                    add_kv_transfer(resource, runtime::ContextTransferDirection::DeviceToHost,
+                                    pages, 1);
                     plan->needs_transfer = true;
                 }
                 return true;

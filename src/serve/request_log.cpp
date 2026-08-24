@@ -462,31 +462,32 @@ std::string format_server_start_json(
     Json artifact_size = nullptr;
     if (artifact_size_bytes.has_value()) { artifact_size = *artifact_size_bytes; }
 
-    record["server"]                         = Json{{"host", options.host},
-                                                    {"port", options.port},
-                                                    {"public_model_id", public_model_id},
-                                                    {"api_key_configured", !options.api_key.empty()},
-                                                    {"cors_enabled", options.enable_cors},
-                                                    {"max_request_bytes", options.max_request_bytes},
-                                                    {"media_cache_bytes", options.media_cache_bytes},
-                                                    {"media_live_bytes", options.media_live_bytes},
-                                                    {"media_preprocess_threads", options.media_preprocess_threads},
-                                                    {"request_log_jsonl", options.request_log_jsonl},
-                                                    {"default_output_tokens", options.default_max_tokens},
-                                                    {"default_thinking", options.enable_thinking},
-                                                    {"default_preserve_thinking", options.preserve_thinking}};
-    record["artifact"]                       = Json{{"path", options.artifact_path},
-                                                    {"size_bytes", std::move(artifact_size)},
-                                                    {"target", load.target},
-                                                    {"weights_id", load.weights_id},
-                                                    {"bytes_read", load.artifact_bytes_read},
-                                                    {"host_to_device_bytes", load.host_to_device_bytes},
-                                                    {"peak_staging_bytes", load.peak_staging_bytes},
-                                                    {"tensor_count", load.tensor_count},
-                                                    {"resource_count", load.resource_count},
-                                                    {"load_seconds", load.load_seconds},
-                                                    {"upload_seconds", load.upload_seconds}};
-    const ninfer::ContextCacheOptions& cache = engine_options.context_cache;
+    record["server"]                               = Json{{"host", options.host},
+                                                          {"port", options.port},
+                                                          {"public_model_id", public_model_id},
+                                                          {"api_key_configured", !options.api_key.empty()},
+                                                          {"cors_enabled", options.enable_cors},
+                                                          {"max_request_bytes", options.max_request_bytes},
+                                                          {"media_cache_bytes", options.media_cache_bytes},
+                                                          {"media_live_bytes", options.media_live_bytes},
+                                                          {"media_preprocess_threads", options.media_preprocess_threads},
+                                                          {"request_log_jsonl", options.request_log_jsonl},
+                                                          {"default_output_tokens", options.default_max_tokens},
+                                                          {"default_thinking", options.enable_thinking},
+                                                          {"default_preserve_thinking", options.preserve_thinking}};
+    record["artifact"]                             = Json{{"path", options.artifact_path},
+                                                          {"size_bytes", std::move(artifact_size)},
+                                                          {"target", load.target},
+                                                          {"weights_id", load.weights_id},
+                                                          {"bytes_read", load.artifact_bytes_read},
+                                                          {"host_to_device_bytes", load.host_to_device_bytes},
+                                                          {"peak_staging_bytes", load.peak_staging_bytes},
+                                                          {"tensor_count", load.tensor_count},
+                                                          {"resource_count", load.resource_count},
+                                                          {"load_seconds", load.load_seconds},
+                                                          {"upload_seconds", load.upload_seconds}};
+    const ninfer::ContextCacheOptions& cache       = engine_options.context_cache;
+    const ninfer::ContextCostSummary& context_cost = load.context_cost;
     const std::uint64_t total_device_state_slots =
         static_cast<std::uint64_t>(engine_options.max_concurrency) +
         cache.device_state_slots.value();
@@ -510,6 +511,14 @@ std::string format_server_start_json(
          product::speculative_backend_name(engine_options.speculative.backend)},
         {"speculative_draft_window", engine_options.speculative.draft_tokens},
         {"proposal_head", proposal_head_name(engine_options.speculative.proposal_head)},
+        {"context_cost", Json{{"transfer_source", ninfer::context_cost_preset_source_name(
+                                                      context_cost.transfer_source)},
+                              {"prefill_source", ninfer::context_cost_preset_source_name(
+                                                     context_cost.prefill_source)},
+                              {"hardware_class", context_cost.hardware_class},
+                              {"model_id", context_cost.model_id},
+                              {"weights_id", context_cost.weights_id},
+                              {"preset_path", context_cost.preset_path.string()}}},
         {"context_cache",
          Json{
              {"enabled", cache.enabled},
@@ -744,8 +753,7 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
                            {"host_kv_bytes", current.host_kv_occupied_bytes},
                            {"shared_active_references", current.shared_active_references}}},
         {"last_materialization",
-         Json{{"cost_calibrated", current.last_predicted_materialization_calibrated},
-              {"predicted_nanoseconds", current.last_predicted_materialization_ns}}},
+         Json{{"predicted_nanoseconds", current.last_predicted_materialization_ns}}},
         {"actual_transfer_seconds", monotonic_delta(previous.actual_context_transfer_seconds,
                                                     current.actual_context_transfer_seconds)}};
     return record.dump();

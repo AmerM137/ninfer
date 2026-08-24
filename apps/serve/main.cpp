@@ -70,9 +70,10 @@ int main(int argc, char** argv) {
                << std::chrono::duration<double>(Clock::now() - load_start).count() << " s";
         ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Info, loaded.str());
 
-        const ninfer::MemorySummary memory       = service.memory_summary();
-        const ninfer::EngineOptions& engine      = service.engine_options();
-        const ninfer::ContextCacheOptions& cache = engine.context_cache;
+        const ninfer::MemorySummary memory            = service.memory_summary();
+        const ninfer::ContextCostSummary context_cost = service.load_summary().context_cost;
+        const ninfer::EngineOptions& engine           = service.engine_options();
+        const ninfer::ContextCacheOptions& cache      = engine.context_cache;
         std::ostringstream capacity;
         capacity << "KV capacity "
                  << (memory.kv_capacity_mode == ninfer::KvCapacityMode::Automatic ? "auto"
@@ -95,6 +96,12 @@ int main(int argc, char** argv) {
                  << " shared=" << *cache.max_shared_prefixes
                  << " anchors=" << *cache.max_long_anchors_per_continuation
                  << " markers=" << *cache.max_cache_markers_per_request;
+        capacity << " context-cost-transfer="
+                 << ninfer::context_cost_preset_source_name(context_cost.transfer_source)
+                 << " context-cost-prefill="
+                 << ninfer::context_cost_preset_source_name(context_cost.prefill_source)
+                 << " cost-profile=" << context_cost.hardware_class << '/' << context_cost.model_id
+                 << '/' << context_cost.weights_id;
         if (options.enable_vision) {
             const ninfer::MediaCacheSummary media = service.media_cache_summary();
             capacity << " media-workers=" << media.preprocess_threads

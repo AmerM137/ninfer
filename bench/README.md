@@ -70,6 +70,85 @@ and `-r 1`, synchronizes after warmup, and brackets only the measured repetition
 `cudaProfilerStart/Stop`. Use it with an Nsight Systems `cudaProfilerApi` capture range so artifact
 load, graph construction, and warmup do not enter topology counts.
 
+## Context-cost calibration
+
+`ninfer_context_cost_bench` measures the static coefficients used to compare context-cache
+materialization alternatives. It is an offline tool, not a startup benchmark or runtime autotuner.
+It has two independent suites:
+
+- `transfer` measures one machine-level D2H/H2D/D2D roofline with the production paged-KV transfer
+  primitives and representative PageMajor/HeadMajor geometries. Contiguous D2D batches independently
+  vary bytes and operation count to represent StateImage components and identify device bandwidth.
+  It uses synthetic non-compressible buffers and never inspects an artifact or loads a model.
+- `prefill` loads one artifact through the public Engine and measures its Text/Vision recomputation
+  cost under the canonical BF16/no-spec configuration. Its result is keyed only by hardware class
+  and artifact `model_id/weights_id`.
+
+The runtime models are:
+
+```text
+transfer = max(batch_ns + copy_operations * operation_ns,
+               payload_bytes * ns_per_byte)
+prefill  = chunks * chunk_ns
+         + suffix_tokens * token_ns
+         + attention_pairs * attention_pair_ns
+         + vision_items * vision_item_ns
+         + vision_patches * vision_patch_ns
+```
+
+`payload_bytes` is the actual copied payload, excluding Host arena padding. `copy_operations` is the
+number of physical `cudaMemcpy*` calls implied by the page geometry and contiguous runs. Resource
+kind, KV dtype, and speculative backend do not select different coefficients; any differences they
+create are represented by those two physical quantities. For a suffix `S` after prefix `B`,
+`attention_pairs = B*S + S*(S+1)/2`. `chunks` is the sum of
+`ceil(segment_tokens/prefill_chunk)` across the actual prefill schedule's capture/rewrite segments;
+with no such boundary it is simply `ceil(S/prefill_chunk)`.
+
+Build the tool, then measure machine transfer without a model:
+
+```bash
+cmake --build build -j --target ninfer_context_cost_bench
+./build/bench/ninfer_context_cost_bench \
+  --suite transfer \
+  --json profiles/bench/context_cost_transfer.json \
+  --preset-out profiles/bench/context_cost_presets.json
+```
+
+Measure prefill separately when the GPU has room for the artifact:
+
+```bash
+./build/bench/ninfer_context_cost_bench \
+  --suite prefill \
+  --artifact out/qwen3_6_27b.ninfer \
+  --corpus bench/fixtures/bench_corpus.ids \
+  --json profiles/bench/qwen3_6_27b_prefill_cost.json \
+  --preset-out profiles/bench/context_cost_presets.json
+```
+
+`--suite all` performs transfer first, releases its fixtures, then loads the artifact for prefill.
+The JSON report retains every repetition, median/MAD, floating and quantized coefficients, and
+training/held-out predictions. A fit is accepted only when both training and held-out p95 relative
+error are at most 35% for transfer and 15% for prefill, and materially different points in either
+partition are never predicted in reverse order. Exact predicted ties are reported separately and
+are allowed: they enter the runtime's deterministic semantic tie-break. Rejection writes the
+report, exits with status 3, and leaves the preset unchanged.
+
+`--preset-out` is valid for every suite. It atomically replaces only the component measured by that
+suite: a transfer run updates the hardware node's three directions, while a prefill run updates one
+artifact entry and preserves machine transfer plus other artifacts. The resulting file is parsed by
+the runtime's strict loader before publication.
+
+[`context_cost_defaults.cpp`](../src/runtime/engine/context_cost_defaults.cpp) is the sole table of
+defaults compiled into the binary. JSON is not a build input: `--preset-out` produces a runtime
+registry that can be selected immediately, without recompilation, through
+`EngineOptions.context_cost.preset_path` or `ninfer-serve --context-cost-presets`. Resolution always
+starts with generic numerical coefficients,
+then independently applies matching compiled transfer/prefill values, then independently applies
+matching external values. A malformed explicit file is an error; a missing hardware or artifact
+entry retains the preceding numerical layer. After real-scenario acceptance, a maintainer may
+promote quantized values into the C++ table. The detailed `--json` report is diagnostic provenance
+and is not a runtime input.
+
 ## Linear Op benchmark
 
 `ninfer_linear_bench` measures only the public pure `linear()` contract. It supports Q4, Q5, Q6,

@@ -2301,18 +2301,95 @@ logical canonical storage
 
 ### 23.6 实测成本模型
 
-持续记录：
+ResourceManager不从请求流在线学习成本。Engine启动时只读解析一个不可变`ContextCostModel`，所有请求
+共享同一组系数，请求执行不会修改它。简化模型为：
+
+```text
+transfer = max(batch_ns + copy_operations * operation_ns,
+               payload_bytes * ns_per_byte)
+prefill = chunks * chunk_ns
+        + suffix_tokens * token_ns
+        + attention_pairs * attention_pair_ns
+        + vision_items * vision_item_ns
+        + vision_patches * vision_patch_ns
+```
+
+transfer只按D2H、H2D、D2D方向各持有一组本机系数。`payload_bytes`是CUDA实际搬运的payload，排除
+Host arena的对齐padding；`copy_operations`是该操作实际提交的`cudaMemcpy*`次数。PageMajor Host
+restore按`planes * contiguous_runs`计数，HeadMajor按`sum(heads) * contiguous_runs`计数，Device页拷贝
+按`planes * pages`计数，StateImage按实际component copy计数。因此Main-KV、Backend-KV、State、KV
+dtype和speculative backend都不再成为成本preset维度：它们造成的物理差异已经落在bytes和operation
+数量中。resource class只保留为资源会计与观测分类。D2H计划在源页已分配时使用实际physical runs；
+H2D候选在目标页尚未分配时以已知Host extent runs作名义值，完成后的observation再按Host extent与实际
+目标physical runs的共同切分记录真实调用数，不为预测额外预分配或重选目标页。
+
+其中从prefix frontier `B`重建suffix `S`时：
+
+```text
+attention_pairs = B*S + S*(S+1)/2
+```
+
+无额外边界时`chunks = ceil(S / prefill_chunk)`；请求计划已知capture/rewrite边界时，按实际segment分别
+向上取整后求和。Program从checkpoint/prompt frontiers直接生成这些feature。尤其checkpoint降级到更早
+fallback时重新按`B,S`计算，不能相减两个累计chunk数；无法从历史checkpoint摘要精确恢复segment边界的
+区间继续使用单区间近似，而不为此保存完整schedule元数据。
+
+数值模型始终存在。解析顺序是generic numerical default、匹配的compiled default、匹配的external
+preset；transfer与prefill独立分层，任一层缺失都保留上一层数值。transfer lookup只使用hardware
+class；prefill lookup使用hardware class和artifact `model_id/weights_id`。有效外部文件没有匹配项不是
+错误；文件格式或数值无效才在启动时失败。ResourceManager始终先比较预测nanoseconds，仅在数值完全
+相同时使用确定性的语义tuple打破平局。
+
+编译期默认值的唯一authority为`src/runtime/engine/context_cost_defaults.cpp`。JSON不参与CMake或构建；
+它只是运行时本机预设。schema以hardware为顶层记录，每个记录可独立包含一组transfer与多个artifact
+prefill项：
+
+```json
+{
+  "schema_version": 2,
+  "artifact_type": "ninfer_context_cost_presets",
+  "machines": [{
+    "hardware_class": "nvidia-geforce-rtx-5090-sm120",
+    "transfer": {
+      "d2h": {"batch_ns": 48655, "operation_ns": 7433, "ns_per_byte_q32": 91692315},
+      "h2d": {"batch_ns": 0, "operation_ns": 8457, "ns_per_byte_q32": 83354284},
+      "d2d": {"batch_ns": 3343, "operation_ns": 9520, "ns_per_byte_q32": 2658314}
+    },
+    "prefill": [{
+      "model_id": "qwen3.6-27b",
+      "weights_id": "groupwise-int",
+      "coefficients": {
+        "chunk_ns": 40813570,
+        "token_ns_q32": 1012273154411951,
+        "attention_pair_ns_q32": 30497396515,
+        "vision_item_ns": 5986585,
+        "vision_patch_ns_q32": 23710212854694
+      }
+    }]
+  }]
+}
+```
+
+离线calibrator的transfer suite使用合成PageMajor/HeadMajor fixture和生产copy primitives，并补充bytes与
+operation数量独立变化的连续D2D batch，以覆盖StateImage component并辨识device bandwidth；它不读取
+artifact也不加载模型。prefill suite才通过公共Engine加载一个artifact。两套suite可分别原子更新同一
+preset，不会覆盖另一组件或其他artifact项。
+
+运行时仍持续记录实际行为用于观测和下一轮离线校准：
 
 * state D2H/H2D latency；
-* 不同 pool的 KV D2H/H2D bandwidth；
-* 不同长度、模态的 prefill时间；
 * checkpoint hit类型；
 * endpoint mismatch比例；
 * shared prefix fan-out；
 * 实际 saved prefill tokens；
 * demoted checkpoint后续命中率。
 
-ResourceManager使用实际观测更新成本估计，但不需要复杂在线学习系统。
+其中State/KV transfer observation只更新`RuntimeStats`的count/bytes/seconds，不回写成本系数。Text与
+Vision prefill系数由独立calibrator在真实artifact上测量；详细report与可加载preset分离，只有通过
+training/held-out error与ordering验收的结果才能原子写入preset。
+
+校准验收把materially different点的严格预测逆序视为失败；简化feature/roofline无法区分而产生的精确
+预测平局单独报告，但不拒绝，因为运行时本来就会把精确nanoseconds平局交给确定性的semantic tie-break。
 
 ---
 
@@ -2332,6 +2409,10 @@ struct ContextCacheOptions {
     optional<uint32_t> max_shared_prefixes;
     optional<uint32_t> max_long_anchors_per_continuation;
     optional<uint32_t> max_cache_markers_per_request;
+};
+
+struct ContextCostOptions {
+    filesystem::path preset_path; // empty: generic + matching compiled defaults
 };
 ```
 
@@ -2386,8 +2467,12 @@ gauge，以及显式命名的最后一次决策观测。当前字段覆盖：
 * `device_state_occupied_slots`、`host_state_occupied_slots`、Device Main/Backend pages、Host KV
   bytes与shared active-reference gauge；
 * historical Fork hit counter；
-* `last_predicted_materialization_ns`及其calibrated bit；
+* `last_predicted_materialization_ns`；
 * 累计actual context-transfer seconds。
+
+`LoadSummary.context_cost`分别报告transfer/prefill来源（generic-default/compiled-default/external）、
+hardware class、artifact `model_id/weights_id`及外部preset路径；serve启动console与JSONL server-start
+record都发布该信息。
 
 `MemorySummary`另行报告启动固定的Host State/KV capacity和调用边界上的physical occupancy。serve
 JSONL把累计counter转换为interval delta，保留当前gauge和last-decision语义；不把进程级delta归因到

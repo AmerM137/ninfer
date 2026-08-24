@@ -56,7 +56,7 @@ public:
     using ResourceInspection = typename ResourceManagement::Inspection;
     using Clock              = std::chrono::steady_clock;
 
-    EngineCore(Instance& instance, const EngineOptions& options)
+    EngineCore(Instance& instance, const EngineOptions& options, ContextCostModel context_cost)
         : instance_(instance), max_concurrency_(options.max_concurrency),
           max_outstanding_(static_cast<std::size_t>(options.max_concurrency) +
                            options.max_pending_requests),
@@ -66,7 +66,8 @@ public:
                      options.context_cache.max_private_continuations.value(),
                      options.context_cache.max_shared_prefixes.value(),
                      options.context_cache.enabled,
-                     options.context_cache.max_long_anchors_per_continuation.value_or(0)) {
+                     options.context_cache.max_long_anchors_per_continuation.value_or(0),
+                     std::move(context_cost)) {
         if (max_concurrency_ == 0 || max_concurrency_ > kMaximumConcurrency ||
             options.max_pending_requests == 0 || pending_timeout_.count() <= 0) {
             throw std::invalid_argument("Engine core bounds are invalid");
@@ -787,9 +788,6 @@ private:
                              const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start) {
         cumulative_stats_.computed_prefill_tokens += progress.processed_prompt_tokens;
         Scheduling::consume_service_work(*request, 1);
-        if (!progress.complete && progress.observation) {
-            throw std::logic_error("incomplete prefill exposed a terminal cost observation");
-        }
         if (progress.capture) {
             if (progress.complete || progress.pending) {
                 throw std::logic_error("prefill capture offer overlaps prompt completion");
@@ -803,10 +801,6 @@ private:
         if (!request->lane || !progress.pending) {
             throw std::logic_error("completed prefill has no lane or pending token");
         }
-        if (!progress.observation) {
-            throw std::logic_error("completed prefill has no cost observation");
-        }
-        resources_.observe_prefill(*progress.observation);
         const std::uint32_t lane = request->lane->value;
         if (scheduler_.prefill_lane() == lane) {
             scheduler_.clear_prefill_lane(lane);

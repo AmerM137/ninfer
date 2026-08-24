@@ -35,7 +35,7 @@ benchmark-report, and external protocol behavior. Repository verification princi
   preparation rejections, protocol-shaped payload-limit errors, and application-error preservation;
 - `test_ninfer_bench_support.cpp` — product benchmark CLI, timing boundary, and schema-v9 reports;
 - `test_bench_matrix.py` — schema-v9 report consumption by the Python matrix summarizer;
-- `test_serve_corpus.py` — serving request-log schema compatibility at the measurement consumer;
+- `test_serve_corpus.py` — current serving request-log identity at the measurement consumer;
 - device/tensor/arena tests — reusable lower-component behavior; KV tests cover the core physical
   container, family runtime tests cover dimension-driven GDN storage/view mechanics, and Op tests
   cover mathematical state transitions at their own boundary.

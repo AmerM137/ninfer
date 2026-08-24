@@ -201,6 +201,8 @@ public:
     [[nodiscard]] std::uint32_t available_pages() const noexcept;
     [[nodiscard]] std::size_t plane_count() const noexcept;
     [[nodiscard]] const Tensor& plane(std::size_t index) const;
+    [[nodiscard]] std::uint32_t
+    contiguous_run_count(std::span<const DeviceKVPageHandle> pages) const;
 
     [[nodiscard]] std::optional<DeviceKVPageReservation> reserve(std::uint32_t pages) noexcept;
 

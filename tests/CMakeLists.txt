@@ -67,6 +67,7 @@ ninfer_add_test(ninfer_tensor_test       SOURCES test_tensor.cpp)
 ninfer_add_test(ninfer_arena_test        SOURCES test_arena.cpp)
 ninfer_add_test(ninfer_request_transient_arena_test SOURCES test_request_transient_arena.cpp)
 ninfer_add_test(ninfer_admission_policy_test SOURCES test_admission_policy.cpp)
+ninfer_add_test(ninfer_context_cost_test SOURCES test_context_cost.cpp)
 ninfer_add_test(ninfer_resource_manager_test SOURCES test_resource_manager.cpp)
 ninfer_add_test(ninfer_kv_capacity_test SOURCES test_kv_capacity.cpp)
 ninfer_add_test(ninfer_sampling_defaults_test
@@ -113,6 +114,11 @@ ninfer_add_test(ninfer_qwen3_6_state_image_test
 target_include_directories(ninfer_qwen3_6_state_image_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
 set_tests_properties(ninfer_qwen3_6_state_image_test PROPERTIES SKIP_RETURN_CODE 77)
+ninfer_add_test(ninfer_qwen3_6_state_image_layout_test
+  SOURCES targets/qwen3_6/test_state_image_layout.cpp
+  LIBRARIES ninfer_engine ninfer_core)
+target_include_directories(ninfer_qwen3_6_state_image_layout_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
 ninfer_add_test(ninfer_qwen3_6_context_store_test
   SOURCES targets/qwen3_6/test_context_store.cpp
   LIBRARIES ninfer_engine ninfer_core)
@@ -184,6 +190,15 @@ ninfer_add_test(ninfer_bench_support_test
   NEEDS_SOURCE_DIR
   LIBRARIES ninfer_engine)
 target_include_directories(ninfer_bench_support_test PRIVATE ${PROJECT_SOURCE_DIR}/bench/targets/qwen3_6_27b)
+
+# Pure host-side qualification of the fixed-dimension non-negative fit and the exact coefficient
+# quantization used by the context-cost calibrator. It deliberately links no Engine/CUDA target.
+add_executable(ninfer_context_cost_measure_test
+  test_context_cost_measure.cpp
+  ${PROJECT_SOURCE_DIR}/bench/context_cost/context_cost_measure.cpp)
+target_include_directories(ninfer_context_cost_measure_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/bench/context_cost)
+add_test(NAME ninfer_context_cost_measure_test COMMAND ninfer_context_cost_measure_test)
 
 # Shared Op numerical tests. Target-composed schedule tests are registered separately below.
 set(ninfer_op_tests

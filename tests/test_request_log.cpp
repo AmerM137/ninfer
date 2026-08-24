@@ -94,6 +94,14 @@ int main() {
     load.peak_staging_bytes   = 128;
     load.tensor_count         = 42;
     load.resource_count       = 6;
+    load.context_cost         = {
+                .transfer_source = ninfer::ContextCostPresetSource::External,
+                .prefill_source  = ninfer::ContextCostPresetSource::CompiledDefault,
+                .hardware_class  = "nvidia-geforce-rtx-5090-sm120",
+                .model_id        = "qwen3.6-27b",
+                .weights_id      = "groupwise-int",
+                .preset_path     = "local-costs.json",
+    };
 
     ninfer::MemorySummary memory;
     memory.max_context                       = 262144;
@@ -161,6 +169,13 @@ int main() {
                       "speculative backend missing");
     failures +=
         check(server.at("engine").at("proposal_head") == "optimized", "proposal head missing");
+    failures += check(
+        server.at("engine").at("context_cost").at("transfer_source") == "external" &&
+            server.at("engine").at("context_cost").at("prefill_source") == "compiled-default" &&
+            server.at("engine").at("context_cost").at("hardware_class") ==
+                "nvidia-geforce-rtx-5090-sm120" &&
+            server.at("engine").at("context_cost").at("preset_path") == "local-costs.json",
+        "resolved context-cost layers missing");
     failures += check(server.at("engine").at("prefix_reuse") == true, "prefix-reuse state missing");
     failures += check(
         server.at("engine").at("context_cache").at("device_state_slots") == 2 &&
@@ -351,29 +366,28 @@ int main() {
                       "human request log mislabels a submitted request");
 
     ThroughputReport throughput;
-    throughput.interval_seconds                                  = 2.0;
-    throughput.computed_prefill_tokens                           = 100;
-    throughput.committed_decode_tokens                           = 40;
-    throughput.decode_rounds                                     = 10;
-    throughput.decode_row_rounds                                 = 18;
-    throughput.previous.root_selections                          = 2;
-    throughput.previous.state_h2d_bytes                          = 100;
-    throughput.current.running_requests                          = 2;
-    throughput.current.prefilling_requests                       = 1;
-    throughput.current.decode_ready_requests                     = 1;
-    throughput.current.waiting_requests                          = 3;
-    throughput.current.materializing_requests                    = 1;
-    throughput.current.capture_pending_requests                  = 1;
-    throughput.current.root_selections                           = 3;
-    throughput.current.state_h2d_count                           = 1;
-    throughput.current.state_h2d_bytes                           = 132;
-    throughput.current.state_h2d_seconds                         = 0.25;
-    throughput.current.device_state_occupied_slots               = 3;
-    throughput.current.host_state_occupied_slots                 = 1;
-    throughput.current.last_selected_frontier_tokens             = 64;
-    throughput.current.last_predicted_materialization_ns         = 250000;
-    throughput.current.last_predicted_materialization_calibrated = true;
-    const std::string human_throughput                           = format_throughput(throughput);
+    throughput.interval_seconds                          = 2.0;
+    throughput.computed_prefill_tokens                   = 100;
+    throughput.committed_decode_tokens                   = 40;
+    throughput.decode_rounds                             = 10;
+    throughput.decode_row_rounds                         = 18;
+    throughput.previous.root_selections                  = 2;
+    throughput.previous.state_h2d_bytes                  = 100;
+    throughput.current.running_requests                  = 2;
+    throughput.current.prefilling_requests               = 1;
+    throughput.current.decode_ready_requests             = 1;
+    throughput.current.waiting_requests                  = 3;
+    throughput.current.materializing_requests            = 1;
+    throughput.current.capture_pending_requests          = 1;
+    throughput.current.root_selections                   = 3;
+    throughput.current.state_h2d_count                   = 1;
+    throughput.current.state_h2d_bytes                   = 132;
+    throughput.current.state_h2d_seconds                 = 0.25;
+    throughput.current.device_state_occupied_slots       = 3;
+    throughput.current.host_state_occupied_slots         = 1;
+    throughput.current.last_selected_frontier_tokens     = 64;
+    throughput.current.last_predicted_materialization_ns = 250000;
+    const std::string human_throughput                   = format_throughput(throughput);
     failures += check(human_throughput.find("prefill=50.0tok/s") != std::string::npos &&
                           human_throughput.find("decode=20.0tok/s") != std::string::npos &&
                           human_throughput.find("materializing=1") != std::string::npos &&
@@ -395,8 +409,6 @@ int main() {
         throughput_json.at("context_cache").at("selections").at("root") == 1 &&
             throughput_json.at("context_cache").at("state_transfers").at("h2d").at("bytes") == 32 &&
             throughput_json.at("context_cache").at("occupancy").at("device_state_slots") == 3 &&
-            throughput_json.at("context_cache").at("last_materialization").at("cost_calibrated") ==
-                true &&
             throughput_json.at("context_cache")
                     .at("last_materialization")
                     .at("predicted_nanoseconds") == 250000,

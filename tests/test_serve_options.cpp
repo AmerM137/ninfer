@@ -35,6 +35,8 @@ int main() {
     failures += check(!defaults.enable_vision, "Vision is not disabled by default");
     failures += check(defaults.request_log_jsonl.empty(),
                       "request JSONL logging is not disabled by default");
+    failures += check(defaults.context_cost_presets.empty(),
+                      "external context-cost presets are unexpectedly configured by default");
     failures += check(defaults.log_stats_interval_ms == 5000,
                       "periodic throughput interval default mismatch");
     failures += check(defaults.media_cache_bytes == ninfer::kDefaultMediaCacheBytes &&
@@ -73,6 +75,11 @@ int main() {
         check(model_alias.model_id_override == "deployment-alias" &&
                   resolve_public_model_id(model_alias, "artifact-model") == "deployment-alias",
               "explicit model id did not override the artifact identity");
+
+    const ServeOptions context_cost =
+        parse({"ninfer-serve", "model.ninfer", "--context-cost-presets", "local-costs.json"});
+    failures += check(context_cost.context_cost_presets == "local-costs.json",
+                      "--context-cost-presets did not preserve its path");
 
     bool empty_model_id_rejected = false;
     try {
@@ -238,6 +245,9 @@ int main() {
     failures += check(serve_usage_text("ninfer-serve").find("--response-store-max-mib") !=
                           std::string::npos,
                       "serve help omits Responses store limits");
+    failures +=
+        check(serve_usage_text("ninfer-serve").find("--context-cost-presets") != std::string::npos,
+              "serve help omits external context-cost presets");
     failures +=
         check(serve_usage_text("ninfer-serve").find("identity.model_id") != std::string::npos,
               "serve help omits the artifact-derived model id default");

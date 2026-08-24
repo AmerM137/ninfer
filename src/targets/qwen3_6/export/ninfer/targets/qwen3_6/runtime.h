@@ -112,8 +112,8 @@ struct PressureKVAction {
 };
 
 // Program-owned description of the policy loss caused by one pressure action. The common
-// ResourceManager owns observations and rates, but never reconstructs which target-private
-// checkpoint depends on a StateImage or typed KV region.
+// ResourceManager consumes static costs, but never reconstructs which target-private checkpoint
+// depends on a StateImage or typed KV region.
 struct PressureCheckpointImpact {
     runtime::CheckpointRef checkpoint;
     runtime::PrefillWork fallback_rebuild_work;
@@ -128,7 +128,7 @@ struct PressureCheckpointImpact {
 
 // The marginal recovery value contributed by one Host replica. Program supplies the exact
 // affected checkpoint and its nearest surviving fallback; ResourceManager applies the
-// checkpoint's retention observation and measured transfer/prefill rates.
+// checkpoint's retention observation and startup-selected transfer/prefill costs.
 struct ReplicaValueImpact {
     runtime::CheckpointRef checkpoint;
     runtime::PrefillWork fallback_rebuild_work;
@@ -150,8 +150,6 @@ struct PressureOption {
     std::optional<runtime::CheckpointRef> dropped_checkpoint;
     runtime::ResourceDelta effect;
     std::uint64_t transfer_bytes = 0;
-    std::uint32_t copy_runs      = 0;
-    runtime::PrefillWork rebuild_work;
     std::vector<runtime::ContextTransferRequirement> transfer_requirements;
     std::vector<PressureCheckpointImpact> checkpoint_impacts;
     std::vector<ReplicaValueImpact> removed_host_replica_impacts;
@@ -169,12 +167,9 @@ struct ReplicaTransitionOption {
     std::uint32_t page_count = 0;
     runtime::ResourceDelta effect;
     std::uint64_t transfer_bytes = 0;
-    std::uint32_t copy_runs      = 0;
-    runtime::PrefillWork rebuild_work;
+    TransferWork transfer_work;
     std::vector<ReplicaValueImpact> added_host_replica_impacts;
-    bool shared_owner                = false;
-    bool calibrated                  = false;
-    std::uint64_t backup_transfer_ns = 0;
+    bool shared_owner = false;
 
     [[nodiscard]] friend constexpr bool
     operator==(const ReplicaTransitionOption&, const ReplicaTransitionOption&) noexcept = default;
@@ -437,7 +432,6 @@ struct PrefillProgress {
     runtime::BeginSummary summary;
     std::uint32_t processed_prompt_tokens = 0;
     bool complete                         = false;
-    std::optional<runtime::PrefillObservation> observation;
     std::optional<PendingBatch<Variant>> pending;
     std::optional<CaptureOffer<Variant>> capture;
 };

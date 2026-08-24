@@ -3,6 +3,7 @@
 #include "ninfer/types.h"
 #include "runtime/contract/types.h"
 #include "runtime/engine/admission_policy.h"
+#include "runtime/engine/context_cost.h"
 
 #include <algorithm>
 #include <array>
@@ -452,7 +453,8 @@ struct ResourceCandidateDescriptor {
     bool publication_slot_available     = false;
 };
 
-struct ColdStartCost {
+// Deterministic semantic ordering used only when two numerical estimates are exactly equal.
+struct CostTieBreak {
     std::uint32_t dropped_shared_stable    = 0;
     std::uint32_t dropped_live_session     = 0;
     std::uint32_t dropped_recent_private   = 0;
@@ -462,14 +464,13 @@ struct ColdStartCost {
     std::uint64_t remaining_vision_prefill = 0;
     std::uint32_t transferred_state_images = 0;
     std::uint64_t transferred_bytes        = 0;
-    std::uint32_t copy_runs                = 0;
+    std::uint32_t copy_operations          = 0;
     std::uint32_t reused_prompt_tokens     = 0;
 };
 
 struct CostEstimate {
-    bool calibrated           = true;
     std::uint64_t nanoseconds = 0;
-    ColdStartCost fallback;
+    CostTieBreak tie_break;
 };
 
 struct RetentionObservation {
@@ -704,7 +705,6 @@ public:
         bool needs_transfer_                        = false;
         bool temporal_eligible_                     = true;
         std::uint64_t predicted_materialization_ns_ = 0;
-        bool predicted_materialization_calibrated_  = false;
         ProtectedHeadResourceProjection projection_;
 
         friend class ResourceManager;
@@ -800,7 +800,7 @@ public:
 
     ResourceManager(ResourceVector capacity, std::uint32_t lane_count,
                     std::uint32_t private_catalog_capacity, std::uint32_t shared_catalog_capacity,
-                    bool cache_enabled, std::uint32_t max_long_anchors = 0)
+                    bool cache_enabled, std::uint32_t max_long_anchors, ContextCostModel cost_model)
         : ledger_(capacity, lane_count), lane_count_(lane_count),
           catalog_count_(private_catalog_capacity), shared_catalog_count_(shared_catalog_capacity),
           cache_enabled_(cache_enabled), catalog_(private_catalog_capacity),
@@ -808,7 +808,7 @@ public:
           shared_prefix_index_(shared_catalog_capacity),
           sparse_checkpoint_index_(
               checked_sparse_index_capacity(private_catalog_capacity, max_long_anchors)),
-          max_long_anchors_(max_long_anchors) {
+          max_long_anchors_(max_long_anchors), cost_model_(std::move(cost_model)) {
         if (private_catalog_capacity < lane_count) {
             throw std::invalid_argument(
                 "private continuation capacity does not cover active lanes");
@@ -1338,15 +1338,13 @@ public:
         const auto& cache = base.context_cache();
         Choice choice(*destination, std::move(*composed), catalog_count_, cache.session_key,
                       cache.retention, cache.update_session_index);
-        choice.demand_             = selected->demand;
-        choice.source_resources_   = source_resources;
-        choice.source_disposition_ = source_disposition;
-        choice.source_slot_        = candidates[index].source_slot;
-        choice.shared_source_slot_ = candidates[index].shared_source_slot;
-        choice.needs_transfer_     = selected->transfer_bytes != 0;
-        choice.predicted_materialization_ns_ =
-            selected->cost.calibrated ? selected->cost.nanoseconds : 0;
-        choice.predicted_materialization_calibrated_ = selected->cost.calibrated;
+        choice.demand_                       = selected->demand;
+        choice.source_resources_             = source_resources;
+        choice.source_disposition_           = source_disposition;
+        choice.source_slot_                  = candidates[index].source_slot;
+        choice.shared_source_slot_           = candidates[index].shared_source_slot;
+        choice.needs_transfer_               = selected->transfer_bytes != 0;
+        choice.predicted_materialization_ns_ = selected->cost.nanoseconds;
         choice.needs_transfer_    = choice.needs_transfer_ || choice.plan_->needs_transfer();
         choice.temporal_eligible_ = !choice.needs_transfer_ && choice.plan_->temporal_eligible();
         for (const auto& observation : candidate_observations) {
@@ -1485,28 +1483,27 @@ public:
         }
 
         MaterializationRecord record;
-        record.destination                          = choice.destination_;
-        record.demand                               = choice.demand_;
-        record.source_slot                          = choice.source_slot_;
-        record.source_id                            = choice.source_id_;
-        record.source_disposition                   = choice.source_disposition_;
-        record.shared_source_slot                   = choice.shared_source_slot_;
-        record.shared_source_id                     = choice.shared_source_id_;
-        record.publication_slot                     = choice.publication_slot_;
-        record.evictions                            = std::move(choice.evictions_);
-        record.eviction_ids                         = std::move(choice.eviction_ids_);
-        record.pressure_options                     = std::move(choice.pressure_options_);
-        record.shared_evictions                     = std::move(choice.shared_evictions_);
-        record.shared_eviction_ids                  = std::move(choice.shared_eviction_ids_);
-        record.shared_pressure_options              = std::move(choice.shared_pressure_options_);
-        record.eligible_observations                = std::move(choice.eligible_observations_);
-        record.selected_observation                 = std::move(choice.selected_observation_);
-        record.session                              = std::move(choice.session_);
-        record.retention                            = choice.retention_;
-        record.update_session_index                 = choice.update_session_index_;
-        record.predicted_materialization_ns         = choice.predicted_materialization_ns_;
-        record.predicted_materialization_calibrated = choice.predicted_materialization_calibrated_;
-        record.publish_continuation                 = publish_continuation;
+        record.destination                  = choice.destination_;
+        record.demand                       = choice.demand_;
+        record.source_slot                  = choice.source_slot_;
+        record.source_id                    = choice.source_id_;
+        record.source_disposition           = choice.source_disposition_;
+        record.shared_source_slot           = choice.shared_source_slot_;
+        record.shared_source_id             = choice.shared_source_id_;
+        record.publication_slot             = choice.publication_slot_;
+        record.evictions                    = std::move(choice.evictions_);
+        record.eviction_ids                 = std::move(choice.eviction_ids_);
+        record.pressure_options             = std::move(choice.pressure_options_);
+        record.shared_evictions             = std::move(choice.shared_evictions_);
+        record.shared_eviction_ids          = std::move(choice.shared_eviction_ids_);
+        record.shared_pressure_options      = std::move(choice.shared_pressure_options_);
+        record.eligible_observations        = std::move(choice.eligible_observations_);
+        record.selected_observation         = std::move(choice.selected_observation_);
+        record.session                      = std::move(choice.session_);
+        record.retention                    = choice.retention_;
+        record.update_session_index         = choice.update_session_index_;
+        record.predicted_materialization_ns = choice.predicted_materialization_ns_;
+        record.publish_continuation         = publish_continuation;
         static_assert(std::is_nothrow_move_constructible_v<MaterializationRecord>);
         context_transaction_.template emplace<MaterializationRecord>(std::move(record));
         return MaterializationReserveResult::Reserved;
@@ -1534,8 +1531,6 @@ private:
             }
             adopt_retention_observations(record);
             context_stats_.last_predicted_materialization_ns = record.predicted_materialization_ns;
-            context_stats_.last_predicted_materialization_calibrated =
-                record.predicted_materialization_calibrated;
         }
         ResourceDelta acknowledged_owner_delta;
         const auto accumulate_owner_delta = [&](const ResourceDelta& delta) {
@@ -1942,7 +1937,6 @@ public:
             CaptureAssessment assessment;
             std::optional<CheckpointRef> private_replacement;
             std::uint32_t publication_slot = kInvalidCatalogSlot;
-            bool calibrated                = false;
             std::uint64_t margin_ns        = 0;
             CostEstimate cost;
         };
@@ -2001,9 +1995,8 @@ public:
                     candidate.publishes_shared || active.retention != RetentionClass::Disposable;
                 if (!retain) { continue; }
 
-                std::uint64_t margin  = 0;
-                const bool calibrated = saving.calibrated && cost.calibrated;
-                if (calibrated && saving.nanoseconds > cost.nanoseconds) {
+                std::uint64_t margin = 0;
+                if (saving.nanoseconds > cost.nanoseconds) {
                     margin = saving.nanoseconds - cost.nanoseconds;
                 }
 
@@ -2011,7 +2004,7 @@ public:
                 // must be allowed to advance.  A full shared catalog likewise must be able to
                 // replace a prefix that has never produced a hit; otherwise its first entry owns a
                 // one-slot catalog forever.  Once a shared prefix has demonstrated reuse, preserve
-                // it unless the calibrated value model prefers the new prefix.
+                // it unless the numerical value model prefers the new prefix.
                 if (shared_victim != nullptr &&
                     shared_victim->observation.selected_hit_count != 0 && margin == 0) {
                     continue;
@@ -2021,7 +2014,6 @@ public:
                     .assessment          = std::move(candidate),
                     .private_replacement = private_replacement,
                     .publication_slot    = publication_slot,
-                    .calibrated          = calibrated,
                     .margin_ns           = margin,
                     .cost                = cost,
                 };
@@ -2035,9 +2027,8 @@ public:
                             ? shared_catalog_[value.publication_slot].observation.last_hit_epoch
                             : 0;
                     return std::tuple{
-                        value.calibrated ? 0U : 1U,
                         std::numeric_limits<std::uint64_t>::max() - value.margin_ns,
-                        cold_cost_key(value.cost.fallback),
+                        tie_break_key(value.cost.tie_break),
                         victim_epoch,
                         checkpoint.kind,
                         checkpoint.frontier,
@@ -2229,6 +2220,7 @@ public:
             std::uint64_t replacement_revision = 0;
             std::optional<typename Package::PressureOption> replacement;
             ResourceDemand demand;
+            std::uint64_t backup_transfer_ns = 0;
             std::uint64_t margin_ns          = 0;
             std::uint32_t retention_priority = 0;
             std::uint64_t last_hit_epoch     = 0;
@@ -2289,13 +2281,10 @@ public:
                                          const SharedCatalogEntry* shared_entry,
                                          const ContinuationHandle* private_owner,
                                          const SharedPrefixHandle* shared_owner) {
-            calibrate_replica_option(target.option);
+            target.backup_transfer_ns       = price_replica_option(target.option);
             const CostEstimate target_value = replica_value_cost(
                 target.option.added_host_replica_impacts, private_entry, shared_entry);
-            if (!target.option.calibrated || !target_value.calibrated ||
-                target_value.nanoseconds <= target.option.backup_transfer_ns) {
-                return;
-            }
+            if (target_value.nanoseconds <= target.backup_transfer_ns) { return; }
             target.demand = ResourceDemand{
                 .reservation_added        = target.option.effect.added,
                 .physical_peak_additional = target.option.effect.added,
@@ -2305,11 +2294,11 @@ public:
                                            const ContinuationHandle* private_replacement,
                                            const SharedPrefixHandle* shared_replacement,
                                            std::uint64_t replacement_loss) -> bool {
-                if (replacement_loss > std::numeric_limits<std::uint64_t>::max() -
-                                           candidate.option.backup_transfer_ns) {
+                if (replacement_loss >
+                    std::numeric_limits<std::uint64_t>::max() - candidate.backup_transfer_ns) {
                     return false;
                 }
-                const std::uint64_t cost = candidate.option.backup_transfer_ns + replacement_loss;
+                const std::uint64_t cost = candidate.backup_transfer_ns + replacement_loss;
                 if (target_value.nanoseconds <= cost ||
                     !detail::demand_fits(ledger_.used(), candidate.demand, ledger_.capacity())) {
                     return false;
@@ -2340,7 +2329,6 @@ public:
                     if (!pure_host_release(option, target.option)) { continue; }
                     const CostEstimate loss =
                         replica_value_cost(option.removed_host_replica_impacts, &entry, nullptr);
-                    if (!loss.calibrated) { continue; }
                     Candidate candidate            = target;
                     candidate.replacement_shared   = false;
                     candidate.replacement_slot     = slot;
@@ -2363,7 +2351,6 @@ public:
                     if (!pure_host_release(option, target.option)) { continue; }
                     const CostEstimate loss =
                         replica_value_cost(option.removed_host_replica_impacts, nullptr, &entry);
-                    if (!loss.calibrated) { continue; }
                     Candidate candidate            = target;
                     candidate.replacement_shared   = true;
                     candidate.replacement_slot     = slot;
@@ -2848,11 +2835,6 @@ public:
             context_transaction_);
     }
 
-    void observe_prefill(PrefillObservation observation) noexcept {
-        prefill_rates_[0].add(observation.work.text_quanta, observation.text_elapsed_ns);
-        prefill_rates_[1].add(observation.work.vision_quanta, observation.vision_elapsed_ns);
-    }
-
     void populate_runtime_stats(RuntimeStats& out) const noexcept {
         out.state_moves                       = context_stats_.state_moves;
         out.state_forks                       = context_stats_.state_forks;
@@ -2892,9 +2874,7 @@ public:
         out.shared_checkpoint_evictions       = context_stats_.shared_checkpoint_evictions;
         out.historical_fork_hits              = context_stats_.historical_fork_hits;
         out.last_predicted_materialization_ns = context_stats_.last_predicted_materialization_ns;
-        out.last_predicted_materialization_calibrated =
-            context_stats_.last_predicted_materialization_calibrated;
-        out.actual_context_transfer_seconds = context_stats_.actual_context_transfer_seconds;
+        out.actual_context_transfer_seconds   = context_stats_.actual_context_transfer_seconds;
 
         const ResourceVector used            = ledger_.used();
         out.device_state_occupied_slots      = used.device.state_slots;
@@ -2938,34 +2918,6 @@ public:
     }
 
 private:
-    struct RateAccumulator {
-        std::uint64_t units      = 0;
-        std::uint64_t elapsed_ns = 0;
-
-        void add(std::uint64_t sample_units, std::uint64_t sample_ns) noexcept {
-            if (sample_units == 0 || sample_ns == 0) { return; }
-            units      = sample_units > std::numeric_limits<std::uint64_t>::max() - units
-                             ? std::numeric_limits<std::uint64_t>::max()
-                             : units + sample_units;
-            elapsed_ns = sample_ns > std::numeric_limits<std::uint64_t>::max() - elapsed_ns
-                             ? std::numeric_limits<std::uint64_t>::max()
-                             : elapsed_ns + sample_ns;
-        }
-
-        [[nodiscard]] std::optional<std::uint64_t>
-        estimate(std::uint64_t requested_units) const noexcept {
-            if (requested_units == 0) { return 0; }
-            if (units == 0 || elapsed_ns == 0) { return std::nullopt; }
-            const unsigned __int128 wide =
-                static_cast<unsigned __int128>(requested_units) * elapsed_ns;
-            const unsigned __int128 rounded = wide + units - 1U;
-            const unsigned __int128 value   = rounded / units;
-            return value > std::numeric_limits<std::uint64_t>::max()
-                       ? std::numeric_limits<std::uint64_t>::max()
-                       : static_cast<std::uint64_t>(value);
-        }
-    };
-
     struct ReplicaTransitionRecord {
         bool shared            = false;
         std::uint32_t slot     = kInvalidCatalogSlot;
@@ -3009,7 +2961,6 @@ private:
         RetentionClass retention                   = RetentionClass::RecentPrivate;
         bool update_session_index                  = true;
         std::uint64_t predicted_materialization_ns = 0;
-        bool predicted_materialization_calibrated  = false;
         bool publish_continuation                  = true;
     };
 
@@ -3080,32 +3031,8 @@ private:
         std::uint64_t retained_source_id   = 0;
     };
 
-    [[nodiscard]] static PrefillWork max_prefill_work(PrefillWork left,
-                                                      PrefillWork right) noexcept {
-        return PrefillWork{.text_quanta   = std::max(left.text_quanta, right.text_quanta),
-                           .vision_quanta = std::max(left.vision_quanta, right.vision_quanta)};
-    }
-
-    [[nodiscard]] static PrefillWork add_prefill_work(PrefillWork left,
-                                                      PrefillWork right) noexcept {
-        return PrefillWork{
-            .text_quanta   = saturating_add(left.text_quanta, right.text_quanta),
-            .vision_quanta = saturating_add(left.vision_quanta, right.vision_quanta),
-        };
-    }
-
     [[nodiscard]] static bool valid_prefill_work(PrefillWork work) noexcept {
-        return work.text_quanta != 0;
-    }
-
-    [[nodiscard]] static PrefillWork rebuild_work(const ContinuationSummary& summary) noexcept {
-        PrefillWork work;
-        if (summary.endpoint) { work = max_prefill_work(work, summary.endpoint->rebuild_work); }
-        if (summary.rewrite) { work = max_prefill_work(work, summary.rewrite->rebuild_work); }
-        for (const auto& anchor : summary.long_anchors) {
-            work = max_prefill_work(work, anchor.rebuild_work);
-        }
-        return work;
+        return work.tokens != 0;
     }
 
     [[nodiscard]] static std::size_t checked_sparse_index_capacity(std::uint32_t private_capacity,
@@ -3204,15 +3131,16 @@ private:
     void observe_transfer(const ContextTransferObservation& observation) {
         const std::size_t resource  = transfer_resource_index(observation.resource);
         const std::size_t direction = transfer_direction_index(observation.direction);
-        if (resource >= transfer_rates_.size() || direction >= transfer_rates_[resource].size() ||
-            observation.units == 0 || observation.bytes == 0 || observation.elapsed_ns == 0 ||
+        if (resource >= 3 || direction >= 3 || observation.units == 0 ||
+            observation.work.payload_bytes == 0 || observation.work.copy_operations == 0 ||
+            observation.elapsed_ns == 0 ||
             (observation.resource == ContextResourceClass::State &&
              (observation.units != 1 || observation.page_count != 0)) ||
             (observation.resource != ContextResourceClass::State &&
-             (observation.units != observation.bytes || observation.page_count == 0))) {
+             (observation.units != observation.work.payload_bytes ||
+              observation.page_count == 0))) {
             throw std::logic_error("Program returned an invalid context-transfer observation");
         }
-        transfer_rates_[resource][direction].add(observation.units, observation.elapsed_ns);
         context_stats_.actual_context_transfer_seconds +=
             static_cast<double>(observation.elapsed_ns) / 1'000'000'000.0;
         const double seconds = static_cast<double>(observation.elapsed_ns) / 1'000'000'000.0;
@@ -3221,19 +3149,19 @@ private:
                 context_stats_.state_d2h_count =
                     saturating_add(context_stats_.state_d2h_count, observation.units);
                 context_stats_.state_d2h_bytes =
-                    saturating_add(context_stats_.state_d2h_bytes, observation.bytes);
+                    saturating_add(context_stats_.state_d2h_bytes, observation.work.payload_bytes);
                 context_stats_.state_d2h_seconds += seconds;
             } else if (observation.direction == ContextTransferDirection::HostToDevice) {
                 context_stats_.state_h2d_count =
                     saturating_add(context_stats_.state_h2d_count, observation.units);
                 context_stats_.state_h2d_bytes =
-                    saturating_add(context_stats_.state_h2d_bytes, observation.bytes);
+                    saturating_add(context_stats_.state_h2d_bytes, observation.work.payload_bytes);
                 context_stats_.state_h2d_seconds += seconds;
             } else {
                 context_stats_.state_d2d_count =
                     saturating_add(context_stats_.state_d2d_count, observation.units);
                 context_stats_.state_d2d_bytes =
-                    saturating_add(context_stats_.state_d2d_bytes, observation.bytes);
+                    saturating_add(context_stats_.state_d2d_bytes, observation.work.payload_bytes);
                 context_stats_.state_d2d_seconds += seconds;
             }
             return;
@@ -3268,7 +3196,7 @@ private:
             elapsed = &context_stats_.backend_kv_d2d_seconds;
         }
         *pages = saturating_add(*pages, observation.page_count);
-        *bytes = saturating_add(*bytes, observation.bytes);
+        *bytes = saturating_add(*bytes, observation.work.payload_bytes);
         *elapsed += seconds;
     }
 
@@ -3293,40 +3221,13 @@ private:
             context_stats_.historical_fork_hits, result.operations.historical_fork_hits);
     }
 
-    [[nodiscard]] std::optional<std::uint64_t>
-    estimate_transfer(ContextResourceClass resource, ContextTransferDirection direction,
-                      std::uint64_t units, bool permit_d2h_cold_start = false) const noexcept {
-        const std::size_t resource_index  = transfer_resource_index(resource);
-        const std::size_t direction_index = transfer_direction_index(direction);
-        if (resource_index >= transfer_rates_.size() ||
-            direction_index >= transfer_rates_[resource_index].size()) {
-            return std::nullopt;
-        }
-        std::optional<std::uint64_t> estimate =
-            transfer_rates_[resource_index][direction_index].estimate(units);
-        if (!estimate && permit_d2h_cold_start &&
-            direction == ContextTransferDirection::HostToDevice) {
-            estimate =
-                transfer_rates_[resource_index]
-                               [transfer_direction_index(ContextTransferDirection::DeviceToHost)]
-                                   .estimate(units);
-        }
-        return estimate;
+    [[nodiscard]] std::uint64_t estimate_transfer(ContextTransferDirection direction,
+                                                  TransferWork work) const noexcept {
+        return cost_model_.transfer_ns(direction, work);
     }
 
-    [[nodiscard]] std::optional<std::uint64_t> estimate_prefill(PrefillWork work) const noexcept {
-        std::uint64_t total = 0;
-        if (work.text_quanta != 0) {
-            const auto text = prefill_rates_[0].estimate(work.text_quanta);
-            if (!text) { return std::nullopt; }
-            total = saturating_add(total, *text);
-        }
-        if (work.vision_quanta != 0) {
-            const auto vision = prefill_rates_[1].estimate(work.vision_quanta);
-            if (!vision) { return std::nullopt; }
-            total = saturating_add(total, *vision);
-        }
-        return total;
+    [[nodiscard]] std::uint64_t estimate_prefill(PrefillWork work) const noexcept {
+        return cost_model_.prefill_ns(work);
     }
 
     [[nodiscard]] static std::uint32_t saturating_add_u32(std::uint32_t left,
@@ -3336,7 +3237,7 @@ private:
                    : left + right;
     }
 
-    static void add_cold_cost(ColdStartCost& total, const ColdStartCost& value) noexcept {
+    static void add_tie_break(CostTieBreak& total, const CostTieBreak& value) noexcept {
         total.dropped_shared_stable =
             saturating_add_u32(total.dropped_shared_stable, value.dropped_shared_stable);
         total.dropped_live_session =
@@ -3354,15 +3255,14 @@ private:
         total.transferred_state_images =
             saturating_add_u32(total.transferred_state_images, value.transferred_state_images);
         total.transferred_bytes = saturating_add(total.transferred_bytes, value.transferred_bytes);
-        total.copy_runs         = saturating_add_u32(total.copy_runs, value.copy_runs);
+        total.copy_operations   = saturating_add_u32(total.copy_operations, value.copy_operations);
         total.reused_prompt_tokens =
             saturating_add_u32(total.reused_prompt_tokens, value.reused_prompt_tokens);
     }
 
     static void add_cost(CostEstimate& total, const CostEstimate& value) noexcept {
-        total.calibrated  = total.calibrated && value.calibrated;
         total.nanoseconds = saturating_add(total.nanoseconds, value.nanoseconds);
-        add_cold_cost(total.fallback, value.fallback);
+        add_tie_break(total.tie_break, value.tie_break);
     }
 
     [[nodiscard]] static CostEstimate subtract_cost_floor(CostEstimate after,
@@ -3373,32 +3273,32 @@ private:
         const auto sub_u64 = [](std::uint64_t value, std::uint64_t removed) {
             return removed >= value ? 0ULL : value - removed;
         };
-        after.calibrated  = after.calibrated && before.calibrated;
         after.nanoseconds = sub_u64(after.nanoseconds, before.nanoseconds);
-        after.fallback.dropped_shared_stable =
-            sub_u32(after.fallback.dropped_shared_stable, before.fallback.dropped_shared_stable);
-        after.fallback.dropped_live_session =
-            sub_u32(after.fallback.dropped_live_session, before.fallback.dropped_live_session);
-        after.fallback.dropped_recent_private =
-            sub_u32(after.fallback.dropped_recent_private, before.fallback.dropped_recent_private);
-        after.fallback.evicted_continuations =
-            sub_u32(after.fallback.evicted_continuations, before.fallback.evicted_continuations);
-        after.fallback.dropped_checkpoints =
-            sub_u32(after.fallback.dropped_checkpoints, before.fallback.dropped_checkpoints);
-        after.fallback.remaining_text_prefill =
-            sub_u64(after.fallback.remaining_text_prefill, before.fallback.remaining_text_prefill);
-        after.fallback.remaining_vision_prefill = sub_u64(after.fallback.remaining_vision_prefill,
-                                                          before.fallback.remaining_vision_prefill);
-        after.fallback.transferred_state_images = sub_u32(after.fallback.transferred_state_images,
-                                                          before.fallback.transferred_state_images);
-        after.fallback.transferred_bytes =
-            sub_u64(after.fallback.transferred_bytes, before.fallback.transferred_bytes);
-        after.fallback.copy_runs = sub_u32(after.fallback.copy_runs, before.fallback.copy_runs);
-        after.fallback.reused_prompt_tokens = 0;
+        after.tie_break.dropped_shared_stable =
+            sub_u32(after.tie_break.dropped_shared_stable, before.tie_break.dropped_shared_stable);
+        after.tie_break.dropped_live_session =
+            sub_u32(after.tie_break.dropped_live_session, before.tie_break.dropped_live_session);
+        after.tie_break.dropped_recent_private = sub_u32(after.tie_break.dropped_recent_private,
+                                                         before.tie_break.dropped_recent_private);
+        after.tie_break.evicted_continuations =
+            sub_u32(after.tie_break.evicted_continuations, before.tie_break.evicted_continuations);
+        after.tie_break.dropped_checkpoints =
+            sub_u32(after.tie_break.dropped_checkpoints, before.tie_break.dropped_checkpoints);
+        after.tie_break.remaining_text_prefill   = sub_u64(after.tie_break.remaining_text_prefill,
+                                                           before.tie_break.remaining_text_prefill);
+        after.tie_break.remaining_vision_prefill = sub_u64(
+            after.tie_break.remaining_vision_prefill, before.tie_break.remaining_vision_prefill);
+        after.tie_break.transferred_state_images = sub_u32(
+            after.tie_break.transferred_state_images, before.tie_break.transferred_state_images);
+        after.tie_break.transferred_bytes =
+            sub_u64(after.tie_break.transferred_bytes, before.tie_break.transferred_bytes);
+        after.tie_break.copy_operations =
+            sub_u32(after.tie_break.copy_operations, before.tie_break.copy_operations);
+        after.tie_break.reused_prompt_tokens = 0;
         return after;
     }
 
-    [[nodiscard]] static auto cold_cost_key(const ColdStartCost& cost) noexcept {
+    [[nodiscard]] static auto tie_break_key(const CostTieBreak& cost) noexcept {
         return std::tuple{
             cost.dropped_shared_stable,
             cost.dropped_live_session,
@@ -3407,7 +3307,7 @@ private:
             cost.remaining_vision_prefill,
             cost.transferred_state_images,
             cost.transferred_bytes,
-            cost.copy_runs,
+            cost.copy_operations,
             cost.evicted_continuations,
             cost.dropped_checkpoints,
             std::numeric_limits<std::uint32_t>::max() - cost.reused_prompt_tokens,
@@ -3416,12 +3316,11 @@ private:
 
     [[nodiscard]] static int compare_cost(const CostEstimate& left,
                                           const CostEstimate& right) noexcept {
-        if (left.calibrated && right.calibrated) {
-            if (left.nanoseconds == right.nanoseconds) { return 0; }
+        if (left.nanoseconds != right.nanoseconds) {
             return left.nanoseconds < right.nanoseconds ? -1 : 1;
         }
-        const auto left_key  = cold_cost_key(left.fallback);
-        const auto right_key = cold_cost_key(right.fallback);
+        const auto left_key  = tie_break_key(left.tie_break);
+        const auto right_key = tie_break_key(right.tie_break);
         if (left_key < right_key) { return -1; }
         if (right_key < left_key) { return 1; }
         return 0;
@@ -3433,38 +3332,27 @@ private:
         for (const ContextTransferRequirement& requirement : requirements) {
             if (requirement.units == 0) { continue; }
             if (requirement.resource == ContextResourceClass::State) {
-                cost.fallback.transferred_state_images =
-                    saturating_add_u32(cost.fallback.transferred_state_images,
+                cost.tie_break.transferred_state_images =
+                    saturating_add_u32(cost.tie_break.transferred_state_images,
                                        requirement.units > std::numeric_limits<std::uint32_t>::max()
                                            ? std::numeric_limits<std::uint32_t>::max()
                                            : static_cast<std::uint32_t>(requirement.units));
             }
-            cost.fallback.transferred_bytes =
-                saturating_add(cost.fallback.transferred_bytes, requirement.bytes);
-            cost.fallback.copy_runs =
-                saturating_add_u32(cost.fallback.copy_runs, requirement.copy_runs);
-            const auto estimate =
-                estimate_transfer(requirement.resource, requirement.direction, requirement.units,
-                                  requirement.direction == ContextTransferDirection::HostToDevice);
-            if (!estimate) {
-                cost.calibrated = false;
-            } else {
-                cost.nanoseconds = saturating_add(cost.nanoseconds, *estimate);
-            }
+            cost.tie_break.transferred_bytes =
+                saturating_add(cost.tie_break.transferred_bytes, requirement.work.payload_bytes);
+            cost.tie_break.copy_operations = saturating_add_u32(cost.tie_break.copy_operations,
+                                                                requirement.work.copy_operations);
+            cost.nanoseconds               = saturating_add(
+                cost.nanoseconds, estimate_transfer(requirement.direction, requirement.work));
         }
         return cost;
     }
 
     [[nodiscard]] CostEstimate prefill_cost(PrefillWork work) const noexcept {
         CostEstimate cost;
-        cost.fallback.remaining_text_prefill   = work.text_quanta;
-        cost.fallback.remaining_vision_prefill = work.vision_quanta;
-        const auto estimate                    = estimate_prefill(work);
-        if (!estimate) {
-            cost.calibrated = false;
-        } else {
-            cost.nanoseconds = *estimate;
-        }
+        cost.tie_break.remaining_text_prefill   = work.tokens;
+        cost.tie_break.remaining_vision_prefill = work.vision_patches;
+        cost.nanoseconds                        = estimate_prefill(work);
         return cost;
     }
 
@@ -3472,7 +3360,7 @@ private:
     candidate_base_cost(const ResourceCandidateDescriptor& candidate) const noexcept {
         CostEstimate cost = prefill_cost(candidate.remaining_prefill_work);
         add_cost(cost, transfer_cost(candidate.transfer_requirements));
-        cost.fallback.reused_prompt_tokens = candidate.reused_prompt_tokens;
+        cost.tie_break.reused_prompt_tokens = candidate.reused_prompt_tokens;
         return cost;
     }
 
@@ -3491,14 +3379,14 @@ private:
             return static_cast<std::uint32_t>(std::min<std::uint64_t>(
                 weighted_u64(value), std::numeric_limits<std::uint32_t>::max()));
         };
-        if (cost.calibrated) { cost.nanoseconds = weighted_u64(cost.nanoseconds); }
-        cost.fallback.remaining_text_prefill = weighted_u64(cost.fallback.remaining_text_prefill);
-        cost.fallback.remaining_vision_prefill =
-            weighted_u64(cost.fallback.remaining_vision_prefill);
-        cost.fallback.transferred_state_images =
-            weighted_u32(cost.fallback.transferred_state_images);
-        cost.fallback.transferred_bytes = weighted_u64(cost.fallback.transferred_bytes);
-        cost.fallback.copy_runs         = weighted_u32(cost.fallback.copy_runs);
+        cost.nanoseconds                      = weighted_u64(cost.nanoseconds);
+        cost.tie_break.remaining_text_prefill = weighted_u64(cost.tie_break.remaining_text_prefill);
+        cost.tie_break.remaining_vision_prefill =
+            weighted_u64(cost.tie_break.remaining_vision_prefill);
+        cost.tie_break.transferred_state_images =
+            weighted_u32(cost.tie_break.transferred_state_images);
+        cost.tie_break.transferred_bytes = weighted_u64(cost.tie_break.transferred_bytes);
+        cost.tie_break.copy_operations   = weighted_u32(cost.tie_break.copy_operations);
         return cost;
     }
 
@@ -3532,20 +3420,20 @@ private:
             add_cost(cost,
                      weighted_cost(std::move(marginal), retention_probability_q16(observation)));
             if (!impact.drops_checkpoint) { continue; }
-            cost.fallback.dropped_checkpoints =
-                saturating_add_u32(cost.fallback.dropped_checkpoints, 1);
+            cost.tie_break.dropped_checkpoints =
+                saturating_add_u32(cost.tie_break.dropped_checkpoints, 1);
             switch (observation.retention_class) {
             case RetentionClass::SharedStable:
-                cost.fallback.dropped_shared_stable =
-                    saturating_add_u32(cost.fallback.dropped_shared_stable, 1);
+                cost.tie_break.dropped_shared_stable =
+                    saturating_add_u32(cost.tie_break.dropped_shared_stable, 1);
                 break;
             case RetentionClass::LiveSession:
-                cost.fallback.dropped_live_session =
-                    saturating_add_u32(cost.fallback.dropped_live_session, 1);
+                cost.tie_break.dropped_live_session =
+                    saturating_add_u32(cost.tie_break.dropped_live_session, 1);
                 break;
             case RetentionClass::RecentPrivate:
-                cost.fallback.dropped_recent_private =
-                    saturating_add_u32(cost.fallback.dropped_recent_private, 1);
+                cost.tie_break.dropped_recent_private =
+                    saturating_add_u32(cost.tie_break.dropped_recent_private, 1);
                 break;
             case RetentionClass::Disposable:
                 break;
@@ -3554,42 +3442,18 @@ private:
         return cost;
     }
 
-    [[nodiscard]] CostEstimate
-    pressure_cost(const typename Package::PressureOption& option, const CatalogEntry* private_entry,
-                  const SharedCatalogEntry* shared_entry) const noexcept {
+    [[nodiscard]] CostEstimate pressure_cost(const typename Package::PressureOption& option,
+                                             const CatalogEntry* private_entry,
+                                             const SharedCatalogEntry* shared_entry) const {
         CostEstimate cost;
-        const bool has_typed_transfers = !option.transfer_requirements.empty();
         add_cost(cost, transfer_cost(option.transfer_requirements));
-        if (!has_typed_transfers && option.transfer_bytes != 0) {
-            cost.calibrated                 = false;
-            cost.fallback.transferred_bytes = option.transfer_bytes;
-            cost.fallback.copy_runs         = option.copy_runs;
-        }
 
-        const bool has_impacts = !option.checkpoint_impacts.empty();
+        if (option.evicts_continuation && option.checkpoint_impacts.empty()) {
+            throw std::logic_error("continuation eviction has no typed checkpoint impacts");
+        }
         add_cost(cost,
                  checkpoint_impacts_cost(option.checkpoint_impacts, private_entry, shared_entry));
-        if (option.evicts_continuation) {
-            cost.fallback.evicted_continuations = 1;
-            if (!has_impacts) {
-                const RetentionClass retention =
-                    shared_entry != nullptr    ? RetentionClass::SharedStable
-                    : private_entry != nullptr ? private_entry->retention
-                                               : RetentionClass::Disposable;
-                cost.fallback.dropped_checkpoints = 1;
-                if (retention == RetentionClass::SharedStable) {
-                    cost.fallback.dropped_shared_stable = 1;
-                } else if (retention == RetentionClass::LiveSession) {
-                    cost.fallback.dropped_live_session = 1;
-                } else if (retention == RetentionClass::RecentPrivate) {
-                    cost.fallback.dropped_recent_private = 1;
-                }
-                RetentionObservation observation{.retention_class = retention};
-                CostEstimate marginal = prefill_cost(option.rebuild_work);
-                add_cost(cost, weighted_cost(std::move(marginal),
-                                             retention_probability_q16(observation)));
-            }
-        }
+        if (option.evicts_continuation) { cost.tie_break.evicted_continuations = 1; }
         if (!option.removed_host_replica_impacts.empty()) {
             add_cost(cost, replica_value_cost(option.removed_host_replica_impacts, private_entry,
                                               shared_entry));
@@ -3602,10 +3466,6 @@ private:
     replica_value_cost(const Impacts& impacts, const CatalogEntry* private_entry,
                        const SharedCatalogEntry* shared_entry) const noexcept {
         CostEstimate value;
-        if (impacts.empty()) {
-            value.calibrated = false;
-            return value;
-        }
         for (const auto& impact : impacts) {
             RetentionObservation observation;
             if (shared_entry != nullptr &&
@@ -3629,17 +3489,9 @@ private:
         return value;
     }
 
-    void calibrate_replica_option(ReplicaTransitionOption& option) const noexcept {
-        const std::uint64_t units =
-            option.resource == ContextResourceClass::State ? 1U : option.transfer_bytes;
-        const auto backup =
-            estimate_transfer(option.resource, ContextTransferDirection::DeviceToHost, units);
-        option.calibrated = backup && !option.added_host_replica_impacts.empty();
-        if (!option.calibrated) {
-            option.backup_transfer_ns = 0;
-            return;
-        }
-        option.backup_transfer_ns = *backup;
+    [[nodiscard]] std::uint64_t
+    price_replica_option(const ReplicaTransitionOption& option) const noexcept {
+        return estimate_transfer(ContextTransferDirection::DeviceToHost, option.transfer_work);
     }
 
     [[nodiscard]] static std::uint32_t eviction_priority(RetentionClass retention) noexcept {
@@ -4371,8 +4223,7 @@ private:
     using ContextTransaction = std::variant<std::monostate, MaterializationRecord,
                                             ActiveCaptureRecord, ReplicaTransitionRecord>;
     ContextTransaction context_transaction_;
-    std::array<std::array<RateAccumulator, 3>, 3> transfer_rates_{};
-    std::array<RateAccumulator, 2> prefill_rates_{};
+    ContextCostModel cost_model_;
     RuntimeStats context_stats_;
     std::uint64_t next_continuation_id_  = 1;
     std::uint64_t next_shared_prefix_id_ = 1;
