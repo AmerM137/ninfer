@@ -94,14 +94,6 @@ target_compile_definitions(ninfer_context_cost_bench PRIVATE
 target_link_libraries(ninfer_context_cost_bench PRIVATE
   ninfer_engine ninfer_core CUDA::cudart)
 
-# Pure Host steady-round observation overhead. It exercises the production coarse clock/NVTX
-# phase sequence and never constructs an Engine or loads a model.
-add_executable(ninfer_host_timing_bench host_timing/host_timing_bench.cpp)
-target_include_directories(ninfer_host_timing_bench PRIVATE
-  ${PROJECT_SOURCE_DIR}/include
-  ${PROJECT_SOURCE_DIR}/src)
-target_link_libraries(ninfer_host_timing_bench PRIVATE ninfer_core)
-
 # Native target-private MTP proposal/verification microbenchmark. It enters through the target
 # Program facade and executes the production round schedule over a real .ninfer artifact.
 add_executable(ninfer_qwen3_6_27b_mtp_round_bench
