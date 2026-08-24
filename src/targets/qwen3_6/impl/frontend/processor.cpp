@@ -158,9 +158,8 @@ Coefficients coefficients(int input, int output) {
     return out;
 }
 
-media::decode::Image resize_bicubic(const media::decode::Image& input, Size size,
-                                    const PreparationControl& control) {
-    if (input.width == size.w && input.height == size.h) { return input; }
+void resize_bicubic(media::decode::Image& input, Size size, const PreparationControl& control) {
+    if (input.width == size.w && input.height == size.h) { return; }
     const Coefficients horizontal = coefficients(input.width, size.w);
     const Coefficients vertical   = coefficients(input.height, size.h);
     std::vector<std::uint8_t> temp(static_cast<std::size_t>(input.height) * size.w * 3);
@@ -215,7 +214,7 @@ media::decode::Image resize_bicubic(const media::decode::Image& input, Size size
             }
         }
     }
-    return out;
+    input = std::move(out);
 }
 
 std::uint16_t to_bf16(float value) noexcept {
@@ -301,8 +300,8 @@ Prepared prepare_image(std::span<const std::uint8_t> bytes, const ProcessorOptio
     request_budget.claim(out.item);
     const std::size_t elements = static_cast<std::size_t>(gh) * gw * kPatchFeatures;
     out.payload                = cache.allocate_payload(elements, control);
-    image                      = resize_bicubic(image, size, control);
-    std::size_t cursor         = 0;
+    resize_bicubic(image, size, control);
+    std::size_t cursor = 0;
     const std::vector<const media::decode::Image*> frames{&image, &image};
     for (int block_y = 0; block_y < gh / kMerge; ++block_y) {
         check_preparation_control(control);
@@ -356,9 +355,7 @@ Prepared prepare_video(std::span<const std::uint8_t> bytes, const ProcessorOptio
     request_budget.claim(out.item);
     const std::size_t elements = static_cast<std::size_t>(gt) * gh * gw * kPatchFeatures;
     out.payload                = cache.allocate_payload(elements, control);
-    for (media::decode::Image& frame : video.frames) {
-        frame = resize_bicubic(frame, size, control);
-    }
+    for (media::decode::Image& frame : video.frames) { resize_bicubic(frame, size, control); }
     if (pad_temporal) { video.frames.push_back(video.frames.back()); }
     out.item.timestamps = video_timestamps(video.indices, gt, video.fps);
     std::size_t cursor  = 0;
