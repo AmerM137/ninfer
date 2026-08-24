@@ -1053,6 +1053,7 @@ template <class Tap>
 PrefillChunkResult
 TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_prefill,
                           const MultimodalPrefill* multimodal, Tap& tap, bool finalize_at_end) {
+    runtime::ExecutionTimingRecorder timing;
     if (ids.empty()) { throw std::invalid_argument("TextContext::prefill requires tokens"); }
     if (ids.size() > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
         throw std::overflow_error("TextContext::prefill token count exceeds int32");
@@ -1234,9 +1235,12 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                 }
                 if (mtp_window.final_column_uses_generated_token) {
                     int next_token = 0;
+                    timing.begin_wait();
                     CUDA_CHECK(cudaStreamSynchronize(s));
                     CUDA_CHECK(cudaMemcpy(&next_token, io_.token.data, sizeof(next_token),
                                           cudaMemcpyDeviceToHost));
+                    timing.end_wait();
+                    timing.resume_submit();
                     mtp_ids_host[static_cast<std::size_t>(len - 1)] = next_token;
                 }
 
@@ -1312,10 +1316,13 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
 
     prefill_split_frontier_ = -1;
 
+    timing.begin_wait();
     ctx_.synchronize();
+    timing.end_wait();
     work_.reset();
     return PrefillChunkResult{.processed_tokens = static_cast<std::uint32_t>(t0),
-                              .finalized        = finalize_at_end && t0 == T};
+                              .finalized        = finalize_at_end && t0 == T,
+                              .timing           = timing.finish()};
 }
 
 PrefillChunkResult TextContext::prefill_chunk(std::span<const int> full_ids, std::uint32_t begin,

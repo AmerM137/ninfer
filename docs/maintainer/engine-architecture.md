@@ -145,6 +145,12 @@ Runtime 的入口是 exact package 暴露的 `Program` contract。它负责：
 - workspace、request transient arena 和 CUDA Graph；
 - generation timings、speculative statistics 和 physical memory summary。
 
+Program execution/commit capability 同时返回结构化 `submit_host/device_wait/post_host`
+observation；它只报告自身直接观察到的边界，不根据请求总耗时反推。EngineCore 将这些 observation 与
+自己的 boundary、commit/output、maintenance phase 合并为 worker-owned monotonic `RuntimeStats`，并向
+phase 开始时已 active 的 request 记录完整 latency exposure。Worker aggregate 对共享 batch wall time 只计
+一次；每个 batch row 的 exposure 各计完整 elapsed，因此 exposure 不能跨并发 request 求和。
+
 Runtime 不维护 FIFO、protected head 或 backfill policy，不决定 continuation 是否值得保留，也不直接发布
 用户输出。
 
@@ -244,6 +250,10 @@ EngineCore 持有：
 - 一个 Engine worker thread；
 - outstanding、runtime stats 和 response event queues；
 - Program 的稳定引用。
+
+Host-work counters 只由 worker 以整数 nanoseconds 累加；五个 Host-active phase 互斥，阻塞 Device wait
+单列。Serve 只读取 snapshot 并在 terminal/interval reporting path 上转换和序列化，不在 worker 热路径
+构造 JSON 或动态标签。
 
 EngineCore 是 orchestration owner。它调用 Scheduler 取得 boundary decision，调用 ResourceManager 完成逻辑
 资源转换，再调用 Program 执行 physical work。它不能绕过 ResourceManager 直接以 raw lane 修改 Program-owned

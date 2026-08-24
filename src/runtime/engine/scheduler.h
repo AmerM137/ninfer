@@ -113,6 +113,10 @@ public:
 
         [[nodiscard]] bool empty() const noexcept { return size == 0; }
 
+        [[nodiscard]] std::span<const std::uint32_t> lane_span() const noexcept {
+            return {lanes.data(), size};
+        }
+
         [[nodiscard]] std::span<const SequenceHandle> sequence_span() const noexcept {
             return {sequences.data(), size};
         }

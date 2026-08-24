@@ -575,7 +575,7 @@ is also rejected if it resolves to the model artifact.
   --request-log-jsonl profiles/bench/run/server.requests.jsonl
 ```
 
-Every line is one `ninfer_serve_request_log` schema-v13 JSON object. All events carry
+Every line is one `ninfer_serve_request_log` schema-v14 JSON object. All events carry
 `timestamp_unix_ms` and a process-unique `server_instance_id`; request IDs are monotonic only within
 that server instance. Successful request-start records include request-scoped acquisition,
 media-preprocessing wall/work, tokenizer, cache hit/miss/single-flight, and payload-size fields;
@@ -586,14 +586,23 @@ they do not infer request behavior from process-global counter deltas.
 | `server_start` | target/weights identity and artifact, resolved Engine and context-cache capacities, registered thinking/non-thinking sampler defaults plus process overrides, thinking-history and thinking-budget defaults, Device arenas, Host State/KV capacity and occupancy, KV sizing ledger, CUDA Graph observed/allowance bytes, CUDA/GPU environment, and redacted argv |
 | `request_start` | protocol, resolved sampler and seed, thinking mode and optional budget, Responses semantic-change flag, output budget, stream/message/tool shape |
 | `request_rejected` | parsed request shape, media-item count, `phase: "prepare"`, and the exact HTTP status/type/code/parameter/message for a synchronous preparation rejection |
-| `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, thinking-budget application counters, unrounded phase seconds, and complete speculative-decoding counters |
+| `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, thinking-budget application counters, unrounded request-stage seconds, per-request Engine Host exposure, and complete speculative-decoding counters |
 | `request_error` | the resolved request configuration and generation error message |
-| `throughput` | interval token/decode/context-cache counter deltas, current scheduler and resource gauges, last materialization decision, and decode-round batch statistics |
+| `throughput` | interval token/decode/context-cache counter deltas, authoritative worker Host-work deltas, current scheduler and resource gauges, last materialization decision, and decode-round batch statistics |
 
 `request_done.timings_seconds` contains `prepare`, `ttft`, `vision`, `prefill`, `decode`, and `total`
 as full-precision JSON numbers. Its `speculative` object contains `backend`, `draft_window`, `rounds`,
 `drafted_tokens`, `accepted_tokens`, `fallback_steps`, and `accepted_per_position`. Rates can be
 derived downstream from raw token counts and seconds instead of rounded stderr strings.
+
+`request_done.engine_timing` separates FIFO `queue_wait_seconds`, blocking
+`device_wait_exposed_seconds`, and five mutually exclusive Host-active exposure phases under
+`host_exposed_seconds`: `engine_boundary`, `program_submit`, `program_post`,
+`engine_commit_output`, and `engine_maintenance`. `total` is exactly their sum and excludes Device
+wait. The nested `decode` object reports the request's decode-class Host exposure, Device wait, and
+round count; `units` reports its prefill/control unit counts. In a compact batch every participating
+request is delayed by the full round, so these values explain request latency but **must not be
+summed across concurrent requests**.
 
 The JSONL file contains no generated response text and never records an API-key value; `argv`
 replaces that value with `<redacted>`. The existing stderr summaries remain available for operators
@@ -616,6 +625,16 @@ selection, capture, transfer, COW/spill, degradation, eviction, and historical-f
 interval deltas; `occupancy`, `last_selection`, and `last_materialization` are end-of-interval
 gauges. `last_materialization.predicted_nanoseconds` is always produced by the startup-selected
 numerical model.
+
+The JSONL `throughput.host_work` object is the aggregation authority: the Engine worker counts each
+wall-time segment once, independent of batch size. `elapsed_seconds` contains the same five
+mutually exclusive Host phases and their `total`; `device_wait_seconds` is separate.
+`work_class_seconds` splits Host and Device-wait time into decode, prefill, and control classes.
+`detail_subset_seconds` and `detail_invocations` expose admission, context-transaction, replica, and
+stats-publication slow paths; these detail values are already contained in a top-level Host phase
+and must not be added to `total`. Per-round, per-row-round, and per-invocation normalized values are
+`null` when their denominator is zero. The stderr interval line shows only total Host milliseconds,
+decode Host/device-wait microseconds per round, boundary, and maintenance; use JSONL for analysis.
 Intervals with context materialization or retention activity are retained even when they contain no
 token execution; only fully idle intervals are omitted. Downstream measurement should prefer the
 raw counters and seconds over rounded stderr rates.

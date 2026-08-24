@@ -390,10 +390,11 @@ PendingBatch<Variant> Program<Variant>::decode(std::span<const SequenceHandle<Va
 }
 
 template <>
-void Program<Variant>::append_forced_tokens(std::span<const SequenceHandle<Variant>> sequences,
-                                            std::span<const TokenId> row_major_tokens,
-                                            std::uint32_t row_stride) {
-    impl_->append_forced_tokens(sequences, row_major_tokens, row_stride);
+runtime::ExecutionTiming
+Program<Variant>::append_forced_tokens(std::span<const SequenceHandle<Variant>> sequences,
+                                       std::span<const TokenId> row_major_tokens,
+                                       std::uint32_t row_stride) {
+    return impl_->append_forced_tokens(sequences, row_major_tokens, row_stride);
 }
 
 template <>

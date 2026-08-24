@@ -39,6 +39,7 @@ API documentation.
 
 Runtime and Op references:
 
+- [Active Host-work governance and observability implementation plan](maintainer/2026-08-24-host-work-governance-plan.md)
 - [Engine architecture, execution ownership, scheduling, and request lifecycles](maintainer/engine-architecture.md)
 - [Resource scheduling, continuation/checkpoint, and Device/Host context-cache contracts](maintainer/resource-scheduling-and-context-cache.md)
 - [Paged KV context storage, ownership, and capacity model](maintainer/paged-kv-cache.md)

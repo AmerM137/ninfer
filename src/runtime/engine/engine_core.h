@@ -2,6 +2,7 @@
 
 // Small fixed-capacity request execution for every backend.
 
+#include "core/nvtx.h"
 #include "ninfer/types.h"
 #include "runtime/contract/types.h"
 #include "runtime/engine/admission_policy.h"
@@ -232,7 +233,230 @@ public:
     }
 
 private:
+    enum class HostWorkClass : std::uint8_t {
+        Decode,
+        Prefill,
+        Control,
+    };
+
+    using EngineHostPhase = RequestEngineHostPhase;
+
+    [[nodiscard]] static nvtx::Name phase_range_name(EngineHostPhase phase) noexcept {
+        switch (phase) {
+        case EngineHostPhase::Boundary:
+            return nvtx::Name::EngineBoundary;
+        case EngineHostPhase::CommitOutput:
+            return nvtx::Name::EngineCommitOutput;
+        case EngineHostPhase::Maintenance:
+            return nvtx::Name::EngineMaintenance;
+        }
+        return nvtx::Name::EngineBoundary;
+    }
+
+    struct ActiveExposureSet {
+        std::array<std::shared_ptr<Request>, kMaximumConcurrency> requests{};
+        std::array<std::uint32_t, kMaximumConcurrency> lanes{};
+        std::size_t size = 0;
+    };
+
+    struct HostPhaseMeasurement {
+        Clock::time_point started;
+        std::uint64_t accounted_before = 0;
+        ActiveExposureSet exposed;
+    };
+
+    [[nodiscard]] static std::uint64_t elapsed_ns(Clock::time_point started,
+                                                  Clock::time_point finished) noexcept {
+        const auto count =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(finished - started).count();
+        return count > 0 ? static_cast<std::uint64_t>(count) : 0;
+    }
+
+    [[nodiscard]] ActiveExposureSet active_exposure_set() const {
+        ActiveExposureSet result;
+        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+            if (slots_[lane] == nullptr) { continue; }
+            result.requests[result.size] = slots_[lane];
+            result.lanes[result.size]    = lane;
+            ++result.size;
+        }
+        return result;
+    }
+
+    [[nodiscard]] HostPhaseMeasurement begin_host_phase() const {
+        return HostPhaseMeasurement{
+            .started          = Clock::now(),
+            .accounted_before = worker_accounted_elapsed_ns_,
+            .exposed          = active_exposure_set(),
+        };
+    }
+
+    void set_host_work_class(HostWorkClass work_class,
+                             std::span<const std::uint32_t> decode_lanes = {}) noexcept {
+        current_host_work_class_   = work_class;
+        current_decode_lane_count_ = decode_lanes.size();
+        for (std::size_t i = 0; i < decode_lanes.size(); ++i) {
+            current_decode_lanes_[i] = decode_lanes[i];
+        }
+    }
+
+    [[nodiscard]] bool current_decode_contains(std::uint32_t lane) const noexcept {
+        return std::find(current_decode_lanes_.begin(),
+                         current_decode_lanes_.begin() +
+                             static_cast<std::ptrdiff_t>(current_decode_lane_count_),
+                         lane) != current_decode_lanes_.begin() +
+                                      static_cast<std::ptrdiff_t>(current_decode_lane_count_);
+    }
+
+    void add_class_host_time(std::uint64_t host_ns, std::uint64_t device_wait_ns) noexcept {
+        RuntimeHostWorkStats& stats = cumulative_stats_.host_work;
+        switch (current_host_work_class_) {
+        case HostWorkClass::Decode:
+            stats.decode_host_ns += host_ns;
+            stats.decode_device_wait_ns += device_wait_ns;
+            break;
+        case HostWorkClass::Prefill:
+            stats.prefill_host_ns += host_ns;
+            stats.prefill_device_wait_ns += device_wait_ns;
+            break;
+        case HostWorkClass::Control:
+            stats.control_host_ns += host_ns;
+            stats.control_device_wait_ns += device_wait_ns;
+            break;
+        }
+    }
+
+    void expose_engine_phase(const ActiveExposureSet& exposed, EngineHostPhase phase,
+                             std::uint64_t elapsed) noexcept {
+        for (std::size_t i = 0; i < exposed.size; ++i) {
+            RequestHostTiming& timing = exposed.requests[i]->host_timing;
+            timing.expose_engine(phase, elapsed,
+                                 current_host_work_class_ == HostWorkClass::Decode &&
+                                     current_decode_contains(exposed.lanes[i]));
+        }
+    }
+
+    void finish_engine_phase(HostPhaseMeasurement measurement, EngineHostPhase phase) noexcept {
+        const std::uint64_t wall    = elapsed_ns(measurement.started, Clock::now());
+        const std::uint64_t nested  = worker_accounted_elapsed_ns_ - measurement.accounted_before;
+        const std::uint64_t own     = wall > nested ? wall - nested : 0;
+        RuntimeHostWorkStats& stats = cumulative_stats_.host_work;
+        switch (phase) {
+        case EngineHostPhase::Boundary:
+            stats.engine_boundary_ns += own;
+            break;
+        case EngineHostPhase::CommitOutput:
+            stats.engine_commit_output_ns += own;
+            break;
+        case EngineHostPhase::Maintenance:
+            stats.engine_maintenance_ns += own;
+            break;
+        }
+        add_class_host_time(own, 0);
+        expose_engine_phase(measurement.exposed, phase, own);
+        worker_accounted_elapsed_ns_ += own;
+    }
+
+    void record_program_timing(runtime::ExecutionTiming timing,
+                               const ActiveExposureSet& exposed) noexcept {
+        RuntimeHostWorkStats& stats = cumulative_stats_.host_work;
+        stats.program_submit_ns += timing.submit_host_ns;
+        stats.program_post_ns += timing.post_host_ns;
+        stats.device_wait_ns += timing.device_wait_ns;
+        add_class_host_time(timing.host_ns(), timing.device_wait_ns);
+        for (std::size_t i = 0; i < exposed.size; ++i) {
+            RequestHostTiming& request = exposed.requests[i]->host_timing;
+            request.expose_program(timing, current_host_work_class_ == HostWorkClass::Decode &&
+                                               current_decode_contains(exposed.lanes[i]));
+        }
+        worker_accounted_elapsed_ns_ += timing.elapsed_ns();
+    }
+
+    void finish_program_call(HostPhaseMeasurement measurement,
+                             runtime::ExecutionTiming timing) noexcept {
+        const std::uint64_t wall     = elapsed_ns(measurement.started, Clock::now());
+        const std::uint64_t nested   = worker_accounted_elapsed_ns_ - measurement.accounted_before;
+        const std::uint64_t observed = timing.elapsed_ns() + nested;
+        if (wall > observed) { timing.submit_host_ns += wall - observed; }
+        record_program_timing(timing, measurement.exposed);
+    }
+
+    void record_detail(std::uint64_t RuntimeHostWorkStats::*elapsed_member,
+                       std::uint64_t RuntimeHostWorkStats::*invocation_member,
+                       Clock::time_point started) noexcept {
+        RuntimeHostWorkStats& stats = cumulative_stats_.host_work;
+        stats.*elapsed_member += elapsed_ns(started, Clock::now());
+        ++(stats.*invocation_member);
+    }
+
+    class DetailScope {
+    public:
+        DetailScope(EngineCore& owner, std::uint64_t RuntimeHostWorkStats::*elapsed_member,
+                    std::uint64_t RuntimeHostWorkStats::*invocation_member,
+                    nvtx::Name range_name) noexcept
+            : owner_(owner), elapsed_member_(elapsed_member), invocation_member_(invocation_member),
+              started_(Clock::now()) {
+            range_.emplace(range_name, nvtx::Category::Control);
+        }
+
+        ~DetailScope() {
+            range_.reset();
+            owner_.record_detail(elapsed_member_, invocation_member_, started_);
+        }
+
+        DetailScope(const DetailScope&)            = delete;
+        DetailScope& operator=(const DetailScope&) = delete;
+
+    private:
+        EngineCore& owner_;
+        std::uint64_t RuntimeHostWorkStats::*elapsed_member_;
+        std::uint64_t RuntimeHostWorkStats::*invocation_member_;
+        Clock::time_point started_;
+        std::optional<nvtx::ScopedRange> range_;
+    };
+
+    class EnginePhaseScope {
+    public:
+        EnginePhaseScope(EngineCore& owner, EngineHostPhase phase)
+            : owner_(owner), phase_(phase), measurement_(owner.begin_host_phase()) {
+            range_.emplace(phase_range_name(phase), nvtx::Category::Runtime);
+        }
+
+        ~EnginePhaseScope() { finish(); }
+
+        EnginePhaseScope(const EnginePhaseScope&)            = delete;
+        EnginePhaseScope& operator=(const EnginePhaseScope&) = delete;
+
+        void pause_range() noexcept { range_.reset(); }
+
+        void resume_range() noexcept {
+            if (active_ && !range_) {
+                range_.emplace(phase_range_name(phase_), nvtx::Category::Runtime);
+            }
+        }
+
+        void finish() noexcept {
+            if (!active_) { return; }
+            range_.reset();
+            owner_.finish_engine_phase(std::move(measurement_), phase_);
+            active_ = false;
+        }
+
+    private:
+        EngineCore& owner_;
+        EngineHostPhase phase_;
+        HostPhaseMeasurement measurement_;
+        std::optional<nvtx::ScopedRange> range_;
+        bool active_ = true;
+    };
+
     void publish_runtime_stats() {
+        HostPhaseMeasurement measurement = begin_host_phase();
+        std::optional<nvtx::ScopedRange> phase_range;
+        phase_range.emplace(nvtx::Name::EngineMaintenance, nvtx::Category::Runtime);
+        const Clock::time_point detail_started = Clock::now();
+        std::optional<nvtx::ScopedRange> detail_range;
+        detail_range.emplace(nvtx::Name::StatsPublication, nvtx::Category::Control);
         RuntimeStats snapshot = cumulative_stats_;
         resources_.populate_runtime_stats(snapshot);
         {
@@ -251,6 +475,12 @@ private:
             if (slots_[lane]->is_decode_ready()) { ++snapshot.decode_ready_requests; }
             if (slots_[lane]->capture_pending) { ++snapshot.capture_pending_requests; }
         }
+        detail_range.reset();
+        record_detail(&RuntimeHostWorkStats::stats_publication_ns,
+                      &RuntimeHostWorkStats::stats_publication_invocations, detail_started);
+        phase_range.reset();
+        finish_engine_phase(std::move(measurement), EngineHostPhase::Maintenance);
+        snapshot.host_work = cumulative_stats_.host_work;
         std::lock_guard lock(stats_mutex_);
         published_stats_ = snapshot;
     }
@@ -435,9 +665,14 @@ private:
     }
 
     void complete_success(const std::shared_ptr<Request>& request, FinishReason reason) {
+        HostPhaseMeasurement completion = begin_host_phase();
         release_planning_state(request);
         request->prompt      = {};
         request->model_state = EngineRequestState::ModelFinished;
+        if (!request->queue_wait_recorded) {
+            request->host_timing.queue_wait_ns = elapsed_ns(request->submitted, Clock::now());
+            request->queue_wait_recorded       = true;
+        }
         GenerationResult result;
         result.prompt                  = request->prompt_summary;
         result.generated_token_ids     = std::move(request->generated);
@@ -465,6 +700,8 @@ private:
         request->sequence.reset();
         request->lane.reset();
         request->budget.reset();
+        finish_engine_phase(std::move(completion), EngineHostPhase::CommitOutput);
+        result.engine_timing = request->host_timing.public_snapshot();
         {
             std::lock_guard lock(request->mutex);
             if (request->response_done) { return; }
@@ -575,6 +812,7 @@ private:
     void commit_pending(PendingBatch&& pending, std::span<const std::uint32_t> lane_indices,
                         bool decode_round,
                         const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start) {
+        EnginePhaseScope phase(*this, EngineHostPhase::CommitOutput);
         const std::size_t row_count = lane_indices.size();
         if (row_count == 0 || row_count != pending.row_count() || pending.row_stride() == 0 ||
             (!pending.row_counts().empty() && pending.row_counts().size() != row_count) ||
@@ -596,6 +834,10 @@ private:
         std::array<std::size_t, kMaximumConcurrency> generated_sizes{};
         std::array<bool, kMaximumConcurrency> cancelled{};
         bool generated_staged = false;
+        std::array<std::shared_ptr<Request>, kMaximumConcurrency> terminal_requests{};
+        std::array<std::uint32_t, kMaximumConcurrency> terminal_lanes{};
+        std::array<FinishReason, kMaximumConcurrency> terminal_reasons{};
+        std::size_t terminal_count = 0;
         for (std::size_t row = 0; row < row_count; ++row) {
             lanes[row] = LaneId{lane_indices[row]};
         }
@@ -617,6 +859,7 @@ private:
                     request->lane->value != lane || !request->budget) {
                     throw std::logic_error("pending row has no active Engine request");
                 }
+                if (decode_round) { ++request->host_timing.decode_rounds; }
                 cancelled[row] = cancelled_at_unit_start[lane];
                 const std::int32_t raw_count =
                     pending.row_counts().empty() ? 1 : pending.row_counts()[row];
@@ -675,9 +918,13 @@ private:
 
         std::optional<typename Package::CommitResult> committed_storage;
         try {
+            phase.pause_range();
+            HostPhaseMeasurement program_call = begin_host_phase();
             committed_storage.emplace(instance_.program->commit(
                 std::move(pending), std::span<const CommitDecision>(decisions.data(), row_count),
                 CommitObservation::ReleasedRowsOnly));
+            finish_program_call(std::move(program_call), committed_storage->timing);
+            phase.resume_range();
         } catch (...) {
             rollback_generated();
             resources_.release_failed_commit(std::span<const LaneId>(lanes.data(), row_count));
@@ -731,8 +978,10 @@ private:
             if (!request->first_token && accepted != 0) { request->first_token = Clock::now(); }
             append_output(request, std::move(published));
             if (decisions[row].terminal) {
-                complete_success(request, finish_reasons[row]);
-                remove_completed_slot(lane);
+                terminal_requests[terminal_count] = request;
+                terminal_lanes[terminal_count]    = lane;
+                terminal_reasons[terminal_count]  = finish_reasons[row];
+                ++terminal_count;
             } else if (committed.captures[row]) {
                 if (!request->is_prefilling()) {
                     throw std::logic_error("prompt-frontier capture lost its prefill owner");
@@ -758,6 +1007,11 @@ private:
             ++cumulative_stats_.decode_rounds;
             cumulative_stats_.decode_row_rounds += row_count;
         }
+        phase.finish();
+        for (std::size_t index = 0; index < terminal_count; ++index) {
+            complete_success(terminal_requests[index], terminal_reasons[index]);
+            remove_completed_slot(terminal_lanes[index]);
+        }
     }
 
     [[nodiscard]] std::shared_ptr<Request> active_capture_owner() const {
@@ -776,6 +1030,10 @@ private:
     }
 
     void try_start_replica_transition() {
+        EnginePhaseScope phase(*this, EngineHostPhase::Maintenance);
+        DetailScope detail(*this, &RuntimeHostWorkStats::replica_policy_ns,
+                           &RuntimeHostWorkStats::replica_policy_invocations,
+                           nvtx::Name::ReplicaPolicy);
         if (instance_.program->has_context_transaction() || scheduler_.prefill_lane() ||
             !pending_snapshot().empty()) {
             return;
@@ -808,6 +1066,9 @@ private:
     resolve_prefill_progress(const std::shared_ptr<Request>& request,
                              typename Package::PrefillProgress&& progress,
                              const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start) {
+        EnginePhaseScope phase(*this, EngineHostPhase::CommitOutput);
+        ++cumulative_stats_.host_work.prefill_units;
+        ++request->host_timing.prefill_units;
         cumulative_stats_.computed_prefill_tokens += progress.processed_prompt_tokens;
         Scheduling::consume_service_work(*request, 1);
         if (progress.capture) {
@@ -830,11 +1091,13 @@ private:
         }
         request->begin = progress.summary;
         const std::array<std::uint32_t, 1> lanes{lane};
+        phase.finish();
         commit_pending(std::move(*progress.pending), lanes, false, cancelled_at_unit_start);
         progress.pending.reset();
     }
 
     void run_prefill_step(const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start) {
+        EnginePhaseScope setup(*this, EngineHostPhase::CommitOutput);
         const auto prefill_lane = scheduler_.prefill_lane();
         if (!prefill_lane) { throw std::logic_error("no request owns staged prefill"); }
         const std::uint32_t lane = *prefill_lane;
@@ -845,7 +1108,10 @@ private:
         if (!request->sequence) {
             throw std::logic_error("prefill request has no sequence handle");
         }
-        auto progress = instance_.program->advance_prefill(*request->sequence);
+        setup.finish();
+        HostPhaseMeasurement program_call = begin_host_phase();
+        auto progress                     = instance_.program->advance_prefill(*request->sequence);
+        finish_program_call(std::move(program_call), progress.timing);
         resolve_prefill_progress(request, std::move(progress), cancelled_at_unit_start);
         publish_runtime_stats();
     }
@@ -898,6 +1164,10 @@ private:
             throw std::logic_error("Engine and Program disagree on context-transaction ownership");
         }
         if (!kind) { return AdmissionProgress::None; }
+        DetailScope detail(*this, &RuntimeHostWorkStats::context_progress_ns,
+                           &RuntimeHostWorkStats::context_progress_invocations,
+                           nvtx::Name::ContextProgress);
+        ++cumulative_stats_.host_work.control_units;
 
         const std::shared_ptr<Request> capture = active_capture_owner();
         std::atomic<bool> yield{yield_requested};
@@ -978,7 +1248,10 @@ private:
                     request->backfill_epoch         = control.protection_epoch;
                     request->backfill_class         = control.backfill_class;
                     request->model_state            = EngineRequestState::Prefill;
-                    slots_[lane]                    = request;
+                    request->host_timing.queue_wait_ns =
+                        elapsed_ns(request->submitted, Clock::now());
+                    request->queue_wait_recorded = true;
+                    slots_[lane]                 = request;
                     record_prefix_selection(control.summary);
                     materializing_.reset();
                     scheduler_.set_prefill_lane(lane);
@@ -1100,6 +1373,9 @@ private:
     }
 
     AdmissionProgress try_admit_one() {
+        DetailScope detail(*this, &RuntimeHostWorkStats::admission_policy_ns,
+                           &RuntimeHostWorkStats::admission_policy_invocations,
+                           nvtx::Name::AdmissionPolicy);
         bool control_progress = false;
         for (;;) {
             const FifoSnapshot queued = pending_snapshot();
@@ -1228,13 +1504,16 @@ private:
 
     void run_decode_round(const RoundMembership& membership,
                           const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start) {
+        HostPhaseMeasurement program_call = begin_host_phase();
         auto pending =
             instance_.program->decode(membership.sequence_span(), membership.budget_span());
+        finish_program_call(std::move(program_call), pending.execution_timing());
         commit_pending(std::move(pending), membership.lane_span(), true, cancelled_at_unit_start);
         publish_runtime_stats();
     }
 
     void run_control_batch(const ControlMembership& membership) {
+        EnginePhaseScope phase(*this, EngineHostPhase::CommitOutput);
         if (membership.empty() || membership.row_stride == 0 ||
             membership.tokens.size() !=
                 static_cast<std::size_t>(membership.row_stride) * membership.size) {
@@ -1287,13 +1566,22 @@ private:
                 }
                 request->generated.insert(request->generated.end(), tokens.begin(), tokens.end());
             }
-            instance_.program->append_forced_tokens(membership.sequence_span(), membership.tokens,
-                                                    membership.row_stride);
+            phase.pause_range();
+            HostPhaseMeasurement program_call     = begin_host_phase();
+            const runtime::ExecutionTiming timing = instance_.program->append_forced_tokens(
+                membership.sequence_span(), membership.tokens, membership.row_stride);
+            finish_program_call(std::move(program_call), timing);
+            phase.resume_range();
         } catch (...) {
             rollback_generated();
             throw;
         }
         generated_staged = false;
+
+        ++cumulative_stats_.host_work.control_units;
+        for (const std::uint32_t lane : membership.lane_span()) {
+            ++slots_[lane]->host_timing.control_units;
+        }
 
         for (std::size_t row = 0; row < membership.size; ++row) {
             const std::uint32_t lane = membership.lanes[row];
@@ -1359,7 +1647,9 @@ private:
 
             std::unique_lock execution_lock(execution_mutex_);
             try {
-                const bool have_pending = expire_pending_requests();
+                set_host_work_class(HostWorkClass::Control);
+                HostPhaseMeasurement boundary = begin_host_phase();
+                const bool have_pending       = expire_pending_requests();
                 (void)progress_context_transaction(have_pending);
                 const auto cancelled_at_boundary = snapshot_cancellations();
                 cancel_active_requests(cancelled_at_boundary);
@@ -1383,6 +1673,8 @@ private:
                 const ControlMembership control_membership =
                     scheduler_.build_control_membership(slots_, max_concurrency_);
                 if (!control_membership.empty()) {
+                    set_host_work_class(HostWorkClass::Control);
+                    finish_engine_phase(std::move(boundary), EngineHostPhase::Boundary);
                     run_control_batch(control_membership);
                     previous_unit_was_decode = true;
                     try_start_replica_transition();
@@ -1400,17 +1692,23 @@ private:
                 const ExecutionAction action = scheduler_.choose_execution(
                     !membership.empty(), prefill_runnable, previous_unit_was_decode);
                 if (action == ExecutionAction::Prefill) {
+                    set_host_work_class(HostWorkClass::Prefill);
+                    finish_engine_phase(std::move(boundary), EngineHostPhase::Boundary);
                     run_prefill_step(cancelled_at_unit_start);
                     previous_unit_was_decode = false;
                     try_start_replica_transition();
                     continue;
                 }
                 if (action == ExecutionAction::Decode) {
+                    set_host_work_class(HostWorkClass::Decode, membership.lane_span());
+                    finish_engine_phase(std::move(boundary), EngineHostPhase::Boundary);
                     run_decode_round(membership, cancelled_at_unit_start);
                     previous_unit_was_decode = true;
                     try_start_replica_transition();
                     continue;
                 }
+                set_host_work_class(HostWorkClass::Control);
+                finish_engine_phase(std::move(boundary), EngineHostPhase::Boundary);
                 try_start_replica_transition();
             } catch (...) {
                 fail_all_locked(std::current_exception());
@@ -1441,6 +1739,10 @@ private:
     std::optional<MaterializingRequest> materializing_;
     Scheduling scheduler_;
     std::atomic<bool> admission_check_pending_{false};
+    std::uint64_t worker_accounted_elapsed_ns_ = 0;
+    HostWorkClass current_host_work_class_     = HostWorkClass::Control;
+    std::array<std::uint32_t, kMaximumConcurrency> current_decode_lanes_{};
+    std::size_t current_decode_lane_count_ = 0;
     RuntimeStats cumulative_stats_;
     RuntimeStats published_stats_;
     bool stopping_ = false;

@@ -18,6 +18,79 @@
 
 namespace ninfer::runtime {
 
+enum class RequestEngineHostPhase : std::uint8_t {
+    Boundary,
+    CommitOutput,
+    Maintenance,
+};
+
+struct RequestHostTiming {
+    std::uint64_t queue_wait_ns                   = 0;
+    std::uint64_t engine_boundary_exposed_ns      = 0;
+    std::uint64_t program_submit_exposed_ns       = 0;
+    std::uint64_t program_post_exposed_ns         = 0;
+    std::uint64_t engine_commit_output_exposed_ns = 0;
+    std::uint64_t engine_maintenance_exposed_ns   = 0;
+    std::uint64_t device_wait_exposed_ns          = 0;
+    std::uint64_t decode_host_exposed_ns          = 0;
+    std::uint64_t decode_device_wait_exposed_ns   = 0;
+    std::uint64_t prefill_units                   = 0;
+    std::uint64_t decode_rounds                   = 0;
+    std::uint64_t control_units                   = 0;
+
+    void expose_engine(RequestEngineHostPhase phase, std::uint64_t elapsed_ns,
+                       bool decode_member) noexcept {
+        switch (phase) {
+        case RequestEngineHostPhase::Boundary:
+            engine_boundary_exposed_ns += elapsed_ns;
+            break;
+        case RequestEngineHostPhase::CommitOutput:
+            engine_commit_output_exposed_ns += elapsed_ns;
+            break;
+        case RequestEngineHostPhase::Maintenance:
+            engine_maintenance_exposed_ns += elapsed_ns;
+            break;
+        }
+        if (decode_member) { decode_host_exposed_ns += elapsed_ns; }
+    }
+
+    void expose_program(ExecutionTiming timing, bool decode_member) noexcept {
+        program_submit_exposed_ns += timing.submit_host_ns;
+        program_post_exposed_ns += timing.post_host_ns;
+        device_wait_exposed_ns += timing.device_wait_ns;
+        if (decode_member) {
+            decode_host_exposed_ns += timing.host_ns();
+            decode_device_wait_exposed_ns += timing.device_wait_ns;
+        }
+    }
+
+    [[nodiscard]] GenerationEngineTiming public_snapshot() const noexcept {
+        constexpr double kNanosecondsToSeconds = 1.0e-9;
+        return GenerationEngineTiming{
+            .queue_wait_seconds = static_cast<double>(queue_wait_ns) * kNanosecondsToSeconds,
+            .engine_boundary_exposed_seconds =
+                static_cast<double>(engine_boundary_exposed_ns) * kNanosecondsToSeconds,
+            .program_submit_exposed_seconds =
+                static_cast<double>(program_submit_exposed_ns) * kNanosecondsToSeconds,
+            .program_post_exposed_seconds =
+                static_cast<double>(program_post_exposed_ns) * kNanosecondsToSeconds,
+            .engine_commit_output_exposed_seconds =
+                static_cast<double>(engine_commit_output_exposed_ns) * kNanosecondsToSeconds,
+            .engine_maintenance_exposed_seconds =
+                static_cast<double>(engine_maintenance_exposed_ns) * kNanosecondsToSeconds,
+            .device_wait_exposed_seconds =
+                static_cast<double>(device_wait_exposed_ns) * kNanosecondsToSeconds,
+            .decode_host_exposed_seconds =
+                static_cast<double>(decode_host_exposed_ns) * kNanosecondsToSeconds,
+            .decode_device_wait_exposed_seconds =
+                static_cast<double>(decode_device_wait_exposed_ns) * kNanosecondsToSeconds,
+            .prefill_units = prefill_units,
+            .decode_rounds = decode_rounds,
+            .control_units = control_units,
+        };
+    }
+};
+
 enum class EngineRequestState : std::uint8_t {
     Waiting,
     Materializing,
@@ -79,6 +152,7 @@ struct RequestRecord {
     Clock::time_point deadline;
     Clock::time_point submitted;
     std::optional<Clock::time_point> first_token;
+    bool queue_wait_recorded = false;
     std::optional<GenerationBudget> budget;
     std::optional<BeginSummary> begin;
     std::vector<TokenId> generated;
@@ -96,6 +170,7 @@ struct RequestRecord {
     std::uint64_t backfill_epoch         = 0;
     BackfillClass backfill_class         = BackfillClass::None;
     GenerationTimings generation_timings;
+    RequestHostTiming host_timing;
     SpeculativeStats speculative_stats;
 
     std::mutex mutex;

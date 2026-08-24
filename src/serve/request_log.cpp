@@ -261,6 +261,89 @@ Json speculative_json(const GenerationMetrics& metrics) {
                 {"accepted_per_position", metrics.speculative_accepted_per_position}};
 }
 
+double nanoseconds_to_seconds(std::uint64_t value) noexcept {
+    return static_cast<double>(value) * 1.0e-9;
+}
+
+double nanoseconds_to_microseconds(std::uint64_t value) noexcept {
+    return static_cast<double>(value) * 1.0e-3;
+}
+
+double request_host_exposed_seconds(const ninfer::GenerationEngineTiming& timing) noexcept {
+    return timing.engine_boundary_exposed_seconds + timing.program_submit_exposed_seconds +
+           timing.program_post_exposed_seconds + timing.engine_commit_output_exposed_seconds +
+           timing.engine_maintenance_exposed_seconds;
+}
+
+Json request_engine_timing_json(const ninfer::GenerationEngineTiming& timing) {
+    return Json{
+        {"queue_wait_seconds", timing.queue_wait_seconds},
+        {"host_exposed_seconds",
+         Json{{"engine_boundary", timing.engine_boundary_exposed_seconds},
+              {"program_submit", timing.program_submit_exposed_seconds},
+              {"program_post", timing.program_post_exposed_seconds},
+              {"engine_commit_output", timing.engine_commit_output_exposed_seconds},
+              {"engine_maintenance", timing.engine_maintenance_exposed_seconds},
+              {"total", request_host_exposed_seconds(timing)}}},
+        {"device_wait_exposed_seconds", timing.device_wait_exposed_seconds},
+        {"decode", Json{{"host_exposed_seconds", timing.decode_host_exposed_seconds},
+                        {"device_wait_exposed_seconds", timing.decode_device_wait_exposed_seconds},
+                        {"rounds", timing.decode_rounds}}},
+        {"units", Json{{"prefill", timing.prefill_units}, {"control", timing.control_units}}},
+    };
+}
+
+ninfer::RuntimeHostWorkStats host_work_delta(const ninfer::RuntimeHostWorkStats& previous,
+                                             const ninfer::RuntimeHostWorkStats& current) {
+    return ninfer::RuntimeHostWorkStats{
+        .engine_boundary_ns =
+            monotonic_delta(previous.engine_boundary_ns, current.engine_boundary_ns),
+        .program_submit_ns = monotonic_delta(previous.program_submit_ns, current.program_submit_ns),
+        .program_post_ns   = monotonic_delta(previous.program_post_ns, current.program_post_ns),
+        .engine_commit_output_ns =
+            monotonic_delta(previous.engine_commit_output_ns, current.engine_commit_output_ns),
+        .engine_maintenance_ns =
+            monotonic_delta(previous.engine_maintenance_ns, current.engine_maintenance_ns),
+        .device_wait_ns = monotonic_delta(previous.device_wait_ns, current.device_wait_ns),
+        .decode_host_ns = monotonic_delta(previous.decode_host_ns, current.decode_host_ns),
+        .decode_device_wait_ns =
+            monotonic_delta(previous.decode_device_wait_ns, current.decode_device_wait_ns),
+        .prefill_host_ns = monotonic_delta(previous.prefill_host_ns, current.prefill_host_ns),
+        .prefill_device_wait_ns =
+            monotonic_delta(previous.prefill_device_wait_ns, current.prefill_device_wait_ns),
+        .control_host_ns = monotonic_delta(previous.control_host_ns, current.control_host_ns),
+        .control_device_wait_ns =
+            monotonic_delta(previous.control_device_wait_ns, current.control_device_wait_ns),
+        .prefill_units = monotonic_delta(previous.prefill_units, current.prefill_units),
+        .control_units = monotonic_delta(previous.control_units, current.control_units),
+        .admission_policy_ns =
+            monotonic_delta(previous.admission_policy_ns, current.admission_policy_ns),
+        .context_progress_ns =
+            monotonic_delta(previous.context_progress_ns, current.context_progress_ns),
+        .replica_policy_ns = monotonic_delta(previous.replica_policy_ns, current.replica_policy_ns),
+        .stats_publication_ns =
+            monotonic_delta(previous.stats_publication_ns, current.stats_publication_ns),
+        .admission_policy_invocations  = monotonic_delta(previous.admission_policy_invocations,
+                                                         current.admission_policy_invocations),
+        .context_progress_invocations  = monotonic_delta(previous.context_progress_invocations,
+                                                         current.context_progress_invocations),
+        .replica_policy_invocations    = monotonic_delta(previous.replica_policy_invocations,
+                                                         current.replica_policy_invocations),
+        .stats_publication_invocations = monotonic_delta(previous.stats_publication_invocations,
+                                                         current.stats_publication_invocations),
+    };
+}
+
+std::uint64_t host_active_ns(const ninfer::RuntimeHostWorkStats& timing) noexcept {
+    return timing.engine_boundary_ns + timing.program_submit_ns + timing.program_post_ns +
+           timing.engine_commit_output_ns + timing.engine_maintenance_ns;
+}
+
+Json microseconds_per(std::uint64_t nanoseconds, std::uint64_t count) {
+    if (count == 0) { return nullptr; }
+    return nanoseconds_to_microseconds(nanoseconds) / static_cast<double>(count);
+}
+
 // Tokens/second with fixed precision, or "n/a" when the interval is degenerate.
 std::string rate(double tokens, double seconds) {
     std::ostringstream out;
@@ -417,8 +500,19 @@ std::string format_request_done(const RequestLogContext& context,
         << std::setprecision(0) << ttft_ms << "ms"
         << " prefill=" << rate(computed_prefill_tokens, metrics.prefill_seconds)
         << " decode=" << rate(decode_tokens, metrics.decode_seconds)
-        << " wall=" << seconds_str(metrics.total_seconds)
-        << " speculative=" << speculative_str(metrics);
+        << " wall=" << seconds_str(metrics.total_seconds) << " host=" << std::setprecision(2)
+        << request_host_exposed_seconds(metrics.engine_timing) * 1000.0 << "ms";
+    if (metrics.engine_timing.decode_rounds == 0) {
+        out << " decode-host=n/a wait=n/a";
+    } else {
+        const double rounds = static_cast<double>(metrics.engine_timing.decode_rounds);
+        out << " decode-host=" << std::setprecision(1)
+            << metrics.engine_timing.decode_host_exposed_seconds * 1.0e6 / rounds
+            << "us/round wait="
+            << metrics.engine_timing.decode_device_wait_exposed_seconds * 1.0e6 / rounds
+            << "us/round";
+    }
+    out << " speculative=" << speculative_str(metrics);
     if (outcome.thinking.configured_budget) {
         out << " thinking_budget=" << *outcome.thinking.configured_budget
             << " model_thinking=" << outcome.thinking.model_thinking_tokens
@@ -443,6 +537,8 @@ std::string format_throughput(const ThroughputReport& report) {
         report.interval_seconds > 0.0
             ? static_cast<double>(report.committed_decode_tokens) / report.interval_seconds
             : 0.0;
+    const ninfer::RuntimeHostWorkStats host =
+        host_work_delta(report.previous.host_work, report.current.host_work);
     std::ostringstream out;
     out << "throughput interval=" << std::fixed << std::setprecision(3) << report.interval_seconds
         << "s prefill=" << std::setprecision(1) << prefill_rate << "tok/s decode=" << decode_rate
@@ -459,6 +555,22 @@ std::string format_throughput(const ThroughputReport& report) {
             << static_cast<double>(report.decode_row_rounds) /
                    static_cast<double>(report.decode_rounds);
     }
+    out << " host=" << std::setprecision(2) << nanoseconds_to_seconds(host_active_ns(host)) * 1000.0
+        << "ms";
+    if (report.decode_rounds == 0) {
+        out << " decode-host=n/a wait=n/a";
+    } else {
+        out << " decode-host=" << std::setprecision(1)
+            << nanoseconds_to_microseconds(host.decode_host_ns) /
+                   static_cast<double>(report.decode_rounds)
+            << "us/round wait="
+            << nanoseconds_to_microseconds(host.decode_device_wait_ns) /
+                   static_cast<double>(report.decode_rounds)
+            << "us/round";
+    }
+    out << " boundary=" << std::setprecision(2)
+        << nanoseconds_to_seconds(host.engine_boundary_ns) * 1000.0
+        << "ms maintenance=" << nanoseconds_to_seconds(host.engine_maintenance_ns) * 1000.0 << "ms";
     return out.str();
 }
 
@@ -628,7 +740,8 @@ std::string format_request_done_json(const std::string& server_instance_id, std:
         {"prepare", outcome.metrics.prepare_seconds}, {"ttft", outcome.metrics.ttft_seconds},
         {"vision", outcome.metrics.vision_seconds},   {"prefill", outcome.metrics.prefill_seconds},
         {"decode", outcome.metrics.decode_seconds},   {"total", outcome.metrics.total_seconds}};
-    record["speculative"] = speculative_json(outcome.metrics);
+    record["engine_timing"] = request_engine_timing_json(outcome.metrics.engine_timing);
+    record["speculative"]   = speculative_json(outcome.metrics);
     return record.dump();
 }
 
@@ -659,20 +772,65 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
         average_batch = static_cast<double>(report.decode_row_rounds) /
                         static_cast<double>(report.decode_rounds);
     }
-    record["interval_seconds"] = report.interval_seconds;
-    record["tokens"]           = Json{{"computed_prefill", report.computed_prefill_tokens},
-                                      {"committed_decode", report.committed_decode_tokens}};
+    const ninfer::RuntimeHostWorkStats host =
+        host_work_delta(previous.host_work, current.host_work);
+    const std::uint64_t active_host = host_active_ns(host);
+    record["interval_seconds"]      = report.interval_seconds;
+    record["tokens"]                = Json{{"computed_prefill", report.computed_prefill_tokens},
+                                           {"committed_decode", report.committed_decode_tokens}};
     record["throughput_tokens_per_second"] =
         Json{{"prefill", prefill_rate}, {"decode", decode_rate}};
-    record["scheduler"]     = Json{{"running", current.running_requests},
-                                   {"prefilling", current.prefilling_requests},
-                                   {"decode_ready", current.decode_ready_requests},
-                                   {"waiting", current.waiting_requests},
-                                   {"materializing", current.materializing_requests},
-                                   {"capture_pending", current.capture_pending_requests}};
-    record["decode_batch"]  = Json{{"rounds", report.decode_rounds},
-                                   {"row_rounds", report.decode_row_rounds},
-                                   {"average_size", std::move(average_batch)}};
+    record["scheduler"]    = Json{{"running", current.running_requests},
+                                  {"prefilling", current.prefilling_requests},
+                                  {"decode_ready", current.decode_ready_requests},
+                                  {"waiting", current.waiting_requests},
+                                  {"materializing", current.materializing_requests},
+                                  {"capture_pending", current.capture_pending_requests}};
+    record["decode_batch"] = Json{{"rounds", report.decode_rounds},
+                                  {"row_rounds", report.decode_row_rounds},
+                                  {"average_size", std::move(average_batch)}};
+    record["host_work"]    = Json{
+           {"elapsed_seconds",
+            Json{{"engine_boundary", nanoseconds_to_seconds(host.engine_boundary_ns)},
+                 {"program_submit", nanoseconds_to_seconds(host.program_submit_ns)},
+                 {"program_post", nanoseconds_to_seconds(host.program_post_ns)},
+                 {"engine_commit_output", nanoseconds_to_seconds(host.engine_commit_output_ns)},
+                 {"engine_maintenance", nanoseconds_to_seconds(host.engine_maintenance_ns)},
+                 {"total", nanoseconds_to_seconds(active_host)}}},
+           {"device_wait_seconds", nanoseconds_to_seconds(host.device_wait_ns)},
+           {"work_class_seconds",
+            Json{{"decode_host", nanoseconds_to_seconds(host.decode_host_ns)},
+                 {"decode_device_wait", nanoseconds_to_seconds(host.decode_device_wait_ns)},
+                 {"prefill_host", nanoseconds_to_seconds(host.prefill_host_ns)},
+                 {"prefill_device_wait", nanoseconds_to_seconds(host.prefill_device_wait_ns)},
+                 {"control_host", nanoseconds_to_seconds(host.control_host_ns)},
+                 {"control_device_wait", nanoseconds_to_seconds(host.control_device_wait_ns)}}},
+           {"detail_subset_seconds",
+            Json{{"admission_policy", nanoseconds_to_seconds(host.admission_policy_ns)},
+                 {"context_progress", nanoseconds_to_seconds(host.context_progress_ns)},
+                 {"replica_policy", nanoseconds_to_seconds(host.replica_policy_ns)},
+                 {"stats_publication", nanoseconds_to_seconds(host.stats_publication_ns)}}},
+           {"detail_invocations", Json{{"admission_policy", host.admission_policy_invocations},
+                                       {"context_progress", host.context_progress_invocations},
+                                       {"replica_policy", host.replica_policy_invocations},
+                                       {"stats_publication", host.stats_publication_invocations}}},
+           {"units", Json{{"prefill", host.prefill_units}, {"control", host.control_units}}},
+           {"decode_host_microseconds_per_round",
+            microseconds_per(host.decode_host_ns, report.decode_rounds)},
+           {"decode_host_microseconds_per_row_round",
+            microseconds_per(host.decode_host_ns, report.decode_row_rounds)},
+           {"decode_device_wait_microseconds_per_round",
+            microseconds_per(host.decode_device_wait_ns, report.decode_rounds)},
+           {"detail_microseconds_per_invocation",
+            Json{{"admission_policy",
+                  microseconds_per(host.admission_policy_ns, host.admission_policy_invocations)},
+                 {"context_progress",
+                  microseconds_per(host.context_progress_ns, host.context_progress_invocations)},
+                 {"replica_policy",
+                  microseconds_per(host.replica_policy_ns, host.replica_policy_invocations)},
+                 {"stats_publication",
+                  microseconds_per(host.stats_publication_ns, host.stats_publication_invocations)}}},
+    };
     record["context_cache"] = Json{
         {"captures", Json{{"completed", monotonic_delta(previous.active_captures_completed,
                                                         current.active_captures_completed)},

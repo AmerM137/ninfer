@@ -397,10 +397,11 @@ public:
         : owner_(std::exchange(other.owner_, nullptr)),
           transaction_(std::exchange(other.transaction_, 0)), rows_(other.rows_),
           row_count_(std::exchange(other.row_count_, 0)), tokens_(other.tokens_),
-          row_counts_(other.row_counts_), row_stride_(other.row_stride_) {
+          row_counts_(other.row_counts_), row_stride_(other.row_stride_), timing_(other.timing_) {
         other.tokens_     = {};
         other.row_counts_ = {};
         other.row_stride_ = 0;
+        other.timing_     = {};
     }
 
     PendingBatch& operator=(PendingBatch&&)      = delete;
@@ -415,6 +416,8 @@ public:
 
     [[nodiscard]] std::uint32_t row_stride() const noexcept { return row_stride_; }
 
+    [[nodiscard]] runtime::ExecutionTiming execution_timing() const noexcept { return timing_; }
+
 private:
     const void* owner_         = nullptr;
     std::uint64_t transaction_ = 0;
@@ -423,6 +426,7 @@ private:
     std::span<const TokenId> tokens_;
     std::span<const std::int32_t> row_counts_;
     std::uint32_t row_stride_ = 0;
+    runtime::ExecutionTiming timing_;
 
     friend struct detail::RuntimeContractAccess<Variant>;
 };
@@ -432,6 +436,7 @@ struct PrefillProgress {
     runtime::BeginSummary summary;
     std::uint32_t processed_prompt_tokens = 0;
     bool complete                         = false;
+    runtime::ExecutionTiming timing;
     std::optional<PendingBatch<Variant>> pending;
     std::optional<CaptureOffer<Variant>> capture;
 };
@@ -554,6 +559,7 @@ struct CommitResult {
     // Keeping the move-only capability row-aligned avoids exposing provisional prompt state.
     std::array<std::optional<CaptureOffer<Variant>>, kMaximumConcurrency> captures{};
     std::size_t row_count = 0;
+    runtime::ExecutionTiming timing;
 };
 
 template <class Variant>
@@ -690,8 +696,9 @@ public:
                                                std::span<const runtime::RoundBudget> budgets);
     // Advance each live sequence with its exact target-owned token row. This does not sample or
     // advance sampler RNG/occurrence state; callers own output publication and budget accounting.
-    void append_forced_tokens(std::span<const SequenceHandle<Variant>> sequences,
-                              std::span<const TokenId> row_major_tokens, std::uint32_t row_stride);
+    [[nodiscard]] runtime::ExecutionTiming
+    append_forced_tokens(std::span<const SequenceHandle<Variant>> sequences,
+                         std::span<const TokenId> row_major_tokens, std::uint32_t row_stride);
     [[nodiscard]] CommitResult<Variant>
     commit(PendingBatch<Variant>&& pending, std::span<const runtime::CommitDecision> decisions,
            runtime::CommitObservation observation = runtime::CommitObservation::AllRows);
@@ -834,7 +841,8 @@ struct RuntimeContractAccess {
     [[nodiscard]] static PendingBatch<Variant>
     make_pending(const void* owner, std::uint64_t transaction,
                  std::span<const SequenceHandle<Variant>> rows, std::span<const TokenId> tokens,
-                 std::span<const std::int32_t> row_counts, std::uint32_t row_stride) {
+                 std::span<const std::int32_t> row_counts, std::uint32_t row_stride,
+                 runtime::ExecutionTiming timing) {
         PendingBatch<Variant> out;
         out.owner_       = owner;
         out.transaction_ = transaction;
@@ -843,6 +851,7 @@ struct RuntimeContractAccess {
         out.tokens_     = tokens;
         out.row_counts_ = row_counts;
         out.row_stride_ = row_stride;
+        out.timing_     = timing;
         return out;
     }
 
@@ -866,6 +875,7 @@ struct RuntimeContractAccess {
         pending.tokens_      = {};
         pending.row_counts_  = {};
         pending.row_stride_  = 0;
+        pending.timing_      = {};
     }
 };
 

@@ -122,6 +122,7 @@ struct NullTap {
 struct PrefillChunkResult {
     std::uint32_t processed_tokens = 0;
     bool finalized                 = false;
+    runtime::ExecutionTiming timing;
 };
 
 struct DFlashFeatureSink {

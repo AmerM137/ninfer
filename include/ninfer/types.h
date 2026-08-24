@@ -440,6 +440,10 @@ struct PreparationControl {
     CancellationView cancellation;
 };
 
+// Request-stage wall timings retained for end-to-end latency/rate reporting. Prefill/decode are
+// Program execution elapsed time and include Device completion waits; total also includes queueing
+// and other request lifetime. They are not Host-work phases. GenerationEngineTiming below is the
+// direct, mutually-exclusive Host observation contract.
 struct GenerationTimings {
     double prepare_seconds     = 0.0;
     double first_token_seconds = 0.0;
@@ -447,6 +451,25 @@ struct GenerationTimings {
     double prefill_seconds     = 0.0;
     double decode_seconds      = 0.0;
     double total_seconds       = 0.0;
+};
+
+// Wall elapsed time directly observed in Engine-owned regions. "Exposed" values are latency
+// exposure: every active request delayed by one compact-batch unit observes that unit's full
+// elapsed time, so values from concurrent requests must not be summed. Device wait is reported
+// separately from Host-active work.
+struct GenerationEngineTiming {
+    double queue_wait_seconds                   = 0.0;
+    double engine_boundary_exposed_seconds      = 0.0;
+    double program_submit_exposed_seconds       = 0.0;
+    double program_post_exposed_seconds         = 0.0;
+    double engine_commit_output_exposed_seconds = 0.0;
+    double engine_maintenance_exposed_seconds   = 0.0;
+    double device_wait_exposed_seconds          = 0.0;
+    double decode_host_exposed_seconds          = 0.0;
+    double decode_device_wait_exposed_seconds   = 0.0;
+    std::uint64_t prefill_units                 = 0;
+    std::uint64_t decode_rounds                 = 0;
+    std::uint64_t control_units                 = 0;
 };
 
 struct SpeculativeStats {
@@ -488,6 +511,7 @@ struct GenerationResult {
     std::uint32_t reused_prompt_tokens = 0;
     PrefixReusePath prefix_reuse_path  = PrefixReusePath::Root;
     GenerationTimings timings;
+    GenerationEngineTiming engine_timing;
     SpeculativeStats speculative;
     ThinkingBudgetStats thinking;
 };
@@ -527,9 +551,40 @@ struct MemorySummary {
     std::size_t host_kv_occupied_bytes            = 0;
 };
 
+// Worker-owned monotonic nanosecond counters. Top-level Host phases are mutually exclusive;
+// device_wait_ns is blocked wall time and is intentionally excluded from their sum. Detail values
+// are subsets of a top-level phase and must not be added to Host-active time again.
+struct RuntimeHostWorkStats {
+    std::uint64_t engine_boundary_ns      = 0;
+    std::uint64_t program_submit_ns       = 0;
+    std::uint64_t program_post_ns         = 0;
+    std::uint64_t engine_commit_output_ns = 0;
+    std::uint64_t engine_maintenance_ns   = 0;
+    std::uint64_t device_wait_ns          = 0;
+
+    std::uint64_t decode_host_ns         = 0;
+    std::uint64_t decode_device_wait_ns  = 0;
+    std::uint64_t prefill_host_ns        = 0;
+    std::uint64_t prefill_device_wait_ns = 0;
+    std::uint64_t control_host_ns        = 0;
+    std::uint64_t control_device_wait_ns = 0;
+    std::uint64_t prefill_units          = 0;
+    std::uint64_t control_units          = 0;
+
+    std::uint64_t admission_policy_ns           = 0;
+    std::uint64_t context_progress_ns           = 0;
+    std::uint64_t replica_policy_ns             = 0;
+    std::uint64_t stats_publication_ns          = 0;
+    std::uint64_t admission_policy_invocations  = 0;
+    std::uint64_t context_progress_invocations  = 0;
+    std::uint64_t replica_policy_invocations    = 0;
+    std::uint64_t stats_publication_invocations = 0;
+};
+
 // Monotonic execution counters, boundary-consistent current gauges, and explicitly named last
 // decision observations. Consumers derive interval counters by subtracting two snapshots.
 struct RuntimeStats {
+    RuntimeHostWorkStats host_work;
     // Actual prompt tokens evaluated by prefill; reused checkpoint-prefix tokens are excluded.
     std::uint64_t computed_prefill_tokens = 0;
     // Tokens committed by decode rounds; the first token emitted by prefill is excluded.

@@ -5696,7 +5696,7 @@ PendingBatch ProgramImplCore::wrap_pending(std::span<const std::uint32_t> lanes,
     pending_transaction_ = transaction;
     return ContractAccess::make_pending(
         this, transaction.id, std::span<const SequenceHandle>(handles.data(), lanes.size()),
-        round.tokens, round.row_counts, round.row_stride);
+        round.tokens, round.row_counts, round.row_stride, round.timing);
 }
 
 PrefillProgress ProgramImplCore::wrap_prefill(std::uint32_t lane, runtime::PrefillStepResult step) {
@@ -5704,6 +5704,7 @@ PrefillProgress ProgramImplCore::wrap_prefill(std::uint32_t lane, runtime::Prefi
     out.summary                 = step.summary;
     out.processed_prompt_tokens = step.processed_prompt_tokens;
     out.complete                = step.complete;
+    out.timing                  = step.timing;
     if (step.complete) {
         const std::array<std::uint32_t, 1> lanes{lane};
         const runtime::BatchedGeneratedRound round{
@@ -7417,9 +7418,11 @@ PendingBatch ProgramImplCore::decode(std::span<const SequenceHandle> members,
     }
 }
 
-void ProgramImplCore::append_forced_tokens(std::span<const SequenceHandle> members,
-                                           std::span<const TokenId> row_major_tokens,
-                                           std::uint32_t row_stride) {
+runtime::ExecutionTiming
+ProgramImplCore::append_forced_tokens(std::span<const SequenceHandle> members,
+                                      std::span<const TokenId> row_major_tokens,
+                                      std::uint32_t row_stride) {
+    runtime::ExecutionTimingRecorder timing;
     if (pending_transaction_ || members.empty() || members.size() > max_concurrency ||
         row_stride == 0 ||
         row_major_tokens.size() != static_cast<std::size_t>(row_stride) * members.size()) {
@@ -7456,6 +7459,7 @@ void ProgramImplCore::append_forced_tokens(std::span<const SequenceHandle> membe
 
     try {
         for (std::size_t row = 0; row < members.size(); ++row) {
+            timing.resume_submit();
             const std::uint32_t lane = lanes[row];
             SequenceState& sequence  = active_sequence(lane);
             RequestControl& request  = requests[lane];
@@ -7472,11 +7476,14 @@ void ProgramImplCore::append_forced_tokens(std::span<const SequenceHandle> membe
                 const std::array<std::uint32_t, 1> append_counts{base -
                                                                  sequence.dflash_context_frontier};
                 enqueue_dflash_context_append(append_lanes, append_starts, append_counts);
+                timing.begin_wait();
                 device.synchronize();
+                timing.end_wait();
                 sequence.dflash_context_frontier = base;
                 commit_sequence_kv(sequence, sequence.text_kv_valid,
                                    sequence.dflash_context_frontier);
                 work.reset();
+                timing.resume_submit();
             }
 
             materialize_sequence_kv(sequence, end,
@@ -7549,7 +7556,9 @@ void ProgramImplCore::append_forced_tokens(std::span<const SequenceHandle> membe
                           prefill_hidden.slice(
                               1, static_cast<std::int32_t>(result.processed_tokens) - 1, 1));
             }
+            timing.begin_wait();
             device.synchronize();
+            timing.end_wait();
             work.reset();
 
             sequence.ledger.insert(sequence.ledger.end(), forced.begin(), forced.end());
@@ -7567,6 +7576,7 @@ void ProgramImplCore::append_forced_tokens(std::span<const SequenceHandle> membe
             request.timings.decode_seconds +=
                 std::chrono::duration<double>(Clock::now() - started).count();
         }
+        return timing.finish();
     } catch (...) {
         try {
             device.synchronize();
@@ -7586,6 +7596,7 @@ void ProgramImplCore::append_forced_tokens(std::span<const SequenceHandle> membe
 CommitResult ProgramImplCore::commit(PendingBatch&& pending,
                                      std::span<const runtime::CommitDecision> decisions,
                                      runtime::CommitObservation observation) {
+    runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Post);
     std::array<SequenceHandle, kMaximumConcurrency> members{};
     const auto input_rows       = ContractAccess::rows(pending);
     const std::size_t row_count = input_rows.size();
@@ -7639,10 +7650,13 @@ CommitResult ProgramImplCore::commit(PendingBatch&& pending,
             }
         }
 
-        resolve_pending_raw(std::span<const std::uint32_t>(lanes.data(), row_count),
-                            std::span<const std::uint32_t>(accepted.data(), row_count),
-                            std::span<const std::uint8_t>(terminal.data(), row_count),
-                            std::span<const std::uint8_t>(cancelled.data(), row_count));
+        timing.pause();
+        timing.include(
+            resolve_pending_raw(std::span<const std::uint32_t>(lanes.data(), row_count),
+                                std::span<const std::uint32_t>(accepted.data(), row_count),
+                                std::span<const std::uint8_t>(terminal.data(), row_count),
+                                std::span<const std::uint8_t>(cancelled.data(), row_count)));
+        timing.resume_post();
         pending_transaction_.reset();
 
         CommitResult out;
@@ -7690,6 +7704,7 @@ CommitResult ProgramImplCore::commit(PendingBatch&& pending,
                 this, runtime::LaneId{lanes[row]}, lane_epochs[lanes[row]],
                 prefill.pending_capture_offer));
         }
+        out.timing = timing.finish();
         return out;
     } catch (...) {
         release_members();
@@ -8424,18 +8439,18 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill_raw(std::uint32_t la
     return advance_prefill(active_sequence(lane), requests[lane]);
 }
 
-void ProgramImplCore::resolve_prefill_raw(std::uint32_t lane, bool terminal) {
+runtime::ExecutionTiming ProgramImplCore::resolve_prefill_raw(std::uint32_t lane, bool terminal) {
     if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
     if (requests[lane].pending.kind != PendingKind::Begin) {
         throw std::logic_error("prefill resolution requires a pending prefill token");
     }
-    resolve_non_speculative_pending(active_sequence(lane), requests[lane], 1, terminal);
+    return resolve_non_speculative_pending(active_sequence(lane), requests[lane], 1, terminal);
 }
 
-void ProgramImplCore::resolve_pending_raw(std::span<const std::uint32_t> lanes,
-                                          std::span<const std::uint32_t> accepted_tokens,
-                                          std::span<const std::uint8_t> terminal,
-                                          std::span<const std::uint8_t> cancelled) {
+runtime::ExecutionTiming ProgramImplCore::resolve_pending_raw(
+    std::span<const std::uint32_t> lanes, std::span<const std::uint32_t> accepted_tokens,
+    std::span<const std::uint8_t> terminal, std::span<const std::uint8_t> cancelled) {
+    runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Post);
     if (lanes.empty() || lanes.size() > max_concurrency || accepted_tokens.size() != lanes.size() ||
         terminal.size() != lanes.size() || cancelled.size() != lanes.size()) {
         throw std::invalid_argument("pending batch resolution has inconsistent membership");
@@ -8453,10 +8468,13 @@ void ProgramImplCore::resolve_pending_raw(std::span<const std::uint32_t> lanes,
             }
             clear_lane(active_sequence(lane), requests[lane]);
         } else {
-            resolve_non_speculative_pending(active_sequence(lane), requests[lane],
-                                            accepted_tokens.front(), terminal.front() != 0);
+            timing.pause();
+            timing.include(resolve_non_speculative_pending(active_sequence(lane), requests[lane],
+                                                           accepted_tokens.front(),
+                                                           terminal.front() != 0));
+            timing.resume_post();
         }
-        return;
+        return timing.finish();
     }
 
     if (speculative_backend == SpeculativeBackend::None) {
@@ -8469,11 +8487,14 @@ void ProgramImplCore::resolve_pending_raw(std::span<const std::uint32_t> lanes,
             if (cancelled[row]) {
                 clear_lane(active_sequence(lane), requests[lane]);
             } else {
-                resolve_non_speculative_pending(active_sequence(lane), requests[lane],
-                                                accepted_tokens[row], terminal[row] != 0);
+                timing.pause();
+                timing.include(resolve_non_speculative_pending(active_sequence(lane),
+                                                               requests[lane], accepted_tokens[row],
+                                                               terminal[row] != 0));
+                timing.resume_post();
             }
         }
-        return;
+        return timing.finish();
     }
 
     if (!replay_records) {
@@ -8522,6 +8543,7 @@ void ProgramImplCore::resolve_pending_raw(std::span<const std::uint32_t> lanes,
 
     const auto tail_started = Clock::now();
     try {
+        timing.resume_submit();
         ops::gdn_replay_fold(*replay_records, state_images->linear().all_layers_view(),
                              std::span<const ops::GdnReplayFoldRow>(fold_rows.data(), lanes.size()),
                              device.stream);
@@ -8577,7 +8599,9 @@ void ProgramImplCore::resolve_pending_raw(std::span<const std::uint32_t> lanes,
             }
         }
 
+        timing.begin_wait();
         device.synchronize();
+        timing.end_wait();
         work.reset();
     } catch (...) {
         try {
@@ -8652,6 +8676,7 @@ void ProgramImplCore::resolve_pending_raw(std::span<const std::uint32_t> lanes,
         }
         throw;
     }
+    return timing.finish();
 }
 
 void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& request) noexcept {
@@ -9541,6 +9566,7 @@ void ProgramImplCore::validate_licensed_tokens(std::span<const TokenId> tokens) 
 
 runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& sequence,
                                                             RequestControl& request) {
+    runtime::ExecutionTimingRecorder timing;
     if (request.lifecycle != Lifecycle::Prefilling || !request.prefill) {
         throw std::logic_error("staged prefill step requires an active concurrent request");
     }
@@ -9647,6 +9673,7 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                     split_frontier = *rewrite_split;
                 }
                 schedule::PrefillChunkResult result;
+                timing.pause();
                 if (staged.vision) {
                     mark_workspace_usage(workspace_plan.vision_encode);
                     result = schedule::prefill_multimodal_chunk(schedule_state, staged.prompt,
@@ -9657,6 +9684,8 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                         schedule_state, std::span<const TokenId>(staged.prompt.token_ids),
                         remaining, split_frontier, final_candidate);
                 }
+                timing.include(result.timing);
+                timing.resume_post();
                 if (result.processed_tokens == 0 || result.processed_tokens > remaining) {
                     throw std::logic_error("ordinary prefill chunk made invalid progress");
                 }
@@ -9688,6 +9717,7 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                         return runtime::PrefillStepResult{
                             .summary                 = summary,
                             .processed_prompt_tokens = processed_prompt_tokens,
+                            .timing                  = timing.finish(),
                         };
                     }
                 }
@@ -9703,11 +9733,15 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                 staged.elapsed_seconds +=
                     std::chrono::duration<double>(Clock::now() - started).count();
                 return runtime::PrefillStepResult{
-                    .summary = summary, .processed_prompt_tokens = processed_prompt_tokens};
+                    .summary                 = summary,
+                    .processed_prompt_tokens = processed_prompt_tokens,
+                    .timing                  = timing.finish(),
+                };
             }
             if (staged.cursor != staged.prompt_tokens) {
                 throw std::logic_error("staged prefill sampled before the prompt frontier");
             }
+            timing.resume_submit();
             copy_tail(sequence, prefill_hidden.slice(
                                     1, static_cast<std::int32_t>(final_chunk_tokens) - 1, 1));
         } else {
@@ -9744,7 +9778,9 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                                        staged.initial_mtp_extent * sizeof(TokenId),
                                        cudaMemcpyDeviceToHost, device.stream));
         }
+        timing.begin_wait();
         device.synchronize();
+        timing.end_wait();
         staged.elapsed_seconds += std::chrono::duration<double>(Clock::now() - started).count();
         const double vision_seconds       = staged.vision ? staged.vision->elapsed_seconds() : 0.0;
         const std::uint32_t prompt_tokens = staged.prompt_tokens;
@@ -9788,6 +9824,7 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             .round   = runtime::GeneratedRound{.tokens = std::span<const TokenId>(host_tokens, 1)},
             .processed_prompt_tokens = processed_prompt_tokens,
             .complete                = true,
+            .timing                  = timing.finish(),
         };
     } catch (...) {
         try {
@@ -9801,6 +9838,7 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
 runtime::BatchedGeneratedRound
 ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
                                        std::span<const runtime::RoundBudget> budgets) {
+    runtime::ExecutionTimingRecorder timing;
     if (speculative_backend != SpeculativeBackend::None) {
         throw std::logic_error("ordinary batch execution requires the ordinary backend");
     }
@@ -9873,7 +9911,9 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
         mark_workspace_usage(workspace_plan.ordinary_round);
         schedule::ordinary_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
                                         envelope, executable);
+        timing.begin_wait();
         device.synchronize();
+        timing.end_wait();
 
         const double seconds = std::chrono::duration<double>(Clock::now() - start).count();
         for (std::size_t row = 0; row < lanes.size(); ++row) {
@@ -9897,8 +9937,10 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             request.timings.decode_seconds += seconds;
         }
         return runtime::BatchedGeneratedRound{
-            .tokens = std::span<const TokenId>(ordinary_host_egress->sampled_tokens.data(),
-                                               lanes.size())};
+            .tokens =
+                std::span<const TokenId>(ordinary_host_egress->sampled_tokens.data(), lanes.size()),
+            .timing = timing.finish(),
+        };
     } catch (...) {
         try {
             device.synchronize();
@@ -9915,6 +9957,7 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
 runtime::BatchedGeneratedRound
 ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                                   std::span<const runtime::RoundBudget> budgets) {
+    runtime::ExecutionTimingRecorder timing;
     if (speculative_backend != SpeculativeBackend::Mtp || !io.mtp_decode ||
         decoder->mtp_cache() == nullptr) {
         throw std::logic_error("MTP batch execution requires the MTP backend");
@@ -10014,7 +10057,9 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         mark_workspace_usage(workspace_plan.mtp_round);
         schedule::mtp_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
                                    draft_window, envelopes, executable);
+        timing.begin_wait();
         device.synchronize();
+        timing.end_wait();
 
         const double seconds = std::chrono::duration<double>(Clock::now() - started).count();
         for (std::size_t row = 0; row < lanes.size(); ++row) {
@@ -10065,7 +10110,9 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                                                    lanes.size() * width),
             .row_counts = std::span<const std::int32_t>(mtp_host_egress->licensed_counts.data(),
                                                         lanes.size()),
-            .row_stride = width};
+            .row_stride = width,
+            .timing     = timing.finish(),
+        };
     } catch (...) {
         try {
             device.synchronize();
@@ -10082,6 +10129,7 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
 runtime::BatchedGeneratedRound
 ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                                      std::span<const runtime::RoundBudget> budgets) {
+    runtime::ExecutionTimingRecorder timing;
     if (speculative_backend != SpeculativeBackend::DFlash || !io.dflash_decode || !dflash) {
         throw std::logic_error("DFlash batch execution requires the DFlash backend");
     }
@@ -10184,7 +10232,9 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         mark_workspace_usage(workspace_plan.dflash_round);
         schedule::dflash_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
                                       draft_window, envelopes, target_envelope, executable);
+        timing.begin_wait();
         device.synchronize();
+        timing.end_wait();
 
         const double seconds = std::chrono::duration<double>(Clock::now() - started).count();
         for (std::size_t row = 0; row < lanes.size(); ++row) {
@@ -10234,7 +10284,9 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                                                    lanes.size() * width),
             .row_counts = std::span<const std::int32_t>(dflash_host_egress->licensed_counts.data(),
                                                         lanes.size()),
-            .row_stride = width};
+            .row_stride = width,
+            .timing     = timing.finish(),
+        };
     } catch (...) {
         try {
             device.synchronize();
@@ -10258,10 +10310,10 @@ ProgramImplCore::decode_raw(std::span<const std::uint32_t> lanes,
     return decode_dflash_batch(lanes, budgets);
 }
 
-void ProgramImplCore::resolve_non_speculative_pending(SequenceState& sequence,
-                                                      RequestControl& request,
-                                                      std::uint32_t accepted_tokens,
-                                                      bool terminal) {
+runtime::ExecutionTiming
+ProgramImplCore::resolve_non_speculative_pending(SequenceState& sequence, RequestControl& request,
+                                                 std::uint32_t accepted_tokens, bool terminal) {
+    runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Post);
     if (request.lifecycle != Lifecycle::Pending) {
         throw std::logic_error("pending resolution requires a pending generated round");
     }
@@ -10295,8 +10347,11 @@ void ProgramImplCore::resolve_non_speculative_pending(SequenceState& sequence,
     // the committed prefill frontier.
     if (request.pending.kind == PendingKind::Begin && terminal && sequence.state.fork_pending) {
         const StateImageSelectors selectors = state_selectors(sequence);
+        timing.resume_submit();
         state_images->copy_slot(selectors.source, selectors.destination, device.stream);
+        timing.begin_wait();
         device.synchronize();
+        timing.end_wait();
         settle_state_fork(sequence);
     } else if (request.pending.kind == PendingKind::Ordinary) {
         settle_state_fork(sequence);
@@ -10305,6 +10360,7 @@ void ProgramImplCore::resolve_non_speculative_pending(SequenceState& sequence,
     if (terminal) { sequence.mtp_draft_count = 0; }
     request.lifecycle = terminal ? Lifecycle::Finishable : Lifecycle::Active;
     request.pending   = {};
+    return timing.finish();
 }
 
 MemorySummary ProgramImplCore::memory_summary() const noexcept {

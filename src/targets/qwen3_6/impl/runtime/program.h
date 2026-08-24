@@ -406,8 +406,9 @@ public:
         runtime::CancellationFlagView cancellation);
     [[nodiscard]] PendingBatch decode(std::span<const SequenceHandle> sequences,
                                       std::span<const runtime::RoundBudget> budgets);
-    void append_forced_tokens(std::span<const SequenceHandle> sequences,
-                              std::span<const TokenId> row_major_tokens, std::uint32_t row_stride);
+    [[nodiscard]] runtime::ExecutionTiming
+    append_forced_tokens(std::span<const SequenceHandle> sequences,
+                         std::span<const TokenId> row_major_tokens, std::uint32_t row_stride);
     [[nodiscard]] CommitResult commit(PendingBatch&& pending,
                                       std::span<const runtime::CommitDecision> decisions,
                                       runtime::CommitObservation observation);
@@ -727,11 +728,10 @@ private:
     [[nodiscard]] runtime::PrefillStepResult advance_prefill_raw(std::uint32_t lane);
     [[nodiscard]] runtime::BatchedGeneratedRound
     decode_raw(std::span<const std::uint32_t> lanes, std::span<const runtime::RoundBudget> budgets);
-    void resolve_prefill_raw(std::uint32_t lane, bool terminal);
-    void resolve_pending_raw(std::span<const std::uint32_t> lanes,
-                             std::span<const std::uint32_t> accepted_tokens,
-                             std::span<const std::uint8_t> terminal,
-                             std::span<const std::uint8_t> cancelled);
+    [[nodiscard]] runtime::ExecutionTiming resolve_prefill_raw(std::uint32_t lane, bool terminal);
+    [[nodiscard]] runtime::ExecutionTiming resolve_pending_raw(
+        std::span<const std::uint32_t> lanes, std::span<const std::uint32_t> accepted_tokens,
+        std::span<const std::uint8_t> terminal, std::span<const std::uint8_t> cancelled);
     [[nodiscard]] bool valid_sequence(SequenceHandle handle) const noexcept;
     [[nodiscard]] bool valid_continuation(const ContinuationHandle& handle) const noexcept;
     [[nodiscard]] bool valid_shared_prefix(const SharedPrefixHandle& handle) const noexcept;
@@ -864,8 +864,9 @@ private:
     void set_device_i32(Tensor& tensor, std::int32_t value);
     void copy_tail(SequenceState& sequence, const Tensor& source);
     void copy_round_token();
-    void resolve_non_speculative_pending(SequenceState& sequence, RequestControl& request,
-                                         std::uint32_t accepted_tokens, bool terminal);
+    [[nodiscard]] runtime::ExecutionTiming
+    resolve_non_speculative_pending(SequenceState& sequence, RequestControl& request,
+                                    std::uint32_t accepted_tokens, bool terminal);
     [[nodiscard]] runtime::PrefillStepResult advance_prefill(SequenceState& sequence,
                                                              RequestControl& request);
     void enqueue_dflash_context_append(std::span<const std::uint32_t> lanes,

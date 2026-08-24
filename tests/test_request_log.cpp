@@ -3,6 +3,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -306,17 +307,31 @@ int main() {
               "human preparation rejection log is incomplete");
 
     GenerationOutcome outcome;
-    outcome.prompt_tokens                             = 401;
-    outcome.completion_tokens                         = 1024;
-    outcome.finish_reason                             = ninfer::FinishReason::OutputLimit;
-    outcome.metrics.prepare_seconds                   = 0.1234567890123;
-    outcome.metrics.ttft_seconds                      = 0.3580246791357;
-    outcome.metrics.vision_seconds                    = 0.0;
-    outcome.metrics.prefill_seconds                   = 0.2345678901234;
-    outcome.metrics.decode_seconds                    = 5.3456789012345;
-    outcome.metrics.total_seconds                     = 5.7037035803702;
-    outcome.metrics.prefix_cache_hit_tokens           = 101;
-    outcome.metrics.prefix_reuse_path                 = ninfer::PrefixReusePath::PrivateTurnClosure;
+    outcome.prompt_tokens                   = 401;
+    outcome.completion_tokens               = 1024;
+    outcome.finish_reason                   = ninfer::FinishReason::OutputLimit;
+    outcome.metrics.prepare_seconds         = 0.1234567890123;
+    outcome.metrics.ttft_seconds            = 0.3580246791357;
+    outcome.metrics.vision_seconds          = 0.0;
+    outcome.metrics.prefill_seconds         = 0.2345678901234;
+    outcome.metrics.decode_seconds          = 5.3456789012345;
+    outcome.metrics.total_seconds           = 5.7037035803702;
+    outcome.metrics.prefix_cache_hit_tokens = 101;
+    outcome.metrics.prefix_reuse_path       = ninfer::PrefixReusePath::PrivateTurnClosure;
+    outcome.metrics.engine_timing           = {
+                  .queue_wait_seconds                   = 0.001,
+                  .engine_boundary_exposed_seconds      = 0.001,
+                  .program_submit_exposed_seconds       = 0.002,
+                  .program_post_exposed_seconds         = 0.003,
+                  .engine_commit_output_exposed_seconds = 0.004,
+                  .engine_maintenance_exposed_seconds   = 0.005,
+                  .device_wait_exposed_seconds          = 0.3,
+                  .decode_host_exposed_seconds          = 0.01,
+                  .decode_device_wait_exposed_seconds   = 0.2,
+                  .prefill_units                        = 4,
+                  .decode_rounds                        = 2,
+                  .control_units                        = 1,
+    };
     outcome.metrics.speculative_backend               = ninfer::SpeculativeBackend::Mtp;
     outcome.metrics.speculative_draft_window          = 3;
     outcome.metrics.speculative_rounds                = 300;
@@ -362,6 +377,13 @@ int main() {
     failures +=
         check(done.at("speculative").at("accepted_per_position") == Json::array({290, 240, 190}),
               "speculative position counts missing");
+    failures += check(
+        done.at("engine_timing").at("queue_wait_seconds") == 0.001 &&
+            std::abs(done.at("engine_timing").at("host_exposed_seconds").at("total").get<double>() -
+                     0.015) < 1.0e-15 &&
+            done.at("engine_timing").at("decode").at("rounds") == 2 &&
+            done.at("engine_timing").at("units").at("prefill") == 4,
+        "request Engine timing exposure is incomplete");
 
     const Json error =
         Json::parse(format_request_error_json("serve-test", 4000, context, "generation failed"));
@@ -379,6 +401,11 @@ int main() {
     failures += check(format_request_done(context, outcome).find("reuse=private_response_replay") !=
                           std::string::npos,
                       "human request log omits response checkpoint reuse path");
+    failures +=
+        check(format_request_done(context, outcome).find("host=15.00ms") != std::string::npos &&
+                  format_request_done(context, outcome).find("decode-host=5000.0us/round") !=
+                      std::string::npos,
+              "human request log omits Engine Host exposure");
     failures += check(format_request_start(context).find("submitted") != std::string::npos,
                       "human request log mislabels a submitted request");
 
@@ -404,12 +431,38 @@ int main() {
     throughput.current.host_state_occupied_slots         = 1;
     throughput.current.last_selected_frontier_tokens     = 64;
     throughput.current.last_predicted_materialization_ns = 250000;
-    const std::string human_throughput                   = format_throughput(throughput);
+    throughput.current.host_work                         = {
+                                .engine_boundary_ns            = 1000000,
+                                .program_submit_ns             = 2000000,
+                                .program_post_ns               = 3000000,
+                                .engine_commit_output_ns       = 4000000,
+                                .engine_maintenance_ns         = 5000000,
+                                .device_wait_ns                = 300000000,
+                                .decode_host_ns                = 10000000,
+                                .decode_device_wait_ns         = 200000000,
+                                .prefill_host_ns               = 3000000,
+                                .prefill_device_wait_ns        = 50000000,
+                                .control_host_ns               = 2000000,
+                                .control_device_wait_ns        = 50000000,
+                                .prefill_units                 = 4,
+                                .control_units                 = 1,
+                                .admission_policy_ns           = 1000000,
+                                .context_progress_ns           = 2000000,
+                                .replica_policy_ns             = 500000,
+                                .stats_publication_ns          = 250000,
+                                .admission_policy_invocations  = 2,
+                                .context_progress_invocations  = 4,
+                                .replica_policy_invocations    = 1,
+                                .stats_publication_invocations = 5,
+    };
+    const std::string human_throughput = format_throughput(throughput);
     failures += check(human_throughput.find("prefill=50.0tok/s") != std::string::npos &&
                           human_throughput.find("decode=20.0tok/s") != std::string::npos &&
                           human_throughput.find("materializing=1") != std::string::npos &&
                           human_throughput.find("capture_pending=1") != std::string::npos &&
-                          human_throughput.find("avg_decode_batch=1.80") != std::string::npos,
+                          human_throughput.find("avg_decode_batch=1.80") != std::string::npos &&
+                          human_throughput.find("host=15.00ms") != std::string::npos &&
+                          human_throughput.find("decode-host=1000.0us/round") != std::string::npos,
                       "human throughput report mismatch");
     const Json throughput_json =
         Json::parse(format_throughput_json("serve-test", 5000, throughput));
@@ -422,6 +475,37 @@ int main() {
     failures += check(throughput_json.at("scheduler").at("materializing") == 1 &&
                           throughput_json.at("scheduler").at("capture_pending") == 1,
                       "context scheduler gauges missing");
+    failures += check(
+        std::abs(throughput_json.at("host_work").at("elapsed_seconds").at("total").get<double>() -
+                 0.015) < 1.0e-15 &&
+            std::abs(throughput_json.at("host_work").at("device_wait_seconds").get<double>() -
+                     0.3) < 1.0e-15 &&
+            std::abs(throughput_json.at("host_work")
+                         .at("decode_host_microseconds_per_round")
+                         .get<double>() -
+                     1000.0) < 1.0e-12 &&
+            std::abs(throughput_json.at("host_work")
+                         .at("decode_device_wait_microseconds_per_round")
+                         .get<double>() -
+                     20000.0) < 1.0e-12 &&
+            std::abs(throughput_json.at("host_work")
+                         .at("detail_microseconds_per_invocation")
+                         .at("stats_publication")
+                         .get<double>() -
+                     50.0) < 1.0e-12,
+        "throughput Host work deltas or normalization are incorrect");
+
+    ThroughputReport zero_rounds;
+    const Json zero_rounds_json =
+        Json::parse(format_throughput_json("serve-test", 5001, zero_rounds));
+    failures += check(
+        zero_rounds_json.at("decode_batch").at("average_size").is_null() &&
+            zero_rounds_json.at("host_work").at("decode_host_microseconds_per_round").is_null() &&
+            zero_rounds_json.at("host_work")
+                .at("detail_microseconds_per_invocation")
+                .at("admission_policy")
+                .is_null(),
+        "zero Host-work denominators must serialize as null");
     failures += check(
         throughput_json.at("context_cache").at("selections").at("root") == 1 &&
             throughput_json.at("context_cache").at("state_transfers").at("h2d").at("bytes") == 32 &&

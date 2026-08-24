@@ -138,7 +138,17 @@ bool report_has_activity(const ThroughputReport& report) {
            report.current.device_backend_kv_occupied_pages !=
                report.previous.device_backend_kv_occupied_pages ||
            report.current.host_kv_occupied_bytes != report.previous.host_kv_occupied_bytes ||
-           report.current.shared_active_references != report.previous.shared_active_references;
+           report.current.shared_active_references != report.previous.shared_active_references ||
+           report.current.host_work.engine_boundary_ns !=
+               report.previous.host_work.engine_boundary_ns ||
+           report.current.host_work.program_submit_ns !=
+               report.previous.host_work.program_submit_ns ||
+           report.current.host_work.program_post_ns != report.previous.host_work.program_post_ns ||
+           report.current.host_work.engine_commit_output_ns !=
+               report.previous.host_work.engine_commit_output_ns ||
+           report.current.host_work.engine_maintenance_ns !=
+               report.previous.host_work.engine_maintenance_ns ||
+           report.current.host_work.device_wait_ns != report.previous.host_work.device_wait_ns;
 }
 
 std::string_view unstreamed_content(const GenerationOutcome& outcome) {
