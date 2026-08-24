@@ -259,9 +259,13 @@ private:
         return nvtx::Name::EngineBoundary;
     }
 
+    struct ActiveExposure {
+        std::shared_ptr<Request> request;
+        std::uint32_t lane = 0;
+    };
+
     struct ActiveExposureSet {
-        std::array<std::shared_ptr<Request>, kMaximumConcurrency> requests{};
-        std::array<std::uint32_t, kMaximumConcurrency> lanes{};
+        std::array<ActiveExposure, kMaximumConcurrency> entries{};
         std::size_t size = 0;
     };
 
@@ -282,9 +286,7 @@ private:
         ActiveExposureSet result;
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             if (slots_[lane] == nullptr) { continue; }
-            result.requests[result.size] = slots_[lane];
-            result.lanes[result.size]    = lane;
-            ++result.size;
+            result.entries[result.size++] = ActiveExposure{.request = slots_[lane], .lane = lane};
         }
         return result;
     }
@@ -335,14 +337,16 @@ private:
     void expose_engine_phase(const ActiveExposureSet& exposed, EngineHostPhase phase,
                              std::uint64_t elapsed) noexcept {
         for (std::size_t i = 0; i < exposed.size; ++i) {
-            RequestHostTiming& timing = exposed.requests[i]->host_timing;
+            const ActiveExposure& exposure = exposed.entries[i];
+            RequestHostTiming& timing      = exposure.request->host_timing;
             timing.expose_engine(phase, elapsed,
                                  current_host_work_class_ == HostWorkClass::Decode &&
-                                     current_decode_contains(exposed.lanes[i]));
+                                     current_decode_contains(exposure.lane));
         }
     }
 
-    void finish_engine_phase(HostPhaseMeasurement measurement, EngineHostPhase phase) noexcept {
+    void finish_engine_phase(const HostPhaseMeasurement& measurement,
+                             EngineHostPhase phase) noexcept {
         const std::uint64_t wall    = elapsed_ns(measurement.started, Clock::now());
         const std::uint64_t nested  = worker_accounted_elapsed_ns_ - measurement.accounted_before;
         const std::uint64_t own     = wall > nested ? wall - nested : 0;
@@ -371,14 +375,15 @@ private:
         stats.device_wait_ns += timing.device_wait_ns;
         add_class_host_time(timing.host_ns(), timing.device_wait_ns);
         for (std::size_t i = 0; i < exposed.size; ++i) {
-            RequestHostTiming& request = exposed.requests[i]->host_timing;
+            const ActiveExposure& exposure = exposed.entries[i];
+            RequestHostTiming& request     = exposure.request->host_timing;
             request.expose_program(timing, current_host_work_class_ == HostWorkClass::Decode &&
-                                               current_decode_contains(exposed.lanes[i]));
+                                               current_decode_contains(exposure.lane));
         }
         worker_accounted_elapsed_ns_ += timing.elapsed_ns();
     }
 
-    void finish_program_call(HostPhaseMeasurement measurement,
+    void finish_program_call(const HostPhaseMeasurement& measurement,
                              runtime::ExecutionTiming timing) noexcept {
         const std::uint64_t wall     = elapsed_ns(measurement.started, Clock::now());
         const std::uint64_t nested   = worker_accounted_elapsed_ns_ - measurement.accounted_before;
@@ -444,7 +449,7 @@ private:
         void finish() noexcept {
             if (!active_) { return; }
             range_.reset();
-            owner_.finish_engine_phase(std::move(measurement_), phase_);
+            owner_.finish_engine_phase(measurement_, phase_);
             active_ = false;
         }
 
@@ -485,7 +490,7 @@ private:
         record_detail(&RuntimeHostWorkStats::stats_publication_ns,
                       &RuntimeHostWorkStats::stats_publication_invocations, detail_started);
         phase_range.reset();
-        finish_engine_phase(std::move(measurement), EngineHostPhase::Maintenance);
+        finish_engine_phase(measurement, EngineHostPhase::Maintenance);
         snapshot.host_work = cumulative_stats_.host_work;
         std::lock_guard lock(stats_mutex_);
         published_stats_ = snapshot;
@@ -707,7 +712,7 @@ private:
         request->sequence.reset();
         request->lane.reset();
         request->budget.reset();
-        finish_engine_phase(std::move(completion), EngineHostPhase::CommitOutput);
+        finish_engine_phase(completion, EngineHostPhase::CommitOutput);
         result.engine_timing = request->host_timing.public_snapshot();
         {
             std::lock_guard lock(request->mutex);
@@ -930,7 +935,7 @@ private:
             committed_storage.emplace(instance_.program->commit(
                 std::move(pending), std::span<const CommitDecision>(decisions.data(), row_count),
                 CommitObservation::ReleasedRowsOnly));
-            finish_program_call(std::move(program_call), committed_storage->timing);
+            finish_program_call(program_call, committed_storage->timing);
             phase.resume_range();
         } catch (...) {
             rollback_generated();
@@ -1119,7 +1124,7 @@ private:
         setup.finish();
         HostPhaseMeasurement program_call = begin_host_phase();
         auto progress                     = instance_.program->advance_prefill(*request->sequence);
-        finish_program_call(std::move(program_call), progress.timing);
+        finish_program_call(program_call, progress.timing);
         resolve_prefill_progress(request, std::move(progress), cancelled_at_unit_start);
         publish_runtime_stats();
     }
@@ -1520,7 +1525,7 @@ private:
         HostPhaseMeasurement program_call = begin_host_phase();
         auto pending =
             instance_.program->decode(membership.sequence_span(), membership.budget_span());
-        finish_program_call(std::move(program_call), pending.execution_timing());
+        finish_program_call(program_call, pending.execution_timing());
         commit_pending(std::move(pending), membership.lane_span(), true, cancelled_at_unit_start);
         publish_runtime_stats();
     }
@@ -1583,7 +1588,7 @@ private:
             HostPhaseMeasurement program_call     = begin_host_phase();
             const runtime::ExecutionTiming timing = instance_.program->append_forced_tokens(
                 membership.sequence_span(), membership.tokens, membership.row_stride);
-            finish_program_call(std::move(program_call), timing);
+            finish_program_call(program_call, timing);
             phase.resume_range();
         } catch (...) {
             rollback_generated();
@@ -1687,7 +1692,7 @@ private:
                     scheduler_.build_control_membership(slots_, max_concurrency_);
                 if (!control_membership.empty()) {
                     set_host_work_class(HostWorkClass::Control);
-                    finish_engine_phase(std::move(boundary), EngineHostPhase::Boundary);
+                    finish_engine_phase(boundary, EngineHostPhase::Boundary);
                     run_control_batch(control_membership);
                     previous_unit_was_decode = true;
                     try_start_replica_transition();
@@ -1706,7 +1711,7 @@ private:
                     !membership.empty(), prefill_runnable, previous_unit_was_decode);
                 if (action == ExecutionAction::Prefill) {
                     set_host_work_class(HostWorkClass::Prefill);
-                    finish_engine_phase(std::move(boundary), EngineHostPhase::Boundary);
+                    finish_engine_phase(boundary, EngineHostPhase::Boundary);
                     run_prefill_step(cancelled_at_unit_start);
                     previous_unit_was_decode = false;
                     try_start_replica_transition();
@@ -1714,14 +1719,14 @@ private:
                 }
                 if (action == ExecutionAction::Decode) {
                     set_host_work_class(HostWorkClass::Decode, membership.lane_span());
-                    finish_engine_phase(std::move(boundary), EngineHostPhase::Boundary);
+                    finish_engine_phase(boundary, EngineHostPhase::Boundary);
                     run_decode_round(membership, cancelled_at_unit_start);
                     previous_unit_was_decode = true;
                     try_start_replica_transition();
                     continue;
                 }
                 set_host_work_class(HostWorkClass::Control);
-                finish_engine_phase(std::move(boundary), EngineHostPhase::Boundary);
+                finish_engine_phase(boundary, EngineHostPhase::Boundary);
                 try_start_replica_transition();
             } catch (...) {
                 fail_all_locked(std::current_exception());
