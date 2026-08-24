@@ -489,7 +489,7 @@ public:
     std::optional<FakeAdmissionPlan> inspect_admission(
         const FakePreparedPrompt& prompt, const FakeRequestBasePlan& base, LaneId destination,
         const FakeContinuationHandle* source, const FakeSharedPrefixHandle* shared_source,
-        std::optional<ninfer::runtime::CheckpointRef> checkpoint, bool retain_private_source) {
+        std::optional<ninfer::runtime::CheckpointRef> checkpoint, bool must_retain_private_source) {
         if (shared_source != nullptr) {
             throw std::logic_error("fake shared-prefix admission is unsupported");
         }
@@ -498,7 +498,7 @@ public:
         }
         if (source != nullptr) {
             ++admission_source_inspections;
-            last_retain_private_source = retain_private_source;
+            last_must_retain_private_source = must_retain_private_source;
         }
         FakeAdmissionPlan plan;
         plan.value       = base.summary();
@@ -515,7 +515,7 @@ public:
             plan.value.reusable_prompt_tokens = 16;
             plan.value.service_work_quanta    = 1;
             plan.source_value                 = source->resources;
-            if (retain_private_source) {
+            if (must_retain_private_source) {
                 plan.disposition = ninfer::runtime::ClaimDisposition::Retained;
                 plan.resources   = base.root_demand();
             } else {
@@ -1075,7 +1075,7 @@ public:
     std::optional<std::uint32_t> pressure_alias_owner_key;
     bool emit_state_d2h_observation            = false;
     bool content_keyed_summaries               = false;
-    bool last_retain_private_source            = false;
+    bool last_must_retain_private_source       = false;
     std::atomic<bool>* cancel_after_victim     = nullptr;
     std::uint64_t admission_source_inspections = 0;
 
@@ -1605,6 +1605,46 @@ void test_clean_replica_policy_waits_for_resource_invalidation() {
            "resource invalidation did not trigger one new replica-policy pass");
 }
 
+void test_anonymous_content_prefix_rolls_in_place() {
+    FakeProgram program;
+    program.content_keyed_summaries = true;
+    FakeManager manager(resources({1, 1, 3, 2}), 1, 1, 0, true, 0, test_cost_model());
+
+    FakeRequestBasePlan request        = make_base(100);
+    request.shortlist_digest           = 7;
+    request.cache.update_session_index = false;
+    auto seed                          = manager.inspect(program, FakePreparedPrompt{7}, request);
+    expect(seed.readiness == ninfer::runtime::Readiness::Ready && seed.choice,
+           "anonymous content-prefix seed was not admitted");
+    auto active =
+        materialize_and_adopt(manager, program, std::move(*seed.choice), FakePreparedPrompt{7});
+    (void)manager.finish(program, LaneId{0}, active.sequence);
+
+    program.admission_source_inspections    = 0;
+    program.last_must_retain_private_source = true;
+    auto first_append = manager.inspect(program, FakePreparedPrompt{7}, request);
+    expect(first_append.readiness == ninfer::runtime::Readiness::Ready && first_append.choice &&
+               first_append.choice->summary().reusable_prompt_tokens == 16 &&
+               program.admission_source_inspections == 1 &&
+               !program.last_must_retain_private_source,
+           "anonymous append did not consume the content-matched source in the only private slot");
+    active = materialize_and_adopt(manager, program, std::move(*first_append.choice),
+                                   FakePreparedPrompt{7});
+    (void)manager.finish(program, LaneId{0}, active.sequence);
+
+    program.admission_source_inspections    = 0;
+    program.last_must_retain_private_source = true;
+    auto second_append = manager.inspect(program, FakePreparedPrompt{7}, request);
+    expect(second_append.readiness == ninfer::runtime::Readiness::Ready && second_append.choice &&
+               second_append.choice->summary().reusable_prompt_tokens == 16 &&
+               program.admission_source_inspections == 1 &&
+               !program.last_must_retain_private_source,
+           "anonymous content source was not republished for the next append");
+    active = materialize_and_adopt(manager, program, std::move(*second_append.choice),
+                                   FakePreparedPrompt{7});
+    (void)manager.abort(program, LaneId{0}, active.sequence);
+}
+
 void test_content_prefix_shortlist_bounds_exact_inspection() {
     FakeProgram program;
     program.content_keyed_summaries = true;
@@ -1654,8 +1694,18 @@ void test_content_prefix_shortlist_bounds_exact_inspection() {
     auto retained = session_manager.inspect(session_program, FakePreparedPrompt{77}, other_session);
     expect(retained.readiness == ninfer::runtime::Readiness::Ready && retained.choice &&
                retained.choice->summary().reusable_prompt_tokens == 16 &&
-               session_program.last_retain_private_source,
+               session_program.last_must_retain_private_source,
            "content hit across session identities did not retain the original continuation");
+
+    retained.choice.reset();
+    FakeRequestBasePlan anonymous                   = make_base(200);
+    anonymous.shortlist_digest                      = 77;
+    session_program.last_must_retain_private_source = false;
+    auto unnamed = session_manager.inspect(session_program, FakePreparedPrompt{77}, anonymous);
+    expect(unnamed.readiness == ninfer::runtime::Readiness::Ready && unnamed.choice &&
+               unnamed.choice->summary().reusable_prompt_tokens == 16 &&
+               session_program.last_must_retain_private_source,
+           "anonymous branch did not retain its content-matched named source");
 }
 
 } // namespace
@@ -1672,6 +1722,7 @@ int main() {
     test_value_positive_replica_replaces_lower_value_host_duplicate();
     test_ready_replica_transition_skips_dominated_replacements();
     test_clean_replica_policy_waits_for_resource_invalidation();
+    test_anonymous_content_prefix_rolls_in_place();
     test_content_prefix_shortlist_bounds_exact_inspection();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;

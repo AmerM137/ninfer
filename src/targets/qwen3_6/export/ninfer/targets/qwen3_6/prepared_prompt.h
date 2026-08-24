@@ -110,6 +110,7 @@ struct PreparedContextCache {
     std::optional<PreparedSessionKey> session_key;
     runtime::RetentionClass retention = runtime::RetentionClass::RecentPrivate;
     std::vector<PreparedCacheOpportunity> opportunities;
+    // Controls replacement of a named SessionIndex entry, not anonymous source ownership.
     bool update_session_index = true;
 };
 

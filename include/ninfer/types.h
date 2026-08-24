@@ -333,6 +333,8 @@ struct ContextCacheHints {
     std::optional<std::string> session_key;
     CacheRetentionHint retention = CacheRetentionHint::Default;
     std::vector<PromptCacheMarker> markers;
+    // Advance the named session lineage when session_key is present. This does not require an
+    // anonymous content-matched source to be retained.
     bool update_session_index = true;
 };
 

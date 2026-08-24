@@ -1273,9 +1273,14 @@ ResourceManager只把key相同的具体checkpoint交给Program。没有匹配buc
 全catalog重新追加为“fallback candidates”。最终exact verification仍必须由Program完成；Hash相同不代表
 prefix相同。
 
-跨SessionKey命中private checkpoint时，原命名continuation必须保留，新的branch通过Retain/Fork启动；
-同SessionKey或双方均无SessionKey的单分支追加可以Consume/Move。Session identity因此只决定ownership
-disposition，不决定内容是否命中。
+Private source的ownership由source是否已经属于命名lineage决定：命名source仅在incoming持有相同
+SessionKey且允许更新SessionIndex时可以Consume/Move；incoming缺少SessionKey、使用不同SessionKey，或
+禁止更新SessionIndex时都必须Retain/Fork。匿名source没有需要保护的SessionIndex owner，因此无论
+incoming是否命名、是否更新SessionIndex，单分支追加都允许Consume/Move。Program仍可因long anchor或
+state-image aliasing把该最低约束提升为Retain，但不能把必须Retain的命名source降为Consume。
+
+Session identity因此只决定ownership disposition，不决定内容是否命中；`update_session_index=false`也
+不表示匿名content-matched source必须保留。
 
 ---
 

@@ -351,11 +351,10 @@ public:
 
     [[nodiscard]] RequestBasePlan plan_request(const PreparedPromptData& prompt,
                                                const runtime::ResolvedExecutionOptions& options);
-    [[nodiscard]] std::optional<AdmissionPlan>
-    inspect_admission(const PreparedPromptData& prompt, const RequestBasePlan& base,
-                      runtime::LaneId destination, const ContinuationHandle* source,
-                      const SharedPrefixHandle* shared_source,
-                      std::optional<runtime::CheckpointRef> checkpoint, bool retain_private_source);
+    [[nodiscard]] std::optional<AdmissionPlan> inspect_admission(
+        const PreparedPromptData& prompt, const RequestBasePlan& base, runtime::LaneId destination,
+        const ContinuationHandle* source, const SharedPrefixHandle* shared_source,
+        std::optional<runtime::CheckpointRef> checkpoint, bool must_retain_private_source);
     [[nodiscard]] std::vector<qwen3_6::PressureOption>
     inspect_pressure_options(const ContinuationHandle& continuation,
                              runtime::ResourceVector deficit) const;
@@ -777,7 +776,7 @@ private:
     [[nodiscard]] std::optional<AdmissionPlan>
     inspect_lane(std::uint32_t lane, const PreparedPromptData& prompt, const RequestBasePlan& base,
                  const SequenceState* source, const SharedPrefixState* shared_source,
-                 std::optional<runtime::CheckpointRef> checkpoint, bool retain_private_source);
+                 std::optional<runtime::CheckpointRef> checkpoint, bool must_retain_private_source);
     [[nodiscard]] StartResult start_request(MaterializationTransaction& transaction);
     void prepare_materialization(MaterializationTransaction& transaction);
     void enqueue_materialization_transfers(MaterializationTransaction& transaction);

@@ -611,7 +611,8 @@ public:
     inspect_admission(const PreparedPrompt& prompt, const RequestBasePlan<Variant>& base,
                       runtime::LaneId destination, const ContinuationHandle<Variant>* source,
                       const SharedPrefixHandle<Variant>* shared_source,
-                      std::optional<runtime::CheckpointRef> checkpoint, bool retain_private_source);
+                      std::optional<runtime::CheckpointRef> checkpoint,
+                      bool must_retain_private_source);
     [[nodiscard]] std::vector<PressureOption>
     inspect_pressure_options(const ContinuationHandle<Variant>& continuation,
                              runtime::ResourceVector deficit) const;

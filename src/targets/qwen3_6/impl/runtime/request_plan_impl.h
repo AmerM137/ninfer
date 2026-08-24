@@ -414,7 +414,7 @@ RequestBasePlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
 std::optional<AdmissionPlan> ProgramImplCore::inspect_lane(
     std::uint32_t lane, const PreparedPromptData& prompt, const RequestBasePlan& base_plan,
     const SequenceState* source, const SharedPrefixState* shared_source,
-    std::optional<runtime::CheckpointRef> checkpoint, bool retain_private_source) {
+    std::optional<runtime::CheckpointRef> checkpoint, bool must_retain_private_source) {
     if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
     const RequestControl& request = requests[lane];
     if (request.lifecycle != Lifecycle::Empty) {
@@ -457,7 +457,7 @@ std::optional<AdmissionPlan> ProgramImplCore::inspect_lane(
     } else if (source != nullptr) {
         const runtime::CheckpointRef selected = *checkpoint;
         plan->selected_checkpoint             = selected;
-        plan->source_disposition              = retain_private_source
+        plan->source_disposition              = must_retain_private_source
                                                     ? runtime::ClaimDisposition::Retained
                                                     : runtime::ClaimDisposition::ConsumedToActive;
         if (!base.allow_prefix_reuse || !prompt.identity.reusable) { return std::nullopt; }

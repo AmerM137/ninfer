@@ -193,9 +193,9 @@ template <>
 std::optional<AdmissionPlan<Variant>> Program<Variant>::inspect_admission(
     const PreparedPrompt& prompt, const RequestBasePlan<Variant>& base, runtime::LaneId destination,
     const ContinuationHandle<Variant>* source, const SharedPrefixHandle<Variant>* shared_source,
-    std::optional<runtime::CheckpointRef> checkpoint, bool retain_private_source) {
+    std::optional<runtime::CheckpointRef> checkpoint, bool must_retain_private_source) {
     return impl_->inspect_admission(PreparedPromptAccess::view(prompt), base, destination, source,
-                                    shared_source, checkpoint, retain_private_source);
+                                    shared_source, checkpoint, must_retain_private_source);
 }
 
 template <>

@@ -902,17 +902,19 @@ public:
                 if (!index.shared) {
                     const CatalogEntry& entry = catalog_[index.slot];
                     if (entry.active_references != 0) { continue; }
-                    const bool source_session_differs =
+                    // Content selects the source; session identity only protects ownership of an
+                    // existing named lineage. An anonymous source has no SessionIndex owner to
+                    // preserve, even when the incoming request does not update SessionIndex.
+                    const bool must_retain_private_source =
                         entry.session && (!base.context_cache().session_key ||
-                                          *entry.session != *base.context_cache().session_key);
-                    const bool retain_source =
-                        source_session_differs || !base.context_cache().update_session_index;
-                    std::optional<AdmissionPlan> assessment =
-                        program.inspect_admission(prompt, base, *destination, &*entry.handle,
-                                                  nullptr, index.checkpoint, retain_source);
+                                          *entry.session != *base.context_cache().session_key ||
+                                          !base.context_cache().update_session_index);
+                    std::optional<AdmissionPlan> assessment = program.inspect_admission(
+                        prompt, base, *destination, &*entry.handle, nullptr, index.checkpoint,
+                        must_retain_private_source);
                     if (!assessment) { continue; }
                     if (assessment->summary().reusable_prompt_tokens == 0 ||
-                        (retain_source &&
+                        (must_retain_private_source &&
                          assessment->source_disposition() != ClaimDisposition::Retained)) {
                         throw std::logic_error("Program returned an invalid private assessment");
                     }

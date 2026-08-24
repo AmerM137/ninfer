@@ -790,7 +790,7 @@ ProgramImplCore::context_transfer_observation(runtime::ContextResourceClass reso
 std::optional<AdmissionPlan> ProgramImplCore::inspect_admission(
     const PreparedPromptData& prompt, const RequestBasePlan& base, runtime::LaneId destination,
     const ContinuationHandle* source, const SharedPrefixHandle* shared_source,
-    std::optional<runtime::CheckpointRef> checkpoint, bool retain_private_source) {
+    std::optional<runtime::CheckpointRef> checkpoint, bool must_retain_private_source) {
     const std::uint32_t lane = destination.value;
     if (lane >= max_concurrency) { throw std::out_of_range("admission lane is out of range"); }
     if (requests[lane].lifecycle != Lifecycle::Empty ||
@@ -817,7 +817,7 @@ std::optional<AdmissionPlan> ProgramImplCore::inspect_admission(
     }
 
     std::optional<AdmissionPlan> plan = inspect_lane(lane, prompt, base, source_state, shared_state,
-                                                     checkpoint, retain_private_source);
+                                                     checkpoint, must_retain_private_source);
     if (!plan) { return std::nullopt; }
     plan->impl_->destination       = destination;
     plan->impl_->destination_epoch = lane_epochs[lane];
