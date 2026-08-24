@@ -13,6 +13,7 @@
 #include <iostream>
 #include <new>
 #include <string_view>
+#include <vector>
 
 namespace {
 
@@ -29,6 +30,16 @@ void expect(bool condition, std::string_view message) {
 
 bool cuda_unavailable(cudaError_t error) {
     return error == cudaErrorNoDevice || error == cudaErrorInsufficientDriver;
+}
+
+std::vector<std::int32_t> read_block_table(const ninfer::KVExecutionTablePool& tables,
+                                           std::int32_t row, std::size_t count) {
+    const ninfer::Tensor source = tables.matrix().slice(1, row, 1).view(
+        {static_cast<std::int32_t>(tables.logical_page_capacity())});
+    std::vector<std::int32_t> values(count);
+    CUDA_CHECK(cudaMemcpy(values.data(), source.data, values.size() * sizeof(std::int32_t),
+                          cudaMemcpyDeviceToHost));
+    return values;
 }
 
 void test_state_store(ninfer::DeviceContext& device) {
@@ -174,13 +185,19 @@ void test_kv_store(ninfer::DeviceContext& device) {
     const auto address = addresses.create_active(3, 0);
     expect(address.has_value(), "active KV address allocation");
     addresses.materialize_to_tokens(*address, 65, device.stream);
+    device.synchronize();
     expect(addresses.mapped_pages(*address) == 2 && addresses.committed_frontier(*address) == 0,
            "physical KV append does not publish canonical coverage before commit");
+    expect(read_block_table(physical_tables, 0, 2) == std::vector<std::int32_t>({0, 1}),
+           "batched KV materialization publishes the exact execution mapping");
     addresses.commit_frontier(*address, 65);
     expect(addresses.mapped_pages(*address) == 2 && addresses.entitlement(*address) == 3 &&
                addresses.committed_frontier(*address) == 65 && addresses.bound_row(*address) == 0,
            "KV address tracks mapped pages, entitlement, frontier, and execution row");
     addresses.materialize_to_tokens(*address, 129, device.stream);
+    device.synchronize();
+    expect(read_block_table(physical_tables, 0, 3) == std::vector<std::int32_t>({0, 1, 2}),
+           "incremental KV materialization preserves the existing mapping prefix");
     addresses.destructive_truncate(*address, 65);
     expect(addresses.mapped_pages(*address) == 2 && addresses.entitlement(*address) == 3 &&
                addresses.committed_frontier(*address) == 65,

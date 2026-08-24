@@ -237,6 +237,7 @@ public:
         for (std::uint32_t index = 0; index < pages_.size(); ++index) {
             free_[index] = static_cast<std::uint32_t>(pages_.size()) - 1U - index;
         }
+        materialization_scratch_.reserve(physical.capacity_pages());
     }
 
     LogicalKVPageStore(const LogicalKVPageStore&)            = delete;
@@ -269,6 +270,47 @@ public:
         page.protected_columns = 0;
         page.occupied          = true;
         return LogicalKVPageHandle(this, index, page.generation);
+    }
+
+    void materialize(DeviceKVPageReservation& reservation,
+                     std::span<LogicalKVPageHandle> destinations,
+                     std::optional<LogicalKVPageHandle> preferred_predecessor = std::nullopt) {
+        if (destinations.empty()) { return; }
+        if (destinations.size() > free_count_ ||
+            destinations.size() > materialization_scratch_.capacity()) {
+            throw std::logic_error("logical KV batch materialization exceeds descriptor capacity");
+        }
+        for (const LogicalKVPageHandle destination : destinations) {
+            if (destination.valid()) {
+                throw std::logic_error("logical KV batch destination is already populated");
+            }
+        }
+        for (std::size_t offset = 0; offset < destinations.size(); ++offset) {
+            const std::uint32_t index = free_[free_count_ - 1U - offset];
+            if (pages_[index].occupied) {
+                throw std::logic_error("logical KV free descriptor is occupied");
+            }
+        }
+
+        std::optional<DeviceKVPageHandle> physical_predecessor;
+        if (preferred_predecessor) { physical_predecessor = physical(*preferred_predecessor); }
+        materialization_scratch_.clear();
+        physical_->materialize(reservation, static_cast<std::uint32_t>(destinations.size()),
+                               materialization_scratch_, physical_predecessor);
+        for (std::size_t offset = 0; offset < destinations.size(); ++offset) {
+            const std::uint32_t index = free_[free_count_ - 1U - offset];
+            Page& page                = pages_[index];
+            page.device_replica.emplace(std::move(materialization_scratch_[offset]));
+            page.content_epoch     = next_epoch(page.content_epoch);
+            page.committed_columns = 0;
+            page.references        = 1;
+            page.writer_references = 1;
+            page.protected_columns = 0;
+            page.occupied          = true;
+            destinations[offset]   = LogicalKVPageHandle(this, index, page.generation);
+        }
+        free_count_ -= static_cast<std::uint32_t>(destinations.size());
+        materialization_scratch_.clear();
     }
 
     [[nodiscard]] LogicalKVPageHandle
@@ -726,6 +768,7 @@ private:
     DeviceKVPagePool* physical_ = nullptr;
     std::vector<Page> pages_;
     std::vector<std::uint32_t> free_;
+    std::vector<DeviceKVPageLease> materialization_scratch_;
     std::uint32_t free_count_ = 0;
 };
 
@@ -744,6 +787,7 @@ public:
         for (std::uint32_t index = 0; index < address_capacity; ++index) {
             free_[index] = address_capacity - 1U - index;
         }
+        publish_scratch_.reserve(page_capacity_);
     }
 
     KVAddressSpaceStore(const KVAddressSpaceStore&)            = delete;
@@ -1054,14 +1098,14 @@ public:
             throw std::logic_error("KV prefix-fork tail destination is stale");
         }
 
+        publish_scratch_.clear();
         for (std::uint32_t page = 0; page < fork.full_pages_; ++page) {
-            const std::array physical{pages_->physical(membership(source, page))};
-            tables_->publish(fork.row_->handle(), page, physical, stream);
+            publish_scratch_.push_back(pages_->physical(membership(source, page)));
         }
         if (fork.tail_destination_) {
-            const std::array physical{pages_->physical(*fork.tail_destination_)};
-            tables_->publish(fork.row_->handle(), fork.full_pages_, physical, stream);
+            publish_scratch_.push_back(pages_->physical(*fork.tail_destination_));
         }
+        tables_->publish(fork.row_->handle(), 0, publish_scratch_, stream);
 
         for (std::uint32_t page = 0; page < fork.full_pages_; ++page) {
             const LogicalKVPageHandle logical = membership(source, page);
@@ -1207,14 +1251,14 @@ public:
             throw std::logic_error("active KV snapshot tail destination is stale");
         }
 
+        publish_scratch_.clear();
         for (std::uint32_t page = 0; page < snapshot.full_pages_; ++page) {
-            const std::array physical{pages_->physical(membership(source, page))};
-            tables_->publish(source.row->handle(), page, physical, stream);
+            publish_scratch_.push_back(pages_->physical(membership(source, page)));
         }
         if (snapshot.tail_destination_) {
-            const std::array physical{pages_->physical(*snapshot.tail_destination_)};
-            tables_->publish(source.row->handle(), snapshot.full_pages_, physical, stream);
+            publish_scratch_.push_back(pages_->physical(*snapshot.tail_destination_));
         }
+        tables_->publish(source.row->handle(), 0, publish_scratch_, stream);
 
         for (std::uint32_t page = 0; page < required_pages; ++page) {
             pages_->set_writer(membership(source, page), false);
@@ -1289,13 +1333,30 @@ public:
         if (target < address.page_count || target > entitlement(address)) {
             throw std::invalid_argument("KV materialization exceeds active entitlement");
         }
-        while (address.page_count < target) {
-            LogicalKVPageHandle page                = pages_->materialize(address.reservation);
-            membership(address, address.page_count) = page;
-            const std::array physical{pages_->physical(page)};
-            tables_->publish(address.row->handle(), address.page_count, physical, stream);
-            ++address.page_count;
+        if (target == address.page_count) { return; }
+        const std::uint32_t begin       = address.page_count;
+        const std::uint32_t count       = target - begin;
+        const std::size_t address_index = static_cast<std::size_t>(&address - addresses_.data());
+        std::span<LogicalKVPageHandle> added(
+            memberships_.data() + address_index * page_capacity_ + begin, count);
+        const std::optional<LogicalKVPageHandle> predecessor =
+            begin == 0 ? std::nullopt
+                       : std::optional<LogicalKVPageHandle>(membership(address, begin - 1U));
+        pages_->materialize(address.reservation, added, predecessor);
+        try {
+            publish_scratch_.clear();
+            for (const LogicalKVPageHandle page : added) {
+                publish_scratch_.push_back(pages_->physical(page));
+            }
+            tables_->publish(address.row->handle(), begin, publish_scratch_, stream);
+        } catch (...) {
+            for (LogicalKVPageHandle& page : added) {
+                pages_->dematerialize(page, address.reservation);
+                page = {};
+            }
+            throw;
         }
+        address.page_count = target;
     }
 
     void commit_frontier(KVAddressSpaceHandle handle, std::uint32_t frontier) {
@@ -1637,10 +1698,11 @@ private:
 
     void publish_membership(const Address& address, cudaStream_t stream = nullptr) {
         if (!address.row) { throw std::logic_error("KV address space has no execution row"); }
+        publish_scratch_.clear();
         for (std::uint32_t page = 0; page < address.page_count; ++page) {
-            const std::array physical{pages_->physical(membership(address, page))};
-            tables_->publish(address.row->handle(), page, physical, stream);
+            publish_scratch_.push_back(pages_->physical(membership(address, page)));
         }
+        tables_->publish(address.row->handle(), 0, publish_scratch_, stream);
     }
 
     LogicalKVPageStore* pages_    = nullptr;
@@ -1649,6 +1711,7 @@ private:
     std::vector<Address> addresses_;
     std::vector<std::uint32_t> free_;
     std::vector<LogicalKVPageHandle> memberships_;
+    std::vector<DeviceKVPageHandle> publish_scratch_;
     std::uint32_t free_count_ = 0;
 };
 

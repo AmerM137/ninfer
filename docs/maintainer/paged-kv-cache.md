@@ -522,6 +522,12 @@ compaction。
 Allocator 应优先给同一 sequence 分配连续 page IDs，使相邻 logical pages 在 plane slab 中尽可能连续；
 但连续 run 不是 admission 条件。找不到连续 run 时使用任意 free pages，不能因此拒绝 request。
 
+Device pool 的 free set 由按 physical ID 排序、互不相交且相邻即合并的 runs 表示；run metadata 在 pool
+构造时预留到固定 capacity，release 路径不做 Host allocation。Materialize 先尝试从上一 logical page 的
+后继位置取得完整连续 run，再选择第一个足够大的 run；没有单一 run 足够时按 physical ID 顺序跨 runs
+消费。释放页与左右相邻 run 合并。操作量取决于涉及的 runs 和实际返回的 page handles，不再为一次
+多页申请反复移动逐页 free-ID vector。
+
 ### 5.5 Logical pages and Device/Host replicas
 
 Device page-group ID 只是当前 Device replica 在 typed slab 中的物理位置，不是 prefix identity。Program
@@ -1368,11 +1374,16 @@ content、positions、context length和commit count的device values，而不是k
 
 ```text
 reserve entitlement already exists
-    -> bind physical page ID
+    -> batch bind all newly required physical page IDs
     -> update host allocation mapping
-    -> publish corresponding device table entry
+    -> publish the contiguous device table slice with one H2D copy
     -> launch/replay consumer on the same ordered stream
 ```
+
+同一 boundary 新增多个 pages、activation 重新绑定完整 membership、prefix fork 和 active snapshot 都遵循
+上述批量 publication。单页 decode boundary 是这个 API 的 `count=1` 特例；不得把长 prefill 恢复为逐页
+4-byte H2D。任何 batch publication 失败都在 address frontier/page-count 发布前退还本批 descriptors 和
+physical leases，保留旧 execution mapping authority。
 
 Graph capture不以page IDs、physical contiguity或checkpoint owner为key。Mapping update必须先于consumer，
 in-flight期间禁止改写同一row；Op和kernel内部不调用allocator，也不等待host page fault。

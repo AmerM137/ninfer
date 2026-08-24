@@ -216,12 +216,10 @@ DeviceKVPagePool::DeviceKVPagePool(DeviceSpan backing, const DeviceKVPagePoolLay
         planes_.push_back(plane);
     }
 
-    free_page_ids_.reserve(spec_.page_group_count);
+    free_page_runs_.reserve(spec_.page_group_count);
     page_generations_.assign(spec_.page_group_count, 1);
     page_allocated_.assign(spec_.page_group_count, false);
-    for (std::uint32_t page = 0; page < spec_.page_group_count; ++page) {
-        free_page_ids_.push_back(static_cast<std::int32_t>(page));
-    }
+    free_page_runs_.push_back(FreePageRun{.begin = 0, .count = spec_.page_group_count});
 }
 
 std::uint32_t DeviceKVPagePool::capacity_pages() const noexcept { return spec_.page_group_count; }
@@ -275,7 +273,8 @@ void DeviceKVPagePool::resize_reservation(DeviceKVPageReservation& reservation,
 
 void DeviceKVPagePool::materialize(DeviceKVPageReservation& reservation,
                                    std::uint32_t target_page_count,
-                                   std::vector<DeviceKVPageLease>& destination) {
+                                   std::vector<DeviceKVPageLease>& destination,
+                                   std::optional<DeviceKVPageHandle> preferred_predecessor) {
     static_assert(std::is_nothrow_move_constructible_v<DeviceKVPageLease>);
     if (!reservation.belongs_to(*this) || target_page_count < destination.size()) {
         throw std::invalid_argument("Paged KV materialization has an invalid owner or extent");
@@ -291,48 +290,74 @@ void DeviceKVPagePool::materialize(DeviceKVPageReservation& reservation,
         }
     }
     if (count == 0) { return; }
-    if (count > free_page_ids_.size()) {
+    if (count > capacity_pages() - allocated_pages_) {
         throw std::logic_error("Paged KV reservation invariant was violated");
     }
 
-    const auto run_at = [&](std::size_t begin) {
-        if (begin + count > free_page_ids_.size()) { return false; }
-        for (std::uint32_t offset = 1; offset < count; ++offset) {
-            if (free_page_ids_[begin + offset] !=
-                free_page_ids_[begin] + static_cast<std::int32_t>(offset)) {
-                return false;
-            }
-        }
-        return true;
-    };
-
-    std::size_t selected = free_page_ids_.size();
-    if (!destination.empty()) {
-        const std::int32_t preferred = destination.back().index_ + 1;
-        const auto it = std::lower_bound(free_page_ids_.begin(), free_page_ids_.end(), preferred);
-        if (it != free_page_ids_.end() && *it == preferred) {
-            const std::size_t begin = static_cast<std::size_t>(it - free_page_ids_.begin());
-            if (run_at(begin)) { selected = begin; }
-        }
+    std::optional<std::int32_t> preferred;
+    if (preferred_predecessor) {
+        preferred = physical_index(*preferred_predecessor) + 1;
+    } else if (!destination.empty()) {
+        preferred = destination.back().index_ + 1;
     }
-    if (selected == free_page_ids_.size()) {
-        for (std::size_t begin = 0; begin + count <= free_page_ids_.size(); ++begin) {
-            if (run_at(begin)) {
-                selected = begin;
-                break;
+
+    std::size_t selected        = free_page_runs_.size();
+    std::int32_t selected_begin = 0;
+    if (preferred && *preferred >= 0) {
+        const auto upper = std::upper_bound(
+            free_page_runs_.begin(), free_page_runs_.end(), *preferred,
+            [](std::int32_t page, const FreePageRun& run) { return page < run.begin; });
+        if (upper != free_page_runs_.begin()) {
+            const auto candidate = upper - 1;
+            const std::uint64_t run_end =
+                static_cast<std::uint64_t>(candidate->begin) + candidate->count;
+            const std::uint64_t requested_end = static_cast<std::uint64_t>(*preferred) + count;
+            if (*preferred >= candidate->begin && requested_end <= run_end) {
+                selected       = static_cast<std::size_t>(candidate - free_page_runs_.begin());
+                selected_begin = *preferred;
             }
         }
     }
-    if (selected == free_page_ids_.size()) { selected = 0; }
+    if (selected == free_page_runs_.size()) {
+        const auto contiguous =
+            std::find_if(free_page_runs_.begin(), free_page_runs_.end(),
+                         [count](const FreePageRun& run) { return run.count >= count; });
+        if (contiguous != free_page_runs_.end()) {
+            selected       = static_cast<std::size_t>(contiguous - free_page_runs_.begin());
+            selected_begin = contiguous->begin;
+        }
+    }
 
-    for (std::uint32_t offset = 0; offset < count; ++offset) {
-        const std::int32_t page = free_page_ids_[selected + offset];
+    const auto append_page = [&](std::int32_t page) {
         destination.push_back(
             DeviceKVPageLease(*this, page, page_generations_[static_cast<std::size_t>(page)]));
         page_allocated_[static_cast<std::size_t>(page)] = true;
+    };
+    if (selected != free_page_runs_.size()) {
+        for (std::uint32_t offset = 0; offset < count; ++offset) {
+            append_page(selected_begin + static_cast<std::int32_t>(offset));
+        }
+        consume_free_run(selected, selected_begin, count);
+    } else {
+        std::uint32_t remaining   = count;
+        std::size_t consumed_runs = 0;
+        for (std::size_t run_index = 0; remaining != 0; ++run_index) {
+            FreePageRun& run         = free_page_runs_[run_index];
+            const std::uint32_t take = std::min(remaining, run.count);
+            for (std::uint32_t offset = 0; offset < take; ++offset) {
+                append_page(run.begin + static_cast<std::int32_t>(offset));
+            }
+            remaining -= take;
+            if (take == run.count) {
+                ++consumed_runs;
+            } else {
+                run.begin += static_cast<std::int32_t>(take);
+                run.count -= take;
+            }
+        }
+        free_page_runs_.erase(free_page_runs_.begin(),
+                              free_page_runs_.begin() + static_cast<std::ptrdiff_t>(consumed_runs));
     }
-    const auto first = free_page_ids_.begin() + static_cast<std::ptrdiff_t>(selected);
-    free_page_ids_.erase(first, first + static_cast<std::ptrdiff_t>(count));
     allocated_pages_ += count;
     reserved_pages_ -= count;
     reservation.pages_ -= count;
@@ -342,11 +367,12 @@ DeviceKVPageLease DeviceKVPagePool::materialize_one(DeviceKVPageReservation& res
     if (!reservation.belongs_to(*this) || reservation.pages_ == 0) {
         throw std::invalid_argument("Paged KV single-page materialization exceeds reservation");
     }
-    if (free_page_ids_.empty()) {
+    if (free_page_runs_.empty()) {
         throw std::logic_error("Paged KV reservation invariant was violated");
     }
-    const std::int32_t page = free_page_ids_.front();
-    free_page_ids_.erase(free_page_ids_.begin());
+    FreePageRun& run        = free_page_runs_.front();
+    const std::int32_t page = run.begin++;
+    if (--run.count == 0) { free_page_runs_.erase(free_page_runs_.begin()); }
     page_allocated_[static_cast<std::size_t>(page)] = true;
     ++allocated_pages_;
     --reserved_pages_;
@@ -412,9 +438,57 @@ void DeviceKVPagePool::release_page(std::int32_t index, std::uint32_t generation
     if (!page_allocated_[position] || page_generations_[position] != generation) { return; }
     page_allocated_[position] = false;
     increment_generation(page_generations_[position]);
-    const auto insertion = std::lower_bound(free_page_ids_.begin(), free_page_ids_.end(), index);
-    free_page_ids_.insert(insertion, index);
+    release_free_page(index);
     --allocated_pages_;
+}
+
+void DeviceKVPagePool::consume_free_run(std::size_t run_index, std::int32_t begin,
+                                        std::uint32_t count) noexcept {
+    if (run_index >= free_page_runs_.size() || count == 0) { std::terminate(); }
+    FreePageRun& run                = free_page_runs_[run_index];
+    const std::int64_t run_end      = static_cast<std::int64_t>(run.begin) + run.count;
+    const std::int64_t consumed_end = static_cast<std::int64_t>(begin) + count;
+    if (begin < run.begin || consumed_end > run_end) { std::terminate(); }
+    if (begin == run.begin && consumed_end == run_end) {
+        free_page_runs_.erase(free_page_runs_.begin() + static_cast<std::ptrdiff_t>(run_index));
+        return;
+    }
+    if (begin == run.begin) {
+        run.begin += static_cast<std::int32_t>(count);
+        run.count -= count;
+        return;
+    }
+    if (consumed_end == run_end) {
+        run.count = static_cast<std::uint32_t>(begin - run.begin);
+        return;
+    }
+    const FreePageRun right{.begin = static_cast<std::int32_t>(consumed_end),
+                            .count = static_cast<std::uint32_t>(run_end - consumed_end)};
+    run.count = static_cast<std::uint32_t>(begin - run.begin);
+    free_page_runs_.insert(free_page_runs_.begin() + static_cast<std::ptrdiff_t>(run_index + 1),
+                           right);
+}
+
+void DeviceKVPagePool::release_free_page(std::int32_t index) noexcept {
+    const auto next = std::lower_bound(
+        free_page_runs_.begin(), free_page_runs_.end(), index,
+        [](const FreePageRun& run, std::int32_t page) { return run.begin < page; });
+    const bool joins_right = next != free_page_runs_.end() && index + 1 == next->begin;
+    const bool joins_left =
+        next != free_page_runs_.begin() &&
+        static_cast<std::int64_t>((next - 1)->begin) + (next - 1)->count == index;
+    if (joins_left && joins_right) {
+        auto& left = *(next - 1);
+        left.count += 1U + next->count;
+        free_page_runs_.erase(next);
+    } else if (joins_left) {
+        ++(next - 1)->count;
+    } else if (joins_right) {
+        next->begin = index;
+        ++next->count;
+    } else {
+        free_page_runs_.insert(next, FreePageRun{.begin = index, .count = 1});
+    }
 }
 
 void DeviceKVPagePool::release_reservation(std::uint32_t pages) noexcept {
