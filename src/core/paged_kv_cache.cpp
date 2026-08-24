@@ -219,6 +219,7 @@ DeviceKVPagePool::DeviceKVPagePool(DeviceSpan backing, const DeviceKVPagePoolLay
     free_page_runs_.reserve(spec_.page_group_count);
     page_generations_.assign(spec_.page_group_count, 1);
     page_allocated_.assign(spec_.page_group_count, false);
+    validation_marks_.assign(spec_.page_group_count, 0);
     free_page_runs_.push_back(FreePageRun{.begin = 0, .count = spec_.page_group_count});
 }
 
@@ -432,6 +433,22 @@ std::int32_t DeviceKVPagePool::physical_index(DeviceKVPageHandle handle) const {
     return handle.index_;
 }
 
+void DeviceKVPagePool::validate_distinct_pages(std::span<const DeviceKVPageHandle> pages,
+                                               const char* duplicate_message) const {
+    ++validation_stamp_;
+    if (validation_stamp_ == 0) {
+        std::fill(validation_marks_.begin(), validation_marks_.end(), 0);
+        validation_stamp_ = 1;
+    }
+    for (const DeviceKVPageHandle page : pages) {
+        const std::size_t index = static_cast<std::size_t>(physical_index(page));
+        if (validation_marks_[index] == validation_stamp_) {
+            throw std::invalid_argument(duplicate_message);
+        }
+        validation_marks_[index] = validation_stamp_;
+    }
+}
+
 void DeviceKVPagePool::release_page(std::int32_t index, std::uint32_t generation) noexcept {
     if (index < 0 || index >= static_cast<std::int32_t>(capacity_pages())) { return; }
     const std::size_t position = static_cast<std::size_t>(index);
@@ -498,14 +515,7 @@ void DeviceKVPagePool::release_reservation(std::uint32_t pages) noexcept {
 
 void DeviceKVPagePool::zero_pages(std::span<const DeviceKVPageHandle> pages,
                                   cudaStream_t stream) const {
-    for (std::size_t index = 0; index < pages.size(); ++index) {
-        (void)physical_index(pages[index]);
-        for (std::size_t previous = 0; previous < index; ++previous) {
-            if (pages[index].index_ == pages[previous].index_) {
-                throw std::invalid_argument("Paged KV zero destination contains duplicate pages");
-            }
-        }
-    }
+    validate_distinct_pages(pages, "Paged KV zero destination contains duplicate pages");
     std::size_t begin = 0;
     while (begin < pages.size()) {
         std::size_t end = begin + 1;
@@ -598,14 +608,7 @@ void DeviceKVPagePool::copy_from_host(HostKVAllocationConstView source,
         source.layout().geometry != geometry()) {
         throw std::invalid_argument("Paged KV H2D geometry or extent is inconsistent");
     }
-    for (std::size_t index = 0; index < destination.size(); ++index) {
-        (void)physical_index(destination[index]);
-        for (std::size_t previous = 0; previous < index; ++previous) {
-            if (destination[index].index_ == destination[previous].index_) {
-                throw std::invalid_argument("Paged KV H2D destination contains duplicate pages");
-            }
-        }
-    }
+    validate_distinct_pages(destination, "Paged KV H2D destination contains duplicate pages");
 
     const HostKVPageLayout& host = source.layout();
     std::size_t begin            = 0;

@@ -194,6 +194,9 @@ void test_kv_store(ninfer::DeviceContext& device) {
     expect(addresses.mapped_pages(*address) == 2 && addresses.entitlement(*address) == 3 &&
                addresses.committed_frontier(*address) == 65 && addresses.bound_row(*address) == 0,
            "KV address tracks mapped pages, entitlement, frontier, and execution row");
+    expect(pages.active_address_references(addresses.logical_page(*address, 0)) == 1 &&
+               pages.active_address_references(addresses.logical_page(*address, 1)) == 1,
+           "active KV membership is counted on each logical page");
     addresses.materialize_to_tokens(*address, 129, device.stream);
     device.synchronize();
     expect(read_block_table(physical_tables, 0, 3) == std::vector<std::int32_t>({0, 1, 2}),
@@ -213,6 +216,10 @@ void test_kv_store(ninfer::DeviceContext& device) {
 
     const std::array logical_pages{addresses.logical_page(*address, 0),
                                    addresses.logical_page(*address, 1)};
+    expect(pages.active_address_references(logical_pages[0]) == 0 &&
+               pages.active_address_references(logical_pages[1]) == 0 &&
+               !addresses.has_active_reference(logical_pages[0]),
+           "KV deactivation clears logical-page active references");
     addresses.set_checkpoint_requirement(*address, 32);
     expect(pages.protected_columns(logical_pages[0]) == 32 &&
                pages.protected_columns(logical_pages[1]) == 0,
@@ -279,6 +286,9 @@ void test_kv_store(ninfer::DeviceContext& device) {
                physical_pages.reserved_pages() == 1,
            "prepared KV activation preserves the catalogued mapping until publication");
     addresses.commit_activation(std::move(activation), device.stream);
+    expect(pages.active_address_references(logical_pages[0]) == 1 &&
+               pages.active_address_references(logical_pages[1]) == 1,
+           "KV reactivation republishes logical-page active references");
     addresses.destructive_truncate(*address, 32);
     expect(addresses.mapped_pages(*address) == 1 && addresses.entitlement(*address) == 3 &&
                addresses.committed_frontier(*address) == 32 &&
@@ -300,6 +310,32 @@ void test_kv_store(ninfer::DeviceContext& device) {
     expect(!addresses.valid(*address) && pages.occupied() == 0 &&
                physical_pages.allocated_pages() == 0 && physical_pages.reserved_pages() == 0,
            "KV release invalidates generations and closes physical ownership");
+
+    const auto snapshot_source      = addresses.create_active(3, 0);
+    const auto snapshot_destination = addresses.create_inactive();
+    expect(snapshot_source && snapshot_destination, "active KV snapshot endpoints allocate");
+    addresses.materialize_to_tokens(*snapshot_source, 65, device.stream);
+    addresses.commit_frontier(*snapshot_source, 65);
+    const auto snapshot_full = addresses.logical_page(*snapshot_source, 0);
+    const auto snapshot_tail = addresses.logical_page(*snapshot_source, 1);
+    auto snapshot = addresses.prepare_active_snapshot(*snapshot_source, *snapshot_destination, 65);
+    physical_pages.copy_page(addresses.active_snapshot_tail_source(snapshot),
+                             addresses.active_snapshot_tail_destination(snapshot),
+                             device.transfer_stream);
+    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+    addresses.commit_active_snapshot(std::move(snapshot), device.stream);
+    const auto snapshot_destination_tail = addresses.logical_page(*snapshot_destination, 1);
+    expect(addresses.active(*snapshot_destination) && !addresses.active(*snapshot_source) &&
+               pages.active_address_references(snapshot_full) == 1 &&
+               pages.active_address_references(snapshot_tail) == 0 &&
+               pages.active_address_references(snapshot_destination_tail) == 1,
+           "active KV snapshot transfers active ownership without double-counting shared pages");
+    addresses.deactivate(*snapshot_destination);
+    expect(pages.active_address_references(snapshot_full) == 0 &&
+               pages.active_address_references(snapshot_destination_tail) == 0 &&
+               addresses.release(*snapshot_destination) && addresses.release(*snapshot_source) &&
+               pages.occupied() == 0,
+           "active KV snapshot references close with both address spaces");
 
     const auto shared = addresses.create_active(3, 0);
     expect(shared.has_value(), "shared-prefix source address allocation");

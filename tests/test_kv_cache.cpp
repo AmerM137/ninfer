@@ -300,6 +300,19 @@ int exercise_layout_and_transfer(ninfer::DeviceContext& context, ninfer::KVPageG
     destination.zero_pages(restored_handles, context.stream);
     destination.copy_from_host(host_arena.view(*host), restored_handles, context.stream);
 
+    const std::array duplicate_destinations{restored[0].handle(), restored[0].handle()};
+    bool duplicate_zero_rejected = false;
+    try {
+        destination.zero_pages(duplicate_destinations, context.stream);
+    } catch (const std::invalid_argument&) { duplicate_zero_rejected = true; }
+    failures += expect(duplicate_zero_rejected, label + " duplicate zero destination accepted");
+    bool duplicate_restore_rejected = false;
+    try {
+        destination.copy_from_host(host_arena.view(*host).subview(0, 2), duplicate_destinations,
+                                   context.stream);
+    } catch (const std::invalid_argument&) { duplicate_restore_rejected = true; }
+    failures += expect(duplicate_restore_rejected, label + " duplicate H2D destination accepted");
+
     std::optional<ninfer::HostKVAllocation> roundtrip = host_arena.allocate(host_layout, 5);
     failures += expect(roundtrip.has_value(), label + " roundtrip Host allocation failed");
     ninfer::HostKVAllocationView roundtrip_view = host_arena.writable_view(*roundtrip);

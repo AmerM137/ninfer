@@ -503,6 +503,56 @@ public:
     std::size_t workspace_logical_peak_bytes = 0;
 
 private:
+    template <typename Handle>
+    struct DenseHandleMaskScratch {
+        struct Slot {
+            Handle handle;
+            std::uint32_t stamp = 0;
+            std::uint32_t mask  = 0;
+        };
+
+        void configure(std::uint32_t capacity) {
+            slots.resize(capacity);
+            touched.reserve(capacity);
+        }
+
+        void begin() {
+            touched.clear();
+            ++stamp;
+            if (stamp == 0) {
+                for (Slot& slot : slots) { slot.stamp = 0; }
+                stamp = 1;
+            }
+        }
+
+        void add(std::uint32_t index, Handle handle, std::uint32_t mask) {
+            if (index >= slots.size()) {
+                throw std::logic_error("protected resource descriptor index is out of range");
+            }
+            Slot& slot = slots[index];
+            if (slot.stamp != stamp) {
+                slot.handle = handle;
+                slot.stamp  = stamp;
+                slot.mask   = mask;
+                touched.push_back(index);
+            } else {
+                slot.mask |= mask;
+            }
+        }
+
+        std::vector<Slot> slots;
+        std::vector<std::uint32_t> touched;
+        std::uint32_t stamp = 0;
+    };
+
+    struct ProtectedProjectionScratch {
+        DenseHandleMaskScratch<StateImageHandle> states;
+        DenseHandleMaskScratch<LogicalKVPageHandle> main_pages;
+        DenseHandleMaskScratch<LogicalKVPageHandle> backend_pages;
+    };
+
+    mutable ProtectedProjectionScratch protected_projection_scratch_;
+
     struct MaterializationSourceProtection {
         std::optional<StateImageHandle> state;
         std::optional<KVAddressSpaceHandle> text;

@@ -180,6 +180,11 @@ public:
                objects_[handle.index_].generation == handle.generation_;
     }
 
+    [[nodiscard]] std::uint32_t descriptor_index(StateImageHandle handle) const {
+        (void)require(handle);
+        return handle.index_;
+    }
+
     [[nodiscard]] StateImageRole role(StateImageHandle handle) const {
         return require(handle).role;
     }

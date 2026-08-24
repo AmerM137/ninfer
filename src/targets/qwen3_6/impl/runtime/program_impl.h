@@ -672,6 +672,11 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
         }
     }
 
+    protected_projection_scratch_.states.configure(state_store->capacity());
+    protected_projection_scratch_.main_pages.configure(text_kv_pages->capacity());
+    protected_projection_scratch_.backend_pages.configure(
+        backend_kv_pages == nullptr ? 0U : backend_kv_pages->capacity());
+
     io = qwen3_6::RoundState(backing, plan.persistent.round);
     if (io.mtp.has_value() != (speculative_backend == SpeculativeBackend::Mtp)) {
         throw std::logic_error("round-state MTP extension does not match the sequence plan");
@@ -5383,54 +5388,24 @@ std::array<runtime::DeviceResources, 1U << kMaximumConcurrency>
 ProgramImplCore::project_protected_resources(
     std::span<const ProtectedPrivateOwner> private_owners,
     std::span<const ProtectedSharedOwner> shared_owners) const {
-    struct MaskedState {
-        StateImageHandle handle;
-        std::uint32_t mask = 0;
-    };
-
-    struct MaskedPage {
-        LogicalKVPageHandle handle;
-        std::uint32_t mask = 0;
-    };
-
-    std::vector<MaskedState> states;
-    std::vector<MaskedPage> main_pages;
-    std::vector<MaskedPage> backend_pages;
-    states.reserve((2U + context_cache.max_long_anchors_per_continuation.value_or(0)) *
-                       private_owners.size() +
-                   shared_owners.size());
+    auto& scratch = protected_projection_scratch_;
+    scratch.states.begin();
+    scratch.main_pages.begin();
+    scratch.backend_pages.begin();
 
     const auto add_state = [&](StateImageHandle handle, std::uint32_t mask) {
-        if (!state_store->valid(handle)) {
-            throw std::logic_error("protected owner contains a stale StateImage");
-        }
-        const auto found =
-            std::find_if(states.begin(), states.end(),
-                         [&](const MaskedState& state) { return state.handle == handle; });
-        if (found == states.end()) {
-            states.push_back(MaskedState{.handle = handle, .mask = mask});
-        } else {
-            found->mask |= mask;
-        }
+        scratch.states.add(state_store->descriptor_index(handle), handle, mask);
     };
     const auto add_address = [&](const KVAddressSpaceStore& addresses, KVAddressSpaceHandle address,
-                                 std::uint32_t mask, std::vector<MaskedPage>& pages) {
+                                 const LogicalKVPageStore& pages, std::uint32_t mask,
+                                 auto& page_scratch) {
         if (!addresses.valid(address)) {
             throw std::logic_error("protected owner contains a stale KV address space");
         }
         const std::uint32_t mapped = addresses.mapped_pages(address);
-        pages.reserve(pages.size() + mapped);
         for (std::uint32_t page = 0; page < mapped; ++page) {
             const LogicalKVPageHandle logical = addresses.logical_page(address, page);
-            const auto found =
-                std::find_if(pages.begin(), pages.end(), [&](const MaskedPage& candidate) {
-                    return candidate.handle == logical;
-                });
-            if (found == pages.end()) {
-                pages.push_back(MaskedPage{.handle = logical, .mask = mask});
-            } else {
-                found->mask |= mask;
-            }
+            page_scratch.add(pages.descriptor_index(logical), logical, mask);
         }
     };
     const auto validate_mask = [](std::uint32_t mask) {
@@ -5457,10 +5432,11 @@ ProgramImplCore::project_protected_resources(
             add_state(anchor.state, owner.owner_mask);
         }
         if (!sequence.kv) { throw std::logic_error("protected private owner has no KV bundle"); }
-        add_address(*text_kv_addresses, sequence.kv->text, owner.owner_mask, main_pages);
+        add_address(*text_kv_addresses, sequence.kv->text, *text_kv_pages, owner.owner_mask,
+                    scratch.main_pages);
         if (sequence.kv->backend) {
-            add_address(*backend_kv_addresses, *sequence.kv->backend, owner.owner_mask,
-                        backend_pages);
+            add_address(*backend_kv_addresses, *sequence.kv->backend, *backend_kv_pages,
+                        owner.owner_mask, scratch.backend_pages);
         }
     }
     for (const ProtectedSharedOwner& owner : shared_owners) {
@@ -5472,10 +5448,11 @@ ProgramImplCore::project_protected_resources(
             shared_prefix_states[ContractAccess::index(*owner.handle)];
         add_state(shared.state, owner.owner_mask);
         if (!shared.kv) { throw std::logic_error("protected shared owner has no KV bundle"); }
-        add_address(*text_kv_addresses, shared.kv->text, owner.owner_mask, main_pages);
+        add_address(*text_kv_addresses, shared.kv->text, *text_kv_pages, owner.owner_mask,
+                    scratch.main_pages);
         if (shared.kv->backend) {
-            add_address(*backend_kv_addresses, *shared.kv->backend, owner.owner_mask,
-                        backend_pages);
+            add_address(*backend_kv_addresses, *shared.kv->backend, *backend_kv_pages,
+                        owner.owner_mask, scratch.backend_pages);
         }
     }
 
@@ -5486,19 +5463,22 @@ ProgramImplCore::project_protected_resources(
         }
         ++value;
     };
-    for (const MaskedState& state : states) {
+    for (const std::uint32_t index : scratch.states.touched) {
+        const auto& state                     = scratch.states.slots[index];
         const StateReplicaResidency residency = state_store->residency(state.handle);
         if (residency == StateReplicaResidency::DeviceOnly ||
             residency == StateReplicaResidency::Both) {
             increment(buckets[state.mask].state_slots);
         }
     }
-    for (const MaskedPage& page : main_pages) {
+    for (const std::uint32_t index : scratch.main_pages.touched) {
+        const auto& page = scratch.main_pages.slots[index];
         if (text_kv_pages->device_resident(page.handle)) {
             increment(buckets[page.mask].main_kv_pages);
         }
     }
-    for (const MaskedPage& page : backend_pages) {
+    for (const std::uint32_t index : scratch.backend_pages.touched) {
+        const auto& page = scratch.backend_pages.slots[index];
         if (backend_kv_pages->device_resident(page.handle)) {
             increment(buckets[page.mask].backend_kv_pages);
         }

@@ -266,6 +266,7 @@ public:
         page.content_epoch     = next_epoch(page.content_epoch);
         page.committed_columns = 0;
         page.references        = 1;
+        page.active_references = 0;
         page.writer_references = 1;
         page.protected_columns = 0;
         page.occupied          = true;
@@ -304,6 +305,7 @@ public:
             page.content_epoch     = next_epoch(page.content_epoch);
             page.committed_columns = 0;
             page.references        = 1;
+            page.active_references = 0;
             page.writer_references = 1;
             page.protected_columns = 0;
             page.occupied          = true;
@@ -327,6 +329,7 @@ public:
         page.content_epoch      = next_epoch(page.content_epoch);
         page.committed_columns  = committed_columns;
         page.references         = 0;
+        page.active_references  = 0;
         page.writer_references  = 0;
         page.protected_columns  = 0;
         page.destination_pinned = true;
@@ -367,6 +370,11 @@ public:
                pages_[handle.index_].generation == handle.generation_;
     }
 
+    [[nodiscard]] std::uint32_t descriptor_index(LogicalKVPageHandle handle) const {
+        (void)require(handle);
+        return handle.index_;
+    }
+
     [[nodiscard]] DeviceKVPageHandle physical(LogicalKVPageHandle handle) const {
         const Page& page = require(handle);
         if (!page.device_replica) {
@@ -399,6 +407,10 @@ public:
 
     [[nodiscard]] std::uint32_t address_references(LogicalKVPageHandle handle) const {
         return require(handle).references;
+    }
+
+    [[nodiscard]] std::uint32_t active_address_references(LogicalKVPageHandle handle) const {
+        return require(handle).active_references;
     }
 
     [[nodiscard]] std::uint8_t writer_references(LogicalKVPageHandle handle) const {
@@ -484,7 +496,24 @@ public:
         const Page& page = pages_[handle.index_];
         return page.device_replica && host_replica_current(handle) &&
                !page.pending_device_replica && page.writer_references == 0 &&
-               page.source_pins == 0 && !page.destination_pinned;
+               page.active_references == 0 && page.source_pins == 0 && !page.destination_pinned;
+    }
+
+    void retain_active_reference(LogicalKVPageHandle handle) {
+        Page& page = require(handle);
+        if (page.active_references == std::numeric_limits<std::uint32_t>::max() ||
+            page.active_references >= page.references) {
+            throw std::logic_error("logical KV active reference is not retainable");
+        }
+        ++page.active_references;
+    }
+
+    void release_active_reference(LogicalKVPageHandle handle) {
+        Page& page = require(handle);
+        if (page.active_references == 0) {
+            throw std::logic_error("logical KV page has no active reference");
+        }
+        --page.active_references;
     }
 
     void retain_reference(LogicalKVPageHandle handle, bool writer) {
@@ -635,7 +664,8 @@ public:
         if (!valid(handle)) { return false; }
         const Page& page = pages_[handle.index_];
         if (page.references == 0 || (writer && page.writer_references != 1) ||
-            page.source_pins != 0 || page.destination_pinned) {
+            page.active_references >= page.references || page.source_pins != 0 ||
+            page.destination_pinned) {
             return false;
         }
         return true;
@@ -726,6 +756,7 @@ private:
         std::uint64_t content_epoch     = 0;
         std::uint32_t committed_columns = 0;
         std::uint32_t references        = 0;
+        std::uint32_t active_references = 0;
         std::uint32_t protected_columns = 0;
         std::uint32_t source_pins       = 0;
         std::uint8_t writer_references  = 0;
@@ -752,8 +783,10 @@ private:
     }
 
     void release_descriptor(LogicalKVPageHandle handle, Page& page) noexcept {
+        if (page.active_references != 0) { std::terminate(); }
         page.committed_columns  = 0;
         page.references         = 0;
+        page.active_references  = 0;
         page.protected_columns  = 0;
         page.source_pins        = 0;
         page.writer_references  = 0;
@@ -936,6 +969,7 @@ public:
                 pages_->clear_protection(logical);
                 pages_->set_writer(logical, true);
             }
+            pages_->retain_active_reference(logical);
         }
         publish_membership(address, stream);
     }
@@ -952,6 +986,7 @@ public:
         for (std::uint32_t page = 0; page < address.page_count; ++page) {
             const LogicalKVPageHandle logical = membership(address, page);
             if (pages_->writer_references(logical) != 0) { pages_->set_writer(logical, false); }
+            pages_->release_active_reference(logical);
         }
         address.row.reset();
         address.reservation.release();
@@ -1125,6 +1160,9 @@ public:
         fork.row_.reset();
         destination.active = true;
         for (std::uint32_t page = 0; page < required_pages; ++page) {
+            pages_->retain_active_reference(membership(destination, page));
+        }
+        for (std::uint32_t page = 0; page < required_pages; ++page) {
             if (page == fork.full_pages_ && fork.tail_source_settled_) { continue; }
             pages_->unpin_source(membership(source, page));
         }
@@ -1282,6 +1320,11 @@ public:
         destination.row                = std::move(source.row);
         destination.active             = true;
 
+        if (snapshot.tail_columns_ != 0) {
+            pages_->release_active_reference(membership(source, snapshot.full_pages_));
+            pages_->retain_active_reference(membership(destination, snapshot.full_pages_));
+        }
+
         source.row.reset();
         source.active              = false;
         source.checkpoint_frontier = snapshot.frontier_;
@@ -1356,6 +1399,7 @@ public:
             }
             throw;
         }
+        for (const LogicalKVPageHandle page : added) { pages_->retain_active_reference(page); }
         address.page_count = target;
     }
 
@@ -1402,6 +1446,7 @@ public:
             const std::uint32_t index  = --address.page_count;
             LogicalKVPageHandle page   = membership(address, index);
             membership(address, index) = {};
+            pages_->release_active_reference(page);
             pages_->dematerialize(page, address.reservation);
         }
         if (target != 0) {
@@ -1566,14 +1611,7 @@ public:
     }
 
     [[nodiscard]] bool has_active_reference(LogicalKVPageHandle page) const noexcept {
-        if (!pages_->valid(page)) { return false; }
-        for (const Address& address : addresses_) {
-            if (!address.occupied || !address.active) { continue; }
-            for (std::uint32_t offset = 0; offset < address.page_count; ++offset) {
-                if (membership(address, offset) == page) { return true; }
-            }
-        }
-        return false;
+        return pages_->valid(page) && pages_->active_address_references(page) != 0;
     }
 
     [[nodiscard]] bool release(KVAddressSpaceHandle handle) noexcept {
