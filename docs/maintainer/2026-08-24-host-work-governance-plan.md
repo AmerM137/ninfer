@@ -34,8 +34,11 @@
 
 以下不在本计划范围内：扩大到多 GPU、大规模抢占式 continuous batching、引入通用 profiler framework、
 为旧的项目内日志 schema 保留兼容分支，以及把真实场景性能验收替代为合成测试。真实语料的
-`ninfer serve` 验收仍由用户完成；实现侧负责构建、单元/契约测试、无模型 Host benchmark 和必要的局部
+`ninfer serve` 验收仍由用户完成；实现侧负责构建、单元/契约测试、临时无模型 Host benchmark 和必要的局部
 GPU 验证。
+
+复杂度/性能 benchmark 是实施期一次性证据：临时源码和二进制放在构建目录，前后使用同一 workload，
+测量完成即删除，不加入 CMake、CTest 或仓库维护面。长期只保留保护可观察语义或真实回归的测试。
 
 ## 2. 已确认的问题地图
 
@@ -320,7 +323,7 @@ per-token/per-round 日志。
 candidate 内层循环计时。detail timer 仅在慢路径执行。worker-owned 累加不使用 atomic、mutex、heap
 allocation 或 string formatting；RuntimeStats snapshot 只是整数复制。
 
-无模型 Host microbenchmark 需测量同样 phase-switch 序列，验收条件为：
+临时无模型 Host microbenchmark 需测量同样 phase-switch 序列，验收条件为：
 
 - profiler 未附加时，包含 coarse NVTX push/pop 在内，每个普通 decode round 的插桩增量不超过
   `0.5 us`；
@@ -343,7 +346,7 @@ allocation 或 string formatting；RuntimeStats snapshot 只是整数复制。
 2. request exposure 与 throughput worker aggregate；
 3. 与相同 phase 边界对齐的静态 NVTX ranges；
 4. request-log schema、console、serve corpus parser、文档和受影响的 request-log 契约测试同步更新；
-5. Host instrumentation microbenchmark；
+5. Host instrumentation 临时 microbenchmark 的测量结论；
 6. 对现有 `prepare/prefill/decode/total` 边界补充准确注释，不改变它们来伪装 Host 指标。
 
 验收：phase 总和在整数 nanoseconds 上精确相等；subset 不大于其 parent；snapshot delta 单调；batch=2
@@ -450,14 +453,15 @@ prefix 命中；构造 hash collision 仍由精确比较拒绝；无关 catalog 
 
 #### M3.1 一次 boundary-aware tokenization
 
-- 渲染阶段先计算真正需要发布的 rewrite/cache/message markers；不要为永远不消费的 message boundary
-  生成 token prefix。
+- 渲染阶段只记录 rewrite/cache/message 的 byte marker；每个 marker 在线性 tokenization 结果上做常数级
+  frontier 映射，不为任何 marker 生成独立 token prefix。
 - Tokenizer 提供一次 encode 同时返回 marker 到 token frontier 的结果。跨 marker 的 tokenizer token
   必须按完整文本语义决定，不能简单把每段独立 tokenize 后拼接。
 - 旧的逐 prefix encode 只可留在测试 oracle，生产路径完全删除，不保留双轨 fallback。
 
-验收：覆盖 token 跨 message/cache marker 的 adversarial 文本；新旧完整 token 序列和所有语义 frontier
-精确一致；增加 turn 数不会增加 full-tokenize 调用次数。
+验收：覆盖 token 跨 message/cache marker 的 adversarial 文本；完整 token 序列和结构性 exact frontier
+精确一致；跨 token/cache marker 的 stable frontier 只保留 normalization/pre-tokenization 已完成的前缀，
+不依赖 marker 后字节；增加 turn 数不会增加 full-tokenize 调用次数。
 
 #### M3.2 BPE 与 placeholder
 
@@ -467,7 +471,7 @@ prefix 命中；构造 hash collision 仍由精确比较拒绝；无关 catalog 
 - 媒体 placeholder 通过一次 rendered-text scan 生成 segments 和 source→rendered cumulative delta map；
   rewrite/cache boundaries 一次映射，不逐媒体修改全部后续 offset。
 
-验收：长 single-word benchmark 的 operation slope 为 `O(N log N)`；普通/特殊 token fixture 精确一致；
+验收：临时长 single-word benchmark 的 operation slope 为 `O(N log N)`；普通/特殊 token fixture 精确一致；
 媒体数增长时 rendered text 只完整扫描一次。
 
 ### M4：Vision 与媒体路径
@@ -540,7 +544,7 @@ M0 之后每个单元的交付说明统一报告：
 
 - 改变了哪个复杂度/所有权不变量；
 - 对应 Host phase 和 operation counter 的前后变化；
-- 已运行的构建、语义测试和无模型 benchmark；
+- 已运行的构建、语义测试和临时无模型 benchmark 结论；
 - 需要用户用真实 `ninfer serve` 验收的 workload 与预期日志信号。
 
 ## 7. 验收矩阵
@@ -558,8 +562,9 @@ M0 之后每个单元的交付说明统一报告：
 | C=2–8 compact batch | 每 row 输出和取消语义正确 | worker aggregate 一段只计一次；request exposure 各计完整延迟 | throughput aggregate vs request exposure |
 | Responses 长 chain/stream | 外部 schema/body 一致 | put/filter work 随新增内容线性 | consumer timing；Engine timing不被混入 |
 
-性能回归判断以 raw JSONL 的 worker aggregate 为主；stderr rounded summary 只用于现场观察。墙钟
-benchmark 不替代 operation counter 的复杂度测试，operation counter 也不替代用户真实语料的端到端验收。
+性能回归判断以 raw JSONL 的 worker aggregate 为主；stderr rounded summary 只用于现场观察。临时墙钟
+benchmark 不替代语义测试，局部复杂度证据也不替代用户真实语料的端到端验收；这些 benchmark 不作为
+长期 target 保留。
 
 ## 8. 计划完成与文档收口
 
