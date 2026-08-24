@@ -17,7 +17,7 @@ struct GdnReplayFoldRow {
 };
 
 /**
- * Op: gdn_replay_fold
+ * Prepared Op: gdn_replay_fold
  *
  * Replays each row's [0,commit_columns) record prefix across every registered GDN layer and
  * updates the caller-selected absolute linear-attention destination state slot. rows[b] always maps
@@ -33,11 +33,23 @@ struct GdnReplayFoldRow {
  * order, writes the final FP32 recurrent state, and sets convolution history to
  * tail_3(old_history || conv_record[0:commit_columns]).
  *
- * The Op admits the two registered all-layer geometries only, owns no workspace or metadata
+ * Construction validates the immutable record/state geometry, layout, address ranges and
+ * disjointness once. execute() validates only active rows, state selectors and commit extents.
+ * The bound record/state addresses must remain stable for the plan lifetime.
+ *
+ * The Op admits the two registered all-layer geometries only, owns no workspace or device
  * allocation, and does not read query or generate token output. The four record planes are
  * read-only, disjoint, and do not overlap either state region.
  */
-void gdn_replay_fold(const GdnReplayRecords& records, LinearAttentionStateAllLayersView states,
-                     std::span<const GdnReplayFoldRow> rows, cudaStream_t stream);
+class GdnReplayFoldPlan {
+public:
+    GdnReplayFoldPlan(const GdnReplayRecords& records, LinearAttentionStateAllLayersView states);
+
+    void execute(std::span<const GdnReplayFoldRow> rows, cudaStream_t stream) const;
+
+private:
+    GdnReplayRecords records_;
+    LinearAttentionStateAllLayersView states_;
+};
 
 } // namespace ninfer::ops

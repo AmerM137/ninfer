@@ -621,8 +621,10 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
         *state_images, host_state_images.get(), static_cast<std::uint32_t>(logical_state_capacity));
     if (plan.persistent.replay_records) {
         replay_records.emplace(backing, *plan.persistent.replay_records);
+        replay_fold.emplace(*replay_records, state_images->linear().all_layers_view());
     }
-    if (replay_records.has_value() != (speculative_backend != SpeculativeBackend::None)) {
+    if (replay_records.has_value() != (speculative_backend != SpeculativeBackend::None) ||
+        replay_fold.has_value() != replay_records.has_value()) {
         throw std::logic_error("ReplaySSM records do not match the sequence plan");
     }
     if (plan.persistent.dflash) {
@@ -8517,7 +8519,7 @@ runtime::ExecutionTiming ProgramImplCore::resolve_pending_raw(
         return timing.finish();
     }
 
-    if (!replay_records) {
+    if (!replay_fold) {
         throw std::logic_error("speculative pending batch has no ReplaySSM records");
     }
 
@@ -8564,8 +8566,7 @@ runtime::ExecutionTiming ProgramImplCore::resolve_pending_raw(
     const auto tail_started = Clock::now();
     try {
         timing.resume_submit();
-        ops::gdn_replay_fold(*replay_records, state_images->linear().all_layers_view(),
-                             std::span<const ops::GdnReplayFoldRow>(fold_rows.data(), lanes.size()),
+        replay_fold->execute(std::span<const ops::GdnReplayFoldRow>(fold_rows.data(), lanes.size()),
                              device.stream);
 
         if (needs_hidden_correction) {

@@ -389,7 +389,8 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
             destination_slots[static_cast<std::size_t>(row)],
             commits[static_cast<std::size_t>(row)]};
     }
-    ops::gdn_replay_fold(records, state_pool.all_layers_view(), fold_rows, nullptr);
+    const ops::GdnReplayFoldPlan fold_plan(records, state_pool.all_layers_view());
+    fold_plan.execute(fold_rows, nullptr);
     cuda_synchronize();
 
     int failures             = 0;
@@ -583,6 +584,7 @@ int run_record_fold_rounds() {
     DeviceBuffer state_storage(state_builder.finish(256));
     state_storage.fill(0);
     LinearAttentionStatePool state_pool({state_storage.p, state_storage.bytes}, state_layout);
+    const ops::GdnReplayFoldPlan fold_plan(records, state_pool.all_layers_view());
 
     const std::size_t recurrent_slot_elements =
         static_cast<std::size_t>(kStateDim) * kStateDim * kProfile.value_heads;
@@ -745,7 +747,7 @@ int run_record_fold_rounds() {
         }
 
         const std::array fold_rows{ops::GdnReplayFoldRow{kInitialSlot, kInitialSlot, commit}};
-        ops::gdn_replay_fold(records, state_pool.all_layers_view(), fold_rows, nullptr);
+        fold_plan.execute(fold_rows, nullptr);
         cuda_synchronize();
         for (std::int32_t layer = 0; layer < kProfile.layers; ++layer) {
             const Tensor folded_recurrent =

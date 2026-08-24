@@ -298,11 +298,7 @@ public:
         state_storage_.fill(0);
     }
 
-    [[nodiscard]] const GdnReplayRecords& records() const { return records_; }
-
-    [[nodiscard]] LinearAttentionStateAllLayersView states() const {
-        return states_.all_layers_view();
-    }
+    [[nodiscard]] const ops::GdnReplayFoldPlan& fold_plan() const { return fold_plan_; }
 
 private:
     static GdnReplayRecordLayout make_record_layout(const Profile& profile, std::int32_t width,
@@ -352,6 +348,7 @@ private:
     GdnReplayRecords records_;
     DeviceBuffer state_storage_;
     LinearAttentionStatePool states_;
+    ops::GdnReplayFoldPlan fold_plan_{records_, states_.all_layers_view()};
 };
 
 DeviceBuffer make_i32(const std::vector<std::int32_t>& values) {
@@ -473,7 +470,7 @@ Measurement measure_fold(const FoldResources& resources,
                          int warmup, int repeat) {
     cudaStream_t stream = nullptr;
     const auto launch   = [&](cudaStream_t launch_stream) {
-        ops::gdn_replay_fold(resources.records(), resources.states(), rows, launch_stream);
+        resources.fold_plan().execute(rows, launch_stream);
     };
     Measurement result;
     result.warm           = bench::measure_launch(launch, stream, warmup, repeat);

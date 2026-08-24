@@ -304,14 +304,18 @@ void gated_delta_net_replay_record(const Tensor& q, const Tensor& k, const Tenso
                                                      value_record, gate_record, out, stream);
 }
 
-void gdn_replay_fold(const GdnReplayRecords& records, LinearAttentionStateAllLayersView states,
-                     std::span<const GdnReplayFoldRow> rows, cudaStream_t stream) {
-    validate_fold_records(records);
-    validate_fold_states(records, states);
-    require_records_disjoint_from_states(records, states);
+GdnReplayFoldPlan::GdnReplayFoldPlan(const GdnReplayRecords& records,
+                                     LinearAttentionStateAllLayersView states)
+    : records_(records), states_(states) {
+    validate_fold_records(records_);
+    validate_fold_states(records_, states_);
+    require_records_disjoint_from_states(records_, states_);
+}
+
+void GdnReplayFoldPlan::execute(std::span<const GdnReplayFoldRow> rows, cudaStream_t stream) const {
     const detail::gated_delta_net::GdnReplayFoldKernelRows packed =
-        validate_fold_rows(records, states, rows);
-    detail::gated_delta_net::launch_replay_fold(records, states, packed,
+        validate_fold_rows(records_, states_, rows);
+    detail::gated_delta_net::launch_replay_fold(records_, states_, packed,
                                                 static_cast<std::int32_t>(rows.size()), stream);
 }
 

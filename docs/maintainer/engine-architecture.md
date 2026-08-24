@@ -685,6 +685,11 @@ Program 为每行返回一个 disposition：
 MTP/DFlash acceptance、KV frontier、Linear Attention state、backend state、RNG/anchor 和 checkpoint 都在
 Program commit 中推进到同一个 accepted frontier。Engine 不分别提交这些 target states。
 
+Speculative ReplaySSM fold 使用 Program-lifetime `GdnReplayFoldPlan`。Program 构造时一次验证固定的
+record/state geometry、tensor layout、layer stride、address range 和 disjointness；每次 commit 只组装并验证
+本轮 active rows 的 source/destination state selector、accepted extent 与跨 row 冲突，然后提交 fold kernel。
+固定绑定验证不能回到逐轮路径，动态 selector/extent 验证也不能提前假定。
+
 ### 8.5 Thinking cap 与 target control transaction
 
 `ExecutionOptions::thinking.budget` 是 accepted model-origin thinking token 的可选正数上限。
