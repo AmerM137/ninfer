@@ -236,14 +236,19 @@ void test_kv_store(ninfer::DeviceContext& device) {
     auto host_extent = extents.publish(std::move(*host_backup));
     expect(pages.host_resident(logical_pages[0]) && pages.host_resident(logical_pages[1]),
            "KV extent publication attaches every logical Host replica");
-    auto [left_extent, right_extent] = extents.split(host_extent, 1);
-    expect(!extents.valid(host_extent) && extents.valid(left_extent) &&
-               extents.valid(right_extent) &&
-               pages.host_replica(logical_pages[0]).page_offset == 0 &&
+    const std::array first_host_release{logical_pages[0]};
+    expect(extents.release_page_replicas(pages, first_host_release),
+           "first Host page release transaction");
+    const auto retained_host_extent = pages.host_replica(logical_pages[1]).extent;
+    expect(!extents.valid(host_extent) && !pages.host_resident(logical_pages[0]) &&
+               extents.valid(retained_host_extent) &&
                pages.host_replica(logical_pages[1]).page_offset == 0,
-           "KV extent split rewrites every generation-checked page capability");
-    expect(extents.release(left_extent) && extents.release(right_extent),
-           "Both KV extents release while Device replicas survive");
+           "partial Host release partitions an extent and republishes the retained run");
+    const std::array second_host_release{logical_pages[1]};
+    expect(extents.release_page_replicas(pages, second_host_release),
+           "second Host page release transaction");
+    expect(!pages.host_resident(logical_pages[1]) && host_arena.occupied_bytes() == 0,
+           "partitioned Host replicas release while Device replicas survive");
 
     auto second_host_backup = extents.prepare(pages, logical_pages);
     expect(second_host_backup.has_value(), "second Host KV extent reservation");
@@ -336,6 +341,39 @@ void test_kv_store(ninfer::DeviceContext& device) {
                addresses.release(*snapshot_destination) && addresses.release(*snapshot_source) &&
                pages.occupied() == 0,
            "active KV snapshot references close with both address spaces");
+
+    const auto alternating = addresses.create_active(4, 0);
+    expect(alternating.has_value(), "alternating Host release address allocation");
+    addresses.materialize_to_tokens(*alternating, 193, device.stream);
+    addresses.commit_frontier(*alternating, 193);
+    addresses.deactivate(*alternating);
+    const std::array alternating_pages{
+        addresses.logical_page(*alternating, 0), addresses.logical_page(*alternating, 1),
+        addresses.logical_page(*alternating, 2), addresses.logical_page(*alternating, 3)};
+    auto alternating_backup = extents.prepare(pages, alternating_pages);
+    expect(alternating_backup.has_value(), "alternating Host extent reservation");
+    const auto alternating_sources = extents.device_sources(*alternating_backup);
+    physical_pages.copy_to_host(alternating_sources, extents.writable_view(*alternating_backup),
+                                device.transfer_stream);
+    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+    const auto alternating_extent = extents.publish(std::move(*alternating_backup));
+    const std::array alternating_release{alternating_pages[0], alternating_pages[2]};
+    expect(extents.release_page_replicas(pages, alternating_release),
+           "alternating Host page release transaction");
+    expect(!extents.valid(alternating_extent) && !pages.host_resident(alternating_pages[0]) &&
+               pages.host_resident(alternating_pages[1]) &&
+               !pages.host_resident(alternating_pages[2]) &&
+               pages.host_resident(alternating_pages[3]) &&
+               pages.host_replica(alternating_pages[1]).extent !=
+                   pages.host_replica(alternating_pages[3]).extent &&
+               host_arena.occupied_bytes() == 2U * host_layout.page_stride,
+           "one batch partitions alternating Host release and retained runs exactly once");
+    const std::array alternating_retained{alternating_pages[1], alternating_pages[3]};
+    expect(extents.release_page_replicas(pages, alternating_retained),
+           "retained Host run release transaction");
+    expect(host_arena.occupied_bytes() == 0 && addresses.release(*alternating) &&
+               pages.occupied() == 0,
+           "alternating Host extent partitions close without leaked descriptors");
 
     const auto shared = addresses.create_active(3, 0);
     expect(shared.has_value(), "shared-prefix source address allocation");

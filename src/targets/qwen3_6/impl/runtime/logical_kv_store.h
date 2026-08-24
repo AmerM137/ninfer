@@ -45,6 +45,7 @@ private:
 struct HostKVPageReplica {
     HostKVExtentCapability extent;
     std::uint32_t page_offset       = 0;
+    std::uint32_t membership_node   = std::numeric_limits<std::uint32_t>::max();
     std::uint64_t content_epoch     = 0;
     std::uint32_t committed_columns = 0;
 };
@@ -696,6 +697,7 @@ public:
     void attach_host_replica(LogicalKVPageHandle handle, HostKVPageReplica replica) {
         Page& page = require(handle);
         if (!replica.extent.valid() ||
+            replica.membership_node == std::numeric_limits<std::uint32_t>::max() ||
             !can_attach_host_replica(handle, replica.content_epoch, replica.committed_columns)) {
             throw std::logic_error("logical KV Host replica is not publishable");
         }
@@ -708,9 +710,11 @@ public:
         Page& page = pages_[handle.index_];
         if (!page.host_replica || page.host_replica->extent != expected.extent ||
             page.host_replica->page_offset != expected.page_offset ||
+            page.host_replica->membership_node != expected.membership_node ||
             page.host_replica->content_epoch != expected.content_epoch ||
             page.host_replica->committed_columns != expected.committed_columns ||
             expected.content_epoch != page.content_epoch || !replacement.extent.valid() ||
+            replacement.membership_node != expected.membership_node ||
             replacement.content_epoch != expected.content_epoch ||
             replacement.committed_columns != expected.committed_columns) {
             std::terminate();

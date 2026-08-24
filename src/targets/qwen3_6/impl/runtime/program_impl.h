@@ -3370,10 +3370,9 @@ void ProgramImplCore::prepare_consumed_source(MaterializationTransaction& transa
     if (host_tail_release_count != 0) {
         const std::span<const HostKVPageReplicaRelease> releases(host_tail_releases.data(),
                                                                  host_tail_release_count);
-        if (!host_kv_extents->can_release_page_replicas(releases)) {
+        if (!host_kv_extents->release_page_replicas(releases)) {
             throw std::logic_error("stale source Host KV tails cannot be released atomically");
         }
-        host_kv_extents->release_page_replicas(releases);
     }
     for (TruncateTarget& target : std::span(targets.data(), target_count)) {
         if (target.prefix_fork) {
@@ -4260,10 +4259,9 @@ ProgramImplCore::publish_pressure_host_releases(MaterializationTransaction::Pres
                 throw std::logic_error("pressure Host KV release membership changed");
             }
         }
-        if (!host_kv_extents || !host_kv_extents->can_release_page_replicas(pages, membership)) {
+        if (!host_kv_extents || !host_kv_extents->release_page_replicas(pages, membership)) {
             throw std::logic_error("pressure Host KV duplicates are no longer releasable");
         }
-        host_kv_extents->release_page_replicas(pages, membership);
         const std::size_t page_stride =
             &pages == text_kv_pages.get() ? text_host_kv_page_stride : backend_host_kv_page_stride;
         if (action.page_count != 0 &&
@@ -4484,7 +4482,9 @@ void ProgramImplCore::publish_pressure_work(
                 if (action.kind == qwen3_6::PressureKVActionKind::DropHostDuplicate) {
                     if (host_release_published) { return; }
                     if (!host_kv_extents || backup) { std::terminate(); }
-                    host_kv_extents->release_page_replicas(pages, membership);
+                    if (!host_kv_extents->release_page_replicas(pages, membership)) {
+                        std::terminate();
+                    }
                     return;
                 }
                 if (backup) {
@@ -8140,11 +8140,10 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
             if (stale_tail_count != 0) {
                 const std::span<const HostKVPageReplicaRelease> releases(stale_tail_replicas.data(),
                                                                          stale_tail_count);
-                if (!host_kv_extents->can_release_page_replicas(releases)) {
+                if (!host_kv_extents->release_page_replicas(releases)) {
                     throw std::logic_error(
                         "stale Host KV tail replicas cannot be released atomically");
                 }
-                host_kv_extents->release_page_replicas(releases);
             }
             if (!text_prefix_fork && transaction.text_activation_frontier &&
                 (text_kv_addresses->committed_frontier(sequence.kv->text) !=
