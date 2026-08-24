@@ -586,10 +586,10 @@ void feed_decoded_text(DecoderState& state, std::string_view text, const StopPol
     state.think_marker_pending.erase(0, safe);
 }
 
-void feed_token_bytes(DecoderState& state, std::string bytes, const StopPolicy& policy,
+void feed_token_bytes(DecoderState& state, std::string_view bytes, const StopPolicy& policy,
                       PublishedOutput& emitted, std::uint32_t committed_tokens,
                       StopMatch* best_match) {
-    state.utf8_pending += bytes;
+    state.utf8_pending.append(bytes);
     const std::size_t valid = valid_utf8_prefix_size(state.utf8_pending);
     if (valid == 0) { return; }
     const std::string text = state.utf8_pending.substr(0, valid);
@@ -987,12 +987,9 @@ runtime::OutputDecision OutputSession::preview_model(std::span<const TokenId> to
     };
 
     for (std::size_t index = 0; index < tokens.size(); ++index) {
-        const std::uint32_t count = static_cast<std::uint32_t>(index + 1);
-        const TokenId token       = tokens[index];
-        if (!impl_->tokenizer->is_valid_token(token)) {
-            throw std::out_of_range("generated token is outside the checkpoint vocabulary: " +
-                                    std::to_string(token));
-        }
+        const std::uint32_t count          = static_cast<std::uint32_t>(index + 1);
+        const TokenId token                = tokens[index];
+        const fi::DecodedTokenView decoded = impl_->tokenizer->decoded_token(token);
 
         if (impl_->preview_state.in_reasoning) { ++impl_->preview_state.reasoning_tokens; }
         if (impl_->preview_semantic.in_reasoning) {
@@ -1001,8 +998,7 @@ runtime::OutputDecision OutputSession::preview_model(std::span<const TokenId> to
                 impl_->preview_semantic.model_thinking_tokens > *impl_->preview_semantic.budget) {
                 throw std::logic_error("model output exceeded the licensed thinking budget");
             }
-            feed_semantic_thinking(impl_->preview_semantic,
-                                   impl_->tokenizer->decode_token_bytes(token, false));
+            feed_semantic_thinking(impl_->preview_semantic, decoded.bytes);
         }
 
         const bool stop_token =
@@ -1016,8 +1012,8 @@ runtime::OutputDecision OutputSession::preview_model(std::span<const TokenId> to
         }
 
         StopMatch match;
-        const std::string bytes =
-            impl_->tokenizer->decode_token_bytes(token, !impl_->preserve_special);
+        const std::string_view bytes =
+            !impl_->preserve_special && decoded.special ? std::string_view{} : decoded.bytes;
         feed_token_bytes(impl_->preview_state, bytes, impl_->policy, impl_->preview_output, count,
                          &match);
 
@@ -1089,15 +1085,12 @@ runtime::OutputDecision OutputSession::preview_control(std::span<const TokenId> 
     impl_->preview_semantic = impl_->semantic;
     impl_->preview_output.clear();
     for (std::size_t index = 0; index < tokens.size(); ++index) {
-        const TokenId token = tokens[index];
-        if (!impl_->tokenizer->is_valid_token(token)) {
-            throw std::out_of_range("thinking control token is outside the checkpoint vocabulary");
-        }
+        const TokenId token                = tokens[index];
+        const fi::DecodedTokenView decoded = impl_->tokenizer->decoded_token(token);
         if (impl_->preview_state.in_reasoning) { ++impl_->preview_state.reasoning_tokens; }
-        const std::string semantic_bytes = impl_->tokenizer->decode_token_bytes(token, false);
-        feed_semantic_thinking(impl_->preview_semantic, semantic_bytes);
-        const std::string presentation_bytes =
-            impl_->tokenizer->decode_token_bytes(token, !impl_->preserve_special);
+        feed_semantic_thinking(impl_->preview_semantic, decoded.bytes);
+        const std::string_view presentation_bytes =
+            !impl_->preserve_special && decoded.special ? std::string_view{} : decoded.bytes;
         feed_token_bytes(impl_->preview_state, presentation_bytes, impl_->policy,
                          impl_->preview_output, static_cast<std::uint32_t>(index + 1), nullptr);
     }

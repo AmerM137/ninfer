@@ -117,6 +117,11 @@ OutputSession   = 一条请求独占的、可 preview/commit 的输出语义状�
 
 Frontend 不持有 admission ledger、physical sequence、KV 或 CUDA Graph，也不决定请求顺序。
 
+Tokenizer 在 Frontend 构造时一次建立 immutable token-byte/special-flag table。所有 OutputSession
+共享该表；每轮对 generated token 只取得一次 decoded view，再由 semantic thinking tracker、presentation
+decoder 和 stop matcher共同消费。Session只拥有跨轮 UTF-8、thinking marker 和 stop-prefix 等有界状态，
+不复制词表，也不保留或重扫完整已生成文本。
+
 ### 2.3 Engine
 
 Engine 是请求控制平面。它负责：

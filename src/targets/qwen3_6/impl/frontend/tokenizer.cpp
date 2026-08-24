@@ -369,6 +369,23 @@ std::unordered_map<std::uint32_t, char> build_byte_level_decoder() {
     return decoder;
 }
 
+std::string decode_byte_level_token(std::string_view token, int id) {
+    static const std::unordered_map<std::uint32_t, char> byte_decoder = build_byte_level_decoder();
+    std::string bytes;
+    const std::vector<uni::CodepointSpan> codepoints =
+        uni::utf8_codepoints(token, "Tokenizer::decode token id " + std::to_string(id));
+    bytes.reserve(codepoints.size());
+    for (const uni::CodepointSpan& codepoint : codepoints) {
+        const auto byte = byte_decoder.find(static_cast<std::uint32_t>(codepoint.value));
+        if (byte == byte_decoder.end()) {
+            throw std::invalid_argument("Tokenizer::decode token id " + std::to_string(id) +
+                                        " contains a character outside the byte-level alphabet");
+        }
+        bytes.push_back(byte->second);
+    }
+    return bytes;
+}
+
 std::unordered_map<unsigned char, std::string> build_byte_level_encoder() {
     std::unordered_map<unsigned char, std::string> encoder;
     std::uint32_t next = 256;
@@ -495,11 +512,6 @@ std::vector<std::string> byte_level_symbols(std::string_view text) {
     return symbols;
 }
 
-bool is_added_token_id(const std::vector<AddedToken>& added_tokens, int id) {
-    return std::any_of(added_tokens.begin(), added_tokens.end(),
-                       [id](const AddedToken& token) { return token.id == id; });
-}
-
 bool is_stop_token_id(std::span<const int> stop_token_ids, int id) {
     return std::find(stop_token_ids.begin(), stop_token_ids.end(), id) != stop_token_ids.end();
 }
@@ -584,15 +596,15 @@ Tokenizer::Tokenizer(TokenizerResources resources) {
     const Json& model = require_object_field(root, "model", tokenizer_label);
 
     VocabMetadata vocab_metadata = load_vocab(model, tokenizer_label);
-    id_to_token_                 = std::move(vocab_metadata.id_to_token);
+    decoded_token_bytes_         = std::move(vocab_metadata.id_to_token);
     vocab_token_to_id_           = std::move(vocab_metadata.token_to_id);
-    valid_token_ids_.resize(id_to_token_.size());
+    valid_token_ids_.resize(decoded_token_bytes_.size());
     for (const int id : vocab_metadata.occupied_ids) {
         valid_token_ids_.at(static_cast<std::size_t>(id)) = true;
     }
-    added_tokens_ = load_added_tokens(root, tokenizer_label, id_to_token_,
+    added_tokens_ = load_added_tokens(root, tokenizer_label, decoded_token_bytes_,
                                       vocab_metadata.occupied_ids, vocab_token_to_id_);
-    merge_added_tokens_decoder(tokenizer_config, tokenizer_config_label, id_to_token_,
+    merge_added_tokens_decoder(tokenizer_config, tokenizer_config_label, decoded_token_bytes_,
                                vocab_metadata.occupied_ids, vocab_token_to_id_, added_tokens_);
     for (std::size_t index = 0; index < added_tokens_.size(); ++index) {
         const std::string& content = added_tokens_[index].content;
@@ -600,11 +612,22 @@ Tokenizer::Tokenizer(TokenizerResources resources) {
             added_token_candidates_[static_cast<unsigned char>(content.front())].push_back(index);
         }
     }
-    if (valid_token_ids_.size() < id_to_token_.size()) {
-        valid_token_ids_.resize(id_to_token_.size());
+    if (valid_token_ids_.size() < decoded_token_bytes_.size()) {
+        valid_token_ids_.resize(decoded_token_bytes_.size());
     }
+    std::vector<bool> added_token_ids(decoded_token_bytes_.size());
+    special_token_ids_.resize(decoded_token_bytes_.size());
     for (const AddedToken& token : added_tokens_) {
-        valid_token_ids_.at(static_cast<std::size_t>(token.id)) = true;
+        const auto index             = static_cast<std::size_t>(token.id);
+        valid_token_ids_.at(index)   = true;
+        added_token_ids.at(index)    = true;
+        special_token_ids_.at(index) = token.special;
+    }
+    for (std::size_t index = 0; index < decoded_token_bytes_.size(); ++index) {
+        if (valid_token_ids_[index] && !added_token_ids[index]) {
+            decoded_token_bytes_[index] =
+                decode_byte_level_token(decoded_token_bytes_[index], static_cast<int>(index));
+        }
     }
     bpe_merge_ranks_        = load_bpe_merge_ranks(model, tokenizer_label);
     has_bpe_merges_         = true;
@@ -675,41 +698,29 @@ std::string Tokenizer::decode(std::span<const int> ids, DecodeOptions options) c
     return text;
 }
 
-std::string Tokenizer::decode_token_bytes(int id, bool skip_special_tokens) const {
-    static const std::unordered_map<std::uint32_t, char> byte_decoder = build_byte_level_decoder();
-
-    if (skip_special_tokens && is_special_token(id)) { return {}; }
+DecodedTokenView Tokenizer::decoded_token(int id) const {
     if (id < 0) {
         throw std::invalid_argument("Tokenizer::decode received negative token id " +
                                     std::to_string(id));
     }
     const auto index = static_cast<std::size_t>(id);
-    if (index >= id_to_token_.size() || index >= valid_token_ids_.size() ||
+    if (index >= decoded_token_bytes_.size() || index >= valid_token_ids_.size() ||
         !valid_token_ids_.at(index)) {
         throw std::out_of_range("Tokenizer::decode token id " + std::to_string(id) +
                                 " is outside loaded vocabulary");
     }
+    return DecodedTokenView{.bytes   = decoded_token_bytes_[index],
+                            .special = special_token_ids_[index]};
+}
 
-    const std::string& token = id_to_token_.at(index);
-    if (is_added_token_id(added_tokens_, id)) { return token; }
-
-    std::string bytes;
-    const std::vector<uni::CodepointSpan> codepoints =
-        uni::utf8_codepoints(token, "Tokenizer::decode token id " + std::to_string(id));
-    for (const uni::CodepointSpan& codepoint : codepoints) {
-        const auto byte = byte_decoder.find(static_cast<std::uint32_t>(codepoint.value));
-        if (byte == byte_decoder.end()) {
-            throw std::invalid_argument("Tokenizer::decode token id " + std::to_string(id) +
-                                        " contains a character outside the byte-level alphabet");
-        }
-        bytes.push_back(byte->second);
-    }
-    return bytes;
+std::string_view Tokenizer::decode_token_bytes(int id, bool skip_special_tokens) const {
+    const DecodedTokenView token = decoded_token(id);
+    return skip_special_tokens && token.special ? std::string_view{} : token.bytes;
 }
 
 bool Tokenizer::is_special_token(int id) const noexcept {
-    return std::any_of(added_tokens_.begin(), added_tokens_.end(),
-                       [id](const AddedToken& token) { return token.id == id && token.special; });
+    return id >= 0 && static_cast<std::size_t>(id) < special_token_ids_.size() &&
+           special_token_ids_[static_cast<std::size_t>(id)];
 }
 
 bool Tokenizer::is_valid_token(int id) const noexcept {

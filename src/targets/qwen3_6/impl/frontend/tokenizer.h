@@ -31,6 +31,11 @@ struct AddedToken {
     bool special     = false;
 };
 
+struct DecodedTokenView {
+    std::string_view bytes;
+    bool special = false;
+};
+
 struct TokenizerResources {
     std::string_view tokenizer_json;
     std::string_view tokenizer_config_json;
@@ -43,7 +48,9 @@ public:
 
     std::vector<int> encode(std::string_view text, EncodeOptions options = {}) const;
     std::string decode(std::span<const int> ids, DecodeOptions options = {}) const;
-    std::string decode_token_bytes(int id, bool skip_special_tokens = false) const;
+    [[nodiscard]] DecodedTokenView decoded_token(int id) const;
+    [[nodiscard]] std::string_view decode_token_bytes(int id,
+                                                      bool skip_special_tokens = false) const;
 
     [[nodiscard]] const std::vector<int>& default_stop_token_ids() const noexcept {
         return default_stop_token_ids_;
@@ -54,8 +61,9 @@ public:
     [[nodiscard]] bool has_exact_token_domain(std::size_t size) const noexcept;
 
 private:
-    std::vector<std::string> id_to_token_;
+    std::vector<std::string> decoded_token_bytes_;
     std::vector<bool> valid_token_ids_;
+    std::vector<bool> special_token_ids_;
     std::unordered_map<std::string, int> vocab_token_to_id_;
     std::unordered_map<std::string, int> bpe_merge_ranks_;
     bool has_bpe_merges_ = true;
