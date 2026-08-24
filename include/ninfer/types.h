@@ -422,6 +422,11 @@ public:
     virtual void publish(OutputDelta delta) = 0;
 };
 
+enum class OutputConsumerMode : std::uint8_t {
+    Aggregate,
+    Streaming,
+};
+
 class CancellationView {
 public:
     CancellationView() = default;

@@ -122,6 +122,11 @@ public:
             if (owner_ == nullptr || request_ == nullptr) {
                 throw std::logic_error("concurrent submission is empty");
             }
+            const bool streaming = request_->consumer_mode == OutputConsumerMode::Streaming;
+            if (streaming != (sink != nullptr)) {
+                throw std::invalid_argument(
+                    "GenerationHandle wait sink does not match its submitted consumer mode");
+            }
             EngineCore* owner = std::exchange(owner_, nullptr);
             return owner->wait_for_request(std::exchange(request_, nullptr), sink, cancellation);
         }
@@ -144,7 +149,8 @@ public:
     };
 
     Submission submit(PreparedPrompt prompt, PromptSummary prompt_summary, double prepare_seconds,
-                      ResolvedRequestOptions options, Clock::time_point pending_deadline = {}) {
+                      ResolvedRequestOptions options, OutputConsumerMode consumer_mode,
+                      Clock::time_point pending_deadline = {}) {
         const Clock::time_point submitted = Clock::now();
         if (pending_deadline == Clock::time_point{}) {
             pending_deadline = submitted + pending_timeout_;
@@ -183,7 +189,7 @@ public:
             }
             request = std::make_shared<Request>(request_id, std::move(prompt), std::move(output),
                                                 prompt_summary, prepare_seconds, std::move(options),
-                                                pending_deadline, submitted);
+                                                consumer_mode, pending_deadline, submitted);
         } catch (...) {
             release_reserved_capacity();
             throw;
@@ -594,16 +600,17 @@ private:
 
     void append_output(const std::shared_ptr<Request>& request, PublishedOutput output) {
         if (output.empty()) { return; }
+        const bool streaming = request->consumer_mode == OutputConsumerMode::Streaming;
         {
             std::lock_guard lock(request->mutex);
             for (OutputDelta& delta : output) {
                 std::string& full = delta.channel == OutputChannel::Reasoning ? request->reasoning
                                                                               : request->content;
                 full += delta.text;
-                request->events.push_back(std::move(delta));
+                if (streaming) { request->events.push_back(std::move(delta)); }
             }
         }
-        request->cv.notify_one();
+        if (streaming) { request->cv.notify_one(); }
     }
 
     void release_reserved_capacity() noexcept {
@@ -1036,7 +1043,7 @@ private:
                            &RuntimeHostWorkStats::replica_policy_invocations,
                            nvtx::Name::ReplicaPolicy);
         if (instance_.program->has_context_transaction() || scheduler_.prefill_lane() ||
-            !pending_snapshot().empty()) {
+            has_pending_requests()) {
             return;
         }
         if (resources_.reserve_replica_transition(*instance_.program) ==
@@ -1053,7 +1060,7 @@ private:
             post_capture_state == EngineRequestState::ModelFinished) {
             throw std::logic_error("committed capture offer has invalid Engine ownership");
         }
-        const bool permit_transfer = pending_snapshot().empty();
+        const bool permit_transfer = !has_pending_requests();
         const auto reserved        = resources_.reserve_active_capture(
             *instance_.program, *request->lane, std::move(offer), permit_transfer,
             CancellationFlagView{&request->cancelled});
@@ -1120,6 +1127,11 @@ private:
     [[nodiscard]] FifoSnapshot pending_snapshot() const {
         std::lock_guard lock(queue_mutex_);
         return Scheduling::fifo_snapshot(pending_);
+    }
+
+    [[nodiscard]] bool has_pending_requests() const {
+        std::lock_guard lock(queue_mutex_);
+        return !pending_.empty();
     }
 
     [[nodiscard]] bool erase_pending(const std::shared_ptr<Request>& request) {

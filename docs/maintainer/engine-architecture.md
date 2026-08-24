@@ -647,6 +647,11 @@ freeze cancellation snapshot
 完成。因此 consumer 不会看到只写入 provisional KV/model state、尚未提交的 token。Publication 本身按请求
 event queue 独立进行，不把多个 consumer 合并成一个 transport transaction。
 
+`Engine::submit` 同时固定 `Aggregate` 或 `Streaming` consumer mode，`wait()` 的 sink 必须与该 mode
+一致。Aggregate 请求仍逐轮提交 Frontend delta 到最终 content/reasoning，但不建立 per-token event queue、
+不执行逐 token condition-variable notify；Streaming 请求才保留增量 event publication。该 mode 在 queue
+membership 建立后不可切换，因而 worker 不需要在热路径探测 consumer 状态。
+
 OutputSession preview 可以更新自己的 staged decoder state，但在 `commit_preview` 前不发布。Preview 失败时，
 Engine 回滚 staged token IDs，调用 `abort_pending` 释放整个 frozen membership，然后进入 Engine-wide
 failure；不会逐 row 对 unresolved PendingBatch 调用普通 abort。

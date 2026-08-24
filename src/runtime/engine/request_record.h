@@ -110,11 +110,12 @@ struct RequestRecord {
 
     RequestRecord(std::uint64_t request_identity, PreparedPrompt input,
                   OutputSession output_session, PromptSummary summary, double frontend_seconds,
-                  ResolvedRequestOptions request_options, Clock::time_point limit,
-                  Clock::time_point submit_time)
+                  ResolvedRequestOptions request_options, OutputConsumerMode output_consumer,
+                  Clock::time_point limit, Clock::time_point submit_time)
         : id(request_identity), prompt(std::move(input)), output(std::move(output_session)),
           prompt_summary(std::move(summary)), prepare_seconds(frontend_seconds),
-          options(std::move(request_options)), deadline(limit), submitted(submit_time) {}
+          options(std::move(request_options)), consumer_mode(output_consumer), deadline(limit),
+          submitted(submit_time) {}
 
     RequestRecord(const RequestRecord&)            = delete;
     RequestRecord& operator=(const RequestRecord&) = delete;
@@ -149,6 +150,7 @@ struct RequestRecord {
     PromptSummary prompt_summary;
     double prepare_seconds = 0.0;
     ResolvedRequestOptions options;
+    const OutputConsumerMode consumer_mode;
     Clock::time_point deadline;
     Clock::time_point submitted;
     std::optional<Clock::time_point> first_token;

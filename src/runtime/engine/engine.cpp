@@ -304,6 +304,7 @@ ModelSamplingDefaults Engine::sampling_defaults() const {
 }
 
 GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
+                                OutputConsumerMode consumer_mode,
                                 std::chrono::steady_clock::time_point pending_deadline) {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     if (prompt.impl_ == nullptr) { throw std::invalid_argument("PreparedPrompt is empty"); }
@@ -322,12 +323,18 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
     if (resolved_options.execution.requested_output_tokens == 0) {
         struct ImmediateSubmission {
             GenerationResult result;
+            OutputConsumerMode consumer_mode = OutputConsumerMode::Aggregate;
 
-            GenerationResult wait(OutputSink*, const CancellationView& cancellation) {
+            GenerationResult wait(OutputSink* sink, const CancellationView& cancellation) {
+                const bool streaming = consumer_mode == OutputConsumerMode::Streaming;
+                if (streaming != (sink != nullptr)) {
+                    throw std::invalid_argument(
+                        "GenerationHandle wait sink does not match its submitted consumer mode");
+                }
                 if (cancellation.requested()) { result.finish_reason = FinishReason::Cancelled; }
                 return std::move(result);
             }
-        } immediate;
+        } immediate{.consumer_mode = consumer_mode};
 
         immediate.result.prompt                     = prompt_summary;
         immediate.result.finish_reason              = FinishReason::OutputLimit;
@@ -347,7 +354,7 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
             } else {
                 auto submission =
                     core->submit(std::move(prompt.impl_->value), prompt_summary, prepare_seconds,
-                                 std::move(resolved_options), pending_deadline);
+                                 std::move(resolved_options), consumer_mode, pending_deadline);
                 return GenerationHandle(std::make_unique<GenerationHandle::Impl>(
                     impl_, std::move(submission), resolved_sampling));
             }
@@ -357,7 +364,9 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
 
 GenerationResult Engine::generate(PreparedPrompt prompt, RequestOptions options, OutputSink* sink,
                                   const CancellationView& cancellation) {
-    return submit(std::move(prompt), std::move(options)).wait(sink, cancellation);
+    const OutputConsumerMode consumer_mode =
+        sink != nullptr ? OutputConsumerMode::Streaming : OutputConsumerMode::Aggregate;
+    return submit(std::move(prompt), std::move(options), consumer_mode).wait(sink, cancellation);
 }
 
 const EngineOptions& Engine::options() const {
