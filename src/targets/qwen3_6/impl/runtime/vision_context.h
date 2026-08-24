@@ -48,6 +48,8 @@ public:
 
     [[nodiscard]] static std::size_t output_transient_bytes(std::size_t merged_tokens);
     [[nodiscard]] static std::size_t workspace_bytes(const qwen3_6::VisionItemControl& item);
+    [[nodiscard]] static std::size_t workspace_bytes(std::size_t patches, std::size_t merged_tokens,
+                                                     std::size_t segments);
     [[nodiscard]] static std::size_t workspace_capacity_bytes(std::uint32_t max_merged_tokens,
                                                               std::uint32_t max_segments);
     void encode(const VisionItemView& item, Tensor& output, WorkspaceArena& workspace) const;

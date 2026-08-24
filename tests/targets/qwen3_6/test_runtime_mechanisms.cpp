@@ -193,7 +193,8 @@ void test_vision_control() {
                                  .token_spans = {{.begin = 3, .count = 1}, {.begin = 5, .count = 1}}},
     };
 
-    const q36::VisionControl control = q36::build_vision_control(prompt);
+    const q36::VisionControlPlan plan = q36::plan_vision_control(prompt);
+    const q36::VisionControl control  = q36::build_vision_control(prompt, plan, 0);
     expect(control.items.size() == 2, "Vision per-item control count");
     expect(control.items[0].patch_begin == 0 && control.items[0].patch_count == 4 &&
                control.items[0].merged_count == 1 && control.items[0].segment_length == 4 &&
@@ -213,6 +214,13 @@ void test_vision_control() {
                control.items[1].position_table_indices.size() == 32 &&
                control.items[1].position_table_weights.size() == 32,
            "video item control offsets");
+
+    const q36::VisionControl suffix = q36::build_vision_control(prompt, plan, 1);
+    expect(suffix.prepared_item_begin == 1 && suffix.items.size() == 1 &&
+               suffix.items[0].patch_begin == control.items[1].patch_begin &&
+               suffix.items[0].scatter_indices == control.items[1].scatter_indices &&
+               suffix.items[0].position_ids == control.items[1].position_ids,
+           "Vision suffix control contents");
 }
 
 q36::PreparedPromptData identity_prompt(std::uint8_t digest_byte = 1) {

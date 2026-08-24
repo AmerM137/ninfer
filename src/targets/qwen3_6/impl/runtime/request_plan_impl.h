@@ -273,33 +273,27 @@ RequestBasePlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
         .backend_kv_pages = base->backend_kv_page_entitlement,
     };
     if (prompt.has_media()) {
-        auto control =
-            std::make_shared<qwen3_6::VisionControl>(qwen3_6::build_vision_control(prompt));
-        std::size_t max_merged     = 0;
+        auto vision =
+            std::make_shared<qwen3_6::VisionControlPlan>(qwen3_6::plan_vision_control(prompt));
         std::uint32_t previous_end = 0;
-        for (const qwen3_6::VisionItemControl& item : control->items) {
-            if (item.scatter_indices.empty()) {
-                throw std::invalid_argument("vision item has no Text consumer columns");
-            }
-            const auto first = static_cast<std::uint32_t>(item.scatter_indices.front());
-            const auto last  = static_cast<std::uint32_t>(item.scatter_indices.back());
+        for (std::size_t index = 0; index < vision->items.size(); ++index) {
+            const qwen3_6::VisionItemControlPlan& item = vision->items[index];
             const std::uint32_t begin =
-                speculative_backend == SpeculativeBackend::Mtp && first != 0 ? first - 1 : first;
-            const std::uint32_t end = last + 1;
+                speculative_backend == SpeculativeBackend::Mtp && item.token_begin != 0
+                    ? item.token_begin - 1
+                    : item.token_begin;
             if (begin < previous_end) {
                 throw std::invalid_argument("vision item consumer spans overlap");
             }
-            if (end > base->summary.prompt_tokens) {
-                throw std::invalid_argument("vision item consumer span exceeds prompt");
-            }
-            if (schedule::VisionContext::workspace_bytes(item) > work.capacity()) {
+            if (schedule::VisionContext::workspace_bytes(
+                    prompt.vision_items[index].patch_count, item.merged_count,
+                    static_cast<std::size_t>(prompt.vision_items[index].grid.temporal)) >
+                work.capacity()) {
                 throw std::invalid_argument("vision item exceeds the Program workspace envelope");
             }
-            previous_end = end;
-            max_merged   = std::max(max_merged, item.merged_count);
+            previous_end = item.token_end;
         }
-        base->vision_transient_bytes = schedule::VisionContext::output_transient_bytes(max_merged);
-        base->vision_control         = std::move(control);
+        base->vision_control_plan = std::move(vision);
     }
 
     if (prompt.identity.rewrite_checkpoint) {
@@ -395,7 +389,7 @@ RequestBasePlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
         .final_added              = root_vector,
     };
     const std::size_t cold_prefill_splits =
-        base->vision_control != nullptr ? base->vision_control->items.size() : 0ULL;
+        base->vision_control_plan ? base->vision_control_plan->items.size() : 0ULL;
     base->summary.service_work_quanta =
         projected_service_work(base->summary, 0, prefill_chunk, cold_prefill_splits,
                                base->capture_groups, prompt.identity.rewrite_execution_frontiers);
@@ -682,22 +676,27 @@ std::optional<AdmissionPlan> ProgramImplCore::inspect_lane(
         }
     }
 
-    if (base.vision_control != nullptr) {
+    if (base.vision_control_plan) {
         VisionPrefillPlan vision;
-        vision.control = base.vision_control;
-        vision.uses.reserve(base.vision_control->items.size());
-        for (std::size_t index = 0; index < base.vision_control->items.size(); ++index) {
-            const qwen3_6::VisionItemControl& item = base.vision_control->items[index];
-            const auto first          = static_cast<std::uint32_t>(item.scatter_indices.front());
-            const auto last           = static_cast<std::uint32_t>(item.scatter_indices.back());
-            const std::uint32_t begin = plan->prepare_mtp && first != 0 ? first - 1 : first;
-            const std::uint32_t end   = last + 1;
-            if (end <= plan->reuse_base) { continue; }
-            vision.uses.push_back(VisionUseSpan{begin, end, static_cast<std::uint32_t>(index)});
+        vision.control_plan = base.vision_control_plan;
+        vision.uses.reserve(base.vision_control_plan->items.size());
+        std::size_t max_merged = 0;
+        for (std::size_t index = 0; index < base.vision_control_plan->items.size(); ++index) {
+            const qwen3_6::VisionItemControlPlan& item = base.vision_control_plan->items[index];
+            if (item.token_end <= plan->reuse_base) { continue; }
+            const std::uint32_t begin = plan->prepare_mtp && item.token_begin != 0
+                                            ? item.token_begin - 1
+                                            : item.token_begin;
+            vision.uses.push_back(VisionUseSpan{
+                .begin               = begin,
+                .end                 = item.token_end,
+                .prepared_item_index = static_cast<std::uint32_t>(index),
+            });
+            max_merged = std::max(max_merged, item.merged_count);
         }
         if (!vision.uses.empty()) {
             plan->transient_alignment = 256;
-            plan->transient_bytes     = base.vision_transient_bytes;
+            plan->transient_bytes     = schedule::VisionContext::output_transient_bytes(max_merged);
             plan->vision              = std::move(vision);
         }
     }
@@ -711,16 +710,16 @@ std::optional<AdmissionPlan> ProgramImplCore::inspect_lane(
     if (plan->vision) {
         std::vector<bool> counted(prompt.vision_items.size(), false);
         for (const VisionUseSpan& use : plan->vision->uses) {
-            if (use.item_index >= counted.size()) {
+            if (use.prepared_item_index >= counted.size()) {
                 throw std::logic_error("Vision cost input references a missing item");
             }
-            if (counted[use.item_index]) { continue; }
-            counted[use.item_index] = true;
+            if (counted[use.prepared_item_index]) { continue; }
+            counted[use.prepared_item_index] = true;
             if (remaining_vision_items == std::numeric_limits<std::uint64_t>::max()) {
                 throw std::overflow_error("Vision prefill item count exceeds uint64");
             }
             ++remaining_vision_items;
-            const std::size_t patches = prompt.vision_items[use.item_index].patch_count;
+            const std::size_t patches = prompt.vision_items[use.prepared_item_index].patch_count;
             if (patches > std::numeric_limits<std::uint64_t>::max() - remaining_vision_patches) {
                 throw std::overflow_error("Vision prefill cost input exceeds uint64");
             }

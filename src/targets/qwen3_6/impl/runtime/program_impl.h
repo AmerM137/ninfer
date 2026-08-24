@@ -3101,10 +3101,10 @@ runtime::ContextTransactionReserveStatus ProgramImplCore::reserve_materializatio
         if (request_plan.vision) {
             std::vector<bool> used(prompt.media_payloads.size(), false);
             for (const VisionUseSpan& use : request_plan.vision->uses) {
-                if (use.item_index >= used.size()) {
+                if (use.prepared_item_index >= used.size()) {
                     throw std::logic_error("Vision plan references a missing media payload");
                 }
-                used[use.item_index] = true;
+                used[use.prepared_item_index] = true;
             }
             for (std::size_t index = 0; index < used.size(); ++index) {
                 if (!used[index]) {
@@ -3112,6 +3112,24 @@ runtime::ContextTransactionReserveStatus ProgramImplCore::reserve_materializatio
                     continue;
                 }
             }
+            VisionPrefillPlan& vision      = *request_plan.vision;
+            const std::uint32_t first_item = vision.uses.front().prepared_item_index;
+            if (!vision.control_plan) {
+                throw std::logic_error("Vision suffix plan has no prepared metadata");
+            }
+            auto control = std::make_shared<qwen3_6::VisionControl>(
+                qwen3_6::build_vision_control(prompt, *vision.control_plan, first_item));
+            for (VisionUseSpan& use : vision.uses) {
+                if (use.prepared_item_index < first_item) {
+                    throw std::logic_error("Vision suffix item order changed during admission");
+                }
+                use.control_index = use.prepared_item_index - first_item;
+                if (use.control_index >= control->items.size()) {
+                    throw std::logic_error("Vision suffix control does not cover a planned item");
+                }
+            }
+            vision.control = std::move(control);
+            vision.control_plan.reset();
         }
         if (prompt.has_media() && !request_plan.vision) { prompt.release_all_media_payloads(); }
 

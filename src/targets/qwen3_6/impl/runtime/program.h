@@ -120,8 +120,7 @@ struct RequestBasePlanImpl<NINFER_QWEN36_VARIANT> {
     ops::SamplingConfig sampling;
     std::uint32_t text_kv_page_entitlement    = 0;
     std::uint32_t backend_kv_page_entitlement = 0;
-    std::shared_ptr<const qwen3_6::VisionControl> vision_control;
-    std::size_t vision_transient_bytes = 0;
+    std::shared_ptr<const qwen3_6::VisionControlPlan> vision_control_plan;
     std::optional<qwen3_6::RewriteCheckpointSpec> rewrite_checkpoint;
     std::vector<NINFER_QWEN36_RUNTIME_NS::CaptureGroup> capture_groups;
     qwen3_6::detail::PrefixShortlistDigests prefix_digests;

@@ -168,9 +168,13 @@ VisionContext::VisionContext(DeviceContext& ctx, const LoadedModelData& weights)
 }
 
 std::size_t VisionContext::workspace_bytes(const qwen3_6::VisionItemControl& item) {
-    return build_workspace_layout(item.patch_count, item.merged_count,
-                                  static_cast<std::size_t>(item.segment_count))
-        .bytes;
+    return workspace_bytes(item.patch_count, item.merged_count,
+                           static_cast<std::size_t>(item.segment_count));
+}
+
+std::size_t VisionContext::workspace_bytes(std::size_t patches, std::size_t merged_tokens,
+                                           std::size_t segments) {
+    return build_workspace_layout(patches, merged_tokens, segments).bytes;
 }
 
 std::size_t VisionContext::output_transient_bytes(std::size_t merged_tokens) {
@@ -336,14 +340,15 @@ VisionPrefillSession::VisionPrefillSession(DeviceContext& device, const LoadedMo
             use.end > prompt_.token_ids.size()) {
             throw std::invalid_argument("Vision suffix item spans are invalid or unordered");
         }
-        if (use.item_index >= plan_.control->items.size() ||
-            use.item_index >= prompt_.vision_items.size() ||
-            use.item_index >= prompt_.media_payloads.size() ||
-            (previous_item && use.item_index <= *previous_item)) {
+        if (use.control_index >= plan_.control->items.size() ||
+            use.prepared_item_index >= prompt_.vision_items.size() ||
+            use.prepared_item_index >= prompt_.media_payloads.size() ||
+            plan_.control->prepared_item_begin + use.control_index != use.prepared_item_index ||
+            (previous_item && use.prepared_item_index <= *previous_item)) {
             throw std::invalid_argument("Vision suffix item indices are invalid or unordered");
         }
-        const qwen3_6::VisionItemControl& control = plan_.control->items[use.item_index];
-        const qwen3_6::VisionItem& source         = prompt_.vision_items[use.item_index];
+        const qwen3_6::VisionItemControl& control = plan_.control->items[use.control_index];
+        const qwen3_6::VisionItem& source         = prompt_.vision_items[use.prepared_item_index];
         if (control.scatter_indices.empty() ||
             use.end != static_cast<std::uint32_t>(control.scatter_indices.back()) + 1U ||
             (use.begin != static_cast<std::uint32_t>(control.scatter_indices.front()) &&
@@ -365,13 +370,13 @@ VisionPrefillSession::VisionPrefillSession(DeviceContext& device, const LoadedMo
         const std::size_t patch_elements = checked_mul(
             control.patch_count, static_cast<std::size_t>(VisionScheduleConfig::patch_dim),
             "item patch elements");
-        const auto& payload = prompt_.media_payloads[use.item_index];
+        const auto& payload = prompt_.media_payloads[use.prepared_item_index];
         if (output_bytes > transient_.size || !payload ||
             payload->patch_elements != patch_elements) {
             throw std::invalid_argument("Vision suffix item storage has an invalid shape");
         }
         previous_end  = use.end;
-        previous_item = use.item_index;
+        previous_item = use.prepared_item_index;
     }
     encoded_payloads_pending_release_.reserve(plan_.uses.size());
     timers_.reserve(plan_.uses.size());
@@ -398,20 +403,20 @@ VisionChunk VisionPrefillSession::prepare_chunk(std::uint32_t begin, std::uint32
     if (active == nullptr) {
         return VisionChunk{static_cast<std::int32_t>(end - begin), nullptr, {}};
     }
-    const qwen3_6::VisionItemControl& control = plan_.control->items[active->item_index];
+    const qwen3_6::VisionItemControl& control = plan_.control->items[active->control_index];
     Tensor output(
         transient_.data, DType::BF16,
         {VisionScheduleConfig::out_hidden, static_cast<std::int32_t>(control.merged_count)});
 
-    if (!active_item_ || *active_item_ != active->item_index) {
-        const auto& payload = prompt_.media_payloads[active->item_index];
+    if (!active_item_ || *active_item_ != active->prepared_item_index) {
+        const auto& payload = prompt_.media_payloads[active->prepared_item_index];
         timers_.emplace_back(device_);
         timers_.back().start();
         context_.encode(VisionItemView{payload->span(), &control}, output, workspace_);
         timers_.back().record_stop();
         workspace_.reset();
-        active_item_ = active->item_index;
-        encoded_payloads_pending_release_.push_back(active->item_index);
+        active_item_ = active->prepared_item_index;
+        encoded_payloads_pending_release_.push_back(active->prepared_item_index);
     }
     return VisionChunk{static_cast<std::int32_t>(end - begin), &control, output};
 }
