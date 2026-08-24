@@ -252,8 +252,11 @@ void test_prefix_identity() {
     q36::PreparedPromptData original    = identity_prompt();
     std::vector<ninfer::TokenId> ledger = original.token_ids;
     q36::detail::ResidentPrefixIdentity resident;
+    q36::detail::PrefixShortlistDigests digests;
     resident.reserve(16);
     resident.assign(original);
+    digests.reserve(16);
+    digests.assign(original);
 
     expect(q36::detail::prefix_matches(original, ledger, resident, original.token_ids.size()),
            "identical multimodal prefix identity");
@@ -293,15 +296,35 @@ void test_prefix_identity() {
     expect(!q36::detail::prefix_matches(incoming_future, ledger, resident_with_future, 3),
            "different execution decomposition inside the frontier reused resident state");
 
+    q36::detail::PrefixShortlistDigests future_digest;
+    future_digest.assign(resident_future);
+    q36::detail::PrefixShortlistDigests incoming_digest;
+    incoming_digest.assign(incoming_future);
+    expect(future_digest.at(1) == incoming_digest.at(1),
+           "future execution boundaries changed an earlier content shortlist");
+    expect(future_digest.at(3) != incoming_digest.at(3),
+           "different in-prefix execution boundaries shared a shortlist digest");
+
     resident.append_generated(1, original.rope_delta);
     ledger.push_back(12);
+    const std::array<ninfer::TokenId, 1> generated{12};
+    digests.append_generated(generated, original.rope_delta);
     append_text_token(original, 12, 4);
+    q36::detail::PrefixShortlistDigests rebuilt;
+    rebuilt.assign(original);
+    expect(digests.at(ledger.size()) == rebuilt.at(ledger.size()),
+           "incremental generated-token shortlist diverged from a full rebuild");
     expect(q36::detail::prefix_matches(original, ledger, resident, ledger.size()),
            "generated multimodal continuation identity");
 
     const q36::PreparedPromptData prompt_only = identity_prompt();
     resident.truncate(prompt_only.token_ids.size());
+    digests.truncate(prompt_only.token_ids.size());
     ledger.resize(prompt_only.token_ids.size());
+    q36::detail::PrefixShortlistDigests prompt_digest;
+    prompt_digest.assign(prompt_only);
+    expect(digests.at(ledger.size()) == prompt_digest.at(ledger.size()),
+           "truncated shortlist did not restore the original frontier digest");
     expect(q36::detail::prefix_matches(prompt_only, ledger, resident, ledger.size()),
            "truncated multimodal continuation identity");
 }

@@ -258,8 +258,8 @@ public:
     [[nodiscard]] const runtime::RequestPlanSummary& summary() const noexcept;
     [[nodiscard]] const runtime::ResourceDemand& root_demand() const noexcept;
     [[nodiscard]] const PreparedContextCache& context_cache() const noexcept;
-    [[nodiscard]] std::span<const PrefixShortlistKey> shared_shortlist_keys() const noexcept;
-    [[nodiscard]] std::span<const PrefixShortlistKey> sparse_shortlist_keys() const noexcept;
+    [[nodiscard]] std::optional<PrefixShortlistKey>
+    prefix_shortlist_key(std::uint32_t frontier) const noexcept;
 
 public:
     explicit RequestBasePlan(std::unique_ptr<detail::RequestBasePlanImpl<Variant>> impl) noexcept;
@@ -612,7 +612,7 @@ public:
     inspect_admission(const PreparedPrompt& prompt, const RequestBasePlan<Variant>& base,
                       runtime::LaneId destination, const ContinuationHandle<Variant>* source,
                       const SharedPrefixHandle<Variant>* shared_source,
-                      std::optional<runtime::CheckpointRef> checkpoint);
+                      std::optional<runtime::CheckpointRef> checkpoint, bool retain_private_source);
     [[nodiscard]] std::vector<PressureOption>
     inspect_pressure_options(const ContinuationHandle<Variant>& continuation,
                              runtime::ResourceVector deficit) const;

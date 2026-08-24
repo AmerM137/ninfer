@@ -1233,8 +1233,7 @@ prefill 新 divergence suffix
 ```text
 ContinuationCatalog
 ├── SessionIndex
-├── SharedPrefixIndex
-└── SparseCheckpointIndex
+└── ContentPrefixIndex
 ```
 
 ### 12.1 SessionIndex
@@ -1252,23 +1251,31 @@ Rewrite candidate
 Long-anchor candidates
 ```
 
-SessionKey只用于快速查找和 retention hint，不证明 prefix匹配。
+SessionIndex只维护命名continuation的latest-lineage替换与retention关系，不证明prefix匹配，也不是未命名
+Agent追加命中的前提。
 
 ---
 
-### 12.2 SharedPrefixIndex
+### 12.2 ContentPrefixIndex
 
-使用 target-derived index key进行 shortlist，例如：
+Private endpoint、typed rewrite、long anchor和shared stable prefix使用同一套target-derived shortlist
+协议。Incoming prepared prompt在一次线性遍历中生成每个token frontier的rolling digest；catalog entry
+保存checkpoint创建时的静态key，例如：
 
 ```text
 prefix digest
 frontier
 identity class
+checkpoint kind / scope
 ```
 
-最终 exact verification必须由 Program完成。
+ResourceManager只把key相同的具体checkpoint交给Program。没有匹配bucket时直接保留root候选，不能把
+全catalog重新追加为“fallback candidates”。最终exact verification仍必须由Program完成；Hash相同不代表
+prefix相同。
 
-Hash相同不代表 prefix相同。
+跨SessionKey命中private checkpoint时，原命名continuation必须保留，新的branch通过Retain/Fork启动；
+同SessionKey或双方均无SessionKey的单分支追加可以Consume/Move。Session identity因此只决定ownership
+disposition，不决定内容是否命中。
 
 ---
 
@@ -1329,9 +1336,9 @@ bounded stable-prefix markers
 allow reuse
 ```
 
-具体C++字段和容器不是本架构contract，但每个request的markers数量必须由启动配置或产品常量限制，避免一个request产生无界candidate/capture工作。Frontend将marker转换为当前prepared prompt中的合法token frontier；Program仍对完整target identity执行exact verification。
+具体C++字段和容器不是本架构contract，但每个request的markers数量必须由启动配置或产品常量限制，避免一个request产生无界candidate/capture工作。Frontend将marker转换为当前prepared prompt中的合法token frontier；同一request的markers引用一份immutable prompt backing的frontier slices，不按marker复制完整prompt。Program仍对完整target identity执行exact verification。
 
-`SessionKey`只用于candidate lookup和retention。Stable marker只建议capture，retention class只影响策略；三者都不能证明prefix相等，也不能绕过Program verification。Catalog天然绑定当前Engine/model instance，不引入额外runtime target discriminator。
+`SessionKey`只用于lineage ownership、latest replacement和retention。Stable marker只建议capture，retention class只影响策略；三者都不能证明prefix相等，也不能绕过Program verification。Catalog天然绑定当前Engine/model instance，不引入额外runtime target discriminator。
 
 ---
 
@@ -1357,6 +1364,9 @@ ResourceManager为该请求枚举：
 5. Optional long anchors
 6. Empty/root state
 ```
+
+前五类候选都由ContentPrefixIndex的内容key产生；顺序只表达ownership/retention偏好，不以SessionKey或
+marker身份放宽匹配。每个shortlist hit仍逐个接受Program exact inspection，root始终是确定的最终回退。
 
 ---
 

@@ -54,6 +54,37 @@ bool prefix_item_count(const std::vector<VisionItem>& items, std::size_t tokens,
     return true;
 }
 
+constexpr std::uint64_t kDigestOffset        = 1469598103934665603ULL;
+constexpr std::uint64_t kDigestPrime         = 1099511628211ULL;
+constexpr std::uint64_t kTokenDigestDomain   = 0x6e696e6665722d74ULL;
+constexpr std::uint64_t kRewriteDigestDomain = 0x6e696e6665722d72ULL;
+
+void mix_digest(std::uint64_t& digest, std::uint64_t value) noexcept {
+    for (std::uint32_t byte = 0; byte < 8; ++byte) {
+        digest ^= static_cast<std::uint8_t>(value >> (8U * byte));
+        digest *= kDigestPrime;
+    }
+}
+
+void append_digest(std::vector<std::uint64_t>& digests, TokenId token, std::uint8_t token_type,
+                   const std::array<std::int32_t, 3>& positions,
+                   std::span<const std::uint32_t> rewrite_frontiers, std::size_t& next_rewrite) {
+    std::uint64_t digest = digests.back();
+    mix_digest(digest, kTokenDigestDomain);
+    mix_digest(digest, static_cast<std::uint32_t>(token));
+    mix_digest(digest, token_type);
+    for (const std::int32_t position : positions) {
+        mix_digest(digest, static_cast<std::uint32_t>(position));
+    }
+    const std::size_t frontier = digests.size();
+    while (next_rewrite < rewrite_frontiers.size() && rewrite_frontiers[next_rewrite] == frontier) {
+        mix_digest(digest, kRewriteDigestDomain);
+        mix_digest(digest, rewrite_frontiers[next_rewrite]);
+        ++next_rewrite;
+    }
+    digests.push_back(digest == 0 ? 1 : digest);
+}
+
 } // namespace
 
 void ResidentPrefixIdentity::reserve(std::size_t tokens) {
@@ -167,46 +198,124 @@ bool ResidentPrefixIdentity::matches(const PreparedPromptData& prompt, std::size
 }
 
 bool ResidentPrefixIdentity::equals(const ResidentPrefixIdentity& other) const {
-    if (token_types_ != other.token_types_ || positions_ != other.positions_ ||
-        rewrite_execution_frontiers_ != other.rewrite_execution_frontiers_ ||
-        vision_items_.size() != other.vision_items_.size()) {
+    return size() == other.size() && prefix_equals(other, size());
+}
+
+bool ResidentPrefixIdentity::prefix_equals(const ResidentPrefixIdentity& other,
+                                           std::size_t count) const {
+    if (count > size() || count > other.size() ||
+        !std::equal(token_types_.begin(), token_types_.begin() + static_cast<std::ptrdiff_t>(count),
+                    other.token_types_.begin())) {
         return false;
     }
-    for (std::size_t index = 0; index < vision_items_.size(); ++index) {
+    for (std::size_t axis = 0; axis < positions_.size(); ++axis) {
+        if (!std::equal(positions_[axis].begin(),
+                        positions_[axis].begin() + static_cast<std::ptrdiff_t>(count),
+                        other.positions_[axis].begin())) {
+            return false;
+        }
+    }
+    std::size_t left_items  = 0;
+    std::size_t right_items = 0;
+    if (!prefix_item_count(vision_items_, count, &left_items) ||
+        !prefix_item_count(other.vision_items_, count, &right_items) || left_items != right_items) {
+        return false;
+    }
+    for (std::size_t index = 0; index < left_items; ++index) {
         if (!same_item(vision_items_[index], other.vision_items_[index])) { return false; }
     }
-    return true;
+    const auto left_end  = std::upper_bound(rewrite_execution_frontiers_.begin(),
+                                            rewrite_execution_frontiers_.end(), count);
+    const auto right_end = std::upper_bound(other.rewrite_execution_frontiers_.begin(),
+                                            other.rewrite_execution_frontiers_.end(), count);
+    return std::distance(rewrite_execution_frontiers_.begin(), left_end) ==
+               std::distance(other.rewrite_execution_frontiers_.begin(), right_end) &&
+           std::equal(rewrite_execution_frontiers_.begin(), left_end,
+                      other.rewrite_execution_frontiers_.begin());
 }
 
-std::uint64_t ResidentPrefixIdentity::shortlist_digest(std::span<const TokenId> tokens,
-                                                       std::size_t count) const {
-    if (count > tokens.size() || count > size()) {
-        throw std::out_of_range("shortlist digest frontier exceeds resident identity");
+void PrefixShortlistDigests::reserve(std::size_t tokens) {
+    if (tokens == std::numeric_limits<std::size_t>::max()) {
+        throw std::overflow_error("prefix shortlist capacity overflows size_t");
     }
-    std::uint64_t digest = 1469598103934665603ULL;
-    const auto mix       = [&](std::uint64_t value) {
-        for (std::uint32_t byte = 0; byte < 8; ++byte) {
-            digest ^= static_cast<std::uint8_t>(value >> (8U * byte));
-            digest *= 1099511628211ULL;
+    digests_.reserve(tokens + 1U);
+}
+
+void PrefixShortlistDigests::clear() noexcept { digests_.clear(); }
+
+void PrefixShortlistDigests::assign(const PreparedPromptData& prompt) {
+    const std::size_t tokens = prompt.token_ids.size();
+    if (prompt.token_types.size() != tokens || prompt.positions.size() != 3U * tokens) {
+        throw std::invalid_argument("prepared prompt shortlist metadata has an invalid shape");
+    }
+    std::uint32_t previous_rewrite = 0;
+    for (const std::uint32_t frontier : prompt.identity.rewrite_execution_frontiers) {
+        if (frontier == 0 || frontier > tokens || frontier <= previous_rewrite) {
+            throw std::invalid_argument(
+                "rewrite execution frontiers must be ordered unique prompt positions");
         }
-    };
-    mix(count);
-    for (std::size_t index = 0; index < count; ++index) {
-        mix(static_cast<std::uint32_t>(tokens[index]));
-        mix(token_types_[index]);
-        for (const auto& axis : positions_) { mix(static_cast<std::uint32_t>(axis[index])); }
+        previous_rewrite = frontier;
     }
-    const auto frontier_end = std::upper_bound(rewrite_execution_frontiers_.begin(),
-                                               rewrite_execution_frontiers_.end(), count);
-    mix(static_cast<std::uint64_t>(frontier_end - rewrite_execution_frontiers_.begin()));
-    for (auto frontier = rewrite_execution_frontiers_.begin(); frontier != frontier_end;
-         ++frontier) {
-        mix(*frontier);
+    digests_.clear();
+    reserve(tokens);
+    digests_.push_back(kDigestOffset);
+    std::size_t next_rewrite = 0;
+    for (std::size_t index = 0; index < tokens; ++index) {
+        const std::array<std::int32_t, 3> positions{prompt.positions[index],
+                                                    prompt.positions[tokens + index],
+                                                    prompt.positions[2U * tokens + index]};
+        append_digest(digests_, prompt.token_ids[index], prompt.token_types[index], positions,
+                      prompt.identity.rewrite_execution_frontiers, next_rewrite);
     }
-    return digest == 0 ? 1 : digest;
+    if (next_rewrite != prompt.identity.rewrite_execution_frontiers.size()) {
+        throw std::invalid_argument("rewrite execution frontier exceeds the prompt");
+    }
 }
 
-bool prefix_matches(const PreparedPromptData& prompt, const std::vector<TokenId>& resident_tokens,
+void PrefixShortlistDigests::swap(PrefixShortlistDigests& other) noexcept {
+    digests_.swap(other.digests_);
+}
+
+void PrefixShortlistDigests::append_generated(std::span<const TokenId> tokens,
+                                              std::int32_t rope_delta) {
+    if (digests_.empty()) {
+        throw std::logic_error("generated shortlist append has no resident prefix");
+    }
+    const std::size_t begin = size();
+    if (tokens.size() > std::numeric_limits<std::size_t>::max() - begin) {
+        throw std::overflow_error("generated shortlist length overflows size_t");
+    }
+    std::size_t no_rewrite = 0;
+    for (std::size_t offset = 0; offset < tokens.size(); ++offset) {
+        const std::size_t index = begin + offset;
+        if (index > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
+            throw std::overflow_error("generated shortlist position exceeds int32");
+        }
+        const std::int64_t position = static_cast<std::int64_t>(index) + rope_delta;
+        if (position < std::numeric_limits<std::int32_t>::min() ||
+            position > std::numeric_limits<std::int32_t>::max()) {
+            throw std::overflow_error("generated shortlist MRoPE position exceeds int32");
+        }
+        const std::int32_t value = static_cast<std::int32_t>(position);
+        append_digest(digests_, tokens[offset], 0, {value, value, value}, {}, no_rewrite);
+    }
+}
+
+void PrefixShortlistDigests::truncate(std::size_t tokens) {
+    if (digests_.empty() || tokens > size()) {
+        throw std::out_of_range("cannot extend prefix shortlist by truncation");
+    }
+    digests_.resize(tokens + 1U);
+}
+
+std::uint64_t PrefixShortlistDigests::at(std::size_t frontier) const {
+    if (digests_.empty() || frontier > size()) {
+        throw std::out_of_range("prefix shortlist frontier exceeds resident identity");
+    }
+    return digests_[frontier];
+}
+
+bool prefix_matches(const PreparedPromptData& prompt, std::span<const TokenId> resident_tokens,
                     const ResidentPrefixIdentity& resident_identity, std::size_t count) {
     if (count > prompt.token_ids.size() || count > resident_tokens.size()) { return false; }
     return std::equal(prompt.token_ids.begin(),

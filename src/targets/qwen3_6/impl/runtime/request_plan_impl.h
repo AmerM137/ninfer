@@ -319,6 +319,11 @@ RequestBasePlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
         }
         previous_rewrite_frontier = frontier;
     }
+    if (base->summary.publish_continuation) {
+        base->prefix_digests.assign(prompt);
+        base->prefix_identity_tag =
+            capture_identity_tag(speculative_backend, proposal_head, kv_dtype);
+    }
     if (options.allow_prefix_reuse && prompt.identity.reusable && context_cache.enabled) {
         const auto add_capture = [&](std::uint32_t frontier, std::uint32_t input_order,
                                      std::optional<RewriteCheckpointKind> rewrite, bool shared,
@@ -356,33 +361,29 @@ RequestBasePlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
                       return std::tie(left.frontier, left.input_order) <
                              std::tie(right.frontier, right.input_order);
                   });
+        std::shared_ptr<const PreparedCaptureBacking> capture_backing;
+        if (!base->capture_groups.empty()) {
+            auto backing                         = std::make_shared<PreparedCaptureBacking>();
+            const std::uint32_t backing_frontier = base->capture_groups.back().frontier;
+            backing->ledger.assign(prompt.token_ids.begin(),
+                                   prompt.token_ids.begin() +
+                                       static_cast<std::ptrdiff_t>(backing_frontier));
+            backing->prefix_identity.assign(prompt);
+            backing->prefix_identity.truncate(backing_frontier);
+            capture_backing = std::move(backing);
+        }
         for (CaptureGroup& group : base->capture_groups) {
-            auto identity = std::make_shared<PreparedCaptureIdentity>();
-            identity->ledger.assign(prompt.token_ids.begin(),
-                                    prompt.token_ids.begin() +
-                                        static_cast<std::ptrdiff_t>(group.frontier));
-            identity->prefix_identity.assign(prompt);
-            identity->prefix_identity.truncate(group.frontier);
+            auto identity          = std::make_shared<PreparedCaptureIdentity>();
+            identity->backing      = capture_backing;
             identity->rebuild_work = rebuild_work_at_frontier(
                 prompt, group.frontier, prefill_chunk, base->capture_groups,
                 prompt.identity.rewrite_execution_frontiers);
             identity->shortlist_key = qwen3_6::PrefixShortlistKey{
-                .digest =
-                    identity->prefix_identity.shortlist_digest(identity->ledger, group.frontier),
+                .digest       = base->prefix_digests.at(group.frontier),
                 .frontier     = group.frontier,
-                .identity_tag = capture_identity_tag(speculative_backend, proposal_head, kv_dtype),
+                .identity_tag = base->prefix_identity_tag,
             };
             group.identity = std::move(identity);
-            if (group.shared &&
-                std::find(base->shared_shortlist_keys.begin(), base->shared_shortlist_keys.end(),
-                          group.identity->shortlist_key) == base->shared_shortlist_keys.end()) {
-                base->shared_shortlist_keys.push_back(group.identity->shortlist_key);
-            }
-            if (group.long_anchor &&
-                std::find(base->sparse_shortlist_keys.begin(), base->sparse_shortlist_keys.end(),
-                          group.identity->shortlist_key) == base->sparse_shortlist_keys.end()) {
-                base->sparse_shortlist_keys.push_back(group.identity->shortlist_key);
-            }
         }
     }
     root_active.state_slots = 1U;
@@ -414,11 +415,10 @@ RequestBasePlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
     return RequestBasePlan(std::move(base));
 }
 
-std::optional<AdmissionPlan>
-ProgramImplCore::inspect_lane(std::uint32_t lane, const PreparedPromptData& prompt,
-                              const RequestBasePlan& base_plan, const SequenceState* source,
-                              const SharedPrefixState* shared_source,
-                              std::optional<runtime::CheckpointRef> checkpoint) {
+std::optional<AdmissionPlan> ProgramImplCore::inspect_lane(
+    std::uint32_t lane, const PreparedPromptData& prompt, const RequestBasePlan& base_plan,
+    const SequenceState* source, const SharedPrefixState* shared_source,
+    std::optional<runtime::CheckpointRef> checkpoint, bool retain_private_source) {
     if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
     const RequestControl& request = requests[lane];
     if (request.lifecycle != Lifecycle::Empty) {
@@ -449,9 +449,10 @@ ProgramImplCore::inspect_lane(std::uint32_t lane, const PreparedPromptData& prom
             throw std::logic_error("catalog shared-prefix summary disagrees with Program state");
         }
         if (!base.allow_prefix_reuse || !prompt.identity.reusable) { return std::nullopt; }
-        if (!qwen3_6::detail::prefix_matches(prompt, shared_source->identity->ledger,
-                                             shared_source->identity->prefix_identity,
-                                             selected.frontier)) {
+        const auto* shared_identity = shared_source->identity->prefix_identity();
+        if (shared_identity == nullptr ||
+            !qwen3_6::detail::prefix_matches(prompt, shared_source->identity->ledger(),
+                                             *shared_identity, selected.frontier)) {
             return std::nullopt;
         }
         plan->reuse              = ReusePath::SharedStablePrefix;
@@ -460,6 +461,9 @@ ProgramImplCore::inspect_lane(std::uint32_t lane, const PreparedPromptData& prom
     } else if (source != nullptr) {
         const runtime::CheckpointRef selected = *checkpoint;
         plan->selected_checkpoint             = selected;
+        plan->source_disposition              = retain_private_source
+                                                    ? runtime::ClaimDisposition::Retained
+                                                    : runtime::ClaimDisposition::ConsumedToActive;
         if (!base.allow_prefix_reuse || !prompt.identity.reusable) { return std::nullopt; }
         if (selected.kind == runtime::CheckpointKind::SessionEndpoint) {
             if (selected.ordinal != 0) {
@@ -505,12 +509,8 @@ ProgramImplCore::inspect_lane(std::uint32_t lane, const PreparedPromptData& prom
                                                  selected.frontier)) {
                 return std::nullopt;
             }
-            plan->reuse              = restore_path(source->rewrite_checkpoint.kind);
-            plan->reuse_base         = selected.frontier;
-            plan->source_disposition = runtime::ClaimDisposition::ConsumedToActive;
-        }
-        if (base.context_cache.session_key && !base.context_cache.update_session_index) {
-            plan->source_disposition = runtime::ClaimDisposition::Retained;
+            plan->reuse      = restore_path(source->rewrite_checkpoint.kind);
+            plan->reuse_base = selected.frontier;
         }
     }
 

@@ -21,6 +21,7 @@
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_prefill.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <array>
 #include <memory>
@@ -60,11 +61,34 @@ enum class RewriteCheckpointDisposition : std::uint8_t {
     DropOptional,
 };
 
-struct PreparedCaptureIdentity {
+struct PreparedCaptureBacking {
     std::vector<TokenId> ledger;
     qwen3_6::detail::ResidentPrefixIdentity prefix_identity;
+};
+
+struct PreparedCaptureIdentity {
+    std::shared_ptr<const PreparedCaptureBacking> backing;
     qwen3_6::PrefixShortlistKey shortlist_key;
     runtime::PrefillWork rebuild_work;
+
+    [[nodiscard]] std::span<const TokenId> ledger() const noexcept {
+        if (!backing || shortlist_key.frontier > backing->ledger.size()) { return {}; }
+        return std::span<const TokenId>(backing->ledger).first(shortlist_key.frontier);
+    }
+
+    [[nodiscard]] const qwen3_6::detail::ResidentPrefixIdentity* prefix_identity() const noexcept {
+        return backing ? &backing->prefix_identity : nullptr;
+    }
+
+    [[nodiscard]] bool prefix_equals(const PreparedCaptureIdentity& other) const {
+        const std::span<const TokenId> left  = ledger();
+        const std::span<const TokenId> right = other.ledger();
+        const auto* left_identity            = prefix_identity();
+        const auto* right_identity           = other.prefix_identity();
+        return left_identity != nullptr && right_identity != nullptr &&
+               left.size() == right.size() && std::equal(left.begin(), left.end(), right.begin()) &&
+               left_identity->prefix_equals(*right_identity, left.size());
+    }
 };
 
 struct CaptureGroup {
@@ -100,9 +124,9 @@ struct RequestBasePlanImpl<NINFER_QWEN36_VARIANT> {
     std::size_t vision_transient_bytes = 0;
     std::optional<qwen3_6::RewriteCheckpointSpec> rewrite_checkpoint;
     std::vector<NINFER_QWEN36_RUNTIME_NS::CaptureGroup> capture_groups;
-    std::vector<qwen3_6::PrefixShortlistKey> shared_shortlist_keys;
-    std::vector<qwen3_6::PrefixShortlistKey> sparse_shortlist_keys;
-    bool allow_prefix_reuse = false;
+    qwen3_6::detail::PrefixShortlistDigests prefix_digests;
+    std::uint32_t prefix_identity_tag = 0;
+    bool allow_prefix_reuse           = false;
 };
 
 template <>
@@ -250,6 +274,7 @@ struct SequenceState {
     std::uint32_t ledger_frontier    = 0;
     std::vector<TokenId> ledger;
     qwen3_6::detail::ResidentPrefixIdentity prefix_identity;
+    qwen3_6::detail::PrefixShortlistDigests prefix_digests;
     std::int32_t rope_delta               = 0;
     std::uint32_t text_kv_valid           = 0;
     std::uint32_t mtp_kv_valid            = 0;
@@ -335,7 +360,7 @@ public:
     inspect_admission(const PreparedPromptData& prompt, const RequestBasePlan& base,
                       runtime::LaneId destination, const ContinuationHandle* source,
                       const SharedPrefixHandle* shared_source,
-                      std::optional<runtime::CheckpointRef> checkpoint);
+                      std::optional<runtime::CheckpointRef> checkpoint, bool retain_private_source);
     [[nodiscard]] std::vector<qwen3_6::PressureOption>
     inspect_pressure_options(const ContinuationHandle& continuation,
                              runtime::ResourceVector deficit) const;
@@ -675,6 +700,7 @@ private:
     CudaCompletionEvent context_completion_;
     std::vector<TokenId> materialization_ledger_;
     qwen3_6::detail::ResidentPrefixIdentity materialization_identity_;
+    qwen3_6::detail::PrefixShortlistDigests materialization_prefix_digests_;
 
     struct ActiveCaptureTransaction {
         std::uint64_t id         = 0;
@@ -753,7 +779,7 @@ private:
     [[nodiscard]] std::optional<AdmissionPlan>
     inspect_lane(std::uint32_t lane, const PreparedPromptData& prompt, const RequestBasePlan& base,
                  const SequenceState* source, const SharedPrefixState* shared_source,
-                 std::optional<runtime::CheckpointRef> checkpoint);
+                 std::optional<runtime::CheckpointRef> checkpoint, bool retain_private_source);
     [[nodiscard]] StartResult start_request(MaterializationTransaction& transaction);
     void prepare_materialization(MaterializationTransaction& transaction);
     void enqueue_materialization_transfers(MaterializationTransaction& transaction);

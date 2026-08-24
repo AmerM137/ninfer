@@ -110,17 +110,16 @@ const PreparedContextCache& RequestBasePlan<Variant>::context_cache() const noex
 }
 
 template <>
-std::span<const PrefixShortlistKey>
-RequestBasePlan<Variant>::shared_shortlist_keys() const noexcept {
-    return impl_ != nullptr ? std::span<const PrefixShortlistKey>(impl_->shared_shortlist_keys)
-                            : std::span<const PrefixShortlistKey>{};
-}
-
-template <>
-std::span<const PrefixShortlistKey>
-RequestBasePlan<Variant>::sparse_shortlist_keys() const noexcept {
-    return impl_ != nullptr ? std::span<const PrefixShortlistKey>(impl_->sparse_shortlist_keys)
-                            : std::span<const PrefixShortlistKey>{};
+std::optional<PrefixShortlistKey>
+RequestBasePlan<Variant>::prefix_shortlist_key(std::uint32_t frontier) const noexcept {
+    if (impl_ == nullptr || frontier == 0 || frontier > impl_->prefix_digests.size()) {
+        return std::nullopt;
+    }
+    return PrefixShortlistKey{
+        .digest       = impl_->prefix_digests.at(frontier),
+        .frontier     = frontier,
+        .identity_tag = impl_->prefix_identity_tag,
+    };
 }
 
 template <>
@@ -199,9 +198,9 @@ template <>
 std::optional<AdmissionPlan<Variant>> Program<Variant>::inspect_admission(
     const PreparedPrompt& prompt, const RequestBasePlan<Variant>& base, runtime::LaneId destination,
     const ContinuationHandle<Variant>* source, const SharedPrefixHandle<Variant>* shared_source,
-    std::optional<runtime::CheckpointRef> checkpoint) {
+    std::optional<runtime::CheckpointRef> checkpoint, bool retain_private_source) {
     return impl_->inspect_admission(PreparedPromptAccess::view(prompt), base, destination, source,
-                                    shared_source, checkpoint);
+                                    shared_source, checkpoint, retain_private_source);
 }
 
 template <>

@@ -805,9 +805,8 @@ public:
           catalog_count_(private_catalog_capacity), shared_catalog_count_(shared_catalog_capacity),
           cache_enabled_(cache_enabled), catalog_(private_catalog_capacity),
           shared_catalog_(shared_catalog_capacity), session_index_(private_catalog_capacity),
-          shared_prefix_index_(shared_catalog_capacity),
-          sparse_checkpoint_index_(
-              checked_sparse_index_capacity(private_catalog_capacity, max_long_anchors)),
+          prefix_index_(checked_prefix_index_capacity(private_catalog_capacity,
+                                                      shared_catalog_capacity, max_long_anchors)),
           max_long_anchors_(max_long_anchors), cost_model_(std::move(cost_model)) {
         if (private_catalog_capacity < lane_count) {
             throw std::invalid_argument(
@@ -855,7 +854,7 @@ public:
         std::vector<ResourceCandidateDescriptor> candidates;
         std::vector<std::uint32_t> residents;
         std::vector<std::optional<PolicyObservationKey>> candidate_observations;
-        const std::size_t candidate_capacity = 1U + 2U * catalog_count_;
+        const std::size_t candidate_capacity = 1U + prefix_index_.size();
         plans.reserve(candidate_capacity);
         candidates.reserve(candidate_capacity);
         candidate_observations.reserve(candidate_capacity);
@@ -866,34 +865,6 @@ public:
             const auto requirements           = plan.transfer_requirements();
             descriptor.transfer_requirements.assign(requirements.begin(), requirements.end());
         };
-
-        std::vector<std::uint32_t> candidate_slots;
-        candidate_slots.reserve(catalog_count_);
-        const auto append_private_slot = [&](std::uint32_t slot) {
-            if (slot < catalog_count_ && std::find(candidate_slots.begin(), candidate_slots.end(),
-                                                   slot) == candidate_slots.end()) {
-                candidate_slots.push_back(slot);
-            }
-        };
-        if (cache_enabled_ && base.context_cache().session_key) {
-            if (const auto indexed = lookup_session(*base.context_cache().session_key)) {
-                append_private_slot(*indexed);
-            }
-        }
-        if (cache_enabled_) {
-            for (const PrefixShortlistKey& key : base.sparse_shortlist_keys()) {
-                for (const SparseCheckpointIndexEntry& index : sparse_checkpoint_index_) {
-                    if (valid_sparse_index_entry(index) && index.key == key) {
-                        append_private_slot(index.slot);
-                    }
-                }
-            }
-        }
-        if (cache_enabled_) {
-            for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
-                append_private_slot(slot);
-            }
-        }
 
         bool vacant_catalog_slot = false;
         for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
@@ -909,8 +880,8 @@ public:
             residents.push_back(slot);
         }
 
-        std::optional<AdmissionPlan> root =
-            program.inspect_admission(prompt, base, *destination, nullptr, nullptr, std::nullopt);
+        std::optional<AdmissionPlan> root = program.inspect_admission(
+            prompt, base, *destination, nullptr, nullptr, std::nullopt, false);
         if (!root) { throw std::logic_error("Program rejected its root admission assessment"); }
         plans.emplace_back(std::move(*root));
         candidates.push_back(ResourceCandidateDescriptor{
@@ -921,78 +892,58 @@ public:
         attach_cost_inputs(candidates.back(), *plans.back());
         candidate_observations.emplace_back();
 
-        for (const std::uint32_t slot : candidate_slots) {
-            const CatalogEntry& entry = catalog_[slot];
-            if (entry.state != CatalogState::Catalogued || !entry.handle ||
-                entry.active_references != 0 ||
-                (entry.session && (!base.context_cache().session_key ||
-                                   *entry.session != *base.context_cache().session_key))) {
-                continue;
-            }
-            const auto add_checkpoint = [&](CheckpointRef checkpoint) {
-                std::optional<AdmissionPlan> assessment = program.inspect_admission(
-                    prompt, base, *destination, &*entry.handle, nullptr, checkpoint);
-                if (!assessment) { return; }
-                if (assessment->summary().reusable_prompt_tokens == 0) {
-                    throw std::logic_error("Program returned an invalid private assessment");
-                }
-                plans.emplace_back(std::move(*assessment));
-                const RequestPlanSummary& summary = plans.back()->summary();
-                candidates.push_back(ResourceCandidateDescriptor{
-                    .demand               = plans.back()->demand(),
-                    .source_resources     = plans.back()->source_resources(),
-                    .source_slot          = slot,
-                    .reused_prompt_tokens = summary.reusable_prompt_tokens,
-                    .service_work_quanta  = summary.service_work_quanta,
-                    .checkpoint_kind      = checkpoint.kind,
-                    .source_disposition   = plans.back()->source_disposition(),
-                    .publication_slot_available =
-                        plans.back()->source_disposition() == ClaimDisposition::ConsumedToActive ||
-                        vacant_catalog_slot,
-                });
-                attach_cost_inputs(candidates.back(), *plans.back());
-                candidate_observations.emplace_back(PolicyObservationKey{
-                    .shared     = false,
-                    .slot       = slot,
-                    .owner_id   = entry.id,
-                    .revision   = entry.revision,
-                    .checkpoint = checkpoint,
-                });
-            };
-            if (entry.summary.endpoint) { add_checkpoint(entry.summary.endpoint->ref); }
-            if (entry.summary.rewrite) { add_checkpoint(entry.summary.rewrite->ref); }
-            for (const auto& anchor : entry.summary.long_anchors) { add_checkpoint(anchor.ref); }
-        }
-
         if (cache_enabled_) {
-            std::vector<std::uint32_t> shared_candidate_slots;
-            shared_candidate_slots.reserve(shared_catalog_count_);
-            const auto append_shared_slot = [&](std::uint32_t slot) {
-                if (slot < shared_catalog_count_ &&
-                    std::find(shared_candidate_slots.begin(), shared_candidate_slots.end(), slot) ==
-                        shared_candidate_slots.end()) {
-                    shared_candidate_slots.push_back(slot);
-                }
-            };
-            for (const PrefixShortlistKey& key : base.shared_shortlist_keys()) {
-                for (const SharedPrefixIndexEntry& index : shared_prefix_index_) {
-                    if (valid_shared_index_entry(index) && index.key == key) {
-                        append_shared_slot(index.slot);
+            for (const PrefixIndexEntry& index : prefix_index_) {
+                if (!valid_prefix_index_entry(index)) { continue; }
+                const std::optional<PrefixShortlistKey> incoming =
+                    base.prefix_shortlist_key(index.key.frontier);
+                if (!incoming || *incoming != index.key) { continue; }
+
+                if (!index.shared) {
+                    const CatalogEntry& entry = catalog_[index.slot];
+                    if (entry.active_references != 0) { continue; }
+                    const bool source_session_differs =
+                        entry.session && (!base.context_cache().session_key ||
+                                          *entry.session != *base.context_cache().session_key);
+                    const bool retain_source =
+                        source_session_differs || !base.context_cache().update_session_index;
+                    std::optional<AdmissionPlan> assessment =
+                        program.inspect_admission(prompt, base, *destination, &*entry.handle,
+                                                  nullptr, index.checkpoint, retain_source);
+                    if (!assessment) { continue; }
+                    if (assessment->summary().reusable_prompt_tokens == 0 ||
+                        (retain_source &&
+                         assessment->source_disposition() != ClaimDisposition::Retained)) {
+                        throw std::logic_error("Program returned an invalid private assessment");
                     }
-                }
-            }
-            for (std::uint32_t slot = 0; slot < shared_catalog_count_; ++slot) {
-                append_shared_slot(slot);
-            }
-            for (const std::uint32_t slot : shared_candidate_slots) {
-                const SharedCatalogEntry& entry = shared_catalog_[slot];
-                if (entry.state != SharedCatalogState::Catalogued || !entry.handle ||
-                    !valid_shared_prefix_summary(entry.summary)) {
+                    plans.emplace_back(std::move(*assessment));
+                    const RequestPlanSummary& summary = plans.back()->summary();
+                    candidates.push_back(ResourceCandidateDescriptor{
+                        .demand                     = plans.back()->demand(),
+                        .source_resources           = plans.back()->source_resources(),
+                        .source_slot                = index.slot,
+                        .reused_prompt_tokens       = summary.reusable_prompt_tokens,
+                        .service_work_quanta        = summary.service_work_quanta,
+                        .checkpoint_kind            = index.checkpoint.kind,
+                        .source_disposition         = plans.back()->source_disposition(),
+                        .publication_slot_available = plans.back()->source_disposition() ==
+                                                          ClaimDisposition::ConsumedToActive ||
+                                                      vacant_catalog_slot,
+                    });
+                    attach_cost_inputs(candidates.back(), *plans.back());
+                    candidate_observations.emplace_back(PolicyObservationKey{
+                        .shared     = false,
+                        .slot       = index.slot,
+                        .owner_id   = entry.id,
+                        .revision   = entry.revision,
+                        .checkpoint = index.checkpoint,
+                    });
                     continue;
                 }
-                std::optional<AdmissionPlan> assessment =
-                    program.inspect_admission(prompt, base, *destination, nullptr, &*entry.handle,
-                                              entry.summary.checkpoint.ref);
+
+                const SharedCatalogEntry& entry         = shared_catalog_[index.slot];
+                std::optional<AdmissionPlan> assessment = program.inspect_admission(
+                    prompt, base, *destination, nullptr, &*entry.handle, index.checkpoint, false);
                 if (!assessment) { continue; }
                 if (assessment->summary().reusable_prompt_tokens == 0 ||
                     assessment->source_disposition() != ClaimDisposition::Retained ||
@@ -1003,7 +954,7 @@ public:
                 const RequestPlanSummary& summary = plans.back()->summary();
                 candidates.push_back(ResourceCandidateDescriptor{
                     .demand                     = plans.back()->demand(),
-                    .shared_source_slot         = slot,
+                    .shared_source_slot         = index.slot,
                     .reused_prompt_tokens       = summary.reusable_prompt_tokens,
                     .service_work_quanta        = summary.service_work_quanta,
                     .checkpoint_kind            = CheckpointKind::SharedStablePrefix,
@@ -1013,10 +964,10 @@ public:
                 attach_cost_inputs(candidates.back(), *plans.back());
                 candidate_observations.emplace_back(PolicyObservationKey{
                     .shared     = true,
-                    .slot       = slot,
+                    .slot       = index.slot,
                     .owner_id   = entry.id,
                     .revision   = entry.revision,
-                    .checkpoint = entry.summary.checkpoint.ref,
+                    .checkpoint = index.checkpoint,
                 });
             }
         }
@@ -1857,15 +1808,10 @@ public:
         if (assessment.publishes_shared) {
             std::vector<std::uint32_t> candidate_slots;
             candidate_slots.reserve(shared_catalog_count_);
-            for (const SharedPrefixIndexEntry& index : shared_prefix_index_) {
-                if (valid_shared_index_entry(index) && index.key == assessment.shortlist_key) {
+            for (const PrefixIndexEntry& index : prefix_index_) {
+                if (index.shared && valid_prefix_index_entry(index) &&
+                    index.key == assessment.shortlist_key) {
                     candidate_slots.push_back(index.slot);
-                }
-            }
-            for (std::uint32_t slot = 0; slot < shared_catalog_count_; ++slot) {
-                if (std::find(candidate_slots.begin(), candidate_slots.end(), slot) ==
-                    candidate_slots.end()) {
-                    candidate_slots.push_back(slot);
                 }
             }
             for (const std::uint32_t slot : candidate_slots) {
@@ -3024,16 +2970,9 @@ private:
         std::uint64_t revision = 0;
     };
 
-    struct SharedPrefixIndexEntry {
+    struct PrefixIndexEntry {
         bool occupied = false;
-        PrefixShortlistKey key;
-        std::uint32_t slot     = kInvalidCatalogSlot;
-        std::uint64_t owner_id = 0;
-        std::uint64_t revision = 0;
-    };
-
-    struct SparseCheckpointIndexEntry {
-        bool occupied = false;
+        bool shared   = false;
         PrefixShortlistKey key;
         std::uint32_t slot     = kInvalidCatalogSlot;
         std::uint64_t owner_id = 0;
@@ -3058,13 +2997,16 @@ private:
         return work.tokens != 0;
     }
 
-    [[nodiscard]] static std::size_t checked_sparse_index_capacity(std::uint32_t private_capacity,
+    [[nodiscard]] static std::size_t checked_prefix_index_capacity(std::uint32_t private_capacity,
+                                                                   std::uint32_t shared_capacity,
                                                                    std::uint32_t max_long_anchors) {
-        if (max_long_anchors != 0 &&
-            private_capacity > std::numeric_limits<std::size_t>::max() / max_long_anchors) {
-            throw std::overflow_error("sparse checkpoint index capacity overflow");
+        const std::size_t private_width = static_cast<std::size_t>(max_long_anchors) + 2U;
+        if (private_capacity != 0 &&
+            private_width >
+                (std::numeric_limits<std::size_t>::max() - shared_capacity) / private_capacity) {
+            throw std::overflow_error("content prefix index capacity overflow");
         }
-        return static_cast<std::size_t>(private_capacity) * max_long_anchors;
+        return static_cast<std::size_t>(private_capacity) * private_width + shared_capacity;
     }
 
     [[nodiscard]] bool
@@ -3077,6 +3019,7 @@ private:
             (summary.endpoint->ref.kind != CheckpointKind::SessionEndpoint ||
              summary.endpoint->ref.frontier == 0 || summary.endpoint->ref.ordinal != 0 ||
              summary.endpoint->scope != CheckpointScope::Private ||
+             summary.endpoint->shortlist_key.frontier != summary.endpoint->ref.frontier ||
              !valid_prefill_work(summary.endpoint->rebuild_work) ||
              summary.endpoint->required_kv.main_pages == 0)) {
             return false;
@@ -3088,6 +3031,7 @@ private:
              summary.rewrite->ref.frontier == 0 || summary.rewrite->ref.ordinal != 0 ||
              (summary.endpoint && summary.rewrite->ref.frontier > summary.endpoint->ref.frontier) ||
              summary.rewrite->scope != CheckpointScope::Private ||
+             summary.rewrite->shortlist_key.frontier != summary.rewrite->ref.frontier ||
              !valid_prefill_work(summary.rewrite->rebuild_work) ||
              summary.rewrite->required_kv.main_pages == 0)) {
             return false;
@@ -3096,6 +3040,7 @@ private:
             if (anchor.ref.kind != CheckpointKind::LongAnchor || anchor.ref.frontier == 0 ||
                 (summary.endpoint && anchor.ref.frontier > summary.endpoint->ref.frontier) ||
                 anchor.scope != CheckpointScope::Private ||
+                anchor.shortlist_key.frontier != anchor.ref.frontier ||
                 !valid_prefill_work(anchor.rebuild_work) || anchor.required_kv.main_pages == 0) {
                 return false;
             }
@@ -3743,68 +3688,73 @@ private:
         advance_revision(entry.revision);
     }
 
-    [[nodiscard]] bool
-    valid_shared_index_entry(const SharedPrefixIndexEntry& index) const noexcept {
-        if (!index.occupied || index.slot >= shared_catalog_count_) { return false; }
-        const SharedCatalogEntry& entry = shared_catalog_[index.slot];
-        return entry.state == SharedCatalogState::Catalogued && entry.handle &&
-               entry.id == index.owner_id && entry.revision == index.revision &&
-               entry.summary.checkpoint.shortlist_key == index.key;
-    }
-
-    [[nodiscard]] bool
-    valid_sparse_index_entry(const SparseCheckpointIndexEntry& index) const noexcept {
-        if (!index.occupied || index.slot >= catalog_count_) { return false; }
+    [[nodiscard]] bool valid_prefix_index_entry(const PrefixIndexEntry& index) const noexcept {
+        if (!index.occupied) { return false; }
+        if (index.shared) {
+            if (index.slot >= shared_catalog_count_) { return false; }
+            const SharedCatalogEntry& entry = shared_catalog_[index.slot];
+            return entry.state == SharedCatalogState::Catalogued && entry.handle &&
+                   entry.id == index.owner_id && entry.revision == index.revision &&
+                   entry.summary.checkpoint.ref == index.checkpoint &&
+                   entry.summary.checkpoint.shortlist_key == index.key;
+        }
+        if (index.slot >= catalog_count_) { return false; }
         const CatalogEntry& entry = catalog_[index.slot];
-        return entry.state == CatalogState::Catalogued && entry.handle &&
-               entry.id == index.owner_id && entry.revision == index.revision &&
-               contains_checkpoint(entry.summary, index.checkpoint);
+        if (entry.state != CatalogState::Catalogued || !entry.handle ||
+            entry.id != index.owner_id || entry.revision != index.revision) {
+            return false;
+        }
+        const auto matches = [&](const auto& checkpoint) {
+            return checkpoint.ref == index.checkpoint && checkpoint.shortlist_key == index.key;
+        };
+        return (entry.summary.endpoint && matches(*entry.summary.endpoint)) ||
+               (entry.summary.rewrite && matches(*entry.summary.rewrite)) ||
+               std::any_of(entry.summary.long_anchors.begin(), entry.summary.long_anchors.end(),
+                           matches);
     }
 
     void rebuild_prefix_indices() {
-        for (SharedPrefixIndexEntry& index : shared_prefix_index_) { index = {}; }
-        for (SparseCheckpointIndexEntry& index : sparse_checkpoint_index_) { index = {}; }
+        for (PrefixIndexEntry& index : prefix_index_) { index = {}; }
+        std::size_t cursor = 0;
+        const auto append  = [&](bool shared, std::uint32_t slot, std::uint64_t owner_id,
+                                std::uint64_t revision, const auto& checkpoint) {
+            if (cursor >= prefix_index_.size()) {
+                throw std::logic_error("content prefix index capacity diverged from catalog");
+            }
+            prefix_index_[cursor++] = PrefixIndexEntry{
+                 .occupied   = true,
+                 .shared     = shared,
+                 .key        = checkpoint.shortlist_key,
+                 .slot       = slot,
+                 .owner_id   = owner_id,
+                 .revision   = revision,
+                 .checkpoint = checkpoint.ref,
+            };
+        };
 
-        std::size_t shared_cursor = 0;
+        for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
+            const CatalogEntry& entry = catalog_[slot];
+            if (entry.state != CatalogState::Catalogued || !entry.handle) { continue; }
+            if (entry.summary.long_anchors.size() > max_long_anchors_) {
+                throw std::logic_error("private continuation exceeded content-index capacity");
+            }
+            if (entry.summary.endpoint) {
+                append(false, slot, entry.id, entry.revision, *entry.summary.endpoint);
+            }
+            if (entry.summary.rewrite) {
+                append(false, slot, entry.id, entry.revision, *entry.summary.rewrite);
+            }
+            for (const auto& anchor : entry.summary.long_anchors) {
+                append(false, slot, entry.id, entry.revision, anchor);
+            }
+        }
         for (std::uint32_t slot = 0; slot < shared_catalog_count_; ++slot) {
             const SharedCatalogEntry& entry = shared_catalog_[slot];
             if (entry.state != SharedCatalogState::Catalogued || !entry.handle ||
                 !valid_shared_prefix_summary(entry.summary)) {
                 continue;
             }
-            if (shared_cursor >= shared_prefix_index_.size()) {
-                throw std::logic_error("shared prefix index capacity diverged from catalog");
-            }
-            shared_prefix_index_[shared_cursor++] = SharedPrefixIndexEntry{
-                .occupied = true,
-                .key      = entry.summary.checkpoint.shortlist_key,
-                .slot     = slot,
-                .owner_id = entry.id,
-                .revision = entry.revision,
-            };
-        }
-
-        std::size_t sparse_cursor = 0;
-        for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
-            const CatalogEntry& entry = catalog_[slot];
-            if (entry.state != CatalogState::Catalogued || !entry.handle) { continue; }
-            if (entry.summary.long_anchors.size() > max_long_anchors_) {
-                throw std::logic_error("private continuation exceeded sparse-index capacity");
-            }
-            for (const auto& anchor : entry.summary.long_anchors) {
-                if (sparse_cursor >= sparse_checkpoint_index_.size()) {
-                    throw std::logic_error(
-                        "sparse checkpoint index capacity diverged from catalog");
-                }
-                sparse_checkpoint_index_[sparse_cursor++] = SparseCheckpointIndexEntry{
-                    .occupied   = true,
-                    .key        = anchor.shortlist_key,
-                    .slot       = slot,
-                    .owner_id   = entry.id,
-                    .revision   = entry.revision,
-                    .checkpoint = anchor.ref,
-                };
-            }
+            append(true, slot, entry.id, entry.revision, entry.summary.checkpoint);
         }
     }
 
@@ -4239,8 +4189,7 @@ private:
     std::vector<CatalogEntry> catalog_;
     std::vector<SharedCatalogEntry> shared_catalog_;
     std::vector<SessionIndexEntry> session_index_;
-    std::vector<SharedPrefixIndexEntry> shared_prefix_index_;
-    std::vector<SparseCheckpointIndexEntry> sparse_checkpoint_index_;
+    std::vector<PrefixIndexEntry> prefix_index_;
     std::uint32_t max_long_anchors_ = 0;
     std::array<ActiveEntry, kMaximumConcurrency> active_{};
     using ContextTransaction = std::variant<std::monostate, MaterializationRecord,

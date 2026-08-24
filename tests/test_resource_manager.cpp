@@ -97,6 +97,7 @@ struct FakeCacheSessionKey {
 };
 
 struct FakeShortlistKey {
+    std::uint32_t digest                                       = 0;
     std::uint32_t frontier                                     = 0;
     friend bool operator==(FakeShortlistKey, FakeShortlistKey) = default;
 };
@@ -111,6 +112,7 @@ struct FakeRequestBasePlan {
     RequestPlanSummary value;
     ResourceDemand resources;
     FakeContextCache cache;
+    std::uint32_t shortlist_digest = 0;
 
     [[nodiscard]] const RequestPlanSummary& summary() const noexcept { return value; }
 
@@ -118,12 +120,10 @@ struct FakeRequestBasePlan {
 
     [[nodiscard]] const FakeContextCache& context_cache() const noexcept { return cache; }
 
-    [[nodiscard]] std::span<const FakeShortlistKey> shared_shortlist_keys() const noexcept {
-        return {};
-    }
-
-    [[nodiscard]] std::span<const FakeShortlistKey> sparse_shortlist_keys() const noexcept {
-        return {};
+    [[nodiscard]] std::optional<FakeShortlistKey>
+    prefix_shortlist_key(std::uint32_t frontier) const noexcept {
+        if (frontier != 16) { return std::nullopt; }
+        return FakeShortlistKey{.digest = shortlist_digest, .frontier = frontier};
     }
 };
 
@@ -348,13 +348,15 @@ struct FakeActiveCaptureResult {
     ninfer::runtime::ContextOperationCounts operations;
 };
 
-FakeContinuationSummary continuation_summary(std::uint64_t rebuild_work = 1) {
+FakeContinuationSummary continuation_summary(std::uint64_t rebuild_work     = 1,
+                                             std::uint32_t shortlist_digest = 0) {
     return FakeContinuationSummary{
         .endpoint =
             FakeCheckpointSummary{
                 .ref = {.kind = ninfer::runtime::CheckpointKind::SessionEndpoint, .frontier = 16},
-                .required_kv  = {.main_pages = 2, .backend_pages = 1},
-                .rebuild_work = {.tokens = rebuild_work},
+                .shortlist_key = {.digest = shortlist_digest, .frontier = 16},
+                .required_kv   = {.main_pages = 2, .backend_pages = 1},
+                .rebuild_work  = {.tokens = rebuild_work},
             },
     };
 }
@@ -484,16 +486,19 @@ struct FakeDiscardResult {
 
 class FakeProgram {
 public:
-    std::optional<FakeAdmissionPlan>
-    inspect_admission(const FakePreparedPrompt& prompt, const FakeRequestBasePlan& base,
-                      LaneId destination, const FakeContinuationHandle* source,
-                      const FakeSharedPrefixHandle* shared_source,
-                      std::optional<ninfer::runtime::CheckpointRef> checkpoint) {
+    std::optional<FakeAdmissionPlan> inspect_admission(
+        const FakePreparedPrompt& prompt, const FakeRequestBasePlan& base, LaneId destination,
+        const FakeContinuationHandle* source, const FakeSharedPrefixHandle* shared_source,
+        std::optional<ninfer::runtime::CheckpointRef> checkpoint, bool retain_private_source) {
         if (shared_source != nullptr) {
             throw std::logic_error("fake shared-prefix admission is unsupported");
         }
         if ((source == nullptr) != !checkpoint.has_value()) {
             throw std::logic_error("fake source/checkpoint mismatch");
+        }
+        if (source != nullptr) {
+            ++admission_source_inspections;
+            last_retain_private_source = retain_private_source;
         }
         FakeAdmissionPlan plan;
         plan.value       = base.summary();
@@ -510,7 +515,7 @@ public:
             plan.value.reusable_prompt_tokens = 16;
             plan.value.service_work_quanta    = 1;
             plan.source_value                 = source->resources;
-            if (base.context_cache().session_key && !base.context_cache().update_session_index) {
+            if (retain_private_source) {
                 plan.disposition = ninfer::runtime::ClaimDisposition::Retained;
                 plan.resources   = base.root_demand();
             } else {
@@ -1021,7 +1026,8 @@ public:
             .removed = active.resources,
             .added   = resident,
         };
-        result.summary = continuation_summary(active.rebuild_work);
+        result.summary =
+            continuation_summary(active.rebuild_work, content_keyed_summaries ? active.key : 0U);
         result.continuation.emplace(active.key, resident, active.rebuild_work);
         active = {};
         return result;
@@ -1067,8 +1073,11 @@ public:
     std::optional<std::uint32_t> host_only_finish_key;
     std::optional<std::uint32_t> pressure_alias_source_key;
     std::optional<std::uint32_t> pressure_alias_owner_key;
-    bool emit_state_d2h_observation        = false;
-    std::atomic<bool>* cancel_after_victim = nullptr;
+    bool emit_state_d2h_observation            = false;
+    bool content_keyed_summaries               = false;
+    bool last_retain_private_source            = false;
+    std::atomic<bool>* cancel_after_victim     = nullptr;
+    std::uint64_t admission_source_inspections = 0;
 
 private:
     struct Transaction {
@@ -1596,6 +1605,59 @@ void test_clean_replica_policy_waits_for_resource_invalidation() {
            "resource invalidation did not trigger one new replica-policy pass");
 }
 
+void test_content_prefix_shortlist_bounds_exact_inspection() {
+    FakeProgram program;
+    program.content_keyed_summaries = true;
+    FakeManager manager(resources({1, 8, 20, 12}), 1, 5, 0, true, 0, test_cost_model());
+
+    for (std::uint32_t key = 1; key <= 4; ++key) {
+        FakeRequestBasePlan base = make_base(100 + key);
+        base.shortlist_digest    = key;
+        auto inspection          = manager.inspect(program, FakePreparedPrompt{key}, base);
+        expect(inspection.readiness == ninfer::runtime::Readiness::Ready && inspection.choice,
+               "content-index seed was not admitted");
+        auto active = materialize_and_adopt(manager, program, std::move(*inspection.choice),
+                                            FakePreparedPrompt{key});
+        (void)manager.finish(program, LaneId{0}, active.sequence);
+    }
+
+    FakeRequestBasePlan exact            = make_base(200);
+    exact.shortlist_digest               = 4;
+    program.admission_source_inspections = 0;
+    auto hit                             = manager.inspect(program, FakePreparedPrompt{4}, exact);
+    expect(hit.readiness == ninfer::runtime::Readiness::Ready && hit.choice &&
+               hit.choice->summary().reusable_prompt_tokens == 16 &&
+               program.admission_source_inspections == 1,
+           "unrelated catalog entries reached private exact inspection");
+
+    program.admission_source_inspections = 0;
+    auto collision                       = manager.inspect(program, FakePreparedPrompt{99}, exact);
+    expect(collision.readiness == ninfer::runtime::Readiness::Ready && collision.choice &&
+               collision.choice->summary().reusable_prompt_tokens == 0 &&
+               program.admission_source_inspections == 1,
+           "shortlist digest collision bypassed exact prefix verification");
+
+    FakeProgram session_program;
+    session_program.content_keyed_summaries = true;
+    FakeManager session_manager(resources({1, 4, 10, 6}), 1, 2, 0, true, 0, test_cost_model());
+    FakeRequestBasePlan session_seed = make_base(100);
+    session_seed.shortlist_digest    = 77;
+    session_seed.cache.session_key   = FakeCacheSessionKey{11};
+    auto seeded = session_manager.inspect(session_program, FakePreparedPrompt{77}, session_seed);
+    auto active = materialize_and_adopt(session_manager, session_program, std::move(*seeded.choice),
+                                        FakePreparedPrompt{77});
+    (void)session_manager.finish(session_program, LaneId{0}, active.sequence);
+
+    FakeRequestBasePlan other_session = make_base(200);
+    other_session.shortlist_digest    = 77;
+    other_session.cache.session_key   = FakeCacheSessionKey{12};
+    auto retained = session_manager.inspect(session_program, FakePreparedPrompt{77}, other_session);
+    expect(retained.readiness == ninfer::runtime::Readiness::Ready && retained.choice &&
+               retained.choice->summary().reusable_prompt_tokens == 16 &&
+               session_program.last_retain_private_source,
+           "content hit across session identities did not retain the original continuation");
+}
+
 } // namespace
 
 int main() {
@@ -1610,6 +1672,7 @@ int main() {
     test_value_positive_replica_replaces_lower_value_host_duplicate();
     test_ready_replica_transition_skips_dominated_replacements();
     test_clean_replica_policy_waits_for_resource_invalidation();
+    test_content_prefix_shortlist_bounds_exact_inspection();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }
