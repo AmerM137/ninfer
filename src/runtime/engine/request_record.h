@@ -23,6 +23,7 @@ enum class EngineRequestState : std::uint8_t {
     Materializing,
     Prefill,
     DecodeReady,
+    ControlReady,
     ModelFinished,
 };
 
@@ -59,6 +60,10 @@ struct RequestRecord {
 
     [[nodiscard]] bool is_decode_ready() const noexcept {
         return model_state == EngineRequestState::DecodeReady;
+    }
+
+    [[nodiscard]] bool is_control_ready() const noexcept {
+        return model_state == EngineRequestState::ControlReady;
     }
 
     [[nodiscard]] bool is_model_finished() const noexcept {

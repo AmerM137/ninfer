@@ -30,6 +30,33 @@ template's default. An artifact whose template does not expose effort rejects th
 `--no-thinking` for direct-response prompt rendering; it cannot be combined with
 `--reasoning-effort`. `--greedy` selects exact argmax decoding independently.
 
+`--thinking-budget N` places a positive upper bound on accepted model-origin tokens while the
+new-turn Qwen thinking block remains open. If the model has not emitted `</think>` at that exact
+boundary, Engine appends [Qwen's canonical early-close guidance](https://github.com/QwenLM/Qwen3/blob/main/docs/source/getting_started/thinking_budget.md)
+and `</think>` to the same resident sequence without sampling, publishes the guidance through the
+reasoning stream, then resumes ordinary generation from the updated context. A natural thinking
+close, stop condition, cancellation, or total output/context limit at the boundary takes priority
+and suppresses this insertion. The option cannot be combined with `--no-thinking`, but it can be
+combined with `--reasoning-effort`.
+
+`--max-new` counts every committed generated token, including internally inserted control tokens.
+When the effective output capacity extends beyond the thinking budget, it must have room for the
+complete tokenizer-derived control suffix plus one post-close model token; an undersized request is
+rejected rather than truncating the suffix. Normal output sends the inserted guidance to stderr as
+reasoning. `--print-token-ids` includes the inserted IDs, while `--raw-output` preserves the raw
+control representation.
+
+For example, this allows at most 512 model-origin thinking tokens while retaining enough total
+output capacity for the inserted suffix and the answer:
+
+```bash
+./build/apps/ninfer models/qwen3_6_27b.ninfer \
+  --prompt "Explain speculative decoding, then give a concise conclusion." \
+  --max-context 4096 \
+  --max-new 1024 \
+  --thinking-budget 512
+```
+
 ## Startup memory profile
 
 GPU residency is frozen when the Engine starts:
@@ -149,6 +176,7 @@ measured recommendation rather than a semantic limit.
 | `--vision` | enable image/video input and load Vision GPU allocations | off |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--no-thinking` | disable thinking in prompt rendering | thinking on |
+| `--thinking-budget N` | positive model-origin thinking-token cap; omitted means unlimited | unset |
 | `--reasoning-effort low\|medium\|xhigh` | select an effort exposed by the loaded chat template | template default |
 | `--greedy` | exact argmax decoding | off |
 | `--temperature F` | sampling temperature override | registered model/mode default |

@@ -688,6 +688,10 @@ public:
         std::optional<PressureOption> replacement, runtime::CancellationFlagView cancellation);
     [[nodiscard]] PendingBatch<Variant> decode(std::span<const SequenceHandle<Variant>> sequences,
                                                std::span<const runtime::RoundBudget> budgets);
+    // Advance each live sequence with its exact target-owned token row. This does not sample or
+    // advance sampler RNG/occurrence state; callers own output publication and budget accounting.
+    void append_forced_tokens(std::span<const SequenceHandle<Variant>> sequences,
+                              std::span<const TokenId> row_major_tokens, std::uint32_t row_stride);
     [[nodiscard]] CommitResult<Variant>
     commit(PendingBatch<Variant>&& pending, std::span<const runtime::CommitDecision> decisions,
            runtime::CommitObservation observation = runtime::CommitObservation::AllRows);

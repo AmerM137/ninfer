@@ -406,6 +406,8 @@ public:
         runtime::CancellationFlagView cancellation);
     [[nodiscard]] PendingBatch decode(std::span<const SequenceHandle> sequences,
                                       std::span<const runtime::RoundBudget> budgets);
+    void append_forced_tokens(std::span<const SequenceHandle> sequences,
+                              std::span<const TokenId> row_major_tokens, std::uint32_t row_stride);
     [[nodiscard]] CommitResult commit(PendingBatch&& pending,
                                       std::span<const runtime::CommitDecision> decisions,
                                       runtime::CommitObservation observation);

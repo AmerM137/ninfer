@@ -49,6 +49,7 @@ public:
     using Scheduling         = Scheduler<Request>;
     using FifoSnapshot       = typename Scheduling::FifoSnapshot;
     using RoundMembership    = typename Scheduling::RoundMembership;
+    using ControlMembership  = typename Scheduling::ControlMembership;
     using ActiveAdmissionSet = typename Scheduling::ActiveAdmissionSet;
     using ExecutionAction    = typename Scheduling::ExecutionAction;
     using AdmissionGrant     = typename Scheduling::AdmissionGrant;
@@ -57,7 +58,8 @@ public:
     using Clock              = std::chrono::steady_clock;
 
     EngineCore(Instance& instance, const EngineOptions& options, ContextCostModel context_cost)
-        : instance_(instance), max_concurrency_(options.max_concurrency),
+        : instance_(instance), max_context_(options.max_context),
+          max_concurrency_(options.max_concurrency),
           max_outstanding_(static_cast<std::size_t>(options.max_concurrency) +
                            options.max_pending_requests),
           pending_timeout_(std::chrono::milliseconds(options.pending_timeout_ms)),
@@ -167,8 +169,17 @@ public:
 
         std::shared_ptr<Request> request;
         try {
-            auto output = instance_.loaded->frontend.make_output_session(prompt, options.stop,
-                                                                         options.output);
+            auto output = instance_.loaded->frontend.make_output_session(
+                prompt, options.stop, options.output, options.execution.thinking);
+            const std::uint32_t capacity_output =
+                max_context_ - prompt_summary.prompt_tokens + static_cast<std::uint32_t>(1);
+            try {
+                output.validate_generation_capacity(
+                    std::min(options.execution.requested_output_tokens, capacity_output));
+            } catch (const std::invalid_argument& error) {
+                throw RequestError(RequestErrorKind::ThinkingBudgetCapacityInsufficient,
+                                   error.what());
+            }
             request = std::make_shared<Request>(request_id, std::move(prompt), std::move(output),
                                                 prompt_summary, prepare_seconds, std::move(options),
                                                 pending_deadline, submitted);
@@ -442,6 +453,7 @@ private:
         result.timings                 = request->generation_timings;
         result.timings.prepare_seconds = request->prepare_seconds;
         result.speculative             = std::move(request->speculative_stats);
+        result.thinking                = request->output.thinking_stats();
         if (request->first_token) {
             result.timings.first_token_seconds =
                 request->prepare_seconds +
@@ -580,6 +592,7 @@ private:
         std::array<LaneId, kMaximumConcurrency> lanes{};
         std::array<CommitDecision, kMaximumConcurrency> decisions{};
         std::array<FinishReason, kMaximumConcurrency> finish_reasons{};
+        std::array<ContinuationAction, kMaximumConcurrency> continuations{};
         std::array<std::size_t, kMaximumConcurrency> generated_sizes{};
         std::array<bool, kMaximumConcurrency> cancelled{};
         bool generated_staged = false;
@@ -624,10 +637,11 @@ private:
                     finish_reasons[row] = FinishReason::Cancelled;
                     continue;
                 }
-                const OutputDecision decision = request->output.preview(
+                const OutputDecision decision = request->output.preview_model(
                     row_tokens, request->budget->remaining(), request->budget->limit_reason());
                 if (decision.accepted_tokens == 0 || decision.accepted_tokens > count ||
-                    (!decision.finished() && decision.accepted_tokens != count)) {
+                    (!decision.finished() && decision.accepted_tokens != count) ||
+                    (decision.finished() && decision.continuation != ContinuationAction::Decode)) {
                     throw std::logic_error("output policy returned an invalid licensed prefix");
                 }
                 decisions[row] = CommitDecision{
@@ -636,6 +650,7 @@ private:
                     .cancelled       = false,
                 };
                 finish_reasons[row] = decision.finish_reason;
+                continuations[row]  = decision.continuation;
             }
             generated_staged = true;
             for (std::size_t row = 0; row < row_count; ++row) {
@@ -723,13 +738,20 @@ private:
                     throw std::logic_error("prompt-frontier capture lost its prefill owner");
                 }
                 reserve_active_capture(request, std::move(*committed.captures[row]),
-                                       EngineRequestState::DecodeReady);
+                                       continuations[row] == ContinuationAction::ApplyTargetControl
+                                           ? EngineRequestState::ControlReady
+                                           : EngineRequestState::DecodeReady);
                 committed.captures[row].reset();
                 if (!request->capture_pending) {
-                    request->model_state = EngineRequestState::DecodeReady;
+                    request->model_state =
+                        continuations[row] == ContinuationAction::ApplyTargetControl
+                            ? EngineRequestState::ControlReady
+                            : EngineRequestState::DecodeReady;
                 }
-            } else if (request->is_prefilling()) {
-                request->model_state = EngineRequestState::DecodeReady;
+            } else {
+                request->model_state = continuations[row] == ContinuationAction::ApplyTargetControl
+                                           ? EngineRequestState::ControlReady
+                                           : EngineRequestState::DecodeReady;
             }
         }
         if (decode_round) {
@@ -1212,6 +1234,79 @@ private:
         publish_runtime_stats();
     }
 
+    void run_control_batch(const ControlMembership& membership) {
+        if (membership.empty() || membership.row_stride == 0 ||
+            membership.tokens.size() !=
+                static_cast<std::size_t>(membership.row_stride) * membership.size) {
+            throw std::logic_error("thinking control membership is invalid");
+        }
+
+        std::array<std::size_t, kMaximumConcurrency> generated_sizes{};
+        bool generated_staged         = false;
+        const auto rollback_generated = [&]() noexcept {
+            if (!generated_staged) { return; }
+            for (std::size_t row = 0; row < membership.size; ++row) {
+                const auto& request = slots_[membership.lanes[row]];
+                if (request != nullptr && request->generated.size() >= generated_sizes[row]) {
+                    request->generated.resize(generated_sizes[row]);
+                }
+            }
+            generated_staged = false;
+        };
+
+        for (std::size_t row = 0; row < membership.size; ++row) {
+            const auto& request = slots_[membership.lanes[row]];
+            if (request == nullptr) {
+                throw std::logic_error("thinking control membership lost its request");
+            }
+            generated_sizes[row] = request->generated.size();
+        }
+        generated_staged = true;
+        try {
+            for (std::size_t row = 0; row < membership.size; ++row) {
+                const std::uint32_t lane = membership.lanes[row];
+                const auto& request      = slots_[lane];
+                if (request == nullptr || !request->is_control_ready() ||
+                    request->capture_pending || !request->budget || !request->sequence ||
+                    !request->lane || request->lane->value != lane) {
+                    throw std::logic_error("thinking control row lost its active request");
+                }
+                const std::span<const TokenId> tokens =
+                    std::span<const TokenId>(membership.tokens)
+                        .subspan(row * membership.row_stride, membership.row_stride);
+                const OutputDecision decision =
+                    request->output.preview_control(tokens, request->budget->remaining());
+                if (decision.accepted_tokens != membership.row_stride || decision.finished() ||
+                    decision.continuation != ContinuationAction::Decode) {
+                    throw std::logic_error("target control preview returned an invalid decision");
+                }
+                if (request->generated.size() > request->generated.capacity() ||
+                    tokens.size() > request->generated.capacity() - request->generated.size()) {
+                    throw std::logic_error(
+                        "admission did not reserve thinking-control token capacity");
+                }
+                request->generated.insert(request->generated.end(), tokens.begin(), tokens.end());
+            }
+            instance_.program->append_forced_tokens(membership.sequence_span(), membership.tokens,
+                                                    membership.row_stride);
+        } catch (...) {
+            rollback_generated();
+            throw;
+        }
+        generated_staged = false;
+
+        for (std::size_t row = 0; row < membership.size; ++row) {
+            const std::uint32_t lane = membership.lanes[row];
+            const auto& request      = slots_[lane];
+            request->budget->commit(membership.row_stride);
+            Scheduling::consume_service_work(*request, membership.row_stride);
+            cumulative_stats_.committed_decode_tokens += membership.row_stride;
+            append_output(request, request->output.commit_preview());
+            request->model_state = EngineRequestState::DecodeReady;
+        }
+        publish_runtime_stats();
+    }
+
     // The worker holds execution_mutex_ across the failing operation and this cleanup, so no
     // Program introspection can observe a partially cleared physical state.
     void fail_all_locked(std::exception_ptr error) noexcept {
@@ -1285,6 +1380,14 @@ private:
                 // not reinterpret an already-issued unit with a later atomic read.
                 const auto cancelled_at_unit_start = snapshot_cancellations();
                 cancel_active_requests(cancelled_at_unit_start);
+                const ControlMembership control_membership =
+                    scheduler_.build_control_membership(slots_, max_concurrency_);
+                if (!control_membership.empty()) {
+                    run_control_batch(control_membership);
+                    previous_unit_was_decode = true;
+                    try_start_replica_transition();
+                    continue;
+                }
                 membership = scheduler_.build_round_membership(slots_, max_concurrency_);
 
                 bool prefill_runnable = false;
@@ -1320,6 +1423,7 @@ private:
     }
 
     Instance& instance_;
+    const std::uint32_t max_context_;
     const std::uint32_t max_concurrency_;
     const std::size_t max_outstanding_;
     const std::chrono::milliseconds pending_timeout_;

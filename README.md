@@ -300,6 +300,7 @@ state, and function calls) plus Anthropic Messages, token counting, and multimod
 All three registered model IDs support:
 
 - text generation with thinking and non-thinking prompt modes;
+- tokenizer-derived Qwen thinking caps through CLI or a server process default;
 - image, multi-image, video, and mixed multimodal messages;
 - chunked prefill and CUDA Graph decode;
 - startup-bounded small-scale concurrent serving with true batched decode;

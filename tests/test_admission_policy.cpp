@@ -1,14 +1,54 @@
 #include "runtime/engine/admission_policy.h"
 #include "runtime/engine/scheduler.h"
 
+#include <algorithm>
 #include <array>
 #include <iostream>
+#include <memory>
+#include <optional>
+#include <span>
 #include <utility>
+#include <vector>
 
 namespace {
 
 struct SchedulerRequest {
     using SequenceHandle = std::uint64_t;
+
+    struct Budget {
+        std::uint32_t tokens = 0;
+
+        [[nodiscard]] std::uint32_t remaining() const noexcept { return tokens; }
+    };
+
+    struct Output {
+        std::uint32_t model_tokens = 0;
+        std::vector<ninfer::TokenId> control;
+
+        [[nodiscard]] std::uint32_t
+        model_token_budget_remaining(std::uint32_t total) const noexcept {
+            return std::min(total, model_tokens);
+        }
+
+        [[nodiscard]] std::span<const ninfer::TokenId> pending_control_tokens() const noexcept {
+            return control;
+        }
+    };
+
+    enum class State : std::uint8_t {
+        Decode,
+        Control,
+    };
+
+    [[nodiscard]] bool is_decode_ready() const noexcept { return state == State::Decode; }
+
+    [[nodiscard]] bool is_control_ready() const noexcept { return state == State::Control; }
+
+    State state          = State::Decode;
+    bool capture_pending = false;
+    std::optional<Budget> budget;
+    std::optional<SequenceHandle> sequence;
+    Output output;
 };
 
 int check(bool condition, const char* message) {
@@ -209,6 +249,24 @@ int main() {
                   scheduler.choose_execution(true, true, false) == ExecutionAction::Decode &&
                   scheduler.choose_execution(true, true, true) == ExecutionAction::Prefill,
               "prefill/decode alternation did not follow the completed GPU unit");
+    scheduler.clear_prefill_lane(0);
+
+    std::array<std::shared_ptr<SchedulerRequest>, ninfer::kMaximumConcurrency> slots{};
+    slots[0]                      = std::make_shared<SchedulerRequest>();
+    slots[0]->budget              = SchedulerRequest::Budget{.tokens = 11};
+    slots[0]->sequence            = 23;
+    slots[0]->output.model_tokens = 3;
+    const auto model_membership   = scheduler.build_round_membership(slots, 1);
+    failures += check(model_membership.size == 1 &&
+                          model_membership.budgets[0].generated_tokens_remaining == 3,
+                      "thinking budget did not constrain Scheduler model-token licensing");
+
+    slots[0]->state          = SchedulerRequest::State::Control;
+    slots[0]->output.control = {7, 8, 9};
+    const auto control       = scheduler.build_control_membership(slots, 1);
+    failures += check(control.size == 1 && control.row_stride == 3 &&
+                          control.tokens == slots[0]->output.control && control.sequences[0] == 23,
+                      "ControlReady membership did not preserve the exact target-control span");
 
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;

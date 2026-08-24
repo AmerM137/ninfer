@@ -99,6 +99,31 @@ the artifact identity, or a target profile. A recognized effort-capable template
 not exposed by the loaded template returns HTTP 400 with code
 `reasoning_effort_not_supported` before prompt preparation.
 
+`--default-thinking-budget N` sets a positive process default for requests whose final resolved
+prompt semantics enable thinking. It does not add or reinterpret an HTTP request field: the
+existing `reasoning_effort` and `enable_thinking` inputs still decide whether thinking is enabled,
+and a request resolved to non-thinking receives no cap. `--no-thinking` may coexist with this
+option because a protocol request can explicitly enable thinking. In this phase, Anthropic's
+existing `thinking.budget_tokens` member does not override the process default.
+
+For example, this caps model-origin thinking at 512 tokens for every thinking-enabled request:
+
+```bash
+./build/apps/ninfer-serve models/qwen3_6_27b.ninfer \
+  --max-context 16384 \
+  --default-thinking-budget 512
+```
+
+At the cap boundary, Engine first honors a natural `</think>`, stop condition, cancellation, or
+total output/context limit. If thinking remains open, it commits Qwen's canonical early-close
+guidance and close marker to the same model sequence without sampling, streams the guidance as a
+reasoning delta, and continues normal content or tool-call generation. Inserted tokens count in
+completion usage and the request's `max_tokens`/`max_output_tokens` budget. If the effective output
+capacity extends past the cap but cannot fit the complete tokenizer-derived control suffix plus one
+post-close model token, preparation is rejected with HTTP 400 code
+`thinking_budget_capacity_insufficient` rather than partially inserting control. The server does
+not promise that the model will emit nonempty content or a tool call after the marker.
+
 For Chat Completions, `reasoning_effort: "none"` disables thinking. `low`, `medium`, and `xhigh`
 select the corresponding template effort when available. The other OpenAI protocol values
 `minimal`, `high`, and `max` are parsed but rejected when the loaded template does not expose them.
@@ -489,6 +514,7 @@ curl http://127.0.0.1:8080/v1/models \
 | `--draft-tokens N` | MTP `1..5`; DFlash `1..15` | unset |
 | `--lm-head-draft` | optimized proposal head | off |
 | `--default-max-tokens N` | output limit when omitted by a request | `8192` |
+| `--default-thinking-budget N` | positive thinking cap inherited by thinking-enabled requests | unset |
 | `--vision` | enable media input and load Vision GPU allocations | off |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--no-prefix-reuse` | disable compatible-prefix caching | prefix reuse on |
@@ -549,7 +575,7 @@ is also rejected if it resolves to the model artifact.
   --request-log-jsonl profiles/bench/run/server.requests.jsonl
 ```
 
-Every line is one `ninfer_serve_request_log` schema-v12 JSON object. All events carry
+Every line is one `ninfer_serve_request_log` schema-v13 JSON object. All events carry
 `timestamp_unix_ms` and a process-unique `server_instance_id`; request IDs are monotonic only within
 that server instance. Successful request-start records include request-scoped acquisition,
 media-preprocessing wall/work, tokenizer, cache hit/miss/single-flight, and payload-size fields;
@@ -557,10 +583,10 @@ they do not infer request behavior from process-global counter deltas.
 
 | Event | Contents |
 |---|---|
-| `server_start` | target/weights identity and artifact, resolved Engine and context-cache capacities, registered thinking/non-thinking sampler defaults plus process overrides, thinking-history defaults, Device arenas, Host State/KV capacity and occupancy, KV sizing ledger, CUDA Graph observed/allowance bytes, CUDA/GPU environment, and redacted argv |
-| `request_start` | protocol, resolved sampler and seed, thinking modes, Responses semantic-change flag, output budget, stream/message/tool shape |
+| `server_start` | target/weights identity and artifact, resolved Engine and context-cache capacities, registered thinking/non-thinking sampler defaults plus process overrides, thinking-history and thinking-budget defaults, Device arenas, Host State/KV capacity and occupancy, KV sizing ledger, CUDA Graph observed/allowance bytes, CUDA/GPU environment, and redacted argv |
+| `request_start` | protocol, resolved sampler and seed, thinking mode and optional budget, Responses semantic-change flag, output budget, stream/message/tool shape |
 | `request_rejected` | parsed request shape, media-item count, `phase: "prepare"`, and the exact HTTP status/type/code/parameter/message for a synchronous preparation rejection |
-| `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, unrounded phase seconds, and complete speculative-decoding counters |
+| `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, thinking-budget application counters, unrounded phase seconds, and complete speculative-decoding counters |
 | `request_error` | the resolved request configuration and generation error message |
 | `throughput` | interval token/decode/context-cache counter deltas, current scheduler and resource gauges, last materialization decision, and decode-round batch statistics |
 

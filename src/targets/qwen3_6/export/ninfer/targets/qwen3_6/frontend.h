@@ -97,12 +97,19 @@ public:
     OutputSession(const OutputSession&)            = delete;
     OutputSession& operator=(const OutputSession&) = delete;
 
-    [[nodiscard]] runtime::OutputDecision preview(std::span<const TokenId> tokens,
-                                                  std::uint32_t budget_remaining,
-                                                  FinishReason limit_reason);
+    [[nodiscard]] runtime::OutputDecision preview_model(std::span<const TokenId> tokens,
+                                                        std::uint32_t total_budget_remaining,
+                                                        FinishReason limit_reason);
+    [[nodiscard]] std::uint32_t
+    model_token_budget_remaining(std::uint32_t total_budget_remaining) const noexcept;
+    [[nodiscard]] std::span<const TokenId> pending_control_tokens() const noexcept;
+    [[nodiscard]] runtime::OutputDecision preview_control(std::span<const TokenId> tokens,
+                                                          std::uint32_t total_budget_remaining);
+    void validate_generation_capacity(std::uint32_t effective_output_tokens) const;
     [[nodiscard]] runtime::OutputDecision preview_terminal(FinishReason reason);
     [[nodiscard]] PublishedOutput commit_preview() noexcept;
     [[nodiscard]] std::uint32_t reasoning_tokens() const noexcept;
+    [[nodiscard]] ThinkingBudgetStats thinking_stats() const noexcept;
 
 private:
     class Impl;
@@ -128,9 +135,10 @@ public:
                                                 bool allow_prefix_identity = true) const;
     [[nodiscard]] PromptCapabilities prompt_capabilities() const noexcept;
     [[nodiscard]] MediaCacheSummary media_cache_summary() const;
-    [[nodiscard]] OutputSession make_output_session(const PreparedPrompt& prompt,
-                                                    const StopPolicy& caller_stop,
-                                                    const OutputOptions& output = {}) const;
+    [[nodiscard]] OutputSession
+    make_output_session(const PreparedPrompt& prompt, const StopPolicy& caller_stop,
+                        const OutputOptions& output            = {},
+                        const ThinkingControlOptions& thinking = {}) const;
     [[nodiscard]] const StopPolicy& default_stop_policy() const noexcept;
 
 private:

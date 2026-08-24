@@ -104,6 +104,20 @@ public:
         }
     };
 
+    struct ControlMembership {
+        std::array<std::uint32_t, kMaximumConcurrency> lanes{};
+        std::array<SequenceHandle, kMaximumConcurrency> sequences{};
+        std::vector<TokenId> tokens;
+        std::uint32_t row_stride = 0;
+        std::size_t size         = 0;
+
+        [[nodiscard]] bool empty() const noexcept { return size == 0; }
+
+        [[nodiscard]] std::span<const SequenceHandle> sequence_span() const noexcept {
+            return {sequences.data(), size};
+        }
+    };
+
     struct ActiveAdmissionSet {
         std::array<ActiveAdmissionSnapshot, kMaximumConcurrency> requests{};
         std::size_t size = 0;
@@ -134,7 +148,44 @@ public:
             }
             membership.lanes[membership.size]     = lane;
             membership.sequences[membership.size] = *request->sequence;
-            membership.budgets[membership.size]   = request->budget->round_budget();
+            membership.budgets[membership.size]   = RoundBudget{
+                  .generated_tokens_remaining =
+                    request->output.model_token_budget_remaining(request->budget->remaining()),
+            };
+            if (membership.budgets[membership.size].generated_tokens_remaining == 0) {
+                throw std::logic_error("decode-ready request has no licensed model tokens");
+            }
+            ++membership.size;
+        }
+        return membership;
+    }
+
+    template <class Slots>
+    [[nodiscard]] ControlMembership build_control_membership(const Slots& slots,
+                                                             std::uint32_t max_concurrency) const {
+        ControlMembership membership;
+        for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
+            const auto& request = slots[lane];
+            if (request == nullptr || !request->is_control_ready() || request->capture_pending) {
+                continue;
+            }
+            if (!request->budget || !request->sequence) {
+                throw std::logic_error("control-ready request has no generation state");
+            }
+            const std::span<const TokenId> control = request->output.pending_control_tokens();
+            if (control.empty() || control.size() > request->budget->remaining()) {
+                throw std::logic_error("control-ready request has no admissible control span");
+            }
+            if (membership.row_stride == 0) {
+                membership.row_stride = static_cast<std::uint32_t>(control.size());
+                membership.tokens.reserve(static_cast<std::size_t>(membership.row_stride) *
+                                          max_concurrency);
+            } else if (control.size() != membership.row_stride) {
+                throw std::logic_error("compact control membership has ragged target spans");
+            }
+            membership.lanes[membership.size]     = lane;
+            membership.sequences[membership.size] = *request->sequence;
+            membership.tokens.insert(membership.tokens.end(), control.begin(), control.end());
             ++membership.size;
         }
         return membership;

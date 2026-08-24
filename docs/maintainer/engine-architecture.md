@@ -105,7 +105,8 @@ Frontend 拥有 target family 的输入和输出语义：
 - tokenizer、chat template、Vision preprocessing 和 MRoPE prompt construction；
 - `PreparedPrompt` 的 owning representation 与 prefix identity；
 - stop policy、thinking/content channel、增量 detokenization 和最终文本；
-- `OutputSession::preview`、`preview_terminal` 与 `commit_preview`。
+- 独立于 presentation mode 的 thinking phase/cap 状态；
+- `OutputSession::preview_model`、`preview_control`、`preview_terminal` 与 `commit_preview`。
 
 Frontend 产生两个关键对象：
 
@@ -124,7 +125,7 @@ Engine 是请求控制平面。它负责：
 - `RequestRecord`、active slots、deadline 和 cancellation；
 - Scheduler policy；
 - ResourceManager 的逻辑资源与 continuation catalog；
-- prefill/decode boundary orchestration；
+- prefill/decode/target-control boundary orchestration；
 - OutputSession 与 Runtime 之间的 commit transaction；
 - generation accounting、event queue 和最终 response completion；
 - Runtime failure 后的 Engine-wide cleanup。
@@ -616,7 +617,7 @@ Program 在 commit 前保持能将全部持久状态折叠到该 prefix 的 boun
 
 ```text
 freeze cancellation snapshot
-  -> OutputSession preview / preview_terminal for every row
+  -> OutputSession preview_model / preview_terminal for every row
   -> stage accepted token IDs in RequestRecord
   -> Program::commit(PendingBatch, decisions)
   -> ResourceManager applies released-row ledger transitions
@@ -664,7 +665,57 @@ Program 为每行返回一个 disposition：
 MTP/DFlash acceptance、KV frontier、Linear Attention state、backend state、RNG/anchor 和 checkpoint 都在
 Program commit 中推进到同一个 accepted frontier。Engine 不分别提交这些 target states。
 
-### 8.5 Finish 与 retention
+### 8.5 Thinking cap 与 target control transaction
+
+`ExecutionOptions::thinking.budget` 是 accepted model-origin thinking token 的可选正数上限。
+cap 激活后，Frontend 的语义 tracker 不依赖 raw/reasoning presentation mode：它逐个解析已接受模型
+token 的完整字节，自然观察 `</think>`，并只在 thinking 仍打开且计数准确到达上限时让
+`OutputDecision` 返回 `ApplyTargetControl`。未配置 cap 时该 tracker 保持 dormant，不增加默认 decode
+路径的逐 token detokenization。Scheduler 在 tracker armed 时把模型 round license 限制为
+`min(total_remaining, budget-used)`，因此 MTP/DFlash 不会跨过该边界提交 speculative extent。
+
+自然 close、stop token/string、总 output/context limit 和 cancellation 都优先于 control。达到边界的
+nonterminal request 进入 `CONTROL_READY`，不再属于普通 decode membership。Prompt-finalization 的第一个
+token 也可能到达边界；若它同时产生 active-capture offer，capture transaction 的 post state 必须保存
+`CONTROL_READY`。
+
+Qwen Frontend 在资源构造时把规范 control suffix 编码一次，不向 Engine 暴露固定 token ID 或固定 token
+数。当前 suffix 与 [Qwen 官方 thinking-budget 机制](https://github.com/QwenLM/Qwen3/blob/main/docs/source/getting_started/thinking_budget.md)
+一致，固定为：
+
+```text
+\n\n Considering the limited time by the user, I have to give the solution based on the thinking directly now.\n</think>\n\n
+```
+
+引导语位于 close marker 之前，因此属于 reasoning；`</think>` 只切换输出 phase，不是 stop token。Control
+membership 中每行携带 tokenizer 动态编码得到的完整 span，事务顺序为：
+
+```text
+freeze cancellation snapshot
+  -> OutputSession::preview_control(exact span)
+  -> stage every control token ID in RequestRecord
+  -> Program::append_forced_tokens(compact membership)
+  -> commit GenerationBudget and service work
+  -> OutputSession::commit_preview
+  -> publish reasoning deltas
+  -> CONTROL_READY -> DECODE_READY
+```
+
+`preview_control` 忽略 caller stop policy 的截断作用，但仍通过 presentation decoder 完成 reasoning close；
+Program 成功前没有 control output 可见。Control span 消耗 generated-token、context 和 service-work 容量，
+但不调用 sampler、不推进 RNG 或 sampling occurrence counter。
+
+Program 把一行 control 前的 sequence invariant
+`S=E+1, ledger.back()=unexecuted anchor` 推进为短 no-sample continuation。对 forced tokens
+`F[0..K-1]`，模型执行 `ledger.back(), F[0], ..., F[K-2]`，并把完整 F 追加到 ledger。提交后
+`E'=E+K, S'=E'+1`，最后的 `F[K-1]` 成为下一普通 decode 的 anchor。同一 family 算法更新 Main KV、GDN
+state/fork、tail hidden、position/rope delta、prefix identity、MTP KV 与 draft reset，以及 DFlash
+feature/context frontier。控制预算值本身不进入 prefix identity；已提交的 forced token IDs 进入。
+
+若有效输出容量 `M` 大于 budget `B`，planning 要求 `M-B >= K+1`；额外一个槽位只提供一次 post-close
+模型执行机会，不保证可见正文或工具调用。`M<=B` 时普通 output/context limit 可以先结束请求。
+
+### 8.6 Finish 与 retention
 
 允许reuse的成功请求在finish时把active mutable state冻结为private endpoint；root-only或request-level
 reuse关闭时直接释放。顺序是：
@@ -700,6 +751,7 @@ Engine 观察到 cancellation flag 后使用 boundary 语义：已经提交的 G
 |---|---|---|
 | `WAITING` | 无 Runtime state | staged `preview_terminal(Cancelled)` 后完成 |
 | active，尚未产生本轮 PendingBatch | `abort(sequence)` | release 成功后 commit/publish terminal preview |
+| `CONTROL_READY`，control transaction 尚未开始 | `abort(sequence)` | 不插入 control；release 后 commit/publish terminal preview |
 | 已属于 frozen PendingBatch | `commit` 为 `CancelledReleased` | ledger release 后 commit/publish terminal preview |
 
 同一请求的 terminal preview 恰好执行一次。若 cancellation 在本轮 snapshot 之后到达，而 row 已被正常
@@ -823,6 +875,7 @@ Gateway/product adapter
   -> finalization PendingBatch preview/commit
   -> DECODE_READY
   -> repeated maximal compact decode + commit
+  -> optional CONTROL_READY + deterministic no-sample target control + DECODE_READY
   -> terminal Program finish
   -> optional catalogued private endpoint and shared/checkpoint references
   -> OutputSession commit and response_done

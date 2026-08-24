@@ -189,10 +189,18 @@ struct StopPolicy {
     bool publish_stop_token     = false;
 };
 
+struct ThinkingControlOptions {
+    // Positive maximum accepted model-origin tokens while the Qwen thinking phase remains open.
+    // Omitted means unlimited. Injected target-control tokens consume the total output budget but
+    // not this model-origin budget.
+    std::optional<std::uint32_t> budget;
+};
+
 struct ExecutionOptions {
     SamplingOverrides sampling;
     std::uint32_t requested_output_tokens = 0;
     bool allow_prefix_reuse               = true;
+    ThinkingControlOptions thinking;
 };
 
 struct OutputOptions {
@@ -336,6 +344,7 @@ struct PromptInput {
 
 enum class RequestErrorKind : std::uint8_t {
     ContextLengthExceeded,
+    ThinkingBudgetCapacityInsufficient,
     MediaBudgetExceeded,
     Overloaded,
     QueueTimeout,
@@ -451,6 +460,15 @@ struct SpeculativeStats {
     std::vector<std::uint64_t> accepted_per_position;
 };
 
+struct ThinkingBudgetStats {
+    std::optional<std::uint32_t> configured_budget;
+    // Model-origin tokens accepted while capped thinking remained open.
+    std::uint32_t model_thinking_tokens = 0;
+    // Complete tokenizer-derived target-control suffix committed by Engine.
+    std::uint32_t injected_tokens = 0;
+    bool applied                  = false;
+};
+
 enum class PrefixReusePath : std::uint8_t {
     Root,
     PrivateEndpoint,
@@ -471,6 +489,7 @@ struct GenerationResult {
     PrefixReusePath prefix_reuse_path  = PrefixReusePath::Root;
     GenerationTimings timings;
     SpeculativeStats speculative;
+    ThinkingBudgetStats thinking;
 };
 
 struct ArenaMemorySummary {
