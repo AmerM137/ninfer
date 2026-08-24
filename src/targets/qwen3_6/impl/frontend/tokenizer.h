@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <span>
 #include <string>
@@ -42,6 +43,11 @@ struct TokenizerResources {
     std::string_view generation_config_json;
 };
 
+struct BpeMergeRule {
+    int rank   = 0;
+    int result = -1;
+};
+
 class Tokenizer {
 public:
     explicit Tokenizer(TokenizerResources resources);
@@ -65,8 +71,8 @@ private:
     std::vector<bool> valid_token_ids_;
     std::vector<bool> special_token_ids_;
     std::unordered_map<std::string, int> vocab_token_to_id_;
-    std::unordered_map<std::string, int> bpe_merge_ranks_;
-    bool has_bpe_merges_ = true;
+    std::unordered_map<std::uint64_t, BpeMergeRule> bpe_merge_rules_;
+    std::array<int, 256> byte_token_ids_{};
     std::vector<AddedToken> added_tokens_;
     std::array<std::vector<std::size_t>, 256> added_token_candidates_;
     std::vector<int> default_stop_token_ids_;

@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <queue>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -316,20 +317,17 @@ std::vector<int> load_default_stop_token_ids(std::string_view contents) {
         "field eos_token_id must be integer or array in generation_config.json");
 }
 
-std::string merge_pair_key(std::string_view left, std::string_view right) {
-    std::string key;
-    key.reserve(left.size() + 1 + right.size());
-    key.append(left);
-    key.push_back('\0');
-    key.append(right);
-    return key;
+std::uint64_t merge_pair_key(int left, int right) noexcept {
+    return (static_cast<std::uint64_t>(static_cast<std::uint32_t>(left)) << 32U) |
+           static_cast<std::uint32_t>(right);
 }
 
-std::unordered_map<std::string, int> load_bpe_merge_ranks(const Json& model,
-                                                          std::string_view label) {
+std::unordered_map<std::uint64_t, BpeMergeRule>
+load_bpe_merge_rules(const Json& model, std::string_view label,
+                     const std::unordered_map<std::string, int>& token_to_id) {
     const Json& merges = require_array_field(model, "merges", label);
-    std::unordered_map<std::string, int> ranks;
-    ranks.reserve(merges.size());
+    std::unordered_map<std::uint64_t, BpeMergeRule> rules;
+    rules.reserve(merges.size());
     int rank = 0;
     for (const Json& item : merges) {
         std::string left;
@@ -351,10 +349,20 @@ std::unordered_map<std::string, int> load_bpe_merge_ranks(const Json& model,
             throw std::invalid_argument("field model.merges must contain symbol pairs in " +
                                         std::string(label));
         }
-        const auto [_, inserted] = ranks.emplace(merge_pair_key(left, right), rank++);
+        const auto left_id   = token_to_id.find(left);
+        const auto right_id  = token_to_id.find(right);
+        const auto result_id = token_to_id.find(left + right);
+        if (left_id == token_to_id.end() || right_id == token_to_id.end() ||
+            result_id == token_to_id.end()) {
+            throw std::invalid_argument("model.merges references a symbol outside model.vocab in " +
+                                        std::string(label));
+        }
+        const auto [_, inserted] =
+            rules.emplace(merge_pair_key(left_id->second, right_id->second),
+                          BpeMergeRule{.rank = rank++, .result = result_id->second});
         if (!inserted) { throw std::invalid_argument("duplicate merge pair in model.merges"); }
     }
-    return ranks;
+    return rules;
 }
 
 std::unordered_map<std::uint32_t, char> build_byte_level_decoder() {
@@ -386,15 +394,15 @@ std::string decode_byte_level_token(std::string_view token, int id) {
     return bytes;
 }
 
-std::unordered_map<unsigned char, std::string> build_byte_level_encoder() {
-    std::unordered_map<unsigned char, std::string> encoder;
+std::array<std::string, 256> build_byte_level_encoder() {
+    std::array<std::string, 256> encoder;
     std::uint32_t next = 256;
     for (int byte = 0; byte <= std::numeric_limits<unsigned char>::max(); ++byte) {
         const bool visible = (byte >= 33 && byte <= 126) || (byte >= 161 && byte <= 172) ||
                              (byte >= 174 && byte <= 255);
         const std::uint32_t codepoint = visible ? static_cast<std::uint32_t>(byte) : next++;
-        encoder.emplace(static_cast<unsigned char>(byte),
-                        uni::codepoint_to_utf8(static_cast<std::int32_t>(codepoint)));
+        encoder[static_cast<unsigned char>(byte)] =
+            uni::codepoint_to_utf8(static_cast<std::int32_t>(codepoint));
     }
     return encoder;
 }
@@ -492,89 +500,115 @@ std::size_t qwen_word_end(std::string_view text, std::size_t begin) {
     return after_first;
 }
 
-std::string byte_level_encode(std::string_view text) {
-    static const std::unordered_map<unsigned char, std::string> byte_encoder =
-        build_byte_level_encoder();
-    std::string encoded;
-    encoded.reserve(text.size());
-    for (const unsigned char byte : text) { encoded += byte_encoder.at(byte); }
-    return encoded;
-}
-
-std::vector<std::string> byte_level_symbols(std::string_view text) {
-    const std::vector<uni::CodepointSpan> spans =
-        uni::utf8_codepoints(text, "Tokenizer::encode byte-level text");
-    std::vector<std::string> symbols;
-    symbols.reserve(spans.size());
-    for (const uni::CodepointSpan& span : spans) {
-        symbols.emplace_back(text.substr(span.offset, span.length));
-    }
-    return symbols;
-}
-
 bool is_stop_token_id(std::span<const int> stop_token_ids, int id) {
     return std::find(stop_token_ids.begin(), stop_token_ids.end(), id) != stop_token_ids.end();
 }
 
-bool append_symbol_id(std::vector<int>& ids,
-                      const std::unordered_map<std::string, int>& token_to_id,
-                      std::string_view symbol, std::size_t max_tokens) {
-    if (ids.size() == max_tokens) { return false; }
-    const auto direct = token_to_id.find(std::string(symbol));
-    if (direct != token_to_id.end()) {
-        ids.push_back(direct->second);
-        return ids.size() != max_tokens;
-    }
+struct BpeNode {
+    int symbol               = -1;
+    int previous             = -1;
+    int next                 = -1;
+    std::uint32_t generation = 0;
+    bool live                = true;
+};
 
-    const std::vector<std::string> bytes = byte_level_symbols(symbol);
-    if (bytes.size() <= 1) {
-        throw std::invalid_argument("Tokenizer::encode produced token outside vocabulary: " +
-                                    std::string(symbol));
+struct BpeCandidate {
+    int rank                       = 0;
+    int left                       = -1;
+    int right                      = -1;
+    int result                     = -1;
+    std::uint32_t left_generation  = 0;
+    std::uint32_t right_generation = 0;
+};
+
+struct LaterBpeCandidate {
+    bool operator()(const BpeCandidate& lhs, const BpeCandidate& rhs) const noexcept {
+        if (lhs.rank != rhs.rank) { return lhs.rank > rhs.rank; }
+        return lhs.left > rhs.left;
     }
-    for (const std::string& byte_symbol : bytes) {
-        const auto byte_id = token_to_id.find(byte_symbol);
-        if (byte_id == token_to_id.end()) {
-            throw std::invalid_argument(
-                "Tokenizer::encode produced byte symbol outside vocabulary: " + byte_symbol);
-        }
-        ids.push_back(byte_id->second);
-        if (ids.size() == max_tokens) { return false; }
+};
+
+std::array<int, 256> load_byte_token_ids(const std::unordered_map<std::string, int>& token_to_id) {
+    static const std::array<std::string, 256> byte_encoder = build_byte_level_encoder();
+    std::array<int, 256> ids;
+    ids.fill(-1);
+    for (std::size_t byte = 0; byte < ids.size(); ++byte) {
+        const auto token = token_to_id.find(byte_encoder[byte]);
+        if (token != token_to_id.end()) { ids[byte] = token->second; }
     }
-    return true;
+    return ids;
 }
 
-bool append_bpe_ids(std::vector<int>& ids, std::string_view text, bool has_bpe_merges,
-                    const std::unordered_map<std::string, int>& merge_ranks,
-                    const std::unordered_map<std::string, int>& token_to_id,
-                    std::size_t max_tokens) {
+bool append_bpe_ids(std::vector<int>& ids, std::string_view text,
+                    const std::unordered_map<std::uint64_t, BpeMergeRule>& merge_rules,
+                    const std::array<int, 256>& byte_token_ids, std::size_t max_tokens) {
     if (text.empty()) { return true; }
     if (ids.size() == max_tokens) { return false; }
-    if (!has_bpe_merges) {
-        throw std::invalid_argument(
-            "Tokenizer::encode ordinary BPE text requires embedded merges.txt");
-    }
 
     const std::string normalized = uni::normalize_nfc(text);
     for (std::size_t begin = 0; begin < normalized.size();) {
         const std::size_t end = qwen_word_end(normalized, begin);
         const std::string_view word(normalized.data() + begin, end - begin);
-        std::vector<std::string> symbols = byte_level_symbols(byte_level_encode(word));
-        while (symbols.size() > 1) {
-            int best_rank              = std::numeric_limits<int>::max();
-            std::size_t best_pair_left = symbols.size();
-            for (std::size_t i = 0; i + 1 < symbols.size(); ++i) {
-                const auto rank = merge_ranks.find(merge_pair_key(symbols[i], symbols[i + 1]));
-                if (rank != merge_ranks.end() && rank->second < best_rank) {
-                    best_rank      = rank->second;
-                    best_pair_left = i;
-                }
+        std::vector<BpeNode> nodes(word.size());
+        for (std::size_t index = 0; index < word.size(); ++index) {
+            const unsigned char byte = static_cast<unsigned char>(word[index]);
+            const int symbol         = byte_token_ids[byte];
+            if (symbol < 0) {
+                throw std::invalid_argument(
+                    "Tokenizer::encode produced byte symbol outside vocabulary");
             }
-            if (best_pair_left == symbols.size()) { break; }
-            symbols[best_pair_left] += symbols[best_pair_left + 1];
-            symbols.erase(symbols.begin() + static_cast<std::ptrdiff_t>(best_pair_left + 1));
+            nodes[index] =
+                BpeNode{.symbol   = symbol,
+                        .previous = index == 0 ? -1 : static_cast<int>(index - 1),
+                        .next     = index + 1 == word.size() ? -1 : static_cast<int>(index + 1)};
         }
-        for (const std::string& symbol : symbols) {
-            if (!append_symbol_id(ids, token_to_id, symbol, max_tokens)) { return false; }
+
+        std::priority_queue<BpeCandidate, std::vector<BpeCandidate>, LaterBpeCandidate> queue;
+        const auto push_candidate = [&](int left) {
+            if (left < 0 || !nodes[static_cast<std::size_t>(left)].live) { return; }
+            const int right = nodes[static_cast<std::size_t>(left)].next;
+            if (right < 0) { return; }
+            const auto rule =
+                merge_rules.find(merge_pair_key(nodes[static_cast<std::size_t>(left)].symbol,
+                                                nodes[static_cast<std::size_t>(right)].symbol));
+            if (rule == merge_rules.end()) { return; }
+            queue.push(BpeCandidate{
+                .rank             = rule->second.rank,
+                .left             = left,
+                .right            = right,
+                .result           = rule->second.result,
+                .left_generation  = nodes[static_cast<std::size_t>(left)].generation,
+                .right_generation = nodes[static_cast<std::size_t>(right)].generation,
+            });
+        };
+        for (std::size_t index = 0; index + 1 < nodes.size(); ++index) {
+            push_candidate(static_cast<int>(index));
+        }
+        while (!queue.empty()) {
+            const BpeCandidate candidate = queue.top();
+            queue.pop();
+            BpeNode& left  = nodes[static_cast<std::size_t>(candidate.left)];
+            BpeNode& right = nodes[static_cast<std::size_t>(candidate.right)];
+            if (!left.live || !right.live || left.next != candidate.right ||
+                left.generation != candidate.left_generation ||
+                right.generation != candidate.right_generation) {
+                continue;
+            }
+            left.symbol = candidate.result;
+            ++left.generation;
+            left.next  = right.next;
+            right.live = false;
+            ++right.generation;
+            if (left.next >= 0) {
+                nodes[static_cast<std::size_t>(left.next)].previous = candidate.left;
+            }
+            push_candidate(left.previous);
+            push_candidate(candidate.left);
+        }
+        for (int node = nodes.empty() ? -1 : 0; node >= 0;
+             node     = nodes[static_cast<std::size_t>(node)].next) {
+            ids.push_back(nodes[static_cast<std::size_t>(node)].symbol);
+            if (ids.size() == max_tokens) { return false; }
         }
         begin = end;
     }
@@ -629,8 +663,8 @@ Tokenizer::Tokenizer(TokenizerResources resources) {
                 decode_byte_level_token(decoded_token_bytes_[index], static_cast<int>(index));
         }
     }
-    bpe_merge_ranks_        = load_bpe_merge_ranks(model, tokenizer_label);
-    has_bpe_merges_         = true;
+    bpe_merge_rules_        = load_bpe_merge_rules(model, tokenizer_label, vocab_token_to_id_);
+    byte_token_ids_         = load_byte_token_ids(vocab_token_to_id_);
     default_stop_token_ids_ = load_default_stop_token_ids(resources.generation_config_json);
 }
 
@@ -638,8 +672,7 @@ std::vector<int> Tokenizer::encode(std::string_view text, EncodeOptions options)
     if (text.empty() || options.max_tokens == 0) { return {}; }
     if (!options.parse_added_tokens) {
         std::vector<int> ids;
-        (void)append_bpe_ids(ids, text, has_bpe_merges_, bpe_merge_ranks_, vocab_token_to_id_,
-                             options.max_tokens);
+        (void)append_bpe_ids(ids, text, bpe_merge_rules_, byte_token_ids_, options.max_tokens);
         return ids;
     }
 
@@ -665,8 +698,7 @@ std::vector<int> Tokenizer::encode(std::string_view text, EncodeOptions options)
 
         if (pos > ordinary_begin) {
             if (!append_bpe_ids(ids, text.substr(ordinary_begin, pos - ordinary_begin),
-                                has_bpe_merges_, bpe_merge_ranks_, vocab_token_to_id_,
-                                options.max_tokens)) {
+                                bpe_merge_rules_, byte_token_ids_, options.max_tokens)) {
                 return ids;
             }
         }
@@ -677,8 +709,8 @@ std::vector<int> Tokenizer::encode(std::string_view text, EncodeOptions options)
         ordinary_begin = pos;
     }
     if (ordinary_begin < text.size()) {
-        (void)append_bpe_ids(ids, text.substr(ordinary_begin), has_bpe_merges_, bpe_merge_ranks_,
-                             vocab_token_to_id_, options.max_tokens);
+        (void)append_bpe_ids(ids, text.substr(ordinary_begin), bpe_merge_rules_, byte_token_ids_,
+                             options.max_tokens);
     }
     return ids;
 }
