@@ -31,6 +31,12 @@ std::uint32_t normalized_private_capacity(const ContextCacheOptions& options) {
 
 using Clock = std::chrono::steady_clock;
 
+std::uint64_t elapsed_ns(Clock::time_point started) noexcept {
+    const auto elapsed =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - started).count();
+    return elapsed > 0 ? static_cast<std::uint64_t>(elapsed) : 0;
+}
+
 static_assert(std::is_nothrow_move_assignable_v<SpeculativeStats>);
 
 std::int32_t checked_i32(std::uint32_t value, const char* label) {
@@ -5990,7 +5996,8 @@ ProgramImplCore::shared_prefix_summary(const SharedPrefixState& shared) const {
     };
 }
 
-PrefillProgress ProgramImplCore::advance_prefill(SequenceHandle sequence) {
+PrefillProgress ProgramImplCore::advance_prefill(SequenceHandle sequence,
+                                                 runtime::ExecutionTiming& failed_timing) {
     if (pending_transaction_ || !valid_sequence(sequence)) {
         throw std::logic_error("prefill sequence capability is invalid");
     }
@@ -5999,10 +6006,14 @@ PrefillProgress ProgramImplCore::advance_prefill(SequenceHandle sequence) {
         throw std::logic_error("prefill advance requires a prefilling sequence");
     }
     try {
-        return wrap_prefill(lane, advance_prefill_raw(lane));
+        runtime::PrefillStepResult step = advance_prefill_raw(lane, &failed_timing);
+        failed_timing += step.timing;
+        return wrap_prefill(lane, std::move(step));
     } catch (...) {
+        const Clock::time_point cleanup_started = Clock::now();
         clear_lane(active_sequence(lane), requests[lane]);
         invalidate_lane(lane);
+        failed_timing.post_host_ns += elapsed_ns(cleanup_started);
         throw;
     }
 }
@@ -7412,7 +7423,8 @@ qwen3_6::ReplicaTransitionResult ProgramImplCore::progress_replica_transition_tr
 }
 
 PendingBatch ProgramImplCore::decode(std::span<const SequenceHandle> members,
-                                     std::span<const runtime::RoundBudget> budgets) {
+                                     std::span<const runtime::RoundBudget> budgets,
+                                     runtime::ExecutionTiming& failed_timing) {
     if (pending_transaction_ || members.empty() || members.size() > max_concurrency ||
         budgets.size() != members.size()) {
         throw std::invalid_argument("decode membership is invalid");
@@ -7432,22 +7444,25 @@ PendingBatch ProgramImplCore::decode(std::span<const SequenceHandle> members,
     }
     const auto lane_span = std::span<const std::uint32_t>(lanes.data(), members.size());
     try {
-        return wrap_pending(lane_span, decode_raw(lane_span, budgets));
+        runtime::BatchedGeneratedRound round = decode_raw(lane_span, budgets, &failed_timing);
+        failed_timing += round.timing;
+        return wrap_pending(lane_span, std::move(round));
     } catch (...) {
+        const Clock::time_point cleanup_started = Clock::now();
         for (const std::uint32_t lane : lane_span) {
             clear_lane(active_sequence(lane), requests[lane]);
             invalidate_lane(lane);
         }
         pending_transaction_.reset();
+        failed_timing.post_host_ns += elapsed_ns(cleanup_started);
         throw;
     }
 }
 
-runtime::ExecutionTiming
-ProgramImplCore::append_forced_tokens(std::span<const SequenceHandle> members,
-                                      std::span<const TokenId> row_major_tokens,
-                                      std::uint32_t row_stride) {
-    runtime::ExecutionTimingRecorder timing;
+runtime::ExecutionTiming ProgramImplCore::append_forced_tokens(
+    std::span<const SequenceHandle> members, std::span<const TokenId> row_major_tokens,
+    std::uint32_t row_stride, runtime::ExecutionTiming& failed_timing) {
+    runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Submit, &failed_timing);
     if (pending_transaction_ || members.empty() || members.size() > max_concurrency ||
         row_stride == 0 ||
         row_major_tokens.size() != static_cast<std::size_t>(row_stride) * members.size()) {
@@ -7605,9 +7620,11 @@ ProgramImplCore::append_forced_tokens(std::span<const SequenceHandle> members,
         }
         return timing.finish();
     } catch (...) {
+        timing.begin_wait();
         try {
             device.synchronize();
         } catch (...) {}
+        timing.end_wait();
         work.reset();
         for (const std::uint32_t lane :
              std::span<const std::uint32_t>(lanes.data(), members.size())) {
@@ -7622,8 +7639,9 @@ ProgramImplCore::append_forced_tokens(std::span<const SequenceHandle> members,
 
 CommitResult ProgramImplCore::commit(PendingBatch&& pending,
                                      std::span<const runtime::CommitDecision> decisions,
-                                     runtime::CommitObservation observation) {
-    runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Post);
+                                     runtime::CommitObservation observation,
+                                     runtime::ExecutionTiming& failed_timing) {
+    runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Post, &failed_timing);
     std::array<SequenceHandle, kMaximumConcurrency> members{};
     const auto input_rows       = ContractAccess::rows(pending);
     const std::size_t row_count = input_rows.size();
@@ -7678,11 +7696,11 @@ CommitResult ProgramImplCore::commit(PendingBatch&& pending,
         }
 
         timing.pause();
-        timing.include(
-            resolve_pending_raw(std::span<const std::uint32_t>(lanes.data(), row_count),
-                                std::span<const std::uint32_t>(accepted.data(), row_count),
-                                std::span<const std::uint8_t>(terminal.data(), row_count),
-                                std::span<const std::uint8_t>(cancelled.data(), row_count)));
+        timing.include(resolve_pending_raw(
+            std::span<const std::uint32_t>(lanes.data(), row_count),
+            std::span<const std::uint32_t>(accepted.data(), row_count),
+            std::span<const std::uint8_t>(terminal.data(), row_count),
+            std::span<const std::uint8_t>(cancelled.data(), row_count), &failed_timing));
         timing.resume_post();
         pending_transaction_.reset();
 
@@ -7734,6 +7752,7 @@ CommitResult ProgramImplCore::commit(PendingBatch&& pending,
         out.timing = timing.finish();
         return out;
     } catch (...) {
+        timing.resume_post();
         release_members();
         throw;
     }
@@ -8465,23 +8484,28 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
     }
 }
 
-runtime::PrefillStepResult ProgramImplCore::advance_prefill_raw(std::uint32_t lane) {
+runtime::PrefillStepResult
+ProgramImplCore::advance_prefill_raw(std::uint32_t lane, runtime::ExecutionTiming* failed_timing) {
     if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
-    return advance_prefill(active_sequence(lane), requests[lane]);
+    return advance_prefill(active_sequence(lane), requests[lane], failed_timing);
 }
 
-runtime::ExecutionTiming ProgramImplCore::resolve_prefill_raw(std::uint32_t lane, bool terminal) {
+runtime::ExecutionTiming
+ProgramImplCore::resolve_prefill_raw(std::uint32_t lane, bool terminal,
+                                     runtime::ExecutionTiming* failed_timing) {
     if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
     if (requests[lane].pending.kind != PendingKind::Begin) {
         throw std::logic_error("prefill resolution requires a pending prefill token");
     }
-    return resolve_non_speculative_pending(active_sequence(lane), requests[lane], 1, terminal);
+    return resolve_non_speculative_pending(active_sequence(lane), requests[lane], 1, terminal,
+                                           failed_timing);
 }
 
 runtime::ExecutionTiming ProgramImplCore::resolve_pending_raw(
     std::span<const std::uint32_t> lanes, std::span<const std::uint32_t> accepted_tokens,
-    std::span<const std::uint8_t> terminal, std::span<const std::uint8_t> cancelled) {
-    runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Post);
+    std::span<const std::uint8_t> terminal, std::span<const std::uint8_t> cancelled,
+    runtime::ExecutionTiming* failed_timing) {
+    runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Post, failed_timing);
     if (lanes.empty() || lanes.size() > max_concurrency || accepted_tokens.size() != lanes.size() ||
         terminal.size() != lanes.size() || cancelled.size() != lanes.size()) {
         throw std::invalid_argument("pending batch resolution has inconsistent membership");
@@ -8502,7 +8526,7 @@ runtime::ExecutionTiming ProgramImplCore::resolve_pending_raw(
             timing.pause();
             timing.include(resolve_non_speculative_pending(active_sequence(lane), requests[lane],
                                                            accepted_tokens.front(),
-                                                           terminal.front() != 0));
+                                                           terminal.front() != 0, failed_timing));
             timing.resume_post();
         }
         return timing.finish();
@@ -8521,7 +8545,7 @@ runtime::ExecutionTiming ProgramImplCore::resolve_pending_raw(
                 timing.pause();
                 timing.include(resolve_non_speculative_pending(active_sequence(lane),
                                                                requests[lane], accepted_tokens[row],
-                                                               terminal[row] != 0));
+                                                               terminal[row] != 0, failed_timing));
                 timing.resume_post();
             }
         }
@@ -9598,9 +9622,10 @@ void ProgramImplCore::validate_licensed_tokens(std::span<const TokenId> tokens) 
     }
 }
 
-runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& sequence,
-                                                            RequestControl& request) {
-    runtime::ExecutionTimingRecorder timing;
+runtime::PrefillStepResult
+ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& request,
+                                 runtime::ExecutionTiming* failed_timing) {
+    runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Submit, failed_timing);
     if (request.lifecycle != Lifecycle::Prefilling || !request.prefill) {
         throw std::logic_error("staged prefill step requires an active concurrent request");
     }
@@ -9863,9 +9888,11 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             .timing                  = timing.finish(),
         };
     } catch (...) {
+        timing.begin_wait();
         try {
             device.synchronize();
         } catch (...) {}
+        timing.end_wait();
         clear_lane(sequence, request);
         throw;
     }
@@ -9873,8 +9900,9 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
 
 runtime::BatchedGeneratedRound
 ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
-                                       std::span<const runtime::RoundBudget> budgets) {
-    runtime::ExecutionTimingRecorder timing;
+                                       std::span<const runtime::RoundBudget> budgets,
+                                       runtime::ExecutionTiming* failed_timing) {
+    runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Submit, failed_timing);
     if (speculative_backend != SpeculativeBackend::None) {
         throw std::logic_error("ordinary batch execution requires the ordinary backend");
     }
@@ -9981,9 +10009,11 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             .timing = timing.finish(),
         };
     } catch (...) {
+        timing.begin_wait();
         try {
             device.synchronize();
         } catch (...) {}
+        timing.end_wait();
         for (const std::uint32_t lane : lanes) {
             if (lane < max_concurrency && active_continuations[lane] < continuation_capacity) {
                 clear_lane(active_sequence(lane), requests[lane]);
@@ -9995,8 +10025,9 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
 
 runtime::BatchedGeneratedRound
 ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
-                                  std::span<const runtime::RoundBudget> budgets) {
-    runtime::ExecutionTimingRecorder timing;
+                                  std::span<const runtime::RoundBudget> budgets,
+                                  runtime::ExecutionTiming* failed_timing) {
+    runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Submit, failed_timing);
     if (speculative_backend != SpeculativeBackend::Mtp || !io.mtp_decode ||
         decoder->mtp_cache() == nullptr) {
         throw std::logic_error("MTP batch execution requires the MTP backend");
@@ -10154,9 +10185,11 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             .timing     = timing.finish(),
         };
     } catch (...) {
+        timing.begin_wait();
         try {
             device.synchronize();
         } catch (...) {}
+        timing.end_wait();
         for (const std::uint32_t lane : lanes) {
             if (lane < max_concurrency && active_continuations[lane] < continuation_capacity) {
                 clear_lane(active_sequence(lane), requests[lane]);
@@ -10168,8 +10201,9 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
 
 runtime::BatchedGeneratedRound
 ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
-                                     std::span<const runtime::RoundBudget> budgets) {
-    runtime::ExecutionTimingRecorder timing;
+                                     std::span<const runtime::RoundBudget> budgets,
+                                     runtime::ExecutionTiming* failed_timing) {
+    runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Submit, failed_timing);
     if (speculative_backend != SpeculativeBackend::DFlash || !io.dflash_decode || !dflash) {
         throw std::logic_error("DFlash batch execution requires the DFlash backend");
     }
@@ -10329,9 +10363,11 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             .timing     = timing.finish(),
         };
     } catch (...) {
+        timing.begin_wait();
         try {
             device.synchronize();
         } catch (...) {}
+        timing.end_wait();
         for (const std::uint32_t lane : lanes) {
             if (lane < max_concurrency && active_continuations[lane] < continuation_capacity) {
                 clear_lane(active_sequence(lane), requests[lane]);
@@ -10343,18 +10379,22 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
 
 runtime::BatchedGeneratedRound
 ProgramImplCore::decode_raw(std::span<const std::uint32_t> lanes,
-                            std::span<const runtime::RoundBudget> budgets) {
+                            std::span<const runtime::RoundBudget> budgets,
+                            runtime::ExecutionTiming* failed_timing) {
     if (speculative_backend == SpeculativeBackend::None) {
-        return decode_ordinary_batch(lanes, budgets);
+        return decode_ordinary_batch(lanes, budgets, failed_timing);
     }
-    if (speculative_backend == SpeculativeBackend::Mtp) { return decode_mtp_batch(lanes, budgets); }
-    return decode_dflash_batch(lanes, budgets);
+    if (speculative_backend == SpeculativeBackend::Mtp) {
+        return decode_mtp_batch(lanes, budgets, failed_timing);
+    }
+    return decode_dflash_batch(lanes, budgets, failed_timing);
 }
 
 runtime::ExecutionTiming
 ProgramImplCore::resolve_non_speculative_pending(SequenceState& sequence, RequestControl& request,
-                                                 std::uint32_t accepted_tokens, bool terminal) {
-    runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Post);
+                                                 std::uint32_t accepted_tokens, bool terminal,
+                                                 runtime::ExecutionTiming* failed_timing) {
+    runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Post, failed_timing);
     if (request.lifecycle != Lifecycle::Pending) {
         throw std::logic_error("pending resolution requires a pending generated round");
     }

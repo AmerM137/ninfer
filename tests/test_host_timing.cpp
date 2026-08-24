@@ -45,6 +45,17 @@ int main() {
     failures += check(post_observed.submit_host_ns == 0 && post_observed.device_wait_ns == 0,
                       "post-only recorder attributed initialization to another phase");
 
+    ninfer::runtime::ExecutionTiming abandoned_observation;
+    {
+        ninfer::runtime::ExecutionTimingRecorder abandoned(
+            ninfer::runtime::ExecutionTimingPhase::Paused, &abandoned_observation);
+        abandoned.include(sum);
+    }
+    failures += check(abandoned_observation.submit_host_ns == sum.submit_host_ns &&
+                          abandoned_observation.device_wait_ns == sum.device_wait_ns &&
+                          abandoned_observation.post_host_ns == sum.post_host_ns,
+                      "abandoned Program timing was lost during exception unwinding");
+
     ninfer::runtime::RequestHostTiming request{
         .queue_wait_ns                   = 1,
         .engine_boundary_exposed_ns      = 2,

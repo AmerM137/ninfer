@@ -461,6 +461,31 @@ private:
         bool active_ = true;
     };
 
+    class ProgramCallScope {
+    public:
+        explicit ProgramCallScope(EngineCore& owner)
+            : owner_(owner), measurement_(owner.begin_host_phase()) {}
+
+        ~ProgramCallScope() noexcept { finish(failed_timing_); }
+
+        ProgramCallScope(const ProgramCallScope&)            = delete;
+        ProgramCallScope& operator=(const ProgramCallScope&) = delete;
+
+        [[nodiscard]] runtime::ExecutionTiming& failed_timing() noexcept { return failed_timing_; }
+
+        void finish(runtime::ExecutionTiming timing) noexcept {
+            if (!active_) { return; }
+            owner_.finish_program_call(measurement_, timing);
+            active_ = false;
+        }
+
+    private:
+        EngineCore& owner_;
+        HostPhaseMeasurement measurement_;
+        runtime::ExecutionTiming failed_timing_;
+        bool active_ = true;
+    };
+
     void publish_runtime_stats() {
         HostPhaseMeasurement measurement = begin_host_phase();
         std::optional<nvtx::ScopedRange> phase_range;
@@ -755,8 +780,8 @@ private:
         return cancelled;
     }
 
-    void
-    cancel_active_requests(const std::array<bool, kMaximumConcurrency>& cancelled_at_boundary) {
+    void cancel_active_requests(const std::array<bool, kMaximumConcurrency>& cancelled_at_boundary,
+                                HostPhaseMeasurement& boundary) {
         bool changed = false;
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             const auto& request = slots_[lane];
@@ -771,9 +796,11 @@ private:
             request->speculative_stats  = std::move(aborted.speculative);
             if (scheduler_.prefill_lane() == lane) { scheduler_.clear_prefill_lane(lane); }
             append_output(request, request->output.commit_preview());
+            finish_engine_phase(boundary, EngineHostPhase::Boundary);
             complete_success(request, FinishReason::Cancelled);
             remove_completed_slot(lane);
-            changed = true;
+            boundary = begin_host_phase();
+            changed  = true;
         }
         if (changed) { publish_runtime_stats(); }
     }
@@ -931,11 +958,12 @@ private:
         std::optional<typename Package::CommitResult> committed_storage;
         try {
             phase.pause_range();
-            HostPhaseMeasurement program_call = begin_host_phase();
-            committed_storage.emplace(instance_.program->commit(
+            ProgramCallScope program_call(*this);
+            auto committed = instance_.program->commit(
                 std::move(pending), std::span<const CommitDecision>(decisions.data(), row_count),
-                CommitObservation::ReleasedRowsOnly));
-            finish_program_call(program_call, committed_storage->timing);
+                CommitObservation::ReleasedRowsOnly, program_call.failed_timing());
+            program_call.finish(committed.timing);
+            committed_storage.emplace(std::move(committed));
             phase.resume_range();
         } catch (...) {
             rollback_generated();
@@ -975,49 +1003,63 @@ private:
             }
         }
 
-        for (std::size_t row = 0; row < row_count; ++row) {
-            const std::uint32_t lane     = lane_indices[row];
-            const auto& request          = slots_[lane];
-            const std::uint32_t accepted = decisions[row].accepted_tokens;
-            if (!cancelled[row]) {
-                request->budget->commit(accepted);
-                if (decode_round) {
-                    Scheduling::consume_service_work(*request, accepted);
-                    cumulative_stats_.committed_decode_tokens += accepted;
+        if (decode_round) {
+            ++cumulative_stats_.decode_rounds;
+            cumulative_stats_.decode_row_rounds += row_count;
+            for (std::size_t row = 0; row < row_count; ++row) {
+                if (!cancelled[row]) {
+                    cumulative_stats_.committed_decode_tokens += decisions[row].accepted_tokens;
                 }
             }
-            auto published = request->output.commit_preview();
-            if (!request->first_token && accepted != 0) { request->first_token = Clock::now(); }
-            append_output(request, std::move(published));
-            if (decisions[row].terminal) {
-                terminal_requests[terminal_count] = request;
-                terminal_lanes[terminal_count]    = lane;
-                terminal_reasons[terminal_count]  = finish_reasons[row];
-                ++terminal_count;
-            } else if (committed.captures[row]) {
-                if (!request->is_prefilling()) {
-                    throw std::logic_error("prompt-frontier capture lost its prefill owner");
+        }
+
+        try {
+            for (std::size_t row = 0; row < row_count; ++row) {
+                const std::uint32_t lane     = lane_indices[row];
+                const auto& request          = slots_[lane];
+                const std::uint32_t accepted = decisions[row].accepted_tokens;
+                if (!cancelled[row]) {
+                    request->budget->commit(accepted);
+                    if (decode_round) { Scheduling::consume_service_work(*request, accepted); }
                 }
-                reserve_active_capture(request, std::move(*committed.captures[row]),
-                                       continuations[row] == ContinuationAction::ApplyTargetControl
-                                           ? EngineRequestState::ControlReady
-                                           : EngineRequestState::DecodeReady);
-                committed.captures[row].reset();
-                if (!request->capture_pending) {
+                auto published = request->output.commit_preview();
+                if (!request->first_token && accepted != 0) { request->first_token = Clock::now(); }
+                append_output(request, std::move(published));
+                if (decisions[row].terminal) {
+                    terminal_requests[terminal_count] = request;
+                    terminal_lanes[terminal_count]    = lane;
+                    terminal_reasons[terminal_count]  = finish_reasons[row];
+                    ++terminal_count;
+                } else if (committed.captures[row]) {
+                    if (!request->is_prefilling()) {
+                        throw std::logic_error("prompt-frontier capture lost its prefill owner");
+                    }
+                    reserve_active_capture(request, std::move(*committed.captures[row]),
+                                           continuations[row] ==
+                                                   ContinuationAction::ApplyTargetControl
+                                               ? EngineRequestState::ControlReady
+                                               : EngineRequestState::DecodeReady);
+                    committed.captures[row].reset();
+                    if (!request->capture_pending) {
+                        request->model_state =
+                            continuations[row] == ContinuationAction::ApplyTargetControl
+                                ? EngineRequestState::ControlReady
+                                : EngineRequestState::DecodeReady;
+                    }
+                } else {
                     request->model_state =
                         continuations[row] == ContinuationAction::ApplyTargetControl
                             ? EngineRequestState::ControlReady
                             : EngineRequestState::DecodeReady;
                 }
-            } else {
-                request->model_state = continuations[row] == ContinuationAction::ApplyTargetControl
-                                           ? EngineRequestState::ControlReady
-                                           : EngineRequestState::DecodeReady;
             }
-        }
-        if (decode_round) {
-            ++cumulative_stats_.decode_rounds;
-            cumulative_stats_.decode_row_rounds += row_count;
+        } catch (...) {
+            phase.finish();
+            for (std::size_t index = 0; index < terminal_count; ++index) {
+                complete_success(terminal_requests[index], terminal_reasons[index]);
+                remove_completed_slot(terminal_lanes[index]);
+            }
+            throw;
         }
         phase.finish();
         for (std::size_t index = 0; index < terminal_count; ++index) {
@@ -1122,9 +1164,10 @@ private:
             throw std::logic_error("prefill request has no sequence handle");
         }
         setup.finish();
-        HostPhaseMeasurement program_call = begin_host_phase();
-        auto progress                     = instance_.program->advance_prefill(*request->sequence);
-        finish_program_call(program_call, progress.timing);
+        ProgramCallScope program_call(*this);
+        auto progress =
+            instance_.program->advance_prefill(*request->sequence, program_call.failed_timing());
+        program_call.finish(progress.timing);
         resolve_prefill_progress(request, std::move(progress), cancelled_at_unit_start);
         publish_runtime_stats();
     }
@@ -1522,10 +1565,10 @@ private:
 
     void run_decode_round(const RoundMembership& membership,
                           const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start) {
-        HostPhaseMeasurement program_call = begin_host_phase();
-        auto pending =
-            instance_.program->decode(membership.sequence_span(), membership.budget_span());
-        finish_program_call(program_call, pending.execution_timing());
+        ProgramCallScope program_call(*this);
+        auto pending = instance_.program->decode(
+            membership.sequence_span(), membership.budget_span(), program_call.failed_timing());
+        program_call.finish(pending.execution_timing());
         commit_pending(std::move(pending), membership.lane_span(), true, cancelled_at_unit_start);
         publish_runtime_stats();
     }
@@ -1585,10 +1628,11 @@ private:
                 request->generated.insert(request->generated.end(), tokens.begin(), tokens.end());
             }
             phase.pause_range();
-            HostPhaseMeasurement program_call     = begin_host_phase();
+            ProgramCallScope program_call(*this);
             const runtime::ExecutionTiming timing = instance_.program->append_forced_tokens(
-                membership.sequence_span(), membership.tokens, membership.row_stride);
-            finish_program_call(program_call, timing);
+                membership.sequence_span(), membership.tokens, membership.row_stride,
+                program_call.failed_timing());
+            program_call.finish(timing);
             phase.resume_range();
         } catch (...) {
             rollback_generated();
@@ -1670,7 +1714,7 @@ private:
                 const bool have_pending       = expire_pending_requests();
                 (void)progress_context_transaction(have_pending);
                 const auto cancelled_at_boundary = snapshot_cancellations();
-                cancel_active_requests(cancelled_at_boundary);
+                cancel_active_requests(cancelled_at_boundary, boundary);
                 RoundMembership membership =
                     scheduler_.build_round_membership(slots_, max_concurrency_);
                 const bool admission_check_pending =
@@ -1687,7 +1731,7 @@ private:
                 // the GPU unit is in flight is observed at the next worker boundary; commit does
                 // not reinterpret an already-issued unit with a later atomic read.
                 const auto cancelled_at_unit_start = snapshot_cancellations();
-                cancel_active_requests(cancelled_at_unit_start);
+                cancel_active_requests(cancelled_at_unit_start, boundary);
                 const ControlMembership control_membership =
                     scheduler_.build_control_membership(slots_, max_concurrency_);
                 if (!control_membership.empty()) {
@@ -1729,7 +1773,13 @@ private:
                 finish_engine_phase(boundary, EngineHostPhase::Boundary);
                 try_start_replica_transition();
             } catch (...) {
-                fail_all_locked(std::current_exception());
+                const std::exception_ptr error = std::current_exception();
+                HostPhaseMeasurement cleanup   = begin_host_phase();
+                fail_all_locked(error);
+                finish_engine_phase(cleanup, EngineHostPhase::Maintenance);
+                try {
+                    publish_runtime_stats();
+                } catch (...) {}
                 return;
             }
             execution_lock.unlock();

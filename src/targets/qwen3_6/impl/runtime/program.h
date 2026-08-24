@@ -403,7 +403,8 @@ public:
     progress_context_transaction(runtime::CancellationFlagView cancellation);
     void finalize_context_transaction() noexcept;
     [[nodiscard]] bool has_context_transaction() const noexcept;
-    [[nodiscard]] PrefillProgress advance_prefill(SequenceHandle sequence);
+    [[nodiscard]] PrefillProgress advance_prefill(SequenceHandle sequence,
+                                                  runtime::ExecutionTiming& failed_timing);
     [[nodiscard]] CaptureAssessment
     inspect_capture(const CaptureOffer& offer, const SharedPrefixHandle* exact_shared,
                     const SharedPrefixHandle* replacement,
@@ -433,13 +434,16 @@ public:
         std::optional<qwen3_6::PressureOption> replacement,
         runtime::CancellationFlagView cancellation);
     [[nodiscard]] PendingBatch decode(std::span<const SequenceHandle> sequences,
-                                      std::span<const runtime::RoundBudget> budgets);
+                                      std::span<const runtime::RoundBudget> budgets,
+                                      runtime::ExecutionTiming& failed_timing);
     [[nodiscard]] runtime::ExecutionTiming
     append_forced_tokens(std::span<const SequenceHandle> sequences,
-                         std::span<const TokenId> row_major_tokens, std::uint32_t row_stride);
+                         std::span<const TokenId> row_major_tokens, std::uint32_t row_stride,
+                         runtime::ExecutionTiming& failed_timing);
     [[nodiscard]] CommitResult commit(PendingBatch&& pending,
                                       std::span<const runtime::CommitDecision> decisions,
-                                      runtime::CommitObservation observation);
+                                      runtime::CommitObservation observation,
+                                      runtime::ExecutionTiming& failed_timing);
     [[nodiscard]] DiscardResult abort_pending(PendingBatch&& pending) noexcept;
     [[nodiscard]] FinishResult finish(SequenceHandle sequence) noexcept;
     [[nodiscard]] AbortResult abort(SequenceHandle sequence) noexcept;
@@ -805,13 +809,17 @@ private:
     void start_sequence(std::uint32_t lane, SequenceState& sequence,
                         MaterializationTransaction& transaction);
     void release_materialization_staging(MaterializationTransaction& transaction) noexcept;
-    [[nodiscard]] runtime::PrefillStepResult advance_prefill_raw(std::uint32_t lane);
+    [[nodiscard]] runtime::PrefillStepResult
+    advance_prefill_raw(std::uint32_t lane, runtime::ExecutionTiming* failed_timing);
     [[nodiscard]] runtime::BatchedGeneratedRound
-    decode_raw(std::span<const std::uint32_t> lanes, std::span<const runtime::RoundBudget> budgets);
-    [[nodiscard]] runtime::ExecutionTiming resolve_prefill_raw(std::uint32_t lane, bool terminal);
+    decode_raw(std::span<const std::uint32_t> lanes, std::span<const runtime::RoundBudget> budgets,
+               runtime::ExecutionTiming* failed_timing);
+    [[nodiscard]] runtime::ExecutionTiming
+    resolve_prefill_raw(std::uint32_t lane, bool terminal, runtime::ExecutionTiming* failed_timing);
     [[nodiscard]] runtime::ExecutionTiming resolve_pending_raw(
         std::span<const std::uint32_t> lanes, std::span<const std::uint32_t> accepted_tokens,
-        std::span<const std::uint8_t> terminal, std::span<const std::uint8_t> cancelled);
+        std::span<const std::uint8_t> terminal, std::span<const std::uint8_t> cancelled,
+        runtime::ExecutionTiming* failed_timing);
     [[nodiscard]] bool valid_sequence(SequenceHandle handle) const noexcept;
     [[nodiscard]] bool valid_continuation(const ContinuationHandle& handle) const noexcept;
     [[nodiscard]] bool valid_shared_prefix(const SharedPrefixHandle& handle) const noexcept;
@@ -946,9 +954,11 @@ private:
     void copy_round_token();
     [[nodiscard]] runtime::ExecutionTiming
     resolve_non_speculative_pending(SequenceState& sequence, RequestControl& request,
-                                    std::uint32_t accepted_tokens, bool terminal);
-    [[nodiscard]] runtime::PrefillStepResult advance_prefill(SequenceState& sequence,
-                                                             RequestControl& request);
+                                    std::uint32_t accepted_tokens, bool terminal,
+                                    runtime::ExecutionTiming* failed_timing);
+    [[nodiscard]] runtime::PrefillStepResult
+    advance_prefill(SequenceState& sequence, RequestControl& request,
+                    runtime::ExecutionTiming* failed_timing);
     void enqueue_dflash_context_append(std::span<const std::uint32_t> lanes,
                                        std::span<const std::uint32_t> starts,
                                        std::span<const std::uint32_t> counts);
@@ -956,13 +966,16 @@ private:
     void mark_workspace_usage(std::size_t phase_bytes) noexcept;
     [[nodiscard]] runtime::BatchedGeneratedRound
     decode_ordinary_batch(std::span<const std::uint32_t> lanes,
-                          std::span<const runtime::RoundBudget> budgets);
+                          std::span<const runtime::RoundBudget> budgets,
+                          runtime::ExecutionTiming* failed_timing);
     [[nodiscard]] runtime::BatchedGeneratedRound
     decode_mtp_batch(std::span<const std::uint32_t> lanes,
-                     std::span<const runtime::RoundBudget> budgets);
+                     std::span<const runtime::RoundBudget> budgets,
+                     runtime::ExecutionTiming* failed_timing);
     [[nodiscard]] runtime::BatchedGeneratedRound
     decode_dflash_batch(std::span<const std::uint32_t> lanes,
-                        std::span<const runtime::RoundBudget> budgets);
+                        std::span<const runtime::RoundBudget> budgets,
+                        runtime::ExecutionTiming* failed_timing);
     void resize_sequence_kv_entitlement(SequenceState& sequence, std::uint32_t text_pages,
                                         std::uint32_t backend_pages);
     void bind_sequence_kv(SequenceState& sequence);

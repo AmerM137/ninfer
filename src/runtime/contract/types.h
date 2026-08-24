@@ -59,12 +59,17 @@ public:
     using Clock = std::chrono::steady_clock;
 
     explicit ExecutionTimingRecorder(
-        ExecutionTimingPhase initial_phase = ExecutionTimingPhase::Submit) noexcept
-        : started_(Clock::now()), phase_(initial_phase) {
+        ExecutionTimingPhase initial_phase = ExecutionTimingPhase::Submit,
+        ExecutionTiming* abandoned_timing  = nullptr) noexcept
+        : started_(Clock::now()), phase_(initial_phase), abandoned_timing_(abandoned_timing) {
         open_range();
     }
 
-    ~ExecutionTimingRecorder() = default;
+    ~ExecutionTimingRecorder() noexcept {
+        if (finished_) { return; }
+        const ExecutionTiming timing = finish();
+        if (abandoned_timing_ != nullptr) { *abandoned_timing_ += timing; }
+    }
 
     ExecutionTimingRecorder(const ExecutionTimingRecorder&)            = delete;
     ExecutionTimingRecorder& operator=(const ExecutionTimingRecorder&) = delete;
@@ -144,7 +149,8 @@ private:
     ExecutionTimingPhase phase_ = ExecutionTimingPhase::Submit;
     ExecutionTiming timing_;
     std::optional<nvtx::ScopedRange> range_;
-    bool finished_ = false;
+    ExecutionTiming* abandoned_timing_ = nullptr;
+    bool finished_                     = false;
 };
 
 // Engine has already selected the registered model/mode preset, applied every explicit override,
