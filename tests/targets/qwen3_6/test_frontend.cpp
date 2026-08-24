@@ -457,6 +457,23 @@ int test_context_capacity_guard() {
                               image_text_input({0}, std::string(64, 'x'), "must-not-decode.bin"));
                       }),
                       "over-capacity media prompt was not rejected before media decoding");
+
+    std::atomic<int> control_checks{0};
+    ninfer::PreparationControl cancelled_during_tokenization{
+        .deadline     = {},
+        .cancellation = ninfer::CancellationView(
+            [&control_checks] { return control_checks.fetch_add(1) >= 2; }),
+    };
+    try {
+        (void)media_frontend.prepare(
+            image_text_input({0}, std::string(64, 'x'), "cancel-before-oversize.bin"),
+            cancelled_during_tokenization);
+        failures += check(false, "cancelled over-capacity media prompt completed successfully");
+    } catch (const ninfer::RequestError& error) {
+        failures +=
+            check(error.kind() == ninfer::RequestErrorKind::Cancelled && control_checks.load() == 3,
+                  "media over-capacity result took priority over tokenization cancellation");
+    }
     return failures;
 }
 

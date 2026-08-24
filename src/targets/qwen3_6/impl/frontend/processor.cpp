@@ -851,6 +851,7 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
             tokenizer_.encode(rendered.text, EncodeOptions{.max_tokens = encode_limit}).size();
         preliminary_tokenize_seconds =
             std::chrono::duration<double>(Clock::now() - preliminary_started).count();
+        check_preparation_control(control, "tokenization");
         if (preliminary_tokens > maximum_prompt_tokens) {
             throw ProcessorError(ProcessorErrorKind::ContextLengthExceeded,
                                  "prepared prompt exceeds Engine max_context " +
