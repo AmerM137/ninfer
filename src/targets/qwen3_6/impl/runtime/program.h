@@ -372,7 +372,8 @@ public:
                                     runtime::ResourceVector deficit) const;
     [[nodiscard]] qwen3_6::PressureOption
     inspect_shared_eviction_option(const SharedPrefixHandle& shared) const;
-    [[nodiscard]] std::optional<runtime::ResourceDelta> inspect_combined_pressure_effect(
+    [[nodiscard]] std::optional<runtime::MaterializationPressureEffect>
+    inspect_combined_pressure_effect(
         const AdmissionPlan& admission, std::span<const ContinuationHandle* const> pressure_owners,
         std::span<const qwen3_6::PressureOption> pressure_options,
         std::span<const SharedPrefixHandle* const> shared_pressure_owners,
@@ -577,11 +578,23 @@ private:
     mutable ProtectedProjectionScratch protected_projection_scratch_;
 
     struct MaterializationSourceProtection {
+        struct StateOwnershipCandidate {
+            StateImageHandle state;
+            std::uint32_t source_checkpoint_references = 0;
+        };
+
+        std::optional<std::uint32_t> private_source_index;
+        bool consumed_private_source = false;
         std::optional<StateImageHandle> state;
+        std::uint32_t consumed_state_references = 0;
+        bool state_fork_required                = false;
+        std::vector<StateOwnershipCandidate> state_ownership_candidates;
         std::optional<KVAddressSpaceHandle> text;
-        std::uint32_t text_pages = 0;
+        std::uint32_t text_pages          = 0;
+        std::uint32_t text_transfer_pages = 0;
         std::optional<KVAddressSpaceHandle> backend;
-        std::uint32_t backend_pages = 0;
+        std::uint32_t backend_pages          = 0;
+        std::uint32_t backend_transfer_pages = 0;
     };
 
     struct PendingTransaction {
@@ -830,6 +843,11 @@ private:
     [[nodiscard]] StateImageHandle
     selected_state(const SequenceState& sequence, ReusePath reuse,
                    std::optional<runtime::CheckpointRef> checkpoint) const;
+    [[nodiscard]] std::uint32_t
+    selected_state_consumed_references(const SequenceState& sequence, ReusePath reuse,
+                                       RewriteCheckpointDisposition rewrite_disposition,
+                                       std::optional<runtime::CheckpointRef> checkpoint,
+                                       std::uint32_t reuse_base) const;
     [[nodiscard]] bool
     selected_state_requires_fork(const SequenceState& sequence, ReusePath reuse,
                                  RewriteCheckpointDisposition rewrite_disposition,
@@ -914,7 +932,7 @@ private:
                                                             StateImageHandle state) const noexcept;
     [[nodiscard]] bool state_exclusive_to_sequence(const SequenceState& sequence,
                                                    StateImageHandle state) const noexcept;
-    [[nodiscard]] std::optional<runtime::ResourceDelta>
+    [[nodiscard]] std::optional<runtime::MaterializationPressureEffect>
     combined_pressure_effect(const MaterializationSourceProtection* protection,
                              std::span<const ContinuationHandle* const> pressure_owners,
                              std::span<const qwen3_6::PressureOption> pressure_options,

@@ -184,6 +184,38 @@ positive_resource_difference(ResourceVector value, ResourceVector removed) noexc
     return true;
 }
 
+[[nodiscard]] inline bool augment_demand(ResourceDemand& demand,
+                                         const MaterializationPressureEffect& effect) noexcept {
+    if (effect.final_ownership_delta.removed != effect.final_ownership_delta.added ||
+        effect.final_ownership_delta.removed.device.active_lanes != 0 ||
+        effect.active_entitlement_delta.removed.device.active_lanes != 0 ||
+        effect.active_entitlement_delta.added.device.active_lanes != 0) {
+        return false;
+    }
+    ResourceDemand next_demand = demand;
+    if (!augment_demand(next_demand, effect.aggregate_delta)) { return false; }
+    ResourceVector next;
+    if (!add_resources(next_demand.final_removed, effect.final_ownership_delta.removed, next)) {
+        return false;
+    }
+    next_demand.final_removed = next;
+    if (!add_resources(next_demand.final_added, effect.final_ownership_delta.added, next)) {
+        return false;
+    }
+    next_demand.final_added = next;
+    ResourceVector remaining;
+    ResourceVector active;
+    if (!subtract_resources(next_demand.active_entitlement, effect.active_entitlement_delta.removed,
+                            remaining) ||
+        !add_resources(remaining, effect.active_entitlement_delta.added, active) ||
+        active.device.active_lanes != 1) {
+        return false;
+    }
+    next_demand.active_entitlement = active;
+    demand                         = next_demand;
+    return true;
+}
+
 [[nodiscard]] constexpr bool resource_delta_within(const ResourceDelta& value,
                                                    const ResourceDelta& limit) noexcept {
     return resources_fit(value.removed, limit.removed) && resources_fit(value.added, limit.added);
@@ -992,7 +1024,7 @@ public:
                 const std::vector<typename Package::PressureOption>& private_options,
                 const std::vector<std::uint32_t>& shared_slots,
                 const std::vector<typename Package::PressureOption>& shared_options)
-            -> std::optional<ResourceDelta> {
+            -> std::optional<MaterializationPressureEffect> {
             if (private_slots.size() != private_options.size() ||
                 shared_slots.size() != shared_options.size()) {
                 throw std::logic_error("pressure selection is not row aligned");
@@ -1074,9 +1106,10 @@ public:
                         next_private_slots.push_back(slot);
                         next_private_options.push_back(option);
                     }
-                    const std::optional<ResourceDelta> combined = inspect_combined_pressure_effect(
-                        *plans[candidate_index], next_private_slots, next_private_options,
-                        next_shared_slots, next_shared_options);
+                    const std::optional<MaterializationPressureEffect> combined =
+                        inspect_combined_pressure_effect(*plans[candidate_index],
+                                                           next_private_slots, next_private_options,
+                                                           next_shared_slots, next_shared_options);
                     if (!combined) { return; }
                     ResourceDemand next_demand = candidates[candidate_index].demand;
                     if (!detail::augment_demand(next_demand, *combined)) { return; }

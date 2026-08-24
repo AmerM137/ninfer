@@ -241,7 +241,8 @@ Program<Variant>::inspect_shared_eviction_option(const SharedPrefixHandle<Varian
 }
 
 template <>
-std::optional<runtime::ResourceDelta> Program<Variant>::inspect_combined_pressure_effect(
+std::optional<runtime::MaterializationPressureEffect>
+Program<Variant>::inspect_combined_pressure_effect(
     const AdmissionPlan<Variant>& admission,
     std::span<const ContinuationHandle<Variant>* const> pressure_owners,
     std::span<const PressureOption> pressure_options,

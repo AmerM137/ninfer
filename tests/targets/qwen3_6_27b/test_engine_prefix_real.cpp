@@ -68,6 +68,27 @@ ninfer::EngineOptions shared_replacement_engine_options(const char* artifact) {
     return options;
 }
 
+ninfer::EngineOptions last_alias_engine_options(const char* artifact) {
+    ninfer::EngineOptions options;
+    options.artifact_path                        = artifact;
+    options.max_context                          = 512;
+    options.kv_capacity                          = ninfer::KvCapacityPolicy::explicit_capacity(512);
+    options.prefill_chunk                        = 256;
+    options.speculative.backend                  = ninfer::SpeculativeBackend::Mtp;
+    options.speculative.draft_tokens             = 3;
+    options.speculative.proposal_head            = ninfer::ProposalHead::Optimized;
+    options.max_concurrency                      = 1;
+    options.max_pending_requests                 = 1;
+    options.context_cache.device_state_slots     = 3;
+    options.context_cache.host_state_slots       = 0;
+    options.context_cache.host_kv_capacity_bytes = 0;
+    options.context_cache.max_private_continuations         = 2;
+    options.context_cache.max_shared_prefixes               = 0;
+    options.context_cache.max_long_anchors_per_continuation = 0;
+    options.context_cache.max_cache_markers_per_request     = 0;
+    return options;
+}
+
 std::vector<std::uint8_t> gradient_ppm(int width = 64, int height = 64) {
     std::vector<std::uint8_t> ppm;
     const std::string header =
@@ -430,6 +451,77 @@ int exercise_shared_replacement_and_full_capacity_reuse(const char* artifact) {
         std::cerr << "shared replacement capture was skipped under full State/KV capacity: "
                   << after_replacement.active_captures_completed << '/'
                   << after_reuse.active_captures_completed << '\n';
+        return 1;
+    }
+    return 0;
+}
+
+int exercise_last_private_alias_eviction(const char* artifact) {
+    ninfer::Engine engine(last_alias_engine_options(artifact));
+    std::string prompt_text;
+    prompt_text.reserve(6U * 300U + 8U);
+    for (std::uint32_t index = 0; index < 300; ++index) { prompt_text += "alpha "; }
+
+    const auto input = [&](std::string session, ninfer::CacheRetentionHint retention) {
+        ninfer::PromptInput prompt;
+        ninfer::ChatMessage user;
+        user.role = ninfer::ChatRole::User;
+        user.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text, .text = prompt_text, .media = {}});
+        prompt.messages.push_back(std::move(user));
+        prompt.options.enable_thinking   = false;
+        prompt.context_cache.session_key = std::move(session);
+        prompt.context_cache.retention   = retention;
+        return prompt;
+    };
+    if (engine.count_tokens(input("probe", ninfer::CacheRetentionHint::Disposable)) % 64U == 0) {
+        prompt_text += "beta";
+    }
+
+    ninfer::RequestOptions one_token;
+    one_token.execution.requested_output_tokens = 1;
+    one_token.execution.sampling.temperature    = 0.0F;
+    one_token.execution.allow_prefix_reuse      = true;
+    one_token.stop.include_model_defaults       = false;
+
+    const ninfer::GenerationResult source = engine.generate(
+        engine.prepare(input("last-alias-source", ninfer::CacheRetentionHint::LiveSession)),
+        one_token);
+    const ninfer::GenerationResult branch = engine.generate(
+        engine.prepare(input("last-alias-branch", ninfer::CacheRetentionHint::Disposable)),
+        one_token);
+    if (source.generated_token_ids.size() != 1 || branch.generated_token_ids.size() != 1 ||
+        branch.reused_prompt_tokens == 0 ||
+        (branch.prefix_reuse_path != ninfer::PrefixReusePath::PrivateResponseReplay &&
+         branch.prefix_reuse_path != ninfer::PrefixReusePath::PrivateEndpoint)) {
+        std::cerr << "last-alias fixture did not establish two private prefix aliases: path="
+                  << static_cast<int>(branch.prefix_reuse_path)
+                  << " reused=" << branch.reused_prompt_tokens << '\n';
+        return 1;
+    }
+
+    ninfer::RequestOptions full_capacity            = one_token;
+    full_capacity.execution.requested_output_tokens = std::numeric_limits<std::uint32_t>::max();
+    full_capacity.stop.token_ids                    = {source.generated_token_ids.front()};
+    full_capacity.stop.publish_stop_token           = true;
+    const ninfer::RuntimeStats before               = engine.runtime_stats();
+    const ninfer::GenerationResult consumed         = engine.generate(
+        engine.prepare(input("last-alias-source", ninfer::CacheRetentionHint::LiveSession)),
+        full_capacity);
+    const ninfer::RuntimeStats after = engine.runtime_stats();
+    if (consumed.generated_token_ids.size() != 1 || consumed.reused_prompt_tokens == 0 ||
+        (consumed.prefix_reuse_path != ninfer::PrefixReusePath::PrivateResponseReplay &&
+         consumed.prefix_reuse_path != ninfer::PrefixReusePath::PrivateEndpoint) ||
+        after.private_checkpoint_evictions <= before.private_checkpoint_evictions ||
+        after.device_main_kv_occupied_pages == 0 || after.device_main_kv_occupied_pages > 8 ||
+        after.device_backend_kv_occupied_pages == 0 || after.device_backend_kv_occupied_pages > 8) {
+        std::cerr << "last private prefix alias did not transfer into the active entitlement: path="
+                  << static_cast<int>(consumed.prefix_reuse_path)
+                  << " reused=" << consumed.reused_prompt_tokens
+                  << " evictions=" << before.private_checkpoint_evictions << '/'
+                  << after.private_checkpoint_evictions
+                  << " main=" << after.device_main_kv_occupied_pages
+                  << " backend=" << after.device_backend_kv_occupied_pages << '\n';
         return 1;
     }
     return 0;
@@ -821,6 +913,9 @@ int exercise_artifact(const char* artifact) {
     }
     if (const int result = exercise_shared_replacement_and_full_capacity_reuse(artifact);
         result != 0) {
+        return result;
+    }
+    if (const int result = exercise_last_private_alias_eviction(artifact); result != 0) {
         return result;
     }
     return 0;

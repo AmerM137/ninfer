@@ -631,7 +631,8 @@ public:
                                     runtime::ResourceVector deficit) const;
     [[nodiscard]] PressureOption
     inspect_shared_eviction_option(const SharedPrefixHandle<Variant>& shared) const;
-    [[nodiscard]] std::optional<runtime::ResourceDelta> inspect_combined_pressure_effect(
+    [[nodiscard]] std::optional<runtime::MaterializationPressureEffect>
+    inspect_combined_pressure_effect(
         const AdmissionPlan<Variant>& admission,
         std::span<const ContinuationHandle<Variant>* const> pressure_owners,
         std::span<const PressureOption> pressure_options,

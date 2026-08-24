@@ -263,6 +263,22 @@ struct ResourceDelta {
                                                    const ResourceDelta&) noexcept = default;
 };
 
+// Materialization pressure can change which logical owner is responsible for an already-resident
+// resource without changing aggregate occupancy. Keep that ownership transition separate from the
+// aggregate ledger delta so the destination lane receives the exact post-pressure entitlement.
+struct MaterializationPressureEffect {
+    // Physical pressure work contributes to reservation, peak, and final aggregate occupancy.
+    ResourceDelta aggregate_delta;
+    // Equal final-only pairs transfer already-resident ownership without reserving new backing.
+    ResourceDelta final_ownership_delta;
+    // The destination lane's logical ownership snapshot after all selected pressure work.
+    ResourceDelta active_entitlement_delta;
+
+    [[nodiscard]] friend constexpr bool
+    operator==(const MaterializationPressureEffect&,
+               const MaterializationPressureEffect&) noexcept = default;
+};
+
 // Exact features for the startup-selected static prefill cost model. They describe only the
 // suffix rebuilt after a selected prefix and remain separate from Scheduler service work.
 struct PrefillWork {

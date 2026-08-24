@@ -19,6 +19,7 @@ using ninfer::runtime::ConsumeStatus;
 using ninfer::runtime::DeviceResources;
 using ninfer::runtime::HostResources;
 using ninfer::runtime::LaneId;
+using ninfer::runtime::MaterializationPressureEffect;
 using ninfer::runtime::RequestPlanSummary;
 using ninfer::runtime::ResourceDelta;
 using ninfer::runtime::ResourceDemand;
@@ -621,7 +622,7 @@ public:
         };
     }
 
-    [[nodiscard]] std::optional<ResourceDelta> inspect_combined_pressure_effect(
+    [[nodiscard]] std::optional<MaterializationPressureEffect> inspect_combined_pressure_effect(
         const FakeAdmissionPlan& admission,
         std::span<const FakeContinuationHandle* const> pressure_owners,
         std::span<const FakePressureOption> pressure_options,
@@ -632,7 +633,7 @@ public:
             !shared_pressure_owners.empty()) {
             return std::nullopt;
         }
-        ResourceDelta combined;
+        MaterializationPressureEffect combined;
         for (std::size_t index = 0; index < pressure_options.size(); ++index) {
             if (pressure_owners[index] == nullptr || !pressure_owners[index]->valid ||
                 pressure_options[index].id != pressure_owners[index]->key) {
@@ -645,10 +646,17 @@ public:
             }
             ResourceDelta next;
             if (!ninfer::runtime::detail::add_resource_deltas(
-                    combined, pressure_options[index].effect, next)) {
+                    combined.aggregate_delta, pressure_options[index].effect, next)) {
                 return std::nullopt;
             }
-            combined = next;
+            combined.aggregate_delta = next;
+            if (pressure_options[index].evicts_continuation && admission.source &&
+                pressure_alias_source_key == admission.key &&
+                pressure_alias_owner_key == pressure_owners[index]->key) {
+                combined.final_ownership_delta.removed  = pressure_alias_active_transfer;
+                combined.final_ownership_delta.added    = pressure_alias_active_transfer;
+                combined.active_entitlement_delta.added = pressure_alias_active_transfer;
+            }
         }
         return combined;
     }
@@ -665,6 +673,10 @@ public:
             throw std::logic_error("fake pressure composition is not row aligned");
         }
         last_composed_pressure.clear();
+        const std::optional<MaterializationPressureEffect> combined =
+            inspect_combined_pressure_effect(plan, pressure_owners, pressure_options,
+                                             shared_pressure_owners, shared_pressure_options);
+        if (!combined) { return std::nullopt; }
         for (std::size_t index = 0; index < pressure_options.size(); ++index) {
             if (pressure_owners[index] == nullptr || !pressure_owners[index]->valid ||
                 pressure_options[index].id != pressure_owners[index]->key) {
@@ -672,10 +684,9 @@ public:
             }
             last_composed_pressure.emplace_back(pressure_options[index].id,
                                                 pressure_options[index].evicts_continuation);
-            if (!ninfer::runtime::detail::augment_demand(plan.resources,
-                                                         pressure_options[index].effect)) {
-                return std::nullopt;
-            }
+        }
+        if (!ninfer::runtime::detail::augment_demand(plan.resources, *combined)) {
+            return std::nullopt;
         }
         return std::optional<FakeAdmissionPlan>(std::move(plan));
     }
@@ -1073,6 +1084,7 @@ public:
     std::optional<std::uint32_t> host_only_finish_key;
     std::optional<std::uint32_t> pressure_alias_source_key;
     std::optional<std::uint32_t> pressure_alias_owner_key;
+    ResourceVector pressure_alias_active_transfer;
     bool emit_state_d2h_observation            = false;
     bool content_keyed_summaries               = false;
     bool last_must_retain_private_source       = false;
@@ -1456,9 +1468,10 @@ void test_generic_numeric_cost_prefers_disposable_eviction() {
 
 void test_source_alias_filters_only_the_unsafe_pressure_action() {
     FakeProgram program;
-    program.demotable_device_state_key = 2;
-    program.pressure_alias_source_key  = 1;
-    program.pressure_alias_owner_key   = 2;
+    program.demotable_device_state_key     = 2;
+    program.pressure_alias_source_key      = 1;
+    program.pressure_alias_owner_key       = 2;
+    program.pressure_alias_active_transfer = resources({.main_kv_pages = 1});
     FakeManager manager(resources({1, 2, 10, 6}), 1, 3, 0, true, 0, test_cost_model());
 
     FakeRequestBasePlan source = make_base();
@@ -1477,7 +1490,8 @@ void test_source_alias_filters_only_the_unsafe_pressure_action() {
     branch.cache.update_session_index = false;
     auto inspection                   = manager.inspect(program, FakePreparedPrompt{1}, branch);
     expect(inspection.readiness == ninfer::runtime::Readiness::Ready && inspection.choice &&
-               inspection.choice->summary().reusable_prompt_tokens == 16,
+               inspection.choice->summary().reusable_prompt_tokens == 16 &&
+               inspection.choice->active_entitlement().device.main_kv_pages == 4,
            "source alias discarded a feasible cache-hit candidate");
     expect(program.last_composed_pressure == std::vector<std::pair<std::uint64_t, bool>>{{2, true}},
            "source alias did not replace only the unsafe preserving action with exact eviction");

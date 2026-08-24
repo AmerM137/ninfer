@@ -1123,8 +1123,46 @@ ProgramImplCore::materialization_source_protection(const AdmissionPlanImpl& admi
         }
         const SequenceState& source = continuation_states[admission.source_index];
         if (!source.kv) { return std::nullopt; }
-        kv               = &*source.kv;
+        kv                              = &*source.kv;
+        protection.private_source_index = admission.source_index;
         protection.state = selected_state(source, admission.reuse, admission.selected_checkpoint);
+        if (admission.source_disposition == runtime::ClaimDisposition::ConsumedToActive) {
+            protection.consumed_private_source   = true;
+            protection.consumed_state_references = selected_state_consumed_references(
+                source, admission.reuse, admission.rewrite_disposition,
+                admission.selected_checkpoint, admission.reuse_base);
+            protection.state_fork_required = admission.state_fork_required;
+            if (admission.state_fork_required !=
+                (state_store->checkpoint_references(*protection.state) !=
+                 protection.consumed_state_references)) {
+                return std::nullopt;
+            }
+
+            if (is_rewrite_checkpoint_restore(admission.reuse)) {
+                const auto append_optional_state = [&](StateImageHandle state) {
+                    if (!state_store->valid(state) || state_exclusive_to_sequence(source, state) ||
+                        std::any_of(
+                            protection.state_ownership_candidates.begin(),
+                            protection.state_ownership_candidates.end(),
+                            [&](const auto& candidate) { return candidate.state == state; })) {
+                        return;
+                    }
+                    protection.state_ownership_candidates.push_back({
+                        .state                        = state,
+                        .source_checkpoint_references = owned_checkpoint_references(source, state),
+                    });
+                };
+                if (admission.rewrite_disposition == RewriteCheckpointDisposition::RetainExisting &&
+                    source.rewrite_state) {
+                    append_optional_state(*source.rewrite_state);
+                }
+                for (const LongAnchorCheckpoint& anchor : source.long_anchors) {
+                    if (anchor.frontier <= admission.reuse_base) {
+                        append_optional_state(anchor.state);
+                    }
+                }
+            }
+        }
     } else if (admission.has_shared_source) {
         if (admission.shared_source_index >= shared_prefix_capacity ||
             shared_prefix_slots[admission.shared_source_index].role !=
@@ -1142,6 +1180,10 @@ ProgramImplCore::materialization_source_protection(const AdmissionPlanImpl& admi
 
     protection.text       = kv->text;
     protection.text_pages = kv_pages_for_frontier(admission.reuse_base);
+    if (protection.consumed_private_source) {
+        protection.text_transfer_pages =
+            admission.reuse_base / static_cast<std::uint32_t>(kPagedKVPageSize);
+    }
     if (!text_kv_addresses->valid(kv->text) ||
         protection.text_pages > text_kv_addresses->mapped_pages(kv->text)) {
         return std::nullopt;
@@ -1149,6 +1191,10 @@ ProgramImplCore::materialization_source_protection(const AdmissionPlanImpl& admi
     const std::uint32_t backend_frontier =
         backend_frontier_at(speculative_backend, admission.reuse_base);
     protection.backend_pages = kv_pages_for_frontier(backend_frontier);
+    if (protection.consumed_private_source) {
+        protection.backend_transfer_pages =
+            backend_frontier / static_cast<std::uint32_t>(kPagedKVPageSize);
+    }
     if (protection.backend_pages != 0) {
         if (!kv->backend || !backend_kv_addresses || !backend_kv_addresses->valid(*kv->backend) ||
             protection.backend_pages > backend_kv_addresses->mapped_pages(*kv->backend)) {
@@ -2050,7 +2096,8 @@ ProgramImplCore::inspect_eviction_option(const SequenceState& sequence) const {
     return option;
 }
 
-std::optional<runtime::ResourceDelta> ProgramImplCore::inspect_combined_pressure_effect(
+std::optional<runtime::MaterializationPressureEffect>
+ProgramImplCore::inspect_combined_pressure_effect(
     const AdmissionPlan& admission, std::span<const ContinuationHandle* const> pressure_owners,
     std::span<const qwen3_6::PressureOption> pressure_options,
     std::span<const SharedPrefixHandle* const> shared_pressure_owners,
@@ -2063,7 +2110,7 @@ std::optional<runtime::ResourceDelta> ProgramImplCore::inspect_combined_pressure
                                     shared_pressure_owners, shared_pressure_options, nullptr);
 }
 
-std::optional<runtime::ResourceDelta> ProgramImplCore::combined_pressure_effect(
+std::optional<runtime::MaterializationPressureEffect> ProgramImplCore::combined_pressure_effect(
     const MaterializationSourceProtection* protection,
     std::span<const ContinuationHandle* const> pressure_owners,
     std::span<const qwen3_6::PressureOption> pressure_options,
@@ -2157,7 +2204,7 @@ std::optional<runtime::ResourceDelta> ProgramImplCore::combined_pressure_effect(
         return append_pages(text_kv_addresses.get(), text, option.main_kv) &&
                append_pages(backend_kv_addresses.get(), backend, option.backend_kv);
     };
-    runtime::ResourceDelta effect;
+    runtime::MaterializationPressureEffect effect;
     for (std::size_t position = 0; position < pressure_owners.size(); ++position) {
         const ContinuationHandle* owner       = pressure_owners[position];
         const qwen3_6::PressureOption& option = pressure_options[position];
@@ -2166,7 +2213,10 @@ std::optional<runtime::ResourceDelta> ProgramImplCore::combined_pressure_effect(
             return std::nullopt;
         }
         const std::uint32_t index = ContractAccess::index(*owner);
-        if (selected_private[index]) { return std::nullopt; }
+        if (selected_private[index] ||
+            (protection != nullptr && protection->private_source_index == index)) {
+            return std::nullopt;
+        }
         selected_private[index] = true;
         if (option.evicts_continuation) {
             if (option.effect.added != runtime::ResourceVector{}) { return std::nullopt; }
@@ -2175,8 +2225,10 @@ std::optional<runtime::ResourceDelta> ProgramImplCore::combined_pressure_effect(
             if (!append_pressure_targets(option, &continuation_states[index], nullptr)) {
                 return std::nullopt;
             }
-            effect.removed = checked_resource_sum(effect.removed, option.effect.removed);
-            effect.added   = checked_resource_sum(effect.added, option.effect.added);
+            effect.aggregate_delta.removed =
+                checked_resource_sum(effect.aggregate_delta.removed, option.effect.removed);
+            effect.aggregate_delta.added =
+                checked_resource_sum(effect.aggregate_delta.added, option.effect.added);
         }
     }
     for (std::size_t position = 0; position < shared_pressure_owners.size(); ++position) {
@@ -2196,8 +2248,170 @@ std::optional<runtime::ResourceDelta> ProgramImplCore::combined_pressure_effect(
             if (!append_pressure_targets(option, nullptr, &shared_prefix_states[index])) {
                 return std::nullopt;
             }
-            effect.removed = checked_resource_sum(effect.removed, option.effect.removed);
-            effect.added   = checked_resource_sum(effect.added, option.effect.added);
+            effect.aggregate_delta.removed =
+                checked_resource_sum(effect.aggregate_delta.removed, option.effect.removed);
+            effect.aggregate_delta.added =
+                checked_resource_sum(effect.aggregate_delta.added, option.effect.added);
+        }
+    }
+
+    struct SelectedPage {
+        LogicalKVPageHandle page;
+        std::uint32_t references = 0;
+    };
+
+    std::vector<SelectedPage> main_pages;
+    std::vector<SelectedPage> backend_pages;
+    const auto append_address = [](const KVAddressSpaceStore& addresses,
+                                   KVAddressSpaceHandle address, std::vector<SelectedPage>& pages) {
+        if (!addresses.valid(address) || addresses.active(address)) {
+            throw std::logic_error("evicted KV address is not an inactive publication");
+        }
+        for (std::uint32_t offset = 0; offset < addresses.mapped_pages(address); ++offset) {
+            const LogicalKVPageHandle page = addresses.logical_page(address, offset);
+            const auto existing            = std::find_if(pages.begin(), pages.end(),
+                                                          [&](const auto& item) { return item.page == page; });
+            if (existing == pages.end()) {
+                pages.push_back(SelectedPage{.page = page, .references = 1});
+            } else {
+                ++existing->references;
+            }
+        }
+    };
+    for (std::uint32_t index = 0; index < continuation_capacity; ++index) {
+        if (!evicted_private[index]) { continue; }
+        const SequenceState& sequence = continuation_states[index];
+        if (!sequence.kv) { return std::nullopt; }
+        append_address(*text_kv_addresses, sequence.kv->text, main_pages);
+        if (sequence.kv->backend) {
+            if (!backend_kv_addresses || !backend_kv_pages) { return std::nullopt; }
+            append_address(*backend_kv_addresses, *sequence.kv->backend, backend_pages);
+        }
+    }
+    for (std::uint32_t index = 0; index < shared_prefix_capacity; ++index) {
+        if (!evicted_shared[index]) { continue; }
+        const SharedPrefixState& shared = shared_prefix_states[index];
+        if (!shared.kv) { return std::nullopt; }
+        append_address(*text_kv_addresses, shared.kv->text, main_pages);
+        if (shared.kv->backend) {
+            if (!backend_kv_addresses || !backend_kv_pages) { return std::nullopt; }
+            append_address(*backend_kv_addresses, *shared.kv->backend, backend_pages);
+        }
+    }
+
+    const auto removed_state_references = [&](StateImageHandle state) {
+        std::uint32_t references = 0;
+        for (std::uint32_t index = 0; index < continuation_capacity; ++index) {
+            if (!evicted_private[index]) { continue; }
+            const SequenceState& sequence = continuation_states[index];
+            if (sequence.rewrite_state && *sequence.rewrite_state == state) { ++references; }
+            references += static_cast<std::uint32_t>(std::count_if(
+                sequence.long_anchors.begin(), sequence.long_anchors.end(),
+                [&](const LongAnchorCheckpoint& anchor) { return anchor.state == state; }));
+        }
+        for (std::uint32_t index = 0; index < shared_prefix_capacity; ++index) {
+            if (evicted_shared[index] && shared_prefix_states[index].state == state) {
+                ++references;
+            }
+        }
+        return references;
+    };
+    if (protection != nullptr && protection->consumed_private_source) {
+        if (!protection->state || !protection->text) { return std::nullopt; }
+        const std::uint32_t selected_state_references =
+            state_store->checkpoint_references(*protection->state);
+        const std::uint32_t selected_state_removed = removed_state_references(*protection->state);
+        if (selected_state_removed > selected_state_references ||
+            selected_state_references - selected_state_removed <
+                protection->consumed_state_references ||
+            ((selected_state_references - selected_state_removed !=
+              protection->consumed_state_references) != protection->state_fork_required)) {
+            // The selected victim set changed a planned StateImage Fork into a Move. Reusing the
+            // stale destination reservation would fail after the victim references are released.
+            return std::nullopt;
+        }
+
+        for (const auto& candidate : protection->state_ownership_candidates) {
+            const std::uint32_t references = state_store->checkpoint_references(candidate.state);
+            const std::uint32_t removed    = removed_state_references(candidate.state);
+            if (candidate.source_checkpoint_references == 0 || removed > references ||
+                references - removed < candidate.source_checkpoint_references) {
+                return std::nullopt;
+            }
+            if (references - removed == candidate.source_checkpoint_references) {
+                // This changes both the active footprint and the target-private optional state
+                // inventory. Replan instead of executing against the shared ownership snapshot.
+                return std::nullopt;
+            }
+        }
+
+        const auto removed_page_references = [](const std::vector<SelectedPage>& removals,
+                                                LogicalKVPageHandle page) {
+            const auto removal = std::find_if(removals.begin(), removals.end(),
+                                              [&](const auto& item) { return item.page == page; });
+            return removal == removals.end() ? 0U : removal->references;
+        };
+        const auto append_kv_ownership_transfers =
+            [&](const KVAddressSpaceStore& addresses, LogicalKVPageStore& pages,
+                KVAddressSpaceHandle address, std::uint32_t protected_pages,
+                std::uint32_t transferable_pages, const std::vector<SelectedPage>& removals,
+                runtime::ContextResourceClass resource) {
+                if (!addresses.valid(address) ||
+                    protected_pages > addresses.mapped_pages(address) ||
+                    transferable_pages > protected_pages) {
+                    return false;
+                }
+                const std::size_t stride =
+                    plan_host_kv_page_layout(pages.physical_pool().geometry()).page_stride;
+                for (std::uint32_t offset = 0; offset < protected_pages; ++offset) {
+                    const LogicalKVPageHandle page = addresses.logical_page(address, offset);
+                    const std::uint32_t references = pages.address_references(page);
+                    const std::uint32_t removed    = removed_page_references(removals, page);
+                    if (removed >= references) { return false; }
+                    if (references <= 1 || references - removed != 1) { continue; }
+                    if (offset >= transferable_pages) {
+                        // A partial tail changing from shared to private changes the COW plan and
+                        // must be replanned instead of executing the stale prefix-fork schedule.
+                        return false;
+                    }
+                    runtime::ResourceVector active_added;
+                    runtime::ResourceVector transferred;
+                    if (resource == runtime::ContextResourceClass::MainKV) {
+                        active_added.device.main_kv_pages = 1;
+                        if (pages.device_resident(page)) { transferred.device.main_kv_pages = 1; }
+                    } else {
+                        active_added.device.backend_kv_pages = 1;
+                        if (pages.device_resident(page)) {
+                            transferred.device.backend_kv_pages = 1;
+                        }
+                    }
+                    if (pages.host_resident(page)) {
+                        active_added.host.kv_bytes = stride;
+                        transferred.host.kv_bytes  = stride;
+                    } else if (!pages.device_resident(page)) {
+                        return false;
+                    }
+                    effect.active_entitlement_delta.added =
+                        checked_resource_sum(effect.active_entitlement_delta.added, active_added);
+                    effect.final_ownership_delta.removed =
+                        checked_resource_sum(effect.final_ownership_delta.removed, transferred);
+                    effect.final_ownership_delta.added =
+                        checked_resource_sum(effect.final_ownership_delta.added, transferred);
+                }
+                return true;
+            };
+        if (!append_kv_ownership_transfers(*text_kv_addresses, *text_kv_pages, *protection->text,
+                                           protection->text_pages, protection->text_transfer_pages,
+                                           main_pages, runtime::ContextResourceClass::MainKV)) {
+            return std::nullopt;
+        }
+        if (protection->backend &&
+            (!backend_kv_addresses || !backend_kv_pages ||
+             !append_kv_ownership_transfers(*backend_kv_addresses, *backend_kv_pages,
+                                            *protection->backend, protection->backend_pages,
+                                            protection->backend_transfer_pages, backend_pages,
+                                            runtime::ContextResourceClass::BackendKV))) {
+            return std::nullopt;
         }
     }
 
@@ -2279,52 +2493,10 @@ std::optional<runtime::ResourceDelta> ProgramImplCore::combined_pressure_effect(
             residency == StateReplicaResidency::Both) {
             released.host.state_slots = 1;
         }
-        effect.removed = checked_resource_sum(effect.removed, released);
+        effect.aggregate_delta.removed =
+            checked_resource_sum(effect.aggregate_delta.removed, released);
     }
 
-    struct SelectedPage {
-        LogicalKVPageHandle page;
-        std::uint32_t references = 0;
-    };
-
-    std::vector<SelectedPage> main_pages;
-    std::vector<SelectedPage> backend_pages;
-    const auto append_address = [](const KVAddressSpaceStore& addresses,
-                                   KVAddressSpaceHandle address, std::vector<SelectedPage>& pages) {
-        if (!addresses.valid(address) || addresses.active(address)) {
-            throw std::logic_error("evicted KV address is not an inactive publication");
-        }
-        for (std::uint32_t offset = 0; offset < addresses.mapped_pages(address); ++offset) {
-            const LogicalKVPageHandle page = addresses.logical_page(address, offset);
-            const auto existing            = std::find_if(pages.begin(), pages.end(),
-                                                          [&](const auto& item) { return item.page == page; });
-            if (existing == pages.end()) {
-                pages.push_back(SelectedPage{.page = page, .references = 1});
-            } else {
-                ++existing->references;
-            }
-        }
-    };
-    for (std::uint32_t index = 0; index < continuation_capacity; ++index) {
-        if (!evicted_private[index]) { continue; }
-        const SequenceState& sequence = continuation_states[index];
-        if (!sequence.kv) { return std::nullopt; }
-        append_address(*text_kv_addresses, sequence.kv->text, main_pages);
-        if (sequence.kv->backend) {
-            if (!backend_kv_addresses || !backend_kv_pages) { return std::nullopt; }
-            append_address(*backend_kv_addresses, *sequence.kv->backend, backend_pages);
-        }
-    }
-    for (std::uint32_t index = 0; index < shared_prefix_capacity; ++index) {
-        if (!evicted_shared[index]) { continue; }
-        const SharedPrefixState& shared = shared_prefix_states[index];
-        if (!shared.kv) { return std::nullopt; }
-        append_address(*text_kv_addresses, shared.kv->text, main_pages);
-        if (shared.kv->backend) {
-            if (!backend_kv_addresses || !backend_kv_pages) { return std::nullopt; }
-            append_address(*backend_kv_addresses, *shared.kv->backend, backend_pages);
-        }
-    }
     const auto append_released_pages = [&](LogicalKVPageStore& pages,
                                            const std::vector<SelectedPage>& selected,
                                            runtime::ContextResourceClass resource) {
@@ -2350,7 +2522,8 @@ std::optional<runtime::ResourceDelta> ProgramImplCore::combined_pressure_effect(
                         HostKVPageReplicaRelease{.pages = &pages, .page = item.page});
                 }
             }
-            effect.removed = checked_resource_sum(effect.removed, released);
+            effect.aggregate_delta.removed =
+                checked_resource_sum(effect.aggregate_delta.removed, released);
         }
     };
     append_released_pages(*text_kv_pages, main_pages, runtime::ContextResourceClass::MainKV);
@@ -2580,12 +2753,12 @@ std::optional<AdmissionPlan> ProgramImplCore::compose_materialization(
         }
     }
 
-    const std::optional<runtime::ResourceDelta> combined = combined_pressure_effect(
+    const std::optional<runtime::MaterializationPressureEffect> combined = combined_pressure_effect(
         &*protection, pressure_owners, pressure_options, shared_pressure_owners,
         shared_pressure_options, &host_last_reference_releases);
     if (!combined) { return std::nullopt; }
-    removed = combined->removed;
-    added   = combined->added;
+    removed = combined->aggregate_delta.removed;
+    added   = combined->aggregate_delta.added;
 
     std::vector<HostKVAllocationRequest> host_requests;
     host_requests.reserve(shared_host_requests.size() + private_host_requests.size());
@@ -2606,8 +2779,16 @@ std::optional<AdmissionPlan> ProgramImplCore::compose_materialization(
         checked_resource_sum(details.demand.reservation_added, added);
     details.demand.physical_peak_additional = positive_resource_difference(
         checked_resource_sum(details.demand.physical_peak_additional, added), removed);
-    details.demand.final_removed = checked_resource_sum(details.demand.final_removed, removed);
-    details.demand.final_added   = checked_resource_sum(details.demand.final_added, added);
+    details.demand.final_removed =
+        checked_resource_sum(checked_resource_sum(details.demand.final_removed, removed),
+                             combined->final_ownership_delta.removed);
+    details.demand.final_added =
+        checked_resource_sum(checked_resource_sum(details.demand.final_added, added),
+                             combined->final_ownership_delta.added);
+    details.demand.active_entitlement = checked_resource_sum(
+        checked_resource_difference(details.demand.active_entitlement,
+                                    combined->active_entitlement_delta.removed),
+        combined->active_entitlement_delta.added);
     return std::optional<AdmissionPlan>(std::move(admission));
 }
 
@@ -5525,10 +5706,10 @@ ProgramImplCore::selected_state(const SequenceState& sequence, ReusePath reuse,
     throw std::logic_error("materialization path has no selected StateImage");
 }
 
-bool ProgramImplCore::selected_state_requires_fork(const SequenceState& sequence, ReusePath reuse,
-                                                   RewriteCheckpointDisposition rewrite_disposition,
-                                                   std::optional<runtime::CheckpointRef> checkpoint,
-                                                   std::uint32_t reuse_base) const {
+std::uint32_t ProgramImplCore::selected_state_consumed_references(
+    const SequenceState& sequence, ReusePath reuse,
+    RewriteCheckpointDisposition rewrite_disposition,
+    std::optional<runtime::CheckpointRef> checkpoint, std::uint32_t reuse_base) const {
     const StateImageHandle selected   = selected_state(sequence, reuse, checkpoint);
     std::uint32_t consumed_references = 0;
     if (is_rewrite_checkpoint_restore(reuse) &&
@@ -5554,7 +5735,17 @@ bool ProgramImplCore::selected_state_requires_fork(const SequenceState& sequence
     if (consumed_references > references) {
         throw std::logic_error("selected StateImage reference inventory is inconsistent");
     }
-    return references != consumed_references;
+    return consumed_references;
+}
+
+bool ProgramImplCore::selected_state_requires_fork(const SequenceState& sequence, ReusePath reuse,
+                                                   RewriteCheckpointDisposition rewrite_disposition,
+                                                   std::optional<runtime::CheckpointRef> checkpoint,
+                                                   std::uint32_t reuse_base) const {
+    const StateImageHandle selected = selected_state(sequence, reuse, checkpoint);
+    return state_store->checkpoint_references(selected) !=
+           selected_state_consumed_references(sequence, reuse, rewrite_disposition, checkpoint,
+                                              reuse_base);
 }
 
 bool ProgramImplCore::can_retain_rewrite_checkpoint(const PreparedPromptData& prompt,
