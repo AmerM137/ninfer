@@ -1304,17 +1304,18 @@ public:
             pages_for_tokens(frontier) > address.page_count) {
             throw std::invalid_argument("KV committed frontier is invalid");
         }
-        address.committed_frontier = frontier;
-        for (std::uint32_t page = 0; page < address.page_count; ++page) {
-            const std::uint32_t begin = page * static_cast<std::uint32_t>(kPagedKVPageSize);
-            const std::uint32_t columns =
-                frontier <= begin
-                    ? 0U
-                    : std::min(static_cast<std::uint32_t>(kPagedKVPageSize), frontier - begin);
+        if (frontier == address.committed_frontier) { return; }
+        const std::uint32_t page_size          = static_cast<std::uint32_t>(kPagedKVPageSize);
+        const std::uint32_t first_changed_page = address.committed_frontier / page_size;
+        const std::uint32_t final_changed_page = (frontier - 1U) / page_size;
+        for (std::uint32_t page = first_changed_page; page <= final_changed_page; ++page) {
+            const std::uint32_t begin   = page * static_cast<std::uint32_t>(kPagedKVPageSize);
+            const std::uint32_t columns = std::min(page_size, frontier - begin);
             if (columns > pages_->committed_columns(membership(address, page))) {
                 pages_->commit_coverage(membership(address, page), columns);
             }
         }
+        address.committed_frontier = frontier;
     }
 
     void destructive_truncate(KVAddressSpaceHandle handle, std::uint32_t frontier) {
