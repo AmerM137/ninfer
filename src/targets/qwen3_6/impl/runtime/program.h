@@ -90,6 +90,7 @@ struct RequestBasePlanImpl<NINFER_QWEN36_VARIANT> {
     runtime::RequestPlanSummary summary;
     runtime::ResourceDemand root_demand;
     runtime::PrefillWork root_rebuild_work;
+    std::uint32_t root_rebuild_tail_begin = 0;
     qwen3_6::PreparedContextCache context_cache;
     ops::SamplingConfig sampling;
     std::uint32_t text_kv_page_entitlement    = 0;
@@ -132,6 +133,7 @@ struct AdmissionPlanImpl<NINFER_QWEN36_VARIANT> {
     std::uint32_t shared_source_index      = 0;
     std::uint64_t shared_source_generation = 0;
     runtime::PrefillWork root_rebuild_work;
+    std::uint32_t root_rebuild_tail_begin = 0;
     runtime::PrefillWork remaining_prefill_work;
     std::vector<runtime::ContextTransferRequirement> transfer_requirements;
     runtime::ClaimDisposition source_disposition = runtime::ClaimDisposition::ConsumedToActive;
@@ -260,6 +262,7 @@ struct SequenceState {
     std::vector<LongAnchorCheckpoint> long_anchors;
     std::vector<std::uint32_t> shared_prefix_references;
     runtime::PrefillWork rebuild_work;
+    std::uint32_t rebuild_tail_begin = 0;
 };
 
 struct SharedPrefixState {

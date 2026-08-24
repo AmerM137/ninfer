@@ -401,6 +401,16 @@ RequestBasePlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
     base->root_rebuild_work =
         rebuild_work_at_frontier(prompt, base->summary.prompt_tokens, prefill_chunk,
                                  base->capture_groups, prompt.identity.rewrite_execution_frontiers);
+    for (const CaptureGroup& group : base->capture_groups) {
+        if (group.frontier < base->summary.prompt_tokens) {
+            base->root_rebuild_tail_begin = std::max(base->root_rebuild_tail_begin, group.frontier);
+        }
+    }
+    for (const std::uint32_t frontier : prompt.identity.rewrite_execution_frontiers) {
+        if (frontier < base->summary.prompt_tokens) {
+            base->root_rebuild_tail_begin = std::max(base->root_rebuild_tail_begin, frontier);
+        }
+    }
     return RequestBasePlan(std::move(base));
 }
 
@@ -423,6 +433,7 @@ ProgramImplCore::inspect_lane(std::uint32_t lane, const PreparedPromptData& prom
     plan->text_kv_page_entitlement    = base.text_kv_page_entitlement;
     plan->backend_kv_page_entitlement = base.backend_kv_page_entitlement;
     plan->root_rebuild_work           = base.root_rebuild_work;
+    plan->root_rebuild_tail_begin     = base.root_rebuild_tail_begin;
 
     if ((source != nullptr && shared_source != nullptr) ||
         ((source == nullptr && shared_source == nullptr) != !checkpoint.has_value())) {

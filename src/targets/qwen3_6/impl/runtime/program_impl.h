@@ -78,6 +78,34 @@ runtime::PrefillWork interval_rebuild_work(std::uint32_t begin_frontier,
                                       prefill_chunk);
 }
 
+void advance_rebuild_work(SequenceState& sequence, std::uint32_t frontier,
+                          std::uint32_t prefill_chunk) {
+    const std::uint32_t previous = sequence.execution_frontier;
+    if (frontier < previous || sequence.rebuild_work.tokens != previous ||
+        sequence.rebuild_tail_begin > previous || prefill_chunk == 0) {
+        throw std::logic_error("sequence rebuild work is not aligned with its frontier");
+    }
+    if (frontier == previous) { return; }
+
+    const std::uint64_t old_tail = previous - sequence.rebuild_tail_begin;
+    const std::uint64_t new_tail = frontier - sequence.rebuild_tail_begin;
+    const auto chunks_for        = [prefill_chunk](std::uint64_t tokens) {
+        return tokens == 0 ? 0ULL : 1ULL + (tokens - 1ULL) / prefill_chunk;
+    };
+    const std::uint64_t old_tail_chunks = chunks_for(old_tail);
+    const std::uint64_t new_tail_chunks = chunks_for(new_tail);
+    if (sequence.rebuild_work.chunks < old_tail_chunks) {
+        throw std::logic_error("sequence rebuild chunk accounting is invalid");
+    }
+
+    const runtime::PrefillWork total =
+        runtime::make_prefill_work(0, frontier, sequence.rebuild_work.vision_items,
+                                   sequence.rebuild_work.vision_patches, prefill_chunk);
+    sequence.rebuild_work.chunks = sequence.rebuild_work.chunks - old_tail_chunks + new_tail_chunks;
+    sequence.rebuild_work.tokens = total.tokens;
+    sequence.rebuild_work.attention_pairs = total.attention_pairs;
+}
+
 std::optional<qwen3_6::TargetKVRequirement>
 retained_requirement_after_drop(const qwen3_6::ContinuationSummary& summary,
                                 runtime::CheckpointRef dropped) noexcept {
@@ -5158,6 +5186,7 @@ void ProgramImplCore::release_continuation_slot(std::uint32_t index) noexcept {
     sequence.endpoint_valid          = false;
     sequence.rewrite_checkpoint      = {};
     sequence.rebuild_work            = {};
+    sequence.rebuild_tail_begin      = 0;
     for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
         if (active_continuations[lane] == index) {
             active_continuations[lane] = continuation_capacity;
@@ -7563,6 +7592,7 @@ ProgramImplCore::append_forced_tokens(std::span<const SequenceHandle> members,
 
             sequence.ledger.insert(sequence.ledger.end(), forced.begin(), forced.end());
             sequence.prefix_identity.append_generated(row_stride, sequence.rope_delta);
+            advance_rebuild_work(sequence, end, prefill_chunk);
             sequence.execution_frontier = end;
             sequence.ledger_frontier    = end + 1U;
             sequence.mtp_draft_count    = 0;
@@ -8405,7 +8435,8 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
         sequence.tail_hidden_valid   = base == prompt_tokens && sequence.tail_hidden_valid;
         sequence.ledger.swap(materialization_ledger_);
         sequence.prefix_identity.swap(materialization_identity_);
-        sequence.rebuild_work = request_plan.root_rebuild_work;
+        sequence.rebuild_work       = request_plan.root_rebuild_work;
+        sequence.rebuild_tail_begin = request_plan.root_rebuild_tail_begin;
 
         if (speculative_backend == SpeculativeBackend::DFlash) {
             if (!dflash || !io.dflash_decode || !sequence.kv->backend) {
@@ -8636,6 +8667,7 @@ runtime::ExecutionTiming ProgramImplCore::resolve_pending_raw(
                     : dflash_host_egress->licensed_tokens.data() + row * width;
             sequence.ledger.insert(sequence.ledger.end(), token_base, token_base + committed);
             sequence.prefix_identity.append_generated(committed, sequence.rope_delta);
+            advance_rebuild_work(sequence, pending.base_E + committed, prefill_chunk);
             sequence.execution_frontier = pending.base_E + committed;
             sequence.ledger_frontier    = pending.base_S + committed;
             sequence.text_kv_valid      = sequence.execution_frontier;
@@ -10329,6 +10361,8 @@ ProgramImplCore::resolve_non_speculative_pending(SequenceState& sequence, Reques
         sequence.ledger_frontier    = request.pending.prompt_tokens + 1;
         break;
     case PendingKind::Ordinary:
+        advance_rebuild_work(sequence, request.pending.base_E + request.pending.produced,
+                             prefill_chunk);
         sequence.execution_frontier = request.pending.base_E + request.pending.produced;
         sequence.ledger_frontier    = request.pending.base_S + request.pending.produced;
         break;
