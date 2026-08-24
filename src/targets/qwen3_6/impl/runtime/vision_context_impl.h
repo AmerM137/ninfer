@@ -329,6 +329,50 @@ VisionPrefillSession::VisionPrefillSession(DeviceContext& device, const LoadedMo
     if (transient_.data == nullptr || transient_.alignment < kWorkspaceAlignment) {
         throw std::invalid_argument("Vision item output transient is missing or misaligned");
     }
+    std::uint32_t previous_end = 0;
+    std::optional<std::uint32_t> previous_item;
+    for (const VisionUseSpan& use : plan_.uses) {
+        if (use.begin >= use.end || use.begin < previous_end ||
+            use.end > prompt_.token_ids.size()) {
+            throw std::invalid_argument("Vision suffix item spans are invalid or unordered");
+        }
+        if (use.item_index >= plan_.control->items.size() ||
+            use.item_index >= prompt_.vision_items.size() ||
+            use.item_index >= prompt_.media_payloads.size() ||
+            (previous_item && use.item_index <= *previous_item)) {
+            throw std::invalid_argument("Vision suffix item indices are invalid or unordered");
+        }
+        const qwen3_6::VisionItemControl& control = plan_.control->items[use.item_index];
+        const qwen3_6::VisionItem& source         = prompt_.vision_items[use.item_index];
+        if (control.scatter_indices.empty() ||
+            use.end != static_cast<std::uint32_t>(control.scatter_indices.back()) + 1U ||
+            (use.begin != static_cast<std::uint32_t>(control.scatter_indices.front()) &&
+             use.begin + 1U != static_cast<std::uint32_t>(control.scatter_indices.front())) ||
+            source.modality != control.modality || source.grid.temporal != control.grid.temporal ||
+            source.grid.height != control.grid.height || source.grid.width != control.grid.width ||
+            source.patch_begin != control.patch_begin ||
+            source.patch_count != control.patch_count) {
+            throw std::invalid_argument("Vision suffix plan does not describe the prepared item");
+        }
+        if (control.merged_count >
+            static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
+            throw std::overflow_error("Vision item output columns exceed int32");
+        }
+        const std::size_t output_bytes =
+            checked_mul(checked_mul(static_cast<std::size_t>(VisionScheduleConfig::out_hidden),
+                                    control.merged_count, "item output elements"),
+                        dtype_size(DType::BF16), "item output bytes");
+        const std::size_t patch_elements = checked_mul(
+            control.patch_count, static_cast<std::size_t>(VisionScheduleConfig::patch_dim),
+            "item patch elements");
+        const auto& payload = prompt_.media_payloads[use.item_index];
+        if (output_bytes > transient_.size || !payload ||
+            payload->patch_elements != patch_elements) {
+            throw std::invalid_argument("Vision suffix item storage has an invalid shape");
+        }
+        previous_end  = use.end;
+        previous_item = use.item_index;
+    }
     encoded_payloads_pending_release_.reserve(plan_.uses.size());
     timers_.reserve(plan_.uses.size());
 }
@@ -342,58 +386,25 @@ VisionChunk VisionPrefillSession::prepare_chunk(std::uint32_t begin, std::uint32
     std::uint32_t end = static_cast<std::uint32_t>(
         std::min<std::uint64_t>(nominal_end64, prompt_.token_ids.size()));
 
+    while (next_use_ < plan_.uses.size() && plan_.uses[next_use_].end <= begin) { ++next_use_; }
     const VisionUseSpan* active = nullptr;
-    for (const VisionUseSpan& use : plan_.uses) {
-        if (use.end <= begin) { continue; }
-        if (use.begin >= end) { break; }
-        if (active == nullptr) {
-            active = &use;
-        } else {
-            end = std::min(end, use.begin);
-            break;
+    if (next_use_ < plan_.uses.size() && plan_.uses[next_use_].begin < end) {
+        active = &plan_.uses[next_use_];
+        if (next_use_ + 1U < plan_.uses.size()) {
+            end = std::min(end, plan_.uses[next_use_ + 1U].begin);
         }
     }
     if (end <= begin) { throw std::logic_error("Vision chunk cap made no forward progress"); }
     if (active == nullptr) {
         return VisionChunk{static_cast<std::int32_t>(end - begin), nullptr, {}};
     }
-    if (active->item_index >= plan_.control->items.size() ||
-        active->item_index >= prompt_.vision_items.size() ||
-        active->item_index >= prompt_.media_payloads.size()) {
-        throw std::logic_error("Vision prefill item index is out of range");
-    }
     const qwen3_6::VisionItemControl& control = plan_.control->items[active->item_index];
-    const qwen3_6::VisionItem& source         = prompt_.vision_items[active->item_index];
-    if (source.modality != control.modality || source.grid.temporal != control.grid.temporal ||
-        source.grid.height != control.grid.height || source.grid.width != control.grid.width ||
-        source.patch_begin != control.patch_begin || source.patch_count != control.patch_count) {
-        throw std::invalid_argument("Vision prefill plan does not describe the prepared item");
-    }
-    if (control.merged_count > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
-        throw std::overflow_error("Vision item output columns exceed int32");
-    }
-    const std::size_t output_bytes =
-        checked_mul(checked_mul(static_cast<std::size_t>(VisionScheduleConfig::out_hidden),
-                                control.merged_count, "item output elements"),
-                    dtype_size(DType::BF16), "item output bytes");
-    if (output_bytes > transient_.size) {
-        throw std::invalid_argument("Vision item output transient is too small");
-    }
     Tensor output(
         transient_.data, DType::BF16,
         {VisionScheduleConfig::out_hidden, static_cast<std::int32_t>(control.merged_count)});
 
     if (!active_item_ || *active_item_ != active->item_index) {
-        if (active_item_ && active->item_index <= *active_item_) {
-            throw std::logic_error("Vision items are not consumed in strictly increasing order");
-        }
-        const std::size_t patch_elements = checked_mul(
-            control.patch_count, static_cast<std::size_t>(VisionScheduleConfig::patch_dim),
-            "item patch elements");
         const auto& payload = prompt_.media_payloads[active->item_index];
-        if (!payload || payload->patch_elements != patch_elements) {
-            throw std::invalid_argument("Vision item patch payload has an invalid shape");
-        }
         timers_.emplace_back(device_);
         timers_.back().start();
         context_.encode(VisionItemView{payload->span(), &control}, output, workspace_);

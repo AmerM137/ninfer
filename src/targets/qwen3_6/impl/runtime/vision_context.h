@@ -108,6 +108,7 @@ private:
     const VisionPrefillPlan& plan_;
     RequestTransientArena::Region transient_;
     VisionContext context_;
+    std::size_t next_use_ = 0;
     std::optional<std::uint32_t> active_item_;
     std::vector<std::uint32_t> encoded_payloads_pending_release_;
     std::vector<CudaEventTimer> timers_;
