@@ -6,6 +6,7 @@
 #include <ninfer/targets/qwen3_6/vision_control.h>
 
 #include "targets/qwen3_6/impl/runtime/prefix_identity.h"
+#include "targets/qwen3_6/impl/runtime/rebuild_work.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -335,6 +336,25 @@ void test_prefix_identity() {
            "truncated multimodal continuation identity");
 }
 
+void test_rebuild_work_prompt_frontier_boundary() {
+    constexpr std::uint32_t prompt_tokens = 100;
+    constexpr std::uint32_t prefill_chunk = 2048;
+    std::uint32_t tail_begin              = 0;
+    q36::runtime_support::include_rebuild_boundary(tail_begin, prompt_tokens, prompt_tokens);
+    expect(tail_begin == prompt_tokens,
+           "prompt-frontier rebuild boundary was not retained for continuation growth");
+
+    ninfer::runtime::PrefillWork work =
+        ninfer::runtime::make_prefill_work(0, prompt_tokens, 0, 0, prefill_chunk);
+    q36::runtime_support::advance_segmented_rebuild_work(work, tail_begin, prompt_tokens,
+                                                         prompt_tokens + 1, prefill_chunk);
+    const ninfer::runtime::PrefillWork exact =
+        ninfer::runtime::make_prefill_work(0, prompt_tokens + 1, 0, 0, prefill_chunk);
+    expect(work.chunks == 2 && work.tokens == exact.tokens &&
+               work.attention_pairs == exact.attention_pairs,
+           "continuation growth did not preserve the prompt-frontier rebuild split");
+}
+
 } // namespace
 
 int main() {
@@ -344,6 +364,7 @@ int main() {
     test_mtp_alignment();
     test_vision_control();
     test_prefix_identity();
+    test_rebuild_work_prompt_frontier_boundary();
     if (failures != 0) {
         std::cerr << failures << " Qwen3.6 runtime mechanism checks failed\n";
         return 1;

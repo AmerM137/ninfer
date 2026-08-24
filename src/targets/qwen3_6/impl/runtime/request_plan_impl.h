@@ -1,5 +1,6 @@
 #include "targets/qwen3_6/impl/runtime/instance.h"
 #include "targets/qwen3_6/impl/runtime/program.h"
+#include "targets/qwen3_6/impl/runtime/rebuild_work.h"
 
 #include "targets/qwen3_6/impl/runtime/schedule.h"
 
@@ -395,14 +396,12 @@ RequestBasePlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
         rebuild_work_at_frontier(prompt, base->summary.prompt_tokens, prefill_chunk,
                                  base->capture_groups, prompt.identity.rewrite_execution_frontiers);
     for (const CaptureGroup& group : base->capture_groups) {
-        if (group.frontier < base->summary.prompt_tokens) {
-            base->root_rebuild_tail_begin = std::max(base->root_rebuild_tail_begin, group.frontier);
-        }
+        runtime_support::include_rebuild_boundary(base->root_rebuild_tail_begin, group.frontier,
+                                                  base->summary.prompt_tokens);
     }
     for (const std::uint32_t frontier : prompt.identity.rewrite_execution_frontiers) {
-        if (frontier < base->summary.prompt_tokens) {
-            base->root_rebuild_tail_begin = std::max(base->root_rebuild_tail_begin, frontier);
-        }
+        runtime_support::include_rebuild_boundary(base->root_rebuild_tail_begin, frontier,
+                                                  base->summary.prompt_tokens);
     }
     return RequestBasePlan(std::move(base));
 }

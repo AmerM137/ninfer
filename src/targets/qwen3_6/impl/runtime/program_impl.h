@@ -1,5 +1,6 @@
 #include "targets/qwen3_6/impl/runtime/instance.h"
 #include "targets/qwen3_6/impl/runtime/program.h"
+#include "targets/qwen3_6/impl/runtime/rebuild_work.h"
 
 #include "targets/qwen3_6/impl/runtime/schedule.h"
 #include "ninfer/ops/gdn_replay.h"
@@ -86,30 +87,9 @@ runtime::PrefillWork interval_rebuild_work(std::uint32_t begin_frontier,
 
 void advance_rebuild_work(SequenceState& sequence, std::uint32_t frontier,
                           std::uint32_t prefill_chunk) {
-    const std::uint32_t previous = sequence.execution_frontier;
-    if (frontier < previous || sequence.rebuild_work.tokens != previous ||
-        sequence.rebuild_tail_begin > previous || prefill_chunk == 0) {
-        throw std::logic_error("sequence rebuild work is not aligned with its frontier");
-    }
-    if (frontier == previous) { return; }
-
-    const std::uint64_t old_tail = previous - sequence.rebuild_tail_begin;
-    const std::uint64_t new_tail = frontier - sequence.rebuild_tail_begin;
-    const auto chunks_for        = [prefill_chunk](std::uint64_t tokens) {
-        return tokens == 0 ? 0ULL : 1ULL + (tokens - 1ULL) / prefill_chunk;
-    };
-    const std::uint64_t old_tail_chunks = chunks_for(old_tail);
-    const std::uint64_t new_tail_chunks = chunks_for(new_tail);
-    if (sequence.rebuild_work.chunks < old_tail_chunks) {
-        throw std::logic_error("sequence rebuild chunk accounting is invalid");
-    }
-
-    const runtime::PrefillWork total =
-        runtime::make_prefill_work(0, frontier, sequence.rebuild_work.vision_items,
-                                   sequence.rebuild_work.vision_patches, prefill_chunk);
-    sequence.rebuild_work.chunks = sequence.rebuild_work.chunks - old_tail_chunks + new_tail_chunks;
-    sequence.rebuild_work.tokens = total.tokens;
-    sequence.rebuild_work.attention_pairs = total.attention_pairs;
+    runtime_support::advance_segmented_rebuild_work(
+        sequence.rebuild_work, sequence.rebuild_tail_begin, sequence.execution_frontier, frontier,
+        prefill_chunk);
 }
 
 std::optional<qwen3_6::TargetKVRequirement>
