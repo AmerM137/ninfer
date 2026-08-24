@@ -1323,8 +1323,7 @@ std::uint32_t Frontend::count_tokens(PromptInput input, const PreparationControl
                             impl_->media_cache);
     try {
         return checked_token_count(
-            processor.process(std::move(messages), render_options(options), control)
-                .input_ids.size());
+            processor.count_tokens(std::move(messages), render_options(options), control));
     } catch (const fi::ProcessorError& error) { throw_processor_error(error); }
 }
 

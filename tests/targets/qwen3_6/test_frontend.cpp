@@ -1105,14 +1105,21 @@ int test_media_admission_uses_aggregate_resources(const Frontend& frontend) {
 
 int test_multimodal_prompt_over_removed_32k_cap(const Frontend& frontend) {
     const std::string long_text(40'000, 'x');
+    const ninfer::MediaCacheSummary before_count = frontend.media_cache_summary();
     const std::uint32_t counted =
         frontend.count_tokens(image_text_input(gradient_ppm(), long_text, "long-context.ppm"));
+    const ninfer::MediaCacheSummary after_count = frontend.media_cache_summary();
     const auto prepared =
         frontend.prepare(image_text_input(gradient_ppm(), long_text, "long-context.ppm"));
     const auto& data = FrontendFactory::inspect(prepared);
 
     int failures = check(counted > 32'768 && data.token_ids.size() == counted,
                          "multimodal prompt retained the removed 32K frontend token cap");
+    failures += check(after_count.entries == before_count.entries &&
+                          after_count.live_bytes == before_count.live_bytes &&
+                          after_count.hits == before_count.hits &&
+                          after_count.misses == before_count.misses,
+                      "multimodal token counting mutated the prepared-media cache");
     failures += check(data.has_media() && data.vision_items.size() == 1,
                       "long multimodal prompt lost its Vision item");
     return failures;
@@ -1145,10 +1152,19 @@ int test_video_prepare(const Frontend& frontend) {
     ninfer::PromptInput input;
     input.messages.push_back(std::move(message));
 
-    auto prepared             = frontend.prepare(std::move(input));
-    const auto& prepared_data = FrontendFactory::inspect(prepared);
-    int failures = check(prepared_data.vision_items.size() == 1 && prepared_data.has_media(),
-                         "video frontend did not retain one Vision item");
+    const ninfer::MediaCacheSummary before_count = frontend.media_cache_summary();
+    const std::uint32_t counted                  = frontend.count_tokens(input);
+    const ninfer::MediaCacheSummary after_count  = frontend.media_cache_summary();
+    auto prepared                                = frontend.prepare(std::move(input));
+    const auto& prepared_data                    = FrontendFactory::inspect(prepared);
+    int failures = check(prepared_data.vision_items.size() == 1 && prepared_data.has_media() &&
+                             prepared_data.token_ids.size() == counted,
+                         "video token counting and preparation geometry diverged");
+    failures += check(after_count.entries == before_count.entries &&
+                          after_count.live_bytes == before_count.live_bytes &&
+                          after_count.hits == before_count.hits &&
+                          after_count.misses == before_count.misses,
+                      "video token counting mutated the prepared-media cache");
     if (!prepared_data.vision_items.empty()) {
         const auto& item = prepared_data.vision_items.front();
         failures +=

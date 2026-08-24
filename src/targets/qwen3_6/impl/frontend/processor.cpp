@@ -319,6 +319,22 @@ Prepared prepare_image(std::span<const std::uint8_t> bytes, const ProcessorOptio
     return out;
 }
 
+std::vector<double> video_timestamps(std::span<const int> indices, int temporal_groups,
+                                     double fps) {
+    std::vector<int> padded(indices.begin(), indices.end());
+    if (padded.size() % kTemporal != 0) { padded.push_back(padded.back()); }
+    if (temporal_groups < 0 ||
+        static_cast<std::size_t>(temporal_groups) > padded.size() / kTemporal) {
+        throw std::logic_error("sampled video indices do not cover the temporal grid");
+    }
+    std::vector<double> timestamps;
+    timestamps.reserve(static_cast<std::size_t>(temporal_groups));
+    for (int t = 0; t < temporal_groups; ++t) {
+        timestamps.push_back(static_cast<double>(padded[2 * t] + padded[2 * t + 1]) / (2.0 * fps));
+    }
+    return timestamps;
+}
+
 Prepared prepare_video(std::span<const std::uint8_t> bytes, const ProcessorOptions& options,
                        const media::decode::Policy& policy, MediaPreprocessCache& cache,
                        ConcurrentMediaBudget& request_budget, const PreparationControl& control) {
@@ -344,17 +360,8 @@ Prepared prepare_video(std::span<const std::uint8_t> bytes, const ProcessorOptio
         frame = resize_bicubic(frame, size, control);
     }
     if (pad_temporal) { video.frames.push_back(video.frames.back()); }
-    out.item.timestamps.reserve(static_cast<std::size_t>(gt));
-    std::vector<int> timestamp_indices = video.indices;
-    if (timestamp_indices.size() % kTemporal != 0) {
-        timestamp_indices.push_back(timestamp_indices.back());
-    }
-    for (int t = 0; t < gt; ++t) {
-        out.item.timestamps.push_back(
-            static_cast<double>(timestamp_indices[2 * t] + timestamp_indices[2 * t + 1]) /
-            (2.0 * video.fps));
-    }
-    std::size_t cursor = 0;
+    out.item.timestamps = video_timestamps(video.indices, gt, video.fps);
+    std::size_t cursor  = 0;
     for (int t = 0; t < gt; ++t) {
         check_preparation_control(control);
         const std::vector<const media::decode::Image*> frames{
@@ -394,6 +401,50 @@ std::vector<ChatPart*> media_parts(std::vector<ChatMessage>& messages) {
         }
     }
     return out;
+}
+
+std::size_t validate_media_inputs(std::span<ChatPart* const> parts,
+                                  const ProcessorOptions& options) {
+    const std::uint64_t maximum_items_from_extents =
+        std::min(options.max_raw_patches / kMinimumRawPatchesPerItem, options.max_vision_tokens);
+    if (std::cmp_greater(parts.size(), maximum_items_from_extents)) {
+        throw ProcessorError(ProcessorErrorKind::BudgetExceeded,
+                             "minimum Vision grids exceed processor extent budget");
+    }
+    std::size_t remaining = options.max_encoded_media_bytes;
+    for (const ChatPart* part : parts) {
+        if (part->media.bytes.size() > remaining) {
+            throw ProcessorError(ProcessorErrorKind::BudgetExceeded,
+                                 "request media bytes exceed processor budget");
+        }
+        remaining -= part->media.bytes.size();
+    }
+    return options.max_encoded_media_bytes - remaining;
+}
+
+VisionItem inspect_image_item(std::span<const std::uint8_t> bytes, const ProcessorOptions& options,
+                              const media::decode::Policy& policy) {
+    const media::decode::ImageInfo image = media::decode::inspect_image(bytes, policy);
+    const Size size = smart_resize_image(image.height, image.width, options.image_min_pixels,
+                                         options.image_max_pixels);
+    VisionItem item;
+    item.modality = Modality::Image;
+    item.grid     = {1, size.h / kPatch, size.w / kPatch};
+    return item;
+}
+
+VisionItem inspect_video_item(std::span<const std::uint8_t> bytes, const ProcessorOptions& options,
+                              const media::decode::Policy& policy) {
+    const media::decode::VideoInfo video = media::decode::inspect_video(
+        bytes, policy, options.video_fps, options.video_min_frames, options.video_max_frames);
+    const Size size = smart_resize_video(video.sampled_frames, video.height, video.width,
+                                         options.video_min_pixels, options.video_max_pixels);
+    const int gt    = (video.sampled_frames + kTemporal - 1) / kTemporal;
+    VisionItem item;
+    item.modality   = Modality::Video;
+    item.grid       = {gt, size.h / kPatch, size.w / kPatch};
+    item.timestamps = video_timestamps(video.indices, gt, video.fps);
+    return item;
 }
 
 void append_repeated(std::string& out, std::string_view value, std::uint64_t count) {
@@ -743,27 +794,55 @@ Processor::Processor(const Tokenizer& tokenizer, const CompiledChatTemplate& cha
     validate_special_token(tokenizer_, kVideoPad, kVideoToken);
 }
 
+std::size_t Processor::count_tokens(std::vector<ChatMessage> messages,
+                                    ChatRenderOptions render_options,
+                                    const PreparationControl& control) const {
+    check_preparation_control(control);
+    const std::vector<ChatPart*> parts = media_parts(messages);
+    (void)validate_media_inputs(parts, options_);
+    RenderedChat rendered = chat_template_.render(messages, std::move(render_options));
+    MediaPreparationPermit request_permit = media_cache_->acquire_request(control);
+    const media::decode::Policy policy{
+        .max_bytes                  = options_.max_encoded_media_bytes,
+        .max_decoded_pixels         = options_.max_decoded_pixels,
+        .max_decoded_video_pixels   = options_.max_decoded_video_pixels,
+        .max_video_source_frames    = options_.max_video_source_frames,
+        .max_video_duration_seconds = options_.max_video_duration_seconds,
+        .checkpoint                 = [&control] { check_preparation_control(control); },
+    };
+    std::vector<VisionItem> items;
+    items.reserve(parts.size());
+    PreprocessStats stats;
+    try {
+        for (const ChatPart* part : parts) {
+            check_preparation_control(control);
+            VisionItem item = part->kind == ChatPartKind::Image
+                                  ? inspect_image_item(part->media.bytes, options_, policy)
+                                  : inspect_video_item(part->media.bytes, options_, policy);
+            add_budget(stats, item);
+            enforce_media_resource_limits(stats, options_);
+            items.push_back(std::move(item));
+        }
+    } catch (const media::decode::Error& error) {
+        if (error.kind() == media::decode::ErrorKind::BudgetExceeded) {
+            throw ProcessorError(ProcessorErrorKind::BudgetExceeded, error.what());
+        }
+        throw;
+    }
+    rendered                = expand_placeholders(std::move(rendered), items);
+    const std::size_t count = tokenizer_.encode(rendered.text).size();
+    check_preparation_control(control, "tokenization");
+    return count;
+}
+
 ProcessedInput Processor::process(std::vector<ChatMessage> messages,
                                   ChatRenderOptions render_options,
                                   const PreparationControl& control,
                                   std::size_t maximum_prompt_tokens) const {
     check_preparation_control(control);
     const std::vector<ChatPart*> parts = media_parts(messages);
-    const std::uint64_t maximum_items_from_extents =
-        std::min(options_.max_raw_patches / kMinimumRawPatchesPerItem, options_.max_vision_tokens);
-    if (std::cmp_greater(parts.size(), maximum_items_from_extents)) {
-        throw ProcessorError(ProcessorErrorKind::BudgetExceeded,
-                             "minimum Vision grids exceed processor extent budget");
-    }
-    std::size_t remaining_media_bytes = options_.max_encoded_media_bytes;
-    for (const ChatPart* part : parts) {
-        if (part->media.bytes.size() > remaining_media_bytes) {
-            throw ProcessorError(ProcessorErrorKind::BudgetExceeded,
-                                 "request media bytes exceed processor budget");
-        }
-        remaining_media_bytes -= part->media.bytes.size();
-    }
-    RenderedChat rendered = chat_template_.render(messages, std::move(render_options));
+    const std::size_t media_bytes      = validate_media_inputs(parts, options_);
+    RenderedChat rendered              = chat_template_.render(messages, std::move(render_options));
     const std::size_t encode_limit =
         maximum_prompt_tokens == std::numeric_limits<std::size_t>::max()
             ? maximum_prompt_tokens
@@ -801,7 +880,7 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
     items.reserve(parts.size());
     PreprocessStats stats;
     stats.media_items      = parts.size();
-    stats.media_bytes      = options_.max_encoded_media_bytes - remaining_media_bytes;
+    stats.media_bytes      = media_bytes;
     stats.tokenize_seconds = preliminary_tokenize_seconds;
 
     std::vector<PendingMedia> pending_items;

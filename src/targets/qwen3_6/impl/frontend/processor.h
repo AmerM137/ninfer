@@ -137,6 +137,10 @@ public:
     Processor(const Tokenizer& tokenizer, const CompiledChatTemplate& chat_template,
               ProcessorOptions options, std::shared_ptr<MediaPreprocessCache> media_cache);
 
+    [[nodiscard]] std::size_t count_tokens(std::vector<ChatMessage> messages,
+                                           ChatRenderOptions render_options  = {},
+                                           const PreparationControl& control = {}) const;
+
     ProcessedInput
     process(std::vector<ChatMessage> messages, ChatRenderOptions render_options = {},
             const PreparationControl& control = {},
