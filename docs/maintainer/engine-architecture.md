@@ -908,6 +908,13 @@ residency、成本与pressure intent；Program拥有State/KV transfer correctnes
 terminal acknowledgement。Host State按完整image计费，Host KV按实际extent bytes计费；active request不被
 swap，只有inactive ownership参加background-free replica transition。
 
+ResourceManager也是replica policy invalidation的唯一owner。Catalog ownership/revision、retention或active
+reference变化，以及materialization、capture、replica transaction的terminal acknowledgement会推进policy
+generation；普通decode commit、逐token output publication和stats snapshot不会推进。Engine先比较
+generation，clean state不进入catalog/checkpoint inspection。一次policy pass选出的candidate固定generation、owner
+ID/revision和完整resource demand；Program在pass内只做一次组合preflight，随后由
+`reserve_prevalidated_replica_transition`消费该结果，不能在两个generation之间执行stale selection。
+
 ### 12.2 Fork、COW 与 shared prefix
 
 Private continuation保持single-claim，但可以从immutable source Fork到新的active StateImage；shared prefix只

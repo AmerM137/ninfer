@@ -401,7 +401,7 @@ public:
         const qwen3_6::ReplicaTransitionOption& option,
         const ContinuationHandle* private_replacement, const SharedPrefixHandle* shared_replacement,
         const qwen3_6::PressureOption* replacement) const;
-    [[nodiscard]] runtime::ContextTransactionReserveStatus reserve_replica_transition(
+    [[nodiscard]] runtime::ContextTransactionReserveStatus reserve_prevalidated_replica_transition(
         const ContinuationHandle* private_owner, const SharedPrefixHandle* shared_owner,
         qwen3_6::ReplicaTransitionOption option, const ContinuationHandle* private_replacement,
         const SharedPrefixHandle* shared_replacement,

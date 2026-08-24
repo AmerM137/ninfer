@@ -2207,12 +2207,16 @@ public:
             program.has_context_transaction()) {
             throw std::logic_error("ResourceManager already owns a context transaction");
         }
+        if (!replica_policy_pending()) { return ReplicaTransitionReserveResult::Skipped; }
+        const std::uint64_t policy_generation = replica_policy_generation_;
+        evaluated_replica_policy_generation_  = policy_generation;
 
         struct Candidate {
-            bool shared            = false;
-            std::uint32_t slot     = kInvalidCatalogSlot;
-            std::uint64_t owner_id = 0;
-            std::uint64_t revision = 0;
+            std::uint64_t policy_generation = 0;
+            bool shared                     = false;
+            std::uint32_t slot              = kInvalidCatalogSlot;
+            std::uint64_t owner_id          = 0;
+            std::uint64_t revision          = 0;
             ReplicaTransitionOption option;
             bool replacement_shared            = false;
             std::uint32_t replacement_slot     = kInvalidCatalogSlot;
@@ -2282,6 +2286,7 @@ public:
                                          const ContinuationHandle* private_owner,
                                          const SharedPrefixHandle* shared_owner) {
             target.backup_transfer_ns       = price_replica_option(target.option);
+            target.policy_generation        = policy_generation;
             const CostEstimate target_value = replica_value_cost(
                 target.option.added_host_replica_impacts, private_entry, shared_entry);
             if (target_value.nanoseconds <= target.backup_transfer_ns) { return; }
@@ -2413,6 +2418,9 @@ public:
                 nullptr, &entry, nullptr, &*entry.handle);
         }
         if (!selected) { return ReplicaTransitionReserveResult::Skipped; }
+        if (selected->policy_generation != replica_policy_generation_) {
+            return ReplicaTransitionReserveResult::Skipped;
+        }
 
         ContinuationHandle* private_owner =
             selected->shared ? nullptr : &*catalog_[selected->slot].handle;
@@ -2427,14 +2435,7 @@ public:
                 private_replacement = &*catalog_[selected->replacement_slot].handle;
             }
         }
-        const PreflightStatus preflight = program.revalidate_replica_transition(
-            private_owner, shared_owner, selected->option, private_replacement, shared_replacement,
-            selected->replacement ? &*selected->replacement : nullptr);
-        if (preflight == PreflightStatus::InvariantFailure) {
-            throw std::logic_error("selected replica transition has an invalid shape");
-        }
-        if (preflight != PreflightStatus::Ready ||
-            !ledger_.can_reserve_replica_transition(selected->demand)) {
+        if (!ledger_.can_reserve_replica_transition(selected->demand)) {
             return ReplicaTransitionReserveResult::Skipped;
         }
         if (selected->shared) {
@@ -2476,9 +2477,9 @@ public:
         }
 
         const runtime::ContextTransactionReserveStatus reserved =
-            program.reserve_replica_transition(private_owner, shared_owner, selected->option,
-                                               private_replacement, shared_replacement,
-                                               selected->replacement, CancellationFlagView{});
+            program.reserve_prevalidated_replica_transition(
+                private_owner, shared_owner, selected->option, private_replacement,
+                shared_replacement, selected->replacement, CancellationFlagView{});
         if (reserved == runtime::ContextTransactionReserveStatus::Aborted) {
             return ReplicaTransitionReserveResult::Skipped;
         }
@@ -2644,7 +2645,7 @@ public:
         }
         ProgramContextTransactionProgress progress =
             program.progress_context_transaction(cancellation);
-        return std::visit(
+        ContextTransactionOutcome outcome = std::visit(
             [&](auto&& result) -> ContextTransactionOutcome {
                 using Result = std::decay_t<decltype(result)>;
                 if constexpr (std::is_same_v<Result, ContextTransactionInProgress>) {
@@ -2671,6 +2672,10 @@ public:
                 }
             },
             std::move(progress));
+        if (!std::holds_alternative<ContextTransactionInProgress>(outcome)) {
+            invalidate_replica_policy();
+        }
+        return outcome;
     }
 
     [[nodiscard]] FinishResult finish(Program& program, LaneId lane, SequenceHandle sequence) {
@@ -2692,6 +2697,7 @@ public:
             release_shared_active_references(lane);
             clear_catalog_slot(active_entry.publication_slot);
             active_entry = {};
+            invalidate_replica_policy();
             return result;
         }
         const bool valid_summary = valid_continuation_summary(result.summary);
@@ -2746,6 +2752,7 @@ public:
             }
         }
         active_entry = {};
+        invalidate_replica_policy();
         return result;
     }
 
@@ -2763,6 +2770,7 @@ public:
         }
         clear_catalog_slot(active_[lane.value].publication_slot);
         active_[lane.value] = {};
+        invalidate_replica_policy();
         return result;
     }
 
@@ -2777,12 +2785,15 @@ public:
                 throw std::logic_error("cancelled commit did not release its active entitlement");
             }
         }
+        bool released = false;
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             if (result.rows[row].disposition != CommitDisposition::CancelledReleased) { continue; }
             if (!release_cancelled_lane(lanes[row])) {
                 throw std::logic_error("cancelled commit ownership could not be released");
             }
+            released = true;
         }
+        if (released) { invalidate_replica_policy(); }
     }
 
     void apply_discard(std::span<const LaneId> lanes,
@@ -2801,21 +2812,28 @@ public:
                 throw std::logic_error("discarded pending ownership could not be released");
             }
         }
+        if (!lanes.empty()) { invalidate_replica_policy(); }
     }
 
     void release_failed_commit(std::span<const LaneId> lanes) noexcept {
+        bool released = false;
         for (const LaneId lane : lanes) {
             if (lane.value >= lane_count_ || ledger_.lane(lane).state != LogicalLaneState::Active) {
                 continue;
             }
-            (void)release_cancelled_lane(lane);
+            released = release_cancelled_lane(lane) || released;
         }
+        if (released) { invalidate_replica_policy(); }
     }
 
     [[nodiscard]] const ResourceLedger& ledger() const noexcept { return ledger_; }
 
     [[nodiscard]] bool has_replica_transition() const noexcept {
         return std::holds_alternative<ReplicaTransitionRecord>(context_transaction_);
+    }
+
+    [[nodiscard]] bool replica_policy_pending() const noexcept {
+        return evaluated_replica_policy_generation_ != replica_policy_generation_;
     }
 
     [[nodiscard]] std::optional<ContextTransactionKind> context_transaction_kind() const noexcept {
@@ -2915,9 +2933,14 @@ public:
             clear_shared_catalog_entry(entry);
         }
         ledger_.clear();
+        invalidate_replica_policy();
     }
 
 private:
+    void invalidate_replica_policy() noexcept {
+        if (++replica_policy_generation_ == 0) { ++replica_policy_generation_; }
+    }
+
     struct ReplicaTransitionRecord {
         bool shared            = false;
         std::uint32_t slot     = kInvalidCatalogSlot;
@@ -4225,9 +4248,11 @@ private:
     ContextTransaction context_transaction_;
     ContextCostModel cost_model_;
     RuntimeStats context_stats_;
-    std::uint64_t next_continuation_id_  = 1;
-    std::uint64_t next_shared_prefix_id_ = 1;
-    std::uint64_t retention_epoch_       = 0;
+    std::uint64_t next_continuation_id_                = 1;
+    std::uint64_t next_shared_prefix_id_               = 1;
+    std::uint64_t retention_epoch_                     = 0;
+    std::uint64_t replica_policy_generation_           = 1;
+    std::uint64_t evaluated_replica_policy_generation_ = 0;
 };
 
 } // namespace ninfer::runtime

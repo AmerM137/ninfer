@@ -827,6 +827,7 @@ public:
     [[nodiscard]] std::optional<FakeReplicaTransitionOption>
     inspect_replica_transition(const FakeContinuationHandle& owner,
                                ninfer::runtime::CheckpointRef checkpoint) const {
+        ++replica_transition_inspections;
         if (!owner.valid || owner.resources.device.state_slots == 0 ||
             owner.resources.host.state_slots != 0 ||
             checkpoint != continuation_summary().endpoint->ref) {
@@ -849,6 +850,7 @@ public:
 
     [[nodiscard]] std::optional<FakeReplicaTransitionOption>
     inspect_replica_transition(const FakeSharedPrefixHandle&) const {
+        ++replica_transition_inspections;
         return std::nullopt;
     }
 
@@ -884,19 +886,16 @@ public:
         return ninfer::runtime::PreflightStatus::Ready;
     }
 
-    [[nodiscard]] ninfer::runtime::ContextTransactionReserveStatus reserve_replica_transition(
-        const FakeContinuationHandle* private_owner, const FakeSharedPrefixHandle* shared_owner,
-        FakeReplicaTransitionOption option, const FakeContinuationHandle* private_replacement,
-        const FakeSharedPrefixHandle* shared_replacement,
-        std::optional<FakePressureOption> replacement,
-        ninfer::runtime::CancellationFlagView cancellation) {
+    [[nodiscard]] ninfer::runtime::ContextTransactionReserveStatus
+    reserve_prevalidated_replica_transition(const FakeContinuationHandle* private_owner,
+                                            const FakeSharedPrefixHandle* shared_owner,
+                                            FakeReplicaTransitionOption option,
+                                            const FakeContinuationHandle* private_replacement,
+                                            const FakeSharedPrefixHandle* shared_replacement,
+                                            std::optional<FakePressureOption> replacement,
+                                            ninfer::runtime::CancellationFlagView cancellation) {
         if (cancellation.requested()) {
             return ninfer::runtime::ContextTransactionReserveStatus::Aborted;
-        }
-        if (revalidate_replica_transition(
-                private_owner, shared_owner, option, private_replacement, shared_replacement,
-                replacement ? &*replacement : nullptr) != ninfer::runtime::PreflightStatus::Ready) {
-            throw std::logic_error("fake replica-transition reservation mismatch");
         }
         ReplicaTransaction transaction{
             .target             = private_owner,
@@ -1061,6 +1060,7 @@ public:
     std::uint32_t last_released_key                         = 0;
     std::uint32_t last_replica_target_key                   = 0;
     std::uint32_t last_replica_victim_key                   = 0;
+    mutable std::uint32_t replica_transition_inspections    = 0;
     mutable std::uint32_t replica_replacement_revalidations = 0;
     mutable std::vector<std::pair<std::uint64_t, bool>> last_composed_pressure;
     std::optional<std::uint32_t> demotable_device_state_key;
@@ -1511,7 +1511,8 @@ void test_value_positive_replica_replaces_lower_value_host_duplicate() {
     expect(outcome.status == ninfer::runtime::ContextTransactionStatus::Published &&
                !manager.has_replica_transition() && !program.has_context_transaction() &&
                manager.ledger().used() == resources({0, 2, 4, 2}, {.state_slots = 1}) &&
-               program.last_replica_target_key == 1 && program.last_replica_victim_key == 2,
+               program.last_replica_target_key == 1 && program.last_replica_victim_key == 2 &&
+               program.replica_replacement_revalidations == 1,
            "Host backup replacement did not atomically move unique occupancy");
 
     ninfer::RuntimeStats stats;
@@ -1559,6 +1560,42 @@ void test_ready_replica_transition_skips_dominated_replacements() {
            "ready Host backup evaluated or consumed a dominated replacement");
 }
 
+void test_clean_replica_policy_waits_for_resource_invalidation() {
+    FakeProgram program;
+    FakeManager manager(resources({1, 2, 6, 4}), 1, 2, 0, true, 0, test_cost_model());
+
+    const auto publish = [&](std::uint32_t key) {
+        auto inspection = manager.inspect(program, FakePreparedPrompt{key}, make_base());
+        expect(inspection.readiness == ninfer::runtime::Readiness::Ready && inspection.choice,
+               "replica-policy seed was not admitted");
+        auto active = materialize_and_adopt(manager, program, std::move(*inspection.choice),
+                                            FakePreparedPrompt{key});
+        (void)manager.finish(program, LaneId{0}, active.sequence);
+    };
+
+    publish(1);
+    expect(manager.replica_policy_pending(),
+           "catalog publication did not invalidate replica policy");
+    expect(manager.reserve_replica_transition(program) ==
+               FakeManager::ReplicaTransitionReserveResult::Skipped,
+           "zero-capacity Host policy unexpectedly reserved a transition");
+    const std::uint32_t clean_inspections = program.replica_transition_inspections;
+    expect(!manager.replica_policy_pending() && clean_inspections != 0,
+           "replica policy did not become clean after a complete pass");
+    expect(manager.reserve_replica_transition(program) ==
+                   FakeManager::ReplicaTransitionReserveResult::Skipped &&
+               program.replica_transition_inspections == clean_inspections,
+           "clean replica policy rescanned the catalog");
+
+    publish(2);
+    expect(manager.replica_policy_pending(),
+           "second catalog publication did not re-arm replica policy");
+    expect(manager.reserve_replica_transition(program) ==
+                   FakeManager::ReplicaTransitionReserveResult::Skipped &&
+               program.replica_transition_inspections > clean_inspections,
+           "resource invalidation did not trigger one new replica-policy pass");
+}
+
 } // namespace
 
 int main() {
@@ -1572,6 +1609,7 @@ int main() {
     test_source_alias_filters_only_the_unsafe_pressure_action();
     test_value_positive_replica_replaces_lower_value_host_duplicate();
     test_ready_replica_transition_skips_dominated_replacements();
+    test_clean_replica_policy_waits_for_resource_invalidation();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

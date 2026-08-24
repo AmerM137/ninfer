@@ -686,7 +686,9 @@ public:
                                   const ContinuationHandle<Variant>* private_replacement,
                                   const SharedPrefixHandle<Variant>* shared_replacement,
                                   const PressureOption* replacement) const;
-    [[nodiscard]] runtime::ContextTransactionReserveStatus reserve_replica_transition(
+    // ResourceManager calls this only with an option preflighted in the same policy generation,
+    // after rechecking every catalog capability by exact owner id and revision.
+    [[nodiscard]] runtime::ContextTransactionReserveStatus reserve_prevalidated_replica_transition(
         const ContinuationHandle<Variant>* private_owner,
         const SharedPrefixHandle<Variant>* shared_owner, ReplicaTransitionOption option,
         const ContinuationHandle<Variant>* private_replacement,

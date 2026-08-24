@@ -372,15 +372,15 @@ runtime::PreflightStatus Program<Variant>::revalidate_replica_transition(
 }
 
 template <>
-runtime::ContextTransactionReserveStatus Program<Variant>::reserve_replica_transition(
+runtime::ContextTransactionReserveStatus Program<Variant>::reserve_prevalidated_replica_transition(
     const ContinuationHandle<Variant>* private_owner,
     const SharedPrefixHandle<Variant>* shared_owner, ReplicaTransitionOption option,
     const ContinuationHandle<Variant>* private_replacement,
     const SharedPrefixHandle<Variant>* shared_replacement,
     std::optional<PressureOption> replacement, runtime::CancellationFlagView cancellation) {
-    return impl_->reserve_replica_transition(private_owner, shared_owner, std::move(option),
-                                             private_replacement, shared_replacement,
-                                             std::move(replacement), cancellation);
+    return impl_->reserve_prevalidated_replica_transition(
+        private_owner, shared_owner, std::move(option), private_replacement, shared_replacement,
+        std::move(replacement), cancellation);
 }
 
 template <>

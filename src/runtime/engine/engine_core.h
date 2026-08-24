@@ -1030,6 +1030,7 @@ private:
     }
 
     void try_start_replica_transition() {
+        if (!resources_.replica_policy_pending()) { return; }
         EnginePhaseScope phase(*this, EngineHostPhase::Maintenance);
         DetailScope detail(*this, &RuntimeHostWorkStats::replica_policy_ns,
                            &RuntimeHostWorkStats::replica_policy_invocations,

@@ -7114,22 +7114,13 @@ runtime::PreflightStatus ProgramImplCore::revalidate_replica_transition(
                : runtime::PreflightStatus::StalePolicyState;
 }
 
-runtime::ContextTransactionReserveStatus ProgramImplCore::reserve_replica_transition(
+runtime::ContextTransactionReserveStatus ProgramImplCore::reserve_prevalidated_replica_transition(
     const ContinuationHandle* private_owner, const SharedPrefixHandle* shared_owner,
     qwen3_6::ReplicaTransitionOption option, const ContinuationHandle* private_replacement,
     const SharedPrefixHandle* shared_replacement,
     std::optional<qwen3_6::PressureOption> replacement,
     runtime::CancellationFlagView cancellation) {
     if (cancellation.requested()) { return runtime::ContextTransactionReserveStatus::Aborted; }
-    const runtime::PreflightStatus preflight =
-        revalidate_replica_transition(private_owner, shared_owner, option, private_replacement,
-                                      shared_replacement, replacement ? &*replacement : nullptr);
-    if (preflight == runtime::PreflightStatus::InvariantFailure) {
-        throw std::logic_error("replica transition selection is invalid");
-    }
-    if (preflight != runtime::PreflightStatus::Ready) {
-        return runtime::ContextTransactionReserveStatus::Aborted;
-    }
 
     ReplicaTransitionTransaction transaction;
     transaction.shared_owner = shared_owner != nullptr;
