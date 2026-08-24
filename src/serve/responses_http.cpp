@@ -31,12 +31,14 @@ public:
 
 struct StreamingResponse {
     PreparedRequest prepared;
-    ResponsesRequest request;
+    std::vector<ChatTurn> input_turns;
+    std::vector<Json> input_items;
     ResponseContext previous_context;
     std::string session_key;
     RequestLogContext log_context;
     std::unique_ptr<ResponsesEventStream> encoder;
     std::atomic<bool> cancelled{false};
+    bool store   = false;
     bool started = false;
 };
 
@@ -115,10 +117,10 @@ void set_owned_content(httplib::Response& response, std::string body,
     response.hold_resource(std::move(lifetime));
 }
 
-ResponseContext terminal_context(const ResponseContext& previous, const ResponsesRequest& request,
-                                 const BuiltResponse& response) {
-    ResponseContext input = append_response_context(previous, request.input_turns);
-    return append_response_context(std::move(input), response.output_history);
+ResponseContext terminal_context(ResponseContext previous, std::vector<ChatTurn> input_turns,
+                                 std::vector<ChatTurn> output_history) {
+    ResponseContext input = append_response_context(std::move(previous), std::move(input_turns));
+    return append_response_context(std::move(input), std::move(output_history));
 }
 
 ResponsesRuntimeValues runtime_values(const PreparedRequest& prepared,
@@ -262,6 +264,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
     const std::int64_t created = unix_time_now();
     const RequestLogContext log_context =
         make_request_log_context(req_id, "openai_responses", request.generation, prepared);
+    request.generation.messages.clear();
     log_request_start(log_context);
 
     if (!request.stream) {
@@ -272,11 +275,13 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
             BuiltResponse response = make_response_object(id, created, request, runtime, outcome);
             if (request.store) {
                 StoredResponse stored;
-                stored.id                = id;
-                stored.session_key       = session_key;
-                stored.response          = response.body;
-                stored.input_items       = request.input_items;
-                stored.context           = terminal_context(previous_context, request, response);
+                stored.id          = id;
+                stored.session_key = session_key;
+                stored.response    = response.body;
+                stored.input_items = std::move(request.input_items);
+                stored.context =
+                    terminal_context(std::move(previous_context), std::move(request.input_turns),
+                                     std::move(response.output_history));
                 stored.preserve_thinking = prepared.preserve_thinking;
                 response_store_.put(std::move(stored));
             }
@@ -295,12 +300,14 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
 
     auto stream              = std::make_shared<StreamingResponse>();
     stream->prepared         = std::move(prepared);
-    stream->request          = std::move(request);
+    stream->input_turns      = std::move(request.input_turns);
+    stream->input_items      = std::move(request.input_items);
     stream->previous_context = std::move(previous_context);
     stream->session_key      = std::move(session_key);
     stream->log_context      = log_context;
-    stream->encoder          = std::make_unique<ResponsesEventStream>(id, created, stream->request,
-                                                                      runtime_values(stream->prepared));
+    stream->store            = request.store;
+    stream->encoder = std::make_unique<ResponsesEventStream>(id, created, std::move(request),
+                                                             runtime_values(stream->prepared));
 
     res.set_header("Cache-Control", "no-cache");
     res.set_header("X-Accel-Buffering", "no");
@@ -328,14 +335,15 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
 
                 const GenerationOutcome outcome = service_->run(stream->prepared, &output);
                 ResponsesStreamFinish finished  = stream->encoder->finish(outcome);
-                if (stream->request.store) {
+                if (stream->store) {
                     StoredResponse stored;
-                    stored.id          = finished.response.body.at("id").get<std::string>();
-                    stored.session_key = stream->session_key;
-                    stored.response    = finished.response.body;
-                    stored.input_items = stream->request.input_items;
-                    stored.context     = terminal_context(stream->previous_context, stream->request,
-                                                          finished.response);
+                    stored.id                = finished.response.body.at("id").get<std::string>();
+                    stored.session_key       = stream->session_key;
+                    stored.response          = finished.response.body;
+                    stored.input_items       = std::move(stream->input_items);
+                    stored.context           = terminal_context(std::move(stream->previous_context),
+                                                                std::move(stream->input_turns),
+                                                                std::move(finished.response.output_history));
                     stored.preserve_thinking = stream->prepared.preserve_thinking;
                     response_store_.put(std::move(stored));
                 }
