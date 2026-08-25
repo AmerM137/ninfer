@@ -20,6 +20,25 @@ struct DeviceContext;
 
 namespace ninfer::targets::qwen3_6 {
 
+namespace detail {
+struct PressureOptionImpl;
+struct CaptureAssessmentImpl;
+
+} // namespace detail
+
+// Read-only diagnostics sampled from the real Program stores.  This is not an accounting input.
+struct PhysicalUsageSnapshot {
+    std::uint64_t resource_revision       = 0;
+    std::uint32_t device_state_slots      = 0;
+    std::uint32_t host_state_slots        = 0;
+    std::uint32_t device_main_kv_pages    = 0;
+    std::uint32_t device_backend_kv_pages = 0;
+    std::size_t host_kv_bytes             = 0;
+
+    [[nodiscard]] friend constexpr bool operator==(const PhysicalUsageSnapshot&,
+                                                   const PhysicalUsageSnapshot&) noexcept = default;
+};
+
 enum class TextPhase {
     Prefill,
     Verify,
@@ -143,12 +162,15 @@ struct ReplicaValueImpact {
 // policy compares only its exact effect/cost fields and returns the value unchanged to Program;
 // page positions and state disposition remain Qwen-family semantics.
 struct PressureOption {
+    PressureOption();
+
     std::uint64_t id          = 0;
     PressureStateAction state = PressureStateAction::None;
     PressureKVAction main_kv;
     PressureKVAction backend_kv;
     std::optional<runtime::CheckpointRef> dropped_checkpoint;
-    runtime::ResourceDelta effect;
+    // Opaque target-private planner payload. Its complete type exists only in Program code.
+    std::shared_ptr<detail::PressureOptionImpl> implementation;
     std::uint64_t transfer_bytes = 0;
     std::vector<runtime::ContextTransferRequirement> transfer_requirements;
     std::vector<PressureCheckpointImpact> checkpoint_impacts;
@@ -156,23 +178,7 @@ struct PressureOption {
     bool evicts_continuation = false;
     bool shared_owner        = false;
 
-    [[nodiscard]] friend constexpr bool operator==(const PressureOption&,
-                                                   const PressureOption&) noexcept = default;
-};
-
-struct ReplicaTransitionOption {
-    runtime::ContextResourceClass resource = runtime::ContextResourceClass::State;
-    runtime::CheckpointRef checkpoint;
-    std::uint32_t begin_page = 0;
-    std::uint32_t page_count = 0;
-    runtime::ResourceDelta effect;
-    std::uint64_t transfer_bytes = 0;
-    TransferWork transfer_work;
-    std::vector<ReplicaValueImpact> added_host_replica_impacts;
-    bool shared_owner = false;
-
-    [[nodiscard]] friend constexpr bool
-    operator==(const ReplicaTransitionOption&, const ReplicaTransitionOption&) noexcept = default;
+    friend bool operator==(const PressureOption&, const PressureOption&) noexcept;
 };
 
 namespace detail {
@@ -192,6 +198,8 @@ struct RuntimeContractAccess;
 
 template <class Variant>
 class SequencePlanner;
+template <class Variant>
+class Program;
 
 // These are the complete family execution types. Exact packages bind them to a private Variant;
 // target selection remains outside this layer and happens once in the closed Engine registry.
@@ -255,7 +263,6 @@ public:
     RequestBasePlan& operator=(const RequestBasePlan&) = delete;
 
     [[nodiscard]] const runtime::RequestPlanSummary& summary() const noexcept;
-    [[nodiscard]] const runtime::ResourceDemand& root_demand() const noexcept;
     [[nodiscard]] const PreparedContextCache& context_cache() const noexcept;
     [[nodiscard]] std::optional<PrefixShortlistKey>
     prefix_shortlist_key(std::uint32_t frontier) const noexcept;
@@ -276,11 +283,8 @@ public:
     AdmissionPlan& operator=(const AdmissionPlan&) = delete;
 
     [[nodiscard]] const runtime::RequestPlanSummary& summary() const noexcept;
-    [[nodiscard]] const runtime::ResourceDemand& demand() const noexcept;
-    [[nodiscard]] runtime::ResourceVector source_resources() const noexcept;
     [[nodiscard]] runtime::ClaimDisposition source_disposition() const noexcept;
     [[nodiscard]] bool needs_transfer() const noexcept;
-    [[nodiscard]] bool temporal_eligible() const noexcept;
     [[nodiscard]] runtime::PrefillWork remaining_prefill_work() const noexcept;
     [[nodiscard]] std::span<const runtime::ContextTransferRequirement>
     transfer_requirements() const noexcept;
@@ -290,6 +294,59 @@ public:
     // Engine code can inspect summary() but not target planning state.
     explicit AdmissionPlan(std::unique_ptr<detail::AdmissionPlanImpl<Variant>> impl) noexcept;
     std::unique_ptr<detail::AdmissionPlanImpl<Variant>> impl_;
+};
+
+// A sealed Program-owned physical decision.  ResourceManager may retain it and inspect the
+// request-level summary, but cannot see allocator quantities, references, reservations, or stage
+// deltas.  Start validates the bound Program revision before performing any mutation.
+template <class Variant>
+class ResourcePlan {
+public:
+    ResourcePlan(ResourcePlan&&) noexcept            = default;
+    ResourcePlan& operator=(ResourcePlan&&) noexcept = default;
+    ~ResourcePlan()                                  = default;
+
+    ResourcePlan(const ResourcePlan&)            = delete;
+    ResourcePlan& operator=(const ResourcePlan&) = delete;
+
+    [[nodiscard]] const runtime::RequestPlanSummary& summary() const noexcept {
+        return admission_.summary();
+    }
+
+    [[nodiscard]] bool needs_transfer() const noexcept { return admission_.needs_transfer(); }
+
+    [[nodiscard]] std::uint64_t resource_revision() const noexcept { return revision_; }
+
+private:
+    ResourcePlan(AdmissionPlan<Variant>&& admission, std::uint64_t revision) noexcept
+        : admission_(std::move(admission)), revision_(revision) {}
+
+    AdmissionPlan<Variant> admission_;
+    std::uint64_t revision_ = 0;
+
+    friend class Program<Variant>;
+};
+
+// A Program-minted proof that one FIFO borrower cannot consume the maximum physical entitlement
+// reserved for the blocked head.  Common scheduling binds the opaque proof to logical identities
+// and a revision; it cannot inspect or reproduce the resource arithmetic.
+template <class Variant>
+class PersistentBackfillProof {
+public:
+    PersistentBackfillProof(PersistentBackfillProof&&) noexcept            = default;
+    PersistentBackfillProof& operator=(PersistentBackfillProof&&) noexcept = default;
+
+    PersistentBackfillProof(const PersistentBackfillProof&)            = delete;
+    PersistentBackfillProof& operator=(const PersistentBackfillProof&) = delete;
+
+    [[nodiscard]] std::uint64_t resource_revision() const noexcept { return revision_; }
+
+private:
+    explicit PersistentBackfillProof(std::uint64_t revision) noexcept : revision_(revision) {}
+
+    std::uint64_t revision_ = 0;
+
+    friend class Program<Variant>;
 };
 
 template <class Variant>
@@ -375,18 +432,6 @@ private:
 };
 
 template <class Variant>
-struct ProtectedPrivateOwner {
-    const ContinuationHandle<Variant>* handle = nullptr;
-    std::uint32_t owner_mask                  = 0;
-};
-
-template <class Variant>
-struct ProtectedSharedOwner {
-    const SharedPrefixHandle<Variant>* handle = nullptr;
-    std::uint32_t owner_mask                  = 0;
-};
-
-template <class Variant>
 class PendingBatch {
 public:
     PendingBatch() noexcept = default;
@@ -446,9 +491,10 @@ enum class CaptureStatePlacement : std::uint8_t {
 };
 
 struct CaptureAssessment {
-    runtime::ResourceDemand demand;
-    runtime::ResourceDelta active_entitlement_delta;
-    runtime::ResourceVector capacity_preparation_removed;
+    CaptureAssessment();
+
+    // Program retains the physical assessment in this opaque package-private payload.
+    std::shared_ptr<detail::CaptureAssessmentImpl> implementation;
     PrefixShortlistKey shortlist_key;
     runtime::PrefillWork protected_rebuild_work;
     std::vector<runtime::ContextTransferRequirement> transfer_requirements;
@@ -471,10 +517,7 @@ struct SharedPrefixPublication {
 template <class Variant>
 struct ActiveCaptureResult {
     runtime::ContextTransactionStatus status = runtime::ContextTransactionStatus::Aborted;
-    runtime::ResourceDelta resource_delta;
-    runtime::ResourceDelta active_entitlement_delta;
-    runtime::ResourceVector capacity_preparation_removed;
-    bool capacity_preparation_committed = false;
+    bool capacity_preparation_committed      = false;
     ContinuationSummary active_summary;
     std::optional<SharedPrefixPublication<Variant>> shared;
     std::vector<runtime::ContextTransferObservation> transfer_observations;
@@ -484,31 +527,26 @@ struct ActiveCaptureResult {
 template <class Variant>
 struct StartResult {
     SequenceHandle<Variant> sequence;
-    runtime::ResourceVector active_resources;
 };
 
 struct MaterializationVictimResult {
     runtime::ClaimDisposition disposition = runtime::ClaimDisposition::Retained;
     std::optional<ContinuationSummary> final_summary;
-    runtime::ResourceDelta resource_delta;
 };
 
 struct MaterializationSharedVictimResult {
     runtime::ClaimDisposition disposition = runtime::ClaimDisposition::Retained;
     std::optional<SharedPrefixSummary> final_summary;
-    runtime::ResourceDelta resource_delta;
 };
 
 struct MaterializationSourceResult {
     runtime::ClaimDisposition disposition = runtime::ClaimDisposition::Retained;
     std::optional<ContinuationSummary> final_summary;
-    runtime::ResourceDelta resource_delta;
 };
 
 struct MaterializationSharedSourceResult {
     runtime::ClaimDisposition disposition = runtime::ClaimDisposition::Retained;
     std::optional<SharedPrefixSummary> final_summary;
-    runtime::ResourceDelta resource_delta;
 };
 
 template <class Variant>
@@ -519,34 +557,17 @@ struct MaterializationResult {
     std::optional<MaterializationSharedSourceResult> shared_source;
     std::vector<MaterializationVictimResult> victims;
     std::vector<MaterializationSharedVictimResult> shared_victims;
-    runtime::ResourceDelta resource_delta;
     std::vector<runtime::ContextTransferObservation> transfer_observations;
     runtime::ContextOperationCounts operations;
-};
-
-struct ReplicaTransitionOwnerResult {
-    bool shared_owner = false;
-    std::optional<ContinuationSummary> private_summary;
-    std::optional<SharedPrefixSummary> shared_summary;
-    runtime::ResourceDelta resource_delta;
-};
-
-struct ReplicaTransitionResult {
-    runtime::ContextTransactionStatus status = runtime::ContextTransactionStatus::Aborted;
-    std::array<ReplicaTransitionOwnerResult, 2> owners;
-    std::size_t owner_count = 0;
-    runtime::ResourceDelta resource_delta;
-    std::vector<runtime::ContextTransferObservation> transfer_observations;
 };
 
 template <class Variant>
 using ContextTransactionProgress =
     std::variant<runtime::ContextTransactionInProgress, MaterializationResult<Variant>,
-                 ActiveCaptureResult<Variant>, ReplicaTransitionResult>;
+                 ActiveCaptureResult<Variant>>;
 
 struct CommitRowResult {
     runtime::CommitDisposition disposition = runtime::CommitDisposition::Active;
-    runtime::ResourceDelta resource_delta;
     GenerationTimings timings;
     SpeculativeStats speculative;
 };
@@ -564,8 +585,7 @@ struct CommitResult {
 template <class Variant>
 struct DiscardResult {
     runtime::ConsumeStatus status = runtime::ConsumeStatus::InvariantMismatch;
-    std::array<runtime::ResourceDelta, kMaximumConcurrency> resource_deltas{};
-    std::size_t row_count = 0;
+    std::size_t row_count         = 0;
 };
 
 template <class Variant>
@@ -574,7 +594,6 @@ struct FinishResult {
     runtime::FinishDisposition disposition = runtime::FinishDisposition::Released;
     GenerationTimings timings;
     SpeculativeStats speculative;
-    runtime::ResourceDelta resource_delta;
     ContinuationSummary summary;
     std::optional<ContinuationHandle<Variant>> continuation;
 };
@@ -584,13 +603,11 @@ struct AbortResult {
     runtime::ConsumeStatus status = runtime::ConsumeStatus::InvariantMismatch;
     GenerationTimings timings;
     SpeculativeStats speculative;
-    runtime::ResourceDelta resource_delta;
 };
 
 template <class Variant>
 struct ReleaseResult {
     runtime::ConsumeStatus status = runtime::ConsumeStatus::InvariantMismatch;
-    runtime::ResourceDelta resource_delta;
 };
 
 template <class Variant>
@@ -614,48 +631,28 @@ public:
                       std::optional<runtime::CheckpointRef> checkpoint,
                       bool must_retain_private_source);
     [[nodiscard]] std::vector<PressureOption>
-    inspect_pressure_options(const ContinuationHandle<Variant>& continuation,
-                             runtime::ResourceVector deficit) const;
-    [[nodiscard]] std::vector<PressureOption>
     inspect_pressure_options(const AdmissionPlan<Variant>& admission,
-                             const ContinuationHandle<Variant>& continuation,
-                             runtime::ResourceVector deficit) const;
+                             const ContinuationHandle<Variant>& continuation) const;
     [[nodiscard]] PressureOption
     inspect_eviction_option(const ContinuationHandle<Variant>& continuation) const;
     [[nodiscard]] std::vector<PressureOption>
-    inspect_shared_pressure_options(const SharedPrefixHandle<Variant>& shared,
-                                    runtime::ResourceVector deficit) const;
-    [[nodiscard]] std::vector<PressureOption>
     inspect_shared_pressure_options(const AdmissionPlan<Variant>& admission,
-                                    const SharedPrefixHandle<Variant>& shared,
-                                    runtime::ResourceVector deficit) const;
+                                    const SharedPrefixHandle<Variant>& shared) const;
     [[nodiscard]] PressureOption
     inspect_shared_eviction_option(const SharedPrefixHandle<Variant>& shared) const;
-    [[nodiscard]] std::optional<runtime::MaterializationPressureEffect>
-    inspect_combined_pressure_effect(
-        const AdmissionPlan<Variant>& admission,
-        std::span<const ContinuationHandle<Variant>* const> pressure_owners,
-        std::span<const PressureOption> pressure_options,
-        std::span<const SharedPrefixHandle<Variant>* const> shared_pressure_owners,
-        std::span<const PressureOption> shared_pressure_options) const;
-    [[nodiscard]] std::optional<AdmissionPlan<Variant>> compose_materialization(
-        AdmissionPlan<Variant>&& admission,
-        std::span<const ContinuationHandle<Variant>* const> pressure_owners,
-        std::span<const PressureOption> pressure_options,
-        std::span<const SharedPrefixHandle<Variant>* const> shared_pressure_owners,
-        std::span<const PressureOption> shared_pressure_options);
-    [[nodiscard]] runtime::PreflightStatus revalidate_materialization(
-        const AdmissionPlan<Variant>& plan, const PreparedPrompt& prompt,
-        const ContinuationHandle<Variant>* source, const SharedPrefixHandle<Variant>* shared_source,
-        std::span<const ContinuationHandle<Variant>* const> victims,
-        std::span<const SharedPrefixHandle<Variant>* const> shared_victims) const;
+    [[nodiscard]] std::optional<ResourcePlan<Variant>>
+    seal_resource_plan(const AdmissionPlan<Variant>& admission, const PreparedPrompt& prompt,
+                       std::span<const ContinuationHandle<Variant>* const> pressure_owners,
+                       std::span<const PressureOption> pressure_options,
+                       std::span<const SharedPrefixHandle<Variant>* const> shared_pressure_owners,
+                       std::span<const PressureOption> shared_pressure_options);
     [[nodiscard]] runtime::ContextTransactionReserveStatus
-    reserve_materialization(AdmissionPlan<Variant>&& plan, PreparedPrompt&& prompt,
-                            const ContinuationHandle<Variant>* source,
-                            const SharedPrefixHandle<Variant>* shared_source,
-                            std::span<const ContinuationHandle<Variant>* const> victims,
-                            std::span<const SharedPrefixHandle<Variant>* const> shared_victims,
-                            runtime::CancellationFlagView cancellation);
+    start_resource_transaction(ResourcePlan<Variant>&& plan, PreparedPrompt&& prompt,
+                               runtime::CancellationFlagView cancellation);
+    [[nodiscard]] std::optional<PersistentBackfillProof<Variant>>
+    prove_persistent_backfill(const RequestBasePlan<Variant>& blocked_head,
+                              const ResourcePlan<Variant>& candidate,
+                              std::span<const SequenceHandle<Variant>> persistent_borrowers) const;
     [[nodiscard]] ContextTransactionProgress<Variant>
     progress_context_transaction(runtime::CancellationFlagView cancellation);
     void finalize_context_transaction() noexcept;
@@ -677,26 +674,6 @@ public:
                            const SharedPrefixHandle<Variant>* replacement,
                            std::optional<runtime::CheckpointRef> private_replacement,
                            runtime::CancellationFlagView cancellation);
-    [[nodiscard]] std::optional<ReplicaTransitionOption>
-    inspect_replica_transition(const ContinuationHandle<Variant>& owner,
-                               runtime::CheckpointRef checkpoint) const;
-    [[nodiscard]] std::optional<ReplicaTransitionOption>
-    inspect_replica_transition(const SharedPrefixHandle<Variant>& owner) const;
-    [[nodiscard]] runtime::PreflightStatus
-    revalidate_replica_transition(const ContinuationHandle<Variant>* private_owner,
-                                  const SharedPrefixHandle<Variant>* shared_owner,
-                                  const ReplicaTransitionOption& option,
-                                  const ContinuationHandle<Variant>* private_replacement,
-                                  const SharedPrefixHandle<Variant>* shared_replacement,
-                                  const PressureOption* replacement) const;
-    // ResourceManager calls this only with an option preflighted in the same policy generation,
-    // after rechecking every catalog capability by exact owner id and revision.
-    [[nodiscard]] runtime::ContextTransactionReserveStatus reserve_prevalidated_replica_transition(
-        const ContinuationHandle<Variant>* private_owner,
-        const SharedPrefixHandle<Variant>* shared_owner, ReplicaTransitionOption option,
-        const ContinuationHandle<Variant>* private_replacement,
-        const SharedPrefixHandle<Variant>* shared_replacement,
-        std::optional<PressureOption> replacement, runtime::CancellationFlagView cancellation);
     [[nodiscard]] PendingBatch<Variant> decode(std::span<const SequenceHandle<Variant>> sequences,
                                                std::span<const runtime::RoundBudget> budgets,
                                                runtime::ExecutionTiming* failed_timing = nullptr);
@@ -717,12 +694,12 @@ public:
     release_continuation(ContinuationHandle<Variant>&& continuation) noexcept;
     [[nodiscard]] ReleaseResult<Variant>
     release_shared_prefix(SharedPrefixHandle<Variant>&& shared) noexcept;
-    [[nodiscard]] std::array<runtime::DeviceResources, 1U << kMaximumConcurrency>
-    project_protected_resources(std::span<const ProtectedPrivateOwner<Variant>> private_owners,
-                                std::span<const ProtectedSharedOwner<Variant>> shared_owners) const;
     void fail_all_cleanup() noexcept;
 
-    [[nodiscard]] runtime::ResourceVector admission_capacity() const noexcept;
+    [[nodiscard]] bool
+    isolated_request_feasible(const RequestBasePlan<Variant>& base) const noexcept;
+    [[nodiscard]] std::uint64_t resource_revision() const noexcept;
+    [[nodiscard]] PhysicalUsageSnapshot physical_usage() const noexcept;
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
     void reset_memory_peaks() noexcept;
 

@@ -159,9 +159,10 @@ runtime::PrefillWork rebuild_work_at_frontier(const PreparedPromptData& prompt,
                                   captures, rewrite_frontiers);
 }
 
-runtime::DeviceResources convertible_source_resources(runtime::DeviceResources active,
-                                                      runtime::DeviceResources source) noexcept {
-    return runtime::DeviceResources{
+detail::PhysicalDeviceResources
+convertible_source_resources(detail::PhysicalDeviceResources active,
+                             detail::PhysicalDeviceResources source) noexcept {
+    return detail::PhysicalDeviceResources{
         .active_lanes     = 0,
         .state_slots      = std::min(active.state_slots, source.state_slots),
         .main_kv_pages    = std::min(active.main_kv_pages, source.main_kv_pages),
@@ -169,9 +170,10 @@ runtime::DeviceResources convertible_source_resources(runtime::DeviceResources a
     };
 }
 
-runtime::DeviceResources additional_resources(runtime::DeviceResources active,
-                                              runtime::DeviceResources converted) noexcept {
-    return runtime::DeviceResources{
+detail::PhysicalDeviceResources
+additional_resources(detail::PhysicalDeviceResources active,
+                     detail::PhysicalDeviceResources converted) noexcept {
+    return detail::PhysicalDeviceResources{
         .active_lanes     = active.active_lanes,
         .state_slots      = active.state_slots - converted.state_slots,
         .main_kv_pages    = active.main_kv_pages - converted.main_kv_pages,
@@ -179,10 +181,10 @@ runtime::DeviceResources additional_resources(runtime::DeviceResources active,
     };
 }
 
-runtime::ResourceVector positive_difference(runtime::ResourceVector value,
-                                            runtime::ResourceVector removed) noexcept {
+detail::PhysicalResources positive_difference(detail::PhysicalResources value,
+                                              detail::PhysicalResources removed) noexcept {
     const auto subtract = [](auto left, auto right) { return left > right ? left - right : 0; };
-    return runtime::ResourceVector{
+    return detail::PhysicalResources{
         .device =
             {
                 .active_lanes = static_cast<std::uint32_t>(
@@ -267,7 +269,7 @@ RequestBasePlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
     } else if (speculative_backend == SpeculativeBackend::DFlash) {
         base->backend_kv_page_entitlement = pages_for_tokens(reserved_context_tokens);
     }
-    runtime::DeviceResources root_active{
+    detail::PhysicalDeviceResources root_active{
         .active_lanes     = 1,
         .state_slots      = 1U,
         .main_kv_pages    = base->text_kv_page_entitlement,
@@ -385,8 +387,8 @@ RequestBasePlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
         }
     }
     root_active.state_slots = 1U;
-    const runtime::ResourceVector root_vector{.device = root_active};
-    base->root_demand = runtime::ResourceDemand{
+    const detail::PhysicalResources root_vector{.device = root_active};
+    base->root_demand = detail::PhysicalDemand{
         .active_entitlement       = root_vector,
         .reservation_added        = root_vector,
         .physical_peak_additional = root_vector,
@@ -647,17 +649,6 @@ std::optional<AdmissionPlan> ProgramImplCore::inspect_lane(
         if (!group.rewrite && !group.shared && !group.long_anchor) { continue; }
         plan->capture_groups.push_back(std::move(group));
     }
-    plan->temporal_eligible = std::none_of(
-        plan->capture_groups.begin(), plan->capture_groups.end(), [&](const CaptureGroup& group) {
-            if (speculative_backend == SpeculativeBackend::DFlash) { return true; }
-            if (!group.shared) { return false; }
-            const std::uint32_t page_size = static_cast<std::uint32_t>(kPagedKVPageSize);
-            const std::uint32_t backend_frontier =
-                backend_frontier_at(speculative_backend, group.frontier);
-            return group.frontier % page_size != 0 ||
-                   (backend_frontier != 0 && backend_frontier % page_size != 0);
-        });
-
     plan->summary.reusable_prompt_tokens = plan->reuse_base;
     plan->summary.prefix_reuse_path      = plan->reuse;
     if (speculative_backend == SpeculativeBackend::Mtp) {
@@ -787,8 +778,8 @@ std::optional<AdmissionPlan> ProgramImplCore::inspect_lane(
         }
         return out;
     };
-    const runtime::ResourceVector source_resources =
-        source != nullptr ? resident_resources(*source) : runtime::ResourceVector{};
+    const detail::PhysicalResources source_resources =
+        source != nullptr ? resident_resources(*source) : detail::PhysicalResources{};
     plan->source_resources = source_resources;
     if (source != nullptr || shared_source != nullptr) {
         const StateImageHandle selected =
@@ -883,7 +874,7 @@ std::optional<AdmissionPlan> ProgramImplCore::inspect_lane(
             }
         }
     }
-    runtime::DeviceResources active = base.root_demand.active_entitlement.device;
+    detail::PhysicalDeviceResources active = base.root_demand.active_entitlement.device;
     if (plan->active_optional_resources.device.state_slots >
         std::numeric_limits<std::uint32_t>::max() - active.state_slots) {
         throw std::overflow_error("active optional StateImage entitlement overflow");
@@ -907,7 +898,7 @@ std::optional<AdmissionPlan> ProgramImplCore::inspect_lane(
             backend_full_pages > active.backend_kv_pages) {
             throw std::logic_error("retained prefix exceeds its active KV entitlement");
         }
-        runtime::ResourceVector active_resources{
+        detail::PhysicalResources active_resources{
             .device =
                 {
                     .active_lanes     = active.active_lanes,
@@ -916,7 +907,7 @@ std::optional<AdmissionPlan> ProgramImplCore::inspect_lane(
                     .backend_kv_pages = active.backend_kv_pages - backend_full_pages,
                 },
         };
-        runtime::ResourceVector source_replica_additions;
+        detail::PhysicalResources source_replica_additions;
         const std::uint32_t main_required = pages_for_tokens(plan->reuse_base);
         const std::uint32_t main_device =
             device_kv_prefix_pages(*text_kv_addresses, source_kv->text, plan->reuse_base);
@@ -934,9 +925,9 @@ std::optional<AdmissionPlan> ProgramImplCore::inspect_lane(
             }
             source_replica_additions.device.backend_kv_pages = backend_required - backend_device;
         }
-        runtime::ResourceVector retained_tail_added;
-        runtime::ResourceVector retained_tail_removed;
-        runtime::ResourceVector retained_tail_preparation_peak;
+        detail::PhysicalResources retained_tail_added;
+        detail::PhysicalResources retained_tail_removed;
+        detail::PhysicalResources retained_tail_preparation_peak;
         const auto plan_retained_tail_release =
             [&](KVAddressSpaceStore& addresses, LogicalKVPageStore& pages,
                 KVAddressSpaceHandle address, std::uint32_t frontier, std::uint32_t active_pages,
@@ -1004,7 +995,7 @@ std::optional<AdmissionPlan> ProgramImplCore::inspect_lane(
                 selected_state(*source, plan->reuse, plan->selected_checkpoint);
             return state_store->residency(selected) == StateReplicaResidency::Both;
         }();
-        runtime::ResourceVector added = active_resources;
+        detail::PhysicalResources added = active_resources;
         if (source_replica_additions.device.main_kv_pages >
                 std::numeric_limits<std::uint32_t>::max() - added.device.main_kv_pages ||
             source_replica_additions.device.backend_kv_pages >
@@ -1014,9 +1005,9 @@ std::optional<AdmissionPlan> ProgramImplCore::inspect_lane(
         added.device.main_kv_pages += source_replica_additions.device.main_kv_pages;
         added.device.backend_kv_pages += source_replica_additions.device.backend_kv_pages;
         added.host.kv_bytes = retained_tail_added.host.kv_bytes;
-        runtime::ResourceVector credit;
-        runtime::ResourceVector removed;
-        runtime::ResourceVector physical_peak = added;
+        detail::PhysicalResources credit;
+        detail::PhysicalResources removed;
+        detail::PhysicalResources physical_peak = added;
         if (splits_private_state) {
             credit.device.state_slots  = 1;
             removed.device.state_slots = 1;
@@ -1045,7 +1036,7 @@ std::optional<AdmissionPlan> ProgramImplCore::inspect_lane(
                 added.device.backend_kv_pages, retained_tail_removed.device.backend_kv_pages,
                 retained_tail_preparation_peak.device.backend_kv_pages);
         }
-        plan->demand = runtime::ResourceDemand{
+        plan->demand = detail::PhysicalDemand{
             .active_entitlement       = active_resources,
             .reservation_added        = added,
             .reservation_credit       = credit,
@@ -1055,12 +1046,12 @@ std::optional<AdmissionPlan> ProgramImplCore::inspect_lane(
         };
         return AdmissionPlan(std::move(plan));
     }
-    runtime::DeviceResources exclusive_active = active;
-    runtime::ResourceVector shared_replica_additions;
-    runtime::ResourceVector transient_source_restores;
-    runtime::DeviceResources conversions;
-    runtime::HostResources retained_host = plan->active_optional_resources.host;
-    std::size_t transient_host_bytes     = 0;
+    detail::PhysicalDeviceResources exclusive_active = active;
+    detail::PhysicalResources shared_replica_additions;
+    detail::PhysicalResources transient_source_restores;
+    detail::PhysicalDeviceResources conversions;
+    detail::PhysicalHostResources retained_host = plan->active_optional_resources.host;
+    std::size_t transient_host_bytes            = 0;
     const auto private_tail_restore =
         [&](const KVAddressSpaceStore& addresses, const LogicalKVPageStore& pages,
             KVAddressSpaceHandle address, std::uint32_t frontier, bool prefix_fork) {
@@ -1158,16 +1149,16 @@ std::optional<AdmissionPlan> ProgramImplCore::inspect_lane(
             transient_host_bytes += backend_discarded_host_bytes;
         }
     }
-    runtime::HostResources preparation_retained_host = retained_host;
+    detail::PhysicalHostResources preparation_retained_host = retained_host;
     if (transient_host_bytes >
         std::numeric_limits<std::size_t>::max() - preparation_retained_host.kv_bytes) {
         throw std::overflow_error("private COW preparation Host KV entitlement overflow");
     }
     preparation_retained_host.kv_bytes += transient_host_bytes;
     conversions = convertible_source_resources(exclusive_active, conversions);
-    const runtime::DeviceResources exclusive_additional =
+    const detail::PhysicalDeviceResources exclusive_additional =
         additional_resources(exclusive_active, conversions);
-    runtime::ResourceVector reservation_added{.device = exclusive_additional};
+    detail::PhysicalResources reservation_added{.device = exclusive_additional};
     if (shared_replica_additions.device.main_kv_pages >
             std::numeric_limits<std::uint32_t>::max() - reservation_added.device.main_kv_pages ||
         shared_replica_additions.device.backend_kv_pages >
@@ -1184,16 +1175,16 @@ std::optional<AdmissionPlan> ProgramImplCore::inspect_lane(
     }
     reservation_added.device.main_kv_pages += transient_source_restores.device.main_kv_pages;
     reservation_added.device.backend_kv_pages += transient_source_restores.device.backend_kv_pages;
-    const runtime::ResourceVector active_resources{.device = exclusive_active,
-                                                   .host   = retained_host};
-    runtime::ResourceVector final_added = active_resources;
+    const detail::PhysicalResources active_resources{.device = exclusive_active,
+                                                     .host   = retained_host};
+    detail::PhysicalResources final_added = active_resources;
     final_added.device.main_kv_pages += shared_replica_additions.device.main_kv_pages;
     final_added.device.backend_kv_pages += shared_replica_additions.device.backend_kv_pages;
-    const runtime::ResourceVector reused_source{.device = conversions,
-                                                .host   = preparation_retained_host};
-    const runtime::ResourceVector early_source_release =
+    const detail::PhysicalResources reused_source{.device = conversions,
+                                                  .host   = preparation_retained_host};
+    const detail::PhysicalResources early_source_release =
         positive_difference(source_resources, reused_source);
-    plan->demand = runtime::ResourceDemand{
+    plan->demand = detail::PhysicalDemand{
         .active_entitlement       = active_resources,
         .reservation_added        = reservation_added,
         .reservation_credit       = {.device = conversions},

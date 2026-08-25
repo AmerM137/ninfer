@@ -165,8 +165,10 @@ int run(const Options& options) {
     auto request_plan = program->inspect_admission(prompt, request_base, ninfer::runtime::LaneId{0},
                                                    nullptr, nullptr, std::nullopt, false);
     if (!request_plan) { throw std::runtime_error("benchmark root admission was rejected"); }
-    const auto reserved = program->reserve_materialization(
-        std::move(*request_plan), std::move(prompt), nullptr, nullptr, {}, {}, {});
+    auto resource_plan = program->seal_resource_plan(*request_plan, prompt, {}, {}, {}, {});
+    if (!resource_plan) { throw std::runtime_error("benchmark root resources were not sealed"); }
+    const auto reserved =
+        program->start_resource_transaction(std::move(*resource_plan), std::move(prompt), {});
     if (reserved != ninfer::runtime::ContextTransactionReserveStatus::Reserved) {
         throw std::runtime_error("benchmark root materialization was not reserved");
     }

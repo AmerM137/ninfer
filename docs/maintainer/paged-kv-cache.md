@@ -1,18 +1,19 @@
 # NInfer Paged KV Context Store
 
-本文定义 NInfer 在单 GPU、单 resident model、少量并发请求下的 growing KV 存储架构。它是
-[NInfer Engine 架构](engine-architecture.md)所依赖的 physical KV substrate。
+本文定义NInfer在单GPU、单resident model、少量并发请求下的growing KV存储架构。它是
+[NInfer Engine架构](engine-architecture.md)所依赖的physical KV substrate。
 
 本文定义 KV pool layout、logical-page ownership、Device/Host replica、容量预留、逻辑 frontier、prefix
 sharing 和生命周期，同时定义 Device block-table representation、single-sequence 与 batched paged KV
 execution view、受影响 Op 的状态效果、kernel 寻址约束和性能准入条件。具体 allocator 算法和 CUDA
 kernel 代码不由本文规定。
 
-顶层所有权以 Engine 架构文档为准，continuation/checkpoint、replica policy 和 materialization transaction
-以[资源调度与上下文缓存架构](resource-scheduling-and-context-cache.md)为准：ResourceManager 选择 logical
-admission、source、replica transition 和 eviction；Program 持有完整 continuation state、KV address spaces、
-logical pages、Device/Host replicas 和 transfer transaction。本文的 KV Store 不选择请求顺序、candidate 或
-eviction victim。
+顶层所有权以Engine架构文档为准，continuation/checkpoint、placement policy和resource transaction以
+[资源调度与上下文缓存架构](resource-scheduling-and-context-cache.md)为准。
+
+ResourceManager只选择logical source、placement intent和victim actions；Program中的KV Store、allocator、
+logical pages、Device/Host replicas、references和reservations是KV物理事实的唯一权威。KV Store不选择请求
+顺序、candidate价值或eviction victim，也不向ResourceManager输出一套可重放的physical delta。
 
 ---
 
@@ -506,10 +507,10 @@ needed pages     = 1024
 连续 allocator 会因为最大 hole 只有 768 pages 而失败；paged allocator 可以把 C 的前 768 个 logical
 pages 映射到 A 的旧 pages，再从尾部取得 256 pages，因此无需搬移 B。
 
-Catalogued checkpoint 持有的 Device replicas 不是 free capacity。若 checkpoint A 阻塞 active admission，
-ResourceManager 可以选择删除已有 Host backup 的 Device replica、先把 A 下沉 Host，或逐出相应 logical
-checkpoint；Program 执行并发布所选 transition 后才形成可用容量。这是 replica occupancy 回收，不是
-compaction。
+Catalogued checkpoint持有的Device replicas不是free capacity。若checkpoint A阻塞active admission，
+ResourceManager可以把“删除Device duplicate”“先下沉Host”或“删除logical checkpoint”放入完整choice；
+只有Program对全部surviving references、copy-before-release stages和allocator状态验证并提交后，相应容量
+才可用于destination。这是replica occupancy回收，不是compaction。
 
 唯一的 payload slack 是每个 pool allocation 的最后一个未填满 page，最多 `P-1` positions。对于
 `P=64`，8 个 active allocations 在一个 pool 中的最大尾页 slack 为：
@@ -549,9 +550,9 @@ page coverage执行，并可合并连续 physical runs；copy完成且epoch/cove
 source。
 
 Logical descriptor容量覆盖Device physical pages和Host arena按相应page stride能够容纳的pages；它不构成
-第三份payload容量。零引用logical page只有在Host extent也已解除后才能回收descriptor。Replica、extent和
-address-space membership均由Program维护；ResourceManager只消费revisioned summary和exact delta。
-Active pages 不搬迁。
+第三份payload容量。零引用logical page只有在Device/Host replicas和全部transaction pins都解除后才能回收
+descriptor。Replica、extent、reference和address-space membership均由Program维护；ResourceManager只采用
+Program返回的逻辑终态。Active pages不搬迁。
 
 ---
 
@@ -713,10 +714,9 @@ blocks；其 Full pool 使用 §4.3 的 head-major page-run order。两者保留
 
 ---
 
-## 8. Vector reservation and admission
+## 8. Reservation and admission
 
-NInfer 不支持 active-request preemption，因此 admission 必须为 sequence 的最大 Device KV extent 建立
-完整 typed reservation vector。Target 根据 request、selected source 和 fixed Engine mode 计算：
+NInfer不抢占active request，因此每条sequence在Active publication前必须取得完整typed KV reservation：
 
 ```text
 KVReservation(request) = {
@@ -725,53 +725,50 @@ KVReservation(request) = {
 }
 ```
 
-计算包含：
+它覆盖prompt尚未materialize的positions、最大合法output、backend provisional tail、pool-local rounding、
+partial-tail COW和新suffix。Reservation是由真实pool capacity支持的concrete protection，不一定提前挑选
+physical page IDs。
 
-- prompt 尚未 materialize 的 main/backend positions；
-- maximum permitted generated output；
-- selected backend 可能触及的 bounded provisional tail；
-- 每个 pool 自己的 page rounding；
-- selected checkpoint 已映射且能够保留或恢复到 Device 的 unique pages；
-- shared full pages、partial-tail private copy 和新 suffix pages 的 exact physical delta；
-- request 是否能够或必须建立 backend continuation。
-
-对每个 Device pool `s`，稳定 boundary 保持：
+对每个Device pool `s`，任一稳定边界满足：
 
 ```text
-unique_mapped_device_replicas[s]
-+ active_future_growth_reservations[s]
-+ transfer_or_COW_destination_reservations[s]
-<= total_device_page_groups[s]
+used[s] =
+    unique Device replicas[s]
+  + reserved-but-unmapped active pages[s]
+  + transaction destination reservations[s]
+
+used[s] <= total Device page groups[s]
 ```
 
-同一 logical page 被多个 checkpoints/address spaces 引用时只计一份 unique Device replica；Host replica
-按 packed extent 的实际 bytes 计入共享 `HostKVArena`。Admission 是跨全部 typed pools、Device/Host state、
-execution row 和 output capacity 的原子 resource plan。任何必要维度无法闭合时，request 不获得部分
-Active ownership。
+Host occupancy按unique packed extents的实际bytes计算。一个logical page无论被多少checkpoints或address
+spaces引用，Device/Host replica都只占用一次；logical references本身不占payload bytes。
 
-这个 per-request vector check 不表示 backend 是一个可以正常先于 main contract 耗尽的独立 admission
-维度。Startup `KVCapacityProfile` 必须满足 §3.3 的 active-set implication：当 request 在 slot、fixed state
-和 advertised main capacity 上可 admission 时，selected-backend reservation 也必须可兑现。
-ResourceManager 可以在 selected admission 中规划 checkpoint Device replica 删除、Device→Host demotion
-或 logical eviction；KV Store只验证和执行Program收到的exact physical transaction，不自行选择victim。
+Admission不是一个per-request delta check，而是Program对完整choice的联合post-state检查。Choice包括source、
+destination、全部victims和有序copy/release stages。每个stage都必须满足pool capacity；copy-before-release
+不能用最终净值掩盖瞬时峰值。
 
-Reservation 只承诺 pool-local page 数量，不提前选择 IDs。Prefill/decode 推进把 reserved capacity 转为
-mapped pages，不改变总 entitlement。因此一个 admitted request 不会因其他 request 后来增长而失去
-已经承诺的 KV capacity。
+Last-reference reclaim也只从完整post-state得到。删除一个alias通常不释放page；多个victims共同删除最后一批
+references时，每个physical replica只释放一次。ResourceManager不得相加per-owner release credits。
 
-Catalogued checkpoint 没有 future-growth reservation。Private endpoint 可以通过 destructive Move 被
-单一 request 消费；需要保留的 private checkpoint和shared checkpoint通过Fork建立新的active writer。
-Host-only required pages必须先恢复Device replica。无论哪条路径，都为incoming suffix、output、partial
-tail copy和provisional tail预留差额，且在transaction publish前不暴露active address space。
+Startup `KVCapacityProfile`仍须满足§3.3的active-set implication：当request在lane、fixed state和advertised
+Main capacity上可admit时，selected backend reservation也必须可兑现。否则是startup sizing错误，不是运行期
+等待条件。
 
-Engine 选定的 speculative backend 在 Engine lifetime 内固定。启用 backend 时，每个 admitted sequence
-在整个 active lifetime 都保留对应 address space 和 entitlement；某一 round 因剩余 output/context 只能执行
-ordinary target progress，不构成 backend capability 降级，也不能据此释放 backend state。完成时要么把
-完整、可继续的 bundle 作为 checkpoint transaction 一起发布，要么释放整个 active bundle。
+Prefill/decode把active reservation在mapped与reserved-but-unmapped之间转换，不改变global available
+capacity，也不推进resource revision。因此已admitted request不会因其他request或cache retention失去完成
+capacity。Truncate/rollback释放的mapped page回到该sequence的reservation；即使physical ID回到allocator
+free set，这部分容量也不能被另一plan消费。
 
-ResourceManager 的 release credit 只有在其对应 Device/Host replica 实际释放后才能供 dependent
-destination 使用；任何中间步骤都不能瞬时越过 physical capacity。Published logical identity、source pin、
-destination reservation 和 exact delta 的事务规则由资源调度架构定义。
+Catalogued checkpoint没有future-growth reservation。Private endpoint可以Move；仍需保留的private source和
+shared source使用Fork。Host-only pages必须先恢复Device replica。任何path都必须在Active publication前同时
+兑现incoming suffix、output、tail COW、backend continuation和execution-row需求。
+
+Selected speculative backend在Engine lifetime内固定。每条Active sequence一直保留相应address space与
+reservation；某轮只运行ordinary target progress不构成capability降级。Finish要么发布Main、backend和其他
+State一致的完整bundle，要么释放整个active bundle。
+
+KV Store不自行选择victim。ResourceManager提供逻辑choice，Program seal并执行唯一ResourceTransaction；
+ResourceManager最终只采用`ResourceResult`中的catalog/lane终态。
 
 ---
 
@@ -815,18 +812,19 @@ Backend pool 是否在同一 round 增长由 target decode mode 决定，不与 
 needed_pages[s] = ceil(max(valid_frontier[s], provisional_frontier[s]) / P[s])
 ```
 
-完全位于该范围之后的 pool-local pages 返回对应 free set。最后一个部分使用的 page 保留；frontier
-之后的 bytes 可以是 stale data，但不得进入 execution view 的有效范围。
+完全位于该范围之后的pool-local mappings可以解除。Active sequence仍持有原完整reservation，因此这些
+page对应的容量回到该sequence的reserved-but-unmapped部分，而不是变成可供其他plan使用的global capacity。
+最后一个部分使用的page保留；frontier之后的bytes可以是stale data，但不得进入execution view的有效范围。
 
 ### 9.5 Finish, retain, release
 
-Request 到达 model completion 后执行两种顶层结果之一：
+Request到达model completion后进入TerminalPending，并执行两种顶层结果之一：
 
 ```text
 publish:
     Freeze a complete endpoint and/or selected typed checkpoint
-    Program returns immutable checkpoint capabilities and exact physical delta
-    ResourceManager atomically adopts the private/shared catalog update
+    Program commits one ResourceResult with immutable checkpoint capabilities
+    ResourceManager adopts the private/shared catalog update
 
 release:
     every active KVAddressSpace releases its memberships
@@ -837,10 +835,13 @@ release:
 完整 bundle 才能发布为 checkpoint。不完整状态释放整个 bundle，不能发布 target-only reusable
 entry。
 
+Finish choice、checkpoint slot、source/victim facts和每个stage peak在Program start前已经验证。若retention
+不能完成，确定性fallback是释放active bundle；lane不能无限停在TerminalPending。
+
 Device table rows和active StateImage slot随后可以复用；catalogued address spaces和replicas独立存在，不与
 这些execution resources绑定。Network response lifetime不直接延长KV ownership，Responses endpoint只通过
-opaque session key向下一请求提供lookup hint。Cancellation在Engine第一个观察到它的GPU boundary释放
-active bundle；不修改in-flight round mappings，且默认不从未完成active state发布新checkpoint。
+opaque session key向下一请求提供lookup hint。Cancellation在Engine第一个观察到它的GPU boundary进入
+TerminalPending；它不修改in-flight round mappings，也不从未完成active state发布新checkpoint。
 
 ---
 
@@ -886,9 +887,10 @@ committed prefix的部分尾页复制到destination，后续写入只发生在pr
 
 ### 10.3 Private Move, immutable Fork and page COW
 
-Private continuation在materialization期间进入`Claimed`，从普通candidate set隐藏；若旧endpoint不需要保留，
-Program可以把其address spaces和Device StateImage slot以Move语义转为active ownership。Move不复制KV
-payload，也不改变logical page identity。
+Private continuation被选为source后从其他candidate set隐藏，但其checkpoint与replicas保持有效直到整个
+ResourceTransaction commit或abort。若旧endpoint不需要保留，Program可在commit阶段把address spaces和
+Device StateImage slot以Move语义转为active ownership。Move不复制KV payload，也不改变logical page
+identity。
 
 Shared checkpoint或仍需保留的private checkpoint使用Fork。对每个typed address space：
 
@@ -919,7 +921,7 @@ backend pool 获取，只是与 Main Text pool 物理分离。
 4. backend writes provisional MTP 或 DFlash KV
 5. acceptance 产生 target-owned committed frontiers
 6. rejected tails 在各 pool 中分别变为 logically unreachable
-7. 各 pool 独立释放不再引用的完整 trailing pages
+7. 各 pool 解除不再需要的trailing mappings，容量回到同一active reservation
 ```
 
 不同 requests 接受不同 proposal length，只改变各自 bundle frontiers，不形成新的 pool type。Rejected
@@ -982,44 +984,38 @@ StateImage单位保留Device或Host replica，不能只迁移其中的cyclic KV�
 
 ## 13. Correctness invariants
 
-1. 一个 Device page-group lease 在其所属 pool 内至多作为一个 logical page 的 Device replica；同一
-   logical page 可以被多个 immutable address-space memberships 引用；
-2. pool grouping 只包含共享 frontier、lifetime 和 page geometry 的 planes；
-3. reserved-but-unmapped active entitlement 和 transaction destination reservation 不能被同一 pool 的
-   其他 request 或 checkpoint 消费；
-4. admission/materialization 对完整 resource vector 原子 publish 或返回已核对的 abort delta；
-5. 一个 execution unit 内所有 pool mappings 不变；
-6. operator 只能读取对应 pool valid frontier 内的 positions；
-7. frontier publish 前，该 pool position 的完整 K/V 以及必要 code/scale planes 必须已经写入；
-8. Device/Host page recycle 不要求清零，但新 content epoch 不得从旧 frontier 或 stale bytes 推导有效状态；
-9. page mapping 使用 cache ordinal，不使用 RoPE/MRoPE coordinate；
-10. prefix hit 必须由 Program 已验证的完整 continuation state 证明，KV token match 或 page match 本身不构成 hit；
-11. active execution 所需 Device replicas 在 in-flight unit 内不因 compaction、checkpoint eviction 或其他
-    request growth 被搬迁或释放；
-12. admitted request 的合法最大 per-pool growth 必须始终被 reservation vector 覆盖；
-13. `KVCapacityProfile` 必须按 §3.2–§3.3 从 `max_context`、`kv_capacity`、`max_concurrency` 和 selected
-    backend 唯一导出；MTP physical headroom 不扩大 per-allocation logical capacity，backend 不得先于
-    Main entitlement contract 耗尽；
-14. 一个 active address space 的 logical block 在该 pool 全部 grouped planes 中使用其 logical page 当前的
-    同一个 Device page-group ID；
-15. active execution table row 只镜像 Device mapping，不拥有 logical page、payload 或 frontier；inactive
-    checkpoint不占row；
-16. growing-cache Op 只消费 `PagedKVLayerView` 或 `PagedKVBatchLayerView`，不取得 allocator、request
-    identity 或 lifecycle authority；
-17. K/V、code 和 scale 的 logical axes、pool-specific closed physical order、exact strides 和 storage
-    bounds 必须与 §4.2 一致；
-18. 一个 page-group ID 在全部 grouped planes 中选择同一 logical page group，但不要求这些 slices
-    物理相邻；
-19. DFlash local 与 boundary-local 分别拥有 §12.1 的完整 fixed cyclic payload；absolute position 只通过
-    `p mod 4096` 选择 physical slot，两者不共享可写 backing storage；
-20. MTP Vision prefill，以及任一 selected backend 下的 prefix reuse 和 ordinary tail round，都不得把
-    sequence 降级为缺少该 backend continuation state；
-21. shared full pages没有writer；Fork的非page-aligned tail在destination使用private copy，任意logical page
-    同时至多一个writer；
-22. Host replica与对应logical page使用相同content epoch且覆盖checkpoint要求的committed columns；H2D/D2H
-    copy完成前不发布destination，也不释放唯一source；
-23. Device/Host capacity按unique physical replicas和reservations计费，不按address-space reference数量重复
-    计费。
+1. 每个Device page-group lease在所属pool内至多承载一个logical page replica；一个logical page可以有多个
+   immutable references。
+2. Pool grouping只包含共享frontier、lifetime和page geometry的planes。
+3. Device/Host occupancy按unique replicas与concrete reservations计算，不按reference或owner重复计数。
+4. Last-reference reclaim对完整victim set的联合post-state计算；同一replica至多释放一次。
+5. Active reserved-but-unmapped capacity和transaction destination reservation不能被其他plan消费。
+6. 每个resource transaction stage都满足pool capacity；final net delta不能替代peak检查。
+7. Materialization对完整State/KV bundle原子发布；abort不留下半Active destination。
+8. Source checkpoint在resource transaction commit或abort前保持有效。
+9. 一个execution unit内所有pool mappings稳定。
+10. Operator只能读取对应pool valid frontier内的positions。
+11. Frontier publication前，完整K/V及必要code/scale planes已经写入。
+12. Recycle不要求清零，但新content epoch不能从stale bytes或旧frontier推导valid state。
+13. Page mapping使用cache ordinal，不使用RoPE/MRoPE coordinate。
+14. Prefix hit必须由Program验证的完整continuation证明；token/page match本身不构成hit。
+15. Active execution replicas在in-flight unit内不被transfer、eviction或其他request growth移动或释放。
+16. Active合法最大per-pool growth始终由其完整reservation覆盖；truncate不把该保障借给其他request。
+17. `KVCapacityProfile`按§3.2–§3.3从`max_context`、`kv_capacity`、`max_concurrency`和selected backend
+    唯一导出；MTP headroom不扩大per-allocation logical capacity。
+18. 一个address-space logical block在该pool全部grouped planes中使用同一Device page-group ID。
+19. Execution table row只镜像Device mapping，不拥有logical page、payload、reservation或frontier；
+    inactive checkpoint不占row。
+20. Growing-cache Op只消费`PagedKVLayerView`或`PagedKVBatchLayerView`，不取得allocator、request identity
+    或lifecycle authority。
+21. K/V、code和scale的logical axes、closed physical order、strides与bounds符合§4.2。
+22. DFlash local与boundary-local分别拥有§12.1的fixed cyclic payload；`p mod 4096`只选择各自physical slot。
+23. Selected backend下的Vision prefill、prefix reuse与ordinary tail都保留完整backend continuation。
+24. Shared full pages没有writer；Fork的partial tail使用private COW；任一logical page同时至多一个writer。
+25. Host replica与logical page具有相同content epoch并覆盖必需committed columns；copy完成前不发布
+    destination，也不释放唯一source。
+26. Rejected speculative bytes不能扩展canonical coverage；回收的mapping容量仍属于同一active reservation。
+27. Capability mismatch、reservation shortfall或checkpoint不完整是内部错误，不得伪装为cache miss。
 
 ---
 
@@ -1037,10 +1033,13 @@ StateImage单位保留Device或Host replica，不能只迁移其中的cyclic KV�
 | 多个 requests 命中同一 shared prefix | 共享完整 immutable pages；每个 branch 建立 private state destination、partial tail 和 suffix |
 | selected page 只有 Host replica | H2D 恢复并核对 epoch/coverage 后才安装 execution row |
 | 只有更短 token prefix match，但该位置没有 checkpoint | cache miss |
-| checkpoint occupancy 阻塞 admission | ResourceManager选择可行的replica demotion/eviction plan；Program发布exact delta后使用release credit |
-| checkpoint replica回收后，request set满足main contract但backend reservation失败 | startup sizing 或 accounting invariant violation；不是正常等待条件 |
-| request cancellation | MATERIALIZING在publish前abort并保留source；Active在in-flight unit后的boundary释放bundle |
-| admitted request materialize 时无 free page | reservation-accounting violation，作为 Engine failure |
+| checkpoint occupancy阻塞admission | ResourceManager提出完整victim set；Program按联合post-state与stage peaks验证并提交 |
+| 删除一个shared alias | 只删reference；非last reference时occupancy不变 |
+| 多个victims共同删除last references | Program在联合post-state中只释放一次replica |
+| checkpoint replica回收后，request set满足Main contract但backend reservation失败 | startup sizing或reservation invariant violation；不是正常等待 |
+| request cancellation | Materializing abort并保留source；Active在in-flight unit后进入TerminalPending再释放 |
+| active truncate/rollback | mapping可解除，但容量回到该sequence reservation，不增加global available capacity |
+| admitted request materialize时无可兑现page | reservation invariant violation，作为Engine failure |
 | 一个 request 使用 main pool 大部分容量 | 合法，只要其他 per-pool entitlements 仍满足 invariants |
 
 ---

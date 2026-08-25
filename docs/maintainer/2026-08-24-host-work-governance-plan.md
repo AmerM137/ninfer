@@ -1,6 +1,10 @@
 # Engine Host 工作治理与可观测性实施计划
 
-状态：待实施
+状态：待实施；资源事务子项 M1.3 已完成
+
+资源前置条件已经落入
+[资源调度与上下文缓存架构](resource-scheduling-and-context-cache.md)：Program 是唯一物理 authority，
+ResourceManager 只拥有逻辑策略，周期性 replica scan 已删除。本文后续工作直接建立在该当前合同上。
 
 适用基线：2026-08-24 当前工作树
 
@@ -23,8 +27,8 @@
 2. Prompt、媒体和 Responses 历史处理对其真实输入规模保持线性或 `O(N log N)`；不再通过逐次
    `erase/insert/find` 形成隐藏的二次复杂度。
 3. 不随状态变化的验证在对象建立或 transaction reserve 时完成；每轮只验证本轮动态边界。
-4. clean state 不触发 replica/admission/catalog 重扫；状态变化通过明确的 generation/dirty owner 唤醒
-   policy。
+4. 普通decode不触发admission/catalog/placement重扫；只有waiting、lane、catalog或Program resource
+   revision变化唤醒相应boundary policy。
 5. 同步点只服务于可观察结果或资源生命周期。异步化必须同时给出 event、buffer、workspace 和取消路径
    的所有权，不能只删除 `synchronize()`。
 6. Prefix reuse 始终按内容成立，不依赖 session/request identity。私有追加命中和跨会话 shared prefix
@@ -47,11 +51,11 @@ GPU 验证。
 | ID | 当前路径和根因 | 错误的规模关系 | 目标状态 | 优先级 |
 |---|---|---|---|---|
 | H1 | `logical_kv_store.h::commit_frontier` 在普通 decode 与 speculative commit 后扫描全部 mapped pages | 长输出累计约为 `O(output × prompt/pages + output²/pages)` | 只处理旧 tail、本轮新页和新 frontier；`O(delta pages)` | P0 |
-| H2 | `EngineCore::try_start_replica_transition` 高频调用，`ResourceManager::reserve_replica_transition` 在无候选时仍遍历 private/shared catalog 与 checkpoint pages | 稳态每轮 `O(catalog + checkpoint pages)` | ResourceManager-owned dirty/generation；clean state 为 `O(1)` | P0 |
+| H2（已解决） | 旧`EngineCore::try_start_replica_transition`曾高频遍历catalog与checkpoint pages | 稳态每轮曾为`O(catalog + checkpoint pages)` | 周期性replica scan已删除；placement只属于具体Resume/Capture/Finish或admission pressure plan | — |
 | H3 | `publish_runtime_stats` 在普通 unit 后复制/汇总结构状态；OutputSession 重复 token byte decode/线性查找；GDN fold 重验不可变几何 | 每轮固定 Host gap 偏大，部分工作随 catalog/token/layer 放大 | 增量计数、结构变更才发布；预解码 token record；prepared fold plan | P0 |
 | H4 | `paged_kv_cache.cpp` 用有序 vector 的头部/中部 `erase`、`insert` 管理 free page | 连续申请/释放可达 `O(page_count²)` | free run/interval allocator；批量 materialize 与 page-table publish | P0 |
 | H5 | `append_forced_tokens` 为 target-control suffix 复制完整 sequence ledger，并逐 row 执行和同步 | cap boundary 的 Host copy 随完整上下文增长；并发 rows 串行等待 | 在已 reserve 的 ledger 上事务式 append；建立可批量提交的 control ingress/event 生命周期 | P1 |
-| A1 | `project_protected_resources` 用 vector + `find` 去重；pressure 路径逐页 query/split/rebind | admission/pressure 可达 `O(pages²)` | dense generation marker 或直接索引；按 extent/run 合并操作 | P1 |
+| A1 | Program联合pressure overlay仍可能逐页query/split/rebind | admission/pressure可达`O(pages²)` | dense generation marker或直接索引；按extent/run合并操作 | P1 |
 | A2 | `has_active_reference` 每次遍历所有 active address/pages；`copy_from_host` 重复检查；Host extent 的 `node_at`/逐页释放 | pressure、copy、release 可达 `O(pages²)` | logical page active refcount；一次验证后的 prepared list；run cursor/release | P1 |
 | C1 | Prefix shortlist 最终仍把所有 private/shared slot 送入 exact candidate 流程；capture marker 复制完整 prompt；静态 checkpoint 摘要重复生成 | candidate 数和 prompt/checkpoint 长度乘积放大 | 可查询任意 frontier 的 rolling content fingerprint；统一索引；共享 immutable backing；缓存静态摘要 | P1 |
 | F1 | `encode_rendered_chat` 先全量 tokenize，再为每条 message/rewrite/cache boundary 重复 tokenize prefix | agent 追加历史接近 `O(turns × rendered bytes)` | 渲染前确定所需 marker；一次 boundary-aware tokenization；精确处理跨 boundary token | P1 |
@@ -78,8 +82,8 @@ cache/admission 或多媒体路径的结构性放大；“P2” 表示在 P0/P1 
   response history 的扫描。
 - Speculative round：允许与 draft window 成线性关系；commit 只处理 accepted delta 和必须折叠的动态
   state，不重验固定 layer/state geometry。
-- Boundary：无 invalidation 时为 `O(B)`；catalog、replica 和 admission 搜索只能由其 owner 的 dirty
-  generation 触发。
+- Boundary：无相关事件时为`O(B)`；catalog/admission只由waiting、lane、catalog或Program resource revision
+  变化触发；不存在周期性replica policy pass。
 - Prompt preparation：`O(rendered bytes + tokens + media items)`，BPE 内部允许 `O(N log N)`；message
   boundary 数量不能再次乘以完整 rendered bytes。
 - KV/Host extent 操作：以 run/extent 为单位；一个范围的申请、释放、copy、publish 不得退化为对有序
@@ -91,10 +95,10 @@ cache/admission 或多媒体路径的结构性放大；“P2” 表示在 P0/P1 
 
 - 静态模型尺寸、layer range、scatter 单调性、checkpoint descriptor 和 output vocab bytes 在构造或 bind
   时验证/准备一次。
-- Transaction reserve 生成 immutable prepared ticket；execution 只验证 generation、owner 和本轮动态
-  范围。失效后重新 reserve，不在 execution 中重复完整候选推导。
-- ResourceManager 是 admission/replica invalidation 的唯一 owner；Program 只暴露准确的状态变更结果，
-  EngineCore 不通过“每轮再问一次”弥补缺少的 invalidation。
+- Program seal生成opaque `ResourcePlan`；start只重验resource revision、capability和动态边界。失效后重新
+  plan，不在execution中重复candidate推导。
+- ResourceManager拥有logical candidate/retention policy；Program真实stores与allocators拥有physical
+  occupancy、reservation与reclaim。EngineCore不通过“每轮再问一次”弥补缺少的event。
 - RuntimeStats 的 token/round 数是 worker-owned monotonic counters；结构 gauges 只在结构变化后重建。
 
 ### 3.3 Cache 语义
@@ -160,7 +164,7 @@ Worker aggregate 使用以下互斥 phase；同一纳秒只属于其中一个 ph
 | `device_wait` | completion wait 调用前后 | CUDA stream/event blocking；不属于 `host_active` |
 | `program_post` | wait 返回到 Program unit 返回 | D2H 小结果读取、frontier 增量 commit、Program state bookkeeping |
 | `engine_commit_output` | Program 返回到 token/state/output transaction 完成 | preview、Program 调用之外的 commit orchestration、ResourceManager apply、result publication |
-| `engine_maintenance` | execution transaction 后到 boundary 完成 | replica policy、结构 stats publication、必要的 cleanup |
+| `engine_maintenance` | execution transaction 后到 boundary 完成 | 结构 stats publication、必要的 cleanup |
 
 Program 中一个 unit 若有多段 submit/wait/post（例如 speculative commit tail），各段分别累加到同名
 phase；仍保持互斥。Program API 返回该 unit 的结构化 observation，EngineCore 负责把它并入全局计数并
@@ -169,7 +173,7 @@ phase；仍保持互斥。Program API 返回该 unit 的结构化 observation，
 Program 内部边界。
 
 为了定位低频 policy，额外记录以下 **subset counters**：`admission_policy`、`context_progress`、
-`replica_policy`、`stats_publication`。它们明确标为 `detail_subset_seconds`，包含在上表某个顶层 phase 中，
+`stats_publication`。它们明确标为 `detail_subset_seconds`，包含在上表某个顶层 phase 中，
 不再次加入 `host_active`。这些 timer 只在对应慢路径真正执行时启动；稳态 clean boundary 不承担额外
 clock call。M0 刚落地而 M1 尚未治理时，某个 helper 可能仍被每轮调用；timer 只跟随实际 invocation，
 M1 删除高频 invocation 后自然退出稳态路径。
@@ -277,13 +281,11 @@ decode 的 admission check）计入 decode，使 `decode_host_microseconds_per_r
     "detail_subset_seconds": {
       "admission_policy": 0.000412,
       "context_progress": 0.000000,
-      "replica_policy": 0.000091,
       "stats_publication": 0.000133
     },
     "detail_invocations": {
       "admission_policy": 2,
       "context_progress": 0,
-      "replica_policy": 1,
       "stats_publication": 1
     },
     "decode_host_microseconds_per_round": 31.42,
@@ -376,22 +378,24 @@ allocation 或 string formatting；RuntimeStats snapshot 只是整数复制。
 验收：测试注入 page-touch counter；frontier 每次增加 1 token 时，touch 次数只在跨页时增长，不随旧
 frontier 增长；普通和 speculative accepted delta 得到相同最终 coverage。
 
-#### M1.3 replica invalidation 与 prepared ticket
+#### M1.3 删除周期性replica scan，接入ResourcePlan（已完成）
 
-- ResourceManager 增加唯一 `replica_policy_generation`/dirty latch。
-- 只有 catalog ownership、device/host residency、active reference、retention、resource ledger、context
-  terminal 等会改变可行集合的事件置位；普通 decode commit、输出 publish、clean stats snapshot 不置位。
-- clean state 的 `try_start_replica_transition` 为一次 generation 比较并返回。
-- reserve 产生 pin 住 owner/generation/resource demand 的 prepared ticket；execution 不重复做相同的
-  3–4 次完整可行性推导。成功、失败 terminal 或相关状态变化按规则 re-arm。
+- 删除独立`try_start_replica_transition`热路径；placement只由具体Resume/Capture/Finish或admission pressure
+  choice触发。
+- Program维护唯一`resource_revision`。只有stable topology、global free capacity或allocator结构变化推进；
+  active mapped/reserved转换、普通decode、output和stats不推进。
+- ResourceManager在相关逻辑事件发生时建立choice；Program一次完成joint post-state、stage peaks与exact
+  allocator preflight并seal `ResourcePlan`。
+- Start前revision变化安全拒绝且无物理副作用；start后由一个`RunningTransaction`到达commit或abort，不缓存
+  第二份physical snapshot。
 
-验收：稳态长 decode 中 replica catalog/page visits 为 0；每次真实 invalidation 至多触发一次完整 policy
-pass；reservation 后 generation 改变会安全失效，不执行 stale ticket。
+验收：稳态长decode中replica catalog/page visits为0；无Resume/Capture/Finish/cleanup时placement visits为0；
+stale plan不产生物理副作用。
 
 #### M1.4 每轮固定 Host 工作
 
-- RuntimeStats token/round/state-transfer 数增量更新；shared catalog、active slot 和结构 gauge 只在其
-  topology generation 改变后重建。
+- RuntimeStats token/round/state-transfer数增量更新；结构gauge只在Program resource revision或明确采样
+  boundary读取，不为统计维护第二份physical ledger。
 - Tokenizer/Frontend 在模型加载时建立一份 immutable vocab token-bytes/flags table，所有 OutputSession
   只引用它，不能为每条请求复制整份词表。每个 generated token 只建立一个 immutable decoded record，
   preview、stop matcher 和 commit 共享。
@@ -423,8 +427,8 @@ oracle 的 free/allocated 集合完全一致；page-table 最终内容精确一�
 
 #### M2.1 page/resource scratch
 
-- `project_protected_resources` 使用 page-id 可直接索引的 generation marker/dense scratch；一次 pass 生成
-  去重结果。
+- Program对完整choice使用page-id可直接索引的generation marker/dense scratch，一次pass构造联合post-state；
+  scratch是可重建加速结构，不是ResourceManager physical mirror。
 - logical page 维护 active-address refcount，在 address bind/rebind/truncate/release transaction 中增减；
   `has_active_reference` 为 `O(1)`。
 - `copy_from_host` 在 reserve 时生成 generation-bound validated page/run list；execution 不再逐项向前
@@ -432,8 +436,8 @@ oracle 的 free/allocated 集合完全一致；page-table 最终内容精确一�
 - Host extent store 维护 linked/run cursor，按 contiguous run `release_unreferenced`；pressure 以 extent
   run 合并 split/rebind。
 
-验收：用 operation counter 证明 protected projection、active reference query、copy validation 和 release
-分别只线性访问输入；transaction abort 后 refcount/extent/free capacity 精确回滚。
+验收：用operation counter证明projection、active reference query、copy validation和release分别只线性访问
+输入；abort不留下半Active target，并由`ResourceResult`准确报告可能已提交的victim changes。
 
 #### M2.2 内容驱动的 prefix index
 
@@ -523,18 +527,17 @@ stream/non-stream response body 和外部协议 schema 保持一致。
 
 ## 6. 实施顺序和变更边界
 
-推荐按以下可审查单元落地：
+剩余工作推荐按以下可审查单元落地：
 
 1. M0 Host measurement contract；
 2. M1.1 context guard；
 3. M1.2 frontier commit；
-4. M1.3 replica invalidation；
-5. M1.4 + M1.5 每轮固定成本和 allocator；
-6. M2 resource/cache candidate；
-7. M3 Frontend/tokenizer；
-8. M4 Vision/media；
-9. M5 async；
-10. M6 serve consumer。
+4. M1.4 + M1.5 每轮固定成本和 allocator；
+5. M2 resource/cache candidate；
+6. M3 Frontend/tokenizer；
+7. M4 Vision/media；
+8. M5 async；
+9. M6 serve consumer。
 
 每个单元都必须删除被替代的项目内生产路径，不能留下 `legacy`、catch fallback、双写 schema 或通过配置
 选择旧算法。若一个阶段暴露新的问题，只在它阻塞本阶段正确性或使测量失真时并入；其他发现进入本文
@@ -558,7 +561,7 @@ M0 之后每个单元的交付说明统一报告：
 | 长多轮 chat preparation | token/frontier 精确一致 | 一次 full tokenize；工作近似随 rendered bytes 线性 | preparation tokenize seconds + benchmark operation count |
 | 大量/长 word | tokenizer 输出精确一致 | BPE `O(N log N)`，无 vector 中删 | tokenizer benchmark |
 | 多媒体、多 chunk | Vision 输出/position 正确 | cursor 不回扫；full reuse 不构造旧 media control | prepare/media stats, `program_submit` |
-| admission/pressure/host restore | transaction/ledger 精确回滚 | page/extent pass 线性，clean replica visits 为 0 | policy subset seconds/invocations |
+| admission/pressure/host restore | joint post-state、stage peak和terminal result正确 | page/extent pass线性；普通decode placement visits为0 | policy subset seconds/invocations |
 | C=2–8 compact batch | 每 row 输出和取消语义正确 | worker aggregate 一段只计一次；request exposure 各计完整延迟 | throughput aggregate vs request exposure |
 | Responses 长 chain/stream | 外部 schema/body 一致 | put/filter work 随新增内容线性 | consumer timing；Engine timing不被混入 |
 

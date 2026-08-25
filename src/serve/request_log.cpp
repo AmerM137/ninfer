@@ -332,15 +332,12 @@ ninfer::RuntimeHostWorkStats host_work_delta(const ninfer::RuntimeHostWorkStats&
             monotonic_delta(previous.admission_policy_ns, current.admission_policy_ns),
         .context_progress_ns =
             monotonic_delta(previous.context_progress_ns, current.context_progress_ns),
-        .replica_policy_ns = monotonic_delta(previous.replica_policy_ns, current.replica_policy_ns),
         .stats_publication_ns =
             monotonic_delta(previous.stats_publication_ns, current.stats_publication_ns),
         .admission_policy_invocations  = monotonic_delta(previous.admission_policy_invocations,
                                                          current.admission_policy_invocations),
         .context_progress_invocations  = monotonic_delta(previous.context_progress_invocations,
                                                          current.context_progress_invocations),
-        .replica_policy_invocations    = monotonic_delta(previous.replica_policy_invocations,
-                                                         current.replica_policy_invocations),
         .stats_publication_invocations = monotonic_delta(previous.stats_publication_invocations,
                                                          current.stats_publication_invocations),
     };
@@ -559,7 +556,8 @@ std::string format_throughput(const ThroughputReport& report) {
         << " decode_ready=" << report.current.decode_ready_requests
         << " waiting=" << report.current.waiting_requests
         << " materializing=" << report.current.materializing_requests
-        << " capture_pending=" << report.current.capture_pending_requests << " avg_decode_batch=";
+        << " capture_pending=" << report.current.capture_pending_requests
+        << " terminal_pending=" << report.current.terminal_pending_requests << " avg_decode_batch=";
     if (report.decode_rounds == 0) {
         out << "n/a";
     } else {
@@ -797,7 +795,8 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
                                   {"decode_ready", current.decode_ready_requests},
                                   {"waiting", current.waiting_requests},
                                   {"materializing", current.materializing_requests},
-                                  {"capture_pending", current.capture_pending_requests}};
+                                  {"capture_pending", current.capture_pending_requests},
+                                  {"terminal_pending", current.terminal_pending_requests}};
     record["decode_batch"] = Json{{"rounds", report.decode_rounds},
                                   {"row_rounds", report.decode_row_rounds},
                                   {"average_size", std::move(average_batch)}};
@@ -820,11 +819,9 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
            {"detail_subset_seconds",
             Json{{"admission_policy", nanoseconds_to_seconds(host.admission_policy_ns)},
                  {"context_progress", nanoseconds_to_seconds(host.context_progress_ns)},
-                 {"replica_policy", nanoseconds_to_seconds(host.replica_policy_ns)},
                  {"stats_publication", nanoseconds_to_seconds(host.stats_publication_ns)}}},
            {"detail_invocations", Json{{"admission_policy", host.admission_policy_invocations},
                                        {"context_progress", host.context_progress_invocations},
-                                       {"replica_policy", host.replica_policy_invocations},
                                        {"stats_publication", host.stats_publication_invocations}}},
            {"units", Json{{"prefill", host.prefill_units}, {"control", host.control_units}}},
            {"decode_host_microseconds_per_round",
@@ -838,8 +835,6 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
                   microseconds_per(host.admission_policy_ns, host.admission_policy_invocations)},
                  {"context_progress",
                   microseconds_per(host.context_progress_ns, host.context_progress_invocations)},
-                 {"replica_policy",
-                  microseconds_per(host.replica_policy_ns, host.replica_policy_invocations)},
                  {"stats_publication",
                   microseconds_per(host.stats_publication_ns, host.stats_publication_invocations)}}},
     };

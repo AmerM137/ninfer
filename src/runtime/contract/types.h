@@ -212,73 +212,6 @@ struct CommitDecision {
     bool cancelled                = false;
 };
 
-// Device ownership in the independently exhausted runtime resource domains. Values are already
-// rounded to the physical allocation granularity by the target.
-struct DeviceResources {
-    std::uint32_t active_lanes     = 0;
-    std::uint32_t state_slots      = 0;
-    std::uint32_t main_kv_pages    = 0;
-    std::uint32_t backend_kv_pages = 0;
-
-    [[nodiscard]] friend constexpr bool operator==(const DeviceResources&,
-                                                   const DeviceResources&) noexcept = default;
-};
-
-struct HostResources {
-    std::uint32_t state_slots = 0;
-    std::size_t kv_bytes      = 0;
-
-    [[nodiscard]] friend constexpr bool operator==(const HostResources&,
-                                                   const HostResources&) noexcept = default;
-};
-
-struct ResourceVector {
-    DeviceResources device;
-    HostResources host;
-
-    [[nodiscard]] friend constexpr bool operator==(const ResourceVector&,
-                                                   const ResourceVector&) noexcept = default;
-};
-
-// The ResourceManager ledger records unique published occupancy plus one exclusive transaction
-// reservation. Program supplies both steady-state deltas and the actual dependency-aware physical
-// peak; callers must not derive either by summing logical checkpoint summaries.
-struct ResourceDemand {
-    ResourceVector active_entitlement;
-    ResourceVector reservation_added;
-    ResourceVector reservation_credit;
-    ResourceVector physical_peak_additional;
-    ResourceVector final_removed;
-    ResourceVector final_added;
-
-    [[nodiscard]] friend constexpr bool operator==(const ResourceDemand&,
-                                                   const ResourceDemand&) noexcept = default;
-};
-
-struct ResourceDelta {
-    ResourceVector removed;
-    ResourceVector added;
-
-    [[nodiscard]] friend constexpr bool operator==(const ResourceDelta&,
-                                                   const ResourceDelta&) noexcept = default;
-};
-
-// Materialization pressure can change which logical owner is responsible for an already-resident
-// resource without changing aggregate occupancy. Keep that ownership transition separate from the
-// aggregate ledger delta so the destination lane receives the exact post-pressure entitlement.
-struct MaterializationPressureEffect {
-    // Physical pressure work contributes to reservation, peak, and final aggregate occupancy.
-    ResourceDelta aggregate_delta;
-    // Equal final-only pairs transfer already-resident ownership without reserving new backing.
-    ResourceDelta final_ownership_delta;
-    // The destination lane's logical ownership snapshot after all selected pressure work.
-    ResourceDelta active_entitlement_delta;
-
-    [[nodiscard]] friend constexpr bool
-    operator==(const MaterializationPressureEffect&,
-               const MaterializationPressureEffect&) noexcept = default;
-};
-
 // Exact features for the startup-selected static prefill cost model. They describe only the
 // suffix rebuilt after a selected prefix and remain separate from Scheduler service work.
 struct PrefillWork {
@@ -389,7 +322,6 @@ struct ContextTransactionInProgress {};
 enum class ContextTransactionKind : std::uint8_t {
     Materialization,
     ActiveCapture,
-    ReplicaTransition,
 };
 
 enum class PreflightStatus : std::uint8_t {

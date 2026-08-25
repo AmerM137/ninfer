@@ -1,167 +1,110 @@
 #include "runtime/engine/admission_policy.h"
 
 #include <algorithm>
-#include <array>
 #include <stdexcept>
 
 namespace ninfer::runtime {
 namespace {
 
-struct ResourceTotals {
-    std::uint64_t active_lanes     = 0;
-    std::uint64_t state_slots      = 0;
-    std::uint64_t main_kv_pages    = 0;
-    std::uint64_t backend_kv_pages = 0;
-};
-
-void add(ResourceTotals& total, const DeviceResources& resources) noexcept {
-    total.active_lanes += resources.active_lanes;
-    total.state_slots += resources.state_slots;
-    total.main_kv_pages += resources.main_kv_pages;
-    total.backend_kv_pages += resources.backend_kv_pages;
-}
-
-bool fits(const ResourceTotals& used, const DeviceResources& capacity) noexcept {
-    return used.active_lanes <= capacity.active_lanes && used.state_slots <= capacity.state_slots &&
-           used.main_kv_pages <= capacity.main_kv_pages &&
-           used.backend_kv_pages <= capacity.backend_kv_pages;
-}
-
-bool contains(std::span<const std::uint64_t> ids, std::uint64_t id) noexcept {
+[[nodiscard]] bool contains(std::span<const std::uint64_t> ids, std::uint64_t id) noexcept {
     return std::find(ids.begin(), ids.end(), id) != ids.end();
 }
 
-bool is_donor(const AdmissionProtection& protection, std::uint64_t id) noexcept {
+[[nodiscard]] bool is_donor(const AdmissionProtection& protection, std::uint64_t id) noexcept {
     return contains(
         std::span<const std::uint64_t>(protection.donor_ids.data(), protection.donor_count), id);
 }
 
-std::uint32_t projection_owner_mask(const ProtectedHeadResourceProjection& projection) noexcept {
-    std::uint32_t mask = 0;
-    for (std::uint32_t owners = 1; owners < projection.release_by_last_owner_mask.size();
-         ++owners) {
-        const DeviceResources& resources = projection.release_by_last_owner_mask[owners];
-        if (resources != DeviceResources{}) { mask |= owners; }
+void validate_active_partition(const AdmissionProtection& protection,
+                               std::span<const ActiveAdmissionSnapshot> active) {
+    if (active.size() > kMaximumConcurrency) {
+        throw std::invalid_argument("protected admission exceeds startup concurrency");
     }
-    return mask;
-}
-
-ResourceTotals projected_resources(const ProtectedHeadResourceProjection& projection,
-                                   std::uint32_t surviving_owners) noexcept {
-    ResourceTotals total;
-    add(total, projection.fixed_non_reclaimable);
-    for (std::uint32_t owners = 1; owners < projection.release_by_last_owner_mask.size();
-         ++owners) {
-        if ((owners & surviving_owners) != 0) {
-            add(total, projection.release_by_last_owner_mask[owners]);
+    for (std::size_t row = 0; row < active.size(); ++row) {
+        const ActiveAdmissionSnapshot& request = active[row];
+        if (request.request_id == 0 || request.request_id == protection.head_request_id) {
+            throw std::invalid_argument("protected admission contains an invalid request");
+        }
+        for (std::size_t prior = 0; prior < row; ++prior) {
+            if (active[prior].request_id == request.request_id) {
+                throw std::invalid_argument("protected admission contains a duplicate request");
+            }
+        }
+        if (is_donor(protection, request.request_id)) {
+            if (request.backfill_epoch == protection.epoch_id &&
+                request.backfill_class == BackfillClass::Persistent) {
+                throw std::logic_error("frozen donor was relabelled as a persistent borrower");
+            }
+            continue;
+        }
+        if (request.backfill_epoch != protection.epoch_id ||
+            request.backfill_class != BackfillClass::Persistent) {
+            throw std::logic_error("new active request is outside protected-head ownership");
         }
     }
-    return total;
 }
 
 } // namespace
 
-bool admission_resources_fit(const DeviceResources& used,
-                             const DeviceResources& capacity) noexcept {
-    ResourceTotals total;
-    add(total, used);
-    return fits(total, capacity);
-}
-
 AdmissionProtection make_admission_protection(std::uint64_t epoch_id, std::uint64_t head_request_id,
-                                              const DeviceResources& head_resources,
-                                              std::span<const ActiveAdmissionSnapshot> active,
-                                              const ProtectedHeadResourceProjection& projection,
-                                              const DeviceResources& capacity) {
-    if (epoch_id == 0 || head_request_id == 0 || active.empty() ||
-        active.size() > kMaximumConcurrency || head_resources.active_lanes == 0 ||
-        !admission_resources_fit(head_resources, capacity)) {
-        throw std::invalid_argument("invalid protected-admission frontier");
+                                              std::uint64_t resource_revision,
+                                              std::span<const ActiveAdmissionSnapshot> active) {
+    if (epoch_id == 0 || head_request_id == 0 || resource_revision == 0 || active.empty() ||
+        active.size() > kMaximumConcurrency) {
+        throw std::invalid_argument("invalid protected-admission identity");
     }
-
-    AdmissionProtection out;
-    out.epoch_id        = epoch_id;
-    out.head_request_id = head_request_id;
-    out.head_resources  = head_resources;
-
-    std::uint32_t surviving_owners = projection_owner_mask(projection);
-    std::uint32_t observed_bits    = 0;
-    for (std::size_t i = 0; i < active.size(); ++i) {
-        if (active[i].request_id == 0 || active[i].remaining_work_quanta == 0 ||
-            active[i].owner_bit == 0 || (active[i].owner_bit & (active[i].owner_bit - 1U)) != 0 ||
-            (observed_bits & active[i].owner_bit) != 0 ||
-            (surviving_owners & active[i].owner_bit) == 0) {
-            throw std::invalid_argument("protected incumbent has invalid progress state");
+    AdmissionProtection protection{
+        .epoch_id          = epoch_id,
+        .head_request_id   = head_request_id,
+        .resource_revision = resource_revision,
+    };
+    for (const ActiveAdmissionSnapshot& request : active) {
+        if (request.request_id == 0 || request.request_id == head_request_id ||
+            contains(
+                std::span<const std::uint64_t>(protection.donor_ids.data(), protection.donor_count),
+                request.request_id)) {
+            throw std::invalid_argument("invalid protected-admission incumbent");
         }
-        observed_bits |= active[i].owner_bit;
+        protection.donor_ids[protection.donor_count++] = request.request_id;
     }
-    ResourceTotals survivors = projected_resources(projection, surviving_owners);
-    add(survivors, head_resources);
-    if (fits(survivors, capacity)) {
-        throw std::invalid_argument("protected head is not blocked by frozen incumbents");
-    }
-
-    std::array<std::size_t, kMaximumConcurrency> order{};
-    for (std::size_t i = 0; i < active.size(); ++i) { order[i] = i; }
-    std::sort(order.begin(), order.begin() + static_cast<std::ptrdiff_t>(active.size()),
-              [&](std::size_t lhs, std::size_t rhs) {
-                  if (active[lhs].remaining_work_quanta != active[rhs].remaining_work_quanta) {
-                      return active[lhs].remaining_work_quanta < active[rhs].remaining_work_quanta;
-                  }
-                  return active[lhs].request_id < active[rhs].request_id;
-              });
-
-    for (std::size_t i = 0; i < active.size(); ++i) {
-        const ActiveAdmissionSnapshot& donor = active[order[i]];
-        surviving_owners &= ~donor.owner_bit;
-        survivors = projected_resources(projection, surviving_owners);
-        add(survivors, head_resources);
-        out.donor_ids[out.donor_count++] = donor.request_id;
-        out.temporal_credit              = donor.remaining_work_quanta;
-        if (fits(survivors, capacity)) { return out; }
-    }
-    throw std::logic_error("exclusive-feasible head has no releasing incumbent frontier");
+    return protection;
 }
 
-bool persistent_backfill_is_safe(const AdmissionProtection& protection,
+void rebind_admission_protection(AdmissionProtection& protection,
                                  std::span<const ActiveAdmissionSnapshot> active,
-                                 const ProtectedHeadResourceProjection& candidate,
-                                 const DeviceResources& capacity) noexcept {
-    std::uint32_t surviving_owners = projection_owner_mask(candidate);
-    for (const ActiveAdmissionSnapshot& request : active) {
-        if (is_donor(protection, request.request_id)) { surviving_owners &= ~request.owner_bit; }
+                                 std::uint64_t resource_revision) {
+    if (protection.epoch_id == 0 || protection.head_request_id == 0 || resource_revision == 0) {
+        throw std::invalid_argument("invalid protected-admission rebind");
     }
-    ResourceTotals future = projected_resources(candidate, surviving_owners);
-    add(future, protection.head_resources);
-    return fits(future, capacity);
+    validate_active_partition(protection, active);
+    protection.resource_revision = resource_revision;
 }
 
-std::uint64_t
-protection_frontier_distance(const AdmissionProtection& protection,
-                             std::span<const ActiveAdmissionSnapshot> active) noexcept {
-    std::uint64_t distance = 0;
-    for (const ActiveAdmissionSnapshot& request : active) {
-        if (is_donor(protection, request.request_id)) {
-            distance = std::max(distance, request.remaining_work_quanta);
-        }
-    }
-    return distance;
+bool protection_has_live_donor(const AdmissionProtection& protection,
+                               std::span<const ActiveAdmissionSnapshot> active) noexcept {
+    return std::any_of(active.begin(), active.end(), [&](const ActiveAdmissionSnapshot& request) {
+        return is_donor(protection, request.request_id);
+    });
 }
 
-bool protected_head_safe_without_temporal(const AdmissionProtection& protection,
-                                          std::span<const ActiveAdmissionSnapshot> active,
-                                          const ProtectedHeadResourceProjection& projection,
-                                          const DeviceResources& capacity) noexcept {
-    std::uint32_t surviving_owners = projection_owner_mask(projection);
+bool persistent_backfill_is_authorized(const AdmissionProtection& protection,
+                                       std::uint64_t candidate_request_id,
+                                       std::span<const ActiveAdmissionSnapshot> active,
+                                       std::uint64_t program_proof_revision) noexcept {
+    if (candidate_request_id == 0 || candidate_request_id == protection.head_request_id ||
+        program_proof_revision == 0 || program_proof_revision != protection.resource_revision ||
+        !protection_has_live_donor(protection, active)) {
+        return false;
+    }
     for (const ActiveAdmissionSnapshot& request : active) {
-        if (request.backfill_epoch == protection.epoch_id &&
-            request.backfill_class == BackfillClass::Temporal) {
-            surviving_owners &= ~request.owner_bit;
+        if (request.request_id == candidate_request_id) { return false; }
+        if (!is_donor(protection, request.request_id) &&
+            (request.backfill_epoch != protection.epoch_id ||
+             request.backfill_class != BackfillClass::Persistent)) {
+            return false;
         }
     }
-    ResourceTotals used = projected_resources(projection, surviving_owners);
-    add(used, protection.head_resources);
-    return fits(used, capacity);
+    return true;
 }
 
 } // namespace ninfer::runtime

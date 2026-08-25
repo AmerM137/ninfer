@@ -108,14 +108,15 @@ struct RequestRecord {
     using BasePlan       = typename Package::RequestBasePlan;
     using SequenceHandle = typename Package::SequenceHandle;
 
-    RequestRecord(std::uint64_t request_identity, PreparedPrompt input,
-                  OutputSession output_session, PromptSummary summary, double frontend_seconds,
-                  ResolvedRequestOptions request_options, OutputConsumerMode output_consumer,
-                  Clock::time_point limit, Clock::time_point submit_time)
-        : id(request_identity), prompt(std::move(input)), output(std::move(output_session)),
-          prompt_summary(std::move(summary)), prepare_seconds(frontend_seconds),
-          options(std::move(request_options)), consumer_mode(output_consumer), deadline(limit),
-          submitted(submit_time) {}
+    RequestRecord(std::uint64_t request_identity, std::uint64_t publication_sequence,
+                  PreparedPrompt input, OutputSession output_session, PromptSummary summary,
+                  double frontend_seconds, ResolvedRequestOptions request_options,
+                  OutputConsumerMode output_consumer, Clock::time_point limit,
+                  Clock::time_point submit_time)
+        : id(request_identity), publication_order(publication_sequence), prompt(std::move(input)),
+          output(std::move(output_session)), prompt_summary(std::move(summary)),
+          prepare_seconds(frontend_seconds), options(std::move(request_options)),
+          consumer_mode(output_consumer), deadline(limit), submitted(submit_time) {}
 
     RequestRecord(const RequestRecord&)            = delete;
     RequestRecord& operator=(const RequestRecord&) = delete;
@@ -145,6 +146,7 @@ struct RequestRecord {
     }
 
     const std::uint64_t id;
+    const std::uint64_t publication_order;
     PreparedPrompt prompt;
     OutputSession output;
     PromptSummary prompt_summary;
@@ -166,6 +168,7 @@ struct RequestRecord {
     EngineRequestState model_state        = EngineRequestState::Waiting;
     bool capture_pending                  = false;
     EngineRequestState post_capture_state = EngineRequestState::Prefill;
+    std::optional<FinishReason> terminal_reason;
 
     std::optional<BasePlan> base_plan;
     std::uint64_t remaining_service_work = 0;

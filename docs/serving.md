@@ -624,8 +624,9 @@ suffix tokens actually computed during the interval, excluding prefix-cache hits
 tokens finally committed by decode rounds, excluding the first token produced by prefill. For MTP
 and DFlash this is the accepted committed output, not draft or rejected tokens.
 `avg_decode_batch` is decode row-rounds divided by decode rounds during the same interval. The
-`running`, `prefilling`, `decode_ready`, `waiting`, `materializing`, and `capture_pending` fields are
-the Engine scheduler snapshot at the end of the interval. The JSONL `context_cache` object reports
+`running`, `prefilling`, `decode_ready`, `waiting`, `materializing`, `capture_pending`, and
+`terminal_pending` fields are the Engine scheduler snapshot at the end of the interval. The JSONL
+`context_cache` object reports
 selection, capture, transfer, COW/spill, degradation, eviction, and historical-fork counters as
 interval deltas; `occupancy`, `last_selection`, and `last_materialization` are end-of-interval
 gauges. `last_materialization.predicted_nanoseconds` is always produced by the startup-selected

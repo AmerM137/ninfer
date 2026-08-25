@@ -7,7 +7,7 @@
 #include <memory>
 #include <optional>
 #include <span>
-#include <utility>
+#include <stdexcept>
 #include <vector>
 
 namespace {
@@ -35,17 +35,18 @@ struct SchedulerRequest {
         }
     };
 
-    enum class State : std::uint8_t {
-        Decode,
-        Control,
-    };
+    enum class State : std::uint8_t { Decode, Control };
 
     [[nodiscard]] bool is_decode_ready() const noexcept { return state == State::Decode; }
 
     [[nodiscard]] bool is_control_ready() const noexcept { return state == State::Control; }
 
-    State state          = State::Decode;
-    bool capture_pending = false;
+    std::uint64_t id                              = 0;
+    std::uint64_t remaining_service_work          = 1;
+    std::uint64_t backfill_epoch                  = 0;
+    ninfer::runtime::BackfillClass backfill_class = ninfer::runtime::BackfillClass::None;
+    State state                                   = State::Decode;
+    bool capture_pending                          = false;
     std::optional<Budget> budget;
     std::optional<SequenceHandle> sequence;
     Output output;
@@ -57,181 +58,112 @@ int check(bool condition, const char* message) {
     return 1;
 }
 
-void add_candidate(ninfer::runtime::ProtectedHeadResourceProjection& projection,
-                   std::uint32_t owner_bit, const ninfer::runtime::DeviceResources& resources) {
-    auto& bucket = projection.release_by_last_owner_mask[owner_bit];
-    bucket.active_lanes += resources.active_lanes;
-    bucket.state_slots += resources.state_slots;
-    bucket.main_kv_pages += resources.main_kv_pages;
-    bucket.backend_kv_pages += resources.backend_kv_pages;
+template <class Function>
+bool throws_logic(Function&& function) {
+    try {
+        function();
+    } catch (const std::logic_error&) { return true; }
+    return false;
 }
 
 } // namespace
 
 int main() {
     using ninfer::runtime::ActiveAdmissionSnapshot;
-    using ninfer::runtime::DeviceResources;
     using ninfer::runtime::BackfillClass;
+    using Scheduler = ninfer::runtime::Scheduler<SchedulerRequest>;
 
     int failures = 0;
-    const DeviceResources capacity{
-        .active_lanes     = 4,
-        .state_slots      = 8,
-        .main_kv_pages    = 160,
-        .backend_kv_pages = 128,
+    const std::array<ActiveAdmissionSnapshot, 2> incumbents{
+        ActiveAdmissionSnapshot{.request_id = 1},
+        ActiveAdmissionSnapshot{.request_id = 2},
     };
-    const DeviceResources head{
-        .active_lanes     = 1,
-        .state_slots      = 2,
-        .main_kv_pages    = 64,
-        .backend_kv_pages = 48,
-    };
-    std::array<ActiveAdmissionSnapshot, 2> incumbents{
-        ActiveAdmissionSnapshot{
-            .request_id            = 1,
-            .remaining_work_quanta = 100,
-            .owner_bit             = 1U,
-        },
-        ActiveAdmissionSnapshot{
-            .request_id            = 2,
-            .remaining_work_quanta = 20,
-            .owner_bit             = 2U,
-        },
-    };
-    ninfer::runtime::ProtectedHeadResourceProjection incumbent_projection;
-    add_candidate(incumbent_projection, 1U, DeviceResources{1, 2, 64, 32});
-    add_candidate(incumbent_projection, 2U, DeviceResources{1, 2, 48, 64});
 
-    const auto protection = ninfer::runtime::make_admission_protection(
-        7, 10, head, std::span<const ActiveAdmissionSnapshot>(incumbents), incumbent_projection,
-        capacity);
-    failures += check(protection.donor_count == 1 && protection.donor_ids[0] == 2 &&
-                          protection.temporal_credit == 20,
-                      "release frontier did not select the earliest sufficient incumbent");
-    failures += check(ninfer::runtime::protection_frontier_distance(protection, incumbents) == 20,
-                      "frontier distance did not follow the frozen donor");
+    auto protection = ninfer::runtime::make_admission_protection(7, 10, 31, incumbents);
+    failures += check(protection.donor_count == 2 && protection.donor_ids[0] == 1 &&
+                          protection.donor_ids[1] == 2 && protection.resource_revision == 31,
+                      "protection did not freeze every incumbent donor");
+    failures += check(ninfer::runtime::protection_has_live_donor(protection, incumbents),
+                      "live donor was not recognized");
+    failures +=
+        check(ninfer::runtime::persistent_backfill_is_authorized(protection, 11, incumbents, 31),
+              "matching Program proof did not authorize persistent backfill");
+    failures +=
+        check(!ninfer::runtime::persistent_backfill_is_authorized(protection, 11, incumbents, 30),
+              "stale Program proof authorized persistent backfill");
 
-    const DeviceResources persistent_candidate{1, 1, 24, 40};
-    auto persistent_projection = incumbent_projection;
-    add_candidate(persistent_projection, 4U, persistent_candidate);
-    failures += check(ninfer::runtime::persistent_backfill_is_safe(protection, incumbents,
-                                                                   persistent_projection, capacity),
-                      "future resource surplus rejected a persistent-safe backfill");
-    auto unsafe_projection = incumbent_projection;
-    add_candidate(unsafe_projection, 4U, DeviceResources{1, 1, 40, 60});
-    failures += check(!ninfer::runtime::persistent_backfill_is_safe(protection, incumbents,
-                                                                    unsafe_projection, capacity),
-                      "persistent backfill borrowed protected future capacity");
-
-    std::array<ActiveAdmissionSnapshot, 3> with_persistent{
+    const std::array<ActiveAdmissionSnapshot, 3> with_borrower{
         incumbents[0],
         incumbents[1],
         ActiveAdmissionSnapshot{
-            .request_id            = 3,
-            .remaining_work_quanta = 50,
-            .backfill_epoch        = 7,
-            .backfill_class        = BackfillClass::Persistent,
-            .owner_bit             = 4U,
+            .request_id     = 11,
+            .backfill_epoch = 7,
+            .backfill_class = BackfillClass::Persistent,
         },
     };
-    auto second_candidate_projection = persistent_projection;
-    add_candidate(second_candidate_projection, 8U, DeviceResources{1, 1, 9, 9});
-    failures += check(!ninfer::runtime::persistent_backfill_is_safe(
-                          protection, with_persistent, second_candidate_projection, capacity),
-                      "persistent ledger failed to accumulate earlier backfills");
-
-    std::array<ActiveAdmissionSnapshot, 2> after_donor{
-        incumbents[0],
-        ActiveAdmissionSnapshot{
-            .request_id            = 4,
-            .remaining_work_quanta = 8,
-            .backfill_epoch        = 7,
-            .backfill_class        = BackfillClass::Temporal,
-            .owner_bit             = 4U,
-        },
-    };
-    failures += check(ninfer::runtime::protection_frontier_distance(protection, after_donor) == 0,
-                      "later temporal work changed the frozen frontier");
-    ninfer::runtime::ProtectedHeadResourceProjection after_donor_projection;
-    add_candidate(after_donor_projection, 1U, DeviceResources{1, 2, 64, 32});
-    add_candidate(after_donor_projection, 4U, DeviceResources{1, 1, 32, 64});
-    failures += check(ninfer::runtime::protected_head_safe_without_temporal(
-                          protection, after_donor, after_donor_projection, capacity),
-                      "released frontier did not mature behind a temporal borrower");
-
+    ninfer::runtime::rebind_admission_protection(protection, with_borrower, 32);
     failures += check(
-        !ninfer::runtime::admission_resources_fit(DeviceResources{1, 9, 1, 1}, capacity) &&
-            !ninfer::runtime::admission_resources_fit(DeviceResources{1, 1, 161, 1}, capacity) &&
-            !ninfer::runtime::admission_resources_fit(DeviceResources{1, 1, 1, 129}, capacity),
-        "independent Device resource dimensions were treated as interchangeable capacity");
+        protection.donor_count == 2 && protection.resource_revision == 32 &&
+            ninfer::runtime::persistent_backfill_is_authorized(protection, 12, with_borrower, 32),
+        "revision rebind changed the frozen donor partition");
 
-    using Scheduler = ninfer::runtime::Scheduler<SchedulerRequest>;
+    const std::array<ActiveAdmissionSnapshot, 1> borrower_only{with_borrower[2]};
+    ninfer::runtime::rebind_admission_protection(protection, borrower_only, 33);
+    failures += check(
+        !ninfer::runtime::protection_has_live_donor(protection, borrower_only) &&
+            !ninfer::runtime::persistent_backfill_is_authorized(protection, 12, borrower_only, 33),
+        "backfill remained open after every frozen donor completed");
+
+    const std::array<ActiveAdmissionSnapshot, 1> unknown_active{
+        ActiveAdmissionSnapshot{.request_id = 99},
+    };
+    failures +=
+        check(throws_logic([&] {
+                  ninfer::runtime::rebind_admission_protection(protection, unknown_active, 34);
+              }),
+              "unclassified post-protection active request was accepted as a donor");
+
     Scheduler scheduler;
     scheduler.observe_fifo_head(10);
+    failures += check(scheduler.protect_blocked_head(10, incumbents, 40),
+                      "blocked FIFO head did not open a donor epoch");
+    auto stale = scheduler.qualify_backfill(11, 50, incumbents, 40);
+    failures += check(stale && stale->backfill_class() == BackfillClass::Persistent &&
+                          scheduler.validate_grant(*stale),
+                      "Program-proved borrower did not receive a persistent grant");
+    if (!stale) { return 1; }
+    const std::uint64_t epoch = stale->protection_epoch();
+    failures += check(scheduler.protect_blocked_head(10, incumbents, 41) &&
+                          !scheduler.validate_grant(*stale),
+                      "resource revision did not invalidate an uncommitted grant");
+
+    auto first = scheduler.qualify_backfill(11, 50, incumbents, 41);
     failures +=
-        check(scheduler.protect_blocked_head(10, head, incumbents, incumbent_projection, capacity),
-              "blocked FIFO head did not open a protection epoch");
+        check(first && first->protection_epoch() == epoch && first->resource_revision() == 41,
+              "revalidated borrower changed the logical protection epoch");
+    if (!first) { return 1; }
+    scheduler.commit_admission(std::move(*first));
 
-    const DeviceResources persistent_safe_candidate{1, 1, 24, 24};
-    auto persistent_safe_projection = incumbent_projection;
-    add_candidate(persistent_safe_projection, 4U, persistent_safe_candidate);
-    auto persistent =
-        scheduler.qualify_backfill(11, persistent_safe_projection, 50, incumbents, capacity);
-    failures += check(persistent && persistent->backfill_class() == BackfillClass::Persistent &&
-                          scheduler.validate_grant(*persistent),
-                      "persistent-safe candidate did not receive a valid Scheduler grant");
-    if (!persistent) { return 1; }
-    const std::uint64_t protection_epoch = persistent->protection_epoch();
-    scheduler.commit_admission(std::move(*persistent));
-
-    std::array<ActiveAdmissionSnapshot, 3> active_with_persistent{
+    const std::array<ActiveAdmissionSnapshot, 3> active_after_first{
         incumbents[0],
         incumbents[1],
         ActiveAdmissionSnapshot{
-            .request_id            = 11,
-            .remaining_work_quanta = 50,
-            .backfill_epoch        = protection_epoch,
-            .backfill_class        = BackfillClass::Persistent,
-            .owner_bit             = 4U,
+            .request_id     = 11,
+            .backfill_epoch = epoch,
+            .backfill_class = BackfillClass::Persistent,
         },
     };
-    const DeviceResources temporal_candidate{1, 1, 16, 8};
-    auto temporal_projection = persistent_safe_projection;
-    add_candidate(temporal_projection, 8U, temporal_candidate);
-    auto temporal =
-        scheduler.qualify_backfill(12, temporal_projection, 8, active_with_persistent, capacity);
-    failures += check(temporal && temporal->backfill_class() == BackfillClass::Temporal &&
-                          scheduler.validate_grant(*temporal),
-                      "bounded temporal candidate did not receive a valid Scheduler grant");
-    if (!temporal) { return 1; }
-    scheduler.commit_admission(std::move(*temporal));
-    failures += check(
-        !scheduler.qualify_backfill(13, temporal_projection, 13, active_with_persistent, capacity),
-        "committed temporal work did not consume protected credit");
+    failures += check(scheduler.protect_blocked_head(10, active_after_first, 42),
+                      "existing persistent borrower prevented revision revalidation");
+    auto second = scheduler.qualify_backfill(12, 1, active_after_first, 42);
+    failures += check(second && scheduler.validate_grant(*second),
+                      "second Program-proved borrower was not cumulatively admitted");
 
-    std::array<ActiveAdmissionSnapshot, 3> matured{
-        incumbents[0],
-        active_with_persistent[2],
-        ActiveAdmissionSnapshot{
-            .request_id            = 12,
-            .remaining_work_quanta = 8,
-            .backfill_epoch        = protection_epoch,
-            .backfill_class        = BackfillClass::Temporal,
-            .owner_bit             = 8U,
-        },
-    };
-    ninfer::runtime::ProtectedHeadResourceProjection matured_projection;
-    add_candidate(matured_projection, 1U, DeviceResources{1, 2, 64, 32});
-    add_candidate(matured_projection, 4U, persistent_safe_candidate);
-    add_candidate(matured_projection, 8U, temporal_candidate);
-    failures +=
-        check(!scheduler.protect_blocked_head(10, head, matured, matured_projection, capacity),
-              "matured protected opportunity did not enter drain");
     scheduler.on_waiting_removed(10);
     scheduler.observe_fifo_head(14);
     auto head_grant = scheduler.grant_head(14, 1);
     failures += check(scheduler.validate_grant(head_grant),
-                      "observed FIFO head did not receive a valid admission grant");
+                      "new FIFO head inherited stale protection state");
     scheduler.commit_admission(std::move(head_grant));
 
     using ExecutionAction = Scheduler::ExecutionAction;
@@ -242,31 +174,36 @@ int main() {
                           scheduler.should_attempt_admission(true, true, true, true, false) &&
                           !scheduler.should_attempt_admission(true, true, false, false, true) &&
                           scheduler.choose_execution(true, false, false) == ExecutionAction::Decode,
-                      "admission invalidation and fairness gates were not independent");
+                      "admission and GPU-unit fairness gates changed");
     scheduler.set_prefill_lane(0);
     failures +=
         check(!scheduler.should_attempt_admission(true, true, true, true, false) &&
                   scheduler.choose_execution(true, true, false) == ExecutionAction::Decode &&
                   scheduler.choose_execution(true, true, true) == ExecutionAction::Prefill,
-              "prefill/decode alternation did not follow the completed GPU unit");
+              "prefill/decode alternation changed");
     scheduler.clear_prefill_lane(0);
 
     std::array<std::shared_ptr<SchedulerRequest>, ninfer::kMaximumConcurrency> slots{};
     slots[0]                      = std::make_shared<SchedulerRequest>();
+    slots[0]->id                  = 21;
     slots[0]->budget              = SchedulerRequest::Budget{.tokens = 11};
     slots[0]->sequence            = 23;
     slots[0]->output.model_tokens = 3;
     const auto model_membership   = scheduler.build_round_membership(slots, 1);
     failures += check(model_membership.size == 1 &&
                           model_membership.budgets[0].generated_tokens_remaining == 3,
-                      "thinking budget did not constrain Scheduler model-token licensing");
+                      "model-token licensing changed");
+
+    const auto active_set = scheduler.active_admission_set(slots, 1);
+    failures += check(active_set.size == 1 && active_set.requests[0].request_id == 21,
+                      "active logical admission snapshot lost request identity");
 
     slots[0]->state          = SchedulerRequest::State::Control;
     slots[0]->output.control = {7, 8, 9};
     const auto control       = scheduler.build_control_membership(slots, 1);
     failures += check(control.size == 1 && control.row_stride == 3 &&
                           control.tokens == slots[0]->output.control && control.sequences[0] == 23,
-                      "ControlReady membership did not preserve the exact target-control span");
+                      "ControlReady membership changed the exact control span");
 
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;

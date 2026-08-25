@@ -89,6 +89,27 @@ ninfer::EngineOptions last_alias_engine_options(const char* artifact) {
     return options;
 }
 
+ninfer::EngineOptions concurrent_engine_options(const char* artifact) {
+    ninfer::EngineOptions options;
+    options.artifact_path                    = artifact;
+    options.max_context                      = 512;
+    options.kv_capacity                      = ninfer::KvCapacityPolicy::explicit_capacity(4096);
+    options.prefill_chunk                    = 256;
+    options.speculative.backend              = ninfer::SpeculativeBackend::Mtp;
+    options.speculative.draft_tokens         = 3;
+    options.speculative.proposal_head        = ninfer::ProposalHead::Optimized;
+    options.max_concurrency                  = 8;
+    options.max_pending_requests             = 8;
+    options.context_cache.device_state_slots = 16;
+    options.context_cache.host_state_slots   = 0;
+    options.context_cache.host_kv_capacity_bytes            = 0;
+    options.context_cache.max_private_continuations         = 8;
+    options.context_cache.max_shared_prefixes               = 0;
+    options.context_cache.max_long_anchors_per_continuation = 0;
+    options.context_cache.max_cache_markers_per_request     = 0;
+    return options;
+}
+
 std::vector<std::uint8_t> gradient_ppm(int width = 64, int height = 64) {
     std::vector<std::uint8_t> ppm;
     const std::string header =
@@ -854,9 +875,141 @@ int exercise_vision(ninfer::Engine& engine) {
     return 0;
 }
 
-int verify_loaded_product(const ninfer::Engine& engine) {
+ninfer::PromptInput session_turn(std::string session, std::string question) {
+    ninfer::PromptInput input;
+    ninfer::ChatMessage user;
+    user.role = ninfer::ChatRole::User;
+    user.parts.push_back(ninfer::MessagePart{
+        .kind = ninfer::MessagePartKind::Text, .text = std::move(question), .media = {}});
+    input.messages.push_back(std::move(user));
+    input.options.enable_thinking   = false;
+    input.context_cache.session_key = std::move(session);
+    input.context_cache.retention   = ninfer::CacheRetentionHint::LiveSession;
+    return input;
+}
+
+ninfer::RequestOptions fixed_output(std::uint32_t tokens, bool reuse = true) {
+    ninfer::RequestOptions options;
+    options.execution.requested_output_tokens = tokens;
+    options.execution.sampling.temperature    = 0.0F;
+    options.execution.allow_prefix_reuse      = reuse;
+    options.stop.include_model_defaults       = false;
+    return options;
+}
+
+int exercise_concurrent_resource_settlement(const char* artifact,
+                                            std::string_view expected_target) {
+    ninfer::Engine engine(concurrent_engine_options(artifact));
+    if (engine.load_summary().target != expected_target) {
+        std::cerr << "concurrent fixture loaded target " << engine.load_summary().target
+                  << ", expected " << expected_target << '\n';
+        return 1;
+    }
+
+    constexpr std::string_view kSession = "publication-order-real";
+    constexpr std::string_view kOlderQuestion =
+        "Describe deterministic scheduling using exactly one concise paragraph.";
+    constexpr std::string_view kNewerQuestion =
+        "Describe prefix caching using exactly one concise paragraph.";
+    auto older = engine.submit(
+        engine.prepare(session_turn(std::string(kSession), std::string(kOlderQuestion))),
+        fixed_output(24));
+    auto newer = engine.submit(
+        engine.prepare(session_turn(std::string(kSession), std::string(kNewerQuestion))),
+        fixed_output(2));
+    const ninfer::GenerationResult newer_result = newer.wait();
+    const ninfer::GenerationResult older_result = older.wait();
+    if (newer_result.generated_token_ids.size() != 2 ||
+        older_result.generated_token_ids.size() != 24) {
+        std::cerr << "concurrent session requests did not reach staggered terminal boundaries\n";
+        return 1;
+    }
+
+    for (std::uint32_t index = 0; index < 6; ++index) {
+        const std::string suffix              = std::to_string(index);
+        const ninfer::GenerationResult filler = engine.generate(
+            engine.prepare(session_turn("publication-filler-" + suffix,
+                                        "Give one deterministic token for filler " + suffix + '.')),
+            fixed_output(1));
+        if (filler.generated_token_ids.size() != 1) {
+            std::cerr << "session-order catalog filler did not complete\n";
+            return 1;
+        }
+    }
+    const ninfer::RuntimeStats before_pressure = engine.runtime_stats();
+    const ninfer::GenerationResult pressure    = engine.generate(
+        engine.prepare(session_turn("publication-pressure",
+                                       "Give one deterministic token for the pressure request.")),
+        fixed_output(1));
+    const ninfer::RuntimeStats after_pressure = engine.runtime_stats();
+    if (pressure.generated_token_ids.size() != 1 ||
+        after_pressure.private_checkpoint_evictions <=
+            before_pressure.private_checkpoint_evictions) {
+        std::cerr << "full session catalog did not execute its canonical eviction\n";
+        return 1;
+    }
+
+    const ninfer::GenerationResult replay = engine.generate(
+        engine.prepare(session_turn(std::string(kSession), std::string(kNewerQuestion))),
+        fixed_output(2));
+    if (replay.generated_token_ids.size() != 2 || replay.reused_prompt_tokens == 0 ||
+        replay.prefix_reuse_path == ninfer::PrefixReusePath::Root) {
+        std::cerr << "late older finish exposed the newer session binding to pressure: path="
+                  << static_cast<int>(replay.prefix_reuse_path)
+                  << " reused=" << replay.reused_prompt_tokens << '\n';
+        return 1;
+    }
+
+    {
+        std::vector<ninfer::TokenId> long_prompt(400, 198);
+        auto cancelled =
+            engine.submit(engine.prepare_tokens(std::move(long_prompt)), fixed_output(32, false));
+        if (!cancelled) {
+            std::cerr << "materialization cancellation fixture did not create a handle\n";
+            return 1;
+        }
+    }
+    const ninfer::GenerationResult after_cancel = engine.generate(
+        engine.prepare_tokens({248045, 846, 198, 5834, 248046, 198}), fixed_output(1, false));
+    if (after_cancel.generated_token_ids.size() != 1) {
+        std::cerr << "request after materialization cancellation did not complete\n";
+        return 1;
+    }
+
+    std::vector<ninfer::GenerationHandle> handles;
+    handles.reserve(8);
+    for (std::uint32_t row = 0; row < 8; ++row) {
+        std::vector<ninfer::TokenId> prompt{
+            248045, 846, 198, static_cast<ninfer::TokenId>(1000 + row), 248046, 198};
+        handles.push_back(
+            engine.submit(engine.prepare_tokens(std::move(prompt)), fixed_output(row + 1, false)));
+    }
+    for (std::uint32_t row = 0; row < handles.size(); ++row) {
+        const ninfer::GenerationResult result = handles[row].wait();
+        if (result.generated_token_ids.size() != row + 1 ||
+            result.finish_reason != ninfer::FinishReason::OutputLimit) {
+            std::cerr << "C=8 staggered row " << row << " did not terminate independently\n";
+            return 1;
+        }
+    }
+    const ninfer::RuntimeStats settled = engine.runtime_stats();
+    if (settled.running_requests != 0 || settled.materializing_requests != 0 ||
+        settled.prefilling_requests != 0 || settled.decode_ready_requests != 0 ||
+        settled.capture_pending_requests != 0 || settled.terminal_pending_requests != 0) {
+        std::cerr << "C=8 terminal settlement left live logical membership: running="
+                  << settled.running_requests << " materializing=" << settled.materializing_requests
+                  << " prefill=" << settled.prefilling_requests
+                  << " decode=" << settled.decode_ready_requests
+                  << " capture=" << settled.capture_pending_requests
+                  << " terminal=" << settled.terminal_pending_requests << '\n';
+        return 1;
+    }
+    return 0;
+}
+
+int verify_loaded_product(const ninfer::Engine& engine, std::string_view expected_target) {
     const ninfer::LoadSummary load = engine.load_summary();
-    if (load.target != "qwen3_6_27b" ||
+    if (load.target != expected_target ||
         (load.weights_id != "groupwise-int" && load.weights_id != "nvfp4") ||
         load.host_to_device_bytes == 0 || load.artifact_bytes_read < load.host_to_device_bytes) {
         std::cerr << "Engine construction has an invalid load summary: target=" << load.target
@@ -885,13 +1038,15 @@ int verify_loaded_product(const ninfer::Engine& engine) {
 
 } // namespace
 
-int exercise_artifact(const char* artifact) {
+int exercise_artifact(const char* artifact, std::string_view expected_target) {
     {
         ninfer::EngineOptions options             = engine_options(artifact);
         options.context_cache.device_state_slots  = 1;
         options.context_cache.max_shared_prefixes = 0;
         ninfer::Engine engine(std::move(options));
-        if (const int result = verify_loaded_product(engine); result != 0) { return result; }
+        if (const int result = verify_loaded_product(engine, expected_target); result != 0) {
+            return result;
+        }
         if (const int result = exercise_registered_frontend(engine); result != 0) { return result; }
         if (const int result = exercise_full_prefill_chunk(engine); result != 0) { return result; }
         if (const int result = exercise_rewrite_checkpoints(engine); result != 0) { return result; }
@@ -918,22 +1073,47 @@ int exercise_artifact(const char* artifact) {
     if (const int result = exercise_last_private_alias_eviction(artifact); result != 0) {
         return result;
     }
+    if (const int result = exercise_concurrent_resource_settlement(artifact, expected_target);
+        result != 0) {
+        return result;
+    }
     return 0;
 }
 
 int main() {
-    const char* groupwise = std::getenv("NINFER_QWEN3_6_27B_WEIGHTS");
-    const char* nvfp4     = std::getenv("NINFER_QWEN3_6_27B_NVFP4_WEIGHTS");
-    if ((groupwise == nullptr || *groupwise == '\0') && (nvfp4 == nullptr || *nvfp4 == '\0')) {
+    const char* groupwise        = std::getenv("NINFER_QWEN3_6_27B_WEIGHTS");
+    const char* nvfp4            = std::getenv("NINFER_QWEN3_6_27B_NVFP4_WEIGHTS");
+    const char* qwen38_groupwise = std::getenv("NINFER_QWEN3_8_27B_WEIGHTS");
+    const char* qwen38_nvfp4     = std::getenv("NINFER_QWEN3_8_27B_NVFP4_WEIGHTS");
+    if ((groupwise == nullptr || *groupwise == '\0') && (nvfp4 == nullptr || *nvfp4 == '\0') &&
+        (qwen38_groupwise == nullptr || *qwen38_groupwise == '\0') &&
+        (qwen38_nvfp4 == nullptr || *qwen38_nvfp4 == '\0')) {
         std::cout << "skip: neither NINFER_QWEN3_6_27B_WEIGHTS nor "
-                     "NINFER_QWEN3_6_27B_NVFP4_WEIGHTS is set\n";
+                     "NINFER_QWEN3_6_27B_NVFP4_WEIGHTS nor a Qwen3.8 equivalent is set\n";
         return 77;
     }
     if (groupwise != nullptr && *groupwise != '\0') {
-        if (const int result = exercise_artifact(groupwise); result != 0) { return result; }
+        if (const int result = exercise_artifact(groupwise, "qwen3_6_27b"); result != 0) {
+            return result;
+        }
     }
     if (nvfp4 != nullptr && *nvfp4 != '\0') {
-        if (const int result = exercise_artifact(nvfp4); result != 0) { return result; }
+        if (const int result = exercise_artifact(nvfp4, "qwen3_6_27b"); result != 0) {
+            return result;
+        }
+    }
+    if (qwen38_groupwise != nullptr && *qwen38_groupwise != '\0') {
+        if (const int result =
+                exercise_concurrent_resource_settlement(qwen38_groupwise, "qwen3_8_27b");
+            result != 0) {
+            return result;
+        }
+    }
+    if (qwen38_nvfp4 != nullptr && *qwen38_nvfp4 != '\0') {
+        if (const int result = exercise_concurrent_resource_settlement(qwen38_nvfp4, "qwen3_8_27b");
+            result != 0) {
+            return result;
+        }
     }
     std::cout << "ok\n";
     return 0;

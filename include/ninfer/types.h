@@ -593,11 +593,9 @@ struct RuntimeHostWorkStats {
 
     std::uint64_t admission_policy_ns           = 0;
     std::uint64_t context_progress_ns           = 0;
-    std::uint64_t replica_policy_ns             = 0;
     std::uint64_t stats_publication_ns          = 0;
     std::uint64_t admission_policy_invocations  = 0;
     std::uint64_t context_progress_invocations  = 0;
-    std::uint64_t replica_policy_invocations    = 0;
     std::uint64_t stats_publication_invocations = 0;
 };
 
@@ -618,6 +616,7 @@ struct RuntimeStats {
     std::uint32_t waiting_requests          = 0;
     std::uint32_t materializing_requests    = 0;
     std::uint32_t capture_pending_requests  = 0;
+    std::uint32_t terminal_pending_requests = 0;
     std::uint64_t active_captures_completed = 0;
     std::uint64_t active_captures_aborted   = 0;
 

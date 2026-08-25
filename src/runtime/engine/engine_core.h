@@ -5,7 +5,6 @@
 #include "core/nvtx.h"
 #include "ninfer/types.h"
 #include "runtime/contract/types.h"
-#include "runtime/engine/admission_policy.h"
 #include "runtime/engine/request_record.h"
 #include "runtime/engine/resource_manager.h"
 #include "runtime/engine/scheduler.h"
@@ -64,9 +63,7 @@ public:
           max_outstanding_(static_cast<std::size_t>(options.max_concurrency) +
                            options.max_pending_requests),
           pending_timeout_(std::chrono::milliseconds(options.pending_timeout_ms)),
-          admission_capacity_(instance.program->admission_capacity()),
-          resources_(admission_capacity_, max_concurrency_,
-                     options.context_cache.max_private_continuations.value(),
+          resources_(max_concurrency_, options.context_cache.max_private_continuations.value(),
                      options.context_cache.max_shared_prefixes.value(),
                      options.context_cache.enabled,
                      options.context_cache.max_long_anchors_per_continuation.value_or(0),
@@ -76,10 +73,7 @@ public:
             throw std::invalid_argument("Engine core bounds are invalid");
         }
         if (!options.context_cache.max_private_continuations ||
-            !options.context_cache.max_shared_prefixes ||
-            admission_capacity_.device.active_lanes != max_concurrency_ ||
-            admission_capacity_.device.state_slots < max_concurrency_ ||
-            admission_capacity_.device.main_kv_pages == 0) {
+            !options.context_cache.max_shared_prefixes) {
             throw std::logic_error("target admission capacity does not match the Engine");
         }
         worker_ = std::thread([this] { worker_loop(); });
@@ -160,7 +154,8 @@ public:
                                "inference request expired before submission");
         }
 
-        std::uint64_t request_id = 0;
+        std::uint64_t request_id        = 0;
+        std::uint64_t publication_order = 0;
         {
             std::lock_guard lock(queue_mutex_);
             if (stopping_ || failed_) {
@@ -170,8 +165,12 @@ public:
             if (outstanding_ >= max_outstanding_) {
                 throw RequestError(RequestErrorKind::Overloaded, "inference request queue is full");
             }
+            if (next_request_id_ == 0 || next_publication_order_ == 0) {
+                throw std::overflow_error("request identity space exhausted");
+            }
             ++outstanding_;
-            request_id = next_request_id_++;
+            request_id        = next_request_id_++;
+            publication_order = next_publication_order_++;
         }
 
         std::shared_ptr<Request> request;
@@ -187,9 +186,9 @@ public:
                 throw RequestError(RequestErrorKind::ThinkingBudgetCapacityInsufficient,
                                    error.what());
             }
-            request = std::make_shared<Request>(request_id, std::move(prompt), std::move(output),
-                                                prompt_summary, prepare_seconds, std::move(options),
-                                                consumer_mode, pending_deadline, submitted);
+            request = std::make_shared<Request>(
+                request_id, publication_order, std::move(prompt), std::move(output), prompt_summary,
+                prepare_seconds, std::move(options), consumer_mode, pending_deadline, submitted);
         } catch (...) {
             release_reserved_capacity();
             throw;
@@ -494,7 +493,7 @@ private:
         std::optional<nvtx::ScopedRange> detail_range;
         detail_range.emplace(nvtx::Name::StatsPublication, nvtx::Category::Control);
         RuntimeStats snapshot = cumulative_stats_;
-        resources_.populate_runtime_stats(snapshot);
+        resources_.populate_runtime_stats(*instance_.program, snapshot);
         {
             std::lock_guard lock(queue_mutex_);
             snapshot.waiting_requests = static_cast<std::uint32_t>(pending_.size());
@@ -510,6 +509,7 @@ private:
             ++snapshot.running_requests;
             if (slots_[lane]->is_decode_ready()) { ++snapshot.decode_ready_requests; }
             if (slots_[lane]->capture_pending) { ++snapshot.capture_pending_requests; }
+            if (slots_[lane]->terminal_reason) { ++snapshot.terminal_pending_requests; }
         }
         detail_range.reset();
         record_detail(&RuntimeHostWorkStats::stats_publication_ns,
@@ -691,6 +691,7 @@ private:
         request->sequence.reset();
         request->lane.reset();
         request->budget.reset();
+        request->terminal_reason.reset();
         {
             std::lock_guard lock(request->mutex);
             if (request->response_done) { return; }
@@ -737,6 +738,7 @@ private:
         request->sequence.reset();
         request->lane.reset();
         request->budget.reset();
+        request->terminal_reason.reset();
         finish_engine_phase(completion, EngineHostPhase::CommitOutput);
         result.engine_timing = request->host_timing.public_snapshot();
         {
@@ -772,6 +774,10 @@ private:
 
     [[nodiscard]] std::array<bool, kMaximumConcurrency> snapshot_cancellations() const noexcept {
         std::array<bool, kMaximumConcurrency> cancelled{};
+        // An already-issued active unit may finish while another row owns the global resource
+        // transaction.  Its cancellation cannot release topology until that transaction reaches
+        // a stable terminal state.
+        if (instance_.program->has_context_transaction()) { return cancelled; }
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             if (slots_[lane] != nullptr) {
                 cancelled[lane] = slots_[lane]->cancelled.load(std::memory_order_acquire);
@@ -780,8 +786,54 @@ private:
         return cancelled;
     }
 
+    bool settle_terminal_requests(HostPhaseMeasurement& boundary) {
+        const bool manager_transaction = resources_.context_transaction_kind().has_value();
+        const bool program_transaction = instance_.program->has_context_transaction();
+        if (manager_transaction != program_transaction) {
+            throw std::logic_error("Engine and Program disagree before terminal settlement");
+        }
+        if (program_transaction) { return false; }
+
+        bool changed = false;
+        for (;;) {
+            std::optional<std::uint32_t> selected;
+            for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+                const auto& request = slots_[lane];
+                if (request == nullptr || !request->terminal_reason) { continue; }
+                if (!selected ||
+                    request->publication_order < slots_[*selected]->publication_order) {
+                    selected = lane;
+                }
+            }
+            if (!selected) { break; }
+
+            const std::uint32_t lane = *selected;
+            const auto request       = slots_[lane];
+            if (!request->is_model_finished() || request->capture_pending || !request->sequence ||
+                !request->lane || request->lane->value != lane ||
+                resources_.lane_state(LaneId{lane}) != LogicalLaneState::TerminalPending) {
+                throw std::logic_error("terminal-pending request has invalid ownership");
+            }
+            const FinishReason reason = *request->terminal_reason;
+            auto finished =
+                resources_.finish(*instance_.program, *request->lane, *request->sequence);
+            request->generation_timings = finished.timings;
+            request->speculative_stats  = std::move(finished.speculative);
+            request->terminal_reason.reset();
+
+            finish_engine_phase(boundary, EngineHostPhase::Boundary);
+            complete_success(request, reason);
+            remove_completed_slot(lane);
+            boundary = begin_host_phase();
+            changed  = true;
+        }
+        if (changed) { publish_runtime_stats(); }
+        return changed;
+    }
+
     void cancel_active_requests(const std::array<bool, kMaximumConcurrency>& cancelled_at_boundary,
                                 HostPhaseMeasurement& boundary) {
+        if (instance_.program->has_context_transaction()) { return; }
         bool changed = false;
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             const auto& request = slots_[lane];
@@ -949,10 +1001,16 @@ private:
                                           first + static_cast<std::ptrdiff_t>(accepted));
             }
         } catch (...) {
+            const std::exception_ptr error = std::current_exception();
             rollback_generated();
             const auto discarded = instance_.program->abort_pending(std::move(pending));
-            resources_.apply_discard(std::span<const LaneId>(lanes.data(), row_count), discarded);
-            throw;
+            if (discarded.status == ConsumeStatus::Consumed) {
+                resources_.apply_discard(std::span<const LaneId>(lanes.data(), row_count),
+                                         discarded);
+            } else if (!instance_.program->has_context_transaction()) {
+                throw std::logic_error("Program could not abort a failed pending batch");
+            }
+            std::rethrow_exception(error);
         }
 
         std::optional<typename Package::CommitResult> committed_storage;
@@ -967,7 +1025,9 @@ private:
             phase.resume_range();
         } catch (...) {
             rollback_generated();
-            resources_.release_failed_commit(std::span<const LaneId>(lanes.data(), row_count));
+            if (!instance_.program->has_context_transaction()) {
+                resources_.release_failed_commit(std::span<const LaneId>(lanes.data(), row_count));
+            }
             throw;
         }
         generated_staged = false;
@@ -989,17 +1049,15 @@ private:
             }
         }
         resources_.apply_commit(std::span<const LaneId>(lanes.data(), row_count), committed);
+        const bool terminal_in_batch = std::any_of(
+            decisions.begin(), decisions.begin() + static_cast<std::ptrdiff_t>(row_count),
+            [](const CommitDecision& decision) { return decision.terminal; });
 
         for (std::size_t row = 0; row < row_count; ++row) {
             const auto& request = slots_[lane_indices[row]];
             if (cancelled[row]) {
                 request->generation_timings = committed.rows[row].timings;
                 request->speculative_stats  = std::move(committed.rows[row].speculative);
-            } else if (decisions[row].terminal) {
-                auto finished =
-                    resources_.finish(*instance_.program, lanes[row], *request->sequence);
-                request->generation_timings = finished.timings;
-                request->speculative_stats  = std::move(finished.speculative);
             }
         }
 
@@ -1026,19 +1084,30 @@ private:
                 if (!request->first_token && accepted != 0) { request->first_token = Clock::now(); }
                 append_output(request, std::move(published));
                 if (decisions[row].terminal) {
-                    terminal_requests[terminal_count] = request;
-                    terminal_lanes[terminal_count]    = lane;
-                    terminal_reasons[terminal_count]  = finish_reasons[row];
-                    ++terminal_count;
+                    if (cancelled[row]) {
+                        terminal_requests[terminal_count] = request;
+                        terminal_lanes[terminal_count]    = lane;
+                        terminal_reasons[terminal_count]  = finish_reasons[row];
+                        ++terminal_count;
+                    } else {
+                        request->model_state     = EngineRequestState::ModelFinished;
+                        request->terminal_reason = finish_reasons[row];
+                    }
                 } else if (committed.captures[row]) {
                     if (!request->is_prefilling()) {
                         throw std::logic_error("prompt-frontier capture lost its prefill owner");
                     }
-                    reserve_active_capture(request, std::move(*committed.captures[row]),
-                                           continuations[row] ==
-                                                   ContinuationAction::ApplyTargetControl
-                                               ? EngineRequestState::ControlReady
-                                               : EngineRequestState::DecodeReady);
+                    const EngineRequestState post_capture_state =
+                        continuations[row] == ContinuationAction::ApplyTargetControl
+                            ? EngineRequestState::ControlReady
+                            : EngineRequestState::DecodeReady;
+                    if (terminal_in_batch) {
+                        instance_.program->skip_capture(std::move(*committed.captures[row]));
+                        request->model_state = post_capture_state;
+                    } else {
+                        reserve_active_capture(request, std::move(*committed.captures[row]),
+                                               post_capture_state);
+                    }
                     committed.captures[row].reset();
                     if (!request->capture_pending) {
                         request->model_state =
@@ -1081,22 +1150,6 @@ private:
             }
         }
         return request;
-    }
-
-    void try_start_replica_transition() {
-        if (!resources_.replica_policy_pending()) { return; }
-        EnginePhaseScope phase(*this, EngineHostPhase::Maintenance);
-        DetailScope detail(*this, &RuntimeHostWorkStats::replica_policy_ns,
-                           &RuntimeHostWorkStats::replica_policy_invocations,
-                           nvtx::Name::ReplicaPolicy);
-        if (instance_.program->has_context_transaction() || scheduler_.prefill_lane() ||
-            has_pending_requests()) {
-            return;
-        }
-        if (resources_.reserve_replica_transition(*instance_.program) ==
-            ResourceManagement::ReplicaTransitionReserveResult::Reserved) {
-            publish_runtime_stats();
-        }
     }
 
     void reserve_active_capture(const std::shared_ptr<Request>& request, CaptureOffer&& offer,
@@ -1200,14 +1253,14 @@ private:
                 instance_.program->plan_request(request->prompt, request->options.execution));
         }
         const RequestPlanSummary& summary = request->base_plan->summary();
-        if (request->base_plan->root_demand().active_entitlement.device.active_lanes != 1 ||
-            summary.service_work_quanta == 0) {
+        if (summary.service_work_quanta == 0) {
             throw std::logic_error("target request plan has invalid admission accounting");
         }
     }
 
     [[nodiscard]] ResourceInspection inspect_admission(const std::shared_ptr<Request>& request) {
-        return resources_.inspect(*instance_.program, request->prompt, *request->base_plan);
+        return resources_.inspect(*instance_.program, request->prompt, *request->base_plan,
+                                  request->publication_order);
     }
 
     [[nodiscard]] AdmissionProgress remove_pending_error(const std::shared_ptr<Request>& request,
@@ -1235,7 +1288,7 @@ private:
         CancellationFlagView cancellation{&yield};
         switch (*kind) {
         case ContextTransactionKind::Materialization: {
-            if (!materializing_ || capture || resources_.has_replica_transition()) {
+            if (!materializing_ || capture) {
                 throw std::logic_error("materialization has conflicting Engine ownership");
             }
             const MaterializingRequest& control = *materializing_;
@@ -1250,15 +1303,10 @@ private:
             break;
         }
         case ContextTransactionKind::ActiveCapture:
-            if (materializing_ || !capture || resources_.has_replica_transition()) {
+            if (materializing_ || !capture) {
                 throw std::logic_error("active capture has conflicting Engine ownership");
             }
             cancellation = CancellationFlagView{&capture->cancelled};
-            break;
-        case ContextTransactionKind::ReplicaTransition:
-            if (materializing_ || capture || !resources_.has_replica_transition()) {
-                throw std::logic_error("replica transition has conflicting Engine ownership");
-            }
             break;
         }
 
@@ -1295,11 +1343,6 @@ private:
                     }
                     auto activation = std::move(*terminal.activation);
                     terminal.activation.reset();
-                    if (activation.active_resources() !=
-                        resources_.lane_entitlement(LaneId{lane})) {
-                        throw std::logic_error(
-                            "materialized entitlement changed after admission commit");
-                    }
                     const SequenceHandle sequence = activation.sequence();
                     resources_.adopt(*instance_.program, std::move(activation));
                     request->sequence.emplace(sequence);
@@ -1337,18 +1380,8 @@ private:
                     request_admission_check();
                     publish_runtime_stats();
                     return AdmissionProgress::ControlProgress;
-                } else {
-                    static_assert(
-                        std::is_same_v<Outcome,
-                                       typename ResourceManagement::ReplicaTransitionOutcome>);
-                    if (*kind != ContextTransactionKind::ReplicaTransition || materializing_ ||
-                        capture || terminal.status == ContextTransactionStatus::InProgress) {
-                        throw std::logic_error("replica-transition outcome is invalid");
-                    }
-                    request_admission_check();
-                    publish_runtime_stats();
-                    return AdmissionProgress::ControlProgress;
                 }
+                throw std::logic_error("unknown resource transaction outcome");
             },
             std::move(outcome));
     }
@@ -1495,15 +1528,30 @@ private:
             const ActiveAdmissionSet active =
                 scheduler_.active_admission_set(slots_, max_concurrency_);
             if (active.size == 0) {
-                throw std::logic_error("exclusive-feasible request cannot enter an idle Engine");
+                throw std::logic_error("isolated-feasible request is blocked in an idle Engine");
             }
-            const ProtectedHeadResourceProjection current_projection =
-                resources_.protected_head_projection(*instance_.program);
-            if (!scheduler_.protect_blocked_head(
-                    head->id, head->base_plan->root_demand().active_entitlement.device,
-                    active.span(), current_projection, admission_capacity_.device)) {
+            if (!scheduler_.protect_blocked_head(head->id, active.span(),
+                                                 instance_.program->resource_revision())) {
                 return control_progress ? AdmissionProgress::ControlProgress
                                         : AdmissionProgress::None;
+            }
+            const std::optional<std::uint64_t> protection_epoch = scheduler_.protection_epoch();
+            if (!protection_epoch) {
+                throw std::logic_error("blocked FIFO head has no protection epoch");
+            }
+
+            std::array<SequenceHandle, kMaximumConcurrency> persistent_borrowers{};
+            std::size_t persistent_borrower_count = 0;
+            for (const auto& active_request : slots_) {
+                if (active_request == nullptr ||
+                    active_request->backfill_class != BackfillClass::Persistent ||
+                    active_request->backfill_epoch != *protection_epoch) {
+                    continue;
+                }
+                if (!active_request->sequence) {
+                    throw std::logic_error("persistent borrower has no sequence reservation");
+                }
+                persistent_borrowers[persistent_borrower_count++] = *active_request->sequence;
             }
 
             for (const std::shared_ptr<Request>& candidate : queued.backfill_candidates()) {
@@ -1524,7 +1572,6 @@ private:
                     control_progress = true;
                     continue;
                 }
-
                 try {
                     ensure_base_plan(candidate);
                 } catch (...) {
@@ -1541,19 +1588,20 @@ private:
                     control_progress = true;
                     continue;
                 }
-                if (candidate_inspection.readiness != Readiness::Ready &&
-                    candidate_inspection.readiness != Readiness::NeedsTransfer) {
+                if ((candidate_inspection.readiness != Readiness::Ready &&
+                     candidate_inspection.readiness != Readiness::NeedsTransfer) ||
+                    !candidate_inspection.choice) {
                     continue;
                 }
-                if (!candidate_inspection.choice) {
-                    throw std::logic_error("ready resource inspection has no admission choice");
-                }
+                const auto proof = resources_.prove_persistent_backfill(
+                    *instance_.program, *head->base_plan, *candidate_inspection.choice,
+                    std::span<const SequenceHandle>(persistent_borrowers.data(),
+                                                    persistent_borrower_count));
+                if (!proof) { continue; }
                 const RequestPlanSummary& candidate_plan = candidate_inspection.choice->summary();
-
-                auto grant = scheduler_.qualify_backfill(
-                    candidate->id, candidate_inspection.choice->projection(),
-                    candidate_plan.service_work_quanta, active.span(), admission_capacity_.device,
-                    candidate_inspection.choice->temporal_eligible());
+                auto grant =
+                    scheduler_.qualify_backfill(candidate->id, candidate_plan.service_work_quanta,
+                                                active.span(), proof->resource_revision());
                 if (grant) {
                     return admit_planned_request(candidate, std::move(*candidate_inspection.choice),
                                                  std::move(*grant));
@@ -1689,7 +1737,7 @@ private:
             {
                 std::unique_lock lock(queue_mutex_);
                 if (!stopping_ && pending_.empty()) {
-                    bool active = materializing_.has_value() || resources_.has_replica_transition();
+                    bool active = materializing_.has_value();
                     for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
                         active = active || slots_[lane] != nullptr;
                     }
@@ -1713,6 +1761,7 @@ private:
                 HostPhaseMeasurement boundary = begin_host_phase();
                 const bool have_pending       = expire_pending_requests();
                 (void)progress_context_transaction(have_pending);
+                (void)settle_terminal_requests(boundary);
                 const auto cancelled_at_boundary = snapshot_cancellations();
                 cancel_active_requests(cancelled_at_boundary, boundary);
                 RoundMembership membership =
@@ -1739,7 +1788,6 @@ private:
                     finish_engine_phase(boundary, EngineHostPhase::Boundary);
                     run_control_batch(control_membership);
                     previous_unit_was_decode = true;
-                    try_start_replica_transition();
                     continue;
                 }
                 membership = scheduler_.build_round_membership(slots_, max_concurrency_);
@@ -1758,7 +1806,6 @@ private:
                     finish_engine_phase(boundary, EngineHostPhase::Boundary);
                     run_prefill_step(cancelled_at_unit_start);
                     previous_unit_was_decode = false;
-                    try_start_replica_transition();
                     continue;
                 }
                 if (action == ExecutionAction::Decode) {
@@ -1766,12 +1813,10 @@ private:
                     finish_engine_phase(boundary, EngineHostPhase::Boundary);
                     run_decode_round(membership, cancelled_at_unit_start);
                     previous_unit_was_decode = true;
-                    try_start_replica_transition();
                     continue;
                 }
                 set_host_work_class(HostWorkClass::Control);
                 finish_engine_phase(boundary, EngineHostPhase::Boundary);
-                try_start_replica_transition();
             } catch (...) {
                 const std::exception_ptr error = std::current_exception();
                 HostPhaseMeasurement cleanup   = begin_host_phase();
@@ -1793,7 +1838,6 @@ private:
     const std::uint32_t max_concurrency_;
     const std::size_t max_outstanding_;
     const std::chrono::milliseconds pending_timeout_;
-    const ResourceVector admission_capacity_;
     ResourceManagement resources_;
 
     mutable std::mutex execution_mutex_;
@@ -1801,8 +1845,9 @@ private:
     mutable std::mutex stats_mutex_;
     std::condition_variable queue_cv_;
     std::deque<std::shared_ptr<Request>> pending_;
-    std::size_t outstanding_       = 0;
-    std::uint64_t next_request_id_ = 1;
+    std::size_t outstanding_              = 0;
+    std::uint64_t next_request_id_        = 1;
+    std::uint64_t next_publication_order_ = 1;
     std::array<std::shared_ptr<Request>, kMaximumConcurrency> slots_{};
     std::optional<MaterializingRequest> materializing_;
     Scheduling scheduler_;

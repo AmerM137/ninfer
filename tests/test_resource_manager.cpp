@@ -5,8 +5,8 @@
 #include <atomic>
 #include <cstdint>
 #include <iostream>
-#include <limits>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string_view>
 #include <utility>
@@ -15,15 +15,43 @@
 
 namespace {
 
+using ninfer::PrefixReusePath;
+using ninfer::RuntimeStats;
+using ninfer::runtime::CancellationFlagView;
+using ninfer::runtime::CheckpointKind;
+using ninfer::runtime::CheckpointRef;
+using ninfer::runtime::CheckpointScope;
+using ninfer::runtime::ClaimDisposition;
+using ninfer::runtime::CommitDisposition;
 using ninfer::runtime::ConsumeStatus;
-using ninfer::runtime::DeviceResources;
-using ninfer::runtime::HostResources;
+using ninfer::runtime::ContextOperationCounts;
+using ninfer::runtime::ContextTransactionInProgress;
+using ninfer::runtime::ContextTransactionReserveStatus;
+using ninfer::runtime::ContextTransactionStatus;
+using ninfer::runtime::ContextTransferObservation;
+using ninfer::runtime::ContextTransferRequirement;
+using ninfer::runtime::FinishDisposition;
 using ninfer::runtime::LaneId;
-using ninfer::runtime::MaterializationPressureEffect;
+using ninfer::runtime::PrefillWork;
+using ninfer::runtime::Readiness;
 using ninfer::runtime::RequestPlanSummary;
-using ninfer::runtime::ResourceDelta;
-using ninfer::runtime::ResourceDemand;
-using ninfer::runtime::ResourceVector;
+using ninfer::runtime::RetentionClass;
+
+int failures = 0;
+
+void require(bool condition, const char* message) {
+    if (!condition) { throw std::runtime_error(message); }
+}
+
+template <class Test>
+void run_test(const char* name, Test&& test) {
+    try {
+        test();
+    } catch (const std::exception& error) {
+        ++failures;
+        std::cerr << "FAIL " << name << ": " << error.what() << '\n';
+    }
+}
 
 ninfer::runtime::ContextCostModel test_cost_model() {
     ninfer::runtime::ContextCostModel model;
@@ -38,168 +66,174 @@ ninfer::runtime::ContextCostModel test_cost_model() {
     return model;
 }
 
-int failures = 0;
-
-void expect(bool condition, const char* message) {
-    if (condition) { return; }
-    ++failures;
-    std::cerr << "FAIL: " << message << '\n';
-}
-
-DeviceResources converted(DeviceResources active, DeviceResources source) {
-    return DeviceResources{
-        .state_slots      = std::min(active.state_slots, source.state_slots),
-        .main_kv_pages    = std::min(active.main_kv_pages, source.main_kv_pages),
-        .backend_kv_pages = std::min(active.backend_kv_pages, source.backend_kv_pages),
-    };
-}
-
-DeviceResources additional(DeviceResources active, DeviceResources source_conversion) {
-    return DeviceResources{
-        .active_lanes     = active.active_lanes,
-        .state_slots      = active.state_slots - source_conversion.state_slots,
-        .main_kv_pages    = active.main_kv_pages - source_conversion.main_kv_pages,
-        .backend_kv_pages = active.backend_kv_pages - source_conversion.backend_kv_pages,
-    };
-}
-
-constexpr ResourceVector resources(DeviceResources device, HostResources host = {}) noexcept {
-    return ResourceVector{.device = device, .host = host};
-}
-
-ResourceDemand demand(DeviceResources active, DeviceResources source = {}) {
-    const DeviceResources conversion  = converted(active, source);
-    const ResourceVector entitlement  = resources(active);
-    const ResourceVector source_value = resources(source);
-    const ResourceVector credit       = resources(conversion);
-    const ResourceVector added        = resources(additional(active, conversion));
-    return ResourceDemand{
-        .active_entitlement       = entitlement,
-        .reservation_added        = added,
-        .reservation_credit       = credit,
-        .physical_peak_additional = added,
-        .final_removed            = source_value,
-        .final_added              = entitlement,
-    };
-}
-
 struct FakePreparedPrompt {
-    std::uint32_t key = 0;
-    bool allow_reuse  = true;
+    std::uint32_t content_key = 0;
 };
 
 struct FakeCacheSessionKey {
-    std::uint32_t value                                              = 0;
-    friend bool operator==(FakeCacheSessionKey, FakeCacheSessionKey) = default;
+    std::uint32_t value = 0;
 
     [[nodiscard]] std::string_view view() const noexcept {
         return {reinterpret_cast<const char*>(&value), sizeof(value)};
     }
+
+    friend bool operator==(FakeCacheSessionKey, FakeCacheSessionKey) = default;
 };
 
 struct FakeShortlistKey {
-    std::uint32_t digest                                       = 0;
-    std::uint32_t frontier                                     = 0;
+    std::uint32_t digest   = 0;
+    std::uint32_t frontier = 0;
+
     friend bool operator==(FakeShortlistKey, FakeShortlistKey) = default;
 };
 
+struct FakeRequiredKV {
+    std::uint32_t main_pages    = 1;
+    std::uint32_t backend_pages = 0;
+};
+
+struct FakeCheckpointSummary {
+    CheckpointRef ref;
+    CheckpointScope scope = CheckpointScope::Private;
+    FakeShortlistKey shortlist_key;
+    FakeRequiredKV required_kv;
+    PrefillWork rebuild_work;
+};
+
+struct FakeContinuationSummary {
+    std::optional<FakeCheckpointSummary> endpoint;
+    std::optional<FakeCheckpointSummary> rewrite;
+    std::vector<FakeCheckpointSummary> long_anchors;
+    std::uint32_t active_references = 0;
+};
+
+struct FakeSharedPrefixSummary {
+    FakeCheckpointSummary checkpoint;
+    std::uint32_t active_references = 0;
+};
+
+FakeCheckpointSummary endpoint(std::uint32_t digest, std::uint32_t frontier) {
+    return FakeCheckpointSummary{
+        .ref           = CheckpointRef{.kind     = CheckpointKind::SessionEndpoint,
+                                       .frontier = frontier,
+                                       .ordinal  = 0},
+        .scope         = CheckpointScope::Private,
+        .shortlist_key = FakeShortlistKey{.digest = digest, .frontier = frontier},
+        .required_kv   = FakeRequiredKV{.main_pages = 1, .backend_pages = 0},
+        .rebuild_work  = PrefillWork{.tokens = frontier},
+    };
+}
+
 struct FakeContextCache {
     std::optional<FakeCacheSessionKey> session_key;
-    ninfer::runtime::RetentionClass retention = ninfer::runtime::RetentionClass::RecentPrivate;
-    bool update_session_index                 = true;
+    RetentionClass retention  = RetentionClass::RecentPrivate;
+    bool update_session_index = true;
 };
 
 struct FakeRequestBasePlan {
     RequestPlanSummary value;
-    ResourceDemand resources;
     FakeContextCache cache;
     std::uint32_t shortlist_digest = 0;
+    bool allow_shortlist           = true;
+    bool isolated_feasible         = true;
 
     [[nodiscard]] const RequestPlanSummary& summary() const noexcept { return value; }
-
-    [[nodiscard]] const ResourceDemand& root_demand() const noexcept { return resources; }
 
     [[nodiscard]] const FakeContextCache& context_cache() const noexcept { return cache; }
 
     [[nodiscard]] std::optional<FakeShortlistKey>
     prefix_shortlist_key(std::uint32_t frontier) const noexcept {
-        if (frontier != 16) { return std::nullopt; }
+        if (!allow_shortlist || frontier == 0) { return std::nullopt; }
         return FakeShortlistKey{.digest = shortlist_digest, .frontier = frontier};
     }
 };
 
+FakeRequestBasePlan make_base(std::uint32_t digest,
+                              std::optional<FakeCacheSessionKey> session = std::nullopt,
+                              RetentionClass retention  = RetentionClass::RecentPrivate,
+                              bool update_session_index = true) {
+    FakeRequestBasePlan out;
+    out.value.prompt_tokens           = 64;
+    out.value.requested_output_tokens = 8;
+    out.value.effective_output_tokens = 8;
+    out.value.service_work_quanta     = 64;
+    out.value.publish_continuation    = true;
+    out.cache.session_key             = session;
+    out.cache.retention               = retention;
+    out.cache.update_session_index    = update_session_index;
+    out.shortlist_digest              = digest;
+    return out;
+}
+
+struct FakeContinuationHandle {
+    std::uint32_t id          = 0;
+    std::uint32_t content_key = 0;
+
+    FakeContinuationHandle() = default;
+
+    FakeContinuationHandle(std::uint32_t id_value, std::uint32_t key_value)
+        : id(id_value), content_key(key_value) {}
+
+    FakeContinuationHandle(FakeContinuationHandle&& other) noexcept
+        : id(std::exchange(other.id, 0)), content_key(other.content_key) {}
+
+    FakeContinuationHandle& operator=(FakeContinuationHandle&& other) noexcept {
+        id          = std::exchange(other.id, 0);
+        content_key = other.content_key;
+        return *this;
+    }
+
+    FakeContinuationHandle(const FakeContinuationHandle&)            = delete;
+    FakeContinuationHandle& operator=(const FakeContinuationHandle&) = delete;
+};
+
+struct FakeSharedPrefixHandle {
+    std::uint32_t id          = 0;
+    std::uint32_t content_key = 0;
+
+    FakeSharedPrefixHandle()                                             = default;
+    FakeSharedPrefixHandle(FakeSharedPrefixHandle&&) noexcept            = default;
+    FakeSharedPrefixHandle& operator=(FakeSharedPrefixHandle&&) noexcept = default;
+    FakeSharedPrefixHandle(const FakeSharedPrefixHandle&)                = delete;
+    FakeSharedPrefixHandle& operator=(const FakeSharedPrefixHandle&)     = delete;
+};
+
+struct FakeSequenceHandle {
+    std::uint32_t id = 0;
+
+    friend bool operator==(FakeSequenceHandle, FakeSequenceHandle) = default;
+};
+
+struct FakeCaptureOffer {
+    std::uint32_t id = 0;
+};
+
 struct FakeAdmissionPlan {
     RequestPlanSummary value;
-    ResourceDemand resources;
-    LaneId destination;
-    std::uint32_t key       = 0;
-    bool source             = false;
-    std::uint64_t root_work = 0;
-    ResourceVector source_value;
-    std::vector<ninfer::runtime::ContextTransferRequirement> transfers;
-    ninfer::runtime::ClaimDisposition disposition =
-        ninfer::runtime::ClaimDisposition::ConsumedToActive;
-
-    FakeAdmissionPlan()                                        = default;
-    FakeAdmissionPlan(FakeAdmissionPlan&&) noexcept            = default;
-    FakeAdmissionPlan& operator=(FakeAdmissionPlan&&) noexcept = default;
-    FakeAdmissionPlan(const FakeAdmissionPlan&)                = delete;
-    FakeAdmissionPlan& operator=(const FakeAdmissionPlan&)     = delete;
+    PrefillWork remaining;
+    std::vector<ContextTransferRequirement> transfers;
+    ClaimDisposition disposition    = ClaimDisposition::ConsumedToActive;
+    std::uint32_t private_source_id = 0;
+    std::uint32_t shared_source_id  = 0;
 
     [[nodiscard]] const RequestPlanSummary& summary() const noexcept { return value; }
 
-    [[nodiscard]] const ResourceDemand& demand() const noexcept { return resources; }
-
-    [[nodiscard]] ResourceVector source_resources() const noexcept { return source_value; }
-
-    [[nodiscard]] ninfer::runtime::ClaimDisposition source_disposition() const noexcept {
-        return disposition;
-    }
+    [[nodiscard]] ClaimDisposition source_disposition() const noexcept { return disposition; }
 
     [[nodiscard]] bool needs_transfer() const noexcept { return !transfers.empty(); }
 
-    [[nodiscard]] bool temporal_eligible() const noexcept { return transfers.empty(); }
+    [[nodiscard]] PrefillWork remaining_prefill_work() const noexcept { return remaining; }
 
-    [[nodiscard]] ninfer::runtime::PrefillWork remaining_prefill_work() const noexcept {
-        return {.tokens = value.service_work_quanta};
-    }
-
-    [[nodiscard]] std::span<const ninfer::runtime::ContextTransferRequirement>
+    [[nodiscard]] std::span<const ContextTransferRequirement>
     transfer_requirements() const noexcept {
         return transfers;
     }
 };
 
-struct FakeReplicaValueImpact {
-    ninfer::runtime::CheckpointRef checkpoint;
-    ninfer::runtime::PrefillWork fallback_rebuild_work;
-    std::vector<ninfer::runtime::ContextTransferRequirement> fallback_restore_requirements;
-    std::vector<ninfer::runtime::ContextTransferRequirement> host_restore_requirements;
-
-    friend bool operator==(const FakeReplicaValueImpact&, const FakeReplicaValueImpact&) = default;
-};
-
-enum class FakePressureKVActionKind : std::uint8_t {
-    None,
-    DropDeviceDuplicate,
-    DemoteToHost,
-    DropHostDuplicate,
-};
-
-struct FakePressureKVAction {
-    std::uint32_t begin_page      = 0;
-    std::uint32_t page_count      = 0;
-    FakePressureKVActionKind kind = FakePressureKVActionKind::None;
-
-    friend bool operator==(FakePressureKVAction, FakePressureKVAction) = default;
-};
-
 struct FakePressureCheckpointImpact {
-    ninfer::runtime::CheckpointRef checkpoint;
-    ninfer::runtime::PrefillWork fallback_rebuild_work;
-    std::vector<ninfer::runtime::ContextTransferRequirement> current_restore_requirements;
-    std::vector<ninfer::runtime::ContextTransferRequirement> fallback_restore_requirements;
-    std::vector<ninfer::runtime::ContextTransferRequirement> added_restore_requirements;
+    CheckpointRef checkpoint;
+    PrefillWork fallback_rebuild_work;
+    std::vector<ContextTransferRequirement> added_restore_requirements;
     bool drops_checkpoint = false;
 
     friend bool operator==(const FakePressureCheckpointImpact&,
@@ -208,127 +242,78 @@ struct FakePressureCheckpointImpact {
 
 struct FakePressureOption {
     std::uint64_t id = 0;
-    FakePressureKVAction main_kv;
-    FakePressureKVAction backend_kv;
-    std::optional<ninfer::runtime::CheckpointRef> dropped_checkpoint;
-    ResourceDelta effect;
-    std::uint64_t transfer_bytes = 0;
-    std::vector<ninfer::runtime::ContextTransferRequirement> transfer_requirements;
+    std::vector<ContextTransferRequirement> transfer_requirements;
     std::vector<FakePressureCheckpointImpact> checkpoint_impacts;
-    std::vector<FakeReplicaValueImpact> removed_host_replica_impacts;
     bool evicts_continuation = false;
     bool shared_owner        = false;
 
     friend bool operator==(const FakePressureOption&, const FakePressureOption&) = default;
 };
 
-struct FakeSequenceHandle {
-    LaneId lane;
-    std::uint64_t generation = 0;
+struct FakeResourcePlan {
+    FakeAdmissionPlan admission;
+    std::uint64_t revision = 0;
+    std::vector<FakePressureOption> private_actions;
+    std::vector<FakePressureOption> shared_actions;
+    std::vector<std::uint32_t> private_owner_ids;
+    std::vector<std::uint32_t> shared_owner_ids;
+
+    FakeResourcePlan() = default;
+
+    FakeResourcePlan(FakeAdmissionPlan admission_value, std::uint64_t revision_value)
+        : admission(std::move(admission_value)), revision(revision_value) {}
+
+    FakeResourcePlan(FakeResourcePlan&&) noexcept            = default;
+    FakeResourcePlan& operator=(FakeResourcePlan&&) noexcept = default;
+    FakeResourcePlan(const FakeResourcePlan&)                = delete;
+    FakeResourcePlan& operator=(const FakeResourcePlan&)     = delete;
+
+    [[nodiscard]] const RequestPlanSummary& summary() const noexcept { return admission.summary(); }
+
+    [[nodiscard]] bool needs_transfer() const noexcept { return admission.needs_transfer(); }
+
+    [[nodiscard]] std::uint64_t resource_revision() const noexcept { return revision; }
 };
 
-struct FakeContinuationHandle {
-    std::uint32_t key = 0;
-    mutable ResourceVector resources;
-    std::uint64_t rebuild_work = 0;
-    bool valid                 = false;
+struct FakePersistentBackfillProof {
+    std::uint64_t revision = 0;
 
-    FakeContinuationHandle() = default;
-
-    FakeContinuationHandle(std::uint32_t key_, ResourceVector resources_,
-                           std::uint64_t rebuild_work_)
-        : key(key_), resources(resources_), rebuild_work(rebuild_work_), valid(true) {}
-
-    FakeContinuationHandle(FakeContinuationHandle&& other) noexcept
-        : key(other.key), resources(other.resources), rebuild_work(other.rebuild_work),
-          valid(std::exchange(other.valid, false)) {}
-
-    FakeContinuationHandle& operator=(FakeContinuationHandle&&)      = delete;
-    FakeContinuationHandle(const FakeContinuationHandle&)            = delete;
-    FakeContinuationHandle& operator=(const FakeContinuationHandle&) = delete;
-};
-
-struct FakeSharedPrefixHandle {
-    FakeSharedPrefixHandle()                                             = default;
-    FakeSharedPrefixHandle(FakeSharedPrefixHandle&&) noexcept            = default;
-    FakeSharedPrefixHandle& operator=(FakeSharedPrefixHandle&&) noexcept = default;
-    FakeSharedPrefixHandle(const FakeSharedPrefixHandle&)                = delete;
-    FakeSharedPrefixHandle& operator=(const FakeSharedPrefixHandle&)     = delete;
-};
-
-struct FakeProtectedPrivateOwner {
-    const FakeContinuationHandle* handle = nullptr;
-    std::uint32_t owner_mask             = 0;
-};
-
-struct FakeProtectedSharedOwner {
-    const FakeSharedPrefixHandle* handle = nullptr;
-    std::uint32_t owner_mask             = 0;
-};
-
-struct FakeCaptureOffer {
-    FakeCaptureOffer()                                       = default;
-    FakeCaptureOffer(FakeCaptureOffer&&) noexcept            = default;
-    FakeCaptureOffer& operator=(FakeCaptureOffer&&) noexcept = default;
-    FakeCaptureOffer(const FakeCaptureOffer&)                = delete;
-    FakeCaptureOffer& operator=(const FakeCaptureOffer&)     = delete;
+    [[nodiscard]] std::uint64_t resource_revision() const noexcept { return revision; }
 };
 
 struct FakeStartResult {
     FakeSequenceHandle sequence;
-    ResourceVector active_resources;
 };
 
-struct FakeTargetKVRequirement {
-    std::uint32_t main_pages    = 0;
-    std::uint32_t backend_pages = 0;
-
-    friend bool operator==(FakeTargetKVRequirement, FakeTargetKVRequirement) = default;
+struct FakeMaterializationVictimResult {
+    ClaimDisposition disposition = ClaimDisposition::Retained;
+    std::optional<FakeContinuationSummary> final_summary;
 };
 
-struct FakeCheckpointSummary {
-    ninfer::runtime::CheckpointRef ref;
-    ninfer::runtime::CheckpointScope scope = ninfer::runtime::CheckpointScope::Private;
-
-    FakeShortlistKey shortlist_key;
-
-    FakeTargetKVRequirement required_kv;
-    ninfer::runtime::PrefillWork rebuild_work;
-
-    friend bool operator==(const FakeCheckpointSummary&, const FakeCheckpointSummary&) = default;
+struct FakeMaterializationSharedVictimResult {
+    ClaimDisposition disposition = ClaimDisposition::Retained;
+    std::optional<FakeSharedPrefixSummary> final_summary;
 };
 
-struct FakeContinuationSummary {
-    std::optional<FakeCheckpointSummary> endpoint;
-    std::optional<FakeCheckpointSummary> rewrite;
-    std::vector<FakeCheckpointSummary> long_anchors;
-    std::uint32_t active_references = 0;
-
-    friend bool operator==(const FakeContinuationSummary&,
-                           const FakeContinuationSummary&) = default;
+struct FakeMaterializationSourceResult {
+    ClaimDisposition disposition = ClaimDisposition::Retained;
+    std::optional<FakeContinuationSummary> final_summary;
 };
 
-struct FakeSharedPrefixSummary {
-    FakeCheckpointSummary checkpoint;
-    std::uint32_t active_references = 0;
-
-    friend bool operator==(const FakeSharedPrefixSummary&,
-                           const FakeSharedPrefixSummary&) = default;
+struct FakeMaterializationSharedSourceResult {
+    ClaimDisposition disposition = ClaimDisposition::Retained;
+    std::optional<FakeSharedPrefixSummary> final_summary;
 };
 
-struct FakeCaptureAssessment {
-    ResourceDemand demand;
-    ResourceDelta active_entitlement_delta;
-    ResourceVector capacity_preparation_removed;
-    FakeShortlistKey shortlist_key;
-    ninfer::runtime::PrefillWork protected_rebuild_work;
-    std::vector<ninfer::runtime::ContextTransferRequirement> transfer_requirements;
-    std::vector<FakePressureCheckpointImpact> replacement_impacts;
-    std::vector<ninfer::runtime::CheckpointRef> private_replacement_candidates;
-    std::uint32_t frontier = 0;
-    bool publishes_private = false;
-    bool publishes_shared  = false;
-    bool needs_transfer    = false;
+struct FakeMaterializationResult {
+    ContextTransactionStatus status = ContextTransactionStatus::Aborted;
+    std::optional<FakeStartResult> published;
+    std::optional<FakeMaterializationSourceResult> source;
+    std::optional<FakeMaterializationSharedSourceResult> shared_source;
+    std::vector<FakeMaterializationVictimResult> victims;
+    std::vector<FakeMaterializationSharedVictimResult> shared_victims;
+    std::vector<ContextTransferObservation> transfer_observations;
+    ContextOperationCounts operations;
 };
 
 struct FakeSharedPrefixPublication {
@@ -337,141 +322,54 @@ struct FakeSharedPrefixPublication {
 };
 
 struct FakeActiveCaptureResult {
-    ninfer::runtime::ContextTransactionStatus status =
-        ninfer::runtime::ContextTransactionStatus::Aborted;
-    ResourceDelta resource_delta;
-    ResourceDelta active_entitlement_delta;
-    ResourceVector capacity_preparation_removed;
+    ContextTransactionStatus status     = ContextTransactionStatus::Aborted;
     bool capacity_preparation_committed = false;
     FakeContinuationSummary active_summary;
     std::optional<FakeSharedPrefixPublication> shared;
-    std::vector<ninfer::runtime::ContextTransferObservation> transfer_observations;
-    ninfer::runtime::ContextOperationCounts operations;
-};
-
-FakeContinuationSummary continuation_summary(std::uint64_t rebuild_work     = 1,
-                                             std::uint32_t shortlist_digest = 0) {
-    return FakeContinuationSummary{
-        .endpoint =
-            FakeCheckpointSummary{
-                .ref = {.kind = ninfer::runtime::CheckpointKind::SessionEndpoint, .frontier = 16},
-                .shortlist_key = {.digest = shortlist_digest, .frontier = 16},
-                .required_kv   = {.main_pages = 2, .backend_pages = 1},
-                .rebuild_work  = {.tokens = rebuild_work},
-            },
-    };
-}
-
-void add_resources(ResourceVector& destination, ResourceVector value) {
-    destination.device.active_lanes += value.device.active_lanes;
-    destination.device.state_slots += value.device.state_slots;
-    destination.device.main_kv_pages += value.device.main_kv_pages;
-    destination.device.backend_kv_pages += value.device.backend_kv_pages;
-    destination.host.state_slots += value.host.state_slots;
-    destination.host.kv_bytes += value.host.kv_bytes;
-}
-
-struct FakeMaterializationResult {
-    ninfer::runtime::ContextTransactionStatus status =
-        ninfer::runtime::ContextTransactionStatus::Aborted;
-    std::optional<FakeStartResult> published;
-
-    struct Source {
-        ninfer::runtime::ClaimDisposition disposition = ninfer::runtime::ClaimDisposition::Retained;
-        std::optional<FakeContinuationSummary> final_summary;
-        ResourceDelta resource_delta;
-    };
-
-    std::optional<Source> source;
-
-    struct SharedSource {
-        ninfer::runtime::ClaimDisposition disposition = ninfer::runtime::ClaimDisposition::Retained;
-        std::optional<FakeSharedPrefixSummary> final_summary;
-        ResourceDelta resource_delta;
-    };
-
-    std::optional<SharedSource> shared_source;
-
-    struct Victim {
-        ninfer::runtime::ClaimDisposition disposition = ninfer::runtime::ClaimDisposition::Retained;
-        std::optional<FakeContinuationSummary> final_summary;
-        ResourceDelta resource_delta;
-    };
-
-    std::vector<Victim> victims;
-
-    struct SharedVictim {
-        ninfer::runtime::ClaimDisposition disposition = ninfer::runtime::ClaimDisposition::Retained;
-        std::optional<FakeSharedPrefixSummary> final_summary;
-        ResourceDelta resource_delta;
-    };
-
-    std::vector<SharedVictim> shared_victims;
-    ResourceDelta resource_delta;
-    std::vector<ninfer::runtime::ContextTransferObservation> transfer_observations;
-    ninfer::runtime::ContextOperationCounts operations;
-};
-
-struct FakeReplicaTransitionOption {
-    ninfer::runtime::ContextResourceClass resource = ninfer::runtime::ContextResourceClass::State;
-    ninfer::runtime::CheckpointRef checkpoint;
-    ResourceDelta effect;
-    std::uint64_t transfer_bytes = 1;
-    std::uint32_t page_count     = 0;
-    ninfer::TransferWork transfer_work{.payload_bytes = 1, .copy_operations = 1};
-    std::vector<FakeReplicaValueImpact> added_host_replica_impacts;
-    bool shared_owner = false;
-
-    friend bool operator==(const FakeReplicaTransitionOption&,
-                           const FakeReplicaTransitionOption&) = default;
-};
-
-struct FakeReplicaTransitionResult {
-    ninfer::runtime::ContextTransactionStatus status =
-        ninfer::runtime::ContextTransactionStatus::Aborted;
-
-    struct Owner {
-        bool shared_owner = false;
-        std::optional<FakeContinuationSummary> private_summary;
-        std::optional<FakeSharedPrefixSummary> shared_summary;
-        ResourceDelta resource_delta;
-    };
-
-    std::array<Owner, 2> owners;
-    std::size_t owner_count = 0;
-    ResourceDelta resource_delta;
-    std::vector<ninfer::runtime::ContextTransferObservation> transfer_observations;
+    std::vector<ContextTransferObservation> transfer_observations;
+    ContextOperationCounts operations;
 };
 
 using FakeContextTransactionProgress =
-    std::variant<ninfer::runtime::ContextTransactionInProgress, FakeMaterializationResult,
-                 FakeActiveCaptureResult, FakeReplicaTransitionResult>;
+    std::variant<ContextTransactionInProgress, FakeMaterializationResult, FakeActiveCaptureResult>;
+
+struct FakeCaptureAssessment {
+    FakeShortlistKey shortlist_key;
+    std::vector<CheckpointRef> private_replacement_candidates;
+    bool publishes_private = false;
+    bool publishes_shared  = false;
+    bool needs_transfer    = false;
+};
+
+struct FakeTimings {
+    std::uint64_t value = 0;
+};
+
+struct FakeSpeculativeStats {
+    std::uint64_t value = 0;
+};
 
 struct FakeFinishResult {
-    ConsumeStatus status                           = ConsumeStatus::InvariantMismatch;
-    ninfer::runtime::FinishDisposition disposition = ninfer::runtime::FinishDisposition::Released;
-    int timings                                    = 0;
-    int speculative                                = 0;
-    ResourceDelta resource_delta;
+    ConsumeStatus status          = ConsumeStatus::InvariantMismatch;
+    FinishDisposition disposition = FinishDisposition::Released;
+    FakeTimings timings;
+    FakeSpeculativeStats speculative;
     FakeContinuationSummary summary;
     std::optional<FakeContinuationHandle> continuation;
 };
 
 struct FakeAbortResult {
     ConsumeStatus status = ConsumeStatus::InvariantMismatch;
-    int timings          = 0;
-    int speculative      = 0;
-    ResourceDelta resource_delta;
+    FakeTimings timings;
+    FakeSpeculativeStats speculative;
 };
 
 struct FakeReleaseResult {
     ConsumeStatus status = ConsumeStatus::InvariantMismatch;
-    ResourceDelta resource_delta;
 };
 
 struct FakeCommitRowResult {
-    ninfer::runtime::CommitDisposition disposition = ninfer::runtime::CommitDisposition::Active;
-    ResourceDelta resource_delta;
+    CommitDisposition disposition = CommitDisposition::Active;
 };
 
 struct FakeCommitResult {
@@ -480,662 +378,344 @@ struct FakeCommitResult {
 };
 
 struct FakeDiscardResult {
-    ConsumeStatus status = ConsumeStatus::InvariantMismatch;
-    std::array<ResourceDelta, ninfer::kMaximumConcurrency> resource_deltas{};
+    ConsumeStatus status  = ConsumeStatus::InvariantMismatch;
     std::size_t row_count = 0;
+};
+
+struct FakePhysicalUsage {
+    std::uint32_t device_state_slots      = 0;
+    std::uint32_t host_state_slots        = 0;
+    std::uint32_t device_main_kv_pages    = 0;
+    std::uint32_t device_backend_kv_pages = 0;
+    std::size_t host_kv_bytes             = 0;
 };
 
 class FakeProgram {
 public:
-    std::optional<FakeAdmissionPlan> inspect_admission(
-        const FakePreparedPrompt& prompt, const FakeRequestBasePlan& base, LaneId destination,
-        const FakeContinuationHandle* source, const FakeSharedPrefixHandle* shared_source,
-        std::optional<ninfer::runtime::CheckpointRef> checkpoint, bool must_retain_private_source) {
-        if (shared_source != nullptr) {
-            throw std::logic_error("fake shared-prefix admission is unsupported");
-        }
-        if ((source == nullptr) != !checkpoint.has_value()) {
-            throw std::logic_error("fake source/checkpoint mismatch");
-        }
+    enum class TransactionKind : std::uint8_t {
+        None,
+        Materialization,
+        Capture,
+    };
+
+    [[nodiscard]] bool isolated_request_feasible(const FakeRequestBasePlan& base) const noexcept {
+        return base.isolated_feasible;
+    }
+
+    [[nodiscard]] std::optional<FakeAdmissionPlan>
+    inspect_admission(const FakePreparedPrompt& prompt, const FakeRequestBasePlan& base, LaneId,
+                      const FakeContinuationHandle* source,
+                      const FakeSharedPrefixHandle* shared_source,
+                      std::optional<CheckpointRef> checkpoint, bool must_retain_source) {
+        ++admission_inspections;
         if (source != nullptr) {
-            ++admission_source_inspections;
-            last_must_retain_private_source = must_retain_private_source;
+            inspected_private_sources.push_back(source->id);
+            if (source->content_key != prompt.content_key || !checkpoint) { return std::nullopt; }
         }
+        if (shared_source != nullptr) {
+            inspected_shared_sources.push_back(shared_source->id);
+            if (shared_source->content_key != prompt.content_key || !checkpoint) {
+                return std::nullopt;
+            }
+        }
+
         FakeAdmissionPlan plan;
-        plan.value       = base.summary();
-        plan.destination = destination;
-        plan.key         = prompt.key;
-        plan.root_work   = base.summary().service_work_quanta;
-        const bool hit   = source != nullptr && source->valid && prompt.allow_reuse &&
-                         source->key == prompt.key &&
-                         checkpoint->kind == ninfer::runtime::CheckpointKind::SessionEndpoint &&
-                         checkpoint->frontier == 16;
-        if (source != nullptr && !hit) { return std::nullopt; }
-        plan.source = hit;
-        if (hit) {
-            plan.value.reusable_prompt_tokens = 16;
-            plan.value.service_work_quanta    = 1;
-            plan.source_value                 = source->resources;
-            if (must_retain_private_source) {
-                plan.disposition = ninfer::runtime::ClaimDisposition::Retained;
-                plan.resources   = base.root_demand();
-            } else {
-                plan.resources =
-                    demand(base.root_demand().active_entitlement.device, source->resources.device);
+        plan.value = base.summary();
+        if (checkpoint) {
+            plan.value.reusable_prompt_tokens = checkpoint->frontier;
+            switch (checkpoint->kind) {
+            case CheckpointKind::SessionEndpoint:
+                plan.value.prefix_reuse_path = PrefixReusePath::PrivateEndpoint;
+                break;
+            case CheckpointKind::TurnClosure:
+                plan.value.prefix_reuse_path = PrefixReusePath::PrivateTurnClosure;
+                break;
+            case CheckpointKind::ResponseReplay:
+                plan.value.prefix_reuse_path = PrefixReusePath::PrivateResponseReplay;
+                break;
+            case CheckpointKind::LongAnchor:
+                plan.value.prefix_reuse_path = PrefixReusePath::PrivateLongAnchor;
+                break;
+            case CheckpointKind::SharedStablePrefix:
+                plan.value.prefix_reuse_path = PrefixReusePath::SharedStablePrefix;
+                break;
             }
         } else {
             plan.value.reusable_prompt_tokens = 0;
-            plan.resources                    = base.root_demand();
+            plan.value.prefix_reuse_path      = PrefixReusePath::Root;
+        }
+        plan.remaining.tokens = plan.value.prompt_tokens > plan.value.reusable_prompt_tokens
+                                    ? plan.value.prompt_tokens - plan.value.reusable_prompt_tokens
+                                    : 0;
+        if (source != nullptr) {
+            plan.private_source_id = source->id;
+            plan.disposition       = must_retain_source ? ClaimDisposition::Retained
+                                                        : ClaimDisposition::ConsumedToActive;
+        } else if (shared_source != nullptr) {
+            plan.shared_source_id = shared_source->id;
+            plan.disposition      = ClaimDisposition::Retained;
         }
         return plan;
     }
 
     [[nodiscard]] std::vector<FakePressureOption>
-    inspect_pressure_options(const FakeContinuationHandle& continuation,
-                             ResourceVector deficit) const {
-        if (continuation.valid && demotable_device_state_key == continuation.key &&
-            deficit.device.state_slots != 0 && continuation.resources.device.state_slots != 0 &&
-            continuation.resources.host.state_slots == 0) {
-            return {FakePressureOption{
-                .id             = continuation.key,
-                .effect         = {.removed = resources({.state_slots = 1}),
-                                   .added   = resources({}, {.state_slots = 1})},
-                .transfer_bytes = 1,
-                .transfer_requirements =
-                    {{.resource  = ninfer::runtime::ContextResourceClass::State,
-                      .direction = ninfer::runtime::ContextTransferDirection::DeviceToHost,
-                      .units     = 1,
-                      .work      = {.payload_bytes = 1, .copy_operations = 1}}},
-            }};
+    inspect_pressure_options(const FakeAdmissionPlan&, const FakeContinuationHandle& handle) const {
+        std::vector<FakePressureOption> options;
+        for (std::uint32_t index = 0; index < private_pressure_alternatives; ++index) {
+            options.push_back(FakePressureOption{.id = 1000U + handle.id +
+                                                       10000U * static_cast<std::uint64_t>(index)});
         }
-        if (!continuation.valid || deficit.host.state_slots == 0 ||
-            continuation.resources.host.state_slots == 0 ||
-            continuation.resources.device.state_slots == 0) {
-            return {};
-        }
-        const ninfer::runtime::CheckpointRef checkpoint = continuation_summary().endpoint->ref;
-        return {FakePressureOption{
-            .id                           = continuation.key,
-            .effect                       = {.removed = resources({}, {.state_slots = 1})},
-            .removed_host_replica_impacts = {FakeReplicaValueImpact{
-                .checkpoint            = checkpoint,
-                .fallback_rebuild_work = {.tokens = continuation.rebuild_work},
-                .host_restore_requirements =
-                    {{.resource  = ninfer::runtime::ContextResourceClass::State,
-                      .direction = ninfer::runtime::ContextTransferDirection::HostToDevice,
-                      .units     = 1,
-                      .work      = {.payload_bytes = 1, .copy_operations = 1}}},
-            }},
-        }};
-    }
-
-    [[nodiscard]] std::vector<FakePressureOption>
-    inspect_pressure_options(const FakeAdmissionPlan& admission,
-                             const FakeContinuationHandle& continuation,
-                             ResourceVector deficit) const {
-        if (admission.source && pressure_alias_source_key == admission.key &&
-            pressure_alias_owner_key == continuation.key) {
-            return {};
-        }
-        return inspect_pressure_options(continuation, deficit);
+        return options;
     }
 
     [[nodiscard]] FakePressureOption
-    inspect_eviction_option(const FakeContinuationHandle& continuation) const {
-        if (!continuation.valid) { throw std::logic_error("fake eviction source is stale"); }
-        const ninfer::runtime::CheckpointRef checkpoint = continuation_summary().endpoint->ref;
-        return FakePressureOption{
-            .id                  = continuation.key,
-            .effect              = {.removed = continuation.resources},
-            .checkpoint_impacts  = {FakePressureCheckpointImpact{
-                 .checkpoint            = checkpoint,
-                 .fallback_rebuild_work = {.tokens = continuation.rebuild_work},
-                 .drops_checkpoint      = true,
-            }},
-            .evicts_continuation = true,
-        };
+    inspect_eviction_option(const FakeContinuationHandle& handle) const {
+        return FakePressureOption{.id = 2000U + handle.id, .evicts_continuation = true};
     }
 
     [[nodiscard]] std::vector<FakePressureOption>
-    inspect_shared_pressure_options(const FakeSharedPrefixHandle&, ResourceVector) const {
-        return {};
-    }
-
-    [[nodiscard]] std::vector<FakePressureOption>
-    inspect_shared_pressure_options(const FakeAdmissionPlan&, const FakeSharedPrefixHandle& shared,
-                                    ResourceVector deficit) const {
-        return inspect_shared_pressure_options(shared, deficit);
+    inspect_shared_pressure_options(const FakeAdmissionPlan&,
+                                    const FakeSharedPrefixHandle& handle) const {
+        return {FakePressureOption{.id = 3000U + handle.id, .shared_owner = true}};
     }
 
     [[nodiscard]] FakePressureOption
-    inspect_shared_eviction_option(const FakeSharedPrefixHandle&) const {
-        const ninfer::runtime::CheckpointRef checkpoint = continuation_summary().endpoint->ref;
+    inspect_shared_eviction_option(const FakeSharedPrefixHandle& handle) const {
         return FakePressureOption{
-            .id                  = std::numeric_limits<std::uint64_t>::max() - 1U,
-            .checkpoint_impacts  = {FakePressureCheckpointImpact{
-                 .checkpoint            = checkpoint,
-                 .fallback_rebuild_work = {.tokens = 1},
-                 .drops_checkpoint      = true,
-            }},
-            .evicts_continuation = true,
-            .shared_owner        = true,
-        };
+            .id = 4000U + handle.id, .evicts_continuation = true, .shared_owner = true};
     }
 
-    [[nodiscard]] std::optional<MaterializationPressureEffect> inspect_combined_pressure_effect(
-        const FakeAdmissionPlan& admission,
-        std::span<const FakeContinuationHandle* const> pressure_owners,
-        std::span<const FakePressureOption> pressure_options,
-        std::span<const FakeSharedPrefixHandle* const> shared_pressure_owners,
-        std::span<const FakePressureOption> shared_pressure_options) const {
-        if (pressure_owners.size() != pressure_options.size() ||
-            shared_pressure_owners.size() != shared_pressure_options.size() ||
-            !shared_pressure_owners.empty()) {
+    [[nodiscard]] std::optional<FakeResourcePlan>
+    seal_resource_plan(const FakeAdmissionPlan& admission, const FakePreparedPrompt&,
+                       std::span<const FakeContinuationHandle* const> private_owners,
+                       std::span<const FakePressureOption> private_actions,
+                       std::span<const FakeSharedPrefixHandle* const> shared_owners,
+                       std::span<const FakePressureOption> shared_actions) {
+        std::vector<std::uint64_t> action_ids;
+        for (const FakePressureOption& action : private_actions) {
+            action_ids.push_back(action.id);
+        }
+        for (const FakePressureOption& action : shared_actions) { action_ids.push_back(action.id); }
+        seal_attempts.push_back(action_ids);
+        if (action_ids.size() < required_pressure_actions) { return std::nullopt; }
+        if (required_action_id && std::find(action_ids.begin(), action_ids.end(),
+                                            *required_action_id) == action_ids.end()) {
             return std::nullopt;
         }
-        MaterializationPressureEffect combined;
-        for (std::size_t index = 0; index < pressure_options.size(); ++index) {
-            if (pressure_owners[index] == nullptr || !pressure_owners[index]->valid ||
-                pressure_options[index].id != pressure_owners[index]->key) {
-                return std::nullopt;
-            }
-            if (!pressure_options[index].evicts_continuation && admission.source &&
-                pressure_alias_source_key == admission.key &&
-                pressure_alias_owner_key == pressure_owners[index]->key) {
-                return std::nullopt;
-            }
-            ResourceDelta next;
-            if (!ninfer::runtime::detail::add_resource_deltas(
-                    combined.aggregate_delta, pressure_options[index].effect, next)) {
-                return std::nullopt;
-            }
-            combined.aggregate_delta = next;
-            if (pressure_options[index].evicts_continuation && admission.source &&
-                pressure_alias_source_key == admission.key &&
-                pressure_alias_owner_key == pressure_owners[index]->key) {
-                combined.final_ownership_delta.removed  = pressure_alias_active_transfer;
-                combined.final_ownership_delta.added    = pressure_alias_active_transfer;
-                combined.active_entitlement_delta.added = pressure_alias_active_transfer;
-            }
-        }
-        return combined;
-    }
-
-    [[nodiscard]] std::optional<FakeAdmissionPlan>
-    compose_materialization(FakeAdmissionPlan&& plan,
-                            std::span<const FakeContinuationHandle* const> pressure_owners,
-                            std::span<const FakePressureOption> pressure_options,
-                            std::span<const FakeSharedPrefixHandle* const> shared_pressure_owners,
-                            std::span<const FakePressureOption> shared_pressure_options) const {
-        if (pressure_owners.size() != pressure_options.size() ||
-            shared_pressure_owners.size() != shared_pressure_options.size() ||
-            !shared_pressure_owners.empty()) {
-            throw std::logic_error("fake pressure composition is not row aligned");
-        }
-        last_composed_pressure.clear();
-        const std::optional<MaterializationPressureEffect> combined =
-            inspect_combined_pressure_effect(plan, pressure_owners, pressure_options,
-                                             shared_pressure_owners, shared_pressure_options);
-        if (!combined) { return std::nullopt; }
-        for (std::size_t index = 0; index < pressure_options.size(); ++index) {
-            if (pressure_owners[index] == nullptr || !pressure_owners[index]->valid ||
-                pressure_options[index].id != pressure_owners[index]->key) {
-                return std::nullopt;
-            }
-            last_composed_pressure.emplace_back(pressure_options[index].id,
-                                                pressure_options[index].evicts_continuation);
-        }
-        if (!ninfer::runtime::detail::augment_demand(plan.resources, *combined)) {
+        if (require_evictions &&
+            (std::ranges::any_of(private_actions,
+                                 [](const auto& action) { return !action.evicts_continuation; }) ||
+             std::ranges::any_of(shared_actions,
+                                 [](const auto& action) { return !action.evicts_continuation; }))) {
             return std::nullopt;
         }
-        return std::optional<FakeAdmissionPlan>(std::move(plan));
+
+        FakeResourcePlan plan(admission, revision_);
+        plan.private_actions.assign(private_actions.begin(), private_actions.end());
+        plan.shared_actions.assign(shared_actions.begin(), shared_actions.end());
+        for (const FakeContinuationHandle* owner : private_owners) {
+            plan.private_owner_ids.push_back(owner->id);
+        }
+        for (const FakeSharedPrefixHandle* owner : shared_owners) {
+            plan.shared_owner_ids.push_back(owner->id);
+        }
+        return plan;
     }
 
-    ninfer::runtime::PreflightStatus revalidate_materialization(
-        const FakeAdmissionPlan& plan, const FakePreparedPrompt& prompt,
-        const FakeContinuationHandle* source, const FakeSharedPrefixHandle* shared_source,
-        std::span<const FakeContinuationHandle* const> victims,
-        std::span<const FakeSharedPrefixHandle* const> shared_victims) const {
-        if (shared_source != nullptr || !shared_victims.empty()) {
-            return ninfer::runtime::PreflightStatus::InvariantFailure;
+    [[nodiscard]] ContextTransactionReserveStatus
+    start_resource_transaction(FakeResourcePlan&& plan, FakePreparedPrompt&& prompt,
+                               CancellationFlagView cancellation) {
+        ++start_calls;
+        started_source_id          = plan.admission.private_source_id;
+        started_source_disposition = plan.admission.disposition;
+        started_action_ids.clear();
+        for (const auto& action : plan.private_actions) { started_action_ids.push_back(action.id); }
+        for (const auto& action : plan.shared_actions) { started_action_ids.push_back(action.id); }
+        if (cancellation.requested() || abort_start || plan.revision != revision_) {
+            return ContextTransactionReserveStatus::Aborted;
         }
-        if (transaction_ || replica_transaction_) {
-            return ninfer::runtime::PreflightStatus::StalePolicyState;
-        }
-        if (plan.key != prompt.key || plan.source != (source != nullptr)) {
-            return ninfer::runtime::PreflightStatus::InvariantFailure;
-        }
-        if (source != nullptr && (!source->valid || source->key != plan.key)) {
-            return ninfer::runtime::PreflightStatus::StalePolicyState;
-        }
-        for (const FakeContinuationHandle* victim : victims) {
-            if (victim == nullptr || !victim->valid ||
-                (source != nullptr && victim->key == source->key)) {
-                return ninfer::runtime::PreflightStatus::InvariantFailure;
-            }
-        }
-        return ninfer::runtime::PreflightStatus::Ready;
+        pending_prompt_ = prompt;
+        pending_plan_.emplace(std::move(plan));
+        transaction_kind_ = TransactionKind::Materialization;
+        advance_revision();
+        return ContextTransactionReserveStatus::Reserved;
     }
 
-    ninfer::runtime::ContextTransactionReserveStatus
-    reserve_materialization(FakeAdmissionPlan&& plan, FakePreparedPrompt&& prompt,
-                            const FakeContinuationHandle* source,
-                            const FakeSharedPrefixHandle* shared_source,
-                            std::span<const FakeContinuationHandle* const> victims,
-                            std::span<const FakeSharedPrefixHandle* const> shared_victims,
-                            ninfer::runtime::CancellationFlagView cancellation) {
-        if (cancellation.requested()) {
-            return ninfer::runtime::ContextTransactionReserveStatus::Aborted;
-        }
-        if (revalidate_materialization(plan, prompt, source, shared_source, victims,
-                                       shared_victims) != ninfer::runtime::PreflightStatus::Ready) {
-            throw std::logic_error("fake materialization reservation mismatch");
-        }
-        Transaction transaction;
-        transaction.id                 = next_transaction_++;
-        transaction.source_key         = source != nullptr ? source->key : 0;
-        transaction.source_resources   = source != nullptr ? source->resources : ResourceVector{};
-        transaction.has_source         = source != nullptr;
-        transaction.source_disposition = plan.source_disposition();
-        transaction.victim_count       = victims.size();
-        transaction.plan.emplace(std::move(plan));
-        transaction.prompt.emplace(std::move(prompt));
-        for (std::size_t index = 0; index < victims.size(); ++index) {
-            if (victims[index] == nullptr || !victims[index]->valid ||
-                (source != nullptr && victims[index]->key == source->key)) {
-                throw std::logic_error("fake materialization victim mismatch");
-            }
-            transaction.victim_keys[index]      = victims[index]->key;
-            transaction.victim_resources[index] = victims[index]->resources;
-        }
-        transaction_.emplace(std::move(transaction));
-        return ninfer::runtime::ContextTransactionReserveStatus::Reserved;
+    [[nodiscard]] std::optional<FakePersistentBackfillProof>
+    prove_persistent_backfill(const FakeRequestBasePlan&, const FakeResourcePlan& candidate,
+                              std::span<const FakeSequenceHandle>) const {
+        if (candidate.resource_revision() != revision_) { return std::nullopt; }
+        return FakePersistentBackfillProof{.revision = revision_};
     }
 
-    FakeMaterializationResult
-    progress_materialization_transaction(ninfer::runtime::CancellationFlagView cancellation) {
-        if (!transaction_ || transaction_->terminal) {
-            throw std::logic_error("fake materialization progress mismatch");
+    [[nodiscard]] FakeContextTransactionProgress
+    progress_context_transaction(CancellationFlagView cancellation) {
+        require(transaction_kind_ != TransactionKind::None,
+                "fake Program has no context transaction");
+        if (progress_in_progress_once) {
+            progress_in_progress_once = false;
+            return ContextTransactionInProgress{};
         }
-        FakeMaterializationResult result;
-        result.victims.resize(transaction_->victim_count);
-        const auto retain_unmodified_claims = [&]() {
-            for (std::size_t index = 0; index < transaction_->victim_count; ++index) {
-                if (transaction_->released[index]) { continue; }
-                result.victims[index] = {
-                    .disposition   = ninfer::runtime::ClaimDisposition::Retained,
-                    .final_summary = continuation_summary(),
-                };
+        if (transaction_kind_ == TransactionKind::Capture) {
+            FakeActiveCaptureResult result;
+            result.status =
+                cancellation.requested() ? ContextTransactionStatus::Aborted : capture_status;
+            if (result.status == ContextTransactionStatus::Published) {
+                result.active_summary = capture_summary;
             }
-        };
-        const auto retain_source = [&]() {
-            if (!transaction_->has_source) { return; }
-            result.source = FakeMaterializationResult::Source{
-                .disposition   = ninfer::runtime::ClaimDisposition::Retained,
-                .final_summary = continuation_summary(),
-            };
-        };
-        if (cancellation.requested()) {
-            retain_unmodified_claims();
-            retain_source();
-            transaction_->terminal = true;
             return result;
         }
-        for (std::size_t index = 0; index < transaction_->victim_count; ++index) {
-            transaction_->released[index] = true;
-            result.victims[index]         = {
-                        .disposition    = ninfer::runtime::ClaimDisposition::Evicted,
-                        .resource_delta = {.removed = transaction_->victim_resources[index]},
-            };
-            add_resources(result.resource_delta.removed, transaction_->victim_resources[index]);
-            ++release_count;
-            last_released_key = transaction_->victim_keys[index];
-            if (cancel_after_victim != nullptr) {
-                cancel_after_victim->store(true, std::memory_order_release);
-            }
-            if (cancellation.requested()) {
-                retain_unmodified_claims();
-                retain_source();
-                transaction_->terminal = true;
-                return result;
-            }
+
+        require(pending_plan_.has_value(), "fake materialization plan disappeared");
+        const FakeResourcePlan& plan = *pending_plan_;
+        FakeMaterializationResult result;
+        result.status = (abort_progress || cancellation.requested())
+                            ? ContextTransactionStatus::Aborted
+                            : ContextTransactionStatus::Published;
+        for (const FakePressureOption& action : plan.private_actions) {
+            result.victims.push_back(FakeMaterializationVictimResult{
+                .disposition = action.evicts_continuation ? ClaimDisposition::Evicted
+                                                          : ClaimDisposition::Retained});
         }
-        FakeAdmissionPlan plan(std::move(*transaction_->plan));
-        FakePreparedPrompt prompt(std::move(*transaction_->prompt));
-        result.status = ninfer::runtime::ContextTransactionStatus::Published;
-        if (transaction_->has_source) {
-            result.source = FakeMaterializationResult::Source{
-                .disposition = transaction_->source_disposition,
-            };
-            if (transaction_->source_disposition == ninfer::runtime::ClaimDisposition::Retained) {
-                result.source->final_summary = continuation_summary();
-            }
+        for (const FakePressureOption& action : plan.shared_actions) {
+            result.shared_victims.push_back(FakeMaterializationSharedVictimResult{
+                .disposition = action.evicts_continuation ? ClaimDisposition::Evicted
+                                                          : ClaimDisposition::Retained});
         }
-        result.resource_delta = {
-            .removed = plan.resources.final_removed,
-            .added   = plan.resources.final_added,
-        };
-        result.published.emplace(
-            start_request(std::move(plan), std::move(prompt), transaction_->has_source));
-        if (emit_state_d2h_observation) {
-            result.transfer_observations.push_back(
-                {.resource   = ninfer::runtime::ContextResourceClass::State,
-                 .direction  = ninfer::runtime::ContextTransferDirection::DeviceToHost,
-                 .units      = 1,
-                 .work       = {.payload_bytes = 1, .copy_operations = 1},
-                 .elapsed_ns = 1});
+        if (plan.admission.private_source_id != 0) {
+            result.source = FakeMaterializationSourceResult{
+                .disposition = result.status == ContextTransactionStatus::Aborted
+                                   ? ClaimDisposition::Retained
+                                   : plan.admission.disposition};
         }
-        transaction_->terminal = true;
+        if (plan.admission.shared_source_id != 0) {
+            result.shared_source =
+                FakeMaterializationSharedSourceResult{.disposition = ClaimDisposition::Retained};
+        }
+        if (result.status == ContextTransactionStatus::Published) {
+            const std::uint32_t sequence_id        = next_sequence_id_++;
+            sequence_content_keys_.at(sequence_id) = pending_prompt_.content_key;
+            result.published = FakeStartResult{.sequence = FakeSequenceHandle{sequence_id}};
+        }
         return result;
     }
 
     void finalize_context_transaction() noexcept {
-        if (transaction_ && transaction_->terminal) { transaction_.reset(); }
-        if (replica_transaction_ && replica_transaction_->terminal) {
-            replica_transaction_.reset();
-        }
+        transaction_kind_ = TransactionKind::None;
+        pending_plan_.reset();
     }
 
     [[nodiscard]] bool has_context_transaction() const noexcept {
-        return transaction_.has_value() || replica_transaction_.has_value();
+        return transaction_kind_ != TransactionKind::None;
     }
 
-    [[nodiscard]] std::optional<FakeReplicaTransitionOption>
-    inspect_replica_transition(const FakeContinuationHandle& owner,
-                               ninfer::runtime::CheckpointRef checkpoint) const {
-        ++replica_transition_inspections;
-        if (!owner.valid || owner.resources.device.state_slots == 0 ||
-            owner.resources.host.state_slots != 0 ||
-            checkpoint != continuation_summary().endpoint->ref) {
-            return std::nullopt;
-        }
-        return FakeReplicaTransitionOption{
-            .checkpoint                 = checkpoint,
-            .effect                     = {.added = resources({}, {.state_slots = 1})},
-            .added_host_replica_impacts = {FakeReplicaValueImpact{
-                .checkpoint            = checkpoint,
-                .fallback_rebuild_work = {.tokens = owner.rebuild_work},
-                .host_restore_requirements =
-                    {{.resource  = ninfer::runtime::ContextResourceClass::State,
-                      .direction = ninfer::runtime::ContextTransferDirection::HostToDevice,
-                      .units     = 1,
-                      .work      = {.payload_bytes = 1, .copy_operations = 1}}},
-            }},
-        };
+    [[nodiscard]] FakeCaptureAssessment inspect_capture(const FakeCaptureOffer&,
+                                                        const FakeSharedPrefixHandle*,
+                                                        const FakeSharedPrefixHandle*,
+                                                        std::optional<CheckpointRef>) const {
+        return capture_assessment;
     }
 
-    [[nodiscard]] std::optional<FakeReplicaTransitionOption>
-    inspect_replica_transition(const FakeSharedPrefixHandle&) const {
-        ++replica_transition_inspections;
-        return std::nullopt;
+    [[nodiscard]] bool shared_capture_matches(const FakeCaptureOffer&,
+                                              const FakeSharedPrefixHandle&) const {
+        return false;
     }
 
-    [[nodiscard]] ninfer::runtime::PreflightStatus
-    revalidate_replica_transition(const FakeContinuationHandle* private_owner,
-                                  const FakeSharedPrefixHandle* shared_owner,
-                                  const FakeReplicaTransitionOption& option,
-                                  const FakeContinuationHandle* private_replacement,
-                                  const FakeSharedPrefixHandle* shared_replacement,
-                                  const FakePressureOption* replacement) const {
-        if (transaction_ || replica_transaction_) {
-            return ninfer::runtime::PreflightStatus::StalePolicyState;
+    void skip_capture(FakeCaptureOffer&&) { ++skipped_captures; }
+
+    [[nodiscard]] ContextTransactionReserveStatus
+    reserve_active_capture(FakeCaptureOffer&&, const FakeSharedPrefixHandle*,
+                           const FakeSharedPrefixHandle*, std::optional<CheckpointRef>,
+                           CancellationFlagView cancellation) {
+        if (cancellation.requested() || abort_capture_start) {
+            return ContextTransactionReserveStatus::Aborted;
         }
-        if (private_owner == nullptr || shared_owner != nullptr || shared_replacement != nullptr) {
-            return ninfer::runtime::PreflightStatus::InvariantFailure;
-        }
-        const std::optional<FakeReplicaTransitionOption> expected =
-            inspect_replica_transition(*private_owner, option.checkpoint);
-        if (!expected || *expected != option) {
-            return ninfer::runtime::PreflightStatus::StalePolicyState;
-        }
-        if ((private_replacement == nullptr) != (replacement == nullptr)) {
-            return ninfer::runtime::PreflightStatus::InvariantFailure;
-        }
-        if (replacement != nullptr) {
-            ++replica_replacement_revalidations;
-            const std::vector<FakePressureOption> options =
-                inspect_pressure_options(*private_replacement, option.effect.added);
-            if (std::find(options.begin(), options.end(), *replacement) == options.end()) {
-                return ninfer::runtime::PreflightStatus::StalePolicyState;
-            }
-        }
-        return ninfer::runtime::PreflightStatus::Ready;
+        transaction_kind_ = TransactionKind::Capture;
+        advance_revision();
+        return ContextTransactionReserveStatus::Reserved;
     }
 
-    [[nodiscard]] ninfer::runtime::ContextTransactionReserveStatus
-    reserve_prevalidated_replica_transition(const FakeContinuationHandle* private_owner,
-                                            const FakeSharedPrefixHandle* shared_owner,
-                                            FakeReplicaTransitionOption option,
-                                            const FakeContinuationHandle* private_replacement,
-                                            const FakeSharedPrefixHandle* shared_replacement,
-                                            std::optional<FakePressureOption> replacement,
-                                            ninfer::runtime::CancellationFlagView cancellation) {
-        if (cancellation.requested()) {
-            return ninfer::runtime::ContextTransactionReserveStatus::Aborted;
+    [[nodiscard]] FakeFinishResult finish(FakeSequenceHandle sequence) noexcept {
+        ++finish_calls;
+        if (finish_fail_next) {
+            finish_fail_next = false;
+            return {};
         }
-        ReplicaTransaction transaction{
-            .target             = private_owner,
-            .replacement        = private_replacement,
-            .option             = std::move(option),
-            .replacement_option = std::move(replacement),
-        };
-        if (transaction.replacement != nullptr) {
-            --transaction.replacement->resources.host.state_slots;
-            transaction.replacement_committed = true;
-        }
-        replica_transaction_.emplace(std::move(transaction));
-        return ninfer::runtime::ContextTransactionReserveStatus::Reserved;
-    }
-
-    [[nodiscard]] FakeReplicaTransitionResult
-    progress_replica_transition_transaction(ninfer::runtime::CancellationFlagView cancellation) {
-        if (!replica_transaction_ || replica_transaction_->terminal) {
-            throw std::logic_error("fake replica-transition progress mismatch");
-        }
-        ReplicaTransaction& transaction = *replica_transaction_;
-        FakeReplicaTransitionResult result;
-        result.owner_count = transaction.replacement != nullptr ? 2U : 1U;
-        result.owners[0]   = {
-              .private_summary = continuation_summary(transaction.target->rebuild_work),
-        };
-        if (transaction.replacement != nullptr) {
-            result.owners[1] = {
-                .private_summary = continuation_summary(transaction.replacement->rebuild_work),
-            };
-            if (transaction.replacement_committed) {
-                result.owners[1].resource_delta.removed =
-                    transaction.replacement_option->effect.removed;
-                result.resource_delta.removed = transaction.replacement_option->effect.removed;
-            }
-        }
-        if (cancellation.requested()) {
-            result.status        = ninfer::runtime::ContextTransactionStatus::Aborted;
-            transaction.terminal = true;
-            return result;
-        }
-        ++transaction.target->resources.host.state_slots;
-        result.status = ninfer::runtime::ContextTransactionStatus::Published;
-        result.owners[0].resource_delta.added = transaction.option.effect.added;
-        result.resource_delta.added           = transaction.option.effect.added;
-        result.transfer_observations.push_back(
-            {.resource   = ninfer::runtime::ContextResourceClass::State,
-             .direction  = ninfer::runtime::ContextTransferDirection::DeviceToHost,
-             .units      = 1,
-             .work       = transaction.option.transfer_work,
-             .elapsed_ns = 1});
-        last_replica_target_key = transaction.target->key;
-        last_replica_victim_key =
-            transaction.replacement != nullptr ? transaction.replacement->key : 0;
-        transaction.terminal = true;
-        return result;
-    }
-
-    [[nodiscard]] FakeContextTransactionProgress
-    progress_context_transaction(ninfer::runtime::CancellationFlagView cancellation) {
-        if (transaction_) {
-            FakeMaterializationResult result = progress_materialization_transaction(cancellation);
-            if (result.status == ninfer::runtime::ContextTransactionStatus::InProgress) {
-                return ninfer::runtime::ContextTransactionInProgress{};
-            }
-            return result;
-        }
-        if (replica_transaction_) {
-            FakeReplicaTransitionResult result =
-                progress_replica_transition_transaction(cancellation);
-            if (result.status == ninfer::runtime::ContextTransactionStatus::InProgress) {
-                return ninfer::runtime::ContextTransactionInProgress{};
-            }
-            return result;
-        }
-        throw std::logic_error("fake context transaction is empty");
-    }
-
-    FakeStartResult start_request(FakeAdmissionPlan&& plan, FakePreparedPrompt&& prompt,
-                                  bool has_source) {
-        const std::uint32_t lane = plan.destination.value;
-        if (lane >= active_.size() || active_[lane].occupied || plan.key != prompt.key ||
-            plan.source != has_source) {
-            throw std::logic_error("fake materialization contract mismatch");
-        }
-        active_[lane]          = Active{.occupied             = true,
-                                        .key                  = prompt.key,
-                                        .generation           = next_generation_++,
-                                        .resources            = plan.resources.active_entitlement,
-                                        .rebuild_work         = plan.root_work,
-                                        .publish_continuation = plan.value.publish_continuation};
-        last_start_lane        = lane;
-        last_start_used_source = plan.source;
-        return FakeStartResult{
-            .sequence         = FakeSequenceHandle{LaneId{lane}, active_[lane].generation},
-            .active_resources = active_[lane].resources,
-        };
-    }
-
-    FakeFinishResult finish(FakeSequenceHandle sequence) noexcept {
+        advance_revision();
         FakeFinishResult result;
-        if (!valid(sequence)) { return result; }
-        Active& active = active_[sequence.lane.value];
-        result.status  = ConsumeStatus::Consumed;
-        if (!active.publish_continuation) {
-            result.disposition            = ninfer::runtime::FinishDisposition::Released;
-            result.resource_delta.removed = active.resources;
-            active                        = {};
+        result.status = ConsumeStatus::Consumed;
+        if (finish_release) {
+            result.disposition = FinishDisposition::Released;
             return result;
         }
-        result.disposition            = ninfer::runtime::FinishDisposition::Catalogued;
-        const bool host_only          = host_only_finish_key == active.key;
-        const ResourceVector resident = resources(
-            DeviceResources{
-                .state_slots      = host_only ? 0U : 1U,
-                .main_kv_pages    = std::min(2U, active.resources.device.main_kv_pages),
-                .backend_kv_pages = std::min(1U, active.resources.device.backend_kv_pages),
-            },
-            HostResources{
-                .state_slots = host_only ? 1U : std::min(1U, active.resources.host.state_slots),
-            });
-        result.resource_delta = {
-            .removed = active.resources,
-            .added   = resident,
-        };
-        result.summary =
-            continuation_summary(active.rebuild_work, content_keyed_summaries ? active.key : 0U);
-        result.continuation.emplace(active.key, resident, active.rebuild_work);
-        active = {};
+        result.disposition      = FinishDisposition::Catalogued;
+        const std::uint32_t key = sequence_content_keys_[sequence.id];
+        result.summary.endpoint = endpoint(key, finish_frontier);
+        result.continuation.emplace(sequence.id, key);
         return result;
     }
 
-    FakeAbortResult abort(FakeSequenceHandle sequence) noexcept {
-        FakeAbortResult result;
-        if (!valid(sequence)) { return result; }
-        Active& active                = active_[sequence.lane.value];
-        result.status                 = ConsumeStatus::Consumed;
-        result.resource_delta.removed = active.resources;
-        active                        = {};
-        return result;
+    [[nodiscard]] FakeAbortResult abort(FakeSequenceHandle) noexcept {
+        ++abort_calls;
+        advance_revision();
+        return FakeAbortResult{.status      = ConsumeStatus::Consumed,
+                               .timings     = FakeTimings{.value = 7},
+                               .speculative = FakeSpeculativeStats{.value = 9}};
     }
 
-    FakeReleaseResult release_continuation(FakeContinuationHandle&& continuation) noexcept {
-        FakeReleaseResult result;
-        if (!continuation.valid) { return result; }
-        result.status                 = ConsumeStatus::Consumed;
-        result.resource_delta.removed = continuation.resources;
-        continuation.valid            = false;
-        ++release_count;
-        last_released_key = continuation.key;
-        return result;
+    [[nodiscard]] FakeReleaseResult
+    release_continuation(FakeContinuationHandle&& continuation) noexcept {
+        released_continuations.push_back(continuation.id);
+        advance_revision();
+        return FakeReleaseResult{.status = ConsumeStatus::Consumed};
     }
 
-    [[nodiscard]] std::array<DeviceResources, 1U << ninfer::kMaximumConcurrency>
-    project_protected_resources(std::span<const FakeProtectedPrivateOwner>,
-                                std::span<const FakeProtectedSharedOwner>) const {
-        return {};
-    }
+    [[nodiscard]] std::uint64_t resource_revision() const noexcept { return revision_; }
 
-    std::uint32_t last_start_lane                           = ninfer::kMaximumConcurrency;
-    bool last_start_used_source                             = false;
-    std::uint32_t release_count                             = 0;
-    std::uint32_t last_released_key                         = 0;
-    std::uint32_t last_replica_target_key                   = 0;
-    std::uint32_t last_replica_victim_key                   = 0;
-    mutable std::uint32_t replica_transition_inspections    = 0;
-    mutable std::uint32_t replica_replacement_revalidations = 0;
-    mutable std::vector<std::pair<std::uint64_t, bool>> last_composed_pressure;
-    std::optional<std::uint32_t> demotable_device_state_key;
-    std::optional<std::uint32_t> host_only_finish_key;
-    std::optional<std::uint32_t> pressure_alias_source_key;
-    std::optional<std::uint32_t> pressure_alias_owner_key;
-    ResourceVector pressure_alias_active_transfer;
-    bool emit_state_d2h_observation            = false;
-    bool content_keyed_summaries               = false;
-    bool last_must_retain_private_source       = false;
-    std::atomic<bool>* cancel_after_victim     = nullptr;
-    std::uint64_t admission_source_inspections = 0;
+    [[nodiscard]] FakePhysicalUsage physical_usage() const noexcept { return usage; }
+
+    void invalidate_resources() noexcept { advance_revision(); }
+
+    std::size_t required_pressure_actions       = 0;
+    std::uint32_t private_pressure_alternatives = 1;
+    std::optional<std::uint64_t> required_action_id;
+    bool require_evictions                  = false;
+    bool abort_start                        = false;
+    bool abort_progress                     = false;
+    bool progress_in_progress_once          = false;
+    bool finish_fail_next                   = false;
+    bool finish_release                     = false;
+    bool abort_capture_start                = false;
+    ContextTransactionStatus capture_status = ContextTransactionStatus::Published;
+    FakeCaptureAssessment capture_assessment;
+    FakeContinuationSummary capture_summary;
+    FakePhysicalUsage usage;
+
+    std::uint64_t admission_inspections         = 0;
+    std::uint64_t start_calls                   = 0;
+    std::uint64_t finish_calls                  = 0;
+    std::uint64_t abort_calls                   = 0;
+    std::uint64_t skipped_captures              = 0;
+    std::uint32_t finish_frontier               = 16;
+    std::uint32_t started_source_id             = 0;
+    ClaimDisposition started_source_disposition = ClaimDisposition::ConsumedToActive;
+    std::vector<std::uint32_t> inspected_private_sources;
+    std::vector<std::uint32_t> inspected_shared_sources;
+    std::vector<std::vector<std::uint64_t>> seal_attempts;
+    std::vector<std::uint64_t> started_action_ids;
+    std::vector<std::uint32_t> released_continuations;
 
 private:
-    struct Transaction {
-        std::uint64_t id = 0;
-        bool has_source  = false;
-        ninfer::runtime::ClaimDisposition source_disposition =
-            ninfer::runtime::ClaimDisposition::ConsumedToActive;
-        std::uint32_t source_key = 0;
-        ResourceVector source_resources;
-        std::array<std::uint32_t, 2 * ninfer::kMaximumConcurrency> victim_keys{};
-        std::array<ResourceVector, 2 * ninfer::kMaximumConcurrency> victim_resources{};
-        std::array<bool, 2 * ninfer::kMaximumConcurrency> released{};
-        std::size_t victim_count = 0;
-        std::optional<FakeAdmissionPlan> plan;
-        std::optional<FakePreparedPrompt> prompt;
-        bool terminal = false;
-    };
-
-    struct Active {
-        bool occupied            = false;
-        std::uint32_t key        = 0;
-        std::uint64_t generation = 0;
-        ResourceVector resources;
-        std::uint64_t rebuild_work = 0;
-        bool publish_continuation  = true;
-    };
-
-    struct ReplicaTransaction {
-        const FakeContinuationHandle* target      = nullptr;
-        const FakeContinuationHandle* replacement = nullptr;
-        FakeReplicaTransitionOption option;
-        std::optional<FakePressureOption> replacement_option;
-        bool replacement_committed = false;
-        bool terminal              = false;
-    };
-
-    [[nodiscard]] bool valid(FakeSequenceHandle sequence) const noexcept {
-        return sequence.lane.value < active_.size() && active_[sequence.lane.value].occupied &&
-               active_[sequence.lane.value].generation == sequence.generation;
+    void advance_revision() noexcept {
+        if (++revision_ == 0) { ++revision_; }
     }
 
-    std::array<Active, ninfer::kMaximumConcurrency> active_{};
-    std::uint64_t next_generation_ = 1;
-    std::optional<Transaction> transaction_;
-    std::optional<ReplicaTransaction> replica_transaction_;
-    std::uint64_t next_transaction_ = 1;
+    std::uint64_t revision_         = 1;
+    std::uint32_t next_sequence_id_ = 1;
+    std::array<std::uint32_t, 256> sequence_content_keys_{};
+    TransactionKind transaction_kind_ = TransactionKind::None;
+    FakePreparedPrompt pending_prompt_;
+    std::optional<FakeResourcePlan> pending_plan_;
 };
 
 struct FakePackage {
@@ -1143,601 +723,438 @@ struct FakePackage {
     using PreparedPrompt             = FakePreparedPrompt;
     using RequestBasePlan            = FakeRequestBasePlan;
     using AdmissionPlan              = FakeAdmissionPlan;
+    using ResourcePlan               = FakeResourcePlan;
+    using PersistentBackfillProof    = FakePersistentBackfillProof;
     using SequenceHandle             = FakeSequenceHandle;
     using ContinuationHandle         = FakeContinuationHandle;
     using SharedPrefixHandle         = FakeSharedPrefixHandle;
     using CaptureOffer               = FakeCaptureOffer;
-    using ProtectedPrivateOwner      = FakeProtectedPrivateOwner;
-    using ProtectedSharedOwner       = FakeProtectedSharedOwner;
     using ContinuationSummary        = FakeContinuationSummary;
     using SharedPrefixSummary        = FakeSharedPrefixSummary;
     using CaptureAssessment          = FakeCaptureAssessment;
     using ActiveCaptureResult        = FakeActiveCaptureResult;
-    using PressureOption             = FakePressureOption;
-    using CacheSessionKey            = FakeCacheSessionKey;
-    using MaterializationResult      = FakeMaterializationResult;
     using ContextTransactionProgress = FakeContextTransactionProgress;
-    using ReplicaTransitionOption    = FakeReplicaTransitionOption;
-    using ReplicaTransitionResult    = FakeReplicaTransitionResult;
+    using MaterializationResult      = FakeMaterializationResult;
     using StartResult                = FakeStartResult;
     using FinishResult               = FakeFinishResult;
     using AbortResult                = FakeAbortResult;
-    using ReleaseResult              = FakeReleaseResult;
+    using PressureOption             = FakePressureOption;
     using CommitResult               = FakeCommitResult;
     using DiscardResult              = FakeDiscardResult;
+    using CacheSessionKey            = FakeCacheSessionKey;
 };
-
-FakeRequestBasePlan make_base(std::uint64_t work = 10) {
-    FakeRequestBasePlan base;
-    base.resources                 = demand(DeviceResources{
-                        .active_lanes = 1, .state_slots = 1, .main_kv_pages = 3, .backend_kv_pages = 2});
-    base.value.service_work_quanta = work;
-    return base;
-}
-
-void add_host_state_entitlement(FakeRequestBasePlan& base) {
-    base.resources.active_entitlement.host.state_slots       = 1;
-    base.resources.reservation_added.host.state_slots        = 1;
-    base.resources.physical_peak_additional.host.state_slots = 1;
-    base.resources.final_added.host.state_slots              = 1;
-}
 
 using FakeManager = ninfer::runtime::ResourceManager<FakePackage>;
 
-FakeStartResult materialize_and_adopt(FakeManager& manager, FakeProgram& program,
-                                      FakeManager::Choice&& choice, FakePreparedPrompt prompt) {
-    std::atomic<bool> cancelled{false};
+FakeManager make_manager(std::uint32_t lanes = 1, std::uint32_t private_capacity = 4,
+                         std::uint32_t shared_capacity = 0, bool cache_enabled = true) {
+    return FakeManager(lanes, private_capacity, shared_capacity, cache_enabled, 2,
+                       test_cost_model());
+}
+
+struct ActiveRequest {
+    LaneId lane;
+    FakeSequenceHandle sequence;
+};
+
+ActiveRequest start_active(FakeManager& manager, FakeProgram& program, std::uint32_t content_key,
+                           const FakeRequestBasePlan& base, std::uint64_t publication_order) {
+    auto inspection =
+        manager.inspect(program, FakePreparedPrompt{content_key}, base, publication_order);
+    require(inspection.choice.has_value(), "request did not produce an admission choice");
+    const LaneId lane   = inspection.choice->destination();
+    const auto reserved = manager.reserve_materialization(program, std::move(*inspection.choice),
+                                                          FakePreparedPrompt{content_key}, {});
+    require(reserved == FakeManager::MaterializationReserveResult::Reserved,
+            "request materialization was not reserved");
+    auto outcome = [&]() -> FakeManager::MaterializationOutcome {
+        auto progress = manager.progress_context_transaction(program, {});
+        if (!std::holds_alternative<ContextTransactionInProgress>(progress)) {
+            return std::get<FakeManager::MaterializationOutcome>(std::move(progress));
+        }
+        auto completed = manager.progress_context_transaction(program, {});
+        return std::get<FakeManager::MaterializationOutcome>(std::move(completed));
+    }();
+    require(outcome.status == ContextTransactionStatus::Published && outcome.activation,
+            "request materialization did not publish");
+    auto activation                   = std::move(*outcome.activation);
+    const FakeSequenceHandle sequence = activation.sequence();
+    manager.adopt(program, std::move(activation));
+    require(manager.lane_state(lane) == ninfer::runtime::LogicalLaneState::Active,
+            "published lane was not adopted as active");
+    return ActiveRequest{.lane = lane, .sequence = sequence};
+}
+
+FakeFinishResult finish_active(FakeManager& manager, FakeProgram& program, ActiveRequest request,
+                               std::uint32_t frontier = 16) {
+    program.finish_frontier = frontier;
+    manager.mark_terminal_pending(request.lane);
+    return manager.finish(program, request.lane, request.sequence);
+}
+
+void test_root_lifecycle_and_prefix_reuse() {
+    FakeManager manager = make_manager(1, 2);
+    FakeProgram program;
+    const ActiveRequest first     = start_active(manager, program, 7, make_base(7), 1);
+    const FakeFinishResult finish = finish_active(manager, program, first);
+    require(finish.status == ConsumeStatus::Consumed &&
+                finish.disposition == FinishDisposition::Catalogued,
+            "terminal continuation was not catalogued");
+    require(manager.lane_state(first.lane) == ninfer::runtime::LogicalLaneState::Free,
+            "terminal lane did not return to Free");
+
+    auto reuse = manager.inspect(program, FakePreparedPrompt{7}, make_base(7), 2);
+    require(reuse.readiness == Readiness::Ready && reuse.choice,
+            "catalogued endpoint was not reusable");
+    require(reuse.choice->summary().reusable_prompt_tokens == 16,
+            "endpoint reuse frontier was not selected");
+    program.abort_start = true;
+    const auto status   = manager.reserve_materialization(program, std::move(*reuse.choice),
+                                                          FakePreparedPrompt{7}, {});
+    require(status == FakeManager::MaterializationReserveResult::Stale &&
+                program.started_source_id == first.sequence.id,
+            "selected endpoint did not reach the sealed Program plan");
+    require(manager.catalog_state(0) == FakeManager::CatalogState::Catalogued,
+            "failed start did not roll back its logical source claim");
+}
+
+void test_stale_revision_is_retryable() {
+    FakeManager manager = make_manager();
+    FakeProgram program;
+    auto inspection = manager.inspect(program, FakePreparedPrompt{1}, make_base(1), 1);
+    require(inspection.choice.has_value(), "root choice was not produced");
+    const std::uint64_t start_calls = program.start_calls;
+    program.invalidate_resources();
+    const auto status = manager.reserve_materialization(program, std::move(*inspection.choice),
+                                                        FakePreparedPrompt{1}, {});
+    require(status == FakeManager::MaterializationReserveResult::Stale,
+            "revision mismatch was not reported as retryable stale work");
+    require(program.start_calls == start_calls,
+            "known-stale plan was incorrectly passed into Program start");
+    require(manager.lane_state(LaneId{0}) == ninfer::runtime::LogicalLaneState::Free,
+            "known-stale plan changed logical lane state");
+}
+
+void test_materialization_abort_preserves_source() {
+    FakeManager manager = make_manager(1, 2);
+    FakeProgram program;
+    const ActiveRequest seed = start_active(manager, program, 5, make_base(5), 1);
+    (void)finish_active(manager, program, seed);
+
+    auto inspection = manager.inspect(program, FakePreparedPrompt{5}, make_base(5), 2);
+    require(inspection.choice && inspection.choice->summary().reusable_prompt_tokens == 16,
+            "abort test did not select its private source");
+    program.abort_progress = true;
+    require(manager.reserve_materialization(program, std::move(*inspection.choice),
+                                            FakePreparedPrompt{5}, {}) ==
+                FakeManager::MaterializationReserveResult::Reserved,
+            "abort test could not reserve materialization");
+    auto progress = manager.progress_context_transaction(program, {});
+    auto outcome  = std::get<FakeManager::MaterializationOutcome>(std::move(progress));
+    require(outcome.status == ContextTransactionStatus::Aborted && !outcome.activation,
+            "cancelled materialization did not abort before publication");
+    require(manager.catalog_state(0) == FakeManager::CatalogState::Catalogued,
+            "aborted Move did not restore its source visibility");
+
+    program.abort_progress = false;
+    program.abort_start    = true;
+    auto retry             = manager.inspect(program, FakePreparedPrompt{5}, make_base(5), 3);
+    require(retry.choice && retry.choice->summary().reusable_prompt_tokens == 16,
+            "restored source was not reusable after abort");
+    (void)manager.reserve_materialization(program, std::move(*retry.choice), FakePreparedPrompt{5},
+                                          {});
+    require(program.started_source_id == seed.sequence.id,
+            "abort restored the wrong source capability");
+}
+
+void test_committed_victim_survives_transaction_abort() {
+    FakeManager manager = make_manager(1, 2);
+    FakeProgram program;
+    const ActiveRequest first = start_active(manager, program, 10, make_base(10), 1);
+    (void)finish_active(manager, program, first);
+    const ActiveRequest second = start_active(manager, program, 20, make_base(20), 2);
+    (void)finish_active(manager, program, second);
+
+    auto inspection = manager.inspect(program, FakePreparedPrompt{30}, make_base(30), 3);
+    require(inspection.choice.has_value(), "full catalog did not produce an eviction closure");
+    program.abort_progress = true;
+    require(manager.reserve_materialization(program, std::move(*inspection.choice),
+                                            FakePreparedPrompt{30}, {}) ==
+                FakeManager::MaterializationReserveResult::Reserved,
+            "evicting materialization was not reserved");
+    auto progress = manager.progress_context_transaction(program, {});
+    auto outcome  = std::get<FakeManager::MaterializationOutcome>(std::move(progress));
+    require(outcome.status == ContextTransactionStatus::Aborted,
+            "pressure transaction did not take the abort path");
+    const std::uint32_t catalogued =
+        (manager.catalog_state(0) == FakeManager::CatalogState::Catalogued ? 1U : 0U) +
+        (manager.catalog_state(1) == FakeManager::CatalogState::Catalogued ? 1U : 0U);
+    require(catalogued == 1,
+            "committed victim eviction was incorrectly rolled back with request-local abort");
+}
+
+void test_retained_source_is_protected_until_terminal() {
+    FakeManager manager = make_manager(2, 3);
+    FakeProgram program;
+    const FakeCacheSessionKey first_session{1};
+    const FakeCacheSessionKey second_session{2};
+    const ActiveRequest seed = start_active(
+        manager, program, 9, make_base(9, first_session, RetentionClass::LiveSession), 1);
+    (void)finish_active(manager, program, seed);
+
+    const ActiveRequest fork = start_active(
+        manager, program, 9, make_base(9, second_session, RetentionClass::LiveSession), 2);
+    require(program.started_source_disposition == ClaimDisposition::Retained,
+            "different-session source was destructively moved");
+
+    program.required_pressure_actions = 1;
+    auto blocked = manager.inspect(program, FakePreparedPrompt{77}, make_base(77), 3);
+    require(blocked.readiness == Readiness::TemporarilyBlocked && !blocked.choice,
+            "active retained source was exposed as a pressure victim");
+
+    (void)manager.abort(program, fork.lane, fork.sequence);
+    program.abort_start = true;
+    auto available      = manager.inspect(program, FakePreparedPrompt{77}, make_base(77), 4);
+    require(available.choice.has_value(),
+            "terminal release did not return retained source to pressure policy");
+    (void)manager.reserve_materialization(program, std::move(*available.choice),
+                                          FakePreparedPrompt{77}, {});
+    require(!program.started_action_ids.empty(),
+            "released source did not participate in the sealed pressure plan");
+}
+
+void test_session_publication_order_controls_tied_source() {
+    FakeManager manager = make_manager(2, 3);
+    FakeProgram program;
+    const FakeCacheSessionKey session{42};
+    const FakeRequestBasePlan base = make_base(42, session, RetentionClass::LiveSession, true);
+
+    const ActiveRequest older = start_active(manager, program, 42, base, 10);
+    const ActiveRequest newer = start_active(manager, program, 42, base, 20);
+    (void)finish_active(manager, program, newer, 16);
+    (void)finish_active(manager, program, older, 16);
+
+    auto next = manager.inspect(program, FakePreparedPrompt{42}, base, 30);
+    require(next.choice && next.choice->summary().reusable_prompt_tokens == 16,
+            "same-session endpoint candidates were not reusable");
+    program.abort_start = true;
+    (void)manager.reserve_materialization(program, std::move(*next.choice), FakePreparedPrompt{42},
+                                          {});
+    require(program.started_source_id == newer.sequence.id,
+            "older out-of-order finish displaced the current session binding on a tied cost");
+
+    program.abort_start             = false;
+    const ActiveRequest replacement = start_active(
+        manager, program, 99, make_base(99, session, RetentionClass::LiveSession, true), 40);
+    (void)finish_active(manager, program, replacement, 16);
+    require(program.released_continuations.empty(),
+            "session publication synchronously released an old physical continuation");
+    require(manager.catalog_state(0) == FakeManager::CatalogState::Catalogued &&
+                manager.catalog_state(1) == FakeManager::CatalogState::Catalogued &&
+                manager.catalog_state(2) == FakeManager::CatalogState::Catalogued,
+            "session replacement did not retain its old binding as anonymous cache");
+}
+
+void test_canonical_pressure_starts_with_disposable_owner() {
+    FakeManager manager = make_manager(1, 3);
+    FakeProgram program;
+    const ActiveRequest disposable = start_active(
+        manager, program, 1, make_base(1, std::nullopt, RetentionClass::Disposable), 1);
+    (void)finish_active(manager, program, disposable);
+    const ActiveRequest live = start_active(
+        manager, program, 2, make_base(2, FakeCacheSessionKey{2}, RetentionClass::LiveSession), 2);
+    (void)finish_active(manager, program, live);
+
+    program.required_pressure_actions = 1;
+    auto inspection = manager.inspect(program, FakePreparedPrompt{3}, make_base(3), 3);
+    require(inspection.choice.has_value(), "canonical pressure did not find a feasible prefix");
+    program.abort_start = true;
+    (void)manager.reserve_materialization(program, std::move(*inspection.choice),
+                                          FakePreparedPrompt{3}, {});
+    require(program.started_action_ids.size() == 1 &&
+                program.started_action_ids.front() == 1000U + disposable.sequence.id,
+            "canonical pressure did not degrade Disposable before LiveSession");
+}
+
+void test_pressure_tries_every_preserving_alternative_before_eviction() {
+    FakeManager manager = make_manager(1, 2);
+    FakeProgram program;
+    const ActiveRequest seed = start_active(manager, program, 15, make_base(15), 1);
+    (void)finish_active(manager, program, seed);
+
+    program.required_pressure_actions     = 1;
+    program.private_pressure_alternatives = 2;
+    program.required_action_id            = 11000U + seed.sequence.id;
+    auto inspection = manager.inspect(program, FakePreparedPrompt{25}, make_base(25), 2);
+    require(inspection.choice.has_value(), "second preserving pressure alternative was skipped");
+
+    program.abort_start = true;
+    (void)manager.reserve_materialization(program, std::move(*inspection.choice),
+                                          FakePreparedPrompt{25}, {});
+    require(program.started_action_ids.size() == 1 &&
+                program.started_action_ids.front() == *program.required_action_id,
+            "pressure escalated before trying the feasible preserving alternative");
+}
+
+void test_in_progress_adoption_and_private_capture() {
+    FakeManager manager = make_manager(1, 2);
+    FakeProgram program;
+    program.progress_in_progress_once = true;
+    const ActiveRequest active        = start_active(manager, program, 12, make_base(12), 1);
+
+    program.capture_assessment = FakeCaptureAssessment{
+        .shortlist_key     = FakeShortlistKey{.digest = 12, .frontier = 24},
+        .publishes_private = true,
+    };
+    program.capture_summary.endpoint = endpoint(12, 24);
     const auto reserved =
-        manager.reserve_materialization(program, std::move(choice), std::move(prompt),
-                                        ninfer::runtime::CancellationFlagView{&cancelled});
-    if (reserved != FakeManager::MaterializationReserveResult::Reserved) {
-        throw std::logic_error("fake materialization was not reserved");
-    }
-    auto progress = manager.progress_context_transaction(
-        program, ninfer::runtime::CancellationFlagView{&cancelled});
-    if (!std::holds_alternative<FakeManager::MaterializationOutcome>(progress)) {
-        throw std::logic_error("fake materialization returned the wrong transaction outcome");
-    }
-    auto outcome = std::get<FakeManager::MaterializationOutcome>(std::move(progress));
-    if (outcome.status != ninfer::runtime::ContextTransactionStatus::Published ||
-        !outcome.activation) {
-        throw std::logic_error("fake materialization did not publish");
-    }
-    FakeStartResult result{
-        .sequence         = outcome.activation->sequence(),
-        .active_resources = outcome.activation->active_resources(),
+        manager.reserve_active_capture(program, active.lane, FakeCaptureOffer{.id = 1}, true, {});
+    require(reserved == FakeManager::ActiveCaptureReserveResult::Reserved,
+            "private capture was not reserved");
+    auto progress = manager.progress_context_transaction(program, {});
+    auto outcome  = std::get<FakeManager::ActiveCaptureOutcome>(std::move(progress));
+    require(outcome.status == ContextTransactionStatus::Published &&
+                !manager.context_transaction_kind(),
+            "private capture was not adopted to a stable logical state");
+    require(manager.lane_state(active.lane) == ninfer::runtime::LogicalLaneState::Active,
+            "private capture disturbed active lane ownership");
+    (void)finish_active(manager, program, active, 24);
+}
+
+void test_terminal_fallback_releases_failed_retention() {
+    FakeManager manager = make_manager(1, 1);
+    FakeProgram program;
+    const ActiveRequest active = start_active(manager, program, 4, make_base(4), 1);
+    manager.mark_terminal_pending(active.lane);
+    program.finish_fail_next      = true;
+    const FakeFinishResult result = manager.finish(program, active.lane, active.sequence);
+    require(result.status == ConsumeStatus::Consumed &&
+                result.disposition == FinishDisposition::Released,
+            "failed retention did not converge to a released terminal result");
+    require(result.timings.value == 7 && result.speculative.value == 9,
+            "terminal fallback lost abort accounting");
+    require(program.abort_calls == 1 &&
+                manager.lane_state(active.lane) == ninfer::runtime::LogicalLaneState::Free &&
+                manager.catalog_state(0) == FakeManager::CatalogState::Vacant,
+            "terminal fallback did not free every logical owner");
+}
+
+void test_terminal_settlement_waits_for_open_resource_transaction() {
+    FakeManager manager = make_manager(2, 3);
+    FakeProgram program;
+    const ActiveRequest active = start_active(manager, program, 31, make_base(31), 1);
+
+    auto inspection = manager.inspect(program, FakePreparedPrompt{32}, make_base(32), 2);
+    require(inspection.choice.has_value(), "concurrent materialization choice was not produced");
+    require(manager.reserve_materialization(program, std::move(*inspection.choice),
+                                            FakePreparedPrompt{32}, {}) ==
+                FakeManager::MaterializationReserveResult::Reserved,
+            "concurrent materialization was not reserved");
+
+    const auto capture =
+        manager.reserve_active_capture(program, active.lane, FakeCaptureOffer{.id = 9}, true, {});
+    require(capture == FakeManager::ActiveCaptureReserveResult::Skipped &&
+                program.skipped_captures == 1 &&
+                manager.context_transaction_kind() ==
+                    ninfer::runtime::ContextTransactionKind::Materialization,
+            "optional capture was not skipped behind the open materialization");
+
+    manager.mark_terminal_pending(active.lane);
+    bool rejected = false;
+    try {
+        (void)manager.finish(program, active.lane, active.sequence);
+    } catch (const std::logic_error&) { rejected = true; }
+    require(rejected && manager.lane_state(active.lane) ==
+                            ninfer::runtime::LogicalLaneState::TerminalPending,
+            "terminal settlement changed topology during an open resource transaction");
+}
+
+void test_commit_and_discard_terminal_states() {
+    FakeManager manager = make_manager(2, 2);
+    FakeProgram program;
+    const ActiveRequest first  = start_active(manager, program, 1, make_base(1), 1);
+    const ActiveRequest second = start_active(manager, program, 2, make_base(2), 2);
+    const std::array<LaneId, 2> lanes{first.lane, second.lane};
+    FakeCommitResult commit;
+    commit.row_count           = 2;
+    commit.rows[0].disposition = CommitDisposition::Active;
+    commit.rows[1].disposition = CommitDisposition::Finishable;
+    manager.apply_commit(lanes, commit);
+    require(manager.lane_state(first.lane) == ninfer::runtime::LogicalLaneState::Active &&
+                manager.lane_state(second.lane) ==
+                    ninfer::runtime::LogicalLaneState::TerminalPending,
+            "row-aligned commit did not establish terminal pending state");
+    (void)manager.finish(program, second.lane, second.sequence);
+
+    FakeDiscardResult discard{.status = ConsumeStatus::Consumed, .row_count = 1};
+    const std::array<LaneId, 1> remaining{first.lane};
+    manager.apply_discard(remaining, discard);
+    require(manager.lane_state(first.lane) == ninfer::runtime::LogicalLaneState::Free,
+            "discard did not release cancelled active membership");
+}
+
+void test_backfill_proof_and_stats_follow_program_revision() {
+    FakeManager manager = make_manager();
+    FakeProgram program;
+    auto inspection = manager.inspect(program, FakePreparedPrompt{8}, make_base(8), 1);
+    require(inspection.choice.has_value(), "backfill test did not produce a candidate plan");
+    const std::array<FakeSequenceHandle, 0> borrowers{};
+    auto proof =
+        manager.prove_persistent_backfill(program, make_base(99), *inspection.choice, borrowers);
+    require(proof && proof->resource_revision() == program.resource_revision(),
+            "Program did not seal a current-revision persistent proof");
+    program.invalidate_resources();
+    proof =
+        manager.prove_persistent_backfill(program, make_base(99), *inspection.choice, borrowers);
+    require(!proof, "resource revision change did not invalidate persistent proof");
+
+    program.usage = FakePhysicalUsage{
+        .device_state_slots      = 3,
+        .host_state_slots        = 2,
+        .device_main_kv_pages    = 11,
+        .device_backend_kv_pages = 5,
+        .host_kv_bytes           = 4096,
     };
-    manager.adopt(program, std::move(*outcome.activation));
-    outcome.activation.reset();
-    return result;
+    RuntimeStats stats;
+    manager.populate_runtime_stats(program, stats);
+    require(stats.device_state_occupied_slots == 3 && stats.host_state_occupied_slots == 2 &&
+                stats.device_main_kv_occupied_pages == 11 &&
+                stats.device_backend_kv_occupied_pages == 5 && stats.host_kv_occupied_bytes == 4096,
+            "runtime physical gauges did not come directly from Program");
 }
 
-void test_global_catalog_lifecycle() {
-    using Manager = ninfer::runtime::ResourceManager<FakePackage>;
+void test_shortlist_collision_requires_program_exact_verification() {
+    FakeManager manager = make_manager(1, 2);
     FakeProgram program;
-    Manager manager(resources({2, 4, 12, 8}), 2, 4, 0, true, 0, test_cost_model());
-    const FakeRequestBasePlan base = make_base();
+    const ActiveRequest seed = start_active(manager, program, 55, make_base(123), 1);
+    (void)finish_active(manager, program, seed);
 
-    auto first = manager.inspect(program, FakePreparedPrompt{1}, base);
-    expect(first.readiness == ninfer::runtime::Readiness::Ready && first.choice &&
-               first.choice->destination() == LaneId{0},
-           "first root was not assigned to the lowest free lane");
-    auto first_active =
-        materialize_and_adopt(manager, program, std::move(*first.choice), FakePreparedPrompt{1});
-    (void)manager.finish(program, LaneId{0}, first_active.sequence);
-
-    auto blocker = manager.inspect(program, FakePreparedPrompt{2}, base);
-    auto blocker_active =
-        materialize_and_adopt(manager, program, std::move(*blocker.choice), FakePreparedPrompt{2});
-    expect(blocker_active.sequence.lane == LaneId{0}, "root blocker did not occupy lane zero");
-
-    auto resumed = manager.inspect(program, FakePreparedPrompt{1}, base);
-    expect(resumed.readiness == ninfer::runtime::Readiness::Ready && resumed.choice &&
-               resumed.choice->destination() == LaneId{1} &&
-               resumed.choice->summary().reusable_prompt_tokens == 16,
-           "global continuation was not reusable on a different destination lane");
-    auto resumed_active =
-        materialize_and_adopt(manager, program, std::move(*resumed.choice), FakePreparedPrompt{1});
-    expect(program.last_start_used_source && program.last_start_lane == 1,
-           "materialization did not consume the global source into lane one");
-    (void)manager.abort(program, LaneId{1}, resumed_active.sequence);
-    (void)manager.abort(program, LaneId{0}, blocker_active.sequence);
-    expect(manager.ledger().used() == ResourceVector{},
-           "abort did not release active ownership and publication reservations");
-}
-
-void test_catalog_pressure_reserves_publication() {
-    using Manager = ninfer::runtime::ResourceManager<FakePackage>;
-    FakeProgram program;
-    Manager manager(resources({1, 2, 6, 4}), 1, 2, 0, true, 0, test_cost_model());
-
-    const auto publish_root = [&](std::uint32_t key, std::uint64_t work) {
-        const FakeRequestBasePlan base = make_base(work);
-        auto inspection                = manager.inspect(program, FakePreparedPrompt{key}, base);
-        expect(inspection.readiness == ninfer::runtime::Readiness::Ready && inspection.choice,
-               "root inspection failed under bounded catalog pressure");
-        auto active = materialize_and_adopt(manager, program, std::move(*inspection.choice),
-                                            FakePreparedPrompt{key});
-        (void)manager.finish(program, LaneId{0}, active.sequence);
-    };
-
-    publish_root(1, 9);
-    publish_root(2, 2);
-    expect(manager.ledger().used() == resources({0, 2, 4, 2}),
-           "two catalogued continuations did not fill the bounded state catalog");
-    publish_root(3, 4);
-    expect(program.release_count == 1 && program.last_released_key == 2 &&
-               manager.ledger().used() == resources({0, 2, 4, 2}),
-           "root materialization did not evict the cheapest whole entry and reuse its slot");
-}
-
-void test_root_only_mode_releases_finished_context() {
-    FakeProgram program;
-    FakeManager manager(resources({1, 1, 3, 2}), 1, 1, 0, false, 0, test_cost_model());
-    FakeRequestBasePlan base        = make_base();
-    base.cache.session_key          = FakeCacheSessionKey{7};
-    base.value.publish_continuation = false;
-
-    auto first = manager.inspect(program, FakePreparedPrompt{7}, base);
-    expect(first.readiness == ninfer::runtime::Readiness::Ready && first.choice &&
-               first.choice->summary().reusable_prompt_tokens == 0,
-           "root-only mode did not admit the initial root plan");
-    auto active =
-        materialize_and_adopt(manager, program, std::move(*first.choice), FakePreparedPrompt{7});
-    (void)manager.finish(program, LaneId{0}, active.sequence);
-    expect(program.release_count == 0 && manager.ledger().used() == ResourceVector{} &&
-               manager.catalog_state(0) == FakeManager::CatalogState::Vacant,
-           "root-only mode did not release active state directly at finish");
-
-    auto second = manager.inspect(program, FakePreparedPrompt{7}, base);
-    expect(second.readiness == ninfer::runtime::Readiness::Ready && second.choice &&
-               second.choice->summary().reusable_prompt_tokens == 0,
-           "root-only mode exposed a private continuation to a later request");
-    auto second_active =
-        materialize_and_adopt(manager, program, std::move(*second.choice), FakePreparedPrompt{7});
-    (void)manager.abort(program, LaneId{0}, second_active.sequence);
-}
-
-void test_materialization_abort_and_adoption() {
-    FakeProgram program;
-    FakeManager manager(resources({1, 2, 4, 2}), 1, 2, 0, true, 0, test_cost_model());
-
-    FakeRequestBasePlan seed = make_base();
-    seed.resources           = demand({1, 1, 2, 1});
-    const auto publish_seed  = [&](std::uint32_t key, std::uint64_t work) {
-        seed.value.service_work_quanta = work;
-        auto inspection                = manager.inspect(program, FakePreparedPrompt{key}, seed);
-        expect(inspection.readiness == ninfer::runtime::Readiness::Ready && inspection.choice,
-                "transaction seed was not ready");
-        auto active = materialize_and_adopt(manager, program, std::move(*inspection.choice),
-                                             FakePreparedPrompt{key});
-        (void)manager.finish(program, LaneId{0}, active.sequence);
-    };
-    publish_seed(1, 8);
-    publish_seed(2, 2);
-
-    std::atomic<bool> cancelled{false};
-    program.cancel_after_victim       = &cancelled;
-    const FakeRequestBasePlan request = make_base(9);
-    auto inspection                   = manager.inspect(program, FakePreparedPrompt{1}, request);
-    expect(inspection.readiness == ninfer::runtime::Readiness::Ready && inspection.choice &&
-               inspection.choice->summary().reusable_prompt_tokens == 16,
-           "source materialization under pressure was not selected");
-    auto reserved = manager.reserve_materialization(
-        program, std::move(*inspection.choice), FakePreparedPrompt{1},
-        ninfer::runtime::CancellationFlagView{&cancelled});
-    expect(reserved == FakeManager::MaterializationReserveResult::Reserved,
-           "source materialization was not reserved");
-    auto abort_progress = manager.progress_context_transaction(
-        program, ninfer::runtime::CancellationFlagView{&cancelled});
-    expect(std::holds_alternative<FakeManager::MaterializationOutcome>(abort_progress),
-           "aborted materialization returned the wrong transaction outcome");
-    auto aborted = std::get<FakeManager::MaterializationOutcome>(std::move(abort_progress));
-    expect(aborted.status == ninfer::runtime::ContextTransactionStatus::Aborted &&
-               !aborted.activation && program.release_count == 1 &&
-               program.last_released_key == 2 && manager.ledger().used() == resources({0, 1, 2, 1}),
-           "pre-publication abort did not retain committed victims and restore the source");
-
-    program.cancel_after_victim = nullptr;
-    cancelled.store(false, std::memory_order_release);
-    auto retry = manager.inspect(program, FakePreparedPrompt{1}, request);
-    expect(retry.readiness == ninfer::runtime::Readiness::Ready && retry.choice &&
-               retry.choice->summary().reusable_prompt_tokens == 16,
-           "aborted source was not reusable after its claim was restored");
-    reserved =
-        manager.reserve_materialization(program, std::move(*retry.choice), FakePreparedPrompt{1},
-                                        ninfer::runtime::CancellationFlagView{&cancelled});
-    expect(reserved == FakeManager::MaterializationReserveResult::Reserved,
-           "retry materialization was not reserved");
-    auto publish_progress = manager.progress_context_transaction(
-        program, ninfer::runtime::CancellationFlagView{&cancelled});
-    expect(std::holds_alternative<FakeManager::MaterializationOutcome>(publish_progress),
-           "published materialization returned the wrong transaction outcome");
-    auto published = std::get<FakeManager::MaterializationOutcome>(std::move(publish_progress));
-    expect(published.status == ninfer::runtime::ContextTransactionStatus::Published &&
-               published.activation && manager.ledger().used() == resources({0, 1, 2, 1}) &&
-               manager.ledger().lane(LaneId{0}).state ==
-                   ninfer::runtime::LogicalLaneState::Materializing,
-           "Program publication changed the host ledger before activation adoption");
-    const FakeSequenceHandle sequence = published.activation->sequence();
-    manager.adopt(program, std::move(*published.activation));
-    published.activation.reset();
-    expect(manager.ledger().used() == resources({1, 1, 3, 2}),
-           "published activation did not adopt the exact source-to-active delta");
-    (void)manager.abort(program, LaneId{0}, sequence);
-}
-
-void test_retained_private_source_reference() {
-    FakeProgram program;
-    FakeManager manager(resources({2, 4, 12, 8}), 2, 4, 0, true, 0, test_cost_model());
-
-    FakeRequestBasePlan seed = make_base();
-    seed.cache.session_key   = FakeCacheSessionKey{42};
-    auto initial             = manager.inspect(program, FakePreparedPrompt{42}, seed);
-    expect(initial.readiness == ninfer::runtime::Readiness::Ready && initial.choice,
-           "session seed was not admitted");
-    auto seeded =
-        materialize_and_adopt(manager, program, std::move(*initial.choice), FakePreparedPrompt{42});
-    (void)manager.finish(program, LaneId{0}, seeded.sequence);
-
-    FakeRequestBasePlan ephemeral        = make_base();
-    ephemeral.cache.session_key          = FakeCacheSessionKey{42};
-    ephemeral.cache.retention            = ninfer::runtime::RetentionClass::Disposable;
-    ephemeral.cache.update_session_index = false;
-    auto retained = manager.inspect(program, FakePreparedPrompt{42}, ephemeral);
-    expect(retained.readiness == ninfer::runtime::Readiness::Ready && retained.choice &&
-               retained.choice->summary().reusable_prompt_tokens == 16,
-           "Disposable branch did not select the live private source");
-    auto branch = materialize_and_adopt(manager, program, std::move(*retained.choice),
-                                        FakePreparedPrompt{42});
-
-    auto while_referenced = manager.inspect(program, FakePreparedPrompt{42}, seed);
-    expect(while_referenced.readiness == ninfer::runtime::Readiness::Ready &&
-               while_referenced.choice &&
-               while_referenced.choice->summary().reusable_prompt_tokens == 0,
-           "active retained source was exposed to a second private branch");
-
-    (void)manager.abort(program, branch.sequence.lane, branch.sequence);
-    auto reusable_again = manager.inspect(program, FakePreparedPrompt{42}, seed);
-    expect(reusable_again.readiness == ninfer::runtime::Readiness::Ready && reusable_again.choice &&
-               reusable_again.choice->summary().reusable_prompt_tokens == 16,
-           "retained source did not become reusable after branch release");
-}
-
-void test_complete_eviction_closure_competes_with_mixed_closure() {
-    FakeProgram program;
-    program.host_only_finish_key       = 3;
-    program.demotable_device_state_key = 1;
-    FakeManager manager(resources({1, 2, 10, 6}, {.state_slots = 1}), 1, 3, 0, true, 0,
-                        test_cost_model());
-
-    const auto publish = [&](std::uint32_t key, ninfer::runtime::RetentionClass retention,
-                             bool host_only) {
-        FakeRequestBasePlan base = make_base();
-        base.cache.retention     = retention;
-        if (host_only) { add_host_state_entitlement(base); }
-        auto inspection = manager.inspect(program, FakePreparedPrompt{key}, base);
-        expect(inspection.readiness == ninfer::runtime::Readiness::Ready && inspection.choice,
-               "pressure seed was not admitted");
-        auto active = materialize_and_adopt(manager, program, std::move(*inspection.choice),
-                                            FakePreparedPrompt{key});
-        (void)manager.finish(program, LaneId{0}, active.sequence);
-    };
-
-    publish(3, ninfer::runtime::RetentionClass::LiveSession, true);
-    publish(1, ninfer::runtime::RetentionClass::LiveSession, false);
-    publish(2, ninfer::runtime::RetentionClass::RecentPrivate, false);
-
-    auto inspection = manager.inspect(program, FakePreparedPrompt{4}, make_base());
-    expect(inspection.readiness == ninfer::runtime::Readiness::Ready && inspection.choice,
-           "root request was not closed under combined pressure");
-    expect(
-        program.last_composed_pressure == std::vector<std::pair<std::uint64_t, bool>>{{2, true}},
-        "mixed closure displaced more valuable continuations than the complete eviction closure");
-}
-
-void test_generic_numeric_cost_prefers_disposable_eviction() {
-    FakeProgram program;
-    program.host_only_finish_key       = 1;
-    program.demotable_device_state_key = 2;
-    FakeManager manager(resources({1, 1, 8, 5}, {.state_slots = 2}), 1, 3, 0, true, 0,
-                        test_cost_model());
-
-    FakeRequestBasePlan live = make_base();
-    live.cache.retention     = ninfer::runtime::RetentionClass::LiveSession;
-    add_host_state_entitlement(live);
-    auto live_inspection = manager.inspect(program, FakePreparedPrompt{1}, live);
-    auto live_active = materialize_and_adopt(manager, program, std::move(*live_inspection.choice),
-                                             FakePreparedPrompt{1});
-    (void)manager.finish(program, LaneId{0}, live_active.sequence);
-
-    FakeRequestBasePlan disposable = make_base();
-    disposable.cache.retention     = ninfer::runtime::RetentionClass::Disposable;
-    auto disposable_inspection     = manager.inspect(program, FakePreparedPrompt{2}, disposable);
-    auto disposable_active         = materialize_and_adopt(
-        manager, program, std::move(*disposable_inspection.choice), FakePreparedPrompt{2});
-    (void)manager.finish(program, LaneId{0}, disposable_active.sequence);
-
-    auto inspection = manager.inspect(program, FakePreparedPrompt{3}, make_base());
-    expect(inspection.readiness == ninfer::runtime::Readiness::Ready && inspection.choice,
-           "generic-cost pressure request was not admitted");
-    expect(
-        program.last_composed_pressure == std::vector<std::pair<std::uint64_t, bool>>{{2, true}},
-        "generic numerical cost preferred transferring a Disposable checkpoint over evicting it");
-}
-
-void test_source_alias_filters_only_the_unsafe_pressure_action() {
-    FakeProgram program;
-    program.demotable_device_state_key     = 2;
-    program.pressure_alias_source_key      = 1;
-    program.pressure_alias_owner_key       = 2;
-    program.pressure_alias_active_transfer = resources({.main_kv_pages = 1});
-    FakeManager manager(resources({1, 2, 10, 6}), 1, 3, 0, true, 0, test_cost_model());
-
-    FakeRequestBasePlan source = make_base();
-    source.cache.session_key   = FakeCacheSessionKey{1};
-    auto source_inspection     = manager.inspect(program, FakePreparedPrompt{1}, source);
-    auto source_active         = materialize_and_adopt(
-        manager, program, std::move(*source_inspection.choice), FakePreparedPrompt{1});
-    (void)manager.finish(program, LaneId{0}, source_active.sequence);
-
-    auto victim_inspection = manager.inspect(program, FakePreparedPrompt{2}, make_base());
-    auto victim_active     = materialize_and_adopt(
-        manager, program, std::move(*victim_inspection.choice), FakePreparedPrompt{2});
-    (void)manager.finish(program, LaneId{0}, victim_active.sequence);
-
-    FakeRequestBasePlan branch        = source;
-    branch.cache.update_session_index = false;
-    auto inspection                   = manager.inspect(program, FakePreparedPrompt{1}, branch);
-    expect(inspection.readiness == ninfer::runtime::Readiness::Ready && inspection.choice &&
-               inspection.choice->summary().reusable_prompt_tokens == 16 &&
-               inspection.choice->active_entitlement().device.main_kv_pages == 4,
-           "source alias discarded a feasible cache-hit candidate");
-    expect(program.last_composed_pressure == std::vector<std::pair<std::uint64_t, bool>>{{2, true}},
-           "source alias did not replace only the unsafe preserving action with exact eviction");
-}
-
-void test_value_positive_replica_replaces_lower_value_host_duplicate() {
-    FakeProgram program;
-    program.emit_state_d2h_observation = true;
-    FakeManager manager(resources({1, 2, 6, 4}, {.state_slots = 1}), 1, 2, 0, true, 0,
-                        test_cost_model());
-
-    const auto publish = [&](std::uint32_t key, FakeRequestBasePlan base) {
-        auto inspection = manager.inspect(program, FakePreparedPrompt{key}, base);
-        expect(inspection.readiness == ninfer::runtime::Readiness::Ready && inspection.choice,
-               "replica-transition seed was not admitted");
-        auto active = materialize_and_adopt(manager, program, std::move(*inspection.choice),
-                                            FakePreparedPrompt{key});
-        (void)manager.finish(program, LaneId{0}, active.sequence);
-    };
-
-    FakeRequestBasePlan victim                                 = make_base(1);
-    victim.resources.active_entitlement.host.state_slots       = 1;
-    victim.resources.reservation_added.host.state_slots        = 1;
-    victim.resources.physical_peak_additional.host.state_slots = 1;
-    victim.resources.final_added.host.state_slots              = 1;
-    publish(2, std::move(victim));
-    publish(1, make_base(100));
-    expect(manager.ledger().used() == resources({0, 2, 4, 2}, {.state_slots = 1}),
-           "replica-transition seeds did not establish a full Host state pool");
-
-    const auto reserved = manager.reserve_replica_transition(program);
-    expect(reserved == FakeManager::ReplicaTransitionReserveResult::Reserved &&
-               manager.has_replica_transition(),
-           "value-positive Host backup replacement was not reserved");
-    auto progress =
-        manager.progress_context_transaction(program, ninfer::runtime::CancellationFlagView{});
-    expect(std::holds_alternative<FakeManager::ReplicaTransitionOutcome>(progress),
-           "replica transition returned the wrong transaction outcome");
-    const auto outcome = std::get<FakeManager::ReplicaTransitionOutcome>(std::move(progress));
-    expect(outcome.status == ninfer::runtime::ContextTransactionStatus::Published &&
-               !manager.has_replica_transition() && !program.has_context_transaction() &&
-               manager.ledger().used() == resources({0, 2, 4, 2}, {.state_slots = 1}) &&
-               program.last_replica_target_key == 1 && program.last_replica_victim_key == 2 &&
-               program.replica_replacement_revalidations == 1,
-           "Host backup replacement did not atomically move unique occupancy");
-
-    ninfer::RuntimeStats stats;
-    manager.populate_runtime_stats(stats);
-    expect(stats.private_checkpoint_degradations == 1,
-           "Host backup replacement did not record the degraded private victim");
-}
-
-void test_ready_replica_transition_skips_dominated_replacements() {
-    FakeProgram program;
-    program.emit_state_d2h_observation = true;
-    FakeManager manager(resources({1, 2, 6, 4}, {.state_slots = 2}), 1, 2, 0, true, 0,
-                        test_cost_model());
-
-    const auto publish = [&](std::uint32_t key, FakeRequestBasePlan base) {
-        auto inspection = manager.inspect(program, FakePreparedPrompt{key}, base);
-        expect(inspection.readiness == ninfer::runtime::Readiness::Ready && inspection.choice,
-               "ready replica-transition seed was not admitted");
-        auto active = materialize_and_adopt(manager, program, std::move(*inspection.choice),
-                                            FakePreparedPrompt{key});
-        (void)manager.finish(program, LaneId{0}, active.sequence);
-    };
-
-    FakeRequestBasePlan host_resident                                 = make_base(1);
-    host_resident.resources.active_entitlement.host.state_slots       = 1;
-    host_resident.resources.reservation_added.host.state_slots        = 1;
-    host_resident.resources.physical_peak_additional.host.state_slots = 1;
-    host_resident.resources.final_added.host.state_slots              = 1;
-    publish(2, std::move(host_resident));
-    publish(1, make_base(100));
-
-    const auto reserved = manager.reserve_replica_transition(program);
-    expect(reserved == FakeManager::ReplicaTransitionReserveResult::Reserved &&
-               manager.has_replica_transition(),
-           "ready Host backup was not reserved");
-    auto progress =
-        manager.progress_context_transaction(program, ninfer::runtime::CancellationFlagView{});
-    expect(std::holds_alternative<FakeManager::ReplicaTransitionOutcome>(progress),
-           "ready replica transition returned the wrong transaction outcome");
-    const auto outcome = std::get<FakeManager::ReplicaTransitionOutcome>(std::move(progress));
-    expect(outcome.status == ninfer::runtime::ContextTransactionStatus::Published &&
-               program.last_replica_target_key == 1 && program.last_replica_victim_key == 0 &&
-               program.replica_replacement_revalidations == 0 &&
-               manager.ledger().used() == resources({0, 2, 4, 2}, {.state_slots = 2}),
-           "ready Host backup evaluated or consumed a dominated replacement");
-}
-
-void test_clean_replica_policy_waits_for_resource_invalidation() {
-    FakeProgram program;
-    FakeManager manager(resources({1, 2, 6, 4}), 1, 2, 0, true, 0, test_cost_model());
-
-    const auto publish = [&](std::uint32_t key) {
-        auto inspection = manager.inspect(program, FakePreparedPrompt{key}, make_base());
-        expect(inspection.readiness == ninfer::runtime::Readiness::Ready && inspection.choice,
-               "replica-policy seed was not admitted");
-        auto active = materialize_and_adopt(manager, program, std::move(*inspection.choice),
-                                            FakePreparedPrompt{key});
-        (void)manager.finish(program, LaneId{0}, active.sequence);
-    };
-
-    publish(1);
-    expect(manager.replica_policy_pending(),
-           "catalog publication did not invalidate replica policy");
-    expect(manager.reserve_replica_transition(program) ==
-               FakeManager::ReplicaTransitionReserveResult::Skipped,
-           "zero-capacity Host policy unexpectedly reserved a transition");
-    const std::uint32_t clean_inspections = program.replica_transition_inspections;
-    expect(!manager.replica_policy_pending() && clean_inspections != 0,
-           "replica policy did not become clean after a complete pass");
-    expect(manager.reserve_replica_transition(program) ==
-                   FakeManager::ReplicaTransitionReserveResult::Skipped &&
-               program.replica_transition_inspections == clean_inspections,
-           "clean replica policy rescanned the catalog");
-
-    publish(2);
-    expect(manager.replica_policy_pending(),
-           "second catalog publication did not re-arm replica policy");
-    expect(manager.reserve_replica_transition(program) ==
-                   FakeManager::ReplicaTransitionReserveResult::Skipped &&
-               program.replica_transition_inspections > clean_inspections,
-           "resource invalidation did not trigger one new replica-policy pass");
-}
-
-void test_anonymous_content_prefix_rolls_in_place() {
-    FakeProgram program;
-    program.content_keyed_summaries = true;
-    FakeManager manager(resources({1, 1, 3, 2}), 1, 1, 0, true, 0, test_cost_model());
-
-    FakeRequestBasePlan request        = make_base(100);
-    request.shortlist_digest           = 7;
-    request.cache.update_session_index = false;
-    auto seed                          = manager.inspect(program, FakePreparedPrompt{7}, request);
-    expect(seed.readiness == ninfer::runtime::Readiness::Ready && seed.choice,
-           "anonymous content-prefix seed was not admitted");
-    auto active =
-        materialize_and_adopt(manager, program, std::move(*seed.choice), FakePreparedPrompt{7});
-    (void)manager.finish(program, LaneId{0}, active.sequence);
-
-    program.admission_source_inspections    = 0;
-    program.last_must_retain_private_source = true;
-    auto first_append = manager.inspect(program, FakePreparedPrompt{7}, request);
-    expect(first_append.readiness == ninfer::runtime::Readiness::Ready && first_append.choice &&
-               first_append.choice->summary().reusable_prompt_tokens == 16 &&
-               program.admission_source_inspections == 1 &&
-               !program.last_must_retain_private_source,
-           "anonymous append did not consume the content-matched source in the only private slot");
-    active = materialize_and_adopt(manager, program, std::move(*first_append.choice),
-                                   FakePreparedPrompt{7});
-    (void)manager.finish(program, LaneId{0}, active.sequence);
-
-    program.admission_source_inspections    = 0;
-    program.last_must_retain_private_source = true;
-    auto second_append = manager.inspect(program, FakePreparedPrompt{7}, request);
-    expect(second_append.readiness == ninfer::runtime::Readiness::Ready && second_append.choice &&
-               second_append.choice->summary().reusable_prompt_tokens == 16 &&
-               program.admission_source_inspections == 1 &&
-               !program.last_must_retain_private_source,
-           "anonymous content source was not republished for the next append");
-    active = materialize_and_adopt(manager, program, std::move(*second_append.choice),
-                                   FakePreparedPrompt{7});
-    (void)manager.abort(program, LaneId{0}, active.sequence);
-}
-
-void test_content_prefix_shortlist_bounds_exact_inspection() {
-    FakeProgram program;
-    program.content_keyed_summaries = true;
-    FakeManager manager(resources({1, 8, 20, 12}), 1, 5, 0, true, 0, test_cost_model());
-
-    for (std::uint32_t key = 1; key <= 4; ++key) {
-        FakeRequestBasePlan base = make_base(100 + key);
-        base.shortlist_digest    = key;
-        auto inspection          = manager.inspect(program, FakePreparedPrompt{key}, base);
-        expect(inspection.readiness == ninfer::runtime::Readiness::Ready && inspection.choice,
-               "content-index seed was not admitted");
-        auto active = materialize_and_adopt(manager, program, std::move(*inspection.choice),
-                                            FakePreparedPrompt{key});
-        (void)manager.finish(program, LaneId{0}, active.sequence);
-    }
-
-    FakeRequestBasePlan exact            = make_base(200);
-    exact.shortlist_digest               = 4;
-    program.admission_source_inspections = 0;
-    auto hit                             = manager.inspect(program, FakePreparedPrompt{4}, exact);
-    expect(hit.readiness == ninfer::runtime::Readiness::Ready && hit.choice &&
-               hit.choice->summary().reusable_prompt_tokens == 16 &&
-               program.admission_source_inspections == 1,
-           "unrelated catalog entries reached private exact inspection");
-
-    program.admission_source_inspections = 0;
-    auto collision                       = manager.inspect(program, FakePreparedPrompt{99}, exact);
-    expect(collision.readiness == ninfer::runtime::Readiness::Ready && collision.choice &&
-               collision.choice->summary().reusable_prompt_tokens == 0 &&
-               program.admission_source_inspections == 1,
-           "shortlist digest collision bypassed exact prefix verification");
-
-    FakeProgram session_program;
-    session_program.content_keyed_summaries = true;
-    FakeManager session_manager(resources({1, 4, 10, 6}), 1, 2, 0, true, 0, test_cost_model());
-    FakeRequestBasePlan session_seed = make_base(100);
-    session_seed.shortlist_digest    = 77;
-    session_seed.cache.session_key   = FakeCacheSessionKey{11};
-    auto seeded = session_manager.inspect(session_program, FakePreparedPrompt{77}, session_seed);
-    auto active = materialize_and_adopt(session_manager, session_program, std::move(*seeded.choice),
-                                        FakePreparedPrompt{77});
-    (void)session_manager.finish(session_program, LaneId{0}, active.sequence);
-
-    FakeRequestBasePlan other_session = make_base(200);
-    other_session.shortlist_digest    = 77;
-    other_session.cache.session_key   = FakeCacheSessionKey{12};
-    auto retained = session_manager.inspect(session_program, FakePreparedPrompt{77}, other_session);
-    expect(retained.readiness == ninfer::runtime::Readiness::Ready && retained.choice &&
-               retained.choice->summary().reusable_prompt_tokens == 16 &&
-               session_program.last_must_retain_private_source,
-           "content hit across session identities did not retain the original continuation");
-
-    retained.choice.reset();
-    FakeRequestBasePlan anonymous                   = make_base(200);
-    anonymous.shortlist_digest                      = 77;
-    session_program.last_must_retain_private_source = false;
-    auto unnamed = session_manager.inspect(session_program, FakePreparedPrompt{77}, anonymous);
-    expect(unnamed.readiness == ninfer::runtime::Readiness::Ready && unnamed.choice &&
-               unnamed.choice->summary().reusable_prompt_tokens == 16 &&
-               session_program.last_must_retain_private_source,
-           "anonymous branch did not retain its content-matched named source");
+    auto collision = manager.inspect(program, FakePreparedPrompt{99}, make_base(55), 2);
+    require(collision.choice && collision.choice->summary().reusable_prompt_tokens == 0,
+            "shortlist collision bypassed Program exact identity verification");
 }
 
 } // namespace
 
 int main() {
-    test_global_catalog_lifecycle();
-    test_catalog_pressure_reserves_publication();
-    test_root_only_mode_releases_finished_context();
-    test_materialization_abort_and_adoption();
-    test_retained_private_source_reference();
-    test_complete_eviction_closure_competes_with_mixed_closure();
-    test_generic_numeric_cost_prefers_disposable_eviction();
-    test_source_alias_filters_only_the_unsafe_pressure_action();
-    test_value_positive_replica_replaces_lower_value_host_duplicate();
-    test_ready_replica_transition_skips_dominated_replacements();
-    test_clean_replica_policy_waits_for_resource_invalidation();
-    test_anonymous_content_prefix_rolls_in_place();
-    test_content_prefix_shortlist_bounds_exact_inspection();
-    if (failures == 0) { std::cout << "ok\n"; }
-    return failures == 0 ? 0 : 1;
+    run_test("root lifecycle and prefix reuse", test_root_lifecycle_and_prefix_reuse);
+    run_test("stale revision is retryable", test_stale_revision_is_retryable);
+    run_test("materialization abort preserves source", test_materialization_abort_preserves_source);
+    run_test("committed victim survives abort", test_committed_victim_survives_transaction_abort);
+    run_test("retained source protection", test_retained_source_is_protected_until_terminal);
+    run_test("session publication order", test_session_publication_order_controls_tied_source);
+    run_test("canonical pressure", test_canonical_pressure_starts_with_disposable_owner);
+    run_test("all preserving pressure alternatives",
+             test_pressure_tries_every_preserving_alternative_before_eviction);
+    run_test("in-progress and capture", test_in_progress_adoption_and_private_capture);
+    run_test("terminal fallback", test_terminal_fallback_releases_failed_retention);
+    run_test("terminal waits for resource transaction",
+             test_terminal_settlement_waits_for_open_resource_transaction);
+    run_test("commit and discard", test_commit_and_discard_terminal_states);
+    run_test("backfill proof and stats", test_backfill_proof_and_stats_follow_program_revision);
+    run_test("shortlist exact verification",
+             test_shortlist_collision_requires_program_exact_verification);
+    if (failures != 0) { return 1; }
+    std::cout << "ok\n";
+    return 0;
 }

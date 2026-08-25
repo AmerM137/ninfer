@@ -435,6 +435,7 @@ int main() {
     throughput.current.waiting_requests                  = 3;
     throughput.current.materializing_requests            = 1;
     throughput.current.capture_pending_requests          = 1;
+    throughput.current.terminal_pending_requests         = 1;
     throughput.current.root_selections                   = 3;
     throughput.current.state_h2d_count                   = 1;
     throughput.current.state_h2d_bytes                   = 132;
@@ -460,11 +461,9 @@ int main() {
                                 .control_units                 = 1,
                                 .admission_policy_ns           = 1000000,
                                 .context_progress_ns           = 2000000,
-                                .replica_policy_ns             = 500000,
                                 .stats_publication_ns          = 250000,
                                 .admission_policy_invocations  = 2,
                                 .context_progress_invocations  = 4,
-                                .replica_policy_invocations    = 1,
                                 .stats_publication_invocations = 5,
     };
     const std::string human_throughput = format_throughput(throughput);
@@ -472,6 +471,7 @@ int main() {
                           human_throughput.find("decode=20.0tok/s") != std::string::npos &&
                           human_throughput.find("materializing=1") != std::string::npos &&
                           human_throughput.find("capture_pending=1") != std::string::npos &&
+                          human_throughput.find("terminal_pending=1") != std::string::npos &&
                           human_throughput.find("avg_decode_batch=1.80") != std::string::npos &&
                           human_throughput.find("host=15.00ms") != std::string::npos &&
                           human_throughput.find("decode-host=1000.0us/round") != std::string::npos,
@@ -485,7 +485,8 @@ int main() {
     failures += check(throughput_json.at("decode_batch").at("average_size") == 1.8,
                       "throughput batch average mismatch");
     failures += check(throughput_json.at("scheduler").at("materializing") == 1 &&
-                          throughput_json.at("scheduler").at("capture_pending") == 1,
+                          throughput_json.at("scheduler").at("capture_pending") == 1 &&
+                          throughput_json.at("scheduler").at("terminal_pending") == 1,
                       "context scheduler gauges missing");
     failures += check(
         std::abs(throughput_json.at("host_work").at("elapsed_seconds").at("total").get<double>() -

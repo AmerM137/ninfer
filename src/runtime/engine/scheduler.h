@@ -42,19 +42,26 @@ public:
 
         [[nodiscard]] std::uint64_t protection_epoch() const noexcept { return protection_epoch_; }
 
+        [[nodiscard]] std::uint64_t resource_revision() const noexcept {
+            return resource_revision_;
+        }
+
         [[nodiscard]] std::uint64_t service_work_quanta() const noexcept {
             return service_work_quanta_;
         }
 
     private:
         AdmissionGrant(std::uint64_t request_id, BackfillClass backfill_class,
-                       std::uint64_t protection_epoch, std::uint64_t service_work_quanta) noexcept
+                       std::uint64_t protection_epoch, std::uint64_t resource_revision,
+                       std::uint64_t service_work_quanta) noexcept
             : request_id_(request_id), backfill_class_(backfill_class),
-              protection_epoch_(protection_epoch), service_work_quanta_(service_work_quanta) {}
+              protection_epoch_(protection_epoch), resource_revision_(resource_revision),
+              service_work_quanta_(service_work_quanta) {}
 
         std::uint64_t request_id_          = 0;
         BackfillClass backfill_class_      = BackfillClass::None;
         std::uint64_t protection_epoch_    = 0;
+        std::uint64_t resource_revision_   = 0;
         std::uint64_t service_work_quanta_ = 0;
 
         friend class Scheduler;
@@ -206,11 +213,9 @@ public:
                 throw std::logic_error("active request has no admission accounting");
             }
             active.requests[active.size++] = ActiveAdmissionSnapshot{
-                .request_id            = request->id,
-                .remaining_work_quanta = request->remaining_service_work,
-                .backfill_epoch        = request->backfill_epoch,
-                .backfill_class        = request->backfill_class,
-                .owner_bit             = 1U << lane,
+                .request_id     = request->id,
+                .backfill_epoch = request->backfill_epoch,
+                .backfill_class = request->backfill_class,
             };
         }
         return active;
@@ -245,6 +250,10 @@ public:
         return prefill_lane_;
     }
 
+    [[nodiscard]] std::optional<std::uint64_t> protection_epoch() const noexcept {
+        return protection_ ? std::optional<std::uint64_t>(protection_->epoch_id) : std::nullopt;
+    }
+
     void set_prefill_lane(std::uint32_t lane) {
         if (prefill_lane_) { throw std::logic_error("multiple requests own staged prefill"); }
         prefill_lane_ = lane;
@@ -276,53 +285,40 @@ public:
             service_work_quanta == 0) {
             throw std::logic_error("head admission is not bound to the observed FIFO head");
         }
-        return AdmissionGrant(request_id, BackfillClass::None, 0, service_work_quanta);
+        return AdmissionGrant(request_id, BackfillClass::None, 0, 0, service_work_quanta);
     }
 
     [[nodiscard]] bool protect_blocked_head(std::uint64_t request_id,
-                                            const DeviceResources& head_resources,
                                             std::span<const ActiveAdmissionSnapshot> active,
-                                            const ProtectedHeadResourceProjection& projection,
-                                            const DeviceResources& capacity) {
+                                            std::uint64_t resource_revision) {
         if (!fifo_head_id_ || *fifo_head_id_ != request_id) {
             throw std::logic_error("blocked admission does not match the observed FIFO head");
         }
         if (!protection_) {
             protection_.emplace(make_admission_protection(next_protection_epoch_++, request_id,
-                                                          head_resources, active, projection,
-                                                          capacity));
-        } else if (protection_->head_request_id != request_id ||
-                   protection_->head_resources != head_resources) {
+                                                          resource_revision, active));
+        } else if (protection_->head_request_id != request_id) {
             throw std::logic_error("protected head changed without a FIFO transition");
+        } else {
+            rebind_admission_protection(*protection_, active, resource_revision);
         }
-        if (protection_->phase == ProtectionPhase::Open &&
-            protected_head_safe_without_temporal(*protection_, active, projection, capacity)) {
-            protection_->phase = ProtectionPhase::Drain;
-        }
-        return protection_->phase == ProtectionPhase::Open;
+        return protection_has_live_donor(*protection_, active);
     }
 
     [[nodiscard]] std::optional<AdmissionGrant>
-    qualify_backfill(std::uint64_t request_id, const ProtectedHeadResourceProjection& projection,
-                     std::uint64_t service_work_quanta,
+    qualify_backfill(std::uint64_t request_id, std::uint64_t service_work_quanta,
                      std::span<const ActiveAdmissionSnapshot> active,
-                     const DeviceResources& capacity, bool temporal_eligible = true) const {
-        if (!fifo_head_id_ || !protection_ || protection_->phase != ProtectionPhase::Open ||
-            protection_->head_request_id != *fifo_head_id_) {
+                     std::uint64_t program_proof_revision) const {
+        if (!fifo_head_id_ || !protection_ || protection_->head_request_id != *fifo_head_id_) {
             throw std::logic_error("backfill qualification has no open protected head");
         }
         if (request_id == 0 || request_id == *fifo_head_id_ || service_work_quanta == 0) {
             throw std::logic_error("backfill candidate has invalid scheduling identity");
         }
-        if (persistent_backfill_is_safe(*protection_, active, projection, capacity)) {
+        if (persistent_backfill_is_authorized(*protection_, request_id, active,
+                                              program_proof_revision)) {
             return AdmissionGrant(request_id, BackfillClass::Persistent, protection_->epoch_id,
-                                  service_work_quanta);
-        }
-        const std::uint64_t frontier_distance = protection_frontier_distance(*protection_, active);
-        if (temporal_eligible && service_work_quanta <= frontier_distance &&
-            service_work_quanta <= protection_->temporal_credit) {
-            return AdmissionGrant(request_id, BackfillClass::Temporal, protection_->epoch_id,
-                                  service_work_quanta);
+                                  program_proof_revision, service_work_quanta);
         }
         return std::nullopt;
     }
@@ -330,17 +326,16 @@ public:
     [[nodiscard]] bool validate_grant(const AdmissionGrant& grant) const noexcept {
         if (grant.request_id_ == 0 || grant.service_work_quanta_ == 0) { return false; }
         if (grant.backfill_class_ == BackfillClass::None) {
-            return grant.protection_epoch_ == 0 && fifo_head_id_ &&
+            return grant.protection_epoch_ == 0 && grant.resource_revision_ == 0 && fifo_head_id_ &&
                    *fifo_head_id_ == grant.request_id_;
         }
-        if (!fifo_head_id_ || !protection_ || protection_->phase != ProtectionPhase::Open ||
-            protection_->head_request_id != *fifo_head_id_ ||
+        if (!fifo_head_id_ || !protection_ || protection_->head_request_id != *fifo_head_id_ ||
             protection_->epoch_id != grant.protection_epoch_ ||
+            protection_->resource_revision != grant.resource_revision_ ||
             grant.request_id_ == *fifo_head_id_) {
             return false;
         }
-        return grant.backfill_class_ != BackfillClass::Temporal ||
-               grant.service_work_quanta_ <= protection_->temporal_credit;
+        return grant.backfill_class_ == BackfillClass::Persistent;
     }
 
     void commit_admission(AdmissionGrant&& grant) {
@@ -353,9 +348,6 @@ public:
             grant.request_id_          = 0;
             grant.service_work_quanta_ = 0;
             return;
-        }
-        if (grant.backfill_class_ == BackfillClass::Temporal) {
-            protection_->temporal_credit -= grant.service_work_quanta_;
         }
         grant.request_id_          = 0;
         grant.service_work_quanta_ = 0;
