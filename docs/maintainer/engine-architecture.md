@@ -231,6 +231,11 @@ mapping和frontier，不重建这些大块device allocations。
 公开cache配置的默认关系不是硬上限。Program必须按实际配置完成可表示性和启动分配验证；失败时构造失败，
 不会在运行期缩容或改走备用算法。
 
+`ninfer-serve`在开始接受HTTP请求前可以通过同一公共Engine执行路径运行内部warmup，但warmup不是产品请求，
+其request-level context-cache participation固定为disabled。它不读取prefix candidate、不建立capture、也不发布
+continuation；执行期间取得的active State/KV entitlement在terminal finish时全部释放。warmup可以留下已分配的
+backing、CUDA Graph和kernel/library初始化状态，但首个外部请求看到的logical context cache必须与新建Engine一致。
+
 ---
 
 ## 5. 生命周期

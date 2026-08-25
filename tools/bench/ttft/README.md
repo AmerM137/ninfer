@@ -97,11 +97,13 @@ Changing the profile changes the legal placement of A; it does not change the re
 `tools/bench/ttft/profiles.py` is the executable profile catalog used by the campaign controller.
 The controller starts a fresh Serve process for every sample. The low-level runner validates only
 the profile label and cannot inspect whether a manually managed process really used these
-arguments. Before the first process, the controller stages the immutable standard artifact once in
-`/dev/shm/ninfer-artifacts/` with a source-identity-qualified name. Every Serve process then reads
-that tmpfs path; a later campaign reuses it while the source device, inode, size, and mtime remain
-unchanged. There is no disk fallback or user-facing cache option. The standard artifact and common
-arguments are:
+arguments. Serve completes its internal warmup before listening; that operational request has
+context-cache participation disabled regardless of profile, so every sample begins with an empty
+logical context cache. Before the first process, the controller stages the immutable standard
+artifact once in `/dev/shm/ninfer-artifacts/` with a source-identity-qualified name. Every Serve
+process then reads that tmpfs path; a later campaign reuses it while the source device, inode, size,
+and mtime remain unchanged. There is no disk fallback or user-facing cache option. The standard
+artifact and common arguments are:
 
 ```bash
 SERVE=build/apps/ninfer-serve

@@ -121,6 +121,15 @@ public:
     void warmup();
 
 private:
+    enum class CacheParticipation : std::uint8_t {
+        Disabled,
+        ReadWrite,
+    };
+
+    [[nodiscard]] PreparedRequest prepare_impl(const GenerationRequest& req,
+                                               std::function<bool()> is_cancelled,
+                                               ContextCacheHints context_cache,
+                                               CacheParticipation cache_participation) const;
     [[nodiscard]] std::shared_ptr<RequestLifetime> acquire_request_lifetime() const;
 
     ServeOptions options_;

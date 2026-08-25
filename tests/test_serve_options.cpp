@@ -214,30 +214,33 @@ int main() {
     ninfer::PromptCapabilities prompt_capabilities;
     prompt_capabilities.enable_thinking = true;
     const auto semantics = resolve_prompt_semantics(request, defaults, prompt_capabilities);
-    failures += check(to_request_options(request, defaults, semantics).execution.allow_prefix_reuse,
-                      "default server policy did not reach Engine options");
     failures +=
-        check(!to_request_options(request, configured, semantics).execution.allow_prefix_reuse,
-              "disabled server policy did not reach Engine options");
+        check(to_request_options(request, defaults, semantics, true).execution.allow_prefix_reuse,
+              "resolved read-write cache policy did not reach Engine options");
+    failures +=
+        check(!to_request_options(request, defaults, semantics, false).execution.allow_prefix_reuse,
+              "resolved disabled cache policy inherited external enablement");
     const ninfer::RequestOptions inherited_sampling =
-        to_request_options(request, sampling, semantics);
+        to_request_options(request, sampling, semantics, sampling.allow_prefix_reuse);
     failures += check(inherited_sampling.execution.sampling.temperature == 0.0F &&
                           inherited_sampling.execution.sampling.top_p == 0.9F &&
                           inherited_sampling.execution.sampling.seed == 0,
                       "server sampling overrides did not reach Engine options");
     request.sampling.temperature = 1.1;
+    failures += check(to_request_options(request, sampling, semantics, sampling.allow_prefix_reuse)
+                              .execution.sampling.temperature == 1.1F,
+                      "request sampling override did not win over the server override");
     failures += check(
-        to_request_options(request, sampling, semantics).execution.sampling.temperature == 1.1F,
-        "request sampling override did not win over the server override");
-    failures += check(
-        to_request_options(request, thinking_budget, semantics).execution.thinking.budget == 37,
+        to_request_options(request, thinking_budget, semantics, thinking_budget.allow_prefix_reuse)
+                .execution.thinking.budget == 37,
         "thinking-enabled request did not inherit the server budget");
     request.enable_thinking = false;
     const auto non_thinking =
         resolve_prompt_semantics(request, thinking_budget, prompt_capabilities);
-    failures +=
-        check(!to_request_options(request, thinking_budget, non_thinking).execution.thinking.budget,
-              "non-thinking request inherited the server thinking budget");
+    failures += check(!to_request_options(request, thinking_budget, non_thinking,
+                                          thinking_budget.allow_prefix_reuse)
+                           .execution.thinking.budget,
+                      "non-thinking request inherited the server thinking budget");
     request.enable_thinking.reset();
     failures +=
         check(resolve_prompt_semantics(request, configured, prompt_capabilities).preserve_thinking,

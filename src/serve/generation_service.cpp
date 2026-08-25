@@ -280,13 +280,23 @@ std::shared_ptr<RequestLifetime> GenerationService::acquire_request_lifetime() c
 PreparedRequest GenerationService::prepare(const GenerationRequest& request,
                                            std::function<bool()> is_cancelled,
                                            ContextCacheHints context_cache) const {
+    return prepare_impl(request, std::move(is_cancelled), std::move(context_cache),
+                        options_.allow_prefix_reuse ? CacheParticipation::ReadWrite
+                                                    : CacheParticipation::Disabled);
+}
+
+PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request,
+                                                std::function<bool()> is_cancelled,
+                                                ContextCacheHints context_cache,
+                                                CacheParticipation cache_participation) const {
     PreparedRequest prepared;
     prepared.include_usage        = request.include_usage;
     prepared.tool_capable         = request.uses_tools() || request.has_tool_history();
     prepared.tool_name_max_length = request.tool_name_max_length;
     const ResolvedPromptSemantics semantics =
         resolve_prompt_semantics(request, options_, prompt_capabilities_);
-    ninfer::RequestOptions request_options     = to_request_options(request, options_, semantics);
+    ninfer::RequestOptions request_options = to_request_options(
+        request, options_, semantics, cache_participation == CacheParticipation::ReadWrite);
     prepared.enable_thinking                   = semantics.enable_thinking;
     prepared.thinking_budget                   = request_options.execution.thinking.budget;
     prepared.preserve_thinking                 = semantics.preserve_thinking;
@@ -446,7 +456,7 @@ void GenerationService::warmup() {
         request.messages.push_back(std::move(turn));
         request.max_tokens       = 4;
         request.max_tokens_set   = true;
-        PreparedRequest prepared = prepare(request);
+        PreparedRequest prepared = prepare_impl(request, {}, {}, CacheParticipation::Disabled);
         run(prepared, nullptr);
     } catch (const std::exception& exception) {
         write_console_log(ConsoleLogLevel::Warning,

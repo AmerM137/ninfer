@@ -332,6 +332,19 @@ Exact identity 由 target Program 定义，可能包括：
 SessionKey、request ID、raw string、caller marker 和 hash 都只是 shortlist 或 ownership hint。最终命中必须由
 Program exact verification。Catalog 已绑定当前 Program/model instance，不增加 runtime target tag。
 
+### 4.6 Request-level cache participation
+
+每个请求在提交Engine前已经确定context-cache participation，只有两种语义：
+
+- `ReadWrite`：可以枚举并精确验证prefix candidate，也可以在合法frontier capture并在finish发布continuation；
+- `Disabled`：不读取candidate、不建立capture group、不发布continuation，finish必须释放该请求持有的active
+  State/KV资源。
+
+Serve启动配置决定外部请求采用哪一种语义；内部operational warmup固定采用`Disabled`。`Disabled`请求执行期间
+仍取得正常的active completion guarantee，但它结束后不得留在private/shared catalog、SessionIndex或任何
+Device/Host context replica中。因此warmup完成后不占用额外checkpoint容量`H`、Host容量`R`或catalog
+容量，首个外部请求的cache选择只由外部请求历史决定。
+
 ---
 
 ## 5. State 物理语义

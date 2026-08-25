@@ -82,7 +82,8 @@ ninfer::PromptInput translate(const GenerationRequest& req) {
 ninfer::RequestOptions translate_options(const GenerationRequest& req) {
     const ServeOptions server = default_server();
     return to_request_options(req, server,
-                              resolve_prompt_semantics(req, server, effort_capabilities()));
+                              resolve_prompt_semantics(req, server, effort_capabilities()),
+                              server.allow_prefix_reuse);
 }
 
 std::string joined_text(const ninfer::ChatMessage& message) {

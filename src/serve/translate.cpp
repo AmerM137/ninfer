@@ -258,10 +258,11 @@ ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
 
 ninfer::RequestOptions to_request_options(const GenerationRequest& request,
                                           const ServeOptions& server,
-                                          const ResolvedPromptSemantics& semantics) {
+                                          const ResolvedPromptSemantics& semantics,
+                                          bool allow_prefix_reuse) {
     ninfer::RequestOptions options;
     options.execution.requested_output_tokens = static_cast<std::uint32_t>(request.max_tokens);
-    options.execution.allow_prefix_reuse      = server.allow_prefix_reuse;
+    options.execution.allow_prefix_reuse      = allow_prefix_reuse;
     if (semantics.enable_thinking) {
         options.execution.thinking.budget = server.default_thinking_budget;
     }
