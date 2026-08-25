@@ -6,6 +6,10 @@ implementation selection behind those contracts. Target benchmarks measure Progr
 composition. Correctness and model parity live outside this directory; development rules are in
 [`../docs/maintainer/op-development.md`](../docs/maintainer/op-development.md).
 
+The frozen request corpus for the separate black-box Serve TTFT tool is documented under
+[`fixtures/ttft/`](fixtures/ttft/README.md). That client does not call the benchmark executables or
+Engine directly.
+
 ## Build
 
 ```bash
@@ -818,7 +822,7 @@ test shapes exercise the scalar fallbacks.
 
 Table, JSON, and CSV reports all identify the selected target, artifact, Engine configuration,
 load summary, memory capacity, KV payload, workspace peak, phase throughput, and speculative
-statistics. JSON schema version 12 records the public value objects directly:
+statistics. JSON schema version 13 records the public value objects directly:
 
 - `load`: target, `weights_id`, load/upload time, file/H2D/staging bytes, tensor count, and resource
   count;

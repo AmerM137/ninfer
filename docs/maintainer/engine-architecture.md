@@ -642,6 +642,11 @@ Vision encode和固定handoff region复用同一backing，但生命周期保证h
 Program为合法`B=1..max_concurrency`建立decode graph families。Graph key描述执行topology，不包含request
 identity、page IDs或active lane集合。变化通过稳定buffers、row selectors、frontiers和block tables输入。
 
+CUDA Graph executable的driver-owned内存没有Program-owned精确计数器。SequencePlan在startup
+预留`cuda_graph_allowance_bytes`，Graph实例化或其他CUDA操作的真实分配失败直接终止启动；
+不得用两次`cudaMemGetInfo`的process-global差值归属到单个Program，也不得由该差值
+构造Program内存不变量。`available_after_startup_bytes`仅是完成启动后的全局可用显存快照。
+
 ### 10.5 Speculative backends
 
 MTP与DFlash是Program内部closed schedules，不是第二套Engine。它们只改变unit内部provisional width和state

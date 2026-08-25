@@ -8626,10 +8626,6 @@ void ProgramImplCore::prepare_graphs() {
     }
     device.synchronize();
 
-    std::size_t free_before = 0;
-    std::size_t total_bytes = 0;
-    CUDA_CHECK(cudaMemGetInfo(&free_before, &total_bytes));
-
     const auto clear_stable_controls = [&] {
         std::vector<Tensor> controls{
             io.token,
@@ -8912,15 +8908,6 @@ void ProgramImplCore::prepare_graphs() {
         }
     }
 
-    std::size_t free_after = 0;
-    CUDA_CHECK(cudaMemGetInfo(&free_after, &total_bytes));
-    const std::size_t consumed = free_before > free_after ? free_before - free_after : 0;
-    graph_observed_bytes       = consumed;
-    if (consumed > graph_allowance_bytes) {
-        throw std::runtime_error("CUDA Graph preparation consumed " + std::to_string(consumed) +
-                                 " bytes, exceeding the planned allowance of " +
-                                 std::to_string(graph_allowance_bytes) + " bytes");
-    }
     const auto release_capture_rows = [](KVAddressSpaceStore& addresses,
                                          std::vector<KVAddressSpaceHandle>& allocations) {
         for (const KVAddressSpaceHandle allocation : allocations) {
@@ -9930,7 +9917,6 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
     }
     out.workspace_logical_peak_bytes = workspace_logical_peak_bytes;
     out.cuda_graph_allowance_bytes   = graph_allowance_bytes;
-    out.cuda_graph_observed_bytes    = graph_observed_bytes;
     out.kv_payload_bytes             = kv_payload_bytes;
     if (host_state_images) {
         out.host_state_capacity_slots = host_state_images->capacity();

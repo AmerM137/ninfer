@@ -132,7 +132,6 @@ int main() {
     memory.available_after_startup_bytes     = 180;
     memory.planned_slack_bytes               = 100;
     memory.cuda_graph_allowance_bytes        = 600;
-    memory.cuda_graph_observed_bytes         = 550;
     memory.kv_payload_bytes                  = 400;
     memory.host_state_capacity_slots         = 3;
     memory.host_state_occupied_slots         = 1;
@@ -223,8 +222,7 @@ int main() {
                           server.at("memory").at("available_after_weights_bytes") == 1700 &&
                           server.at("memory").at("available_after_startup_bytes") == 180 &&
                           server.at("memory").at("kv_capacity_headroom_bytes") == 0 &&
-                          server.at("memory").at("planned_slack_bytes") == 100 &&
-                          server.at("memory").at("cuda_graph_observed_bytes") == 550,
+                          server.at("memory").at("planned_slack_bytes") == 100,
                       "adaptive KV memory ledger missing");
     failures += check(server.at("memory").at("host_state_capacity_slots") == 3 &&
                           server.at("memory").at("host_state_occupied_slots") == 1 &&

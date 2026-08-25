@@ -86,8 +86,7 @@ int main(int argc, char** argv) {
                  << " free-after-startup=" << format_bytes(memory.available_after_startup_bytes)
                  << " headroom=" << format_bytes(memory.kv_capacity_headroom_bytes)
                  << " slack=" << format_bytes(memory.planned_slack_bytes)
-                 << " graphs=" << format_bytes(memory.cuda_graph_observed_bytes) << '/'
-                 << format_bytes(memory.cuda_graph_allowance_bytes)
+                 << " graph-allowance=" << format_bytes(memory.cuda_graph_allowance_bytes)
                  << " context-cache=" << (cache.enabled ? "on" : "root-only")
                  << " device-state=" << *cache.device_state_slots << "-cache+"
                  << engine.max_concurrency << "-active" << " host-state=" << cache.host_state_slots
