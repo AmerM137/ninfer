@@ -297,6 +297,12 @@ optional surviving fallback
 `TurnClosure` 与 `ResponseReplay` 是 typed rewrite checkpoints。`TargetKVRequirement` 由 Program 定义，
 Main 与 Backend 不要求具有相同数值 frontier。
 
+Typed rewrite frontier 必须位于下一请求允许替换的 assistant suffix 之前，而不能位于该 suffix 内部。
+`ResponseReplay` 位于 generation opener 之前；`TurnClosure` 位于当前 open turn 中第一个可能被重写的
+assistant opener 之前。确定性的 opener/thinking prologue 属于低成本 rebuild suffix。这样立即后继请求无论回放
+response、关闭 tool loop，还是直接追加 replacement user message，都保留同一个稳定 conversation prefix；每条
+continuation 仍只需要一个 rolling rewrite StateImage。
+
 Checkpoint 发布后逻辑内容不可变：
 
 - identity 和 frontier 不变；

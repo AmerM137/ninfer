@@ -104,6 +104,9 @@ struct ChatTurn {
     std::string reasoning_content; // assistant thinking carried across turns (round-tripped to the
                                    // template)
     std::vector<std::uint32_t> shared_cache_boundaries_after_text_bytes;
+    // Anthropic conversation cache_control on the terminal content block names the exact
+    // boundary after this normalized turn. It remains private to the continuation lineage.
+    bool private_cache_boundary_after = false;
 };
 
 // OpenAI sampling fields carried by the protocol adapter. `logit_bias` remains

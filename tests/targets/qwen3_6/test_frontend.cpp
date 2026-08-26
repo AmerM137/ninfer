@@ -634,13 +634,12 @@ int test_ordered_instruction_turns() {
                      chat_message(ninfer::ChatRole::System, "current diagnostics")});
     const std::string assistant_header = "<|im_start|>assistant\n";
     const std::size_t header           = generated.text.rfind(assistant_header);
-    failures +=
-        check(header != std::string::npos && generated.rewrite_checkpoint &&
-                  generated.rewrite_checkpoint->kind ==
-                      ninfer::targets::qwen3_6::RewriteCheckpointKind::TurnClosure &&
-                  generated.rewrite_checkpoint->offset == header + assistant_header.size() &&
-                  generated.text.find("current diagnostics<|im_end|>\n", 0) < header,
-              "late system was not included before the generation rewrite boundary");
+    failures += check(header != std::string::npos && generated.rewrite_checkpoint &&
+                          generated.rewrite_checkpoint->kind ==
+                              ninfer::targets::qwen3_6::RewriteCheckpointKind::TurnClosure &&
+                          generated.rewrite_checkpoint->offset == header &&
+                          generated.text.find("current diagnostics<|im_end|>\n", 0) < header,
+                      "late system was not included before the generation rewrite boundary");
 
     fi::ChatMessage invalid = chat_message(ninfer::ChatRole::System, "diagnostics");
     invalid.tool_calls.push_back({.id = "call", .name = "f", .arguments_json = "{}"});
@@ -791,8 +790,8 @@ int test_rewrite_checkpoint_trace() {
         check(first_header != std::string::npos && open.rewrite_checkpoint &&
                   open.rewrite_checkpoint->kind ==
                       ninfer::targets::qwen3_6::RewriteCheckpointKind::TurnClosure &&
-                  open.rewrite_checkpoint->offset == first_header + assistant_header.size(),
-              "tool loop did not retain its first assistant turn-closure boundary");
+                  open.rewrite_checkpoint->offset == first_header,
+              "tool loop did not retain the stable prefix before its first assistant turn");
 
     fi::ChatRenderOptions preserve;
     preserve.preserve_thinking         = true;
@@ -801,18 +800,19 @@ int test_rewrite_checkpoint_trace() {
     failures += check(preserved_header != std::string::npos && preserved.rewrite_checkpoint &&
                           preserved.rewrite_checkpoint->kind ==
                               ninfer::targets::qwen3_6::RewriteCheckpointKind::ResponseReplay &&
-                          preserved.rewrite_checkpoint->offset == preserved.text.size() &&
+                          preserved.rewrite_checkpoint->offset == preserved_header &&
                           preserved.text.ends_with("<think>\n"),
-                      "preserve_thinking did not publish the complete generation prologue");
+                      "preserve_thinking did not checkpoint before the generation prologue");
 
-    preserve.enable_thinking           = false;
-    const fi::RenderedChat nonthinking = render_chat(tool_loop, preserve);
-    failures += check(nonthinking.rewrite_checkpoint &&
+    preserve.enable_thinking             = false;
+    const fi::RenderedChat nonthinking   = render_chat(tool_loop, preserve);
+    const std::size_t nonthinking_header = nonthinking.text.rfind(assistant_header);
+    failures += check(nonthinking_header != std::string::npos && nonthinking.rewrite_checkpoint &&
                           nonthinking.rewrite_checkpoint->kind ==
                               ninfer::targets::qwen3_6::RewriteCheckpointKind::ResponseReplay &&
-                          nonthinking.rewrite_checkpoint->offset == nonthinking.text.size() &&
+                          nonthinking.rewrite_checkpoint->offset == nonthinking_header &&
                           nonthinking.text.ends_with("<think>\n\n</think>\n\n"),
-                      "non-thinking response replay did not retain its complete generation "
+                      "non-thinking response replay did not checkpoint before its generation "
                       "prologue");
 
     std::vector<fi::ChatMessage> next_turn = tool_loop;
@@ -822,8 +822,24 @@ int test_rewrite_checkpoint_trace() {
     failures += check(final_header != std::string::npos && next.rewrite_checkpoint &&
                           next.rewrite_checkpoint->kind ==
                               ninfer::targets::qwen3_6::RewriteCheckpointKind::TurnClosure &&
-                          next.rewrite_checkpoint->offset == final_header + assistant_header.size(),
-                      "new user turn did not move the rewrite boundary to its generation opener");
+                          next.rewrite_checkpoint->offset == final_header,
+                      "new user turn did not move the rewrite boundary before its generation "
+                      "opener");
+
+    const fi::RenderedChat branch =
+        render_chat({chat_message(ninfer::ChatRole::User, "question"),
+                     chat_message(ninfer::ChatRole::User, "summarize the conversation")},
+                    preserve);
+    const fi::RenderedChat source =
+        render_chat({chat_message(ninfer::ChatRole::User, "question")}, preserve);
+    failures += check(
+        source.rewrite_checkpoint &&
+            source.rewrite_checkpoint->kind ==
+                ninfer::targets::qwen3_6::RewriteCheckpointKind::ResponseReplay &&
+            branch.text.starts_with(source.text.substr(0, source.rewrite_checkpoint->offset)) &&
+            !branch.text.starts_with(
+                source.text.substr(0, source.rewrite_checkpoint->offset + assistant_header.size())),
+        "a replacement user suffix lost the stable pre-generation checkpoint");
 
     fi::ChatRenderOptions no_generation;
     no_generation.add_generation_prompt = false;
@@ -844,12 +860,11 @@ int test_rewrite_checkpoint_trace() {
          second},
         no_generation);
     const std::size_t wrapped_first = wrapped.text.find(assistant_header);
-    failures +=
-        check(wrapped.rewrite_checkpoint &&
-                  wrapped.rewrite_checkpoint->kind ==
-                      ninfer::targets::qwen3_6::RewriteCheckpointKind::TurnClosure &&
-                  wrapped.rewrite_checkpoint->offset == wrapped_first + assistant_header.size(),
-              "bare tool-response wrapper incorrectly advanced the real user turn");
+    failures += check(wrapped.rewrite_checkpoint &&
+                          wrapped.rewrite_checkpoint->kind ==
+                              ninfer::targets::qwen3_6::RewriteCheckpointKind::TurnClosure &&
+                          wrapped.rewrite_checkpoint->offset == wrapped_first,
+                      "bare tool-response wrapper incorrectly advanced the real user turn");
     return failures;
 }
 
@@ -918,7 +933,7 @@ int test_text_and_image_prepare(const Frontend& frontend) {
     failures += check(text_data.identity.rewrite_checkpoint &&
                           text_data.identity.rewrite_checkpoint->kind ==
                               ninfer::targets::qwen3_6::RewriteCheckpointKind::TurnClosure &&
-                          text_data.identity.rewrite_checkpoint->frontier == 7 &&
+                          text_data.identity.rewrite_checkpoint->frontier == 5 &&
                           text_data.starts_in_reasoning && !text_data.has_media(),
                       "text frontend did not preserve prefix/thinking identity");
     failures +=
@@ -938,9 +953,10 @@ int test_text_and_image_prepare(const Frontend& frontend) {
     failures += check(preserved_data.identity.rewrite_checkpoint &&
                           preserved_data.identity.rewrite_checkpoint->kind ==
                               ninfer::targets::qwen3_6::RewriteCheckpointKind::ResponseReplay &&
-                          preserved_data.identity.rewrite_checkpoint->frontier ==
+                          preserved_data.identity.rewrite_checkpoint->frontier == 5 &&
+                          preserved_data.identity.rewrite_checkpoint->frontier <
                               preserved_data.token_ids.size(),
-                      "preserve-thinking prompt did not publish a prompt-frontier response "
+                      "preserve-thinking prompt did not publish a pre-generation response "
                       "checkpoint");
 
     ninfer::ChatMessage nonthinking_message;
@@ -956,10 +972,11 @@ int test_text_and_image_prepare(const Frontend& frontend) {
     failures += check(nonthinking_data.identity.rewrite_checkpoint &&
                           nonthinking_data.identity.rewrite_checkpoint->kind ==
                               ninfer::targets::qwen3_6::RewriteCheckpointKind::ResponseReplay &&
-                          nonthinking_data.identity.rewrite_checkpoint->frontier ==
+                          nonthinking_data.identity.rewrite_checkpoint->frontier == 5 &&
+                          nonthinking_data.identity.rewrite_checkpoint->frontier <
                               nonthinking_data.token_ids.size() &&
                           !nonthinking_data.starts_in_reasoning,
-                      "non-thinking prompt did not publish a prompt-frontier response checkpoint");
+                      "non-thinking prompt did not publish a pre-generation response checkpoint");
 
     ninfer::MessagePart image;
     image.kind              = ninfer::MessagePartKind::Media;

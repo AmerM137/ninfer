@@ -192,6 +192,49 @@ int test_cache_control_boundaries() {
                           tool_prompt.context_cache.markers[0].after_tool_count == 1,
                       "Anthropic tool cache_control boundary did not reach PromptInput");
 
+    const Json message_cached = {
+        {"model", "m"},
+        {"max_tokens", 16},
+        {"messages",
+         Json::array({Json{{"role", "user"},
+                           {"content", Json::array({Json{{"type", "text"},
+                                                         {"text", "question"},
+                                                         {"cache_control", ephemeral}}})}},
+                      Json{{"role", "assistant"},
+                           {"content", Json::array({Json{{"type", "text"},
+                                                         {"text", "answer"},
+                                                         {"cache_control", ephemeral}}})}},
+                      Json{{"role", "user"}, {"content", "next"}}})},
+    };
+    const GenerationRequest message_request =
+        parse_messages_request(message_cached, default_limits());
+    const ninfer::PromptInput message_prompt = translate(message_request);
+    failures += check(message_request.messages.size() == 3 &&
+                          message_request.messages[0].private_cache_boundary_after &&
+                          message_request.messages[1].private_cache_boundary_after &&
+                          !message_request.messages[2].private_cache_boundary_after,
+                      "Anthropic message cache_control boundary was discarded during parsing");
+    failures +=
+        check(message_prompt.context_cache.markers.size() == 2 &&
+                  message_prompt.context_cache.markers[0].kind ==
+                      ninfer::PromptCacheMarkerKind::PrivateLongAnchor &&
+                  message_prompt.context_cache.markers[0].location ==
+                      ninfer::PromptCacheMarkerLocation::MessageBoundary &&
+                  message_prompt.context_cache.markers[0].after_message_count == 1 &&
+                  message_prompt.context_cache.markers[1].kind ==
+                      ninfer::PromptCacheMarkerKind::PrivateLongAnchor &&
+                  message_prompt.context_cache.markers[1].location ==
+                      ninfer::PromptCacheMarkerLocation::MessageBoundary &&
+                  message_prompt.context_cache.markers[1].after_message_count == 2,
+              "Anthropic conversation cache_control did not become private message anchors");
+
+    Json unsupported_position = message_cached;
+    unsupported_position["messages"][0]["content"].push_back(
+        Json{{"type", "text"}, {"text", "dynamic tail"}});
+    failures += check(
+        throws_api([&] { (void)parse_messages_request(unsupported_position, default_limits()); }),
+        "non-terminal Anthropic message cache_control was silently approximated");
+
     Json invalid                          = body;
     invalid["system"][0]["cache_control"] = Json{{"type", "unknown"}};
     failures += check(throws_api([&] { (void)parse_messages_request(invalid, default_limits()); }),

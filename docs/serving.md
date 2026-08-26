@@ -449,6 +449,9 @@ marks a shared stable-prefix boundary. Because the Qwen prompt renders tools bef
 system instruction, NInfer retains the last marked tool boundary unless a later marked system
 boundary exists; when several system blocks are marked, it retains the last one. The boundary is a
 retention hint rather than a forced hit: reuse still requires exact rendered-token compatibility.
+Ephemeral `cache_control` on the final content block of a user or assistant message marks the
+normalized message boundary as a private long anchor; a non-final message-block breakpoint is
+rejected because it cannot be represented as an exact Qwen message frontier.
 
 `thinking.type: "disabled"` disables thinking; other supported values enable it.
 The independent top-level `preserve_thinking` boolean controls closed-turn history and otherwise
@@ -700,14 +703,13 @@ The completion log reports one of six reuse paths: `root`, `private_endpoint`,
 `private_turn_closure`, `private_response_replay`, `private_long_anchor`, or
 `shared_stable_prefix`. Every reusable checkpoint includes the recurrent, hidden, and selected
 speculative-backend continuation state required to recompute its suffix; matching KV tokens alone
-never authorize a partial hit. With stable
-`preserve_thinking=true`, the auxiliary checkpoint rolls to the prompt frontier after the current
-response's complete deterministic generation prologue. For thinking generation this includes
-`<think>\n`; for non-thinking generation it includes the complete empty thinking block. Capturing
-that frontier does not split a tiny trailing prologue into a separate prefill unit, and a normalized
-response which no longer matches the raw generated tokens replays only that response and its
-suffix. Stable `false` keeps the first assistant opener in the open turn so a newly closed turn can
-be recomputed without its reasoning.
+never authorize a partial hit. With stable `preserve_thinking=true`, the auxiliary checkpoint rolls
+to the message frontier immediately before the current response's deterministic generation
+prologue. A normalized response, compact-summary instruction, or replacement user suffix therefore
+replays the small generation prologue and only the changed suffix while retaining the complete
+stable conversation prefix. Stable `false` places the turn-closure checkpoint before the first
+assistant opener in the open turn, so closing that turn can recompute its opener and omit its
+reasoning without discarding the preceding conversation.
 
 `preserve_thinking` selects where the next checkpoint should live; it is not a cache-compatibility
 bit. Any exact complete checkpoint remains reusable across a mode change. If the newly desired

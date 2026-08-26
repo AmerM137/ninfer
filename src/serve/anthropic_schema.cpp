@@ -304,8 +304,15 @@ void parse_assistant_content(const Json& content, GenerationRequest& out) {
     ChatTurn turn;
     turn.role = ChatRole::Assistant;
     std::string text;
-    for (const Json& block : content) {
-        const std::string type = require_block_type(block, "messages");
+    for (std::size_t index = 0; index < content.size(); ++index) {
+        const Json& block      = content.at(index);
+        const bool cache_after = has_ephemeral_cache_control(block, "messages");
+        if (cache_after && index + 1U != content.size()) {
+            bad_request("message cache_control is supported only on the final content block",
+                        "messages", "cache_control_position_not_supported");
+        }
+        turn.private_cache_boundary_after = cache_after;
+        const std::string type            = require_block_type(block, "messages");
         if (type == "text") {
             append_text(text, require_string_field(block, "text", "text block"));
         } else if (type == "thinking") {
@@ -341,8 +348,16 @@ void parse_user_content(const Json& content, GenerationRequest& out) {
         user_turn      = ChatTurn{};
         user_turn.role = ChatRole::User;
     };
-    for (const Json& block : content) {
-        const std::string type = require_block_type(block, "messages");
+    bool private_cache_boundary_after = false;
+    for (std::size_t index = 0; index < content.size(); ++index) {
+        const Json& block      = content.at(index);
+        const bool cache_after = has_ephemeral_cache_control(block, "messages");
+        if (cache_after && index + 1U != content.size()) {
+            bad_request("message cache_control is supported only on the final content block",
+                        "messages", "cache_control_position_not_supported");
+        }
+        private_cache_boundary_after = cache_after;
+        const std::string type       = require_block_type(block, "messages");
         if (type == "text") {
             std::string text = require_string_field(block, "text", "text block");
             user_turn.content.push_back(ContentPart{ContentKind::Text, std::move(text), "text"});
@@ -368,6 +383,12 @@ void parse_user_content(const Json& content, GenerationRequest& out) {
         }
     }
     flush_user_turn();
+    if (private_cache_boundary_after) {
+        if (out.messages.empty()) {
+            throw std::logic_error("cacheable user content produced no normalized turn");
+        }
+        out.messages.back().private_cache_boundary_after = true;
+    }
 }
 
 void parse_messages(const Json& body, GenerationRequest& out) {

@@ -611,7 +611,7 @@ int exercise_rewrite_checkpoints(ninfer::Engine& engine) {
         exact_replay.prefix_reuse_path != ninfer::PrefixReusePath::PrivateResponseReplay ||
         exact_replay.reused_prompt_tokens == 0) {
         const ninfer::RuntimeStats stats = engine.runtime_stats();
-        std::cerr << "prompt-frontier response checkpoint was not restored on an exact replay: "
+        std::cerr << "pre-generation response checkpoint was not restored on an exact replay: "
                   << "path=" << static_cast<int>(exact_replay.prefix_reuse_path)
                   << " reused=" << exact_replay.reused_prompt_tokens
                   << " captures=" << stats.active_captures_completed
@@ -679,6 +679,28 @@ int exercise_rewrite_checkpoints(ninfer::Engine& engine) {
         std::cerr << "preserve-thinking policy change discarded a compatible response checkpoint: "
                   << "path=" << static_cast<int>(mode_change.prefix_reuse_path)
                   << " reused=" << mode_change.reused_prompt_tokens << '\n';
+        return 1;
+    }
+
+    ninfer::PromptInput branch_input = input_with_history(0, true);
+    branch_input.messages.push_back(
+        text_message(ninfer::ChatRole::User, "Summarize the conversation before answering."));
+    const ninfer::GenerationResult branch =
+        engine.generate(engine.prepare(std::move(branch_input)), options(true));
+    ninfer::PromptInput branch_baseline_input = input_with_history(0, true);
+    branch_baseline_input.messages.push_back(
+        text_message(ninfer::ChatRole::User, "Summarize the conversation before answering."));
+    const ninfer::GenerationResult branch_baseline =
+        engine.generate(engine.prepare(std::move(branch_baseline_input)), options(false));
+    if (branch.generated_token_ids.size() != 4 || branch.reused_prompt_tokens == 0 ||
+        branch.reused_prompt_tokens >= branch.prompt.prompt_tokens ||
+        (branch.prefix_reuse_path != ninfer::PrefixReusePath::PrivateResponseReplay &&
+         branch.prefix_reuse_path != ninfer::PrefixReusePath::PrivateTurnClosure) ||
+        branch.generated_token_ids != branch_baseline.generated_token_ids) {
+        std::cerr << "replacement user suffix did not reuse the stable conversation prefix: path="
+                  << static_cast<int>(branch.prefix_reuse_path)
+                  << " reused=" << branch.reused_prompt_tokens
+                  << " prompt=" << branch.prompt.prompt_tokens << '\n';
         return 1;
     }
     return 0;
@@ -1062,7 +1084,7 @@ int exercise_artifact(const char* artifact, std::string_view expected_target) {
     if (const int result = exercise_host_restore(artifact); result != 0) { return result; }
     {
         // Production C=1/H=1 topology: the shared prefix occupies the only cache Device slot,
-        // while the prompt-frontier ResponseReplay must still rotate without a session identity.
+        // while the pre-generation ResponseReplay must still rotate without a session identity.
         ninfer::Engine engine(shared_replacement_engine_options(artifact));
         if (const int result = exercise_rewrite_checkpoints(engine); result != 0) { return result; }
     }

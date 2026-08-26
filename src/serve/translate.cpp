@@ -227,6 +227,16 @@ ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
             }
         }
         input.messages.push_back(std::move(message));
+        if (turn.private_cache_boundary_after) {
+            if (input.messages.size() > std::numeric_limits<std::uint32_t>::max()) {
+                throw std::overflow_error("conversation cache boundary exceeds uint32");
+            }
+            input.context_cache.markers.push_back(ninfer::PromptCacheMarker{
+                .after_message_count = static_cast<std::uint32_t>(input.messages.size()),
+                .kind                = ninfer::PromptCacheMarkerKind::PrivateLongAnchor,
+                .location            = ninfer::PromptCacheMarkerLocation::MessageBoundary,
+            });
+        }
     }
 
     input.options.add_generation_prompt            = true;
@@ -246,7 +256,12 @@ ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
     // Qwen renders tools before the leading instruction. One shared descriptor is enough for an
     // Anthropic request: the latest explicit breakpoint contains every earlier stable section and
     // avoids pinning the sole shared slot with an earlier tool-only prefix during the same request.
-    if (input.context_cache.markers.empty() && last_tool_cache_boundary) {
+    bool has_shared_marker = false;
+    for (const ninfer::PromptCacheMarker& marker : input.context_cache.markers) {
+        has_shared_marker =
+            has_shared_marker || marker.kind == ninfer::PromptCacheMarkerKind::SharedStablePrefix;
+    }
+    if (!has_shared_marker && last_tool_cache_boundary) {
         input.context_cache.markers.push_back(ninfer::PromptCacheMarker{
             .kind             = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
             .location         = ninfer::PromptCacheMarkerLocation::ToolBoundary,
