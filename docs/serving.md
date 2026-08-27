@@ -6,35 +6,41 @@ Anthropic-compatible HTTP endpoints over one resident NInfer Engine.
 ## Start the server
 
 ```bash
-./build/apps/ninfer-serve models/qwen3_6_27b.ninfer \
+./build/apps/ninfer-serve models/qwen3_8_27b_nvfp4.ninfer \
   --host 127.0.0.1 \
   --port 8080 \
-  --max-context 16384 \
-  --kv-capacity 32768 \
+  --max-context 240000 \
+  --kv-capacity 240000 \
   --max-concurrency 2 \
+  --kv-dtype fp8 \
+  --device-state-slots 2 \
+  --host-state-slots 8 \
+  --host-kv-mib 8192 \
   --spec mtp --draft-tokens 3 \
-  --lm-head-draft
+  --lm-head-draft \
+  --preserve-thinking
 ```
 
-For the 35B-A3B artifact, select its artifact path; the public model ID follows the container
-identity automatically:
+The command uses Qwen3.8-27B NVFP4. Each request has a 240,000-token logical ceiling. A shared
+240,000-token Main Text KV pool serves admitted requests; either request may use the full capacity
+when running alone, and two requests run concurrently when their complete reservations fit.
 
-```bash
-./build/apps/ninfer-serve models/qwen3_6_35b_a3b.ninfer \
-  --max-context 16384 \
-  --spec mtp --draft-tokens 3 \
-  --lm-head-draft
-```
+With `C=2` and two extra Device checkpoint slots, the process owns two active StateImage guarantees
+plus a global pool of two Device-resident checkpoints. Eight pinned Host State slots and 8 GiB of
+pinned Host KV retain inactive continuations under Device pressure. Active request capacity is two.
+
+Other artifacts use the same command shape with their own path. For 35B-A3B text-only DFlash,
+replace the MTP selection with `--spec dflash --draft-tokens 7 --lm-head-draft`; DFlash cannot be
+combined with `--vision`.
 
 When `--model-id` is omitted, the server advertises and accepts the loaded container's exact
 `identity.model_id`. An explicit `--model-id` remains a public HTTP alias override and does not
 select or alter the artifact.
 
 Vision is disabled by default: its weights and Vision-specific unified-workspace extent are not
-allocated, and media
-requests and token-count requests fail with HTTP 400 `vision_disabled`. Add `--vision` when the
-server must accept image or video input. Speculative residency is likewise frozen by
-`--spec mtp|dflash` and `--draft-tokens`; omitting `--spec` loads neither backend.
+allocated, and media requests and token-count requests fail with HTTP 400 `vision_disabled`. Add
+`--vision` when the server must accept image or video input. Speculative residency is likewise
+frozen by `--spec mtp|dflash` and `--draft-tokens`; omitting `--spec` loads neither backend.
 `--lm-head-draft` additionally loads the optimized proposal head. DFlash is 35B-A3B text-only and
 cannot be combined with `--vision`. A later request cannot enable a capability omitted at startup.
 
@@ -60,7 +66,7 @@ cannot be combined with `--vision`. A later request cannot enable a capability o
 curl http://127.0.0.1:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "qwen3.6-27b",
+    "model": "qwen3.8-27b",
     "messages": [
       {"role": "system", "content": "Answer concisely."},
       {"role": "user", "content": "What is speculative decoding?"}
@@ -106,13 +112,8 @@ and a request resolved to non-thinking receives no cap. `--no-thinking` may coex
 option because a protocol request can explicitly enable thinking. In this phase, Anthropic's
 existing `thinking.budget_tokens` member does not override the process default.
 
-For example, this caps model-origin thinking at 512 tokens for every thinking-enabled request:
-
-```bash
-./build/apps/ninfer-serve models/qwen3_6_27b.ninfer \
-  --max-context 16384 \
-  --default-thinking-budget 512
-```
+Add `--default-thinking-budget 512` to the startup command to cap model-origin thinking at 512
+tokens for every thinking-enabled request.
 
 At the cap boundary, Engine first honors a natural `</think>`, stop condition, cancellation, or
 total output/context limit. If thinking remains open, it commits Qwen's canonical early-close
@@ -147,7 +148,7 @@ Start the server with `--vision` before sending media:
 curl http://127.0.0.1:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "qwen3.6-27b",
+    "model": "qwen3.8-27b",
     "messages": [{
       "role": "user",
       "content": [
@@ -196,7 +197,7 @@ Conversations, or compaction.
 curl http://127.0.0.1:8080/v1/responses \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "qwen3.6-27b",
+    "model": "qwen3.8-27b",
     "instructions": "Answer concisely.",
     "input": "What is speculative decoding?",
     "max_output_tokens": 128,
@@ -211,7 +212,7 @@ from openai import OpenAI
 
 client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="local-secret")
 response = client.responses.create(
-    model="qwen3.6-27b",
+    model="qwen3.8-27b",
     instructions="Answer concisely.",
     input="What is speculative decoding?",
     max_output_tokens=128,
@@ -410,7 +411,7 @@ template, and media expansion, and does not run generation:
 ```bash
 curl http://127.0.0.1:8080/v1/responses/input_tokens \
   -H 'Content-Type: application/json' \
-  -d '{"model":"qwen3.6-27b","input":"Count this prompt."}'
+  -d '{"model":"qwen3.8-27b","input":"Count this prompt."}'
 ```
 
 ```json
@@ -428,7 +429,7 @@ tools. These are compatibility boundaries, not silently accepted placeholders.
 curl http://127.0.0.1:8080/v1/messages \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "qwen3.6-27b",
+    "model": "qwen3.8-27b",
     "max_tokens": 128,
     "messages": [
       {"role": "user", "content": "Explain prefix reuse in one sentence."}
@@ -471,7 +472,7 @@ without running GPU generation:
 curl http://127.0.0.1:8080/v1/messages/count_tokens \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "qwen3.6-27b",
+    "model": "qwen3.8-27b",
     "messages": [{"role": "user", "content": "Count this prompt."}]
   }'
 ```
@@ -489,6 +490,8 @@ curl http://127.0.0.1:8080/v1/models \
 `--cors` adds permissive browser CORS headers. It is disabled by default.
 
 ## Server options
+
+The table lists executable defaults. The startup example selects a long-context FP8/MTP3 profile.
 
 | Option | Meaning | Default |
 |---|---|---:|
@@ -540,15 +543,9 @@ curl http://127.0.0.1:8080/v1/models \
 | `--seed N` | fixed seed when a request omits one | fresh random seed per request |
 | `--greedy` | force exact argmax for all requests | off |
 
-Context-cost coefficients are selected once during startup and never learned from live requests.
-An always-available generic numerical model is first refined by matching compiled defaults.
-`--context-cost-presets FILE` adds runtime overrides without recompilation: transfer is matched by
-GPU class, while prefill is matched by GPU class and artifact `model_id/weights_id`. The two
-components layer independently. A malformed file fails during startup; a valid file with no
-matching machine or artifact entry simply leaves the preceding numerical layer in use. KV dtype,
-speculative backend, and prefill chunk are not lookup dimensions. The server-start console line and
-JSONL record report `generic-default`, `compiled-default`, or `external` independently for transfer
-and prefill, together with the resolved hardware/artifact identity.
+Context-cost coefficients resolve once at startup from generic defaults, matching compiled values,
+and optional transfer or artifact-prefill entries from `--context-cost-presets FILE`. A malformed
+file aborts startup; the startup console line and JSONL record identify the selected source.
 
 Engine selects sampling defaults from the loaded model and the request's resolved thinking mode.
 Qwen3.6-27B and Qwen3.8-27B use `1.0/0.95/20/0/0` for
@@ -573,10 +570,8 @@ in append mode and flushes every event, so successive model or MTP blocks may sh
 file. The parent directory must already exist. Failure to open the file aborts startup; the log path
 is also rejected if it resolves to the model artifact.
 
-```bash
-./build/apps/ninfer-serve models/qwen3_6_27b.ninfer \
-  --request-log-jsonl profiles/bench/run/server.requests.jsonl
-```
+Add `--request-log-jsonl profiles/bench/run/server.requests.jsonl` to the startup command to write
+the log at that path.
 
 Every line is one `ninfer_serve_request_log` schema-v17 JSON object. All events carry
 `timestamp_unix_ms` and a process-unique `server_instance_id`; request IDs are monotonic only within
@@ -679,65 +674,53 @@ media request retains the same cancellation and timeout deadline. Model output i
 same finite request count and each request's effective output-token limit; output callbacks and
 network serialization run outside the GPU executor and do not delay formation of the next batch.
 
-`--max-context` and the resolved `--kv-capacity` are independent limits. The former is each
-sequence's logical ceiling; the latter sizes the shared Main Text KV pool used by all active
-requests and retained prefixes. Both are represented with 64-token pages internally, while a
-sequence can never cross the exact `--max-context` frontier. `--kv-capacity N` requests an explicit
-capacity; `--kv-capacity auto` chooses the largest legal capacity that fits the memory remaining
-after weights are loaded while keeping 1 GiB of sizing headroom. When omitted it follows
-`--max-context`, preserving one full-length request's capacity. The shared pool is fixed at startup
-and is not divided evenly among request lanes.
+`--max-context` is each sequence's logical ceiling. `--kv-capacity` fixes the shared Main Text KV
+pool used by active requests and retained prefixes. `auto` accounts for the complete enabled runtime
+and leaves 1 GiB of sizing headroom; omitting the option makes it follow `--max-context`. Capacity
+resolves once at startup.
 
-Automatic sizing evaluates the complete target runtime layout for the chosen concurrency, KV
-dtype, speculative backend, draft window, Vision setting, workspace, and CUDA Graph allowance. It
-uses a direct page-capacity calculation rather than allocation probing. Startup reports the policy,
-resolved capacity, runtime reservation, free memory after weights, automatic headroom, planned
-slack, actual free memory after complete startup, and observed Graph memory. An explicit capacity
-is never silently reduced, and neither policy permits request-time pool growth.
+Admission reserves the full prompt-plus-effective-output page entitlement through request
+completion. A request remains queued until a legal resource plan can satisfy that entitlement.
 
-Admission reserves the full prompt-plus-effective-output page entitlement, so an admitted request
-can finish within its declared bound. A later request waits in FIFO order when the remaining shared
-pages cannot satisfy its complete entitlement; the Engine never admits it and later truncates an
-older request to recover capacity. Startup rejects a KV pool smaller than one sequence, too small to
-provide one page per configured lane, or larger than all configured lanes could use.
+Each reusable checkpoint contains KV and complete continuation state. At admission, capture, and
+finish boundaries, resource pressure may keep it on Device, move its StateImage and/or KV replicas
+to pinned Host memory, or evict it. The planner compares incoming-request work with the later
+recovery cost imposed on retained checkpoints. Active requests retain their state and completion
+reservations, and placement choices preserve model semantics. The full policy and invariants are
+defined in [Resource scheduling and context cache](maintainer/resource-scheduling-and-context-cache.md).
 
-Compatible checkpoint prefixes are reused for both text and multimodal histories unless the server is
-started with `--no-prefix-reuse`. A multimodal hit requires matching token types, three-axis MRoPE
-positions, encoded-media digest, grid, and consumer spans; changing an earlier image or video
-therefore resets the prefix instead of reusing placeholder-token KV. Media wholly inside a matched
-prefix skips Vision execution, while new suffix media is encoded normally. The completion log
-reports the reused token count as `cache=`.
+Compatible prefixes are reused for both text and multimodal histories unless the server starts with
+`--no-prefix-reuse`. A multimodal hit additionally requires matching token types, three-axis MRoPE
+positions, encoded-media digest, grid, and consumer spans. Media wholly inside a matched prefix
+skips Vision execution, while new suffix media is encoded normally. The completion log reports the
+reused token count as `cache=`.
 
 The completion log reports one of six reuse paths: `root`, `private_endpoint`,
 `private_turn_closure`, `private_response_replay`, `private_long_anchor`, or
-`shared_stable_prefix`. Every reusable checkpoint includes the recurrent, hidden, and selected
-speculative-backend continuation state required to recompute its suffix; matching KV tokens alone
-never authorize a partial hit. With stable `preserve_thinking=true`, the auxiliary checkpoint rolls
-to the message frontier immediately before the current response's deterministic generation
+`shared_stable_prefix`. Reuse validation covers KV, recurrent state, hidden state, selected-backend
+state, and the exact prompt frontier. With stable `preserve_thinking=true`, the auxiliary checkpoint
+rolls to the message frontier immediately before the current response's deterministic generation
 prologue. A normalized response, compact-summary instruction, or replacement user suffix therefore
 replays the small generation prologue and only the changed suffix while retaining the complete
 stable conversation prefix. Stable `false` places the turn-closure checkpoint before the first
 assistant opener in the open turn, so closing that turn can recompute its opener and omit its
 reasoning without discarding the preceding conversation.
 
-`preserve_thinking` selects where the next checkpoint should live; it is not a cache-compatibility
-bit. Any exact complete checkpoint remains reusable across a mode change. If the newly desired
-boundary is already behind the selected reuse frontier and no snapshot exists there, the Engine
-keeps the valid hit and defers installing that new checkpoint rather than forcing an eager root
-start. A later request that diverges before every retained checkpoint then starts from root. The
-JSONL completion record exposes the checkpoint actually restored as
-`prefix_reuse_path`. Changing reasoning effort changes rendered tokens and therefore does not reuse
-a prefix whose effort instruction differs.
+`preserve_thinking` selects the capture frontier for newly created checkpoints. Existing exact
+checkpoints remain reusable across a mode change. If the desired boundary is behind the selected
+reuse frontier and has no snapshot, the Engine keeps the valid hit and defers the new checkpoint. A
+later request that diverges before every retained checkpoint starts from root. The JSONL completion
+record exposes the restored checkpoint as `prefix_reuse_path`. Reasoning-effort changes participate
+in rendered-token identity and exact-prefix selection.
 
 An appended mid-conversation system message is an ordinary prompt suffix, so an unchanged prior
 history remains eligible for `private_endpoint`. If the client modifies, removes, or moves a
 historical system message, the token prefix genuinely differs and a miss/reset is correct.
 
-Speculative decoding is an engine option and does not change protocol output shapes, stop behavior,
-or usage accounting. If a stop truncates a multi-token MTP or DFlash round, the Engine commits the
-exact accepted target prefix so a following compatible turn can still reuse it. Output-limit and
-context-capacity finishes map to `length`/ `max_tokens`; ordinary model or string stops map to
-`stop`/ `end_turn`.
+Speculative backends preserve protocol output shapes, stop behavior, and usage accounting. If a stop
+truncates a multi-token MTP or DFlash round, the Engine commits the exact accepted target prefix so
+a following compatible turn can reuse it. Output-limit and context-capacity finishes map to
+`length`/ `max_tokens`; ordinary model or string stops map to `stop`/ `end_turn`.
 
 Function tools are rendered into the model prompt and generated calls are parsed into protocol
 responses. NInfer does not execute tools and does not enforce client JSON Schema through constrained
