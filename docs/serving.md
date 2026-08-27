@@ -94,6 +94,11 @@ The request `model` must equal the public model ID: the artifact `identity.model
 the explicit `--model-id` override. Reasoning is returned separately as `reasoning_content`; answer
 text remains in `content`.
 
+Across Chat Completions, Responses, and Anthropic Messages, an explicit top-level tool-parameter
+type controls conversion of Qwen's untyped parameter text. String-admitting values remain strings;
+other explicitly typed values are decoded as JSON without coercion. NInfer does not validate
+generated arguments against the full JSON Schema.
+
 Message roles retain their input order through schema translation. The Qwen family frontend maps
 both `system` and `developer` to system-class ChatML blocks at their original positions; it does not
 move later instructions to the beginning of the conversation. A leading instruction keeps the
