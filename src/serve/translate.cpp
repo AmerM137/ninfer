@@ -37,6 +37,7 @@ ninfer::SamplingOverrides resolve_sampling_overrides(const SamplingParams& reque
     ninfer::SamplingOverrides sampling = server.sampling_overrides;
     if (request.temperature) { sampling.temperature = static_cast<float>(*request.temperature); }
     if (request.top_p) { sampling.top_p = static_cast<float>(*request.top_p); }
+    if (request.min_p) { sampling.min_p = static_cast<float>(*request.min_p); }
     if (request.top_k) { sampling.top_k = static_cast<std::int32_t>(*request.top_k); }
     if (request.presence_penalty) {
         sampling.presence_penalty = static_cast<float>(*request.presence_penalty);
@@ -115,15 +116,15 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
     const RequestedReasoningEffort requested = *request.reasoning_effort;
     const bool enables_thinking              = requested != RequestedReasoningEffort::None;
     if (request.enable_thinking && *request.enable_thinking != enables_thinking) {
-        invalid_prompt_option("reasoning effort conflicts with enable_thinking",
-                              request.reasoning_effort_param, "conflicting_template_option");
+        invalid_prompt_option("reasoning effort conflicts with enable_thinking", "reasoning_effort",
+                              "conflicting_template_option");
     }
     result.enable_thinking = enables_thinking;
 
     if (requested == RequestedReasoningEffort::None) {
         if (!capabilities.enable_thinking) {
             invalid_prompt_option("the loaded chat template cannot disable thinking",
-                                  request.reasoning_effort_param, "reasoning_effort_not_supported");
+                                  "reasoning_effort", "reasoning_effort_not_supported");
         }
         return result;
     }
@@ -144,7 +145,7 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
         invalid_prompt_option("reasoning effort '" +
                                   std::string(requested_reasoning_effort_name(requested)) +
                                   "' is not supported by the loaded chat template",
-                              request.reasoning_effort_param, "reasoning_effort_not_supported");
+                              "reasoning_effort", "reasoning_effort_not_supported");
     case RequestedReasoningEffort::None:
         break;
     }
@@ -153,7 +154,7 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
         invalid_prompt_option("reasoning effort '" +
                                   std::string(requested_reasoning_effort_name(requested)) +
                                   "' is not supported by the loaded chat template",
-                              request.reasoning_effort_param, "reasoning_effort_not_supported");
+                              "reasoning_effort", "reasoning_effort_not_supported");
     }
     return result;
 }
@@ -177,13 +178,6 @@ ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
         std::uint64_t text_bytes = 0;
         for (const ContentPart& part : turn.content) {
             if (part.kind == ContentKind::Text) {
-                if (!message.parts.empty() && !part.text.empty() &&
-                    message.parts.back().kind == ninfer::MessagePartKind::Text) {
-                    ninfer::MessagePart newline;
-                    newline.text = "\n";
-                    message.parts.push_back(std::move(newline));
-                    ++text_bytes;
-                }
                 ninfer::MessagePart text;
                 text.text = part.text;
                 message.parts.push_back(std::move(text));
@@ -285,30 +279,23 @@ ninfer::RequestOptions to_request_options(const GenerationRequest& request,
     options.output.raw                     = false;
     options.output.preserve_special_tokens = request.uses_tools() || request.has_tool_history();
     options.output.tool_name_max_length = static_cast<std::uint32_t>(request.tool_name_max_length);
-    options.stop.strings.reserve(request.stop_strings.size());
+    options.stop.strings.reserve(request.stop_strings.size() *
+                                 (request.stop_strings_apply_to_reasoning ? 2U : 1U));
     for (const std::string& stop : request.stop_strings) {
         if (!stop.empty()) {
             options.stop.strings.push_back(
                 ninfer::StopString{.text              = stop,
                                    .channel           = ninfer::OutputChannel::Content,
                                    .include_in_output = false});
+            if (request.stop_strings_apply_to_reasoning) {
+                options.stop.strings.push_back(
+                    ninfer::StopString{.text              = stop,
+                                       .channel           = ninfer::OutputChannel::Reasoning,
+                                       .include_in_output = false});
+            }
         }
     }
     return options;
-}
-
-const char* finish_reason_wire(ninfer::FinishReason reason) {
-    switch (reason) {
-    case ninfer::FinishReason::OutputLimit:
-    case ninfer::FinishReason::ContextCapacity:
-        return "length";
-    case ninfer::FinishReason::None:
-    case ninfer::FinishReason::StopToken:
-    case ninfer::FinishReason::StopString:
-    case ninfer::FinishReason::Cancelled:
-        return "stop";
-    }
-    return "stop";
 }
 
 } // namespace ninfer::serve

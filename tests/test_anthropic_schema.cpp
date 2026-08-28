@@ -54,6 +54,10 @@ RequestLimits default_limits() {
     return limits;
 }
 
+GenerationRequest parse_generation(const Json& body, const RequestLimits& request_limits) {
+    return parse_messages_request(body, request_limits).generation;
+}
+
 ServeOptions default_server() { return ServeOptions{}; }
 
 ninfer::PromptCapabilities effort_capabilities() {
@@ -116,20 +120,21 @@ Json parse_sse(const std::string& event, std::string* out_type = nullptr) {
 }
 
 int test_parse_basic_and_system() {
-    int failures                = 0;
-    const Json body             = {{"model", "claude-sonnet-4-5"},
-                                   {"max_tokens", 256},
-                                   {"system", "be terse"},
-                                   {"messages", Json::array({Json{{"role", "user"}, {"content", "hello"}}})}};
-    const GenerationRequest req = parse_messages_request(body, default_limits());
-    failures += check(req.model == "claude-sonnet-4-5", "model echoed verbatim");
-    failures += check(req.max_tokens == 256 && req.max_tokens_set, "max_tokens parsed");
+    int failures                          = 0;
+    const Json body                       = {{"model", "claude-sonnet-4-5"},
+                                             {"max_tokens", 256},
+                                             {"system", "be terse"},
+                                             {"messages", Json::array({Json{{"role", "user"}, {"content", "hello"}}})}};
+    const AnthropicMessagesRequest parsed = parse_messages_request(body, default_limits());
+    const GenerationRequest& req          = parsed.generation;
+    failures += check(parsed.model == "claude-sonnet-4-5", "model echoed verbatim");
+    failures += check(req.max_tokens == 256 && parsed.output_tokens_explicit, "max_tokens parsed");
     failures += check(req.messages.size() == 2, "system + user turns");
     failures += check(req.messages[0].role == ninfer::ChatRole::System, "system turn is first");
     failures += check(req.messages[0].content[0].text == "be terse", "system text carried");
     failures += check(req.messages[1].role == ninfer::ChatRole::User, "user turn follows system");
     failures += check(req.messages[1].content[0].text == "hello", "user text carried");
-    failures += check(!req.stream, "stream defaults false");
+    failures += check(!parsed.stream, "stream defaults false");
     return failures;
 }
 
@@ -144,7 +149,7 @@ int test_parse_system_array_and_blocks() {
          Json::array({Json{{"role", "user"},
                            {"content", Json::array({Json{{"type", "text"}, {"text", "x"}},
                                                     Json{{"type", "text"}, {"text", "y"}}})}}})}};
-    const GenerationRequest req = parse_messages_request(body, default_limits());
+    const GenerationRequest req = parse_generation(body, default_limits());
     failures += check(req.messages[0].role == ninfer::ChatRole::System, "system first");
     failures += check(req.messages[0].content[0].text == "a\nb", "system blocks joined");
     const ninfer::PromptInput prompt = translate(req);
@@ -167,7 +172,7 @@ int test_cache_control_boundaries() {
                                          {"cache_control", ephemeral}}})},
         {"messages", Json::array({Json{{"role", "user"}, {"content", "hello"}}})},
     };
-    const GenerationRequest request  = parse_messages_request(body, default_limits());
+    const GenerationRequest request  = parse_generation(body, default_limits());
     const ninfer::PromptInput prompt = translate(request);
     int failures = check(request.messages[0].shared_cache_boundaries_after_text_bytes.size() == 1 &&
                              request.messages[0].shared_cache_boundaries_after_text_bytes[0] ==
@@ -185,7 +190,7 @@ int test_cache_control_boundaries() {
     Json tool_only      = body;
     tool_only["system"] = "dynamic system";
     const ninfer::PromptInput tool_prompt =
-        translate(parse_messages_request(tool_only, default_limits()));
+        translate(parse_generation(tool_only, default_limits()));
     failures += check(tool_prompt.context_cache.markers.size() == 1 &&
                           tool_prompt.context_cache.markers[0].location ==
                               ninfer::PromptCacheMarkerLocation::ToolBoundary &&
@@ -206,8 +211,7 @@ int test_cache_control_boundaries() {
                                                          {"cache_control", ephemeral}}})}},
                       Json{{"role", "user"}, {"content", "next"}}})},
     };
-    const GenerationRequest message_request =
-        parse_messages_request(message_cached, default_limits());
+    const GenerationRequest message_request  = parse_generation(message_cached, default_limits());
     const ninfer::PromptInput message_prompt = translate(message_request);
     failures += check(message_request.messages.size() == 3 &&
                           message_request.messages[0].private_cache_boundary_after &&
@@ -231,13 +235,13 @@ int test_cache_control_boundaries() {
     Json unsupported_position = message_cached;
     unsupported_position["messages"][0]["content"].push_back(
         Json{{"type", "text"}, {"text", "dynamic tail"}});
-    failures += check(
-        throws_api([&] { (void)parse_messages_request(unsupported_position, default_limits()); }),
-        "non-terminal Anthropic message cache_control was silently approximated");
+    failures +=
+        check(throws_api([&] { (void)parse_generation(unsupported_position, default_limits()); }),
+              "non-terminal Anthropic message cache_control was silently approximated");
 
     Json invalid                          = body;
     invalid["system"][0]["cache_control"] = Json{{"type", "unknown"}};
-    failures += check(throws_api([&] { (void)parse_messages_request(invalid, default_limits()); }),
+    failures += check(throws_api([&] { (void)parse_generation(invalid, default_limits()); }),
                       "invalid Anthropic cache_control type was accepted");
     return failures;
 }
@@ -252,7 +256,7 @@ int test_ordered_system_messages() {
                          Json{{"role", "user"}, {"content", "hello"}},
                          Json{{"role", "system"}, {"content", "reminder from messages"}},
                      })}};
-    const GenerationRequest req = parse_messages_request(body, default_limits());
+    const GenerationRequest req = parse_generation(body, default_limits());
     failures += check(req.messages.size() == 3, "top-level, user, and dynamic system kept");
     failures += check(req.messages[0].role == ninfer::ChatRole::System &&
                           req.messages[0].content[0].text == "top-level system",
@@ -278,7 +282,7 @@ int test_ordered_system_messages() {
                          Json{{"role", "system"},
                               {"content", Json::array({Json{{"type", "text"}, {"text", "r"}}})}},
                      })}};
-    const GenerationRequest breq = parse_messages_request(blocks_body, default_limits());
+    const GenerationRequest breq = parse_generation(blocks_body, default_limits());
     failures +=
         check(breq.messages.size() == 2 && breq.messages[0].role == ninfer::ChatRole::User &&
                   breq.messages[1].role == ninfer::ChatRole::System &&
@@ -292,7 +296,7 @@ int test_ordered_system_messages() {
                                   Json{{"role", "system"}, {"content", "first"}},
                                   Json{{"role", "system"}, {"content", "second"}},
                                   Json{{"role", "assistant"}, {"content", "answer"}}})}};
-    const GenerationRequest creq = parse_messages_request(consecutive, default_limits());
+    const GenerationRequest creq = parse_generation(consecutive, default_limits());
     failures +=
         check(creq.messages.size() == 4 && creq.messages[1].role == ninfer::ChatRole::System &&
                   creq.messages[1].content[0].text == "first" &&
@@ -304,7 +308,7 @@ int test_ordered_system_messages() {
                           {"max_tokens", 16},
                           {"messages", Json::array({Json{{"role", "system"}, {"content", "bad"}},
                                                     Json{{"role", "user"}, {"content", "hi"}}})}};
-    failures += check(api_code([&] { (void)parse_messages_request(leading, default_limits()); }) ==
+    failures += check(api_code([&] { (void)parse_generation(leading, default_limits()); }) ==
                           "invalid_message_order",
                       "leading array system was not rejected by the Anthropic schema");
 
@@ -315,7 +319,7 @@ int test_ordered_system_messages() {
                                   Json{{"role", "system"}, {"content", "bad"}},
                                   Json{{"role", "user"}, {"content", "second"}}})}};
     failures += check(api_code([&] {
-                          (void)parse_messages_request(followed_by_user, default_limits());
+                          (void)parse_generation(followed_by_user, default_limits());
                       }) == "invalid_message_order",
                       "system section followed by user was not rejected by the Anthropic schema");
 
@@ -334,7 +338,7 @@ int test_ordered_system_messages() {
         {"messages",
          Json::array({Json{{"role", "user"}, {"content", "inspect"}}, tool_use, tool_result,
                       Json{{"role", "system"}, {"content", "diagnostics"}}})}};
-    const GenerationRequest tool_req = parse_messages_request(after_tool_result, default_limits());
+    const GenerationRequest tool_req = parse_generation(after_tool_result, default_limits());
     failures += check(tool_req.messages.size() == 4 &&
                           tool_req.messages[0].role == ninfer::ChatRole::User &&
                           tool_req.messages[1].role == ninfer::ChatRole::Assistant &&
@@ -348,7 +352,7 @@ int test_ordered_system_messages() {
         {"messages", Json::array({Json{{"role", "user"}, {"content", "inspect"}}, tool_use,
                                   Json{{"role", "system"}, {"content", "bad"}}, tool_result})}};
     failures += check(api_code([&] {
-                          (void)parse_messages_request(interrupted_tool_pair, default_limits());
+                          (void)parse_generation(interrupted_tool_pair, default_limits());
                       }) == "invalid_message_order",
                       "system interrupting tool_use/tool_result was not rejected");
     return failures;
@@ -365,7 +369,7 @@ int test_user_content_block_order() {
                                                        {"tool_use_id", "toolu_1"},
                                                        {"content", "result"}},
                                                   Json{{"type", "text"}, {"text", "after"}}})}}})}};
-    const GenerationRequest req = parse_messages_request(body, default_limits());
+    const GenerationRequest req = parse_generation(body, default_limits());
     int failures = check(req.messages.size() == 3, "mixed user content did not expand in place");
     failures += check(req.messages[0].role == ninfer::ChatRole::User &&
                           req.messages[0].content[0].text == "before" &&
@@ -381,32 +385,32 @@ int test_missing_and_bad_fields() {
     int failures        = 0;
     const Json no_model = {{"max_tokens", 8},
                            {"messages", Json::array({Json{{"role", "user"}, {"content", "hi"}}})}};
-    failures += check(throws_api([&] { (void)parse_messages_request(no_model, default_limits()); }),
+    failures += check(throws_api([&] { (void)parse_generation(no_model, default_limits()); }),
                       "missing model rejected");
 
     const Json bad_role = {
         {"model", "m"},
         {"max_tokens", 8},
         {"messages", Json::array({Json{{"role", "developer"}, {"content", "hi"}}})}};
-    failures += check(throws_api([&] { (void)parse_messages_request(bad_role, default_limits()); }),
+    failures += check(throws_api([&] { (void)parse_generation(bad_role, default_limits()); }),
                       "unknown message role rejected");
 
     const Json empty_msgs = {{"model", "m"}, {"max_tokens", 8}, {"messages", Json::array()}};
-    failures +=
-        check(throws_api([&] { (void)parse_messages_request(empty_msgs, default_limits()); }),
-              "empty messages rejected");
+    failures += check(throws_api([&] { (void)parse_generation(empty_msgs, default_limits()); }),
+                      "empty messages rejected");
 
     const Json bad_max = {{"model", "m"},
                           {"max_tokens", 0},
                           {"messages", Json::array({Json{{"role", "user"}, {"content", "hi"}}})}};
-    failures += check(throws_api([&] { (void)parse_messages_request(bad_max, default_limits()); }),
+    failures += check(throws_api([&] { (void)parse_generation(bad_max, default_limits()); }),
                       "non-positive max_tokens rejected");
 
     // Omitting max_tokens falls back to the server default (lenient vs the API).
-    const Json no_max           = {{"model", "m"},
-                                   {"messages", Json::array({Json{{"role", "user"}, {"content", "hi"}}})}};
-    const GenerationRequest req = parse_messages_request(no_max, default_limits());
-    failures += check(req.max_tokens == 512 && !req.max_tokens_set, "max_tokens default applied");
+    const Json no_max                     = {{"model", "m"},
+                                             {"messages", Json::array({Json{{"role", "user"}, {"content", "hi"}}})}};
+    const AnthropicMessagesRequest parsed = parse_messages_request(no_max, default_limits());
+    failures += check(parsed.generation.max_tokens == 512 && !parsed.output_tokens_explicit,
+                      "max_tokens default applied");
     return failures;
 }
 
@@ -420,7 +424,7 @@ int test_parse_image() {
                                                        {"source", Json{{"type", "base64"},
                                                                        {"media_type", "image/png"},
                                                                        {"data", "AA=="}}}}})}}})}};
-    const GenerationRequest req      = parse_messages_request(body, default_limits());
+    const GenerationRequest req      = parse_generation(body, default_limits());
     const ninfer::PromptInput prompt = translate(req);
     int failures                     = 0;
     failures += check(req.messages[0].content[0].kind == ContentKind::Image,
@@ -448,7 +452,7 @@ int test_tools_and_choice() {
         {"tool_choice", Json{{"type", "auto"}}},
         {"messages", Json::array({Json{{"role", "user"}, {"content", "weather in Paris?"}}})}};
 
-    const GenerationRequest req = parse_messages_request(body, default_limits());
+    const GenerationRequest req = parse_generation(body, default_limits());
     failures += check(req.tools.size() == 1, "one tool parsed");
     failures += check(req.tools[0].name == "get_weather", "tool name parsed");
     failures += check(req.tool_choice.mode == ToolChoiceMode::Auto, "auto -> Auto");
@@ -466,50 +470,47 @@ int test_tools_and_choice() {
 
     Json any           = body;
     any["tool_choice"] = Json{{"type", "any"}};
-    failures += check(parse_messages_request(any, default_limits()).tool_choice.mode ==
-                          ToolChoiceMode::Required,
-                      "any -> Required");
+    failures +=
+        check(parse_generation(any, default_limits()).tool_choice.mode == ToolChoiceMode::Required,
+              "any -> Required");
 
     Json none           = body;
     none["tool_choice"] = Json{{"type", "none"}};
-    failures += check(parse_messages_request(none, default_limits()).tool_choice.mode ==
-                          ToolChoiceMode::None,
-                      "none -> None");
+    failures +=
+        check(parse_generation(none, default_limits()).tool_choice.mode == ToolChoiceMode::None,
+              "none -> None");
 
     Json named                        = body;
     named["tool_choice"]              = Json{{"type", "tool"}, {"name", "get_weather"}};
-    const GenerationRequest named_req = parse_messages_request(named, default_limits());
+    const GenerationRequest named_req = parse_generation(named, default_limits());
     failures += check(named_req.tool_choice.mode == ToolChoiceMode::Named &&
                           named_req.tool_choice.name == "get_weather",
                       "tool+name -> Named");
 
     Json unknown           = body;
     unknown["tool_choice"] = Json{{"type", "tool"}, {"name", "nope"}};
-    failures += check(throws_api([&] { (void)parse_messages_request(unknown, default_limits()); }),
+    failures += check(throws_api([&] { (void)parse_generation(unknown, default_limits()); }),
                       "unknown named tool rejected");
 
     Json server_tool     = body;
     server_tool["tools"] = Json::array({Json{{"type", "bash_20250124"}, {"name", "bash"}}});
-    failures +=
-        check(throws_api([&] { (void)parse_messages_request(server_tool, default_limits()); }),
-              "server tool without input_schema rejected");
+    failures += check(throws_api([&] { (void)parse_generation(server_tool, default_limits()); }),
+                      "server tool without input_schema rejected");
 
     const std::string max_name(128, 'a');
     Json max_tool          = tool;
     max_tool["name"]       = max_name;
     Json max_name_body     = body;
     max_name_body["tools"] = Json::array({max_tool});
-    failures +=
-        check(parse_messages_request(max_name_body, default_limits()).tools[0].name == max_name,
-              "128-character Anthropic tool name accepted");
+    failures += check(parse_generation(max_name_body, default_limits()).tools[0].name == max_name,
+                      "128-character Anthropic tool name accepted");
 
     Json too_long_tool     = tool;
     too_long_tool["name"]  = std::string(129, 'a');
     Json too_long_body     = body;
     too_long_body["tools"] = Json::array({too_long_tool});
-    failures +=
-        check(throws_api([&] { (void)parse_messages_request(too_long_body, default_limits()); }),
-              "129-character Anthropic tool name rejected");
+    failures += check(throws_api([&] { (void)parse_generation(too_long_body, default_limits()); }),
+                      "129-character Anthropic tool name rejected");
     return failures;
 }
 
@@ -540,7 +541,7 @@ int test_tool_use_result_roundtrip() {
                        {"messages", Json::array({Json{{"role", "user"}, {"content", "weather?"}},
                                                  assistant, user_result})}};
 
-    const GenerationRequest req = parse_messages_request(body, default_limits());
+    const GenerationRequest req = parse_generation(body, default_limits());
     // user, assistant, tool
     failures += check(req.messages.size() == 3, "user + assistant + tool turns");
     failures += check(req.messages[1].role == ninfer::ChatRole::Assistant, "assistant turn");
@@ -591,7 +592,7 @@ int test_tool_use_result_roundtrip() {
                                      Json::array({Json{{"type", "text"}, {"text", "first"}}, image,
                                                   Json{{"type", "text"}, {"text", "second"}},
                                                   image}))})}}})}};
-    const GenerationRequest parallel = parse_messages_request(parallel_body, default_limits());
+    const GenerationRequest parallel          = parse_generation(parallel_body, default_limits());
     const ninfer::PromptInput parallel_prompt = translate(parallel);
     failures +=
         check(parallel.messages.size() == 4 && parallel.messages[2].tool_call_id == "call_B" &&
@@ -615,7 +616,7 @@ int test_thinking_and_sampling() {
                                    {"stop_sequences", Json::array({"STOP", "END"})},
                                    {"thinking", Json{{"type", "enabled"}, {"budget_tokens", 1024}}},
                                    {"messages", Json::array({Json{{"role", "user"}, {"content", "hi"}}})}};
-    const GenerationRequest req = parse_messages_request(body, default_limits());
+    const GenerationRequest req = parse_generation(body, default_limits());
     failures += check(req.sampling.temperature.has_value() && *req.sampling.temperature == 0.3,
                       "temperature parsed");
     failures += check(req.sampling.top_p.has_value() && *req.sampling.top_p == 0.8, "top_p parsed");
@@ -637,7 +638,7 @@ int test_thinking_and_sampling() {
                       "sampling reaches Engine overrides without inventing omitted fields");
     Json oversized_top_k              = body;
     oversized_top_k["top_k"]          = 21;
-    const GenerationRequest oversized = parse_messages_request(oversized_top_k, default_limits());
+    const GenerationRequest oversized = parse_generation(oversized_top_k, default_limits());
     failures += check(throws_api([&] { (void)translate_options(oversized); }),
                       "top_k beyond the Engine candidate domain reached execution");
     failures += check(options.stop.strings.size() == 2 && options.stop.strings[0].text == "STOP" &&
@@ -646,7 +647,7 @@ int test_thinking_and_sampling() {
 
     Json disabled                = body;
     disabled["thinking"]         = Json{{"type", "disabled"}};
-    const GenerationRequest dreq = parse_messages_request(disabled, default_limits());
+    const GenerationRequest dreq = parse_generation(disabled, default_limits());
     failures +=
         check(dreq.enable_thinking.has_value() && !*dreq.enable_thinking, "thinking disabled");
 
@@ -654,19 +655,19 @@ int test_thinking_and_sampling() {
     // non-"disabled" mode must map to thinking-on, not a 400.
     Json adaptive                = body;
     adaptive["thinking"]         = Json{{"type", "adaptive"}};
-    const GenerationRequest areq = parse_messages_request(adaptive, default_limits());
+    const GenerationRequest areq = parse_generation(adaptive, default_limits());
     failures +=
         check(areq.enable_thinking.has_value() && *areq.enable_thinking, "adaptive -> thinking on");
 
     Json preserve                 = body;
     preserve["thinking"]          = Json{{"type", "disabled"}};
     preserve["preserve_thinking"] = true;
-    const GenerationRequest preq  = parse_messages_request(preserve, default_limits());
+    const GenerationRequest preq  = parse_generation(preserve, default_limits());
     failures += check(preq.enable_thinking == false && preq.preserve_thinking == true,
                       "Anthropic preserve_thinking was not independent from thinking.type");
     Json invalid                 = body;
     invalid["preserve_thinking"] = "yes";
-    failures += check(throws_api([&] { (void)parse_messages_request(invalid, default_limits()); }),
+    failures += check(throws_api([&] { (void)parse_generation(invalid, default_limits()); }),
                       "Anthropic accepted non-boolean preserve_thinking");
     return failures;
 }
@@ -688,14 +689,14 @@ int test_reasoning_effort() {
               {"max", RequestedReasoningEffort::Max}}}) {
         Json body                       = base;
         body["output_config"]           = Json{{"effort", wire}};
-        const GenerationRequest request = parse_messages_request(body, default_limits());
+        const GenerationRequest request = parse_generation(body, default_limits());
         failures += check(request.reasoning_effort == expected,
                           std::string("Anthropic did not accept protocol effort ") + wire);
     }
 
     Json low                             = base;
     low["output_config"]                 = Json{{"effort", "low"}};
-    const GenerationRequest low_request  = parse_messages_request(low, default_limits());
+    const GenerationRequest low_request  = parse_generation(low, default_limits());
     const ninfer::PromptInput low_prompt = translate(low_request);
     failures += check(low_prompt.options.enable_thinking &&
                           low_prompt.options.reasoning_effort == ninfer::ReasoningEffort::Low,
@@ -703,17 +704,16 @@ int test_reasoning_effort() {
 
     Json high                            = base;
     high["output_config"]                = Json{{"effort", "high"}};
-    const GenerationRequest high_request = parse_messages_request(high, default_limits());
+    const GenerationRequest high_request = parse_generation(high, default_limits());
     failures += check(api_code([&] {
                           (void)resolve_prompt_semantics(high_request, default_server(),
                                                          effort_capabilities());
                       }) == "reasoning_effort_not_supported",
                       "Anthropic high effort bypassed template capability validation");
 
-    Json conflict        = low;
-    conflict["thinking"] = Json{{"type", "disabled"}};
-    const GenerationRequest conflicting_request =
-        parse_messages_request(conflict, default_limits());
+    Json conflict                               = low;
+    conflict["thinking"]                        = Json{{"type", "disabled"}};
+    const GenerationRequest conflicting_request = parse_generation(conflict, default_limits());
     failures += check(api_code([&] {
                           (void)resolve_prompt_semantics(conflicting_request, default_server(),
                                                          effort_capabilities());
@@ -722,13 +722,13 @@ int test_reasoning_effort() {
 
     Json invalid             = base;
     invalid["output_config"] = Json{{"effort", "minimal"}};
-    failures += check(throws_api([&] { (void)parse_messages_request(invalid, default_limits()); }),
+    failures += check(throws_api([&] { (void)parse_generation(invalid, default_limits()); }),
                       "Anthropic accepted an effort outside its protocol vocabulary");
     invalid["output_config"] = Json{{"effort", 1}};
-    failures += check(throws_api([&] { (void)parse_messages_request(invalid, default_limits()); }),
+    failures += check(throws_api([&] { (void)parse_generation(invalid, default_limits()); }),
                       "Anthropic accepted non-string output_config.effort");
     invalid["output_config"] = Json{{"format", Json{{"type", "json_schema"}}}};
-    failures += check(throws_api([&] { (void)parse_messages_request(invalid, default_limits()); }),
+    failures += check(throws_api([&] { (void)parse_generation(invalid, default_limits()); }),
                       "unsupported Anthropic output_config option was ignored");
     return failures;
 }

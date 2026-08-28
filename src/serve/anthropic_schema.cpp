@@ -95,6 +95,14 @@ void append_text(std::string& acc, const std::string& piece) {
     acc += piece;
 }
 
+void append_text_part(std::vector<ContentPart>& parts, std::string text) {
+    if (!parts.empty() && parts.back().kind == ContentKind::Text) {
+        append_text(parts.back().text, text);
+        return;
+    }
+    parts.push_back(ContentPart{ContentKind::Text, std::move(text), "text"});
+}
+
 std::string require_block_type(const Json& block, const char* param) {
     if (!block.is_object() || !block.contains("type") || !block.at("type").is_string()) {
         bad_request("content blocks must be objects with a string 'type'", param);
@@ -282,8 +290,7 @@ std::vector<ContentPart> parse_tool_result_content(const Json& block) {
         for (const Json& part : content) {
             const std::string type = require_block_type(part, "messages");
             if (type == "text") {
-                parts.push_back(ContentPart{
-                    ContentKind::Text, require_string_field(part, "text", "text block"), "text"});
+                append_text_part(parts, require_string_field(part, "text", "text block"));
             } else if (type == "image") {
                 ContentPart image;
                 image.kind     = ContentKind::Image;
@@ -359,8 +366,7 @@ void parse_user_content(const Json& content, GenerationRequest& out) {
         private_cache_boundary_after = cache_after;
         const std::string type       = require_block_type(block, "messages");
         if (type == "text") {
-            std::string text = require_string_field(block, "text", "text block");
-            user_turn.content.push_back(ContentPart{ContentKind::Text, std::move(text), "text"});
+            append_text_part(user_turn.content, require_string_field(block, "text", "text block"));
         } else if (type == "tool_result") {
             if (!block.contains("tool_use_id") || !block.at("tool_use_id").is_string() ||
                 block.at("tool_use_id").get<std::string>().empty()) {
@@ -531,8 +537,7 @@ void parse_output_config(const Json& body, GenerationRequest& out) {
         bad_request("output_config.effort must be one of low, medium, high, xhigh, or max",
                     "output_config.effort");
     }
-    out.reasoning_effort       = *effort;
-    out.reasoning_effort_param = "output_config.effort";
+    out.reasoning_effort = *effort;
 }
 
 const char* anthropic_error_type(int status) {
@@ -558,16 +563,17 @@ std::string sse(const char* type, const Json& payload) {
 
 } // namespace
 
-GenerationRequest parse_messages_request(const Json& body, const RequestLimits& limits) {
+AnthropicMessagesRequest parse_messages_request(const Json& body, const RequestLimits& limits) {
     require_object(body);
 
-    GenerationRequest out;
+    AnthropicMessagesRequest parsed;
+    GenerationRequest& out   = parsed.generation;
     out.tool_name_max_length = kMaxToolNameLength;
     if (!body.contains("model") || !body.at("model").is_string() ||
         body.at("model").get<std::string>().empty()) {
         bad_request("missing required field: model", "model");
     }
-    out.model = body.at("model").get<std::string>();
+    parsed.model = body.at("model").get<std::string>();
 
     parse_tools(body, out);
     parse_tool_choice(body, out);
@@ -584,18 +590,34 @@ GenerationRequest parse_messages_request(const Json& body, const RequestLimits& 
         out.preserve_thinking = body.at("preserve_thinking").get<bool>();
     }
 
-    out.stream = get_bool(body, "stream", false);
+    parsed.stream = get_bool(body, "stream", false);
 
     const std::optional<int> max_tokens = get_int(body, "max_tokens");
     if (max_tokens) {
         if (*max_tokens <= 0) { bad_request("max_tokens must be positive", "max_tokens"); }
-        out.max_tokens     = *max_tokens;
-        out.max_tokens_set = true;
+        out.max_tokens                = *max_tokens;
+        parsed.output_tokens_explicit = true;
     } else {
-        out.max_tokens     = limits.default_max_tokens;
-        out.max_tokens_set = false;
+        out.max_tokens = limits.default_max_tokens;
     }
-    return out;
+    return parsed;
+}
+
+std::vector<ToolCall>
+materialize_anthropic_tool_calls(const std::vector<ninfer::GeneratedToolCall>& generated) {
+    static thread_local std::mt19937_64 rng{std::random_device{}()};
+    std::uniform_int_distribution<std::uint64_t> distribution;
+    std::vector<ToolCall> calls;
+    calls.reserve(generated.size());
+    for (const ninfer::GeneratedToolCall& call : generated) {
+        std::array<char, 32> buffer{};
+        std::snprintf(buffer.data(), buffer.size(), "%016llx",
+                      static_cast<unsigned long long>(distribution(rng)));
+        calls.push_back(ToolCall{.id             = "toolu_" + std::string(buffer.data()),
+                                 .name           = call.name,
+                                 .arguments_json = call.arguments_json});
+    }
+    return calls;
 }
 
 const char* messages_stop_reason(ninfer::FinishReason reason, bool has_tool_calls) {

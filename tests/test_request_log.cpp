@@ -235,10 +235,7 @@ int main() {
                       "server argv did not retain the redaction marker");
 
     GenerationRequest request;
-    request.model          = "qwen3.6-27b";
-    request.stream         = false;
-    request.max_tokens     = 4096;
-    request.max_tokens_set = true;
+    request.max_tokens = 4096;
     request.messages.resize(2);
     request.messages.front().content.push_back(ContentPart{.kind = ContentKind::Image});
 
@@ -246,7 +243,6 @@ int main() {
     prepared.enable_thinking                           = true;
     prepared.thinking_budget                           = 256;
     prepared.preserve_thinking                         = true;
-    prepared.preserve_thinking_semantic_change         = true;
     prepared.sampling.temperature                      = 0.6F;
     prepared.sampling.top_p                            = 0.95F;
     prepared.sampling.top_k                            = 20;
@@ -263,8 +259,14 @@ int main() {
     prepared.preparation.media_cache_misses            = 1;
     prepared.preparation.built_patch_bytes             = 49152;
 
+    const RequestLogMetadata metadata{
+        .model                             = "qwen3.6-27b",
+        .stream                            = false,
+        .output_tokens_explicit            = true,
+        .preserve_thinking_semantic_change = true,
+    };
     const RequestLogContext context =
-        make_request_log_context(7, "openai_chat_completions", request, prepared);
+        make_request_log_context(7, "openai_chat_completions", request, metadata, prepared);
     const Json started = Json::parse(format_request_start_json("serve-test", 2000, context));
     failures +=
         check(started.at("request").at("request_id") == 7, "request id missing from start record");
@@ -293,8 +295,8 @@ int main() {
     preparation_error.code   = "context_length_exceeded";
     preparation_error.message =
         "prepared prompt has 270000 tokens, exceeding Engine max_context 262144";
-    const RequestRejectionLogContext rejected_context =
-        make_request_rejection_log_context(8, "anthropic_messages", request, preparation_error);
+    const RequestRejectionLogContext rejected_context = make_request_rejection_log_context(
+        8, "anthropic_messages", request, metadata, preparation_error);
     const Json rejected =
         Json::parse(format_request_rejected_json("serve-test", 2500, rejected_context));
     failures +=

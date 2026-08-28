@@ -1747,6 +1747,29 @@ int test_disabled_vision() {
     return failures;
 }
 
+int test_invalid_media_classification() {
+    const Frontend frontend = FrontendFactory::create_component(resources());
+    auto invalid_image      = [] {
+        ninfer::PromptInput input                    = image_input();
+        input.messages[0].parts[0].media.bytes       = {0x00, 0x01, 0x02};
+        input.messages[0].parts[0].media.source_name = "invalid-image.bin";
+        return input;
+    };
+    auto is_invalid_media = [](const auto& operation) {
+        try {
+            operation();
+        } catch (const ninfer::RequestError& error) {
+            return error.kind() == ninfer::RequestErrorKind::InvalidMedia;
+        }
+        return false;
+    };
+    int failures = check(is_invalid_media([&] { (void)frontend.prepare(invalid_image()); }),
+                         "invalid image preparation lost its typed request error");
+    failures += check(is_invalid_media([&] { (void)frontend.count_tokens(invalid_image()); }),
+                      "invalid image token counting lost its typed request error");
+    return failures;
+}
+
 int test_media_cache_reuses_immutable_payload() {
     const Frontend frontend = FrontendFactory::create_component(resources());
     auto first              = frontend.prepare(image_input());
@@ -1968,6 +1991,7 @@ int main() {
     failures += test_media_cache_runs_independent_misses_in_parallel();
     failures += test_many_images_prepare_in_one_parallel_batch();
     failures += test_media_preparation_cancellation();
+    failures += test_invalid_media_classification();
     failures += test_disabled_vision();
     return failures == 0 ? 0 : 1;
 }

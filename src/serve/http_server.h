@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <thread>
 
 namespace ninfer::serve {
@@ -23,6 +24,9 @@ namespace ninfer::serve {
 httplib::Server::HandlerResponse handle_unrendered_http_error(const ServeOptions& options,
                                                               const httplib::Request& request,
                                                               httplib::Response& response);
+
+[[nodiscard]] bool matches_bearer_credential(std::string_view authorization,
+                                             std::string_view api_key) noexcept;
 
 class HttpServer {
 public:

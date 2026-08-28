@@ -41,6 +41,13 @@ struct RequestLogContext {
     ninfer::PromptPreparationStats preparation;
 };
 
+struct RequestLogMetadata {
+    std::string model;
+    bool stream                            = false;
+    bool output_tokens_explicit            = false;
+    bool preserve_thinking_semantic_change = false;
+};
+
 // A parsed generation request that failed during synchronous preparation. It intentionally has a
 // separate shape from RequestLogContext: sampler and prompt semantics are not guaranteed to have
 // resolved when preparation rejects the request.
@@ -83,10 +90,12 @@ struct ThroughputReport {
 
 RequestLogContext make_request_log_context(std::uint64_t id, std::string protocol,
                                            const GenerationRequest& request,
+                                           const RequestLogMetadata& metadata,
                                            const PreparedRequest& prepared);
 RequestRejectionLogContext make_request_rejection_log_context(std::uint64_t id,
                                                               std::string protocol,
                                                               const GenerationRequest& request,
+                                                              const RequestLogMetadata& metadata,
                                                               ApiError error);
 
 // Compact console records retained for operator visibility.

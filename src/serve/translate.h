@@ -38,8 +38,4 @@ ninfer::RequestOptions to_request_options(const GenerationRequest& req, const Se
                                           const ResolvedPromptSemantics& semantics,
                                           bool allow_prefix_reuse);
 
-// Map an internal finish reason onto the OpenAI wire value. Cancelled maps to
-// "stop" (a disconnected client is not an error state on the wire).
-const char* finish_reason_wire(ninfer::FinishReason reason);
-
 } // namespace ninfer::serve

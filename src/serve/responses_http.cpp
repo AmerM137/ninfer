@@ -1,6 +1,6 @@
 #include "serve/http_server.h"
 
-#include "serve/openai_schema.h"
+#include "serve/openai_common.h"
 #include "serve/responses_schema.h"
 
 #include <nlohmann/json.hpp>
@@ -49,6 +49,7 @@ void write_error(httplib::Response& response, const ApiError& error) {
 
 ApiError responses_error(ApiError error) {
     if (error.param == "messages") { error.param = "input"; }
+    if (error.param == "reasoning_effort") { error.param = "reasoning.effort"; }
     return error;
 }
 
@@ -214,7 +215,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
         RequestLimits limits;
         limits.default_max_tokens = options_.default_max_tokens;
         request                   = parse_responses_request(parse_json_body(req), limits);
-        validate_model(request.generation.model, public_model_id_);
+        validate_model(request.model, public_model_id_);
         if (request.previous_response_id) {
             const std::shared_ptr<const StoredResponse> previous =
                 response_store_.get(*request.previous_response_id);
@@ -243,27 +244,35 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
     cache_hints.update_session_index = request.store;
 
     const std::uint64_t req_id = ++request_seq_;
+    const RequestLogMetadata metadata{
+        .model                             = request.model,
+        .stream                            = request.stream,
+        .output_tokens_explicit            = request.output_tokens_explicit,
+        .preserve_thinking_semantic_change = request.preserve_thinking_semantic_change,
+    };
     PreparedRequest prepared;
     try {
         prepared = service_->prepare(
-            request.generation, [&req] { return disconnected(req); }, std::move(cache_hints));
+            request.generation,
+            request.stream ? GenerationConsumerMode::Streaming : GenerationConsumerMode::Aggregate,
+            [&req] { return disconnected(req); }, std::move(cache_hints));
     } catch (const ApiException& exception) {
         const ApiError error = responses_error(exception.error());
-        log_request_rejected(make_request_rejection_log_context(req_id, "openai_responses",
-                                                                request.generation, error));
+        log_request_rejected(make_request_rejection_log_context(
+            req_id, "openai_responses", request.generation, metadata, error));
         write_error(res, error);
         return;
     } catch (const std::exception& exception) {
         const ApiError error = internal_error(exception);
-        log_request_rejected(make_request_rejection_log_context(req_id, "openai_responses",
-                                                                request.generation, error));
+        log_request_rejected(make_request_rejection_log_context(
+            req_id, "openai_responses", request.generation, metadata, error));
         write_error(res, error);
         return;
     }
 
-    const std::int64_t created = unix_time_now();
-    const RequestLogContext log_context =
-        make_request_log_context(req_id, "openai_responses", request.generation, prepared);
+    const std::int64_t created          = unix_time_now();
+    const RequestLogContext log_context = make_request_log_context(
+        req_id, "openai_responses", request.generation, metadata, prepared);
     request.generation.messages.clear();
     log_request_start(log_context);
 
@@ -382,7 +391,7 @@ void HttpServer::handle_response_input_tokens(const httplib::Request& req, httpl
         limits.default_max_tokens = options_.default_max_tokens;
         ResponsesRequest request =
             parse_response_input_tokens_request(parse_json_body(req), limits);
-        validate_model(request.generation.model, public_model_id_);
+        validate_model(request.model, public_model_id_);
         const int tokens =
             service_->count_prompt_tokens(request.generation, [&req] { return disconnected(req); });
         res.set_content(make_response_input_tokens_body(tokens), "application/json");

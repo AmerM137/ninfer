@@ -28,6 +28,11 @@ int main() {
                              "vision tokens exceed processor budget"));
     failures += check(media_budget.status == 400 && media_budget.code == "media_budget_exceeded",
                       "media resource rejection did not map to HTTP 400");
+    const ninfer::serve::ApiError invalid_media = ninfer::serve::request_error_to_api_error(
+        ninfer::RequestError(ninfer::RequestErrorKind::InvalidMedia, "failed to open media"));
+    failures += check(invalid_media.status == 400 && invalid_media.code == "invalid_media" &&
+                          invalid_media.param == "messages",
+                      "invalid media did not retain its client-input classification");
     const ninfer::serve::ApiError context_limit = ninfer::serve::request_error_to_api_error(
         ninfer::RequestError(ninfer::RequestErrorKind::ContextLengthExceeded,
                              "prepared prompt has 200 tokens, exceeding Engine max_context 128"));
@@ -46,8 +51,20 @@ int main() {
     const ninfer::serve::ApiError cancelled =
         ninfer::serve::request_error_to_api_error(ninfer::RequestError(
             ninfer::RequestErrorKind::Cancelled, "request cancelled during preparation"));
-    failures += check(cancelled.status == 499 && cancelled.code == "client_disconnected",
+    failures += check(cancelled.status == 499 && cancelled.code == "client_disconnected" &&
+                          cancelled.param.empty(),
                       "preparation cancellation did not retain its HTTP classification");
+
+    failures +=
+        check(ninfer::serve::matches_bearer_credential("Bearer secret", "secret") &&
+                  ninfer::serve::matches_bearer_credential("bearer secret", "secret") &&
+                  ninfer::serve::matches_bearer_credential("\tBEARER   secret\t", "secret"),
+              "valid Bearer credentials were rejected because of scheme case or whitespace");
+    failures += check(!ninfer::serve::matches_bearer_credential("Basic secret", "secret") &&
+                          !ninfer::serve::matches_bearer_credential("Bearer wrong", "secret") &&
+                          !ninfer::serve::matches_bearer_credential("Bearersecret", "secret") &&
+                          !ninfer::serve::matches_bearer_credential("Bearer secret", ""),
+                      "invalid Bearer credentials were accepted");
 
     httplib::Request messages_request;
     messages_request.path = "/v1/messages";

@@ -357,6 +357,7 @@ enum class RequestErrorKind : std::uint8_t {
     ContextLengthExceeded,
     ThinkingBudgetCapacityInsufficient,
     MediaBudgetExceeded,
+    InvalidMedia,
     Overloaded,
     QueueTimeout,
     Cancelled,

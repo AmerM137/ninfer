@@ -26,6 +26,16 @@
 namespace ninfer::targets::qwen3_6::frontend_internal {
 namespace {
 
+[[noreturn]] void throw_decode_error(const media::decode::Error& error) {
+    switch (error.kind()) {
+    case media::decode::ErrorKind::BudgetExceeded:
+        throw ProcessorError(ProcessorErrorKind::BudgetExceeded, error.what());
+    case media::decode::ErrorKind::InvalidInput:
+        throw ProcessorError(ProcessorErrorKind::InvalidMedia, error.what());
+    }
+    throw std::logic_error("unknown media decode error kind");
+}
+
 using Clock = std::chrono::steady_clock;
 
 constexpr int kPatch                              = 16;
@@ -875,12 +885,7 @@ std::size_t Processor::count_tokens(std::vector<ChatMessage> messages,
             enforce_media_resource_limits(stats, options_);
             items.push_back(std::move(item));
         }
-    } catch (const media::decode::Error& error) {
-        if (error.kind() == media::decode::ErrorKind::BudgetExceeded) {
-            throw ProcessorError(ProcessorErrorKind::BudgetExceeded, error.what());
-        }
-        throw;
-    }
+    } catch (const media::decode::Error& error) { throw_decode_error(error); }
     rendered                = expand_placeholders(std::move(rendered), items);
     const std::size_t count = encode_rendered_chat(tokenizer_, rendered).input_ids.size();
     check_preparation_control(control, "tokenization");
@@ -1022,12 +1027,7 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
     if (preparation_error) {
         try {
             std::rethrow_exception(preparation_error);
-        } catch (const media::decode::Error& error) {
-            if (error.kind() == media::decode::ErrorKind::BudgetExceeded) {
-                throw ProcessorError(ProcessorErrorKind::BudgetExceeded, error.what());
-            }
-            throw;
-        }
+        } catch (const media::decode::Error& error) { throw_decode_error(error); }
     }
     if (patch_cursor != stats.raw_patches || output.media_payloads.size() != items.size()) {
         throw std::logic_error("preprocessed patch count does not match processor budget");

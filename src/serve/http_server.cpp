@@ -2,7 +2,8 @@
 
 #include "serve/anthropic_schema.h"
 #include "serve/console_log.h"
-#include "serve/openai_schema.h"
+#include "serve/openai_chat.h"
+#include "serve/openai_common.h"
 #include "serve/request_log.h"
 #include "serve/translate.h"
 
@@ -25,6 +26,7 @@ struct StreamingRequest {
     explicit StreamingRequest(PreparedRequest request) : prepared(std::move(request)) {}
 
     PreparedRequest prepared;
+    std::string content;
     std::atomic<bool> cancelled{false};
     bool started = false;
 };
@@ -59,6 +61,11 @@ void write_error(httplib::Response& res, const ApiError& error) {
 void write_messages_error(httplib::Response& res, const ApiError& error) {
     res.status = error.status;
     res.set_content(make_messages_error_body(error), "application/json");
+}
+
+ApiError anthropic_error(ApiError error) {
+    if (error.param == "reasoning_effort") { error.param = "output_config.effort"; }
+    return error;
 }
 
 void write_exception(httplib::Response& res, const std::exception& ex) {
@@ -159,11 +166,12 @@ bool report_has_activity(const ThroughputReport& report) {
            report.current.host_work.device_wait_ns != report.previous.host_work.device_wait_ns;
 }
 
-std::string_view unstreamed_content(const GenerationOutcome& outcome) {
-    if (outcome.streamed_content_bytes > outcome.text.size()) {
-        throw std::logic_error("streamed content exceeds terminal content");
+std::string_view unstreamed_content(const GenerationOutcome& outcome,
+                                    const std::string& streamed_content) {
+    if (!outcome.text.starts_with(streamed_content)) {
+        throw std::logic_error("streamed content does not match terminal content");
     }
-    return std::string_view(outcome.text).substr(outcome.streamed_content_bytes);
+    return std::string_view(outcome.text).substr(streamed_content.size());
 }
 
 } // namespace
@@ -187,6 +195,36 @@ httplib::Server::HandlerResponse handle_unrendered_http_error(const ServeOptions
         write_error(response, error);
     }
     return httplib::Server::HandlerResponse::Handled;
+}
+
+bool matches_bearer_credential(std::string_view authorization, std::string_view api_key) noexcept {
+    if (api_key.empty()) { return false; }
+    const auto is_whitespace = [](char value) { return value == ' ' || value == '\t'; };
+    const auto ascii_equal   = [](char lhs, char rhs) {
+        if (lhs >= 'A' && lhs <= 'Z') { lhs = static_cast<char>(lhs - 'A' + 'a'); }
+        if (rhs >= 'A' && rhs <= 'Z') { rhs = static_cast<char>(rhs - 'A' + 'a'); }
+        return lhs == rhs;
+    };
+
+    std::size_t position = 0;
+    while (position < authorization.size() && is_whitespace(authorization[position])) {
+        ++position;
+    }
+    constexpr std::string_view scheme = "Bearer";
+    if (authorization.size() - position < scheme.size()) { return false; }
+    for (std::size_t index = 0; index < scheme.size(); ++index) {
+        if (!ascii_equal(authorization[position + index], scheme[index])) { return false; }
+    }
+    position += scheme.size();
+    if (position == authorization.size() || !is_whitespace(authorization[position])) {
+        return false;
+    }
+    while (position < authorization.size() && is_whitespace(authorization[position])) {
+        ++position;
+    }
+    std::size_t end = authorization.size();
+    while (end > position && is_whitespace(authorization[end - 1])) { --end; }
+    return authorization.substr(position, end - position) == api_key;
 }
 
 HttpServer::HttpServer(ServeOptions options)
@@ -278,7 +316,7 @@ void HttpServer::register_routes() {
     if (options_.enable_cors) {
         server_.set_default_headers(
             {{"Access-Control-Allow-Origin", "*"},
-             {"Access-Control-Allow-Headers", "Authorization, Content-Type"},
+             {"Access-Control-Allow-Headers", "Authorization, Content-Type, X-API-Key"},
              {"Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS"}});
         // CORS preflight: browsers send OPTIONS with no credentials before the real
         // request; answer it without auth so the actual GET/POST can carry the key.
@@ -294,7 +332,7 @@ void HttpServer::register_routes() {
         // x-api-key header so OpenAI clients and Claude Code (ANTHROPIC_API_KEY
         // -> x-api-key, ANTHROPIC_AUTH_TOKEN -> Authorization: Bearer) both work.
         const bool bearer_ok =
-            req.get_header_value("Authorization") == ("Bearer " + options_.api_key);
+            matches_bearer_credential(req.get_header_value("Authorization"), options_.api_key);
         const bool x_api_key_ok = req.get_header_value("x-api-key") == options_.api_key;
         if (!bearer_ok && !x_api_key_ok) {
             ApiError error;
@@ -407,7 +445,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
         return;
     }
 
-    GenerationRequest request;
+    OpenAIChatRequest request;
     try {
         RequestLimits limits;
         limits.default_max_tokens = options_.default_max_tokens;
@@ -416,6 +454,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
             ApiError error;
             error.status  = 404;
             error.type    = "invalid_request_error";
+            error.param   = "model";
             error.code    = "model_not_found";
             error.message = "model '" + request.model + "' not found";
             throw ApiException(std::move(error));
@@ -426,13 +465,18 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
     }
 
     const std::uint64_t req_id = ++request_seq_;
+    const RequestLogMetadata metadata{.model                  = request.model,
+                                      .stream                 = request.stream,
+                                      .output_tokens_explicit = request.output_tokens_explicit};
     PreparedRequest prepared;
     try {
         prepared = service_->prepare(
-            request, [&req] { return req.is_connection_alive && !req.is_connection_alive(); });
+            request.generation,
+            request.stream ? GenerationConsumerMode::Streaming : GenerationConsumerMode::Aggregate,
+            [&req] { return req.is_connection_alive && !req.is_connection_alive(); });
     } catch (const ApiException& e) {
-        log_request_rejected(make_request_rejection_log_context(req_id, "openai_chat_completions",
-                                                                request, e.error()));
+        log_request_rejected(make_request_rejection_log_context(
+            req_id, "openai_chat_completions", request.generation, metadata, e.error()));
         write_error(res, e.error());
         return;
     } catch (const std::exception& e) {
@@ -440,18 +484,15 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
         error.status  = 500;
         error.type    = "internal_error";
         error.message = e.what();
-        log_request_rejected(
-            make_request_rejection_log_context(req_id, "openai_chat_completions", request, error));
+        log_request_rejected(make_request_rejection_log_context(
+            req_id, "openai_chat_completions", request.generation, metadata, error));
         write_error(res, error);
         return;
     }
 
-    const std::string id       = new_chat_completion_id();
-    const std::int64_t created = unix_time_now();
-    const std::string model    = request.model;
-
-    const RequestLogContext log_context =
-        make_request_log_context(req_id, "openai_chat_completions", request, prepared);
+    const OpenAIChatResponseIdentity identity = make_openai_chat_response_identity(request.model);
+    const RequestLogContext log_context       = make_request_log_context(
+        req_id, "openai_chat_completions", request.generation, metadata, prepared);
     log_request_start(log_context);
 
     if (!request.stream) {
@@ -460,16 +501,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                 return req.is_connection_alive && !req.is_connection_alive();
             });
             log_request_done(log_context, outcome);
-            const CompletionUsage usage{outcome.prompt_tokens, outcome.completion_tokens};
-            std::string response_body;
-            if (!outcome.tool_calls.empty()) {
-                response_body = make_chat_completion_tool_response(
-                    id, model, created, outcome.text, outcome.reasoning, outcome.tool_calls, usage);
-            } else {
-                response_body = make_chat_completion_response(
-                    id, model, created, outcome.text, outcome.reasoning,
-                    finish_reason_wire(outcome.finish_reason), usage);
-            }
+            std::string response_body = make_chat_completion_response(identity, outcome);
             set_owned_content(res, std::move(response_body), prepared.lifetime);
         } catch (const std::exception& e) {
             log_request_error(log_context, e.what());
@@ -478,8 +510,8 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
         return;
     }
 
-    auto stream              = std::make_shared<StreamingRequest>(std::move(prepared));
-    const bool include_usage = stream->prepared.include_usage;
+    auto stream  = std::make_shared<StreamingRequest>(std::move(prepared));
+    auto encoder = std::make_shared<OpenAIChatStream>(identity, request.include_usage);
 
     // SSE hints: disable client/proxy caching and reverse-proxy response buffering
     // so tokens flush immediately. Content-Type is set by the chunked provider.
@@ -488,26 +520,20 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
 
     res.set_chunked_content_provider(
         "text/event-stream",
-        [this, stream, id, created, model, include_usage,
-         log_context](std::size_t, httplib::DataSink& sink) -> bool {
+        [this, stream, encoder, log_context](std::size_t, httplib::DataSink& sink) -> bool {
             if (stream->started) {
                 sink.done();
                 return true;
             }
             stream->started = true;
             try {
-                write_stream_item(sink, *stream,
-                                  make_chat_chunk_role(id, model, created, include_usage));
+                write_stream_item(sink, *stream, encoder->start());
                 StreamSink output;
                 output.on_content = [&](const std::string& text) {
-                    write_stream_item(
-                        sink, *stream,
-                        make_chat_chunk_content(id, model, created, text, include_usage));
+                    write_stream_item(sink, *stream, encoder->content_delta(text));
                 };
                 output.on_reasoning = [&](const std::string& text) {
-                    write_stream_item(
-                        sink, *stream,
-                        make_chat_chunk_reasoning(id, model, created, text, include_usage));
+                    write_stream_item(sink, *stream, encoder->reasoning_delta(text));
                 };
                 output.is_cancelled = [&] {
                     return stream->cancelled.load(std::memory_order_acquire) ||
@@ -516,39 +542,9 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
 
                 const GenerationOutcome outcome = service_->run(stream->prepared, &output);
                 log_request_done(log_context, outcome);
-                const std::string_view remaining = unstreamed_content(outcome);
-                if (!outcome.tool_calls.empty()) {
-                    if (!remaining.empty()) {
-                        write_stream_item(sink, *stream,
-                                          make_chat_chunk_content(id, model, created,
-                                                                  std::string(remaining),
-                                                                  include_usage));
-                    }
-                    write_stream_item(sink, *stream,
-                                      make_chat_chunk_tool_calls(
-                                          id, model, created, outcome.tool_calls, include_usage));
-                    write_stream_item(
-                        sink, *stream,
-                        make_chat_chunk_final(id, model, created, "tool_calls", include_usage));
-                } else {
-                    if (!remaining.empty()) {
-                        write_stream_item(sink, *stream,
-                                          make_chat_chunk_content(id, model, created,
-                                                                  std::string(remaining),
-                                                                  include_usage));
-                    }
-                    write_stream_item(
-                        sink, *stream,
-                        make_chat_chunk_final(id, model, created,
-                                              finish_reason_wire(outcome.finish_reason),
-                                              include_usage));
+                for (const std::string& event : encoder->finish(outcome)) {
+                    write_stream_item(sink, *stream, event);
                 }
-                if (include_usage) {
-                    const CompletionUsage usage{outcome.prompt_tokens, outcome.completion_tokens};
-                    write_stream_item(sink, *stream,
-                                      make_chat_chunk_usage(id, model, created, usage));
-                }
-                write_stream_item(sink, *stream, sse_done());
                 sink.done();
                 return true;
             } catch (const ClientDisconnected& e) {
@@ -590,13 +586,14 @@ void HttpServer::handle_count_tokens(const httplib::Request& req, httplib::Respo
     }
     try {
         RequestLimits limits;
-        limits.default_max_tokens       = options_.default_max_tokens;
-        const GenerationRequest request = parse_messages_request(body, limits);
-        const int input_tokens          = service_->count_prompt_tokens(
-            request, [&req] { return req.is_connection_alive && !req.is_connection_alive(); });
+        limits.default_max_tokens              = options_.default_max_tokens;
+        const AnthropicMessagesRequest request = parse_messages_request(body, limits);
+        const int input_tokens = service_->count_prompt_tokens(request.generation, [&req] {
+            return req.is_connection_alive && !req.is_connection_alive();
+        });
         res.set_content(make_count_tokens_response(input_tokens), "application/json");
     } catch (const ApiException& e) {
-        write_messages_error(res, e.error());
+        write_messages_error(res, anthropic_error(e.error()));
     } catch (const std::exception& e) {
         ApiError error;
         error.status  = 500;
@@ -618,7 +615,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
         return;
     }
 
-    GenerationRequest request;
+    AnthropicMessagesRequest request;
     try {
         RequestLimits limits;
         limits.default_max_tokens = options_.default_max_tokens;
@@ -638,22 +635,28 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
     }
 
     const std::uint64_t req_id = ++request_seq_;
+    const RequestLogMetadata metadata{.model                  = request.model,
+                                      .stream                 = request.stream,
+                                      .output_tokens_explicit = request.output_tokens_explicit};
     PreparedRequest prepared;
     try {
         prepared = service_->prepare(
-            request, [&req] { return req.is_connection_alive && !req.is_connection_alive(); });
+            request.generation,
+            request.stream ? GenerationConsumerMode::Streaming : GenerationConsumerMode::Aggregate,
+            [&req] { return req.is_connection_alive && !req.is_connection_alive(); });
     } catch (const ApiException& e) {
-        log_request_rejected(
-            make_request_rejection_log_context(req_id, "anthropic_messages", request, e.error()));
-        write_messages_error(res, e.error());
+        const ApiError error = anthropic_error(e.error());
+        log_request_rejected(make_request_rejection_log_context(
+            req_id, "anthropic_messages", request.generation, metadata, error));
+        write_messages_error(res, error);
         return;
     } catch (const std::exception& e) {
         ApiError error;
         error.status  = 500;
         error.type    = "internal_error";
         error.message = e.what();
-        log_request_rejected(
-            make_request_rejection_log_context(req_id, "anthropic_messages", request, error));
+        log_request_rejected(make_request_rejection_log_context(
+            req_id, "anthropic_messages", request.generation, metadata, error));
         write_messages_error(res, error);
         return;
     }
@@ -662,8 +665,8 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
     const std::string model = request.model; // echo the requested model
     const int input_tokens  = prepared.prompt_tokens;
 
-    const RequestLogContext log_context =
-        make_request_log_context(req_id, "anthropic_messages", request, prepared);
+    const RequestLogContext log_context = make_request_log_context(
+        req_id, "anthropic_messages", request.generation, metadata, prepared);
     log_request_start(log_context);
 
     if (!request.stream) {
@@ -672,16 +675,19 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                 return req.is_connection_alive && !req.is_connection_alive();
             });
             log_request_done(log_context, outcome);
+            const std::vector<ToolCall> tool_calls =
+                materialize_anthropic_tool_calls(outcome.tool_calls);
             const CompletionUsage usage{outcome.prompt_tokens, outcome.completion_tokens};
             const char* stop_reason =
-                messages_stop_reason(outcome.finish_reason, !outcome.tool_calls.empty());
+                messages_stop_reason(outcome.finish_reason, !tool_calls.empty());
             set_owned_content(res,
                               make_messages_response(id, model, outcome.text, outcome.reasoning,
-                                                     outcome.tool_calls, stop_reason, usage),
+                                                     tool_calls, stop_reason, usage),
                               prepared.lifetime);
         } catch (const ApiException& e) {
-            log_request_error(log_context, e.error().message);
-            write_messages_error(res, e.error());
+            const ApiError error = anthropic_error(e.error());
+            log_request_error(log_context, error.message);
+            write_messages_error(res, error);
         } catch (const std::exception& e) {
             log_request_error(log_context, e.what());
             ApiError error;
@@ -739,6 +745,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                     }
                     write_stream_item(sink, *stream,
                                       make_content_block_delta_text(text_index, text));
+                    stream->content += text;
                 };
                 output.is_cancelled = [&] {
                     return stream->cancelled.load(std::memory_order_acquire) ||
@@ -747,7 +754,9 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
 
                 const GenerationOutcome outcome = service_->run(stream->prepared, &output);
                 log_request_done(log_context, outcome);
-                const std::string_view remaining = unstreamed_content(outcome);
+                const std::string_view remaining = unstreamed_content(outcome, stream->content);
+                const std::vector<ToolCall> tool_calls =
+                    materialize_anthropic_tool_calls(outcome.tool_calls);
 
                 if (thinking_open) {
                     write_stream_item(sink, *stream, make_content_block_stop(thinking_index));
@@ -765,7 +774,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                                       make_content_block_delta_text(idx, std::string(remaining)));
                     write_stream_item(sink, *stream, make_content_block_stop(idx));
                 }
-                for (const ToolCall& call : outcome.tool_calls) {
+                for (const ToolCall& call : tool_calls) {
                     const int idx = next_index++;
                     write_stream_item(sink, *stream, make_content_block_start_tool_use(idx, call));
                     write_stream_item(sink, *stream,
@@ -780,7 +789,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                 }
 
                 const char* stop_reason =
-                    messages_stop_reason(outcome.finish_reason, !outcome.tool_calls.empty());
+                    messages_stop_reason(outcome.finish_reason, !tool_calls.empty());
                 write_stream_item(sink, *stream,
                                   make_message_delta(stop_reason, outcome.completion_tokens));
                 write_stream_item(sink, *stream, make_message_stop());
@@ -790,9 +799,10 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                 log_request_error(log_context, e.what());
                 return false;
             } catch (const ApiException& e) {
-                log_request_error(log_context, e.error().message);
+                const ApiError error = anthropic_error(e.error());
+                log_request_error(log_context, error.message);
                 try {
-                    write_stream_item(sink, *stream, messages_sse_error_event(e.error()));
+                    write_stream_item(sink, *stream, messages_sse_error_event(error));
                     sink.done();
                     return true;
                 } catch (const ClientDisconnected&) { return false; }

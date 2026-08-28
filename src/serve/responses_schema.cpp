@@ -1,8 +1,6 @@
 #include "serve/responses_schema.h"
 
 #include "serve/generation_service.h"
-#include "serve/openai_schema.h"
-
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -548,8 +546,7 @@ void parse_reasoning(const Json& body, ResponsesRequest& out) {
                     "max",
                     "reasoning");
     }
-    out.generation.reasoning_effort       = *effort;
-    out.generation.reasoning_effort_param = "reasoning.effort";
+    out.generation.reasoning_effort = *effort;
 }
 
 void validate_metadata(const Json& body, ResponsesRequest& out) {
@@ -716,7 +713,7 @@ ResponsesRequest parse_request_impl(const Json& body, const RequestLimits& limit
         body.at("model").get<std::string>().empty()) {
         bad_request("missing required field: model", "model");
     }
-    out.generation.model = body.at("model").get<std::string>();
+    out.model = body.at("model").get<std::string>();
     if (!body.contains("input")) { bad_request("missing required field: input", "input"); }
     parse_input(body.at("input"), out);
 
@@ -734,14 +731,44 @@ ResponsesRequest parse_request_impl(const Json& body, const RequestLimits& limit
         out.previous_response_id = body.at("previous_response_id").get<std::string>();
     }
 
-    out.store             = optional_bool(body, "store", true);
-    out.stream            = optional_bool(body, "stream", false);
-    out.generation.stream = out.stream;
+    out.store  = optional_bool(body, "store", true);
+    out.stream = optional_bool(body, "stream", false);
     validate_metadata(body, out);
     parse_tools(body, out);
     parse_tool_choice(body, out);
     parse_reasoning(body, out);
-    out.generation.preserve_thinking = parse_openai_preserve_thinking(body);
+    // NInfer's Qwen continuation extension controls whether stored reasoning survives into the
+    // next prompt. It accepts both the direct spelling and vLLM/SGLang's chat_template_kwargs form.
+    if (body.contains("preserve_thinking") && !body.at("preserve_thinking").is_null()) {
+        if (!body.at("preserve_thinking").is_boolean()) {
+            bad_request("preserve_thinking must be a boolean or null", "preserve_thinking");
+        }
+        out.generation.preserve_thinking = body.at("preserve_thinking").get<bool>();
+    }
+    if (body.contains("chat_template_kwargs") && !body.at("chat_template_kwargs").is_null()) {
+        const Json& kwargs = body.at("chat_template_kwargs");
+        if (!kwargs.is_object()) {
+            bad_request("chat_template_kwargs must be an object", "chat_template_kwargs");
+        }
+        for (auto iterator = kwargs.begin(); iterator != kwargs.end(); ++iterator) {
+            if (iterator.key() != "preserve_thinking" && !iterator.value().is_null()) {
+                bad_request("chat_template_kwargs." + iterator.key() + " is not supported",
+                            "chat_template_kwargs", "chat_template_option_not_supported");
+            }
+        }
+        if (kwargs.contains("preserve_thinking") && !kwargs.at("preserve_thinking").is_null()) {
+            if (!kwargs.at("preserve_thinking").is_boolean()) {
+                bad_request("chat_template_kwargs.preserve_thinking must be a boolean or null",
+                            "chat_template_kwargs");
+            }
+            const bool nested = kwargs.at("preserve_thinking").get<bool>();
+            if (out.generation.preserve_thinking && *out.generation.preserve_thinking != nested) {
+                bad_request("conflicting preserve_thinking values", "preserve_thinking",
+                            "conflicting_template_option");
+            }
+            out.generation.preserve_thinking = nested;
+        }
+    }
 
     if (const std::optional<double> temperature = optional_number(body, "temperature")) {
         if (*temperature < 0.0 || *temperature > 2.0) {
@@ -759,11 +786,10 @@ ResponsesRequest parse_request_impl(const Json& body, const RequestLimits& limit
             bad_request("max_output_tokens must be at least 16", "max_output_tokens",
                         "invalid_value");
         }
-        out.generation.max_tokens     = *max_output;
-        out.generation.max_tokens_set = true;
+        out.generation.max_tokens  = *max_output;
+        out.output_tokens_explicit = true;
     } else {
-        out.generation.max_tokens     = limits.default_max_tokens;
-        out.generation.max_tokens_set = false;
+        out.generation.max_tokens = limits.default_max_tokens;
     }
     out.generation.messages = out.input_turns;
     return out;
@@ -804,6 +830,7 @@ struct ItemIds {
     std::string reasoning;
     std::string message;
     std::vector<std::string> function_calls;
+    std::vector<std::string> call_ids;
 };
 
 Json response_common(const std::string& id, std::int64_t created_at,
@@ -822,7 +849,7 @@ Json response_common(const std::string& id, std::int64_t created_at,
         {"max_output_tokens", request.generation.max_tokens},
         {"max_tool_calls", nullptr},
         {"metadata", request.metadata},
-        {"model", request.generation.model},
+        {"model", request.model},
         {"parallel_tool_calls", true},
         {"previous_response_id",
          request.previous_response_id ? Json(*request.previous_response_id) : Json(nullptr)},
@@ -872,15 +899,17 @@ BuiltResponse build_response(const std::string& id, std::int64_t created_at,
     }
 
     ids.function_calls.resize(outcome.tool_calls.size());
+    ids.call_ids.resize(outcome.tool_calls.size());
     for (std::size_t index = 0; index < outcome.tool_calls.size(); ++index) {
         if (ids.function_calls[index].empty()) {
             ids.function_calls[index] = new_response_item_id("fc");
         }
-        const ToolCall& call = outcome.tool_calls[index];
+        if (ids.call_ids[index].empty()) { ids.call_ids[index] = new_response_item_id("call"); }
+        const ninfer::GeneratedToolCall& call = outcome.tool_calls[index];
         built.output_items.push_back(Json{{"id", ids.function_calls[index]},
                                           {"type", "function_call"},
                                           {"status", "completed"},
-                                          {"call_id", call.id},
+                                          {"call_id", ids.call_ids[index]},
                                           {"name", call.name},
                                           {"arguments", call.arguments_json}});
     }
@@ -888,7 +917,12 @@ BuiltResponse build_response(const std::string& id, std::int64_t created_at,
     ChatTurn history;
     history.role              = ChatRole::Assistant;
     history.reasoning_content = outcome.reasoning;
-    history.tool_calls        = outcome.tool_calls;
+    history.tool_calls.reserve(outcome.tool_calls.size());
+    for (std::size_t index = 0; index < outcome.tool_calls.size(); ++index) {
+        const ninfer::GeneratedToolCall& call = outcome.tool_calls[index];
+        history.tool_calls.push_back(ToolCall{
+            .id = ids.call_ids[index], .name = call.name, .arguments_json = call.arguments_json});
+    }
     if (!outcome.text.empty()) {
         ContentPart part;
         part.kind     = ContentKind::Text;
@@ -950,16 +984,15 @@ ResponsesRequest parse_response_input_tokens_request(const Json& body,
             bad_request("unknown parameter: " + it.key(), it.key(), "unknown_parameter");
         }
     }
-    ResponsesRequest parsed  = parse_request_impl(body, limits);
-    parsed.store             = false;
-    parsed.stream            = false;
-    parsed.generation.stream = false;
+    ResponsesRequest parsed = parse_request_impl(body, limits);
+    parsed.store            = false;
+    parsed.stream           = false;
     return parsed;
 }
 
 void inherit_responses_preserve_thinking(ResponsesRequest& request, bool parent_value) {
     if (request.generation.preserve_thinking) {
-        request.generation.preserve_thinking_semantic_change =
+        request.preserve_thinking_semantic_change =
             *request.generation.preserve_thinking != parent_value;
         return;
     }
@@ -1220,12 +1253,15 @@ ResponsesStreamFinish ResponsesEventStream::finish(const GenerationOutcome& outc
     }
 
     impl_->ids.function_calls.reserve(outcome.tool_calls.size());
-    for (const ToolCall& call : outcome.tool_calls) {
+    impl_->ids.call_ids.reserve(outcome.tool_calls.size());
+    for (const ninfer::GeneratedToolCall& call : outcome.tool_calls) {
         const std::string item_id = new_response_item_id("fc");
+        const std::string call_id = new_response_item_id("call");
         impl_->ids.function_calls.push_back(item_id);
+        impl_->ids.call_ids.push_back(call_id);
         const int output_index = impl_->next_output_index++;
         const Json added_item  = {{"id", item_id},           {"type", "function_call"},
-                                  {"status", "in_progress"}, {"call_id", call.id},
+                                  {"status", "in_progress"}, {"call_id", call_id},
                                   {"name", call.name},       {"arguments", ""}};
         finished.events_before_terminal.push_back(
             sse(impl_->event("response.output_item.added",
@@ -1242,7 +1278,7 @@ ResponsesStreamFinish ResponsesEventStream::finish(const GenerationOutcome& outc
                                                           {"name", call.name},
                                                           {"arguments", call.arguments_json}})));
         const Json done_item = {{"id", item_id},         {"type", "function_call"},
-                                {"status", "completed"}, {"call_id", call.id},
+                                {"status", "completed"}, {"call_id", call_id},
                                 {"name", call.name},     {"arguments", call.arguments_json}};
         finished.events_before_terminal.push_back(
             sse(impl_->event("response.output_item.done",

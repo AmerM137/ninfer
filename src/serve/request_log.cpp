@@ -427,23 +427,24 @@ std::string speculative_str(const GenerationMetrics& metrics) {
 
 RequestLogContext make_request_log_context(std::uint64_t id, std::string protocol,
                                            const GenerationRequest& request,
+                                           const RequestLogMetadata& metadata,
                                            const PreparedRequest& prepared) {
     RequestLogContext context;
     context.id                                 = id;
     context.protocol                           = std::move(protocol);
-    context.model                              = request.model;
-    context.stream                             = request.stream;
+    context.model                              = metadata.model;
+    context.stream                             = metadata.stream;
     context.message_count                      = request.messages.size();
     context.media_item_count                   = request.media_item_count();
     context.requested_output_tokens            = request.max_tokens;
-    context.requested_output_tokens_client_set = request.max_tokens_set;
+    context.requested_output_tokens_client_set = metadata.output_tokens_explicit;
     context.tool_count                         = request.tools.size();
     context.tool_choice                        = request.tool_choice;
     context.has_tool_history                   = request.has_tool_history();
     context.enable_thinking                    = prepared.enable_thinking;
     context.thinking_budget                    = prepared.thinking_budget;
     context.preserve_thinking                  = prepared.preserve_thinking;
-    context.preserve_thinking_semantic_change  = prepared.preserve_thinking_semantic_change;
+    context.preserve_thinking_semantic_change  = metadata.preserve_thinking_semantic_change;
     context.sampling                           = prepared.sampling;
     context.acquisition_seconds                = prepared.acquisition_seconds;
     context.preparation                        = prepared.preparation;
@@ -453,16 +454,17 @@ RequestLogContext make_request_log_context(std::uint64_t id, std::string protoco
 RequestRejectionLogContext make_request_rejection_log_context(std::uint64_t id,
                                                               std::string protocol,
                                                               const GenerationRequest& request,
+                                                              const RequestLogMetadata& metadata,
                                                               ApiError error) {
     RequestRejectionLogContext context;
     context.id                                 = id;
     context.protocol                           = std::move(protocol);
-    context.model                              = request.model;
-    context.stream                             = request.stream;
+    context.model                              = metadata.model;
+    context.stream                             = metadata.stream;
     context.message_count                      = request.messages.size();
     context.media_item_count                   = request.media_item_count();
     context.requested_output_tokens            = request.max_tokens;
-    context.requested_output_tokens_client_set = request.max_tokens_set;
+    context.requested_output_tokens_client_set = metadata.output_tokens_explicit;
     context.tool_count                         = request.tools.size();
     context.tool_choice                        = request.tool_choice;
     context.has_tool_history                   = request.has_tool_history();

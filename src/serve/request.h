@@ -6,7 +6,7 @@
 
 // Internal, wire-format-independent representation of a generation request.
 //
-// OpenAI and Anthropic schemas both map into this wire-independent value.
+// OpenAI and Anthropic schemas map into this wire-independent value.
 // translate.cpp then produces the public PromptInput and RequestOptions consumed
 // by Engine; media sources remain unresolved until the product service acquires
 // owning bytes.
@@ -17,7 +17,6 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
-#include <unordered_map>
 #include <vector>
 
 namespace ninfer::serve {
@@ -51,20 +50,20 @@ struct RequestLimits {
 struct CompletionUsage {
     int prompt_tokens     = 0;
     int completion_tokens = 0;
+    int cached_tokens     = 0;
+    int reasoning_tokens  = 0;
 };
 
 enum class ContentKind {
     Text,
     Image,
     Video,
-    InputAudio,
-    Unsupported,
 };
 
 struct ContentPart {
     ContentKind kind = ContentKind::Text;
     std::string text;     // populated for Text
-    std::string type_raw; // original OpenAI "type" string (diagnostics / future use)
+    std::string type_raw; // original wire "type" string for diagnostics
     ninfer::product::media_acquire::Source source;
 };
 
@@ -72,7 +71,7 @@ struct ToolDefinition {
     std::string name;
     std::string description;
     std::string parameters_json;
-    std::string definition_json; // normalized OpenAI function-tool object for Qwen prompt rendering
+    std::string definition_json; // normalized function-tool object for Qwen prompt rendering
     bool strict               = false;
     bool cache_boundary_after = false;
 };
@@ -97,8 +96,7 @@ struct ToolChoice {
 
 struct ChatTurn {
     ChatRole role = ChatRole::User;
-    std::vector<ContentPart>
-        content; // one or more parts; assistant content may be empty with tool_calls
+    std::vector<ContentPart> content; // ordered parts; may be empty when wire content is empty
     std::vector<ToolCall> tool_calls;
     std::string tool_call_id;      // populated for role=tool
     std::string reasoning_content; // assistant thinking carried across turns (round-tripped to the
@@ -109,18 +107,16 @@ struct ChatTurn {
     bool private_cache_boundary_after = false;
 };
 
-// OpenAI sampling fields carried by the protocol adapter. `logit_bias` remains
-// parsed for wire compatibility; the current public engine sampler has no bias
-// input, so it does not affect generation.
+// Sampling overrides that have an executable Engine meaning. Protocol-only
+// fields are normalized or rejected before this value is constructed.
 struct SamplingParams {
     std::optional<double> temperature;
     std::optional<double> top_p;
+    std::optional<double> min_p;
     std::optional<int> top_k;
     std::optional<double> presence_penalty;
     std::optional<double> frequency_penalty;
     std::optional<std::uint64_t> seed;
-    std::unordered_map<int, double> logit_bias;
-    int n = 1;
 };
 
 // Protocol-level effort vocabulary. Each wire adapter accepts the values from
@@ -170,21 +166,16 @@ requested_reasoning_effort_name(RequestedReasoningEffort effort) noexcept {
 }
 
 struct GenerationRequest {
-    std::string model;
     std::vector<ChatTurn> messages;
     std::vector<ToolDefinition> tools;
     std::size_t tool_name_max_length = 64;
     ToolChoice tool_choice;
     std::vector<std::string> stop_strings;
-    int max_tokens      = 0; // 0 => use server default
-    bool max_tokens_set = false;
-    bool stream         = false;
-    bool include_usage  = false;
-    std::optional<bool> enable_thinking; // non-standard extension; falls back to server default
+    bool stop_strings_apply_to_reasoning = false;
+    int max_tokens                       = 0; // 0 => use server default
+    std::optional<bool> enable_thinking;      // unset => use the server default
     std::optional<RequestedReasoningEffort> reasoning_effort;
-    std::string reasoning_effort_param = "reasoning_effort";
     std::optional<bool> preserve_thinking;
-    bool preserve_thinking_semantic_change = false;
     SamplingParams sampling;
 
     [[nodiscard]] bool uses_tools() const noexcept {

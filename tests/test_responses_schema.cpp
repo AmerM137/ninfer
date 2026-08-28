@@ -89,7 +89,7 @@ int test_basic_request() {
                                       {"metadata", Json{{"trace", "abc"}}}};
     const ResponsesRequest request = parse_responses_request(body, limits());
     int failures                   = 0;
-    failures += check(request.generation.model == "qwen3.6-27b", "model parsed");
+    failures += check(request.model == "qwen3.6-27b", "model parsed");
     failures += check(request.input_turns.size() == 1 &&
                           request.input_turns[0].role == ninfer::ChatRole::User &&
                           request.input_turns[0].content[0].text == "hello",
@@ -103,7 +103,7 @@ int test_basic_request() {
     failures +=
         check(request.previous_response_id && *request.previous_response_id == "resp_previous",
               "previous response id parsed");
-    failures += check(request.generation.max_tokens == 64 && request.generation.max_tokens_set,
+    failures += check(request.generation.max_tokens == 64 && request.output_tokens_explicit,
                       "max_output_tokens reaches generation request");
     failures += check(request.generation.reasoning_effort == RequestedReasoningEffort::Medium,
                       "medium reasoning effort was not parsed");
@@ -216,12 +216,12 @@ int test_preserve_thinking_options_and_inheritance() {
     ResponsesRequest inherited = parse_responses_request(base, limits());
     inherit_responses_preserve_thinking(inherited, true);
     failures += check(inherited.generation.preserve_thinking == true &&
-                          !inherited.generation.preserve_thinking_semantic_change,
+                          !inherited.preserve_thinking_semantic_change,
                       "Responses child did not inherit parent preserve_thinking");
 
     ResponsesRequest unchanged = request;
     inherit_responses_preserve_thinking(unchanged, true);
-    failures += check(!unchanged.generation.preserve_thinking_semantic_change,
+    failures += check(!unchanged.preserve_thinking_semantic_change,
                       "equal explicit preserve value marked a semantic change");
 
     Json explicit_false                 = base;
@@ -229,7 +229,7 @@ int test_preserve_thinking_options_and_inheritance() {
     ResponsesRequest changed            = parse_responses_request(explicit_false, limits());
     inherit_responses_preserve_thinking(changed, true);
     failures += check(changed.generation.preserve_thinking == false &&
-                          changed.generation.preserve_thinking_semantic_change,
+                          changed.preserve_thinking_semantic_change,
                       "explicit Responses preserve branch was not marked");
 
     Json conflict                 = kwargs;
@@ -407,12 +407,15 @@ int test_response_object() {
 
     GenerationOutcome tools = sample_outcome();
     tools.text.clear();
-    tools.tool_calls.push_back(ToolCall{"call_weather", "weather", R"({"city":"Paris"})"});
+    tools.tool_calls.push_back(
+        ninfer::GeneratedToolCall{.name = "weather", .arguments_json = R"({"city":"Paris"})"});
     const Json tool_response = make_response_object("resp_tool", 123, request, runtime, tools).body;
-    failures += check(tool_response.at("output").back().at("type") == "function_call" &&
-                          tool_response.at("output").back().at("call_id") == "call_weather" &&
-                          !tool_response.at("output").back().at("id").get<std::string>().empty(),
-                      "function call has distinct Item id and call_id");
+    failures +=
+        check(tool_response.at("output").back().at("type") == "function_call" &&
+                  tool_response.at("output").back().at("call_id").get<std::string>().starts_with(
+                      "call_") &&
+                  !tool_response.at("output").back().at("id").get<std::string>().empty(),
+              "function call has distinct Item id and call_id");
     return failures;
 }
 
@@ -426,7 +429,7 @@ int test_sse_sequence() {
                                      {"stream", true}},
                                 limits());
     ResponsesEventStream encoder("resp_stream", 123, request, {});
-    request.generation.model      = "mutated";
+    request.model                 = "mutated";
     request.instructions          = "mutated";
     request.metadata              = Json{{"trace", "mutated"}};
     std::vector<std::string> wire = encoder.start();
@@ -481,7 +484,8 @@ int test_sse_function_call() {
     outcome.prompt_tokens     = 8;
     outcome.completion_tokens = 4;
     outcome.finish_reason     = ninfer::FinishReason::StopToken;
-    outcome.tool_calls.push_back(ToolCall{"call_weather", "weather", R"({"city":"Paris"})"});
+    outcome.tool_calls.push_back(
+        ninfer::GeneratedToolCall{.name = "weather", .arguments_json = R"({"city":"Paris"})"});
     ResponsesStreamFinish finish = encoder.finish(outcome);
     wire.insert(wire.end(), finish.events_before_terminal.begin(),
                 finish.events_before_terminal.end());
@@ -501,7 +505,8 @@ int test_sse_function_call() {
         check(arguments == R"({"city":"Paris"})", "function argument deltas reconstruct arguments");
     const Json& item = finish.response.body.at("output").at(0);
     failures += check(item.at("type") == "function_call" && item.at("id") == item_id &&
-                          item.at("call_id") == "call_weather" && item_id != "call_weather",
+                          item.at("call_id").get<std::string>().starts_with("call_") &&
+                          item_id != item.at("call_id").get<std::string>(),
                       "function stream preserves distinct stable Item id and call_id");
     return failures;
 }

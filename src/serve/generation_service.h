@@ -1,8 +1,7 @@
 #pragma once
 
-// Product-side adapter between HTTP protocol requests and the public NInfer
-// engine. It owns one Engine and keeps protocol concerns (aliases, usage,
-// streaming callbacks, and wire-level tool-call identifiers) outside the target package.
+// Product-side adapter from one protocol-neutral generation request to the public Engine. Wire
+// adapters normalize before this layer and render IDs, usage, and response events after it.
 
 #include "ninfer/engine.h"
 #include "serve/request.h"
@@ -46,12 +45,11 @@ struct GenerationMetrics {
 struct GenerationOutcome {
     std::string text;
     std::string reasoning;
-    std::vector<ToolCall> tool_calls;
+    std::vector<ninfer::GeneratedToolCall> tool_calls;
     int prompt_tokens     = 0;
     int completion_tokens = 0;
     int reasoning_tokens  = 0;
     ninfer::ThinkingBudgetStats thinking;
-    std::size_t streamed_content_bytes = 0;
     ninfer::FinishReason finish_reason = ninfer::FinishReason::OutputLimit;
     GenerationMetrics metrics;
 };
@@ -60,6 +58,11 @@ struct StreamSink {
     std::function<void(const std::string& delta_text)> on_content;
     std::function<void(const std::string& delta_text)> on_reasoning;
     std::function<bool()> is_cancelled;
+};
+
+enum class GenerationConsumerMode : std::uint8_t {
+    Aggregate,
+    Streaming,
 };
 
 // Translate Engine request failures into the shared protocol-neutral HTTP error contract.
@@ -74,13 +77,10 @@ struct PreparedRequest {
     double prepare_seconds     = 0.0;
     double acquisition_seconds = 0.0;
     PromptPreparationStats preparation;
-    int prompt_tokens  = 0;
-    bool include_usage = false;
-
+    int prompt_tokens    = 0;
     bool enable_thinking = true;
     std::optional<std::uint32_t> thinking_budget;
-    bool preserve_thinking                 = false;
-    bool preserve_thinking_semantic_change = false;
+    bool preserve_thinking = false;
     std::shared_ptr<RequestLifetime> lifetime;
 };
 
@@ -109,6 +109,7 @@ public:
     }
 
     [[nodiscard]] PreparedRequest prepare(const GenerationRequest& req,
+                                          GenerationConsumerMode consumer_mode,
                                           std::function<bool()> is_cancelled = {},
                                           ContextCacheHints context_cache    = {}) const;
     [[nodiscard]] int count_prompt_tokens(const GenerationRequest& req,
@@ -131,11 +132,10 @@ private:
         UnboundedStartup,
     };
 
-    [[nodiscard]] PreparedRequest prepare_impl(const GenerationRequest& req,
-                                               std::function<bool()> is_cancelled,
-                                               ContextCacheHints context_cache,
-                                               CacheParticipation cache_participation,
-                                               DeadlinePolicy deadline_policy) const;
+    [[nodiscard]] PreparedRequest
+    prepare_impl(const GenerationRequest& req, GenerationConsumerMode consumer_mode,
+                 std::function<bool()> is_cancelled, ContextCacheHints context_cache,
+                 CacheParticipation cache_participation, DeadlinePolicy deadline_policy) const;
     [[nodiscard]] std::shared_ptr<RequestLifetime>
     acquire_request_lifetime(DeadlinePolicy deadline_policy) const;
 

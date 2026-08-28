@@ -19,6 +19,7 @@ namespace ninfer::serve {
 struct GenerationOutcome;
 
 struct ResponsesRequest {
+    std::string model;
     GenerationRequest generation;
 
     // Current request input only. The HTTP layer prepends instructions and a
@@ -29,11 +30,13 @@ struct ResponsesRequest {
 
     std::optional<std::string> instructions;
     std::optional<std::string> previous_response_id;
-    nlohmann::json metadata    = nlohmann::json::object();
-    nlohmann::json tools       = nlohmann::json::array();
-    nlohmann::json tool_choice = "auto";
-    bool store                 = true;
-    bool stream                = false;
+    nlohmann::json metadata                = nlohmann::json::object();
+    nlohmann::json tools                   = nlohmann::json::array();
+    nlohmann::json tool_choice             = "auto";
+    bool store                             = true;
+    bool stream                            = false;
+    bool output_tokens_explicit            = false;
+    bool preserve_thinking_semantic_change = false;
 };
 
 struct ResponsesRuntimeValues {

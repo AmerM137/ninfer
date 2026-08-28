@@ -234,6 +234,8 @@ fi::CompiledChatTemplate compile_chat_template(const FrontendResources& resource
         throw RequestError(RequestErrorKind::MediaBudgetExceeded, error.what());
     case fi::ProcessorErrorKind::ContextLengthExceeded:
         throw RequestError(RequestErrorKind::ContextLengthExceeded, error.what());
+    case fi::ProcessorErrorKind::InvalidMedia:
+        throw RequestError(RequestErrorKind::InvalidMedia, error.what());
     }
     throw std::logic_error("unknown Qwen3.6 processor error kind");
 }

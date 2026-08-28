@@ -4,13 +4,10 @@
 #include "serve/translate.h"
 
 #include <algorithm>
-#include <array>
 #include <chrono>
 #include <cstddef>
-#include <cstdio>
 #include <iterator>
 #include <mutex>
-#include <random>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -59,6 +56,10 @@ ApiError request_error_to_api_error(const ninfer::RequestError& exception) {
         error.status = 400;
         error.code   = "media_budget_exceeded";
         break;
+    case ninfer::RequestErrorKind::InvalidMedia:
+        error.status = 400;
+        error.code   = "invalid_media";
+        break;
     case ninfer::RequestErrorKind::Overloaded:
         error.param.clear();
         error.status = 429;
@@ -72,6 +73,7 @@ ApiError request_error_to_api_error(const ninfer::RequestError& exception) {
         error.code   = "request_queue_timeout";
         break;
     case ninfer::RequestErrorKind::Cancelled:
+        error.param.clear();
         error.status = 499;
         error.type   = "request_cancelled";
         error.code   = "client_disconnected";
@@ -112,6 +114,7 @@ using Clock = std::chrono::steady_clock;
         error.code   = "media_fetch_timeout";
         break;
     case ninfer::product::media_acquire::ErrorKind::DeadlineExceeded:
+        error.param.clear();
         error.status = 503;
         error.type   = "server_error";
         error.code   = "request_queue_timeout";
@@ -122,8 +125,7 @@ using Clock = std::chrono::steady_clock;
     throw ApiException(std::move(error));
 }
 
-[[noreturn]] void throw_invalid_input(const std::exception& exception,
-                                      const char* code = "invalid_media") {
+[[noreturn]] void throw_invalid_input(const std::exception& exception, const char* code) {
     ApiError error;
     error.status  = 400;
     error.param   = "messages";
@@ -158,7 +160,9 @@ ninfer::OwnedMedia acquire_media(const ContentPart& part, Clock::time_point dead
         source_bytes = ninfer::product::media_acquire::acquire_bytes(part.source, policy);
     } catch (const ninfer::product::media_acquire::Error& exception) {
         throw_media_error(exception);
-    } catch (const std::invalid_argument& exception) { throw_invalid_input(exception); }
+    } catch (const std::invalid_argument& exception) {
+        throw_invalid_input(exception, "invalid_media");
+    }
 
     remaining_bytes -= source_bytes.size();
     ninfer::OwnedMedia media;
@@ -203,31 +207,13 @@ public:
         if (delta.channel == ninfer::OutputChannel::Reasoning) {
             if (sink_->on_reasoning) { sink_->on_reasoning(delta.text); }
         } else {
-            publish_content(delta.text);
+            if (sink_->on_content) { sink_->on_content(delta.text); }
         }
     }
 
-    [[nodiscard]] std::size_t content_bytes() const noexcept { return content_bytes_; }
-
 private:
-    void publish_content(const std::string& text) {
-        if (text.empty() || !sink_->on_content) { return; }
-        sink_->on_content(text);
-        content_bytes_ += text.size();
-    }
-
-    const StreamSink* sink_    = nullptr;
-    std::size_t content_bytes_ = 0;
+    const StreamSink* sink_ = nullptr;
 };
-
-std::string new_tool_call_id() {
-    static thread_local std::mt19937_64 rng{std::random_device{}()};
-    std::uniform_int_distribution<std::uint64_t> dist;
-    std::array<char, 32> buf{};
-    std::snprintf(buf.data(), buf.size(), "call_%016llx",
-                  static_cast<unsigned long long>(dist(rng)));
-    return std::string(buf.data());
-}
 
 } // namespace
 
@@ -283,30 +269,30 @@ GenerationService::acquire_request_lifetime(DeadlinePolicy deadline_policy) cons
 }
 
 PreparedRequest GenerationService::prepare(const GenerationRequest& request,
+                                           GenerationConsumerMode consumer_mode,
                                            std::function<bool()> is_cancelled,
                                            ContextCacheHints context_cache) const {
-    return prepare_impl(request, std::move(is_cancelled), std::move(context_cache),
+    return prepare_impl(request, consumer_mode, std::move(is_cancelled), std::move(context_cache),
                         options_.allow_prefix_reuse ? CacheParticipation::ReadWrite
                                                     : CacheParticipation::Disabled,
                         DeadlinePolicy::ClientPendingTimeout);
 }
 
 PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request,
+                                                GenerationConsumerMode consumer_mode,
                                                 std::function<bool()> is_cancelled,
                                                 ContextCacheHints context_cache,
                                                 CacheParticipation cache_participation,
                                                 DeadlinePolicy deadline_policy) const {
     PreparedRequest prepared;
-    prepared.include_usage = request.include_usage;
     const ResolvedPromptSemantics semantics =
         resolve_prompt_semantics(request, options_, prompt_capabilities_);
     ninfer::RequestOptions request_options = to_request_options(
         request, options_, semantics, cache_participation == CacheParticipation::ReadWrite);
-    prepared.enable_thinking                   = semantics.enable_thinking;
-    prepared.thinking_budget                   = request_options.execution.thinking.budget;
-    prepared.preserve_thinking                 = semantics.preserve_thinking;
-    prepared.preserve_thinking_semantic_change = request.preserve_thinking_semantic_change;
-    const bool request_has_media               = request.media_item_count() != 0;
+    prepared.enable_thinking     = semantics.enable_thinking;
+    prepared.thinking_budget     = request_options.execution.thinking.budget;
+    prepared.preserve_thinking   = semantics.preserve_thinking;
+    const bool request_has_media = request.media_item_count() != 0;
     if (request_has_media && !options_.enable_vision) {
         const std::invalid_argument error("Vision is disabled for this server");
         throw_invalid_input(error, "vision_disabled");
@@ -340,15 +326,17 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
         prepared.preparation   = prompt.preparation_stats();
         prepared.prepare_seconds =
             std::chrono::duration<double>(Clock::now() - prepared.lifetime->started).count();
-        prepared.generation =
-            engine_->submit(std::move(prompt), std::move(request_options),
-                            request.stream ? ninfer::OutputConsumerMode::Streaming
-                                           : ninfer::OutputConsumerMode::Aggregate,
-                            prepared.lifetime->deadline);
-        prepared.sampling = prepared.generation.resolved_sampling();
+        prepared.generation = engine_->submit(std::move(prompt), std::move(request_options),
+                                              consumer_mode == GenerationConsumerMode::Streaming
+                                                  ? ninfer::OutputConsumerMode::Streaming
+                                                  : ninfer::OutputConsumerMode::Aggregate,
+                                              prepared.lifetime->deadline);
+        prepared.sampling   = prepared.generation.resolved_sampling();
     } catch (const ApiException&) { throw; } catch (const ninfer::RequestError& exception) {
         throw_request_error(exception);
-    } catch (const std::invalid_argument& exception) { throw_invalid_input(exception); }
+    } catch (const std::invalid_argument& exception) {
+        throw_invalid_input(exception, "invalid_prompt");
+    }
     return prepared;
 }
 
@@ -381,7 +369,9 @@ int GenerationService::count_prompt_tokens(const GenerationRequest& request,
         return prompt_tokens;
     } catch (const ApiException&) { throw; } catch (const ninfer::RequestError& exception) {
         throw_request_error(exception);
-    } catch (const std::invalid_argument& exception) { throw_invalid_input(exception); }
+    } catch (const std::invalid_argument& exception) {
+        throw_invalid_input(exception, "invalid_prompt");
+    }
 }
 
 GenerationOutcome GenerationService::run(PreparedRequest& prepared, const StreamSink* sink,
@@ -433,13 +423,7 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     outcome.metrics.speculative_accepted_per_position =
         std::move(result.speculative.accepted_per_position);
 
-    outcome.tool_calls.reserve(result.tool_calls.size());
-    for (ninfer::GeneratedToolCall& call : result.tool_calls) {
-        outcome.tool_calls.push_back(ToolCall{.id             = new_tool_call_id(),
-                                              .name           = std::move(call.name),
-                                              .arguments_json = std::move(call.arguments_json)});
-    }
-    if (output_sink) { outcome.streamed_content_bytes = output_sink->content_bytes(); }
+    outcome.tool_calls = std::move(result.tool_calls);
     return outcome;
 }
 
@@ -453,10 +437,10 @@ void GenerationService::warmup() {
     content.type_raw = "text";
     turn.content.push_back(std::move(content));
     request.messages.push_back(std::move(turn));
-    request.max_tokens       = 4;
-    request.max_tokens_set   = true;
-    PreparedRequest prepared = prepare_impl(request, {}, {}, CacheParticipation::Disabled,
-                                            DeadlinePolicy::UnboundedStartup);
+    request.max_tokens = 4;
+    PreparedRequest prepared =
+        prepare_impl(request, GenerationConsumerMode::Aggregate, {}, {},
+                     CacheParticipation::Disabled, DeadlinePolicy::UnboundedStartup);
     run(prepared, nullptr);
 }
 

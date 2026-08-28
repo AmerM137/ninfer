@@ -1,8 +1,8 @@
 #pragma once
 
 // Anthropic Messages API wire-format layer: parses /v1/messages request JSON into
-// the internal GenerationRequest and serializes internal results back into
-// Anthropic message bodies / SSE events. This is a sibling of openai_schema.h;
+// a protocol wrapper around GenerationRequest and serializes internal results back into
+// Anthropic message bodies / SSE events. This is a sibling of openai_chat.h;
 // both map to the same wire-agnostic GenerationRequest / GenerationOutcome, so the
 // engine and generation service below know nothing about either protocol.
 
@@ -16,13 +16,24 @@
 
 namespace ninfer::serve {
 
-// Parse an already-decoded Anthropic Messages body into a GenerationRequest.
+struct AnthropicMessagesRequest {
+    std::string model;
+    GenerationRequest generation;
+    bool stream                 = false;
+    bool output_tokens_explicit = false;
+};
+
+// Parse an already-decoded Anthropic Messages body into its wire envelope and GenerationRequest.
 // Top-level `system` becomes a leading system turn; system-role messages retain
 // their array position; user tool_result blocks become ordered tool turns; and
 // assistant tool_use blocks become tool calls. Throws ApiException on malformed /
 // unsupported requests. The `model` field is accepted verbatim (any Claude model
 // name) and echoed back, never validated against the loaded model.
-GenerationRequest parse_messages_request(const nlohmann::json& body, const RequestLimits& limits);
+AnthropicMessagesRequest parse_messages_request(const nlohmann::json& body,
+                                                const RequestLimits& limits);
+
+std::vector<ToolCall>
+materialize_anthropic_tool_calls(const std::vector<ninfer::GeneratedToolCall>& generated);
 
 // Map an internal finish reason (+ whether tool calls were produced) onto the
 // Anthropic stop_reason wire value.
