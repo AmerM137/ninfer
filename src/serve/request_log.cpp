@@ -92,6 +92,34 @@ std::string tool_choice_name(const ToolChoice& choice) {
     return "unknown";
 }
 
+const char* reasoning_effort_name(ninfer::ReasoningEffort effort) {
+    switch (effort) {
+    case ninfer::ReasoningEffort::Low:
+        return "low";
+    case ninfer::ReasoningEffort::Medium:
+        return "medium";
+    case ninfer::ReasoningEffort::XHigh:
+        return "xhigh";
+    }
+    return "unknown";
+}
+
+Json requested_reasoning_effort_json(const std::optional<RequestedReasoningEffort>& requested) {
+    return requested ? Json(std::string(requested_reasoning_effort_name(*requested)))
+                     : Json(nullptr);
+}
+
+Json resolved_reasoning_effort_json(bool enable_thinking,
+                                    const std::optional<ninfer::ReasoningEffort>& resolved) {
+    if (!enable_thinking) { return "none"; }
+    return resolved ? Json(reasoning_effort_name(*resolved)) : Json(nullptr);
+}
+
+std::string
+requested_reasoning_effort_text(const std::optional<RequestedReasoningEffort>& requested) {
+    return requested ? std::string(requested_reasoning_effort_name(*requested)) : "default";
+}
+
 const char* kv_cache_name(ninfer::KvCacheStorage storage) {
     switch (storage) {
     case ninfer::KvCacheStorage::BFloat16:
@@ -192,6 +220,11 @@ Json request_json(const RequestLogContext& context) {
                 {"has_tool_history", context.has_tool_history},
                 {"enable_thinking", context.enable_thinking},
                 {"thinking_budget", std::move(thinking_budget)},
+                {"requested_reasoning_effort",
+                 requested_reasoning_effort_json(context.requested_reasoning_effort)},
+                {"resolved_reasoning_effort",
+                 resolved_reasoning_effort_json(context.enable_thinking,
+                                                context.resolved_reasoning_effort)},
                 {"preserve_thinking", context.preserve_thinking},
                 {"preserve_thinking_semantic_change", context.preserve_thinking_semantic_change},
                 {"sampling", sampler_json(context.sampling)}};
@@ -228,7 +261,10 @@ Json rejected_request_json(const RequestRejectionLogContext& context) {
                  context.requested_output_tokens_client_set ? "client" : "server_default"},
                 {"tool_count", context.tool_count},
                 {"tool_choice", tool_choice_name(context.tool_choice)},
-                {"has_tool_history", context.has_tool_history}};
+                {"has_tool_history", context.has_tool_history},
+                {"requested_reasoning_effort",
+                 requested_reasoning_effort_json(context.requested_reasoning_effort)},
+                {"resolved_reasoning_effort", nullptr}};
 }
 
 Json error_json(const ApiError& error) {
@@ -439,6 +475,8 @@ RequestLogContext make_request_log_context(std::uint64_t id, std::string protoco
     context.has_tool_history                   = request.has_tool_history();
     context.enable_thinking                    = prepared.enable_thinking;
     context.thinking_budget                    = prepared.thinking_budget;
+    context.requested_reasoning_effort         = request.reasoning_effort;
+    context.resolved_reasoning_effort          = prepared.effective_reasoning_effort;
     context.preserve_thinking                  = prepared.preserve_thinking;
     context.preserve_thinking_semantic_change  = metadata.preserve_thinking_semantic_change;
     context.sampling                           = prepared.sampling;
@@ -464,6 +502,7 @@ RequestRejectionLogContext make_request_rejection_log_context(std::uint64_t id,
     context.tool_count                         = request.tools.size();
     context.tool_choice                        = request.tool_choice;
     context.has_tool_history                   = request.has_tool_history();
+    context.requested_reasoning_effort         = request.reasoning_effort;
     context.error                              = std::move(error);
     return context;
 }
@@ -477,8 +516,16 @@ std::string format_request_start(const RequestLogContext& context) {
         << " tools=" << context.tool_count
         << " tool_choice=" << tool_choice_name(context.tool_choice)
         << " tool_history=" << (context.has_tool_history ? "yes" : "no")
-        << " thinking=" << (context.enable_thinking ? "on" : "off")
-        << " preserve_thinking=" << (context.preserve_thinking ? "on" : "off")
+        << " thinking=" << (context.enable_thinking ? "on" : "off") << " reasoning_effort="
+        << requested_reasoning_effort_text(context.requested_reasoning_effort) << "->";
+    if (!context.enable_thinking) {
+        out << "none";
+    } else if (context.resolved_reasoning_effort) {
+        out << reasoning_effort_name(*context.resolved_reasoning_effort);
+    } else {
+        out << "n/a";
+    }
+    out << " preserve_thinking=" << (context.preserve_thinking ? "on" : "off")
         << " preserve_change=" << (context.preserve_thinking_semantic_change ? "yes" : "no")
         << " sampler=[" << sampler_str(context.sampling) << ']';
     if (context.thinking_budget) { out << " thinking_budget=" << *context.thinking_budget; }
@@ -501,6 +548,8 @@ std::string format_request_rejected(const RequestRejectionLogContext& context) {
     out << "[req " << context.id << "] rejected phase=prepare protocol=" << context.protocol << ' '
         << (context.stream ? "stream" : "non-stream") << " msgs=" << context.message_count
         << " media=" << context.media_item_count << " tools=" << context.tool_count
+        << " reasoning_effort="
+        << requested_reasoning_effort_text(context.requested_reasoning_effort) << "->unresolved"
         << " status=" << context.error.status;
     if (!context.error.code.empty()) { out << " code=" << context.error.code; }
     out << " message=" << context.error.message;

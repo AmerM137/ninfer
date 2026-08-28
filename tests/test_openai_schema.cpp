@@ -350,6 +350,34 @@ int test_messages_and_media() {
     failures += check(content_rejected("system", "image_url"),
                       "system media rejected at protocol boundary");
 
+    body["messages"] = Json::array(
+        {Json{{"role", "user"}, {"content", "capture it"}},
+         Json{{"role", "assistant"},
+              {"content", nullptr},
+              {"tool_calls",
+               Json::array({Json{{"id", "call_capture"},
+                                 {"type", "function"},
+                                 {"function", Json{{"name", "capture"}, {"arguments", "{}"}}}}})}},
+         Json{{"role", "tool"},
+              {"tool_call_id", "call_capture"},
+              {"content",
+               Json::array({Json{{"type", "text"}, {"text", "captured"}},
+                            Json{{"type", "image_url"},
+                                 {"image_url", Json{{"url", "https://example.test/capture.png"},
+                                                    {"detail", "auto"}}}}})}}});
+    const GenerationRequest tool_image = parse(body).generation;
+    failures += check(tool_image.messages.back().role == ninfer::ChatRole::Tool &&
+                          tool_image.messages.back().tool_call_id == "call_capture" &&
+                          tool_image.messages.back().content.size() == 2 &&
+                          tool_image.messages.back().content[0].kind == ContentKind::Text &&
+                          tool_image.messages.back().content[1].kind == ContentKind::Image,
+                      "tool result text and image parts normalize to one tool turn");
+
+    body["messages"].back()["content"] = Json::array(
+        {Json{{"type", "video_url"}, {"video_url", "https://example.test/capture.mp4"}}});
+    failures += check(api_error([&] { (void)parse(body); }).code == "modality_not_supported",
+                      "tool result video remains outside the Chat compatibility extension");
+
     body = base_request();
     body["messages"][0]["content"] =
         Json::array({Json{{"type", "input_audio"}, {"input_audio", Json::object()}}});
@@ -597,8 +625,13 @@ int test_stream_response() {
 
 int test_common_objects() {
     int failures      = 0;
-    const Json models = Json::parse(make_models_list("qwen", 7));
-    failures += check(models["data"][0]["id"] == "qwen", "models list remains available");
+    const Json models = Json::parse(make_models_list("qwen", 7, 240000));
+    failures +=
+        check(models["data"][0]["id"] == "qwen" && models["data"][0]["max_model_len"] == 240000,
+              "models list advertises the configured context limit");
+    const Json model = Json::parse(make_model_object("qwen", 7, 240000));
+    failures += check(model["max_model_len"] == 240000,
+                      "model lookup advertises the configured context limit");
     const Json error = Json::parse(make_error_body(
         ApiError{.status = 400, .message = "bad", .param = "messages", .code = "invalid"}));
     failures += check(error["error"]["param"] == "messages" && error["error"]["code"] == "invalid",

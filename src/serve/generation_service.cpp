@@ -308,10 +308,11 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
         resolve_prompt_semantics(request, options_, prompt_capabilities_);
     ninfer::RequestOptions request_options = to_request_options(
         request, options_, semantics, cache_participation == CacheParticipation::ReadWrite);
-    prepared.enable_thinking     = semantics.enable_thinking;
-    prepared.thinking_budget     = request_options.execution.thinking.budget;
-    prepared.preserve_thinking   = semantics.preserve_thinking;
-    const bool request_has_media = request.media_item_count() != 0;
+    prepared.enable_thinking            = semantics.enable_thinking;
+    prepared.thinking_budget            = request_options.execution.thinking.budget;
+    prepared.effective_reasoning_effort = semantics.effective_reasoning_effort;
+    prepared.preserve_thinking          = semantics.preserve_thinking;
+    const bool request_has_media        = request.media_item_count() != 0;
     if (request_has_media && !options_.enable_vision) {
         const std::invalid_argument error("Vision is disabled for this server");
         throw_invalid_input(error, "vision_disabled");

@@ -10,8 +10,10 @@
 
 namespace ninfer::serve {
 
-std::string make_models_list(const std::string& model_id, std::int64_t created);
-std::string make_model_object(const std::string& model_id, std::int64_t created);
+std::string make_models_list(const std::string& model_id, std::int64_t created,
+                             std::uint32_t max_model_len);
+std::string make_model_object(const std::string& model_id, std::int64_t created,
+                              std::uint32_t max_model_len);
 std::string make_error_body(const ApiError& error);
 std::int64_t unix_time_now();
 

@@ -36,18 +36,26 @@ std::string responses_identifier(std::string_view prefix) {
 
 using Json = nlohmann::json;
 
-std::string make_models_list(const std::string& model_id, std::int64_t created) {
+std::string make_models_list(const std::string& model_id, std::int64_t created,
+                             std::uint32_t max_model_len) {
+    // vLLM/llama.cpp-compatible discovery metadata for the configured per-request context limit.
     const Json payload = {{"object", "list"},
                           {"data", Json::array({Json{{"id", model_id},
                                                      {"object", "model"},
                                                      {"created", created},
-                                                     {"owned_by", "ninfer"}}})}};
+                                                     {"owned_by", "ninfer"},
+                                                     {"max_model_len", max_model_len}}})}};
     return payload.dump();
 }
 
-std::string make_model_object(const std::string& model_id, std::int64_t created) {
-    const Json payload = {
-        {"id", model_id}, {"object", "model"}, {"created", created}, {"owned_by", "ninfer"}};
+std::string make_model_object(const std::string& model_id, std::int64_t created,
+                              std::uint32_t max_model_len) {
+    // vLLM/llama.cpp-compatible discovery metadata for the configured per-request context limit.
+    const Json payload = {{"id", model_id},
+                          {"object", "model"},
+                          {"created", created},
+                          {"owned_by", "ninfer"},
+                          {"max_model_len", max_model_len}};
     return payload.dump();
 }
 

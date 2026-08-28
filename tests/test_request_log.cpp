@@ -242,6 +242,7 @@ int main() {
     PreparedRequest prepared;
     prepared.enable_thinking                           = true;
     prepared.thinking_budget                           = 256;
+    prepared.effective_reasoning_effort                = ninfer::ReasoningEffort::XHigh;
     prepared.preserve_thinking                         = true;
     prepared.sampling.temperature                      = 0.6F;
     prepared.sampling.top_p                            = 0.95F;
@@ -276,6 +277,12 @@ int main() {
                       "resolved thinking mode missing");
     failures += check(started.at("request").at("thinking_budget") == 256,
                       "resolved thinking budget missing");
+    failures += check(started.at("request").at("requested_reasoning_effort").is_null() &&
+                          started.at("request").at("resolved_reasoning_effort") == "xhigh",
+                      "requested and resolved reasoning effort are not distinguished");
+    failures += check(format_request_start(context).find("reasoning_effort=default->xhigh") !=
+                          std::string::npos,
+                      "human request log omits default reasoning resolution");
     failures += check(started.at("request").at("preserve_thinking") == true &&
                           started.at("request").at("preserve_thinking_semantic_change") == true,
                       "resolved preserve-thinking metadata missing");
@@ -295,8 +302,10 @@ int main() {
     preparation_error.code   = "context_length_exceeded";
     preparation_error.message =
         "prepared prompt has 270000 tokens, exceeding Engine max_context 262144";
+    GenerationRequest rejected_request                = request;
+    rejected_request.reasoning_effort                 = RequestedReasoningEffort::High;
     const RequestRejectionLogContext rejected_context = make_request_rejection_log_context(
-        8, "anthropic_messages", request, metadata, preparation_error);
+        8, "anthropic_messages", rejected_request, metadata, preparation_error);
     const Json rejected =
         Json::parse(format_request_rejected_json("serve-test", 2500, rejected_context));
     failures +=
@@ -306,17 +315,22 @@ int main() {
                           rejected.at("request").at("media_item_count") == 1 &&
                           rejected.at("request").at("message_count") == 2,
                       "preparation rejection request shape missing");
+    failures += check(rejected.at("request").at("requested_reasoning_effort") == "high" &&
+                          rejected.at("request").at("resolved_reasoning_effort").is_null(),
+                      "rejection log fabricated a resolved reasoning effort");
     failures += check(rejected.at("error").at("status") == 400 &&
                           rejected.at("error").at("code") == "context_length_exceeded" &&
                           rejected.at("error").at("param") == "messages",
                       "preparation rejection API error missing");
-    failures +=
-        check(format_request_rejected(rejected_context)
-                          .find("rejected phase=prepare protocol=anthropic_messages") !=
-                      std::string::npos &&
-                  format_request_rejected(rejected_context).find("code=context_length_exceeded") !=
-                      std::string::npos,
-              "human preparation rejection log is incomplete");
+    failures += check(
+        format_request_rejected(rejected_context)
+                    .find("rejected phase=prepare protocol=anthropic_messages") !=
+                std::string::npos &&
+            format_request_rejected(rejected_context).find("code=context_length_exceeded") !=
+                std::string::npos &&
+            format_request_rejected(rejected_context).find("reasoning_effort=high->unresolved") !=
+                std::string::npos,
+        "human preparation rejection log is incomplete");
 
     GenerationOutcome outcome;
     outcome.prompt_tokens                   = 401;

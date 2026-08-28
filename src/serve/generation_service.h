@@ -82,6 +82,7 @@ struct PreparedRequest {
     int prompt_tokens    = 0;
     bool enable_thinking = true;
     std::optional<std::uint32_t> thinking_budget;
+    std::optional<ninfer::ReasoningEffort> effective_reasoning_effort;
     bool preserve_thinking = false;
     std::shared_ptr<RequestLifetime> lifetime;
 };

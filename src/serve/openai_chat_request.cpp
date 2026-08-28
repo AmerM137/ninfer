@@ -332,8 +332,9 @@ void parse_content_parts(const Json& content, ChatTurn& turn, std::size_t index)
             parsed.kind = ContentKind::Text;
             parsed.text = part.at("refusal").get<std::string>();
         } else if (type == "image_url") {
-            if (turn.role != ChatRole::User) {
-                bad_request("image_url is only supported on user messages", "messages",
+            // VS Code Copilot-compatible screenshot results use image_url parts on tool turns.
+            if (turn.role != ChatRole::User && turn.role != ChatRole::Tool) {
+                bad_request("image_url is only supported on user or tool messages", "messages",
                             "modality_not_supported");
             }
             parsed.kind   = ContentKind::Image;
@@ -349,10 +350,6 @@ void parse_content_parts(const Json& content, ChatTurn& turn, std::size_t index)
             parsed.source = parse_media_url(part, "video_url", false);
         } else {
             bad_request("content type '" + type + "' is not supported", "messages",
-                        "modality_not_supported");
-        }
-        if (turn.role != ChatRole::User && parsed.kind != ContentKind::Text) {
-            bad_request("only user messages may contain media", "messages",
                         "modality_not_supported");
         }
         turn.content.push_back(std::move(parsed));

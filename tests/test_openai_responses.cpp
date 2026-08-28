@@ -173,6 +173,7 @@ int test_budgets_and_nonsemantic_hints() {
 
     Json hints = base;
     hints.update({{"background", false},
+                  {"client_metadata", Json{{"session_id", "session-1"}, {"trace", Json::array()}}},
                   {"include", Json::array()},
                   {"max_tool_calls", 0},
                   {"prompt_cache_key", "stable-prefix"},
@@ -189,6 +190,10 @@ int test_budgets_and_nonsemantic_hints() {
         parse_openai_responses_create_request(hints, limits());
     failures += check(accepted.max_tool_calls == 0,
                       "typed nonsemantic hints are accepted without changing generation");
+
+    hints["client_metadata"] = nullptr;
+    failures += check(parse_openai_responses_create_request(hints, limits()).prompt.model == "m",
+                      "null client_metadata is neutral");
     return failures;
 }
 
@@ -315,6 +320,166 @@ int test_tools_and_effective_subset() {
     return failures;
 }
 
+int test_namespace_tools() {
+    const Json clock_namespace = {
+        {"type", "namespace"},
+        {"name", "mcp__clock"},
+        {"description", "Clock service"},
+        {"tools", Json::array({Json{{"type", "function"},
+                                    {"name", "now"},
+                                    {"description", "Read the current time"},
+                                    {"parameters", Json{{"type", "object"}}},
+                                    {"strict", false},
+                                    {"allowed_callers", Json::array({"direct"})},
+                                    {"defer_loading", false}}})}};
+    const Json weather_namespace = {
+        {"type", "namespace"},
+        {"name", "mcp__weather"},
+        {"description", "Weather service"},
+        {"tools", Json::array({Json{{"type", "function"}, {"name", "now"}}})}};
+    const Json body = {{"model", "m"},
+                       {"input", "time"},
+                       {"tools", Json::array({clock_namespace, weather_namespace})},
+                       {"tool_choice", Json{{"type", "allowed_tools"},
+                                            {"mode", "auto"},
+                                            {"tools", Json::array({Json{{"type", "function"},
+                                                                        {"namespace", "mcp__clock"},
+                                                                        {"name", "now"}}})}}}};
+    const OpenAIResponsesCreateRequest request =
+        parse_openai_responses_create_request(body, limits());
+
+    int failures = 0;
+    failures += check(request.tools.size() == 2 && request.tools[0].at("type") == "namespace" &&
+                          request.tools[0].at("tools")[0].at("name") == "now",
+                      "wire namespace grouping is retained in the response echo");
+    failures += check(request.prompt.generation.tools.size() == 1 &&
+                          request.prompt.generation.tools[0].name == "mcp__clock__now" &&
+                          request.prompt.generation.tools[0].description ==
+                              "Clock service\n\nRead the current time",
+                      "allowed namespace function lowers to one Engine tool with shared context");
+    failures +=
+        check(request.tool_identities.at("mcp__clock__now").name == "now" &&
+                  request.tool_identities.at("mcp__clock__now").wire_namespace == "mcp__clock",
+              "Engine identity has an explicit reversible wire mapping");
+
+    GenerationOutcome outcome;
+    outcome.finish_reason = ninfer::FinishReason::StopToken;
+    outcome.tool_calls.push_back(ninfer::GeneratedToolCall{
+        .name = "mcp__clock__now", .arguments_json = R"({"timezone":"UTC"})"});
+    const BuiltOpenAIResponse built =
+        make_openai_response_object("resp_namespace", 1, request, {}, outcome);
+    const Json& output = built.body.at("output").at(0);
+    failures += check(output.at("name") == "now" && output.at("namespace") == "mcp__clock" &&
+                          built.output_history[0].tool_calls[0].name == "mcp__clock__now",
+                      "terminal response restores wire identity while stored history stays flat");
+
+    OpenAIResponsesCreateRequest stream_request = request;
+    stream_request.stream                       = true;
+    OpenAIResponsesEventStream stream("resp_namespace_stream", 1, stream_request, {});
+    (void)stream.start();
+    const OpenAIResponsesStreamFinish streamed = stream.finish(outcome);
+    bool saw_added                             = false;
+    bool saw_done                              = false;
+    bool saw_item_done                         = false;
+    for (const std::string& wire : streamed.events_before_terminal) {
+        const Json event = parse_event(wire);
+        if (event.at("type") == "response.output_item.added" &&
+            event.at("item").at("type") == "function_call") {
+            saw_added = event.at("item").at("name") == "now" &&
+                        event.at("item").at("namespace") == "mcp__clock";
+        } else if (event.at("type") == "response.function_call_arguments.done") {
+            saw_done = event.at("name") == "now" && event.at("namespace") == "mcp__clock";
+        } else if (event.at("type") == "response.output_item.done" &&
+                   event.at("item").at("type") == "function_call") {
+            saw_item_done = event.at("item").at("name") == "now" &&
+                            event.at("item").at("namespace") == "mcp__clock";
+        }
+    }
+    failures += check(saw_added && saw_done && saw_item_done,
+                      "every named SSE function-call event restores the namespace identity");
+
+    const Json history = {
+        {"model", "m"},
+        {"input", Json::array({Json{{"type", "message"}, {"role", "user"}, {"content", "time"}},
+                               Json{{"type", "function_call"},
+                                    {"call_id", "call_clock"},
+                                    {"namespace", "mcp__clock"},
+                                    {"name", "now"},
+                                    {"arguments", "{}"}},
+                               Json{{"type", "function_call_output"},
+                                    {"call_id", "call_clock"},
+                                    {"namespace", "mcp__clock"},
+                                    {"name", "now"},
+                                    {"output", "12:00"}}})}};
+    const OpenAIResponsesCreateRequest replay =
+        parse_openai_responses_create_request(history, limits());
+    OpenAIResponsesStore store(8, 1ULL << 20);
+    const OpenAIResponsesResolvedPrompt resolved =
+        resolve_openai_responses_prompt(replay.prompt, store, "resp_replay", true);
+    failures += check(resolved.generation.messages[1].tool_calls[0].name == "mcp__clock__now" &&
+                          resolved.generation.messages[2].tool_result_name == "mcp__clock__now" &&
+                          replay.prompt.input_items[1].at("namespace") == "mcp__clock" &&
+                          replay.prompt.input_items[2].at("namespace") == "mcp__clock",
+                      "stateless namespaced call history validates and preserves wire identity");
+
+    Json mismatch                = history;
+    mismatch["input"][2]["name"] = "later";
+    const OpenAIResponsesCreateRequest mismatched =
+        parse_openai_responses_create_request(mismatch, limits());
+    failures += check(api_code([&] {
+                          (void)resolve_openai_responses_prompt(mismatched.prompt, store,
+                                                                "resp_mismatch", true);
+                      }) == "invalid_tool_history",
+                      "tool output identity must agree with its call_id");
+
+    store.put(stored_parent(append_openai_response_context(
+        {}, {text_turn(ninfer::ChatRole::User, "time"),
+             call_turn({{"call_stored_clock", "mcp__clock__now"}})})));
+    const OpenAIResponsesCreateRequest stored_replay = parse_openai_responses_create_request(
+        Json{{"model", "m"},
+             {"previous_response_id", "resp_parent"},
+             {"input", Json::array({Json{{"type", "function_call_output"},
+                                         {"call_id", "call_stored_clock"},
+                                         {"namespace", "mcp__clock"},
+                                         {"name", "now"},
+                                         {"output", "12:00"}}})}},
+        limits());
+    const OpenAIResponsesResolvedPrompt stored_resolved =
+        resolve_openai_responses_prompt(stored_replay.prompt, store, "resp_stored_replay", true);
+    failures +=
+        check(stored_resolved.generation.messages.back().tool_call_id == "call_stored_clock" &&
+                  stored_resolved.generation.messages.back().tool_result_name == "mcp__clock__now",
+              "namespaced tool result validates against previous_response_id history");
+
+    Json collision           = body;
+    collision["tool_choice"] = "auto";
+    collision["tools"].push_back(Json{{"type", "function"}, {"name", "mcp__clock__now"}});
+    failures += check(api_code([&] {
+                          (void)parse_openai_responses_create_request(collision, limits());
+                      }) == "duplicate_tool_name",
+                      "plain and namespaced Engine identities cannot collide");
+
+    Json nested_custom                 = body;
+    nested_custom["tool_choice"]       = "auto";
+    nested_custom["tools"][0]["tools"] = Json::array({Json{{"type", "custom"}, {"name", "raw"}}});
+    failures += check(api_code([&] {
+                          (void)parse_openai_responses_create_request(nested_custom, limits());
+                      }) == "tool_type_not_supported",
+                      "namespace custom tools remain explicitly unsupported");
+
+    Json oversized           = body;
+    oversized["tool_choice"] = "auto";
+    oversized["tools"] =
+        Json::array({Json{{"type", "namespace"},
+                          {"name", std::string(60, 'n')},
+                          {"tools", Json::array({Json{{"type", "function"}, {"name", "tool"}}})}}});
+    failures += check(api_code([&] {
+                          (void)parse_openai_responses_create_request(oversized, limits());
+                      }) == "invalid_tool_name",
+                      "flattened identities must fit the Engine tool-name contract");
+    return failures;
+}
+
 int test_explicit_rejections() {
     const Json base = {{"model", "m"}, {"input", "hello"}};
     int failures    = 0;
@@ -360,6 +525,15 @@ int test_explicit_rejections() {
                           (void)parse_openai_responses_create_request(value, limits());
                       }) == "unknown_parameter",
                       "unknown request parameter is rejected");
+
+    for (const Json invalid : {Json("trace"), Json::array(), Json(7)}) {
+        value                    = base;
+        value["client_metadata"] = invalid;
+        failures += check(api_code([&] {
+                              (void)parse_openai_responses_create_request(value, limits());
+                          }) == "invalid_type",
+                          "client_metadata rejects malformed top-level shapes");
+    }
     return failures;
 }
 
@@ -548,12 +722,17 @@ int test_input_tokens_uses_shared_state_path() {
         append_openai_response_context({}, {text_turn(ninfer::ChatRole::User, "parent"),
                                             text_turn(ninfer::ChatRole::Assistant, "answer")})));
 
-    const OpenAIResponsesPromptRequest request =
-        parse_openai_responses_input_tokens_request(Json{{"model", "m"},
-                                                         {"previous_response_id", "resp_parent"},
-                                                         {"instructions", "count this"},
-                                                         {"input", "next"}},
-                                                    limits());
+    const OpenAIResponsesPromptRequest request = parse_openai_responses_input_tokens_request(
+        Json{{"model", "m"},
+             {"previous_response_id", "resp_parent"},
+             {"instructions", "count this"},
+             {"input", "next"},
+             {"tools",
+              Json::array(
+                  {Json{{"type", "namespace"},
+                        {"name", "mcp__clock"},
+                        {"tools", Json::array({Json{{"type", "function"}, {"name", "now"}}})}}})}},
+        limits());
     const OpenAIResponsesResolvedPrompt resolved =
         resolve_openai_responses_prompt(request, store, std::nullopt, false);
     int failures = 0;
@@ -561,6 +740,9 @@ int test_input_tokens_uses_shared_state_path() {
                           resolved.generation.messages[0].role == ninfer::ChatRole::Developer &&
                           resolved.generation.messages.back().content[0].text == "next",
                       "input token counting resolves instructions, parent, and current input");
+    failures += check(resolved.generation.tools.size() == 1 &&
+                          resolved.generation.tools[0].name == "mcp__clock__now",
+                      "input token counting uses the namespace tool translation path");
     failures += check(Json::parse(make_openai_response_input_tokens_body(9)) ==
                           Json{{"object", "response.input_tokens"}, {"input_tokens", 9}},
                       "input token count response shape");
@@ -575,6 +757,7 @@ int main() {
     failures += test_budgets_and_nonsemantic_hints();
     failures += test_typed_items_and_cache_markers();
     failures += test_tools_and_effective_subset();
+    failures += test_namespace_tools();
     failures += test_explicit_rejections();
     failures += test_previous_response_call_graph();
     failures += test_response_object();

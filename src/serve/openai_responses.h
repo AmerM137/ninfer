@@ -13,11 +13,19 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace ninfer::serve {
 
 struct GenerationOutcome;
+
+struct OpenAIResponsesFunctionIdentity {
+    std::string name;
+    std::optional<std::string> wire_namespace;
+
+    bool operator==(const OpenAIResponsesFunctionIdentity&) const = default;
+};
 
 struct OpenAIResponsesPromptRequest {
     std::string model;
@@ -33,6 +41,9 @@ struct OpenAIResponsesCreateRequest {
     nlohmann::json metadata    = nlohmann::json::object();
     nlohmann::json tools       = nlohmann::json::array();
     nlohmann::json tool_choice = "auto";
+    // Responses beta namespace tools are flattened for the Engine and restored only at the wire
+    // boundary. Never infer a namespace by splitting an Engine function name.
+    std::unordered_map<std::string, OpenAIResponsesFunctionIdentity> tool_identities;
     std::optional<int> requested_max_output_tokens;
     std::optional<int> max_tool_calls;
     bool parallel_tool_calls = true;

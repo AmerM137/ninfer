@@ -90,6 +90,9 @@ struct ChatTurn {
     std::vector<ContentPart> content; // ordered parts; may be empty when wire content is empty
     std::vector<ToolCall> tool_calls;
     std::string tool_call_id; // populated for role=tool
+    // Optional protocol assertion for a tool result. Call-graph normalization verifies it against
+    // the function identified by tool_call_id before the Engine sees the history.
+    std::optional<std::string> tool_result_name;
     bool tool_result_is_error = false;
     std::string reasoning_content; // assistant thinking carried across turns (round-tripped to the
                                    // template)

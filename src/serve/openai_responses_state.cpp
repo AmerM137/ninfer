@@ -94,6 +94,11 @@ std::vector<ChatTurn> normalize_call_graph(std::vector<ChatTurn> turns) {
                 invalid_tool_history("function_call_output call_id '" + result.tool_call_id +
                                      "' does not immediately follow its assistant call group");
             }
+            const ToolCall& call = normalized.back().tool_calls[position->second];
+            if (result.tool_result_name && *result.tool_result_name != call.name) {
+                invalid_tool_history("function_call_output identity does not match call_id '" +
+                                     result.tool_call_id + "'");
+            }
             if (results[position->second]) {
                 invalid_tool_history("duplicate function_call_output for call_id '" +
                                      result.tool_call_id + "'");
