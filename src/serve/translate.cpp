@@ -219,7 +219,7 @@ ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
                 error.code    = "modality_not_supported";
                 throw ApiException(std::move(error));
             }
-            if (part.private_cache_boundary_after) {
+            if (part.cache_boundary_after) {
                 if (turn_index >= std::numeric_limits<std::uint32_t>::max() ||
                     part_index >= std::numeric_limits<std::uint32_t>::max()) {
                     throw std::overflow_error("conversation cache boundary exceeds uint32");
@@ -230,14 +230,14 @@ ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
                     part.kind == ContentKind::Text;
                 if (leading_instruction) {
                     input.context_cache.markers.push_back(ninfer::PromptCacheMarker{
-                        .kind     = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+                        .kind     = *part.cache_boundary_after,
                         .location = ninfer::PromptCacheMarkerLocation::LeadingInstructionBoundary,
                         .leading_instruction_bytes = static_cast<std::uint32_t>(text_bytes),
                     });
                 } else {
                     input.context_cache.markers.push_back(ninfer::PromptCacheMarker{
                         .after_message_count = static_cast<std::uint32_t>(turn_index + 1U),
-                        .kind                = ninfer::PromptCacheMarkerKind::PrivateLongAnchor,
+                        .kind                = *part.cache_boundary_after,
                         .location = ninfer::PromptCacheMarkerLocation::MessagePartBoundary,
                         .after_message_part_count =
                             static_cast<std::uint32_t>(message.parts.size()),
@@ -245,30 +245,14 @@ ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
                 }
             }
         }
-        if (turn_index == 0 &&
-            (turn.role == ChatRole::System || turn.role == ChatRole::Developer)) {
-            for (const std::uint32_t boundary : turn.shared_cache_boundaries_after_text_bytes) {
-                if (boundary == 0 || boundary > text_bytes) {
-                    throw std::invalid_argument("instruction cache boundary exceeds its text");
-                }
-            }
-            if (!turn.shared_cache_boundaries_after_text_bytes.empty()) {
-                input.context_cache.markers.push_back(ninfer::PromptCacheMarker{
-                    .kind     = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
-                    .location = ninfer::PromptCacheMarkerLocation::LeadingInstructionBoundary,
-                    .leading_instruction_bytes =
-                        turn.shared_cache_boundaries_after_text_bytes.back(),
-                });
-            }
-        }
         input.messages.push_back(std::move(message));
-        if (turn.private_cache_boundary_after) {
+        if (turn.cache_boundary_after) {
             if (input.messages.size() > std::numeric_limits<std::uint32_t>::max()) {
                 throw std::overflow_error("conversation cache boundary exceeds uint32");
             }
             input.context_cache.markers.push_back(ninfer::PromptCacheMarker{
                 .after_message_count = static_cast<std::uint32_t>(input.messages.size()),
-                .kind                = ninfer::PromptCacheMarkerKind::PrivateLongAnchor,
+                .kind                = *turn.cache_boundary_after,
                 .location            = ninfer::PromptCacheMarkerLocation::MessageBoundary,
             });
         }
@@ -284,7 +268,7 @@ ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
     std::optional<std::uint32_t> last_tool_cache_boundary;
     for (std::size_t index = 0; index < tools.size(); ++index) {
         input.options.tool_jsons.push_back(render_tool_definition(*tools[index]));
-        if (tools[index]->cache_boundary_after) {
+        if (tools[index]->shared_cache_boundary_after) {
             last_tool_cache_boundary = static_cast<std::uint32_t>(index + 1U);
         }
     }
@@ -305,7 +289,7 @@ ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
                 .after_tool_count = *last_tool_cache_boundary,
             });
     }
-    if (request.automatic_cache_boundary && !input.messages.empty()) {
+    if (request.private_cache_boundary_at_prompt_end && !input.messages.empty()) {
         const ninfer::PromptCacheMarker automatic{
             .after_message_count = static_cast<std::uint32_t>(input.messages.size()),
             .kind                = ninfer::PromptCacheMarkerKind::PrivateLongAnchor,

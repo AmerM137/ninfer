@@ -1,0 +1,1172 @@
+#include "serve/openai_responses.h"
+
+#include <algorithm>
+#include <cctype>
+#include <cmath>
+#include <cstdint>
+#include <limits>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
+
+namespace ninfer::serve {
+namespace {
+
+using Json = nlohmann::json;
+
+[[noreturn]] void bad_request(std::string message, std::string param = {}, std::string code = {}) {
+    ApiError error;
+    error.status  = 400;
+    error.type    = "invalid_request_error";
+    error.message = std::move(message);
+    error.param   = std::move(param);
+    error.code    = std::move(code);
+    throw ApiException(std::move(error));
+}
+
+void require_object(const Json& value, std::string_view name = "request body") {
+    if (!value.is_object()) { bad_request(std::string(name) + " must be a JSON object"); }
+}
+
+bool optional_bool(const Json& object, const char* key, bool fallback) {
+    if (!object.contains(key) || object.at(key).is_null()) { return fallback; }
+    if (!object.at(key).is_boolean()) { bad_request(std::string(key) + " must be a boolean", key); }
+    return object.at(key).get<bool>();
+}
+
+std::optional<double> optional_number(const Json& object, const char* key) {
+    if (!object.contains(key) || object.at(key).is_null()) { return std::nullopt; }
+    if (!object.at(key).is_number()) { bad_request(std::string(key) + " must be a number", key); }
+    const double value = object.at(key).get<double>();
+    if (!std::isfinite(value)) { bad_request(std::string(key) + " must be finite", key); }
+    return value;
+}
+
+std::optional<int> optional_int(const Json& object, const char* key) {
+    if (!object.contains(key) || object.at(key).is_null()) { return std::nullopt; }
+    if (!object.at(key).is_number_integer()) {
+        bad_request(std::string(key) + " must be an integer", key);
+    }
+    if (object.at(key).is_number_unsigned()) {
+        const std::uint64_t value = object.at(key).get<std::uint64_t>();
+        if (value > static_cast<std::uint64_t>(std::numeric_limits<int>::max())) {
+            bad_request(std::string(key) + " is out of range", key);
+        }
+        return static_cast<int>(value);
+    }
+    const std::int64_t value = object.at(key).get<std::int64_t>();
+    if (value < std::numeric_limits<int>::min() || value > std::numeric_limits<int>::max()) {
+        bad_request(std::string(key) + " is out of range", key);
+    }
+    return static_cast<int>(value);
+}
+
+void require_string_hint(const Json& body, const char* key, std::size_t max_bytes = 0) {
+    if (!body.contains(key) || body.at(key).is_null()) { return; }
+    if (!body.at(key).is_string()) { bad_request(std::string(key) + " must be a string", key); }
+    if (max_bytes != 0 && body.at(key).get_ref<const std::string&>().size() > max_bytes) {
+        bad_request(std::string(key) + " exceeds its maximum length", key, "invalid_value");
+    }
+}
+
+bool valid_function_name(std::string_view name) {
+    if (name.empty() || name.size() > 64) { return false; }
+    for (const unsigned char byte : name) {
+        if (std::isalnum(byte) == 0 && byte != '_' && byte != '-') { return false; }
+    }
+    return true;
+}
+
+std::string require_function_name(const Json& object, const char* param) {
+    if (!object.contains("name") || !object.at("name").is_string()) {
+        bad_request("function name must be a string", param);
+    }
+    const std::string name = object.at("name").get<std::string>();
+    if (!valid_function_name(name)) {
+        bad_request("function name must match [A-Za-z0-9_-]{1,64}", param);
+    }
+    return name;
+}
+
+std::string item_id(const Json& item, const char* prefix) {
+    if (!item.contains("id") || item.at("id").is_null()) {
+        return new_openai_response_item_id(prefix);
+    }
+    if (!item.at("id").is_string() || item.at("id").get_ref<const std::string&>().empty()) {
+        bad_request("input Item id must be a non-empty string", "input");
+    }
+    return item.at("id").get<std::string>();
+}
+
+bool prompt_cache_breakpoint(const Json& value) {
+    if (!value.contains("prompt_cache_breakpoint") ||
+        value.at("prompt_cache_breakpoint").is_null()) {
+        return false;
+    }
+    const Json& breakpoint = value.at("prompt_cache_breakpoint");
+    if (!breakpoint.is_object() || breakpoint.size() != 1 || !breakpoint.contains("mode") ||
+        !breakpoint.at("mode").is_string() ||
+        breakpoint.at("mode").get<std::string>() != "explicit") {
+        bad_request("prompt_cache_breakpoint must be {mode:'explicit'}", "input",
+                    "invalid_cache_breakpoint");
+    }
+    return true;
+}
+
+ninfer::product::media_acquire::Source parse_image_source(const Json& part) {
+    if (part.contains("file_id") && !part.at("file_id").is_null()) {
+        bad_request("input_image.file_id requires a Files API, which NInfer does not provide",
+                    "input", "file_inputs_not_supported");
+    }
+    if (!part.contains("image_url") || !part.at("image_url").is_string() ||
+        part.at("image_url").get_ref<const std::string&>().empty()) {
+        bad_request("input_image must contain a non-empty image_url", "input");
+    }
+    if (part.contains("detail") && !part.at("detail").is_null()) {
+        if (!part.at("detail").is_string()) {
+            bad_request("input_image.detail must be a string", "input");
+        }
+        if (part.at("detail").get<std::string>() != "auto") {
+            bad_request("only input_image detail 'auto' is supported", "input",
+                        "image_detail_not_supported");
+        }
+    }
+
+    ninfer::product::media_acquire::Source source;
+    source.value = part.at("image_url").get<std::string>();
+    if (source.value.starts_with("data:")) {
+        source.kind = ninfer::product::media_acquire::SourceKind::Data;
+    } else if (source.value.starts_with("http://") || source.value.starts_with("https://")) {
+        source.kind = ninfer::product::media_acquire::SourceKind::Url;
+    } else {
+        bad_request("input_image.image_url must use HTTP(S) or a data URI", "input");
+    }
+    return source;
+}
+
+ninfer::product::media_acquire::Source parse_video_source(const Json& part) {
+    if (!part.contains("video_url") || !part.at("video_url").is_string() ||
+        part.at("video_url").get_ref<const std::string&>().empty()) {
+        bad_request("input_video must contain a non-empty video_url", "input");
+    }
+    ninfer::product::media_acquire::Source source;
+    source.value = part.at("video_url").get<std::string>();
+    if (source.value.starts_with("data:")) {
+        source.kind = ninfer::product::media_acquire::SourceKind::Data;
+    } else if (source.value.starts_with("http://") || source.value.starts_with("https://")) {
+        source.kind = ninfer::product::media_acquire::SourceKind::Url;
+    } else {
+        bad_request("input_video.video_url must use HTTP(S) or a data URI", "input");
+    }
+    return source;
+}
+
+void apply_shared_breakpoint(ContentPart& part, const Json& wire, std::size_t& breakpoint_count) {
+    if (!prompt_cache_breakpoint(wire)) { return; }
+    ++breakpoint_count;
+    if (breakpoint_count > 4) {
+        bad_request("at most four prompt_cache_breakpoint values are supported per request",
+                    "input", "too_many_cache_breakpoints");
+    }
+    part.cache_boundary_after = ninfer::PromptCacheMarkerKind::SharedStablePrefix;
+}
+
+struct ParsedMessage {
+    ChatTurn turn;
+    Json canonical;
+};
+
+ParsedMessage parse_message_item(const Json& item, std::size_t index,
+                                 std::size_t& breakpoint_count) {
+    if (!item.contains("role") || !item.at("role").is_string()) {
+        bad_request("input message " + std::to_string(index) + " must contain a string role",
+                    "input");
+    }
+    const std::string role = item.at("role").get<std::string>();
+    ChatRole parsed_role;
+    if (role == "user") {
+        parsed_role = ChatRole::User;
+    } else if (role == "assistant") {
+        parsed_role = ChatRole::Assistant;
+    } else if (role == "system") {
+        parsed_role = ChatRole::System;
+    } else if (role == "developer") {
+        parsed_role = ChatRole::Developer;
+    } else {
+        bad_request("unsupported input message role: " + role, "input", "unsupported_role");
+    }
+
+    if (item.contains("status") && !item.at("status").is_null() && !item.at("status").is_string()) {
+        bad_request("input message status must be a string", "input");
+    }
+    if (item.contains("phase") && !item.at("phase").is_null() && !item.at("phase").is_string()) {
+        bad_request("input message phase must be a string", "input");
+    }
+    if (!item.contains("content") || item.at("content").is_null()) {
+        bad_request("input message " + std::to_string(index) + " must contain content", "input");
+    }
+
+    ParsedMessage parsed;
+    parsed.turn.role       = parsed_role;
+    Json content           = Json::array();
+    const auto append_text = [&](const std::string& text, const std::string& wire_type,
+                                 const Json* wire) {
+        ContentPart part;
+        part.kind     = ContentKind::Text;
+        part.text     = text;
+        part.type_raw = wire_type;
+        if (wire != nullptr) { apply_shared_breakpoint(part, *wire, breakpoint_count); }
+        parsed.turn.content.push_back(std::move(part));
+
+        Json canonical;
+        if (wire_type == "refusal") {
+            canonical = Json{{"type", "refusal"}, {"refusal", text}};
+        } else {
+            canonical = Json{{"type", wire_type}, {"text", text}};
+            if (wire_type == "output_text") {
+                canonical["annotations"] = wire != nullptr && wire->contains("annotations")
+                                               ? wire->at("annotations")
+                                               : Json::array();
+                if (wire != nullptr && wire->contains("logprobs")) {
+                    canonical["logprobs"] = wire->at("logprobs");
+                }
+            }
+        }
+        if (wire != nullptr && wire->contains("prompt_cache_breakpoint")) {
+            canonical["prompt_cache_breakpoint"] = wire->at("prompt_cache_breakpoint");
+        }
+        content.push_back(std::move(canonical));
+    };
+
+    if (item.at("content").is_string()) {
+        append_text(item.at("content").get<std::string>(),
+                    parsed_role == ChatRole::Assistant ? "output_text" : "input_text", nullptr);
+    } else if (item.at("content").is_array()) {
+        for (const Json& value : item.at("content")) {
+            if (!value.is_object() || !value.contains("type") || !value.at("type").is_string()) {
+                bad_request("input message content parts must have a string type", "input");
+            }
+            const std::string type = value.at("type").get<std::string>();
+            if (type == "input_text") {
+                if (!value.contains("text") || !value.at("text").is_string()) {
+                    bad_request("input_text must contain a string text", "input");
+                }
+                append_text(value.at("text").get<std::string>(), type, &value);
+            } else if (type == "output_text") {
+                if (parsed_role != ChatRole::Assistant) {
+                    bad_request("output_text is only valid on assistant messages", "input");
+                }
+                if (!value.contains("text") || !value.at("text").is_string()) {
+                    bad_request("output_text must contain a string text", "input");
+                }
+                if (value.contains("annotations") && !value.at("annotations").is_null() &&
+                    !value.at("annotations").is_array()) {
+                    bad_request("output_text.annotations must be an array", "input");
+                }
+                if (value.contains("logprobs") && !value.at("logprobs").is_null() &&
+                    !value.at("logprobs").is_array()) {
+                    bad_request("output_text.logprobs must be an array", "input");
+                }
+                append_text(value.at("text").get<std::string>(), type, &value);
+            } else if (type == "refusal") {
+                if (parsed_role != ChatRole::Assistant) {
+                    bad_request("refusal is only valid on assistant messages", "input");
+                }
+                if (!value.contains("refusal") || !value.at("refusal").is_string()) {
+                    bad_request("refusal must contain a string refusal", "input");
+                }
+                append_text(value.at("refusal").get<std::string>(), type, &value);
+            } else if (type == "input_image") {
+                if (parsed_role != ChatRole::User && parsed_role != ChatRole::Assistant) {
+                    bad_request("input_image is only supported on user or assistant messages",
+                                "input");
+                }
+                ContentPart part;
+                part.kind     = ContentKind::Image;
+                part.type_raw = type;
+                part.source   = parse_image_source(value);
+                apply_shared_breakpoint(part, value, breakpoint_count);
+                parsed.turn.content.push_back(std::move(part));
+                Json canonical{{"type", "input_image"},
+                               {"image_url", value.at("image_url")},
+                               {"detail", "auto"}};
+                if (value.contains("prompt_cache_breakpoint")) {
+                    canonical["prompt_cache_breakpoint"] = value.at("prompt_cache_breakpoint");
+                }
+                content.push_back(std::move(canonical));
+            } else if (type == "input_video") {
+                if (parsed_role != ChatRole::User) {
+                    bad_request("input_video is only supported on user messages", "input");
+                }
+                ContentPart part;
+                part.kind     = ContentKind::Video;
+                part.type_raw = type;
+                part.source   = parse_video_source(value);
+                parsed.turn.content.push_back(std::move(part));
+                content.push_back(
+                    Json{{"type", "input_video"}, {"video_url", value.at("video_url")}});
+            } else if (type == "input_file") {
+                bad_request("input_file requires a Files API, which NInfer does not provide",
+                            "input", "file_inputs_not_supported");
+            } else if (type == "input_audio") {
+                bad_request("input_audio is not supported by the Engine", "input",
+                            "audio_inputs_not_supported");
+            } else {
+                bad_request("unsupported message content type: " + type, "input",
+                            "modality_not_supported");
+            }
+        }
+    } else {
+        bad_request("input message content must be a string or array", "input");
+    }
+    if (parsed.turn.content.empty()) {
+        bad_request("input message content must not be empty", "input");
+    }
+
+    parsed.canonical = {{"id", item_id(item, "msg")},
+                        {"type", "message"},
+                        {"role", role},
+                        {"content", std::move(content)}};
+    if (item.contains("status") && !item.at("status").is_null()) {
+        parsed.canonical["status"] = item.at("status");
+    }
+    if (item.contains("phase") && !item.at("phase").is_null()) {
+        parsed.canonical["phase"] = item.at("phase");
+    }
+    return parsed;
+}
+
+std::string parse_reasoning_item(const Json& item, Json& canonical) {
+    const bool has_encrypted =
+        item.contains("encrypted_content") && !item.at("encrypted_content").is_null();
+    if (has_encrypted && !item.at("encrypted_content").is_string()) {
+        bad_request("reasoning encrypted_content must be a string", "input");
+    }
+    if (item.contains("summary") && !item.at("summary").is_null() &&
+        !item.at("summary").is_array()) {
+        bad_request("reasoning summary must be an array", "input");
+    }
+    if (!item.contains("content") || !item.at("content").is_array()) {
+        bad_request("reasoning Item must contain a content array", "input");
+    }
+
+    std::string text;
+    Json content = Json::array();
+    for (const Json& part : item.at("content")) {
+        if (!part.is_object() || !part.contains("type") || !part.at("type").is_string() ||
+            part.at("type").get<std::string>() != "reasoning_text" || !part.contains("text") ||
+            !part.at("text").is_string()) {
+            bad_request("reasoning content only supports reasoning_text parts", "input");
+        }
+        text += part.at("text").get<std::string>();
+        content.push_back(Json{{"type", "reasoning_text"}, {"text", part.at("text")}});
+    }
+    if (text.empty() &&
+        (has_encrypted || (item.contains("summary") && !item.at("summary").is_null() &&
+                           !item.at("summary").empty()))) {
+        bad_request("reasoning Items require raw reasoning_text; summary or encrypted content "
+                    "cannot reconstruct the model context",
+                    "input", "reasoning_content_not_supported");
+    }
+
+    canonical = {{"id", item_id(item, "rs")},
+                 {"type", "reasoning"},
+                 {"summary", item.contains("summary") && !item.at("summary").is_null()
+                                 ? item.at("summary")
+                                 : Json::array()},
+                 {"content", std::move(content)}};
+    if (has_encrypted) { canonical["encrypted_content"] = item.at("encrypted_content"); }
+    return text;
+}
+
+void reject_nonnull_unknown_members(const Json& object,
+                                    const std::unordered_set<std::string>& allowed,
+                                    const char* param) {
+    for (auto iterator = object.begin(); iterator != object.end(); ++iterator) {
+        if (!allowed.contains(iterator.key()) && !iterator.value().is_null()) {
+            bad_request("unsupported " + std::string(param) + " member: " + iterator.key(), param,
+                        "parameter_not_supported");
+        }
+    }
+}
+
+ToolCall parse_function_call_item(const Json& item, Json& canonical) {
+    static const std::unordered_set<std::string> allowed = {
+        "id", "type", "call_id", "name", "arguments", "status", "caller", "namespace"};
+    reject_nonnull_unknown_members(item, allowed, "input");
+    for (const char* key : {"caller", "namespace"}) {
+        if (item.contains(key) && !item.at(key).is_null()) {
+            bad_request("function_call." + std::string(key) + " is not supported", "input",
+                        "tool_relationship_not_supported");
+        }
+    }
+
+    ToolCall call;
+    if (!item.contains("call_id") || !item.at("call_id").is_string() ||
+        item.at("call_id").get_ref<const std::string&>().empty()) {
+        bad_request("function_call must contain a non-empty call_id", "input");
+    }
+    call.id   = item.at("call_id").get<std::string>();
+    call.name = require_function_name(item, "input");
+    if (!item.contains("arguments") || !item.at("arguments").is_string()) {
+        bad_request("function_call arguments must be a JSON string", "input");
+    }
+    call.arguments_json  = item.at("arguments").get<std::string>();
+    const Json arguments = Json::parse(call.arguments_json, nullptr, false);
+    if (arguments.is_discarded() || !arguments.is_object()) {
+        bad_request("function_call arguments must encode a JSON object", "input");
+    }
+    if (item.contains("status") && !item.at("status").is_null() &&
+        (!item.at("status").is_string() || item.at("status").get<std::string>() != "completed")) {
+        bad_request("partial function_call Items cannot be represented in model history", "input",
+                    "partial_tool_call_not_supported");
+    }
+    canonical = {{"id", item_id(item, "fc")}, {"type", "function_call"},
+                 {"status", "completed"},     {"call_id", call.id},
+                 {"name", call.name},         {"arguments", call.arguments_json}};
+    return call;
+}
+
+ContentPart tool_output_text(std::string text, const Json* wire, std::size_t& breakpoint_count) {
+    ContentPart part;
+    part.kind     = ContentKind::Text;
+    part.type_raw = "input_text";
+    part.text     = std::move(text);
+    if (wire != nullptr) { apply_shared_breakpoint(part, *wire, breakpoint_count); }
+    return part;
+}
+
+ChatTurn parse_function_call_output_item(const Json& item, Json& canonical,
+                                         std::size_t& breakpoint_count) {
+    static const std::unordered_set<std::string> allowed = {
+        "id", "type", "call_id", "output", "status", "caller", "name", "namespace"};
+    reject_nonnull_unknown_members(item, allowed, "input");
+    for (const char* key : {"caller", "name", "namespace"}) {
+        if (item.contains(key) && !item.at(key).is_null()) {
+            bad_request("function_call_output." + std::string(key) + " is not supported", "input",
+                        "tool_relationship_not_supported");
+        }
+    }
+    if (!item.contains("call_id") || !item.at("call_id").is_string() ||
+        item.at("call_id").get_ref<const std::string&>().empty()) {
+        bad_request("function_call_output must contain a non-empty call_id", "input");
+    }
+    if (!item.contains("output")) {
+        bad_request("function_call_output must contain output", "input");
+    }
+    if (item.contains("status") && !item.at("status").is_null() &&
+        (!item.at("status").is_string() || item.at("status").get<std::string>() != "completed")) {
+        bad_request("partial function_call_output Items cannot be represented in model history",
+                    "input", "partial_tool_result_not_supported");
+    }
+
+    ChatTurn turn;
+    turn.role         = ChatRole::Tool;
+    turn.tool_call_id = item.at("call_id").get<std::string>();
+    if (item.at("output").is_string()) {
+        turn.content.push_back(
+            tool_output_text(item.at("output").get<std::string>(), nullptr, breakpoint_count));
+    } else if (item.at("output").is_array()) {
+        for (const Json& value : item.at("output")) {
+            if (!value.is_object() || !value.contains("type") || !value.at("type").is_string()) {
+                bad_request("function_call_output content parts must have a string type", "input");
+            }
+            const std::string type = value.at("type").get<std::string>();
+            if (type == "input_text") {
+                if (!value.contains("text") || !value.at("text").is_string()) {
+                    bad_request("tool result input_text must contain a string text", "input");
+                }
+                turn.content.push_back(tool_output_text(value.at("text").get<std::string>(), &value,
+                                                        breakpoint_count));
+            } else if (type == "input_image") {
+                ContentPart part;
+                part.kind     = ContentKind::Image;
+                part.type_raw = type;
+                part.source   = parse_image_source(value);
+                apply_shared_breakpoint(part, value, breakpoint_count);
+                turn.content.push_back(std::move(part));
+            } else if (type == "input_file") {
+                bad_request("tool result input_file requires a Files API", "input",
+                            "file_inputs_not_supported");
+            } else {
+                bad_request("unsupported function_call_output content type: " + type, "input",
+                            "modality_not_supported");
+            }
+        }
+        if (turn.content.empty()) {
+            bad_request("function_call_output content must not be empty", "input");
+        }
+    } else {
+        bad_request("function_call_output output must be a string or content array", "input");
+    }
+
+    canonical = {{"id", item_id(item, "fco")},
+                 {"type", "function_call_output"},
+                 {"status", "completed"},
+                 {"call_id", turn.tool_call_id},
+                 {"output", item.at("output")}};
+    return turn;
+}
+
+void parse_input(const Json& input, OpenAIResponsesPromptRequest& out) {
+    Json values;
+    if (input.is_string()) {
+        values = Json::array({Json{{"type", "message"}, {"role", "user"}, {"content", input}}});
+    } else if (input.is_array()) {
+        values = input;
+    } else {
+        bad_request("input must be a string or an array of Items", "input");
+    }
+
+    std::string pending_reasoning;
+    bool pending_reasoning_present = false;
+    bool can_group_function_calls  = false;
+    std::size_t breakpoint_count   = 0;
+    std::unordered_set<std::string> item_ids;
+    for (std::size_t index = 0; index < values.size(); ++index) {
+        const Json& item = values.at(index);
+        if (!item.is_object()) {
+            bad_request("input Item " + std::to_string(index) + " must be an object", "input");
+        }
+        std::string type;
+        if (item.contains("type") && !item.at("type").is_null()) {
+            if (!item.at("type").is_string()) {
+                bad_request("input Item type must be a string", "input");
+            }
+            type = item.at("type").get<std::string>();
+        } else if (item.contains("role")) {
+            type = "message";
+        } else {
+            bad_request("input Item must contain type", "input");
+        }
+
+        Json canonical;
+        if (type == "message") {
+            ParsedMessage message = parse_message_item(item, index, breakpoint_count);
+            if (pending_reasoning_present) {
+                if (message.turn.role != ChatRole::Assistant) {
+                    bad_request("a reasoning Item must be followed by an assistant output Item",
+                                "input");
+                }
+                message.turn.reasoning_content = std::move(pending_reasoning);
+                pending_reasoning.clear();
+                pending_reasoning_present = false;
+            }
+            out.input_turns.push_back(std::move(message.turn));
+            canonical                = std::move(message.canonical);
+            can_group_function_calls = false;
+        } else if (type == "reasoning") {
+            if (pending_reasoning_present) {
+                bad_request("adjacent reasoning Items are not supported", "input");
+            }
+            pending_reasoning         = parse_reasoning_item(item, canonical);
+            pending_reasoning_present = true;
+            can_group_function_calls  = false;
+        } else if (type == "function_call") {
+            ToolCall call = parse_function_call_item(item, canonical);
+            if (can_group_function_calls && !pending_reasoning_present &&
+                !out.input_turns.empty() && out.input_turns.back().role == ChatRole::Assistant &&
+                out.input_turns.back().content.empty() &&
+                !out.input_turns.back().tool_calls.empty()) {
+                out.input_turns.back().tool_calls.push_back(std::move(call));
+            } else {
+                ChatTurn turn;
+                turn.role              = ChatRole::Assistant;
+                turn.reasoning_content = std::move(pending_reasoning);
+                pending_reasoning.clear();
+                pending_reasoning_present = false;
+                turn.tool_calls.push_back(std::move(call));
+                out.input_turns.push_back(std::move(turn));
+            }
+            can_group_function_calls = true;
+        } else if (type == "function_call_output") {
+            if (pending_reasoning_present) {
+                bad_request("a reasoning Item must be followed by an assistant output Item",
+                            "input");
+            }
+            out.input_turns.push_back(
+                parse_function_call_output_item(item, canonical, breakpoint_count));
+            can_group_function_calls = false;
+        } else if (type == "input_file") {
+            bad_request("input_file requires a Files API, which NInfer does not provide", "input",
+                        "file_inputs_not_supported");
+        } else {
+            bad_request("unsupported input Item type: " + type, "input", "item_type_not_supported");
+        }
+
+        const std::string id = canonical.at("id").get<std::string>();
+        if (!item_ids.insert(id).second) { bad_request("duplicate input Item id: " + id, "input"); }
+        out.input_items.push_back(std::move(canonical));
+    }
+    if (pending_reasoning_present) {
+        bad_request("a reasoning Item must be followed by an assistant output Item", "input");
+    }
+}
+
+struct ParsedPromptFields {
+    OpenAIResponsesPromptRequest prompt;
+    Json wire_tools          = Json::array();
+    Json wire_tool_choice    = "auto";
+    bool parallel_tool_calls = true;
+};
+
+void parse_tools(const Json& body, ParsedPromptFields& out) {
+    if (!body.contains("tools") || body.at("tools").is_null()) { return; }
+    if (!body.at("tools").is_array()) { bad_request("tools must be an array", "tools"); }
+
+    static const std::unordered_set<std::string> allowed_members = {
+        "type",          "name",         "description", "parameters", "strict", "allowed_callers",
+        "defer_loading", "output_schema"};
+    std::unordered_set<std::string> names;
+    for (const Json& item : body.at("tools")) {
+        if (!item.is_object() || !item.contains("type") || !item.at("type").is_string()) {
+            bad_request("tools entries must be objects with a string type", "tools");
+        }
+        if (item.at("type").get<std::string>() != "function") {
+            bad_request("tool type '" + item.at("type").get<std::string>() +
+                            "' requires an executor that NInfer does not provide",
+                        "tools", "tool_type_not_supported");
+        }
+        reject_nonnull_unknown_members(item, allowed_members, "tools");
+
+        ToolDefinition tool;
+        tool.name = require_function_name(item, "tools");
+        if (!names.insert(tool.name).second) {
+            bad_request("duplicate function tool name: " + tool.name, "tools");
+        }
+        if (item.contains("description") && !item.at("description").is_null()) {
+            if (!item.at("description").is_string()) {
+                bad_request("function description must be a string", "tools");
+            }
+            tool.description = item.at("description").get<std::string>();
+        }
+        Json parameters = Json{{"type", "object"}, {"properties", Json::object()}};
+        if (item.contains("parameters") && !item.at("parameters").is_null()) {
+            if (!item.at("parameters").is_object()) {
+                bad_request("function parameters must be a JSON object", "tools");
+            }
+            parameters = item.at("parameters");
+        }
+        if (item.contains("strict") && !item.at("strict").is_null()) {
+            if (!item.at("strict").is_boolean()) {
+                bad_request("function strict must be a boolean", "tools");
+            }
+            if (item.at("strict").get<bool>()) {
+                bad_request("strict function schema enforcement requires constrained decoding, "
+                            "which the Engine does not provide",
+                            "tools", "strict_tools_not_supported");
+            }
+        }
+        if (item.contains("defer_loading") && !item.at("defer_loading").is_null()) {
+            if (!item.at("defer_loading").is_boolean()) {
+                bad_request("function defer_loading must be a boolean", "tools");
+            }
+            if (item.at("defer_loading").get<bool>()) {
+                bad_request("deferred tool loading is not supported", "tools",
+                            "deferred_tools_not_supported");
+            }
+        }
+        if (item.contains("allowed_callers") && !item.at("allowed_callers").is_null()) {
+            const Json& callers = item.at("allowed_callers");
+            if (!callers.is_array()) {
+                bad_request("function allowed_callers must be an array", "tools");
+            }
+            bool direct = false;
+            for (const Json& caller : callers) {
+                if (!caller.is_string()) {
+                    bad_request("function allowed_callers entries must be strings", "tools");
+                }
+                direct = direct || caller.get<std::string>() == "direct";
+            }
+            if (!direct) {
+                bad_request("function allowed_callers must permit direct invocation", "tools",
+                            "tool_caller_not_supported");
+            }
+        }
+        if (item.contains("output_schema") && !item.at("output_schema").is_null()) {
+            bad_request("function output_schema cannot be enforced", "tools",
+                        "tool_output_schema_not_supported");
+        }
+
+        tool.input_schema_json = parameters.dump();
+        Json canonical         = {{"type", "function"},
+                                  {"name", tool.name},
+                                  {"parameters", parameters},
+                                  {"strict", false}};
+        if (!tool.description.empty()) { canonical["description"] = tool.description; }
+        if (item.contains("allowed_callers") && !item.at("allowed_callers").is_null()) {
+            canonical["allowed_callers"] = item.at("allowed_callers");
+        }
+        if (item.contains("defer_loading") && !item.at("defer_loading").is_null()) {
+            canonical["defer_loading"] = false;
+        }
+        out.prompt.generation.tools.push_back(std::move(tool));
+        out.wire_tools.push_back(std::move(canonical));
+    }
+}
+
+void filter_allowed_tools(const Json& choice, ParsedPromptFields& out) {
+    static const std::unordered_set<std::string> allowed_choice = {"type", "mode", "tools"};
+    reject_nonnull_unknown_members(choice, allowed_choice, "tool_choice");
+    if (!choice.contains("mode") || !choice.at("mode").is_string()) {
+        bad_request("allowed_tools tool_choice must contain a string mode", "tool_choice");
+    }
+    if (choice.at("mode").get<std::string>() != "auto") {
+        bad_request("allowed_tools mode 'required' cannot be enforced", "tool_choice",
+                    "tool_choice_not_supported");
+    }
+    if (!choice.contains("tools") || !choice.at("tools").is_array()) {
+        bad_request("allowed_tools tool_choice must contain a tools array", "tool_choice");
+    }
+
+    std::unordered_set<std::string> declared;
+    for (const ToolDefinition& tool : out.prompt.generation.tools) { declared.insert(tool.name); }
+    std::unordered_set<std::string> selected;
+    for (const Json& item : choice.at("tools")) {
+        if (!item.is_object() || !item.contains("type") || !item.at("type").is_string() ||
+            item.at("type").get<std::string>() != "function") {
+            bad_request("allowed_tools only supports function entries", "tool_choice",
+                        "tool_choice_not_supported");
+        }
+        static const std::unordered_set<std::string> allowed_entry = {"type", "name"};
+        reject_nonnull_unknown_members(item, allowed_entry, "tool_choice");
+        const std::string name = require_function_name(item, "tool_choice");
+        if (!declared.contains(name)) {
+            bad_request("allowed_tools references undeclared function '" + name + "'",
+                        "tool_choice", "invalid_tool_choice");
+        }
+        selected.insert(name);
+    }
+
+    std::vector<ToolDefinition> effective;
+    effective.reserve(selected.size());
+    for (ToolDefinition& tool : out.prompt.generation.tools) {
+        if (selected.contains(tool.name)) { effective.push_back(std::move(tool)); }
+    }
+    out.prompt.generation.tools = std::move(effective);
+}
+
+void parse_tool_choice(const Json& body, ParsedPromptFields& out) {
+    if (!body.contains("tool_choice") || body.at("tool_choice").is_null()) {
+        out.wire_tool_choice = "auto";
+        return;
+    }
+    const Json& choice = body.at("tool_choice");
+    if (choice.is_string()) {
+        const std::string value = choice.get<std::string>();
+        if (value == "auto") {
+            out.prompt.generation.tool_choice.mode = ToolChoiceMode::Auto;
+        } else if (value == "none") {
+            out.prompt.generation.tool_choice.mode = ToolChoiceMode::None;
+        } else if (value == "required") {
+            bad_request("tool_choice 'required' cannot be guaranteed by the Engine", "tool_choice",
+                        "tool_choice_not_supported");
+        } else {
+            bad_request("tool_choice must be 'auto', 'none', or a supported object", "tool_choice");
+        }
+        out.wire_tool_choice = value;
+        return;
+    }
+    if (!choice.is_object() || !choice.contains("type") || !choice.at("type").is_string()) {
+        bad_request("tool_choice must be a string or typed object", "tool_choice");
+    }
+    if (choice.at("type").get<std::string>() != "allowed_tools") {
+        bad_request("named or hosted tool_choice cannot be enforced", "tool_choice",
+                    "tool_choice_not_supported");
+    }
+    filter_allowed_tools(choice, out);
+    out.wire_tool_choice = choice;
+}
+
+void parse_reasoning(const Json& body, OpenAIResponsesPromptRequest& out) {
+    if (!body.contains("reasoning") || body.at("reasoning").is_null()) { return; }
+    const Json& reasoning = body.at("reasoning");
+    if (!reasoning.is_object()) { bad_request("reasoning must be an object", "reasoning"); }
+    static const std::unordered_set<std::string> allowed = {"effort", "context", "summary",
+                                                            "generate_summary", "mode"};
+    reject_nonnull_unknown_members(reasoning, allowed, "reasoning");
+    for (const char* key : {"context", "summary", "generate_summary", "mode"}) {
+        if (reasoning.contains(key) && !reasoning.at(key).is_null()) {
+            bad_request("reasoning." + std::string(key) +
+                            " changes reasoning input or output and is not supported",
+                        "reasoning", "reasoning_option_not_supported");
+        }
+    }
+    if (!reasoning.contains("effort") || reasoning.at("effort").is_null()) { return; }
+    if (!reasoning.at("effort").is_string()) {
+        bad_request("reasoning.effort must be a string", "reasoning");
+    }
+    const std::string value = reasoning.at("effort").get<std::string>();
+    const std::optional<RequestedReasoningEffort> effort = parse_requested_reasoning_effort(value);
+    if (!effort) {
+        bad_request("reasoning.effort must be one of none, minimal, low, medium, high, xhigh, or "
+                    "max",
+                    "reasoning");
+    }
+    out.generation.reasoning_effort = *effort;
+}
+
+void parse_text(const Json& body) {
+    if (!body.contains("text") || body.at("text").is_null()) { return; }
+    const Json& text = body.at("text");
+    if (!text.is_object()) { bad_request("text must be an object", "text"); }
+    static const std::unordered_set<std::string> allowed = {"format", "verbosity"};
+    reject_nonnull_unknown_members(text, allowed, "text");
+    if (text.contains("format") && !text.at("format").is_null()) {
+        const Json& format = text.at("format");
+        if (!format.is_object() || !format.contains("type") || !format.at("type").is_string()) {
+            bad_request("text.format must be a typed object", "text");
+        }
+        if (format.at("type").get<std::string>() != "text" || format.size() != 1) {
+            bad_request("structured text output requires constrained decoding, which the Engine "
+                        "does not provide",
+                        "text", "structured_outputs_not_supported");
+        }
+    }
+    if (text.contains("verbosity") && !text.at("verbosity").is_null()) {
+        if (!text.at("verbosity").is_string()) {
+            bad_request("text.verbosity must be a string", "text");
+        }
+        const std::string verbosity = text.at("verbosity").get<std::string>();
+        if (verbosity != "medium") {
+            bad_request("text.verbosity '" + verbosity + "' cannot be enforced by the Engine",
+                        "text", "verbosity_not_supported");
+        }
+    }
+}
+
+void parse_preserve_thinking(const Json& body, OpenAIResponsesPromptRequest& out) {
+    if (body.contains("preserve_thinking") && !body.at("preserve_thinking").is_null()) {
+        if (!body.at("preserve_thinking").is_boolean()) {
+            bad_request("preserve_thinking must be a boolean or null", "preserve_thinking");
+        }
+        out.generation.preserve_thinking = body.at("preserve_thinking").get<bool>();
+    }
+    if (!body.contains("chat_template_kwargs") || body.at("chat_template_kwargs").is_null()) {
+        return;
+    }
+    const Json& kwargs = body.at("chat_template_kwargs");
+    if (!kwargs.is_object()) {
+        bad_request("chat_template_kwargs must be an object", "chat_template_kwargs");
+    }
+    for (auto iterator = kwargs.begin(); iterator != kwargs.end(); ++iterator) {
+        if (iterator.key() != "preserve_thinking" && !iterator.value().is_null()) {
+            bad_request("chat_template_kwargs." + iterator.key() + " is not supported",
+                        "chat_template_kwargs", "chat_template_option_not_supported");
+        }
+    }
+    if (!kwargs.contains("preserve_thinking") || kwargs.at("preserve_thinking").is_null()) {
+        return;
+    }
+    if (!kwargs.at("preserve_thinking").is_boolean()) {
+        bad_request("chat_template_kwargs.preserve_thinking must be a boolean or null",
+                    "chat_template_kwargs");
+    }
+    const bool nested = kwargs.at("preserve_thinking").get<bool>();
+    if (out.generation.preserve_thinking && *out.generation.preserve_thinking != nested) {
+        bad_request("conflicting preserve_thinking values", "preserve_thinking",
+                    "conflicting_template_option");
+    }
+    out.generation.preserve_thinking = nested;
+}
+
+void parse_truncation(const Json& body) {
+    if (!body.contains("truncation") || body.at("truncation").is_null()) { return; }
+    if (!body.at("truncation").is_string()) {
+        bad_request("truncation must be a string", "truncation");
+    }
+    if (body.at("truncation").get<std::string>() != "disabled") {
+        bad_request("truncation 'auto' would discard input Items and is not supported",
+                    "truncation", "truncation_not_supported");
+    }
+}
+
+ParsedPromptFields parse_prompt_fields(const Json& body, const RequestLimits& limits) {
+    ParsedPromptFields out;
+    if (!body.contains("model") || !body.at("model").is_string() ||
+        body.at("model").get_ref<const std::string&>().empty()) {
+        bad_request("missing required field: model", "model");
+    }
+    out.prompt.model = body.at("model").get<std::string>();
+    if (body.contains("input") && !body.at("input").is_null()) {
+        parse_input(body.at("input"), out.prompt);
+    }
+    if (body.contains("instructions") && !body.at("instructions").is_null()) {
+        if (!body.at("instructions").is_string()) {
+            bad_request("instructions must be a string", "instructions");
+        }
+        out.prompt.instructions = body.at("instructions").get<std::string>();
+    }
+    if (body.contains("previous_response_id") && !body.at("previous_response_id").is_null()) {
+        if (!body.at("previous_response_id").is_string() ||
+            body.at("previous_response_id").get_ref<const std::string&>().empty()) {
+            bad_request("previous_response_id must be a non-empty string", "previous_response_id");
+        }
+        out.prompt.previous_response_id = body.at("previous_response_id").get<std::string>();
+    }
+
+    parse_tools(body, out);
+    parse_tool_choice(body, out);
+    out.parallel_tool_calls = optional_bool(body, "parallel_tool_calls", true);
+    if (!out.parallel_tool_calls && out.prompt.generation.uses_tools()) {
+        bad_request("parallel_tool_calls=false cannot be guaranteed when callable tools are "
+                    "present",
+                    "parallel_tool_calls", "parallel_tool_calls_not_supported");
+    }
+    parse_reasoning(body, out.prompt);
+    parse_text(body);
+    parse_truncation(body);
+    parse_preserve_thinking(body, out.prompt);
+    out.prompt.generation.max_tokens = limits.default_max_tokens;
+    return out;
+}
+
+void validate_metadata(const Json& body, Json& metadata) {
+    if (!body.contains("metadata") || body.at("metadata").is_null()) { return; }
+    if (!body.at("metadata").is_object()) { bad_request("metadata must be an object", "metadata"); }
+    if (body.at("metadata").size() > 16) {
+        bad_request("metadata supports at most 16 entries", "metadata");
+    }
+    for (auto iterator = body.at("metadata").begin(); iterator != body.at("metadata").end();
+         ++iterator) {
+        if (iterator.key().size() > 64 || !iterator.value().is_string() ||
+            iterator.value().get_ref<const std::string&>().size() > 512) {
+            bad_request("metadata keys must be at most 64 characters and string values at most "
+                        "512 characters",
+                        "metadata");
+        }
+    }
+    metadata = body.at("metadata");
+}
+
+void parse_prompt_cache_hints(const Json& body) {
+    require_string_hint(body, "prompt_cache_key");
+    require_string_hint(body, "safety_identifier", 64);
+    require_string_hint(body, "user");
+
+    if (body.contains("prompt_cache_retention") && !body.at("prompt_cache_retention").is_null()) {
+        if (!body.at("prompt_cache_retention").is_string()) {
+            bad_request("prompt_cache_retention must be a string", "prompt_cache_retention");
+        }
+        const std::string value = body.at("prompt_cache_retention").get<std::string>();
+        if (value != "in_memory" && value != "24h") {
+            bad_request("prompt_cache_retention must be 'in_memory' or '24h'",
+                        "prompt_cache_retention");
+        }
+    }
+    if (!body.contains("prompt_cache_options") || body.at("prompt_cache_options").is_null()) {
+        return;
+    }
+    const Json& options = body.at("prompt_cache_options");
+    if (!options.is_object()) {
+        bad_request("prompt_cache_options must be an object", "prompt_cache_options");
+    }
+    static const std::unordered_set<std::string> allowed = {"mode", "ttl"};
+    reject_nonnull_unknown_members(options, allowed, "prompt_cache_options");
+    if (options.contains("mode") && !options.at("mode").is_null()) {
+        if (!options.at("mode").is_string()) {
+            bad_request("prompt_cache_options.mode must be a string", "prompt_cache_options");
+        }
+        const std::string mode = options.at("mode").get<std::string>();
+        if (mode != "implicit" && mode != "explicit") {
+            bad_request("prompt_cache_options.mode must be 'implicit' or 'explicit'",
+                        "prompt_cache_options");
+        }
+    }
+    if (options.contains("ttl") && !options.at("ttl").is_null() &&
+        (!options.at("ttl").is_string() || options.at("ttl").get<std::string>() != "30m")) {
+        bad_request("prompt_cache_options.ttl must be '30m'", "prompt_cache_options");
+    }
+}
+
+void reject_unsupported_platform_fields(const Json& body) {
+    const struct {
+        const char* field;
+        const char* code;
+        const char* reason;
+    } unsupported[] = {
+        {"conversation", "conversations_not_supported",
+         "conversation requires an OpenAI Conversations resource"},
+        {"prompt", "prompt_templates_not_supported",
+         "prompt requires an OpenAI prompt-template resource"},
+        {"context_management", "context_management_not_supported",
+         "context_management requires an API compaction pipeline"},
+        {"moderation", "moderation_not_supported",
+         "moderation changes request acceptance and output but no moderator is configured"},
+    };
+
+    for (const auto& entry : unsupported) {
+        if (body.contains(entry.field) && !body.at(entry.field).is_null()) {
+            bad_request(entry.reason, entry.field, entry.code);
+        }
+    }
+}
+
+void validate_common_top_level(const Json& body, bool create) {
+    static const std::unordered_set<std::string> create_fields = {"background",
+                                                                  "chat_template_kwargs",
+                                                                  "context_management",
+                                                                  "conversation",
+                                                                  "include",
+                                                                  "input",
+                                                                  "instructions",
+                                                                  "max_output_tokens",
+                                                                  "max_tool_calls",
+                                                                  "metadata",
+                                                                  "model",
+                                                                  "moderation",
+                                                                  "parallel_tool_calls",
+                                                                  "previous_response_id",
+                                                                  "preserve_thinking",
+                                                                  "prompt",
+                                                                  "prompt_cache_key",
+                                                                  "prompt_cache_options",
+                                                                  "prompt_cache_retention",
+                                                                  "reasoning",
+                                                                  "safety_identifier",
+                                                                  "service_tier",
+                                                                  "store",
+                                                                  "stream",
+                                                                  "stream_options",
+                                                                  "temperature",
+                                                                  "text",
+                                                                  "tool_choice",
+                                                                  "tools",
+                                                                  "top_logprobs",
+                                                                  "top_p",
+                                                                  "truncation",
+                                                                  "user"};
+    static const std::unordered_set<std::string> count_fields  = {"chat_template_kwargs",
+                                                                  "conversation",
+                                                                  "input",
+                                                                  "instructions",
+                                                                  "model",
+                                                                  "parallel_tool_calls",
+                                                                  "personality",
+                                                                  "previous_response_id",
+                                                                  "preserve_thinking",
+                                                                  "reasoning",
+                                                                  "text",
+                                                                  "tool_choice",
+                                                                  "tools",
+                                                                  "truncation"};
+    const auto& allowed = create ? create_fields : count_fields;
+    for (auto iterator = body.begin(); iterator != body.end(); ++iterator) {
+        if (!allowed.contains(iterator.key())) {
+            bad_request("unknown parameter: " + iterator.key(), iterator.key(),
+                        "unknown_parameter");
+        }
+    }
+}
+
+} // namespace
+
+OpenAIResponsesCreateRequest parse_openai_responses_create_request(const Json& body,
+                                                                   const RequestLimits& limits) {
+    require_object(body);
+    validate_common_top_level(body, true);
+    reject_unsupported_platform_fields(body);
+    parse_prompt_cache_hints(body);
+
+    ParsedPromptFields parsed = parse_prompt_fields(body, limits);
+    OpenAIResponsesCreateRequest out;
+    out.prompt              = std::move(parsed.prompt);
+    out.tools               = std::move(parsed.wire_tools);
+    out.tool_choice         = std::move(parsed.wire_tool_choice);
+    out.parallel_tool_calls = parsed.parallel_tool_calls;
+    out.store               = optional_bool(body, "store", true);
+    out.stream              = optional_bool(body, "stream", false);
+    validate_metadata(body, out.metadata);
+
+    if (body.contains("background") && !body.at("background").is_null()) {
+        if (!body.at("background").is_boolean()) {
+            bad_request("background must be a boolean", "background");
+        }
+        if (body.at("background").get<bool>()) {
+            bad_request("background execution is not supported", "background",
+                        "background_not_supported");
+        }
+    }
+    if (body.contains("include") && !body.at("include").is_null()) {
+        if (!body.at("include").is_array()) { bad_request("include must be an array", "include"); }
+        if (!body.at("include").empty()) {
+            bad_request("the requested additional response fields have no available response "
+                        "representation",
+                        "include", "include_not_supported");
+        }
+    }
+    if (body.contains("stream_options") && !body.at("stream_options").is_null()) {
+        const Json& options = body.at("stream_options");
+        if (!options.is_object()) {
+            bad_request("stream_options must be an object", "stream_options");
+        }
+        static const std::unordered_set<std::string> allowed = {"include_obfuscation"};
+        reject_nonnull_unknown_members(options, allowed, "stream_options");
+        if (options.contains("include_obfuscation") &&
+            !options.at("include_obfuscation").is_null() &&
+            !options.at("include_obfuscation").is_boolean()) {
+            bad_request("stream_options.include_obfuscation must be a boolean", "stream_options");
+        }
+    }
+    if (body.contains("service_tier") && !body.at("service_tier").is_null()) {
+        if (!body.at("service_tier").is_string()) {
+            bad_request("service_tier must be a string", "service_tier");
+        }
+        const std::string tier = body.at("service_tier").get<std::string>();
+        if (tier != "auto" && tier != "default") {
+            bad_request("the requested service tier is not provided by this local server",
+                        "service_tier", "service_tier_not_supported");
+        }
+    }
+    if (const std::optional<int> top_logprobs = optional_int(body, "top_logprobs")) {
+        if (*top_logprobs < 0 || *top_logprobs > 20) {
+            bad_request("top_logprobs must be in [0,20]", "top_logprobs");
+        }
+        if (*top_logprobs != 0) {
+            bad_request("the Engine does not return token log probabilities", "top_logprobs",
+                        "logprobs_not_supported");
+        }
+    }
+    if (const std::optional<int> max_tool_calls = optional_int(body, "max_tool_calls")) {
+        if (*max_tool_calls < 0) {
+            bad_request("max_tool_calls must be non-negative", "max_tool_calls");
+        }
+        out.max_tool_calls = *max_tool_calls;
+    }
+
+    if (const std::optional<double> temperature = optional_number(body, "temperature")) {
+        if (*temperature < 0.0 || *temperature > 2.0) {
+            bad_request("temperature must be in [0,2]", "temperature");
+        }
+        out.prompt.generation.sampling.temperature = *temperature;
+    }
+    if (const std::optional<double> top_p = optional_number(body, "top_p")) {
+        if (*top_p < 0.0 || *top_p > 1.0) { bad_request("top_p must be in [0,1]", "top_p"); }
+        out.prompt.generation.sampling.top_p = *top_p;
+    }
+    if (const std::optional<int> max_output = optional_int(body, "max_output_tokens")) {
+        if (*max_output < 0) {
+            bad_request("max_output_tokens must be non-negative", "max_output_tokens");
+        }
+        out.requested_max_output_tokens  = *max_output;
+        out.prompt.generation.max_tokens = *max_output;
+    }
+    return out;
+}
+
+OpenAIResponsesPromptRequest
+parse_openai_responses_input_tokens_request(const Json& body, const RequestLimits& limits) {
+    require_object(body);
+    validate_common_top_level(body, false);
+    reject_unsupported_platform_fields(body);
+    if (body.contains("personality") && !body.at("personality").is_null()) {
+        bad_request("personality changes prompt construction and is not supported", "personality",
+                    "personality_not_supported");
+    }
+    return std::move(parse_prompt_fields(body, limits).prompt);
+}
+
+} // namespace ninfer::serve

@@ -1301,12 +1301,8 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     std::vector<ChatRole> message_roles;
     message_roles.reserve(input.messages.size());
     for (const ChatMessage& message : input.messages) { message_roles.push_back(message.role); }
-    const bool has_tool_history =
-        std::any_of(input.messages.begin(), input.messages.end(), [](const ChatMessage& message) {
-            return message.role == ChatRole::Tool || !message.tool_calls.empty();
-        });
-    const auto tool_call_output = fi::build_tool_call_output_contract(
-        options.tool_jsons, !options.tool_jsons.empty() || has_tool_history);
+    const auto tool_call_output =
+        fi::build_tool_call_output_contract(options.tool_jsons, !options.tool_jsons.empty());
     const std::optional<std::uint32_t> automatic_boundary =
         automatic_stable_boundary(message_roles, !options.tool_jsons.empty());
     const std::size_t message_count       = input.messages.size();

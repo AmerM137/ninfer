@@ -33,6 +33,7 @@ struct ToolArgumentTypeContracts {
     };
 
     std::vector<Tool> tools;
+    bool enforce_declared_names = false;
 };
 
 struct ToolCallOutputContract {

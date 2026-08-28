@@ -224,8 +224,8 @@ bool matches_bearer_credential(std::string_view authorization, std::string_view 
 }
 
 HttpServer::HttpServer(ServeOptions options)
-    : options_(std::move(options)),
-      response_store_(options_.response_store_max_records, options_.response_store_max_bytes),
+    : options_(std::move(options)), openai_responses_store_(options_.response_store_max_records,
+                                                            options_.response_store_max_bytes),
       request_jsonl_(options_.request_log_jsonl, options_.artifact_path) {
     const std::size_t queued_requests =
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests;

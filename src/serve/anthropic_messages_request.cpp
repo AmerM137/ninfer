@@ -153,10 +153,12 @@ ninfer::product::media_acquire::Source parse_image_source(const Json& block) {
 
 ContentPart parse_image(const Json& block) {
     ContentPart result;
-    result.kind                         = ContentKind::Image;
-    result.type_raw                     = "image";
-    result.source                       = parse_image_source(block);
-    result.private_cache_boundary_after = cache_boundary(block);
+    result.kind     = ContentKind::Image;
+    result.type_raw = "image";
+    result.source   = parse_image_source(block);
+    if (cache_boundary(block)) {
+        result.cache_boundary_after = ninfer::PromptCacheMarkerKind::PrivateLongAnchor;
+    }
     if (!block.contains("transformations") || block.at("transformations").is_null()) {
         return result;
     }
@@ -182,10 +184,10 @@ ContentPart parse_image(const Json& block) {
 
 ContentPart text_part(std::string value, bool boundary = false) {
     ContentPart part;
-    part.kind                         = ContentKind::Text;
-    part.type_raw                     = "text";
-    part.text                         = std::move(value);
-    part.private_cache_boundary_after = boundary;
+    part.kind     = ContentKind::Text;
+    part.type_raw = "text";
+    part.text     = std::move(value);
+    if (boundary) { part.cache_boundary_after = ninfer::PromptCacheMarkerKind::PrivateLongAnchor; }
     return part;
 }
 
@@ -196,9 +198,9 @@ bool is_server_tool_block(std::string_view type) {
 }
 
 void append_turn(ChatTurn& target, ChatTurn turn) {
-    if (target.private_cache_boundary_after && !target.content.empty()) {
-        target.content.back().private_cache_boundary_after = true;
-        target.private_cache_boundary_after                = false;
+    if (target.cache_boundary_after && !target.content.empty()) {
+        target.content.back().cache_boundary_after = target.cache_boundary_after;
+        target.cache_boundary_after.reset();
     }
     target.content.insert(target.content.end(), std::make_move_iterator(turn.content.begin()),
                           std::make_move_iterator(turn.content.end()));
@@ -206,7 +208,7 @@ void append_turn(ChatTurn& target, ChatTurn turn) {
                              std::make_move_iterator(turn.tool_calls.begin()),
                              std::make_move_iterator(turn.tool_calls.end()));
     target.reasoning_content += turn.reasoning_content;
-    target.private_cache_boundary_after = turn.private_cache_boundary_after;
+    target.cache_boundary_after = turn.cache_boundary_after;
 }
 
 void merge_turn(GenerationRequest& request, ChatTurn turn) {
@@ -520,11 +522,13 @@ void lower_messages(std::vector<ParsedMessage> messages, GenerationRequest& requ
             }
             ParsedToolResult& result = std::get<ParsedToolResult>(block);
             ChatTurn tool;
-            tool.role                         = ChatRole::Tool;
-            tool.tool_call_id                 = std::move(result.tool_use_id);
-            tool.content                      = std::move(result.content);
-            tool.tool_result_is_error         = result.is_error;
-            tool.private_cache_boundary_after = result.cache_boundary_after;
+            tool.role                 = ChatRole::Tool;
+            tool.tool_call_id         = std::move(result.tool_use_id);
+            tool.content              = std::move(result.content);
+            tool.tool_result_is_error = result.is_error;
+            if (result.cache_boundary_after) {
+                tool.cache_boundary_after = ninfer::PromptCacheMarkerKind::PrivateLongAnchor;
+            }
             request.messages.push_back(std::move(tool));
         }
         if (!user.content.empty() || message.user_blocks.empty()) {
@@ -723,7 +727,7 @@ std::vector<ParsedTool> parse_tool_definitions(const Json& body) {
                 }
                 parsed.definition.input_examples_json = item.at("input_examples").dump();
             }
-            parsed.definition.cache_boundary_after = cache_boundary(item);
+            parsed.definition.shared_cache_boundary_after = cache_boundary(item);
         } else if (item.contains("name") && item.at("name").is_string()) {
             parsed.definition.name = item.at("name").get<std::string>();
         }
@@ -944,7 +948,7 @@ void parse_common_prompt(const Json& body, GenerationRequest& request, ParsePurp
     parse_messages(body, request);
     parse_thinking(body, request, purpose, effective_max_tokens);
     parse_effort(body, request, purpose);
-    request.automatic_cache_boundary = cache_boundary(body);
+    request.private_cache_boundary_at_prompt_end = cache_boundary(body);
     if (body.contains("container") && !body.at("container").is_null()) {
         bad_request("container requires an external execution environment that NInfer does not "
                     "provide",

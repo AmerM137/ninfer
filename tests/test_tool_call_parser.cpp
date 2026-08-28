@@ -282,21 +282,17 @@ int test_unknown_schema_keeps_legacy_inference() {
     return failures;
 }
 
-int test_parser_does_not_enforce_active_tool_set() {
+int test_parser_enforces_active_tool_set() {
     const auto contracts = contracts_for("declared", Json{{"value", Json{{"type", "string"}}}});
     const auto parsed    = fi::parse_qwen_tool_call_output(
         "<tool_call>\n<function=other>\n<parameter=value>\n1\n</parameter>\n"
            "</function>\n</tool_call>",
         64, contracts);
     int failures = 0;
-    failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1 &&
-                          parsed.tool_calls.front().name == "other",
-                      "parser incorrectly enforced the active tool-name set");
-    if (!parsed.tool_calls.empty()) {
-        const Json args = Json::parse(parsed.tool_calls.front().arguments_json);
-        failures += check(args.at("value").is_number_integer() && args.at("value") == 1,
-                          "undeclared tool did not retain legacy argument inference");
-    }
+    failures += check(!parsed.is_tool_call_response && parsed.tool_calls.empty(),
+                      "undeclared tool escaped the active tool-name set");
+    failures += check(parsed.content.find("<function=other>") != std::string::npos,
+                      "undeclared tool was not preserved as ordinary content");
     return failures;
 }
 
@@ -359,7 +355,7 @@ int main() {
     failures += test_declared_non_string_values_are_json_decoded();
     failures += test_declared_type_mismatches_are_forwarded_without_coercion();
     failures += test_unknown_schema_keeps_legacy_inference();
-    failures += test_parser_does_not_enforce_active_tool_set();
+    failures += test_parser_enforces_active_tool_set();
     failures += test_incremental_filter_valid_tool();
     failures += test_incremental_filter_fallback();
     if (failures == 0) { std::cout << "ok\n"; }

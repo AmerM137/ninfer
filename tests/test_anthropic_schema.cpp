@@ -229,7 +229,8 @@ int test_tool_history() {
                                                             normalized.messages[2].tool_call_id == "toolu_b" &&
                                                             normalized.messages[2].content[0].text == "result B" &&
                                                             normalized.messages[2].tool_result_is_error &&
-                                                            normalized.messages[2].private_cache_boundary_after &&
+                                                            normalized.messages[2].cache_boundary_after ==
+                                                                ninfer::PromptCacheMarkerKind::PrivateLongAnchor &&
                                                             normalized.messages[3].role == ninfer::ChatRole::User &&
                                                             normalized.messages[3].content[0].text == "continue",
                                                         "valid out-of-order tool results were not associated by ID");
@@ -411,10 +412,11 @@ int test_content_and_cache_hints() {
                                           {"source", Json{{"type", "url"}, {"url", "https://example/image.png"}}},
                                           {"transformations", Json{{"oversized_image", "error"}}}}})}}});
     const GenerationRequest request = parse(body).generation;
-    int failures = check(request.automatic_cache_boundary && request.media_item_count() == 1 &&
-                             request.messages[0].content[1].image_resize_policy ==
-                                 ninfer::ImageResizePolicy::RejectOversized,
-                         "automatic caching or image transformation policy was lost");
+    int failures =
+        check(request.private_cache_boundary_at_prompt_end && request.media_item_count() == 1 &&
+                  request.messages[0].content[1].image_resize_policy ==
+                      ninfer::ImageResizePolicy::RejectOversized,
+              "automatic caching or image transformation policy was lost");
     const ninfer::PromptInput translated = prompt(request);
     failures += check(translated.context_cache.markers.size() == 2 &&
                           translated.context_cache.markers[1].location ==

@@ -66,7 +66,7 @@ struct ContentPart {
     std::string type_raw; // original wire "type" string for diagnostics
     ninfer::product::media_acquire::Source source;
     ninfer::ImageResizePolicy image_resize_policy = ninfer::ImageResizePolicy::Downsize;
-    bool private_cache_boundary_after             = false;
+    std::optional<ninfer::PromptCacheMarkerKind> cache_boundary_after;
 };
 
 struct ToolDefinition {
@@ -74,7 +74,7 @@ struct ToolDefinition {
     std::string description;
     std::string input_schema_json;
     std::optional<std::string> input_examples_json;
-    bool cache_boundary_after = false;
+    bool shared_cache_boundary_after = false;
 };
 
 struct ToolCall {
@@ -100,10 +100,7 @@ struct ChatTurn {
     bool tool_result_is_error = false;
     std::string reasoning_content; // assistant thinking carried across turns (round-tripped to the
                                    // template)
-    std::vector<std::uint32_t> shared_cache_boundaries_after_text_bytes;
-    // Anthropic conversation cache_control on the terminal content block names the exact
-    // boundary after this normalized turn. It remains private to the continuation lineage.
-    bool private_cache_boundary_after = false;
+    std::optional<ninfer::PromptCacheMarkerKind> cache_boundary_after;
 };
 
 // Sampling overrides that have an executable Engine meaning. Protocol-only
@@ -171,13 +168,13 @@ struct GenerationRequest {
     ToolChoice tool_choice;
     std::vector<std::string> stop_strings;
     bool stop_strings_apply_to_reasoning = false;
-    int max_tokens                       = 0; // 0 => use server default
+    int max_tokens                       = 0; // resolved budget; zero means immediate output limit
     std::optional<bool> enable_thinking;      // unset => use the server default
     std::optional<std::uint32_t> thinking_budget;
     std::optional<RequestedReasoningEffort> reasoning_effort;
     std::optional<bool> preserve_thinking;
     ninfer::PromptContinuationMode continuation = ninfer::PromptContinuationMode::NewAssistantTurn;
-    bool automatic_cache_boundary               = false;
+    bool private_cache_boundary_at_prompt_end   = false;
     SamplingParams sampling;
 
     [[nodiscard]] bool uses_tools() const noexcept {

@@ -270,10 +270,10 @@ wire response contains typed `output` Items.
 | Field | NInfer Responses Core contract |
 |---|---|
 | `model` | required non-empty string; must equal the artifact-derived public model ID or explicit `--model-id` override |
-| `input` | required string or non-empty typed Item array |
+| `input` | string or typed Item array; it may be omitted or empty only when `previous_response_id` already supplies a user query |
 | `instructions` | optional string, inserted before the reconstructed conversation for this request only |
 | `previous_response_id` | optional ID of a retained local Response |
-| `max_output_tokens` | integer at least `16`; default is `--default-max-tokens` |
+| `max_output_tokens` | non-negative integer; omission executes with `--default-max-tokens` but remains `null` in the Response object |
 | `stream` | boolean; `true` selects Responses SSE rather than a JSON body |
 | `store` | boolean, default `true`; controls local retrieval and continuation state |
 | `temperature` | finite number in `[0,2]` |
@@ -284,14 +284,16 @@ wire response contains typed `output` Items.
 | `preserve_thinking` | top-level alias for the same option; conflicting values are rejected |
 | `text.format` | omitted or `{"type":"text"}` only |
 | `tools` | flat Responses function definitions; see below |
-| `tool_choice` | `auto` or `none` |
-| `parallel_tool_calls` | omitted or `true` |
+| `tool_choice` | `auto`, `none`, or function-only `allowed_tools` with mode `auto` |
+| `parallel_tool_calls` | `true` by default; `false` is accepted only when no effective tool is callable |
+| `max_tool_calls` | non-negative integer accepted as a hosted-tool no-op; NInfer does not execute hosted tools |
 | `truncation` | omitted or `disabled`; overlong input fails instead of silently dropping Items |
 | `top_logprobs` | omitted or `0` |
 | `service_tier` | omitted, `auto`, or `default`; the response reports `default` |
 | `background` | omitted or `false` |
 | `include` | omitted or an empty array |
-| `stream_options` | omitted or `{"include_obfuscation":false}` |
+| `stream_options.include_obfuscation` | optional boolean; accepted as a transport hint, but this local server emits no padding |
+| cache and client hints | valid `prompt_cache_key`, `prompt_cache_options`, `prompt_cache_retention`, `safety_identifier`, and `user` values are accepted without being mapped to Engine session identity |
 
 Unknown top-level fields fail with `unknown_parameter`. Recognized but unsupported features fail
 with a field-specific 400 error instead of being silently ignored.
@@ -305,24 +307,32 @@ String `input` is normalized to one user `message` with an `input_text` part. Ar
 | `message` | roles `user`, `assistant`, `system`, and `developer`; string content or typed content array |
 | `input_text` | message content part containing string `text` |
 | `output_text` | assistant-message replay part containing string `text` |
-| `input_image` | user-message part with HTTP(S) or data-URI `image_url`; detail omitted or `auto`; requires server `--vision` |
+| `refusal` | assistant-message replay part; its text enters assistant history |
+| `input_image` | user- or assistant-message part with HTTP(S) or data-URI `image_url`; detail omitted or `auto`; requires server `--vision` |
 | `input_video` | NInfer extension with HTTP(S) or data-URI `video_url`; requires server `--vision` |
-| `reasoning` | raw replay Item with an empty `summary` and `reasoning_text` content parts |
+| `reasoning` | raw replay Item with `reasoning_text` content; summary/encrypted metadata may accompany raw text but cannot replace it |
 | `function_call` | completed assistant call with optional `id`, and required `call_id`, `name`, and JSON-object string `arguments` |
-| `function_call_output` | completed tool result with required `call_id` and string `output` |
+| `function_call_output` | completed result with required `call_id`; `output` may be a string or a non-empty array of `input_text`/`input_image` parts |
 
 Adjacent function-call Items are grouped into one assistant history turn. A reasoning Item attaches
-to the following assistant message or function call. Input Item IDs are preserved when supplied and
-generated otherwise; duplicate IDs fail.
+to the following assistant message or function call. Results are validated by `call_id` and reordered
+to call declaration order before prompt rendering; unknown, duplicate, or unrepresentable partial
+result sets fail with `invalid_tool_history`. Canonical input Items retain client order. Input Item
+IDs are preserved when supplied and generated otherwise; duplicate IDs fail.
 
 System and developer message Items retain their positions in the input array. Top-level
 `instructions` is represented as a leading developer turn for the current request; target-specific
 role lowering occurs only in the Qwen family frontend.
 
-`input_file`, `input_audio`, image `file_id`, non-`auto` image detail, reasoning summaries or
-encrypted reasoning, message `phase`, and other Item/content types are not supported. HTTP media
-URLs stored in a response chain are fetched again when that chain is continued; use data URIs when
-the historical media bytes must be immutable.
+An `input_text`, `input_image`, or tool-result part may carry
+`prompt_cache_breakpoint:{"mode":"explicit"}`. Up to four such values become shared stable-prefix
+boundaries; they affect reuse opportunities, not prompt identity or output semantics. String
+message status/phase metadata is accepted but has no Qwen prompt representation.
+
+`input_file`, `input_audio`, image `file_id`, non-`auto` image detail, reasoning metadata without raw
+reasoning text, partial tool Items, and other Item/content types are not supported. HTTP media URLs
+stored in a response chain are fetched again when that chain is continued; use data URIs when the
+historical media bytes must be immutable.
 
 ### Function tools
 
@@ -345,9 +355,15 @@ Responses function definitions are flat rather than Chat Completions' nested `fu
 NInfer renders these definitions in the Qwen prompt and parses model output into separate
 `function_call` output Items. Each output has a protocol Item `id` (`fc_...`) and a distinct
 `call_id` (`call_...`). The client executes the function and sends a `function_call_output` Item in
-a later request. NInfer does not execute functions or enforce JSON Schema through constrained
-decoding, so `strict:true`, `tool_choice:required`, named tool choice, hosted tools, MCP tools, and
-custom free-form tools are rejected.
+a later request. Only functions in the current effective tool set can become structured calls;
+undeclared model output remains ordinary text. `allowed_tools` with mode `auto` filters that set
+without changing declaration order, while `tool_choice:"none"` disables structured tool output even
+when the history contains earlier calls.
+
+NInfer does not execute functions or enforce JSON Schema through constrained decoding, so
+`strict:true`, required or named tool choice, hosted tools, MCP tools, and custom free-form tools are
+rejected. Deferred loading, output schemas, and caller restrictions that exclude direct invocation
+are also rejected because their semantics cannot be honored.
 
 ### Response object and usage
 
@@ -361,7 +377,8 @@ A terminal wire response has `object: "response"`, one of `completed`, `incomple
 Ordinary model/string stops produce `completed`. Output-token or context-capacity exhaustion
 produces `incomplete` with `incomplete_details.reason: "max_output_tokens"`. Errors accepted after
 an SSE response has started produce `response.failed`; validation and preparation errors remain
-normal HTTP error responses.
+normal HTTP error responses. `completed_at` is populated only for completed Responses. A
+reasoning-only incomplete result contains no invented empty assistant message.
 
 Usage is checkpoint-native:
 
@@ -434,9 +451,9 @@ Resource behavior:
 
 | Endpoint | Contract |
 |---|---|
-| `GET /v1/responses/{id}` | returns the stored terminal object, or 404 `response_not_found` |
+| `GET /v1/responses/{id}` | returns the stored terminal object, or 404 `response_not_found`; stream recovery and non-empty `include` are rejected rather than ignored |
 | `DELETE /v1/responses/{id}` | removes public retrieval and returns `response.deleted`; descendant contexts already retained by other Responses remain usable |
-| `GET /v1/responses/{id}/input_items` | returns normalized Items supplied to that request; supports `after`, `limit` `1..100` (default `20`), and `order` `asc|desc` (default `desc`) |
+| `GET /v1/responses/{id}/input_items` | returns normalized Items supplied to that request; supports `after`, `limit` `1..100` (default `20`), and `order` `asc|desc` (default `desc`); image URLs are redacted unless `include=message.input_image.image_url` |
 | `POST /v1/responses/{id}/cancel` | explicitly fails because background execution is unsupported |
 | `POST /v1/responses/compact` | explicitly fails with `compaction_not_supported` |
 
@@ -447,8 +464,11 @@ stored.
 
 ### Responses input token count
 
-`POST /v1/responses/input_tokens` accepts exactly `model` and `input`, performs the same typed Item,
-template, and media expansion, and does not run generation:
+`POST /v1/responses/input_tokens` uses the same prompt path as Create and does not run generation.
+It accepts `model`, `input`, `instructions`, `previous_response_id`, reasoning, function tools and
+tool choice, supported text/truncation values, and the `preserve_thinking` extension. Parent lookup,
+call-ID normalization, template rendering, and media expansion are therefore identical to the
+corresponding Create request:
 
 ```bash
 curl http://127.0.0.1:8080/v1/responses/input_tokens \
@@ -461,9 +481,9 @@ curl http://127.0.0.1:8080/v1/responses/input_tokens \
 ```
 
 Unsupported Create fields include Conversations, prompt templates, context management, hosted
-moderation, prompt-cache controls, safety/user identifiers, Structured Outputs/JSON mode,
-non-empty `include`, background execution, compaction, files/audio, and OpenAI-hosted/MCP/custom
-tools. These are compatibility boundaries, not silently accepted placeholders.
+moderation, Structured Outputs/JSON mode, non-empty `include`, background execution, compaction,
+files/audio, and OpenAI-hosted/MCP/custom tools. These are compatibility boundaries, not silently
+accepted placeholders.
 
 ## Anthropic Messages
 

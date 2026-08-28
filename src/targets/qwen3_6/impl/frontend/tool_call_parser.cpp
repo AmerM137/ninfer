@@ -140,6 +140,12 @@ find_parameter_contract(const ToolArgumentTypeContracts& contracts, std::string_
     return parameter == tool->parameters.end() ? nullptr : &*parameter;
 }
 
+bool declares_tool(const ToolArgumentTypeContracts& contracts, std::string_view tool_name) {
+    if (!contracts.enforce_declared_names) { return true; }
+    return std::any_of(contracts.tools.begin(), contracts.tools.end(),
+                       [&](const auto& tool) { return tool.name == tool_name; });
+}
+
 std::string_view remove_parameter_framing_newlines(std::string_view text) {
     std::size_t begin = 0;
     std::size_t end   = text.size();
@@ -200,7 +206,9 @@ bool parse_one_tool_call(std::string_view block, std::size_t max_name_length,
     const std::size_t name_end   = block.find('>', name_begin);
     if (name_end == std::string_view::npos || name_end == name_begin) { return false; }
     const std::string name = std::string(block.substr(name_begin, name_end - name_begin));
-    if (!valid_function_name(name, max_name_length)) { return false; }
+    if (!valid_function_name(name, max_name_length) || !declares_tool(contracts, name)) {
+        return false;
+    }
     pos = name_end + 1;
 
     const std::size_t function_end = block.find(kFunctionClose, pos);
@@ -234,7 +242,8 @@ ParsedToolCallOutput fallback(const std::string& text) {
 std::shared_ptr<const ToolCallOutputContract>
 build_tool_call_output_contract(std::span<const std::string> tool_jsons, bool enabled) {
     if (!enabled) { return {}; }
-    auto contract = std::make_shared<ToolCallOutputContract>();
+    auto contract                                   = std::make_shared<ToolCallOutputContract>();
+    contract->argument_types.enforce_declared_names = true;
     contract->argument_types.tools.reserve(tool_jsons.size());
     for (const std::string& tool_json : tool_jsons) {
         const Json definition = Json::parse(tool_json, nullptr, false);

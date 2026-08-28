@@ -330,16 +330,18 @@ if(NINFER_BUILD_SERVE)
     serve/openai_chat_request.cpp
     serve/openai_chat_response.cpp
     serve/openai_common.cpp
-    serve/responses_schema.cpp
+    serve/openai_responses_request.cpp
+    serve/openai_responses_state.cpp
+    serve/openai_responses_response.cpp
     serve/anthropic_messages_request.cpp
     serve/anthropic_messages_response.cpp
-    serve/response_store.cpp
+    serve/openai_responses_store.cpp
     serve/translate.cpp
     serve/console_log.cpp
     serve/generation_service.cpp
     serve/request_log.cpp
     serve/http_server.cpp
-    serve/responses_http.cpp
+    serve/openai_responses_http.cpp
     serve/serve_options.cpp)
   ninfer_internal_includes(ninfer_serve)
   target_include_directories(ninfer_serve PRIVATE
