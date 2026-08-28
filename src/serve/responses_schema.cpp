@@ -481,18 +481,12 @@ void parse_tools(const Json& body, ResponsesRequest& out) {
                             "strict_tools_not_supported");
             }
         }
-        tool.strict          = false;
-        tool.parameters_json = parameters.dump();
-        Json canonical       = {{"type", "function"},
-                                {"name", tool.name},
-                                {"parameters", parameters},
-                                {"strict", false}};
+        tool.input_schema_json = parameters.dump();
+        Json canonical         = {{"type", "function"},
+                                  {"name", tool.name},
+                                  {"parameters", parameters},
+                                  {"strict", false}};
         if (!tool.description.empty()) { canonical["description"] = tool.description; }
-        Json nested = {
-            {"type", "function"},
-            {"function", Json{{"name", tool.name}, {"parameters", parameters}, {"strict", false}}}};
-        if (!tool.description.empty()) { nested["function"]["description"] = tool.description; }
-        tool.definition_json = nested.dump();
         out.generation.tools.push_back(std::move(tool));
         out.tools.push_back(std::move(canonical));
     }

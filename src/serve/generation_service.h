@@ -51,10 +51,12 @@ struct GenerationOutcome {
     int reasoning_tokens  = 0;
     ninfer::ThinkingBudgetStats thinking;
     ninfer::FinishReason finish_reason = ninfer::FinishReason::OutputLimit;
+    std::optional<std::string> matched_stop_string;
     GenerationMetrics metrics;
 };
 
 struct StreamSink {
+    std::function<void(const ninfer::GenerationStart& start)> on_start;
     std::function<void(const std::string& delta_text)> on_content;
     std::function<void(const std::string& delta_text)> on_reasoning;
     std::function<bool()> is_cancelled;

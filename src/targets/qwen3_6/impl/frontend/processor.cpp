@@ -441,6 +441,24 @@ VisionItem inspect_image_item(std::span<const std::uint8_t> bytes, const Process
     return item;
 }
 
+void enforce_image_resize_policy(const ChatPart& part, const ProcessorOptions& options,
+                                 const media::decode::Policy& policy) {
+    if (part.kind != ChatPartKind::Image ||
+        part.media.image_resize_policy != ImageResizePolicy::RejectOversized) {
+        return;
+    }
+    const media::decode::ImageInfo image = media::decode::inspect_image(part.media.bytes, policy);
+    const int aligned_h = round_even(static_cast<double>(image.height) / kFactor) * kFactor;
+    const int aligned_w = round_even(static_cast<double>(image.width) / kFactor) * kFactor;
+    const std::uint64_t area =
+        checked_mul(std::max(aligned_h, 0), std::max(aligned_w, 0), "image area");
+    if (area > options.image_max_pixels) {
+        throw ProcessorError(ProcessorErrorKind::InvalidMedia,
+                             "image exceeds the native Vision geometry and oversized_image is "
+                             "set to 'error'");
+    }
+}
+
 VisionItem inspect_video_item(std::span<const std::uint8_t> bytes, const ProcessorOptions& options,
                               const media::decode::Policy& policy) {
     const media::decode::VideoInfo video = media::decode::inspect_video(
@@ -875,6 +893,7 @@ std::size_t Processor::count_tokens(std::vector<ChatMessage> messages,
     try {
         for (const ChatPart* part : parts) {
             check_preparation_control(control);
+            enforce_image_resize_policy(*part, options_, policy);
             VisionItem item = part->kind == ChatPartKind::Image
                                   ? inspect_image_item(part->media.bytes, options_, policy)
                                   : inspect_video_item(part->media.bytes, options_, policy);
@@ -937,6 +956,9 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
         .max_video_duration_seconds = options_.max_video_duration_seconds,
         .checkpoint = [&worker_control] { check_preparation_control(worker_control); },
     };
+    try {
+        for (const ChatPart* part : parts) { enforce_image_resize_policy(*part, options_, policy); }
+    } catch (const media::decode::Error& error) { throw_decode_error(error); }
     ProcessedInput output;
     std::vector<VisionItem> items;
     items.reserve(parts.size());

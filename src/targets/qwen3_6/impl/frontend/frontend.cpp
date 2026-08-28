@@ -293,9 +293,10 @@ std::vector<fi::ChatMessage> convert_messages(std::vector<ChatMessage> messages)
                     throw std::invalid_argument("frontend media input contains no owning bytes");
                 }
                 fi::MediaData media;
-                media.source_name = std::move(part.media.source_name);
-                media.media_type  = std::move(part.media.media_type);
-                media.bytes       = std::move(part.media.bytes);
+                media.source_name         = std::move(part.media.source_name);
+                media.media_type          = std::move(part.media.media_type);
+                media.bytes               = std::move(part.media.bytes);
+                media.image_resize_policy = part.media.image_resize_policy;
                 switch (part.media.kind) {
                 case MediaKind::Image:
                     target.parts.push_back(fi::ChatPart::image(std::move(media)));
@@ -319,12 +320,12 @@ std::vector<fi::ChatMessage> convert_messages(std::vector<ChatMessage> messages)
 
 fi::ChatRenderOptions render_options(const PromptOptions& options,
                                      std::span<const PromptCacheMarker> cache_markers = {}) {
-    fi::ChatRenderOptions rendered{.add_generation_prompt = options.add_generation_prompt,
-                                   .enable_thinking       = options.enable_thinking,
-                                   .reasoning_effort      = options.reasoning_effort,
-                                   .preserve_thinking     = options.preserve_thinking,
-                                   .add_vision_id         = options.add_vision_id,
-                                   .tool_jsons            = options.tool_jsons};
+    fi::ChatRenderOptions rendered{.continuation      = options.continuation,
+                                   .enable_thinking   = options.enable_thinking,
+                                   .reasoning_effort  = options.reasoning_effort,
+                                   .preserve_thinking = options.preserve_thinking,
+                                   .add_vision_id     = options.add_vision_id,
+                                   .tool_jsons        = options.tool_jsons};
     rendered.cache_markers.assign(cache_markers.begin(), cache_markers.end());
     return rendered;
 }
@@ -477,6 +478,7 @@ struct DecoderState {
     bool terminal                  = false;
     std::uint64_t decoded_bytes    = 0;
     std::uint32_t reasoning_tokens = 0;
+    std::optional<std::uint32_t> matched_stop_order;
 };
 
 struct SemanticThinkingState {
@@ -722,19 +724,27 @@ prepare_context_cache(ContextCacheHints hints, std::size_t message_count,
         switch (marker.location) {
         case PromptCacheMarkerLocation::MessageBoundary:
             if (marker.after_message_count > message_count ||
-                marker.leading_instruction_bytes != 0 || marker.after_tool_count != 0) {
+                marker.leading_instruction_bytes != 0 || marker.after_tool_count != 0 ||
+                marker.after_message_part_count != 0) {
                 throw std::invalid_argument("context cache message marker is invalid");
+            }
+            break;
+        case PromptCacheMarkerLocation::MessagePartBoundary:
+            if (marker.after_message_count == 0 || marker.after_message_count > message_count ||
+                marker.after_message_part_count == 0 || marker.leading_instruction_bytes != 0 ||
+                marker.after_tool_count != 0) {
+                throw std::invalid_argument("context cache message-part marker is invalid");
             }
             break;
         case PromptCacheMarkerLocation::LeadingInstructionBoundary:
             if (marker.after_message_count != 0 || marker.leading_instruction_bytes == 0 ||
-                marker.after_tool_count != 0) {
+                marker.after_tool_count != 0 || marker.after_message_part_count != 0) {
                 throw std::invalid_argument("context cache leading-instruction marker is invalid");
             }
             break;
         case PromptCacheMarkerLocation::ToolBoundary:
             if (marker.after_message_count != 0 || marker.leading_instruction_bytes != 0 ||
-                marker.after_tool_count == 0) {
+                marker.after_tool_count == 0 || marker.after_message_part_count != 0) {
                 throw std::invalid_argument("context cache tool marker is invalid");
             }
             break;
@@ -1056,8 +1066,9 @@ runtime::OutputDecision OutputSession::preview_model(std::span<const TokenId> to
                          &match);
 
         if (match.found) {
-            impl_->preview_state  = terminal_state(std::move(impl_->preview_state));
-            impl_->preview_output = std::move(match.output);
+            impl_->preview_state = terminal_state(std::move(impl_->preview_state));
+            impl_->preview_state.matched_stop_order = match.declaration_order;
+            impl_->preview_output                   = std::move(match.output);
             return complete(match.committed_tokens, FinishReason::StopString);
         }
 
@@ -1230,6 +1241,15 @@ ThinkingBudgetStats OutputSession::thinking_stats() const noexcept {
     };
 }
 
+std::optional<std::string> OutputSession::matched_stop_string() const {
+    if (impl_ == nullptr || !impl_->state.matched_stop_order) { return std::nullopt; }
+    const std::size_t index = *impl_->state.matched_stop_order;
+    if (index >= impl_->policy.strings.size()) {
+        throw std::logic_error("matched stop declaration is outside the stop policy");
+    }
+    return impl_->policy.strings[index].text;
+}
+
 Frontend::Frontend(std::shared_ptr<const Impl> impl) noexcept : impl_(std::move(impl)) {}
 
 Frontend::Frontend(const Frontend&)                = default;
@@ -1366,8 +1386,9 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     result.context_cache     = prepare_context_cache(
         std::move(cache_hints), message_count, message_boundaries, cache_boundaries,
         automatic_boundary, impl_->max_cache_markers_per_request);
-    result.starts_in_reasoning = options.add_generation_prompt && options.enable_thinking;
-    result.prepare.seconds     = std::chrono::duration<double>(Clock::now() - start).count();
+    result.starts_in_reasoning =
+        options.continuation == PromptContinuationMode::NewAssistantTurn && options.enable_thinking;
+    result.prepare.seconds = std::chrono::duration<double>(Clock::now() - start).count();
     return PreparedPrompt(std::move(prepared));
 }
 

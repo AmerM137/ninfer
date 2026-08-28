@@ -612,11 +612,12 @@ void parse_tools(const Json& body, GenerationRequest& output) {
             tool.description = function.at("description").get<std::string>();
         }
         if (!function.contains("parameters") || function.at("parameters").is_null()) {
-            tool.parameters_json = Json{{"type", "object"}, {"properties", Json::object()}}.dump();
+            tool.input_schema_json =
+                Json{{"type", "object"}, {"properties", Json::object()}}.dump();
         } else if (!function.at("parameters").is_object()) {
             bad_request("function parameters must be a JSON object", "tools");
         } else {
-            tool.parameters_json = function.at("parameters").dump();
+            tool.input_schema_json = function.at("parameters").dump();
         }
         if (function.contains("strict") && !function.at("strict").is_null()) {
             if (!function.at("strict").is_boolean()) {
@@ -629,13 +630,6 @@ void parse_tools(const Json& body, GenerationRequest& output) {
                     "tools", "strict_tools_not_supported");
             }
         }
-        const Json parameters    = Json::parse(tool.parameters_json);
-        Json normalized_function = {
-            {"name", tool.name}, {"parameters", parameters}, {"strict", false}};
-        if (!tool.description.empty()) { normalized_function["description"] = tool.description; }
-        tool.strict = false;
-        tool.definition_json =
-            Json{{"type", "function"}, {"function", std::move(normalized_function)}}.dump();
         output.tools.push_back(std::move(tool));
     }
 }

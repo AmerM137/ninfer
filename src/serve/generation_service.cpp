@@ -181,8 +181,23 @@ ninfer::OwnedMedia acquire_media(const ContentPart& part, Clock::time_point dead
         media.source_name = "inline-bytes";
         break;
     }
-    media.bytes = std::move(source_bytes);
+    media.bytes               = std::move(source_bytes);
+    media.image_resize_policy = part.image_resize_policy;
     return media;
+}
+
+void trim_cache_markers(std::vector<ninfer::PromptCacheMarker>& markers, std::uint32_t maximum) {
+    std::vector<ninfer::PromptCacheMarker> unique;
+    unique.reserve(markers.size());
+    for (const ninfer::PromptCacheMarker& marker : markers) {
+        if (std::find(unique.begin(), unique.end(), marker) == unique.end()) {
+            unique.push_back(marker);
+        }
+    }
+    if (unique.size() > maximum) {
+        unique.erase(unique.begin(), unique.end() - static_cast<std::ptrdiff_t>(maximum));
+    }
+    markers = std::move(unique);
 }
 
 [[noreturn]] void throw_request_error(const ninfer::RequestError& exception) {
@@ -201,6 +216,10 @@ void check_preparation_control(Clock::time_point deadline,
 class ServiceOutputSink final : public ninfer::OutputSink {
 public:
     explicit ServiceOutputSink(const StreamSink& sink) : sink_(&sink) {}
+
+    void start(ninfer::GenerationStart start) override {
+        if (sink_->on_start) { sink_->on_start(start); }
+    }
 
     void publish(ninfer::OutputDelta delta) override {
         if (delta.text.empty()) { return; }
@@ -313,6 +332,8 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
         input.context_cache.markers.insert(input.context_cache.markers.end(),
                                            std::make_move_iterator(protocol_markers.begin()),
                                            std::make_move_iterator(protocol_markers.end()));
+        trim_cache_markers(input.context_cache.markers,
+                           engine_->options().context_cache.max_cache_markers_per_request.value());
         prepared.acquisition_seconds =
             std::chrono::duration<double>(Clock::now() - acquisition_started).count();
         check_preparation_control(prepared.lifetime->deadline, is_cancelled);
@@ -392,13 +413,14 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
         result = prepared.generation.wait(public_sink, cancellation);
     } catch (const ninfer::RequestError& exception) { throw_request_error(exception); }
     GenerationOutcome outcome;
-    outcome.text              = std::move(result.content);
-    outcome.reasoning         = std::move(result.reasoning);
-    outcome.prompt_tokens     = static_cast<int>(result.prompt.prompt_tokens);
-    outcome.completion_tokens = static_cast<int>(result.generated_token_ids.size());
-    outcome.reasoning_tokens  = static_cast<int>(result.reasoning_tokens);
-    outcome.thinking          = result.thinking;
-    outcome.finish_reason     = result.finish_reason;
+    outcome.text                = std::move(result.content);
+    outcome.reasoning           = std::move(result.reasoning);
+    outcome.prompt_tokens       = static_cast<int>(result.prompt.prompt_tokens);
+    outcome.completion_tokens   = static_cast<int>(result.generated_token_ids.size());
+    outcome.reasoning_tokens    = static_cast<int>(result.reasoning_tokens);
+    outcome.thinking            = result.thinking;
+    outcome.finish_reason       = result.finish_reason;
+    outcome.matched_stop_string = std::move(result.matched_stop_string);
 
     outcome.metrics.prepare_seconds = prepared.prepare_seconds;
     outcome.metrics.ttft_seconds =

@@ -147,8 +147,9 @@ not exposed by the loaded template returns HTTP 400 with code
 prompt semantics enable thinking. It does not add or reinterpret an HTTP request field: the
 existing `reasoning_effort` and `enable_thinking` inputs still decide whether thinking is enabled,
 and a request resolved to non-thinking receives no cap. `--no-thinking` may coexist with this
-option because a protocol request can explicitly enable thinking. In this phase, Anthropic's
-existing `thinking.budget_tokens` member does not override the process default.
+option because a protocol request can explicitly enable thinking. Anthropic
+`thinking:{"type":"enabled","budget_tokens":N}` supplies a request-specific budget instead of
+this process default.
 
 Add `--default-thinking-budget 512` to the startup command to cap model-origin thinking at 512
 tokens for every thinking-enabled request.
@@ -478,36 +479,62 @@ curl http://127.0.0.1:8080/v1/messages \
   }'
 ```
 
-The endpoint supports top-level system text, ordered mid-conversation system messages,
-user/assistant history, text and image blocks, thinking blocks, tool-use history, tool results,
-client-defined tools, non-streaming responses, and Anthropic SSE events.
-Mid-conversation system messages remain at their `messages` array position and are not merged into
-the top-level system instruction. A system section must follow a user/tool-result message and be
-final or immediately precede an assistant message; it cannot interrupt a tool-use/tool-result pair.
-Consecutive system messages remain separate ordered turns.
+The endpoint accepts top-level System text, ordered User/Assistant/System history, text and image
+blocks, Thinking history, tool-use history, tool results, user-defined tools, aggregate responses,
+and Anthropic SSE. Consecutive User or Assistant messages are joined without adding separators.
+Mid-conversation System messages retain their input position. A final text-only Assistant message
+is an Assistant prefill: generation continues its existing text instead of opening another turn.
+Assistant prefill cannot contain media, Thinking, or tool calls and cannot start with Thinking
+enabled.
 
-Anthropic ephemeral `cache_control` on top-level system text blocks and client tool definitions
-marks a shared stable-prefix boundary. Because the Qwen prompt renders tools before the leading
-system instruction, NInfer retains the last marked tool boundary unless a later marked system
-boundary exists; when several system blocks are marked, it retains the last one. The boundary is a
-retention hint rather than a forced hit: reuse still requires exact rendered-token compatibility.
-Ephemeral `cache_control` on the final content block of a user or assistant message marks the
-normalized message boundary as a private long anchor; a non-final message-block breakpoint is
-rejected because it cannot be represented as an exact Qwen message frontier.
+`max_tokens` is optional for local clients and otherwise uses `--default-max-tokens`; a positive
+value is the complete output budget. `max_tokens:0` is rejected because NInfer does not expose a
+completed zero-output cache-prewarm lifecycle. `temperature`, `top_p`, `top_k`, and
+`stop_sequences` enter Engine execution. A matched custom stop is returned as
+`stop_reason:"stop_sequence"` together with the actual `stop_sequence`; context exhaustion returns
+`model_context_window_exceeded`.
 
-`thinking.type: "disabled"` disables thinking; other supported values enable it.
-The independent top-level `preserve_thinking` boolean controls closed-turn history and otherwise
-uses the server default.
+Thinking supports `disabled`, `adaptive`, and `enabled`. Enabled Thinking requires
+`budget_tokens >= 1024` and less than `max_tokens`, and that budget is passed to Engine. Visible
+Thinking is returned with an opaque local signature; SSE emits its `signature_delta` before
+closing the block. `display:"omitted"` is rejected because NInfer cannot provide Anthropic's
+encrypted hidden-reasoning restore semantics. `preserve_thinking` remains a NInfer extension for
+closed-turn Qwen reasoning history. `output_config.effort` is checked against the loaded template's
+declared effort capability.
 
-Anthropic `output_config.effort` accepts the protocol values `low`, `medium`, `high`, `xhigh`, and
-`max`. The value is then checked against the loaded chat template in the same way as the OpenAI
-endpoints; the registered effort-capable template exposes `low`, `medium`, and `xhigh`. Combining
-an effort with `thinking.type: "disabled"` is rejected as contradictory.
+User-defined, non-strict tools support `name`, `description`, object `input_schema`, and
+`input_examples`. `tool_choice:auto` and `none` are executable. Forced or named choice,
+`strict:true`, active single-call enforcement, deferred tools, tools that exclude direct model
+calls, Anthropic-provided/server tools, toolsets, MCP, and containers are rejected because their
+required constraint or executor is absent. `tool_result` preserves text/image order and marks
+`is_error:true` explicitly in the model prompt. For a visible Assistant tool-use turn, the next
+User turn must provide exactly one leading result for every declared ID; valid results are matched
+by ID and normalized to call order. A history that begins with results remains valid as a truncated
+or imported conversation.
 
-Anthropic's `model` field is treated as a response label and does not select the loaded artifact.
+Ephemeral `cache_control` on the request, tools, System blocks, and User text/image frontiers is a
+best-effort retention hint. NInfer maps representable breakpoints to exact prompt frontiers, keeps
+the latest markers allowed by the Engine configuration, and ignores TTL and unrepresentable cache
+hints rather than rejecting generation. Reuse still requires exact rendered-token compatibility;
+aggregate usage reports verified reused tokens in `cache_read_input_tokens` and leaves cache
+creation unknown. Streaming emits `message_start` after Engine admission commits the prefix
+selection and before transfer/prefill output, so its uncached/cache-read split is already exact;
+terminal cumulative usage matches the aggregate response.
+
+Documents, Search Results, Files, Structured Outputs, server-tool results, container uploads, and
+other execution-dependent blocks are rejected with the missing capability identified. Metadata,
+service tier, inference geography, protocol-version/beta headers, cache TTL, and unknown advisory
+fields do not block an otherwise executable request. The request `model` is any non-empty local
+proxy label and is echoed in the response; it does not select the resident artifact.
+
+Every Messages response carries a `request-id` header; error bodies also carry `request_id` and use
+Anthropic error categories. Local admission overload maps to HTTP 529 and queue/media timeouts to
+HTTP 504. Streaming owns the full Anthropic block lifecycle for Thinking, text, and tool use.
 
 `POST /v1/messages/count_tokens` uses the artifact's tokenizer, chat template, and media expansion
-without running GPU generation:
+without generation. It shares the same prompt normalization, tools, Thinking mode, Assistant
+prefill, media processing, and cache-marker interpretation as Messages; output-only sampling and
+streaming fields do not affect the count:
 
 ```bash
 curl http://127.0.0.1:8080/v1/messages/count_tokens \

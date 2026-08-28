@@ -204,6 +204,8 @@ Free -> Materializing -> Active -> TerminalPending -> Free
 
 请求只有在 materialization 的物理结果和逻辑结果均成功采用后才能进入 Active。Terminal request
 必须保留 active ownership，直到完整 checkpoint 被发布或全部 active resources 被释放。
+Streaming request 在 admission 选择提交后、任何输出 delta 前发布一次 `GenerationStart`；其中的
+prompt token 和 reused-prefix token 是已提交的资源选择事实，不等待 prefill 完成。
 
 Control lane、StateImage slot、KV execution row 和 decode batch row 是不同身份：
 

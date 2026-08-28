@@ -43,6 +43,19 @@ ninfer::PromptCapabilities effort_capabilities() {
     return capabilities;
 }
 
+ninfer::PromptInput prompt(const GenerationRequest& request) {
+    ServeOptions server;
+    const ResolvedPromptSemantics resolved =
+        resolve_prompt_semantics(request, server, effort_capabilities());
+    return to_prompt_input(request, resolved, [](const ContentPart& part) {
+        ninfer::OwnedMedia media;
+        media.kind =
+            part.kind == ContentKind::Image ? ninfer::MediaKind::Image : ninfer::MediaKind::Video;
+        media.bytes = {1};
+        return media;
+    });
+}
+
 bool throws_api(const std::function<void()>& fn) {
     try {
         fn();
@@ -298,11 +311,10 @@ int test_typed_items_and_tools() {
                       "function output translated to tool turn");
     failures += check(request.input_turns[2].content[0].kind == ContentKind::Image,
                       "input image translated to media part");
-    failures += check(request.generation.tools.size() == 1 &&
-                          request.generation.tools[0].name == "weather" &&
-                          !request.generation.tools[0].strict,
-                      "flat Responses function converted to internal tool");
-    const Json nested = Json::parse(request.generation.tools[0].definition_json);
+    failures +=
+        check(request.generation.tools.size() == 1 && request.generation.tools[0].name == "weather",
+              "flat Responses function converted to internal tool");
+    const Json nested = Json::parse(prompt(request.generation).options.tool_jsons[0]);
     failures += check(nested.at("function").at("name") == "weather",
                       "Qwen prompt receives normalized nested function definition");
     return failures;

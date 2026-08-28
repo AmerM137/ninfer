@@ -75,7 +75,10 @@ int main() {
     const Json messages_body = Json::parse(messages_response.body);
     failures += check(messages_result == httplib::Server::HandlerResponse::Handled &&
                           messages_body.at("type") == "error" &&
-                          messages_body.at("error").at("type") == "invalid_request_error" &&
+                          messages_body.at("error").at("type") == "request_too_large" &&
+                          messages_body.at("request_id").get<std::string>().starts_with("req_") &&
+                          messages_response.get_header_value("request-id") ==
+                              messages_body.at("request_id").get<std::string>() &&
                           messages_body.at("error").at("message").get<std::string>().find(
                               "1234 bytes") != std::string::npos,
                       "empty Anthropic 413 did not become a payload-limit error");
@@ -92,6 +95,25 @@ int main() {
                           openai_body.at("error").at("message").get<std::string>().find(
                               "1234 bytes") != std::string::npos,
                       "empty OpenAI 413 did not become a payload-limit error");
+
+    httplib::Request missing_messages_request;
+    missing_messages_request.path = "/v1/messages/missing";
+    httplib::Response missing_messages_response;
+    missing_messages_response.status = 404;
+    missing_messages_response.set_header("request-id", "req_stale");
+    const auto missing_messages_result = ninfer::serve::handle_unrendered_http_error(
+        options, missing_messages_request, missing_messages_response);
+    const Json missing_messages_body = Json::parse(missing_messages_response.body);
+    failures +=
+        check(missing_messages_result == httplib::Server::HandlerResponse::Handled &&
+                  missing_messages_response.status == 404 &&
+                  missing_messages_body.at("error").at("type") == "not_found_error" &&
+                  missing_messages_body.at("request_id").get<std::string>().starts_with("req_") &&
+                  missing_messages_body.at("request_id") != "req_stale" &&
+                  missing_messages_response.get_header_value_count("request-id") == 1 &&
+                  missing_messages_response.get_header_value("request-id") ==
+                      missing_messages_body.at("request_id").get<std::string>(),
+              "missing Anthropic resource did not use the protocol error envelope");
 
     httplib::Response authored_response;
     authored_response.status = 413;

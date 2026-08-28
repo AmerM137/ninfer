@@ -88,10 +88,6 @@ std::string tool_choice_name(const ToolChoice& choice) {
         return "auto";
     case ToolChoiceMode::None:
         return "none";
-    case ToolChoiceMode::Required:
-        return "required";
-    case ToolChoiceMode::Named:
-        return choice.name.empty() ? "named" : choice.name;
     }
     return "unknown";
 }

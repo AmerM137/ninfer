@@ -331,7 +331,8 @@ if(NINFER_BUILD_SERVE)
     serve/openai_chat_response.cpp
     serve/openai_common.cpp
     serve/responses_schema.cpp
-    serve/anthropic_schema.cpp
+    serve/anthropic_messages_request.cpp
+    serve/anthropic_messages_response.cpp
     serve/response_store.cpp
     serve/translate.cpp
     serve/console_log.cpp

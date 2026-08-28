@@ -222,11 +222,17 @@ enum class MediaKind : std::uint8_t {
     Video,
 };
 
+enum class ImageResizePolicy : std::uint8_t {
+    Downsize,
+    RejectOversized,
+};
+
 struct OwnedMedia {
     MediaKind kind = MediaKind::Image;
     std::vector<std::uint8_t> bytes;
     std::string media_type;
     std::string source_name;
+    ImageResizePolicy image_resize_policy = ImageResizePolicy::Downsize;
 };
 
 struct ToolCall {
@@ -300,9 +306,14 @@ struct PromptCapabilities {
     ReasoningEffortCapabilities reasoning_effort;
 };
 
+enum class PromptContinuationMode : std::uint8_t {
+    NewAssistantTurn,
+    ContinueFinalAssistant,
+};
+
 struct PromptOptions {
-    bool add_generation_prompt = true;
-    bool enable_thinking       = true;
+    PromptContinuationMode continuation = PromptContinuationMode::NewAssistantTurn;
+    bool enable_thinking                = true;
     std::optional<ReasoningEffort> reasoning_effort;
     bool preserve_thinking = false;
     bool add_vision_id     = false;
@@ -322,6 +333,7 @@ enum class PromptCacheMarkerKind : std::uint8_t {
 
 enum class PromptCacheMarkerLocation : std::uint8_t {
     MessageBoundary,
+    MessagePartBoundary,
     LeadingInstructionBoundary,
     ToolBoundary,
 };
@@ -333,6 +345,9 @@ struct PromptCacheMarker {
     // Byte count within the untrimmed leading System/Developer message.
     std::uint32_t leading_instruction_bytes = 0;
     std::uint32_t after_tool_count          = 0;
+    // For MessagePartBoundary, after_message_count identifies the containing message using a
+    // one-based count and this value identifies the number of serialized parts within it.
+    std::uint32_t after_message_part_count = 0;
 
     [[nodiscard]] friend constexpr bool operator==(PromptCacheMarker,
                                                    PromptCacheMarker) noexcept = default;
@@ -428,10 +443,19 @@ struct OutputDelta {
     std::string text;
 };
 
+// Exact prompt accounting selected at admission. Streaming consumers receive this once before any
+// OutputDelta, after the prefix choice and materialization reservation are committed and before
+// transfer/prefill execution.
+struct GenerationStart {
+    PromptSummary prompt;
+    std::uint32_t reused_prompt_tokens = 0;
+};
+
 class OutputSink {
 public:
-    virtual ~OutputSink()                   = default;
-    virtual void publish(OutputDelta delta) = 0;
+    virtual ~OutputSink()                     = default;
+    virtual void start(GenerationStart start) = 0;
+    virtual void publish(OutputDelta delta)   = 0;
 };
 
 enum class OutputConsumerMode : std::uint8_t {
@@ -580,8 +604,9 @@ struct GenerationResult {
     std::string content;
     std::string reasoning;
     std::vector<GeneratedToolCall> tool_calls;
-    std::uint32_t reasoning_tokens     = 0;
-    FinishReason finish_reason         = FinishReason::None;
+    std::uint32_t reasoning_tokens = 0;
+    FinishReason finish_reason     = FinishReason::None;
+    std::optional<std::string> matched_stop_string;
     std::uint32_t reused_prompt_tokens = 0;
     PrefixReusePath prefix_reuse_path  = PrefixReusePath::Root;
     MaterializationDiagnostics materialization;

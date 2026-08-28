@@ -1,5 +1,7 @@
 #include "serve/translate.h"
 
+#include <nlohmann/json.hpp>
+
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -87,18 +89,20 @@ ninfer::SamplingOverrides resolve_sampling_overrides(const SamplingParams& reque
 std::vector<const ToolDefinition*> effective_tools(const GenerationRequest& request) {
     std::vector<const ToolDefinition*> tools;
     if (!request.uses_tools()) { return tools; }
-    if (request.tool_choice.mode == ToolChoiceMode::Named) {
-        for (const ToolDefinition& tool : request.tools) {
-            if (tool.name == request.tool_choice.name) {
-                tools.push_back(&tool);
-                break;
-            }
-        }
-        return tools;
-    }
     tools.reserve(request.tools.size());
     for (const ToolDefinition& tool : request.tools) { tools.push_back(&tool); }
     return tools;
+}
+
+std::string render_tool_definition(const ToolDefinition& tool) {
+    using Json  = nlohmann::json;
+    Json schema = Json::parse(tool.input_schema_json);
+    Json function{{"name", tool.name}, {"parameters", std::move(schema)}, {"strict", false}};
+    if (!tool.description.empty()) { function["description"] = tool.description; }
+    if (tool.input_examples_json) {
+        function["input_examples"] = Json::parse(*tool.input_examples_json);
+    }
+    return Json{{"type", "function"}, {"function", std::move(function)}}.dump();
 }
 
 } // namespace
@@ -111,7 +115,15 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
         .reasoning_effort  = std::nullopt,
         .preserve_thinking = request.preserve_thinking.value_or(server.preserve_thinking),
     };
-    if (!request.reasoning_effort) { return result; }
+    const auto complete = [&]() {
+        if (request.continuation == ninfer::PromptContinuationMode::ContinueFinalAssistant &&
+            result.enable_thinking) {
+            invalid_prompt_option("assistant prefill cannot be combined with enabled thinking",
+                                  "messages", "assistant_prefill_not_supported");
+        }
+        return result;
+    };
+    if (!request.reasoning_effort) { return complete(); }
 
     const RequestedReasoningEffort requested = *request.reasoning_effort;
     const bool enables_thinking              = requested != RequestedReasoningEffort::None;
@@ -126,7 +138,7 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
             invalid_prompt_option("the loaded chat template cannot disable thinking",
                                   "reasoning_effort", "reasoning_effort_not_supported");
         }
-        return result;
+        return complete();
     }
 
     switch (requested) {
@@ -156,7 +168,7 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
                                   "' is not supported by the loaded chat template",
                               "reasoning_effort", "reasoning_effort_not_supported");
     }
-    return result;
+    return complete();
 }
 
 ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
@@ -175,8 +187,15 @@ ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
             message.tool_calls.push_back(ninfer::ToolCall{call.id, call.name, call.arguments_json});
         }
 
+        if (turn.role == ChatRole::Tool && turn.tool_result_is_error) {
+            ninfer::MessagePart error;
+            error.text = "[tool_error]\n";
+            message.parts.push_back(std::move(error));
+        }
+
         std::uint64_t text_bytes = 0;
-        for (const ContentPart& part : turn.content) {
+        for (std::size_t part_index = 0; part_index < turn.content.size(); ++part_index) {
+            const ContentPart& part = turn.content[part_index];
             if (part.kind == ContentKind::Text) {
                 ninfer::MessagePart text;
                 text.text = part.text;
@@ -185,9 +204,7 @@ ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
                     throw std::invalid_argument("cacheable instruction text exceeds uint32");
                 }
                 text_bytes += part.text.size();
-                continue;
-            }
-            if (part.kind == ContentKind::Image || part.kind == ContentKind::Video) {
+            } else if (part.kind == ContentKind::Image || part.kind == ContentKind::Video) {
                 if (!acquire_media) {
                     throw std::logic_error("media acquisition callback is not configured");
                 }
@@ -195,14 +212,38 @@ ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
                 media.kind  = ninfer::MessagePartKind::Media;
                 media.media = acquire_media(part);
                 message.parts.push_back(std::move(media));
-                continue;
+            } else {
+                ApiError error;
+                error.message = "content type '" + part.type_raw + "' is not supported";
+                error.param   = "messages";
+                error.code    = "modality_not_supported";
+                throw ApiException(std::move(error));
             }
-
-            ApiError error;
-            error.message = "content type '" + part.type_raw + "' is not supported";
-            error.param   = "messages";
-            error.code    = "modality_not_supported";
-            throw ApiException(std::move(error));
+            if (part.private_cache_boundary_after) {
+                if (turn_index >= std::numeric_limits<std::uint32_t>::max() ||
+                    part_index >= std::numeric_limits<std::uint32_t>::max()) {
+                    throw std::overflow_error("conversation cache boundary exceeds uint32");
+                }
+                const bool leading_instruction =
+                    turn_index == 0 &&
+                    (turn.role == ChatRole::System || turn.role == ChatRole::Developer) &&
+                    part.kind == ContentKind::Text;
+                if (leading_instruction) {
+                    input.context_cache.markers.push_back(ninfer::PromptCacheMarker{
+                        .kind     = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+                        .location = ninfer::PromptCacheMarkerLocation::LeadingInstructionBoundary,
+                        .leading_instruction_bytes = static_cast<std::uint32_t>(text_bytes),
+                    });
+                } else {
+                    input.context_cache.markers.push_back(ninfer::PromptCacheMarker{
+                        .after_message_count = static_cast<std::uint32_t>(turn_index + 1U),
+                        .kind                = ninfer::PromptCacheMarkerKind::PrivateLongAnchor,
+                        .location = ninfer::PromptCacheMarkerLocation::MessagePartBoundary,
+                        .after_message_part_count =
+                            static_cast<std::uint32_t>(message.parts.size()),
+                    });
+                }
+            }
         }
         if (turn_index == 0 &&
             (turn.role == ChatRole::System || turn.role == ChatRole::Developer)) {
@@ -233,7 +274,7 @@ ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
         }
     }
 
-    input.options.add_generation_prompt            = true;
+    input.options.continuation                     = request.continuation;
     input.options.enable_thinking                  = semantics.enable_thinking;
     input.options.reasoning_effort                 = semantics.reasoning_effort;
     input.options.preserve_thinking                = semantics.preserve_thinking;
@@ -242,7 +283,7 @@ ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
     input.options.tool_jsons.reserve(tools.size());
     std::optional<std::uint32_t> last_tool_cache_boundary;
     for (std::size_t index = 0; index < tools.size(); ++index) {
-        input.options.tool_jsons.push_back(tools[index]->definition_json);
+        input.options.tool_jsons.push_back(render_tool_definition(*tools[index]));
         if (tools[index]->cache_boundary_after) {
             last_tool_cache_boundary = static_cast<std::uint32_t>(index + 1U);
         }
@@ -256,11 +297,21 @@ ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
             has_shared_marker || marker.kind == ninfer::PromptCacheMarkerKind::SharedStablePrefix;
     }
     if (!has_shared_marker && last_tool_cache_boundary) {
-        input.context_cache.markers.push_back(ninfer::PromptCacheMarker{
-            .kind             = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
-            .location         = ninfer::PromptCacheMarkerLocation::ToolBoundary,
-            .after_tool_count = *last_tool_cache_boundary,
-        });
+        input.context_cache.markers.insert(
+            input.context_cache.markers.begin(),
+            ninfer::PromptCacheMarker{
+                .kind             = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+                .location         = ninfer::PromptCacheMarkerLocation::ToolBoundary,
+                .after_tool_count = *last_tool_cache_boundary,
+            });
+    }
+    if (request.automatic_cache_boundary && !input.messages.empty()) {
+        const ninfer::PromptCacheMarker automatic{
+            .after_message_count = static_cast<std::uint32_t>(input.messages.size()),
+            .kind                = ninfer::PromptCacheMarkerKind::PrivateLongAnchor,
+            .location            = ninfer::PromptCacheMarkerLocation::MessageBoundary,
+        };
+        input.context_cache.markers.insert(input.context_cache.markers.begin(), automatic);
     }
     return input;
 }
@@ -273,7 +324,8 @@ ninfer::RequestOptions to_request_options(const GenerationRequest& request,
     options.execution.requested_output_tokens = static_cast<std::uint32_t>(request.max_tokens);
     options.execution.allow_prefix_reuse      = allow_prefix_reuse;
     if (semantics.enable_thinking) {
-        options.execution.thinking.budget = server.default_thinking_budget;
+        options.execution.thinking.budget =
+            request.thinking_budget ? request.thinking_budget : server.default_thinking_budget;
     }
     options.execution.sampling             = resolve_sampling_overrides(request.sampling, server);
     options.output.raw                     = false;

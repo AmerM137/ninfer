@@ -193,7 +193,7 @@ int test_tools() {
 
     body["tools"][0]["future_item_field"]                 = "ignored";
     body["tools"][0]["function"]["future_function_field"] = "ignored";
-    const std::string normalized_definition = parse(body).generation.tools[0].definition_json;
+    const std::string normalized_definition = prompt(parse(body).generation).options.tool_jsons[0];
     failures += check(normalized_definition.find("future_item_field") == std::string::npos &&
                           normalized_definition.find("future_function_field") == std::string::npos,
                       "unknown tool fields do not silently alter the model prompt");

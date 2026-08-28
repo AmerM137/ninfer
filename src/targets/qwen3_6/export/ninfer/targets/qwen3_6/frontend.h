@@ -111,6 +111,7 @@ public:
     [[nodiscard]] std::vector<GeneratedToolCall> take_tool_calls() noexcept;
     [[nodiscard]] std::uint32_t reasoning_tokens() const noexcept;
     [[nodiscard]] ThinkingBudgetStats thinking_stats() const noexcept;
+    [[nodiscard]] std::optional<std::string> matched_stop_string() const;
 
 private:
     class Impl;

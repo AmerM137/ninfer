@@ -732,6 +732,35 @@ int test_ordered_instruction_turns() {
     return failures;
 }
 
+int test_assistant_continuation() {
+    fi::ChatRenderOptions options;
+    options.continuation    = ninfer::PromptContinuationMode::ContinueFinalAssistant;
+    options.enable_thinking = false;
+    const fi::RenderedChat rendered =
+        render_chat({chat_message(ninfer::ChatRole::User, "question"),
+                     chat_message(ninfer::ChatRole::Assistant, "answer prefix")},
+                    options);
+    const std::string expected = "<|im_start|>user\nquestion<|im_end|>\n"
+                                 "<|im_start|>assistant\nanswer prefix";
+    int failures               = check(rendered.text == expected,
+                                       "assistant continuation closed the turn or opened a second assistant");
+    failures +=
+        check(rendered.rewrite_checkpoint &&
+                  rendered.rewrite_checkpoint->kind ==
+                      ninfer::targets::qwen3_6::RewriteCheckpointKind::ResponseReplay &&
+                  rendered.rewrite_checkpoint->offset == expected.find("<|im_start|>assistant"),
+              "assistant continuation did not retain its replayable opener boundary");
+
+    options.enable_thinking = true;
+    failures += check(throws_invalid_argument([&] {
+                          (void)render_chat({chat_message(ninfer::ChatRole::User, "question"),
+                                             chat_message(ninfer::ChatRole::Assistant, "prefix")},
+                                            options);
+                      }),
+                      "assistant continuation accepted an ambiguous Thinking opener");
+    return failures;
+}
+
 int test_reasoning_effort_chat_template() {
     constexpr std::string_view low_instructions =
         "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly "
@@ -1053,8 +1082,10 @@ int test_text_and_image_prepare(const Frontend& frontend) {
     ninfer::PromptInput image_input;
     image_input.messages.push_back(std::move(image_message));
     image_input.context_cache.markers.push_back(ninfer::PromptCacheMarker{
-        .after_message_count = 1,
-        .kind                = ninfer::PromptCacheMarkerKind::PrivateLongAnchor,
+        .after_message_count      = 1,
+        .kind                     = ninfer::PromptCacheMarkerKind::PrivateLongAnchor,
+        .location                 = ninfer::PromptCacheMarkerLocation::MessagePartBoundary,
+        .after_message_part_count = 1,
     });
     auto prepared             = frontend.prepare(std::move(image_input));
     const auto& prepared_data = FrontendFactory::inspect(prepared);
@@ -1123,6 +1154,16 @@ int test_literal_control_tokens_with_media() {
             literal_rendered.text.find("\xE2\x81\xA0") == std::string::npos &&
             std::find(literal_tokens.begin(), literal_tokens.end(), 248056) == literal_tokens.end(),
         "renderer changed or structurally tokenized a literal Vision marker");
+
+    fi::ChatMessage leading_tool;
+    leading_tool.role = ninfer::ChatRole::Tool;
+    leading_tool.parts.push_back(
+        fi::ChatPart{.kind = fi::ChatPartKind::Text, .text = "imported result"});
+    const fi::RenderedChat leading_tool_rendered = render_chat({leading_tool}, no_generation);
+    failures += check(
+        leading_tool_rendered.text ==
+            "<|im_start|>user\n<tool_response>\nimported result\n</tool_response><|im_end|>\n",
+        "leading tool result was rendered without its user-role envelope");
 
     FrontendResources official = resources();
     official.tokenizer_json =
@@ -1245,6 +1286,32 @@ int test_literal_control_tokens_with_media() {
                           std::count(data.token_ids.begin(), data.token_ids.end(), 248053) == 3 &&
                           std::count(data.token_ids.begin(), data.token_ids.end(), 248054) == 3,
                       "literal Vision spellings became media tokens");
+    return failures;
+}
+
+int test_image_resize_rejection_policy() {
+    FrontendResources owned = resources();
+    owned.preprocessor_config_json =
+        R"({"patch_size":16,"temporal_patch_size":2,"merge_size":2,"image_mean":[0.5,0.5,0.5],"image_std":[0.5,0.5,0.5],"size":{"shortest_edge":4096,"longest_edge":1048576}})";
+    const Frontend frontend = FrontendFactory::create_component(owned);
+
+    ninfer::PromptInput small = image_input();
+    small.messages[0].parts[0].media.image_resize_policy =
+        ninfer::ImageResizePolicy::RejectOversized;
+    int failures = check(frontend.count_tokens(std::move(small)) != 0,
+                         "oversized_image=error rejected an image that needed no downsize");
+
+    ninfer::PromptInput oversized =
+        image_text_input(block_ppm(2048, 1024, 127), {}, "oversized.ppm");
+    oversized.messages[0].parts[0].media.image_resize_policy =
+        ninfer::ImageResizePolicy::RejectOversized;
+    try {
+        (void)frontend.count_tokens(std::move(oversized));
+        failures += check(false, "oversized_image=error allowed a required Vision downsize");
+    } catch (const ninfer::RequestError& error) {
+        failures += check(error.kind() == ninfer::RequestErrorKind::InvalidMedia,
+                          "oversized_image=error used the wrong request-error classification");
+    }
     return failures;
 }
 
@@ -1443,6 +1510,8 @@ int test_cross_round_stop(const Frontend& frontend) {
                       "cross-round stop did not select the exact terminal token prefix");
     const auto second = session.commit_preview();
     failures += check(second.empty(), "stop marker or same-token suffix leaked to output");
+    failures += check(session.matched_stop_string() == std::optional<std::string>("STOP"),
+                      "terminal output session lost the matched stop declaration");
     return failures;
 }
 
@@ -1542,10 +1611,10 @@ int test_reasoning_split(const Frontend& frontend) {
         ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
     ninfer::PromptInput input;
     input.messages.push_back(std::move(message));
-    input.options.add_generation_prompt = true;
-    input.options.enable_thinking       = true;
-    auto prompt                         = frontend.prepare(std::move(input));
-    auto session                        = frontend.make_output_session(prompt, {});
+    input.options.continuation    = ninfer::PromptContinuationMode::NewAssistantTurn;
+    input.options.enable_thinking = true;
+    auto prompt                   = frontend.prepare(std::move(input));
+    auto session                  = frontend.make_output_session(prompt, {});
     const std::array<ninfer::TokenId, 2> tokens{3, 4};
     const auto decision = session.preview_model(tokens, 2, ninfer::FinishReason::OutputLimit);
     int failures        = check(decision.accepted_tokens == 2 &&
@@ -1568,8 +1637,8 @@ ninfer::targets::qwen3_6::PreparedPrompt thinking_prompt(const Frontend& fronten
         ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
     ninfer::PromptInput input;
     input.messages.push_back(std::move(message));
-    input.options.add_generation_prompt = true;
-    input.options.enable_thinking       = true;
+    input.options.continuation    = ninfer::PromptContinuationMode::NewAssistantTurn;
+    input.options.enable_thinking = true;
     return frontend.prepare(std::move(input));
 }
 
@@ -1965,6 +2034,7 @@ int main() {
     failures += test_context_capacity_guard();
     failures += test_official_chat_template();
     failures += test_ordered_instruction_turns();
+    failures += test_assistant_continuation();
     failures += test_reasoning_effort_chat_template();
     failures += test_rewrite_checkpoint_trace();
     failures += test_adjacent_tool_message_boundary();
@@ -1972,6 +2042,7 @@ int main() {
     failures += test_invalid_public_part_enums(frontend);
     failures += test_text_and_image_prepare(frontend);
     failures += test_literal_control_tokens_with_media();
+    failures += test_image_resize_rejection_policy();
     failures += test_explicit_leading_instruction_cache_boundary();
     failures += test_media_admission_uses_aggregate_resources(frontend);
     failures += test_multimodal_prompt_over_removed_32k_cap(frontend);
