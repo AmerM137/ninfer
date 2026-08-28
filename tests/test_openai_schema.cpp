@@ -10,6 +10,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -171,6 +172,38 @@ int test_standard_field_policy() {
     const OpenAIChatRequest zero        = parse(zero_limit);
     failures += check(zero.output_tokens_explicit && zero.generation.max_tokens == 0,
                       "an explicit zero output limit reaches Engine's no-generation path");
+    return failures;
+}
+
+int test_constrained_decoding_extensions() {
+    int failures                                           = 0;
+    const std::vector<std::pair<const char*, Json>> active = {
+        {"grammar", "root ::= \"yes\" | \"no\""},
+        {"structured_outputs", Json{{"json", Json{{"type", "object"}}}}},
+        {"guided_json", Json{{"type", "object"}}},
+        {"guided_regex", "[a-z]+"},
+        {"guided_choice", Json::array({"yes", "no"})},
+        {"guided_grammar", "root ::= \"yes\" | \"no\""},
+    };
+    for (const auto& [field, value] : active) {
+        Json body            = base_request();
+        body[field]          = value;
+        const ApiError error = api_error([&] { (void)parse(body); });
+        failures +=
+            check(error.param == field && error.code == "constrained_decoding_not_supported" &&
+                      error.message.find(field) != std::string::npos,
+                  std::string(field) + " constrained decoding is explicitly rejected");
+    }
+
+    Json neutral                  = base_request();
+    neutral["grammar"]            = "";
+    neutral["structured_outputs"] = nullptr;
+    neutral["guided_json"]        = nullptr;
+    neutral["guided_regex"]       = nullptr;
+    neutral["guided_choice"]      = nullptr;
+    neutral["guided_grammar"]     = nullptr;
+    failures += check(parse(neutral).generation.messages.size() == 1,
+                      "neutral constrained-decoding extension values are accepted");
     return failures;
 }
 
@@ -579,6 +612,7 @@ int main() {
     int failures = 0;
     failures += test_request_envelope_and_sampling();
     failures += test_standard_field_policy();
+    failures += test_constrained_decoding_extensions();
     failures += test_tools();
     failures += test_messages_and_media();
     failures += test_reasoning_and_extensions();

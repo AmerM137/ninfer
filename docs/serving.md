@@ -107,6 +107,9 @@ audio/file input or audio output, `strict:true`, required or named tool choice,
 `parallel_tool_calls:false` with enabled tools, explicit low/high image detail, web search,
 moderation, low/high verbosity, stored Chat Completions, and non-empty legacy `functions`.
 Each capability rejection identifies the affected field and the guarantee NInfer cannot provide.
+Known constrained-decoding aliases (`grammar`, `structured_outputs`, `guided_json`, `guided_regex`,
+`guided_choice`, and `guided_grammar`) receive the same explicit rejection instead of being treated
+as unknown hints.
 
 Semantically neutral fields do not make an otherwise executable request fail. All-zero
 `logit_bias`, `logprobs:false`, `top_logprobs:0`, `verbosity:"medium"`, empty legacy tool controls,
