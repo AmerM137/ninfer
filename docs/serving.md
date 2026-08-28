@@ -60,6 +60,9 @@ cannot be combined with `--vision`. A later request cannot enable a capability o
 | `POST /v1/messages` | Anthropic-style message generation |
 | `POST /v1/messages/count_tokens` | checkpoint-native expanded input-token count |
 
+Every OpenAI-compatible response carries a unique `x-request-id` header, including streaming and
+error responses. Anthropic endpoints use their separate `request-id` contract.
+
 ## OpenAI Chat Completions
 
 ```bash
@@ -517,7 +520,9 @@ completed zero-output cache-prewarm lifecycle. `temperature`, `top_p`, `top_k`, 
 Thinking supports `disabled`, `adaptive`, and `enabled`. Enabled Thinking requires
 `budget_tokens >= 1024` and less than `max_tokens`, and that budget is passed to Engine. Visible
 Thinking is returned with an opaque local signature; SSE emits its `signature_delta` before
-closing the block. `display:"omitted"` is rejected because NInfer cannot provide Anthropic's
+closing the block. Assistant Thinking blocks must be passed back unmodified with that signature;
+signatures belong to the current serve process and are invalid after it restarts.
+`display:"omitted"` is rejected because NInfer cannot provide Anthropic's
 encrypted hidden-reasoning restore semantics. `preserve_thinking` remains a NInfer extension for
 closed-turn Qwen reasoning history. `output_config.effort` is checked against the loaded template's
 declared effort capability.

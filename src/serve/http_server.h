@@ -1,5 +1,6 @@
 #pragma once
 
+#include "serve/anthropic_thinking_signature.h"
 #include "serve/generation_service.h"
 #include "serve/openai_responses_store.h"
 #include "serve/request_log.h"
@@ -72,6 +73,7 @@ private:
 
     GenerationService* service_ = nullptr;
     ServeOptions options_;
+    AnthropicThinkingSigner anthropic_thinking_signer_;
     std::string public_model_id_;
     OpenAIResponsesStore openai_responses_store_;
     JsonlRequestLog request_jsonl_;

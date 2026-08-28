@@ -4,6 +4,7 @@
 // GenerationRequest; response construction owns Anthropic aggregate, SSE, usage, and error shapes.
 
 #include "serve/request.h"
+#include "serve/anthropic_thinking_signature.h"
 
 #include <nlohmann/json.hpp>
 
@@ -28,14 +29,16 @@ struct AnthropicCountTokensRequest {
 };
 
 AnthropicMessagesRequest parse_anthropic_messages_request(const nlohmann::json& body,
-                                                          const RequestLimits& limits);
-AnthropicCountTokensRequest parse_anthropic_count_tokens_request(const nlohmann::json& body);
+                                                          const RequestLimits& limits,
+                                                          const AnthropicThinkingSigner& signer);
+AnthropicCountTokensRequest
+parse_anthropic_count_tokens_request(const nlohmann::json& body,
+                                     const AnthropicThinkingSigner& signer);
 
 struct AnthropicResponseIdentity {
     std::string request_id;
     std::string message_id;
     std::string model;
-    std::string thinking_signature;
 };
 
 std::string new_anthropic_request_id();
@@ -47,12 +50,14 @@ std::string make_anthropic_error_body(const ApiError& error, const std::string& 
 std::string make_anthropic_sse_error(const ApiError& error, const std::string& request_id);
 
 std::string make_anthropic_messages_response(const AnthropicResponseIdentity& identity,
-                                             const GenerationOutcome& outcome);
+                                             const GenerationOutcome& outcome,
+                                             const AnthropicThinkingSigner& signer);
 std::string make_anthropic_count_tokens_response(int input_tokens);
 
 class AnthropicMessagesStream {
 public:
-    AnthropicMessagesStream(AnthropicResponseIdentity identity, int input_tokens);
+    AnthropicMessagesStream(AnthropicResponseIdentity identity, int input_tokens,
+                            AnthropicThinkingSigner signer);
 
     // The Engine start event is exact for normal streams. The no-argument form is reserved for an
     // error raised before admission, so an Anthropic error event still has a valid stream prefix.
@@ -72,6 +77,7 @@ private:
     std::vector<std::string> close_text();
 
     AnthropicResponseIdentity identity_;
+    AnthropicThinkingSigner signer_;
     std::string reasoning_;
     std::string content_;
     int input_tokens_    = 0;

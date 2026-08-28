@@ -79,6 +79,8 @@ std::string new_openai_chat_completion_id() { return chat_identifier("chatcmpl-"
 
 std::string new_openai_chat_tool_call_id() { return chat_identifier("call_"); }
 
+std::string new_openai_request_id() { return responses_identifier("req"); }
+
 std::string new_openai_response_id() { return responses_identifier("resp"); }
 
 std::string new_openai_response_item_id(std::string_view prefix) {

@@ -19,6 +19,7 @@ void validate_openai_model(std::string_view requested, std::string_view availabl
 
 std::string new_openai_chat_completion_id();
 std::string new_openai_chat_tool_call_id();
+std::string new_openai_request_id();
 std::string new_openai_response_id();
 std::string new_openai_response_item_id(std::string_view prefix);
 

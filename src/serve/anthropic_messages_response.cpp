@@ -126,10 +126,9 @@ std::string new_anthropic_request_id() { return random_identifier("req_"); }
 
 AnthropicResponseIdentity make_anthropic_response_identity(std::string request_id,
                                                            std::string model) {
-    return AnthropicResponseIdentity{.request_id         = std::move(request_id),
-                                     .message_id         = random_identifier("msg_"),
-                                     .model              = std::move(model),
-                                     .thinking_signature = random_identifier("sig_ninfer_")};
+    return AnthropicResponseIdentity{.request_id = std::move(request_id),
+                                     .message_id = random_identifier("msg_"),
+                                     .model      = std::move(model)};
 }
 
 ApiError normalize_anthropic_error(ApiError error) {
@@ -182,12 +181,13 @@ std::string make_anthropic_sse_error(const ApiError& error, const std::string& r
 }
 
 std::string make_anthropic_messages_response(const AnthropicResponseIdentity& identity,
-                                             const GenerationOutcome& outcome) {
+                                             const GenerationOutcome& outcome,
+                                             const AnthropicThinkingSigner& signer) {
     Json content = Json::array();
     if (!outcome.reasoning.empty()) {
         content.push_back(Json{{"type", "thinking"},
                                {"thinking", outcome.reasoning},
-                               {"signature", identity.thinking_signature}});
+                               {"signature", signer.sign(outcome.reasoning, 0)}});
     }
     if (!outcome.text.empty()) {
         content.push_back(Json{{"type", "text"}, {"text", outcome.text}});
@@ -215,8 +215,8 @@ std::string make_anthropic_count_tokens_response(int input_tokens) {
 }
 
 AnthropicMessagesStream::AnthropicMessagesStream(AnthropicResponseIdentity identity,
-                                                 int input_tokens)
-    : identity_(std::move(identity)), input_tokens_(input_tokens) {}
+                                                 int input_tokens, AnthropicThinkingSigner signer)
+    : identity_(std::move(identity)), signer_(std::move(signer)), input_tokens_(input_tokens) {}
 
 std::string AnthropicMessagesStream::start() { return start_with_cache(std::nullopt); }
 
@@ -271,11 +271,13 @@ std::vector<std::string> AnthropicMessagesStream::close_thinking() {
     std::vector<std::string> events;
     if (!thinking_open_) { return events; }
     if (!signature_sent_) {
-        events.push_back(event("content_block_delta",
-                               Json{{"type", "content_block_delta"},
-                                    {"index", thinking_index_},
-                                    {"delta", Json{{"type", "signature_delta"},
-                                                   {"signature", identity_.thinking_signature}}}}));
+        events.push_back(event(
+            "content_block_delta",
+            Json{{"type", "content_block_delta"},
+                 {"index", thinking_index_},
+                 {"delta", Json{{"type", "signature_delta"},
+                                {"signature", signer_.sign(reasoning_, static_cast<std::size_t>(
+                                                                           thinking_index_))}}}}));
         signature_sent_ = true;
     }
     events.push_back(event("content_block_stop",

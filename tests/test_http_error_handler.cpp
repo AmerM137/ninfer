@@ -79,6 +79,7 @@ int main() {
                           messages_body.at("request_id").get<std::string>().starts_with("req_") &&
                           messages_response.get_header_value("request-id") ==
                               messages_body.at("request_id").get<std::string>() &&
+                          !messages_response.has_header("x-request-id") &&
                           messages_body.at("error").at("message").get<std::string>().find(
                               "1234 bytes") != std::string::npos,
                       "empty Anthropic 413 did not become a payload-limit error");
@@ -92,6 +93,8 @@ int main() {
     const Json openai_body = Json::parse(openai_response.body);
     failures += check(openai_result == httplib::Server::HandlerResponse::Handled &&
                           openai_body.at("error").at("code") == "request_too_large" &&
+                          openai_response.get_header_value_count("x-request-id") == 1 &&
+                          openai_response.get_header_value("x-request-id").starts_with("req_") &&
                           openai_body.at("error").at("message").get<std::string>().find(
                               "1234 bytes") != std::string::npos,
                       "empty OpenAI 413 did not become a payload-limit error");
@@ -117,13 +120,16 @@ int main() {
 
     httplib::Response authored_response;
     authored_response.status = 413;
+    authored_response.set_header("x-request-id", "req_existing");
     authored_response.set_content(R"({"error":{"code":"application_error"}})", "application/json");
     const std::string authored_body = authored_response.body;
     const auto authored_result =
         ninfer::serve::handle_unrendered_http_error(options, openai_request, authored_response);
     failures += check(authored_result == httplib::Server::HandlerResponse::Unhandled &&
-                          authored_response.body == authored_body,
-                      "application-authored 413 was overwritten by the payload-limit handler");
+                          authored_response.body == authored_body &&
+                          authored_response.get_header_value_count("x-request-id") == 1 &&
+                          authored_response.get_header_value("x-request-id") == "req_existing",
+                      "application-authored 413 or its request ID was overwritten");
 
     httplib::Response other_response;
     other_response.status = 400;

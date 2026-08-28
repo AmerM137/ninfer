@@ -18,7 +18,7 @@ void HttpServer::handle_count_tokens(const httplib::Request& req, httplib::Respo
     res.set_header("request-id", request_id);
     try {
         const AnthropicCountTokensRequest request =
-            parse_anthropic_count_tokens_request(parse_json_body(req));
+            parse_anthropic_count_tokens_request(parse_json_body(req), anthropic_thinking_signer_);
         const int input_tokens = service_->count_prompt_tokens(
             request.generation, [&req] { return client_disconnected(req); });
         res.set_content(make_anthropic_count_tokens_response(input_tokens), "application/json");
@@ -40,7 +40,8 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
     try {
         RequestLimits limits;
         limits.default_max_tokens = options_.default_max_tokens;
-        request                   = parse_anthropic_messages_request(parse_json_body(req), limits);
+        request                   = parse_anthropic_messages_request(parse_json_body(req), limits,
+                                                                     anthropic_thinking_signer_);
     } catch (const ApiException& exception) {
         write_anthropic_error(res, exception.error(), request_id);
         return;
@@ -91,8 +92,10 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
             const GenerationOutcome outcome =
                 service_->run(prepared, nullptr, [&req] { return client_disconnected(req); });
             log_request_done(log_context, outcome);
-            set_owned_json_content(res, make_anthropic_messages_response(identity, outcome),
-                                   prepared.lifetime);
+            set_owned_json_content(
+                res,
+                make_anthropic_messages_response(identity, outcome, anthropic_thinking_signer_),
+                prepared.lifetime);
         } catch (const ApiException& exception) {
             const ApiError error = normalize_anthropic_error(exception.error());
             log_request_error(log_context, error.message);
@@ -108,7 +111,8 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
     }
 
     auto stream  = std::make_shared<HttpGenerationStream>(std::move(prepared));
-    auto encoder = std::make_shared<AnthropicMessagesStream>(identity, input_tokens);
+    auto encoder = std::make_shared<AnthropicMessagesStream>(identity, input_tokens,
+                                                             anthropic_thinking_signer_);
 
     prepare_sse_response(res);
     res.set_chunked_content_provider(

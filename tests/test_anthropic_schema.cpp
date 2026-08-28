@@ -6,6 +6,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <array>
 #include <functional>
 #include <iostream>
 #include <iterator>
@@ -37,8 +38,19 @@ RequestLimits limits() {
     return value;
 }
 
+const AnthropicThinkingSigner& thinking_signer() {
+    static const AnthropicThinkingSigner value = [] {
+        AnthropicThinkingSigner::Key key{};
+        for (std::size_t index = 0; index < key.size(); ++index) {
+            key[index] = static_cast<std::uint8_t>(index + 1U);
+        }
+        return AnthropicThinkingSigner(key);
+    }();
+    return value;
+}
+
 AnthropicMessagesRequest parse(const Json& body) {
-    return parse_anthropic_messages_request(body, limits());
+    return parse_anthropic_messages_request(body, limits(), thinking_signer());
 }
 
 std::string api_code(const std::function<void()>& action) {
@@ -294,8 +306,9 @@ int test_tool_history() {
          Json{{"role", "user"}, {"content", Json::array({tool_result("toolu_same", "result")})}}});
     failures += check(api_code([&] { (void)parse(body); }) == "invalid_tool_history",
                       "duplicate tool_use ID was accepted");
-    failures += check(api_code([&] { (void)parse_anthropic_count_tokens_request(body); }) ==
-                          "invalid_tool_history",
+    failures += check(api_code([&] {
+                          (void)parse_anthropic_count_tokens_request(body, thinking_signer());
+                      }) == "invalid_tool_history",
                       "Count Tokens did not share Messages tool-history validation");
     return failures;
 }
@@ -380,10 +393,11 @@ int test_thinking_and_count_tokens() {
     failures += check(api_code([&] { (void)parse(body); }) == "thinking_display_not_supported",
                       "hidden Thinking was accepted without restore semantics");
 
-    body["max_tokens"]                        = 0;
-    body["temperature"]                       = "ignored for counting";
-    body["output_config"]                     = Json{{"format", Json{{"type", "json_schema"}}}};
-    const AnthropicCountTokensRequest counted = parse_anthropic_count_tokens_request(body);
+    body["max_tokens"]    = 0;
+    body["temperature"]   = "ignored for counting";
+    body["output_config"] = Json{{"format", Json{{"type", "json_schema"}}}};
+    const AnthropicCountTokensRequest counted =
+        parse_anthropic_count_tokens_request(body, thinking_signer());
     failures += check(counted.generation.enable_thinking == true,
                       "Count Tokens did not share prompt-affecting Thinking parsing");
 
@@ -396,6 +410,76 @@ int test_thinking_and_count_tokens() {
     failures += check(api_code([&] { (void)semantics(parse(body).generation); }) ==
                           "assistant_prefill_not_supported",
                       "Thinking-on assistant prefill was not rejected at capability resolution");
+    return failures;
+}
+
+int test_thinking_history_integrity() {
+    constexpr std::string_view thought = "thought";
+    const std::string signature        = thinking_signer().sign(thought, 0);
+    int failures =
+        check(signature ==
+                  "sig_ninfer_v1_72f7f5bccf8a10a8e5de051274eb2643f6a0fe99764bf463f935af5e2b845198",
+              "Anthropic Thinking signature does not match the HMAC-SHA256 contract");
+    AnthropicThinkingSigner::Key other_key{};
+    other_key.fill(0xa5U);
+    const AnthropicThinkingSigner other_process(other_key);
+    failures += check(!other_process.verify(thought, 0, signature),
+                      "Thinking signature remained valid under another process key");
+    std::string changed_encoding = signature;
+    const std::size_t hex_letter = changed_encoding.find_first_of("abcdef");
+    changed_encoding[hex_letter] = static_cast<char>(changed_encoding[hex_letter] - 'a' + 'A');
+    failures += check(!thinking_signer().verify(thought, 0, changed_encoding),
+                      "textually modified Thinking signature was accepted");
+
+    Json body        = base_request();
+    body["messages"] = Json::array(
+        {Json{{"role", "user"}, {"content", "before"}},
+         Json{{"role", "assistant"},
+              {"content",
+               Json::array(
+                   {Json{{"type", "thinking"}, {"thinking", thought}, {"signature", signature}},
+                    Json{{"type", "text"}, {"text", "answer"}}})}},
+         Json{{"role", "user"}, {"content", "after"}}});
+    const GenerationRequest accepted = parse(body).generation;
+    failures +=
+        check(accepted.messages.size() == 3 && accepted.messages[1].reasoning_content == thought &&
+                  accepted.messages[1].content[0].text == "answer",
+              "valid signed Thinking history was not lowered");
+
+    Json changed_text                                     = body;
+    changed_text["messages"][1]["content"][0]["thinking"] = "changed";
+    failures += check(api_code([&] { (void)parse(changed_text); }) == "invalid_thinking_signature",
+                      "Thinking text changed under an existing signature was accepted");
+
+    Json changed_signature                                      = body;
+    std::string invalid                                         = signature;
+    invalid.back()                                              = invalid.back() == '0' ? '1' : '0';
+    changed_signature["messages"][1]["content"][0]["signature"] = invalid;
+    failures +=
+        check(api_code([&] { (void)parse(changed_signature); }) == "invalid_thinking_signature",
+              "changed Thinking signature was accepted");
+
+    Json missing_signature = body;
+    missing_signature["messages"][1]["content"][0].erase("signature");
+    failures +=
+        check(api_code([&] { (void)parse(missing_signature); }) == "invalid_thinking_signature",
+              "missing Thinking signature was accepted");
+
+    Json wrong_type                                      = body;
+    wrong_type["messages"][1]["content"][0]["signature"] = 1;
+    failures += check(api_code([&] { (void)parse(wrong_type); }) == "invalid_thinking_signature",
+                      "non-string Thinking signature was accepted");
+
+    Json reordered = body;
+    reordered["messages"][1]["content"].insert(reordered["messages"][1]["content"].begin(),
+                                               Json{{"type", "text"}, {"text", "first"}});
+    failures += check(api_code([&] { (void)parse(reordered); }) == "invalid_thinking_signature",
+                      "signed Thinking block was accepted at a changed content position");
+    failures +=
+        check(api_code([&] {
+                  (void)parse_anthropic_count_tokens_request(missing_signature, thinking_signer());
+              }) == "invalid_thinking_signature",
+              "Count Tokens bypassed Thinking signature validation");
     return failures;
 }
 
@@ -452,12 +536,15 @@ int test_aggregate_and_errors() {
     const AnthropicResponseIdentity identity =
         make_anthropic_response_identity("req_test", "claude-local");
     GenerationOutcome outcome = sample_outcome();
-    const Json response       = Json::parse(make_anthropic_messages_response(identity, outcome));
-    int failures =
-        check(response["content"].size() == 2 && response["content"][0]["type"] == "thinking" &&
-                  !response["content"][0]["signature"].get<std::string>().empty() &&
-                  response["stop_reason"] == "stop_sequence" && response["stop_sequence"] == "STOP",
-              "aggregate Thinking or stop-sequence presentation is incomplete");
+    const Json response =
+        Json::parse(make_anthropic_messages_response(identity, outcome, thinking_signer()));
+    int failures = check(
+        response["content"].size() == 2 && response["content"][0]["type"] == "thinking" &&
+            !response["content"][0]["signature"].get<std::string>().empty() &&
+            thinking_signer().verify(response["content"][0]["thinking"].get<std::string>(), 0,
+                                     response["content"][0]["signature"].get<std::string>()) &&
+            response["stop_reason"] == "stop_sequence" && response["stop_sequence"] == "STOP",
+        "aggregate Thinking or stop-sequence presentation is incomplete");
     failures += check(response["usage"]["input_tokens"] == 40 &&
                           response["usage"]["cache_read_input_tokens"] == 60 &&
                           response["usage"]["cache_creation_input_tokens"].is_null() &&
@@ -466,14 +553,16 @@ int test_aggregate_and_errors() {
 
     outcome.prompt_tokens                   = 10;
     outcome.metrics.prefix_cache_hit_tokens = 1000;
-    const Json clamped = Json::parse(make_anthropic_messages_response(identity, outcome));
+    const Json clamped =
+        Json::parse(make_anthropic_messages_response(identity, outcome, thinking_signer()));
     failures += check(clamped["usage"]["input_tokens"] == 0 &&
                           clamped["usage"]["cache_read_input_tokens"] == 10,
                       "cache-read usage was not clamped to the prompt token count");
 
     outcome               = {};
     outcome.finish_reason = ninfer::FinishReason::ContextCapacity;
-    const Json empty      = Json::parse(make_anthropic_messages_response(identity, outcome));
+    const Json empty =
+        Json::parse(make_anthropic_messages_response(identity, outcome, thinking_signer()));
     failures +=
         check(empty["content"].empty() && empty["stop_reason"] == "model_context_window_exceeded",
               "empty output was fabricated or context capacity was misclassified");
@@ -494,7 +583,7 @@ int test_aggregate_and_errors() {
 int test_stream() {
     const AnthropicResponseIdentity identity =
         make_anthropic_response_identity("req_stream", "claude-local");
-    AnthropicMessagesStream stream(identity, 100);
+    AnthropicMessagesStream stream(identity, 100, thinking_signer());
     const ninfer::GenerationStart warm_start{
         .prompt               = ninfer::PromptSummary{.prompt_tokens = 100},
         .reused_prompt_tokens = 60,
@@ -521,7 +610,8 @@ int test_stream() {
         }
         if (parsed.at("type") == "content_block_delta" &&
             parsed["delta"]["type"] == "signature_delta") {
-            saw_signature = !parsed["delta"]["signature"].get<std::string>().empty();
+            const std::string signature = parsed["delta"]["signature"].get<std::string>();
+            saw_signature               = thinking_signer().verify("thought", 0, signature);
         }
         if (parsed.at("type") == "message_delta") { terminal_usage = parsed.at("usage"); }
     }
@@ -537,14 +627,14 @@ int test_stream() {
     });
     failures += check(signature_position < text_position,
                       "Thinking signature was emitted after the text block began");
-    const Json aggregate =
-        Json::parse(make_anthropic_messages_response(identity, sample_outcome()));
+    const Json aggregate = Json::parse(
+        make_anthropic_messages_response(identity, sample_outcome(), thinking_signer()));
     failures +=
         check(terminal_usage == aggregate.at("usage") && terminal_usage["input_tokens"] == 40 &&
                   terminal_usage["cache_read_input_tokens"] == 60,
               "terminal stream usage did not match aggregate cache usage");
 
-    AnthropicMessagesStream cold_stream(identity, 25);
+    AnthropicMessagesStream cold_stream(identity, 25, thinking_signer());
     (void)cold_stream.start(ninfer::GenerationStart{
         .prompt               = ninfer::PromptSummary{.prompt_tokens = 25},
         .reused_prompt_tokens = 0,
@@ -559,7 +649,7 @@ int test_stream() {
                           cold_delta["usage"]["output_tokens"] == 3,
                       "cold terminal stream usage was not cumulative and exact");
 
-    AnthropicMessagesStream pre_admission_error(identity, 25);
+    AnthropicMessagesStream pre_admission_error(identity, 25, thinking_signer());
     const Json provisional = parse_event(pre_admission_error.start());
     failures += check(provisional["message"]["usage"]["input_tokens"] == 25 &&
                           provisional["message"]["usage"]["cache_read_input_tokens"].is_null(),
@@ -576,6 +666,7 @@ int main() {
     failures += test_tool_history();
     failures += test_tools();
     failures += test_thinking_and_count_tokens();
+    failures += test_thinking_history_integrity();
     failures += test_content_and_cache_hints();
     failures += test_aggregate_and_errors();
     failures += test_stream();
