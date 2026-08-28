@@ -8,6 +8,7 @@
 #include "targets/qwen3_6/impl/frontend/processor.h"
 #include "targets/qwen3_6/impl/frontend/test_access.h"
 #include "targets/qwen3_6/impl/frontend/tokenizer.h"
+#include "targets/qwen3_6/impl/frontend/tool_call_parser.h"
 #include "text/unicode.h"
 
 #include <nlohmann/json.hpp>
@@ -865,11 +866,14 @@ class OutputSession::Impl {
 public:
     Impl(std::shared_ptr<const fi::Tokenizer> tokenizer_, StopPolicy policy_, OutputOptions output,
          bool starts_in_reasoning, ThinkingControlOptions thinking,
-         std::shared_ptr<const std::vector<TokenId>> thinking_control_tokens_)
+         std::shared_ptr<const std::vector<TokenId>> thinking_control_tokens_,
+         std::shared_ptr<const fi::ToolCallOutputContract> tool_call_output_)
         : tokenizer(std::move(tokenizer_)), policy(std::move(policy_)),
           thinking_control_tokens(std::move(thinking_control_tokens_)),
           preserve_special(output.raw || output.preserve_special_tokens),
-          split_reasoning(starts_in_reasoning && !output.raw) {
+          split_reasoning(starts_in_reasoning && !output.raw),
+          tool_call_output(output.raw ? nullptr : std::move(tool_call_output_),
+                           output.tool_name_max_length) {
         if (thinking.budget && *thinking.budget == 0) {
             throw std::invalid_argument("thinking budget must be positive");
         }
@@ -891,6 +895,8 @@ public:
     SemanticThinkingState semantic;
     SemanticThinkingState preview_semantic;
     PublishedOutput preview_output;
+    fi::ToolCallOutputDecoder tool_call_output;
+    std::vector<GeneratedToolCall> tool_calls;
     bool preview_ready = false;
 };
 
@@ -1158,7 +1164,7 @@ runtime::OutputDecision OutputSession::preview_terminal(FinishReason reason) {
     return runtime::OutputDecision{.accepted_tokens = 0, .finish_reason = reason};
 }
 
-PublishedOutput OutputSession::commit_preview() noexcept {
+PublishedOutput OutputSession::commit_preview() {
     if (impl_ == nullptr || !impl_->preview_ready) { std::terminate(); }
     using std::swap;
     swap(impl_->state, impl_->preview_state);
@@ -1166,7 +1172,33 @@ PublishedOutput OutputSession::commit_preview() noexcept {
     PublishedOutput output = std::move(impl_->preview_output);
     impl_->preview_output.clear();
     impl_->preview_ready = false;
+
+    for (OutputDelta& delta : output) {
+        if (delta.channel == OutputChannel::Content) {
+            delta.text = impl_->tool_call_output.feed(delta.text);
+        }
+    }
+    if (impl_->state.terminal) {
+        fi::ToolCallOutputDecoder::Terminal terminal = impl_->tool_call_output.finish();
+        impl_->tool_calls                            = std::move(terminal.tool_calls);
+        if (!terminal.content.empty()) {
+            OutputDelta* content = nullptr;
+            for (OutputDelta& delta : output) {
+                if (delta.channel == OutputChannel::Content) { content = &delta; }
+            }
+            if (content != nullptr) {
+                content->text += terminal.content;
+            } else {
+                output.push_back(OutputDelta{.channel = OutputChannel::Content,
+                                             .text    = std::move(terminal.content)});
+            }
+        }
+    }
     return output;
+}
+
+std::vector<GeneratedToolCall> OutputSession::take_tool_calls() noexcept {
+    return impl_ != nullptr ? std::move(impl_->tool_calls) : std::vector<GeneratedToolCall>{};
 }
 
 std::uint32_t OutputSession::reasoning_tokens() const noexcept {
@@ -1234,6 +1266,12 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     std::vector<ChatRole> message_roles;
     message_roles.reserve(input.messages.size());
     for (const ChatMessage& message : input.messages) { message_roles.push_back(message.role); }
+    const bool has_tool_history =
+        std::any_of(input.messages.begin(), input.messages.end(), [](const ChatMessage& message) {
+            return message.role == ChatRole::Tool || !message.tool_calls.empty();
+        });
+    const auto tool_call_output = fi::build_tool_call_output_contract(
+        options.tool_jsons, !options.tool_jsons.empty() || has_tool_history);
     const std::optional<std::uint32_t> automatic_boundary =
         automatic_stable_boundary(message_roles, !options.tool_jsons.empty());
     const std::size_t message_count       = input.messages.size();
@@ -1247,6 +1285,7 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
 
     auto prepared              = std::make_unique<PreparedPromptData>();
     PreparedPromptData& result = *prepared;
+    result.tool_call_output    = tool_call_output;
     std::vector<std::optional<std::uint32_t>> message_boundaries;
     std::vector<std::optional<std::uint32_t>> cache_boundaries;
     if (has_media) {
@@ -1402,7 +1441,7 @@ OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,
     if (output.raw) { policy.publish_stop_token = true; }
     return OutputSession(std::make_unique<OutputSession::Impl>(
         impl_->tokenizer, std::move(policy), output, prompt.data_->starts_in_reasoning, thinking,
-        impl_->thinking_control_tokens));
+        impl_->thinking_control_tokens, prompt.data_->tool_call_output));
 }
 
 const StopPolicy& Frontend::default_stop_policy() const noexcept { return impl_->defaults; }

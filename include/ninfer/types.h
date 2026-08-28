@@ -163,7 +163,7 @@ struct SamplingOverrides {
 // Complete parameters after Engine resolution. Target runtimes consume only this type.
 struct ResolvedSamplingParameters {
     float temperature       = 0.0F;
-    std::int32_t top_k      = 0;
+    std::int32_t top_k      = 20;
     float top_p             = 1.0F;
     float min_p             = 0.0F;
     float presence_penalty  = 0.0F;
@@ -206,6 +206,9 @@ struct ExecutionOptions {
 struct OutputOptions {
     bool raw                     = false;
     bool preserve_special_tokens = false;
+    // Presentation constraint supplied by the protocol adapter. It bounds only Qwen's emitted
+    // function-name grammar; it does not require the name to match a currently declared tool.
+    std::uint32_t tool_name_max_length = 128;
 };
 
 struct RequestOptions {
@@ -228,6 +231,12 @@ struct OwnedMedia {
 
 struct ToolCall {
     std::string id;
+    std::string name;
+    std::string arguments_json;
+};
+
+// Model-origin structured output. Protocol adapters own any wire-level call identifier.
+struct GeneratedToolCall {
     std::string name;
     std::string arguments_json;
 };
@@ -569,6 +578,7 @@ struct GenerationResult {
     std::vector<TokenId> generated_token_ids;
     std::string content;
     std::string reasoning;
+    std::vector<GeneratedToolCall> tool_calls;
     std::uint32_t reasoning_tokens     = 0;
     FinishReason finish_reason         = FinishReason::None;
     std::uint32_t reused_prompt_tokens = 0;

@@ -76,7 +76,7 @@ Frontend 拥有模型家族的输入与输出语义：
 
 - tokenizer、chat template、Vision preprocessing 和 MRoPE prompt construction；
 - owning `PreparedPrompt` 及其内容 identity；
-- stop、thinking/content channel、detokenization 和最终文本；
+- stop、thinking/content channel、detokenization、最终文本和模型私有结构化输出；
 - 每个请求独占的 `OutputSession`。
 
 Frontend 可以预览一次模型输出将产生的语义效果，但只有 Engine 完成提交后才能发布该效果。

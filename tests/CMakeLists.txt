@@ -173,7 +173,7 @@ ninfer_add_test(ninfer_anthropic_schema_test
   LIBRARIES ninfer_serve)
 ninfer_add_test(ninfer_tool_call_parser_test
   SOURCES test_tool_call_parser.cpp
-  LIBRARIES ninfer_serve)
+  LIBRARIES ninfer_engine)
 ninfer_add_test(ninfer_serve_options_test
   SOURCES test_serve_options.cpp
   LIBRARIES ninfer_serve)

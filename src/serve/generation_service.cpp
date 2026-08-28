@@ -1,14 +1,16 @@
 #include "serve/generation_service.h"
 
 #include "product/media_acquire/acquire.h"
-#include "serve/tool_call_parser.h"
 #include "serve/translate.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstddef>
+#include <cstdio>
 #include <iterator>
 #include <mutex>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -194,24 +196,18 @@ void check_preparation_control(Clock::time_point deadline,
 
 class ServiceOutputSink final : public ninfer::OutputSink {
 public:
-    ServiceOutputSink(const StreamSink& sink, bool filter_tool_calls)
-        : sink_(&sink), filter_tool_calls_(filter_tool_calls) {}
+    explicit ServiceOutputSink(const StreamSink& sink) : sink_(&sink) {}
 
     void publish(ninfer::OutputDelta delta) override {
         if (delta.text.empty()) { return; }
         if (delta.channel == ninfer::OutputChannel::Reasoning) {
             if (sink_->on_reasoning) { sink_->on_reasoning(delta.text); }
         } else {
-            std::string visible =
-                filter_tool_calls_ ? tool_filter_.feed(delta.text) : std::move(delta.text);
-            publish_content(visible);
+            publish_content(delta.text);
         }
     }
 
-    std::size_t finish(bool is_tool_call_response) {
-        if (filter_tool_calls_) { publish_content(tool_filter_.finish(is_tool_call_response)); }
-        return content_bytes_;
-    }
+    [[nodiscard]] std::size_t content_bytes() const noexcept { return content_bytes_; }
 
 private:
     void publish_content(const std::string& text) {
@@ -220,11 +216,18 @@ private:
         content_bytes_ += text.size();
     }
 
-    const StreamSink* sink_ = nullptr;
-    bool filter_tool_calls_ = false;
-    ToolCallStreamFilter tool_filter_;
+    const StreamSink* sink_    = nullptr;
     std::size_t content_bytes_ = 0;
 };
+
+std::string new_tool_call_id() {
+    static thread_local std::mt19937_64 rng{std::random_device{}()};
+    std::uniform_int_distribution<std::uint64_t> dist;
+    std::array<char, 32> buf{};
+    std::snprintf(buf.data(), buf.size(), "call_%016llx",
+                  static_cast<unsigned long long>(dist(rng)));
+    return std::string(buf.data());
+}
 
 } // namespace
 
@@ -294,10 +297,7 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
                                                 CacheParticipation cache_participation,
                                                 DeadlinePolicy deadline_policy) const {
     PreparedRequest prepared;
-    prepared.include_usage        = request.include_usage;
-    prepared.tool_capable         = request.uses_tools() || request.has_tool_history();
-    prepared.tool_name_max_length = request.tool_name_max_length;
-    prepared.tool_argument_types  = build_tool_argument_type_contracts(request);
+    prepared.include_usage = request.include_usage;
     const ResolvedPromptSemantics semantics =
         resolve_prompt_semantics(request, options_, prompt_capabilities_);
     ninfer::RequestOptions request_options = to_request_options(
@@ -387,9 +387,7 @@ int GenerationService::count_prompt_tokens(const GenerationRequest& request,
 GenerationOutcome GenerationService::run(PreparedRequest& prepared, const StreamSink* sink,
                                          std::function<bool()> is_cancelled) {
     std::unique_ptr<ServiceOutputSink> output_sink;
-    if (sink != nullptr) {
-        output_sink = std::make_unique<ServiceOutputSink>(*sink, prepared.tool_capable);
-    }
+    if (sink != nullptr) { output_sink = std::make_unique<ServiceOutputSink>(*sink); }
     ninfer::OutputSink* public_sink = output_sink.get();
     ninfer::CancellationView cancellation;
     if (is_cancelled || (sink != nullptr && sink->is_cancelled)) {
@@ -435,17 +433,13 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     outcome.metrics.speculative_accepted_per_position =
         std::move(result.speculative.accepted_per_position);
 
-    bool is_tool_call_response = false;
-    if (prepared.tool_capable) {
-        ParsedToolCallOutput parsed = parse_qwen_tool_call_output(
-            outcome.text, prepared.tool_name_max_length, prepared.tool_argument_types);
-        outcome.text          = std::move(parsed.content);
-        is_tool_call_response = parsed.is_tool_call_response;
-        if (is_tool_call_response) { outcome.tool_calls = std::move(parsed.tool_calls); }
+    outcome.tool_calls.reserve(result.tool_calls.size());
+    for (ninfer::GeneratedToolCall& call : result.tool_calls) {
+        outcome.tool_calls.push_back(ToolCall{.id             = new_tool_call_id(),
+                                              .name           = std::move(call.name),
+                                              .arguments_json = std::move(call.arguments_json)});
     }
-    if (output_sink) {
-        outcome.streamed_content_bytes = output_sink->finish(is_tool_call_response);
-    }
+    if (output_sink) { outcome.streamed_content_bytes = output_sink->content_bytes(); }
     return outcome;
 }
 

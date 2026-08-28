@@ -480,7 +480,6 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
 
     auto stream              = std::make_shared<StreamingRequest>(std::move(prepared));
     const bool include_usage = stream->prepared.include_usage;
-    const bool tool_capable  = stream->prepared.tool_capable;
 
     // SSE hints: disable client/proxy caching and reverse-proxy response buffering
     // so tokens flush immediately. Content-Type is set by the chunked provider.
@@ -489,7 +488,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
 
     res.set_chunked_content_provider(
         "text/event-stream",
-        [this, stream, id, created, model, include_usage, tool_capable,
+        [this, stream, id, created, model, include_usage,
          log_context](std::size_t, httplib::DataSink& sink) -> bool {
             if (stream->started) {
                 sink.done();
@@ -532,7 +531,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                         sink, *stream,
                         make_chat_chunk_final(id, model, created, "tool_calls", include_usage));
                 } else {
-                    if (tool_capable && !remaining.empty()) {
+                    if (!remaining.empty()) {
                         write_stream_item(sink, *stream,
                                           make_chat_chunk_content(id, model, created,
                                                                   std::string(remaining),
@@ -694,16 +693,15 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
         return;
     }
 
-    auto stream             = std::make_shared<StreamingRequest>(std::move(prepared));
-    const bool tool_capable = stream->prepared.tool_capable;
+    auto stream = std::make_shared<StreamingRequest>(std::move(prepared));
 
     res.set_header("Cache-Control", "no-cache");
     res.set_header("X-Accel-Buffering", "no");
 
     res.set_chunked_content_provider(
         "text/event-stream",
-        [this, stream, id, model, input_tokens, tool_capable,
-         log_context](std::size_t, httplib::DataSink& sink) -> bool {
+        [this, stream, id, model, input_tokens, log_context](std::size_t,
+                                                             httplib::DataSink& sink) -> bool {
             if (stream->started) {
                 sink.done();
                 return true;
@@ -760,24 +758,19 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                     text_open = false;
                 }
 
-                if (tool_capable) {
-                    if (!remaining.empty()) {
-                        const int idx = next_index++;
-                        write_stream_item(sink, *stream, make_content_block_start_text(idx));
-                        write_stream_item(
-                            sink, *stream,
-                            make_content_block_delta_text(idx, std::string(remaining)));
-                        write_stream_item(sink, *stream, make_content_block_stop(idx));
-                    }
-                    for (const ToolCall& call : outcome.tool_calls) {
-                        const int idx = next_index++;
-                        write_stream_item(sink, *stream,
-                                          make_content_block_start_tool_use(idx, call));
-                        write_stream_item(
-                            sink, *stream,
-                            make_content_block_delta_tool_json(idx, call.arguments_json));
-                        write_stream_item(sink, *stream, make_content_block_stop(idx));
-                    }
+                if (!remaining.empty()) {
+                    const int idx = next_index++;
+                    write_stream_item(sink, *stream, make_content_block_start_text(idx));
+                    write_stream_item(sink, *stream,
+                                      make_content_block_delta_text(idx, std::string(remaining)));
+                    write_stream_item(sink, *stream, make_content_block_stop(idx));
+                }
+                for (const ToolCall& call : outcome.tool_calls) {
+                    const int idx = next_index++;
+                    write_stream_item(sink, *stream, make_content_block_start_tool_use(idx, call));
+                    write_stream_item(sink, *stream,
+                                      make_content_block_delta_tool_json(idx, call.arguments_json));
+                    write_stream_item(sink, *stream, make_content_block_stop(idx));
                 }
 
                 if (next_index == 0) {

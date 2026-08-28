@@ -81,7 +81,8 @@ The endpoint supports:
 - string content and ordered text, `image_url`, and `video_url` parts; tool messages accept text
   parts only;
 - `max_completion_tokens` and the legacy `max_tokens` spelling;
-- `temperature`, `top_p`, `top_k`, presence/frequency penalties, and a nonnegative `seed`;
+- `temperature`, `top_p`, `top_k` (`0..20`; zero selects the target's top-20 cap),
+  presence/frequency penalties, and a nonnegative `seed`;
 - one stop string or an array of stop strings;
 - non-streaming responses and server-sent event streams;
 - `stream_options.include_usage`;
@@ -542,7 +543,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--cors` | permissive browser CORS headers | off |
 | `--temperature F` | process-level temperature override | unset |
 | `--top-p F` | process-level top-p override | unset |
-| `--top-k N` | process-level top-k override | unset |
+| `--top-k N` | process-level top-k override (`0..20`; zero selects the top-20 cap) | unset |
 | `--min-p F` | process-level min-p override | unset |
 | `--presence-penalty F` | process-level presence-penalty override | unset |
 | `--frequency-penalty F` | process-level frequency-penalty override | unset |

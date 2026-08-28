@@ -65,8 +65,8 @@ ninfer::SamplingOverrides resolve_sampling_overrides(const SamplingParams& reque
     if (sampling.top_p && (*sampling.top_p < 0.0F || *sampling.top_p > 1.0F)) {
         invalid_sampling("top_p must be in [0,1]", "top_p");
     }
-    if (sampling.top_k && *sampling.top_k < 0) {
-        invalid_sampling("top_k must be nonnegative", "top_k");
+    if (sampling.top_k && (*sampling.top_k < 0 || *sampling.top_k > 20)) {
+        invalid_sampling("top_k must be in [0,20]", "top_k");
     }
     if (sampling.min_p && (*sampling.min_p < 0.0F || *sampling.min_p > 1.0F)) {
         invalid_sampling("min_p must be in [0,1]", "min_p");
@@ -284,6 +284,7 @@ ninfer::RequestOptions to_request_options(const GenerationRequest& request,
     options.execution.sampling             = resolve_sampling_overrides(request.sampling, server);
     options.output.raw                     = false;
     options.output.preserve_special_tokens = request.uses_tools() || request.has_tool_history();
+    options.output.tool_name_max_length = static_cast<std::uint32_t>(request.tool_name_max_length);
     options.stop.strings.reserve(request.stop_strings.size());
     for (const std::string& stop : request.stop_strings) {
         if (!stop.empty()) {

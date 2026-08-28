@@ -2,12 +2,11 @@
 
 // Product-side adapter between HTTP protocol requests and the public NInfer
 // engine. It owns one Engine and keeps protocol concerns (aliases, usage,
-// streaming callbacks, and tool-call parsing) outside the target package.
+// streaming callbacks, and wire-level tool-call identifiers) outside the target package.
 
 #include "ninfer/engine.h"
 #include "serve/request.h"
 #include "serve/serve_options.h"
-#include "serve/tool_call_parser.h"
 
 #include <chrono>
 #include <cstddef>
@@ -75,11 +74,8 @@ struct PreparedRequest {
     double prepare_seconds     = 0.0;
     double acquisition_seconds = 0.0;
     PromptPreparationStats preparation;
-    int prompt_tokens                = 0;
-    bool include_usage               = false;
-    bool tool_capable                = false;
-    std::size_t tool_name_max_length = 64;
-    ToolArgumentTypeContracts tool_argument_types;
+    int prompt_tokens  = 0;
+    bool include_usage = false;
 
     bool enable_thinking = true;
     std::optional<std::uint32_t> thinking_budget;

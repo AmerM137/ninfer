@@ -611,7 +611,7 @@ int test_thinking_and_sampling() {
                                    {"max_tokens", 8},
                                    {"temperature", 0.3},
                                    {"top_p", 0.8},
-                                   {"top_k", 40},
+                                   {"top_k", 20},
                                    {"stop_sequences", Json::array({"STOP", "END"})},
                                    {"thinking", Json{{"type", "enabled"}, {"budget_tokens", 1024}}},
                                    {"messages", Json::array({Json{{"role", "user"}, {"content", "hi"}}})}};
@@ -619,7 +619,7 @@ int test_thinking_and_sampling() {
     failures += check(req.sampling.temperature.has_value() && *req.sampling.temperature == 0.3,
                       "temperature parsed");
     failures += check(req.sampling.top_p.has_value() && *req.sampling.top_p == 0.8, "top_p parsed");
-    failures += check(req.sampling.top_k.has_value() && *req.sampling.top_k == 40, "top_k parsed");
+    failures += check(req.sampling.top_k.has_value() && *req.sampling.top_k == 20, "top_k parsed");
     failures += check(req.stop_strings.size() == 2 && req.stop_strings[0] == "STOP",
                       "stop_sequences parsed");
     failures += check(req.enable_thinking.has_value() && *req.enable_thinking, "thinking enabled");
@@ -632,9 +632,14 @@ int test_thinking_and_sampling() {
                       "Anthropic budget_tokens unexpectedly became a request-level thinking cap");
     failures += check(options.execution.sampling.temperature == 0.3F &&
                           options.execution.sampling.top_p == 0.8F &&
-                          options.execution.sampling.top_k == 40 &&
+                          options.execution.sampling.top_k == 20 &&
                           !options.execution.sampling.presence_penalty,
                       "sampling reaches Engine overrides without inventing omitted fields");
+    Json oversized_top_k              = body;
+    oversized_top_k["top_k"]          = 21;
+    const GenerationRequest oversized = parse_messages_request(oversized_top_k, default_limits());
+    failures += check(throws_api([&] { (void)translate_options(oversized); }),
+                      "top_k beyond the Engine candidate domain reached execution");
     failures += check(options.stop.strings.size() == 2 && options.stop.strings[0].text == "STOP" &&
                           options.stop.strings[1].text == "END",
                       "stop_sequences reach Engine options");

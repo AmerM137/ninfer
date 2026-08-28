@@ -1463,6 +1463,51 @@ int test_terminal_flush(const Frontend& frontend) {
     return failures;
 }
 
+int test_structured_tool_output() {
+    FrontendResources owned = resources();
+    owned.tokenizer_json =
+        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/tokenizer.json");
+    owned.tokenizer_config_json =
+        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/tokenizer_config.json");
+    owned.generation_config_json =
+        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/generation_config.json");
+    const Frontend frontend = FrontendFactory::create_component(owned);
+
+    ninfer::ChatMessage message;
+    message.role = ninfer::ChatRole::User;
+    message.parts.push_back(
+        ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
+    ninfer::PromptInput input;
+    input.messages.push_back(std::move(message));
+    input.options.enable_thinking = false;
+    input.options.tool_jsons.push_back(
+        R"({"type":"function","function":{"name":"TaskUpdate","parameters":{"type":"object","properties":{"taskId":{"type":"string"}}}}})");
+    auto prompt = frontend.prepare(std::move(input));
+    auto session =
+        frontend.make_output_session(prompt, {}, ninfer::OutputOptions{.tool_name_max_length = 64});
+
+    const std::string generated =
+        "Calling.  \n<tool_call>\n<function=TaskUpdate>\n<parameter=taskId>\n1\n"
+        "</parameter>\n</function>\n</tool_call>";
+    const std::vector<ninfer::TokenId> tokens = official_tokenizer().encode(generated);
+    const auto decision = session.preview_model(tokens, static_cast<std::uint32_t>(tokens.size()),
+                                                ninfer::FinishReason::OutputLimit);
+    int failures        = check(decision.finish_reason == ninfer::FinishReason::OutputLimit,
+                                "tool output did not reach the terminal transaction");
+    const auto output   = session.commit_preview();
+    failures += check(channel_text(output, ninfer::OutputChannel::Content) == "Calling.",
+                      "frontend did not hide the terminal tool-call suffix");
+    const std::vector<ninfer::GeneratedToolCall> calls = session.take_tool_calls();
+    failures += check(calls.size() == 1 && calls.front().name == "TaskUpdate",
+                      "frontend did not publish the structured tool call");
+    if (!calls.empty()) {
+        const nlohmann::json arguments = nlohmann::json::parse(calls.front().arguments_json);
+        failures += check(arguments.at("taskId").is_string() && arguments.at("taskId") == "1",
+                          "frontend changed the declared string argument type");
+    }
+    return failures;
+}
+
 int test_reasoning_split(const Frontend& frontend) {
     ninfer::ChatMessage message;
     message.role = ninfer::ChatRole::User;
@@ -1884,6 +1929,7 @@ int main() {
     failures += test_cross_round_stop(frontend);
     failures += test_same_token_stop_priority(frontend);
     failures += test_terminal_flush(frontend);
+    failures += test_structured_tool_output();
     failures += test_reasoning_split(frontend);
     failures += test_thinking_budget_control(frontend);
     failures += test_utf8_and_hidden_eos(frontend);
