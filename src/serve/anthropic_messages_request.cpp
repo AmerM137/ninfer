@@ -1,8 +1,7 @@
 #include "serve/anthropic_messages.h"
+#include "serve/request_validation.h"
 
 #include <algorithm>
-#include <cctype>
-#include <cmath>
 #include <cstdint>
 #include <limits>
 #include <iterator>
@@ -27,16 +26,6 @@ enum class ParsePurpose {
     CountTokens,
 };
 
-[[noreturn]] void bad_request(std::string message, std::string param = {}, std::string code = {}) {
-    ApiError error;
-    error.status  = 400;
-    error.type    = "invalid_request_error";
-    error.message = std::move(message);
-    error.param   = std::move(param);
-    error.code    = std::move(code);
-    throw ApiException(std::move(error));
-}
-
 [[noreturn]] void invalid_tool_history(std::string message) {
     bad_request(std::move(message), "messages", "invalid_tool_history");
 }
@@ -44,39 +33,6 @@ enum class ParsePurpose {
 const Json& require_object(const Json& body) {
     if (!body.is_object()) { bad_request("request body must be a JSON object"); }
     return body;
-}
-
-std::optional<int> optional_int(const Json& object, const char* key) {
-    if (!object.contains(key) || object.at(key).is_null()) { return std::nullopt; }
-    const Json& value = object.at(key);
-    if (!value.is_number_integer()) { bad_request(std::string(key) + " must be an integer", key); }
-    if (value.is_number_unsigned()) {
-        const std::uint64_t converted = value.get<std::uint64_t>();
-        if (converted > static_cast<std::uint64_t>(std::numeric_limits<int>::max())) {
-            bad_request(std::string(key) + " is out of range", key);
-        }
-        return static_cast<int>(converted);
-    }
-    const std::int64_t converted = value.get<std::int64_t>();
-    if (converted < std::numeric_limits<int>::min() ||
-        converted > std::numeric_limits<int>::max()) {
-        bad_request(std::string(key) + " is out of range", key);
-    }
-    return static_cast<int>(converted);
-}
-
-std::optional<double> optional_number(const Json& object, const char* key) {
-    if (!object.contains(key) || object.at(key).is_null()) { return std::nullopt; }
-    if (!object.at(key).is_number()) { bad_request(std::string(key) + " must be a number", key); }
-    const double value = object.at(key).get<double>();
-    if (!std::isfinite(value)) { bad_request(std::string(key) + " must be finite", key); }
-    return value;
-}
-
-bool optional_bool(const Json& object, const char* key, bool fallback) {
-    if (!object.contains(key) || object.at(key).is_null()) { return fallback; }
-    if (!object.at(key).is_boolean()) { bad_request(std::string(key) + " must be a boolean", key); }
-    return object.at(key).get<bool>();
 }
 
 std::string require_string(const Json& object, const char* key, const char* param,
@@ -104,19 +60,14 @@ bool cache_boundary(const Json& value) {
            control.at("type").get<std::string>() == "ephemeral";
 }
 
-bool valid_tool_name(const std::string& name) {
-    if (name.empty() || name.size() > kMaxToolNameLength) { return false; }
-    return std::all_of(name.begin(), name.end(), [](unsigned char character) {
-        return std::isalnum(character) != 0 || character == '_' || character == '-';
-    });
-}
-
 std::string require_tool_name(const Json& object, const char* param) {
     if (!object.contains("name") || !object.at("name").is_string()) {
         bad_request("tool name must be a string", param);
     }
     std::string name = object.at("name").get<std::string>();
-    if (!valid_tool_name(name)) { bad_request("tool name must match [A-Za-z0-9_-]{1,128}", param); }
+    if (!valid_tool_name(name, kMaxToolNameLength)) {
+        bad_request("tool name must match [A-Za-z0-9_-]{1,128}", param);
+    }
     return name;
 }
 

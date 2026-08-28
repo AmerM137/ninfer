@@ -1,4 +1,5 @@
 #include "serve/openai_responses.h"
+#include "serve/request_validation.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -14,32 +15,19 @@ namespace ninfer::serve {
 namespace {
 
 [[noreturn]] void invalid_tool_history(std::string message) {
-    ApiError error;
-    error.status  = 400;
-    error.type    = "invalid_request_error";
-    error.param   = "input";
-    error.code    = "invalid_tool_history";
-    error.message = std::move(message);
-    throw ApiException(std::move(error));
+    bad_request(std::move(message), "input", "invalid_tool_history");
 }
 
 [[noreturn]] void invalid_input(std::string message) {
-    ApiError error;
-    error.status  = 400;
-    error.type    = "invalid_request_error";
-    error.param   = "input";
-    error.code    = "invalid_value";
-    error.message = std::move(message);
-    throw ApiException(std::move(error));
+    bad_request(std::move(message), "input", "invalid_value");
 }
 
 [[noreturn]] void response_not_found(const std::string& id) {
-    ApiError error;
-    error.status  = 404;
-    error.type    = "invalid_request_error";
-    error.param   = "previous_response_id";
-    error.code    = "response_not_found";
-    error.message = "response '" + id + "' not found";
+    ApiError error{.status  = 404,
+                   .type    = "invalid_request_error",
+                   .message = "response '" + id + "' not found",
+                   .param   = "previous_response_id",
+                   .code    = "response_not_found"};
     throw ApiException(std::move(error));
 }
 

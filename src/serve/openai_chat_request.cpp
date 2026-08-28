@@ -1,10 +1,9 @@
 #include "serve/openai_chat.h"
+#include "serve/request_validation.h"
 
 #include <algorithm>
 #include <cmath>
-#include <cctype>
 #include <cstdint>
-#include <limits>
 #include <optional>
 #include <string>
 #include <utility>
@@ -13,16 +12,6 @@ namespace ninfer::serve {
 namespace {
 
 using Json = nlohmann::json;
-
-[[noreturn]] void bad_request(std::string message, std::string param = {}, std::string code = {}) {
-    ApiError error;
-    error.status  = 400;
-    error.type    = "invalid_request_error";
-    error.message = std::move(message);
-    error.param   = std::move(param);
-    error.code    = std::move(code);
-    throw ApiException(std::move(error));
-}
 
 void require_object(const Json& value, const char* message, const char* param = nullptr) {
     if (!value.is_object()) { bad_request(message, param == nullptr ? "" : param); }
@@ -48,24 +37,6 @@ std::optional<double> get_number(const Json& object, const char* key) {
     return object.at(key).get<double>();
 }
 
-std::optional<int> get_int(const Json& object, const char* key) {
-    if (!object.contains(key) || object.at(key).is_null()) { return std::nullopt; }
-    const Json& value = object.at(key);
-    if (!value.is_number_integer()) { bad_request(std::string(key) + " must be an integer", key); }
-    if (value.is_number_unsigned()) {
-        const std::uint64_t parsed = value.get<std::uint64_t>();
-        if (parsed > static_cast<std::uint64_t>(std::numeric_limits<int>::max())) {
-            bad_request(std::string(key) + " is out of range", key);
-        }
-        return static_cast<int>(parsed);
-    }
-    const std::int64_t parsed = value.get<std::int64_t>();
-    if (parsed < std::numeric_limits<int>::min() || parsed > std::numeric_limits<int>::max()) {
-        bad_request(std::string(key) + " is out of range", key);
-    }
-    return static_cast<int>(parsed);
-}
-
 std::optional<std::uint64_t> get_seed(const Json& object) {
     if (!object.contains("seed") || object.at("seed").is_null()) { return std::nullopt; }
     const Json& value = object.at("seed");
@@ -83,20 +54,12 @@ ChatRole parse_message_role(const std::string& role) {
     bad_request("unsupported role: " + role, "messages", "unsupported_role");
 }
 
-bool is_valid_function_name(const std::string& name) {
-    if (name.empty() || name.size() > 64) { return false; }
-    for (const unsigned char c : name) {
-        if (std::isalnum(c) == 0 && c != '_' && c != '-') { return false; }
-    }
-    return true;
-}
-
 std::string require_function_name(const Json& object, const char* param) {
     if (!object.contains("name") || !object.at("name").is_string()) {
         bad_request("function name must be a string", param);
     }
     std::string name = object.at("name").get<std::string>();
-    if (!is_valid_function_name(name)) {
+    if (!valid_tool_name(name, 64)) {
         bad_request("function name must match [A-Za-z0-9_-]{1,64}", param);
     }
     return name;
@@ -157,7 +120,7 @@ void validate_standard_output_controls(const Json& body) {
                         "logprobs", "logprobs_not_supported");
         }
     }
-    if (const std::optional<int> top_logprobs = get_int(body, "top_logprobs")) {
+    if (const std::optional<int> top_logprobs = optional_int(body, "top_logprobs")) {
         if (*top_logprobs != 0) {
             bad_request(
                 "nonzero top_logprobs requires alternative-token probabilities in the response, "
@@ -317,7 +280,8 @@ ninfer::product::media_acquire::Source parse_media_url(const Json& part, const c
 
 void parse_content_parts(const Json& content, ChatTurn& turn, std::size_t index) {
     if (content.is_string()) {
-        turn.content.push_back(ContentPart{ContentKind::Text, content.get<std::string>(), "text"});
+        turn.content.push_back(ContentPart{
+            .kind = ContentKind::Text, .text = content.get<std::string>(), .type_raw = "text"});
         return;
     }
     if (!content.is_array()) {
@@ -448,6 +412,143 @@ std::optional<std::string> parse_assistant_reasoning(const Json& message, std::s
     return reasoning ? reasoning : content;
 }
 
+void validate_message_name(const Json& item, bool legacy_function) {
+    if (!item.contains("name") || item.at("name").is_null()) { return; }
+    if (!item.at("name").is_string()) { bad_request("message name must be a string", "messages"); }
+    const std::string name = item.at("name").get<std::string>();
+    if (!name.empty() && !legacy_function) {
+        bad_request("a non-empty message name changes participant identity, which NInfer's chat "
+                    "template cannot represent",
+                    "messages", "message_name_not_supported");
+    }
+}
+
+void validate_non_assistant_fields(const Json& item, ChatRole role) {
+    if (role != ChatRole::Assistant && item.contains("function_call") &&
+        !item.at("function_call").is_null()) {
+        bad_request("function_call is only valid on assistant messages", "messages");
+    }
+    if (role == ChatRole::Assistant) { return; }
+    for (const char* key : {"reasoning", "reasoning_content"}) {
+        if (!item.contains(key) || item.at(key).is_null()) { continue; }
+        if (!item.at(key).is_string()) {
+            bad_request(std::string(key) + " must be a string", "messages");
+        }
+        if (!item.at(key).get<std::string>().empty()) {
+            bad_request(std::string(key) + " is only valid on assistant messages", "messages");
+        }
+    }
+}
+
+void validate_non_tool_call_id(const Json& item) {
+    if (!item.contains("tool_call_id") || item.at("tool_call_id").is_null()) { return; }
+    if (!item.at("tool_call_id").is_string()) {
+        bad_request("tool_call_id must be a string", "messages");
+    }
+    if (!item.at("tool_call_id").get<std::string>().empty()) {
+        bad_request("a non-empty tool_call_id is only valid on tool messages", "messages");
+    }
+}
+
+ChatTurn parse_tool_message(const Json& item, std::size_t index, bool legacy_function) {
+    if (item.contains("tool_calls") && !item.at("tool_calls").is_null()) {
+        if (!item.at("tool_calls").is_array()) {
+            bad_request("tool_calls must be an array", "messages");
+        }
+        if (!item.at("tool_calls").empty()) {
+            bad_request("tool messages cannot contain tool_calls", "messages");
+        }
+    }
+    if (!legacy_function &&
+        (!item.contains("tool_call_id") || !item.at("tool_call_id").is_string())) {
+        bad_request("tool messages must contain a string tool_call_id", "messages");
+    }
+    if (item.contains("tool_call_id") && !item.at("tool_call_id").is_null() &&
+        !item.at("tool_call_id").is_string()) {
+        bad_request("tool_call_id must be a string", "messages");
+    }
+    if (!item.contains("content") || item.at("content").is_null()) {
+        bad_request("tool messages must contain content", "messages");
+    }
+
+    ChatTurn turn;
+    turn.role = ChatRole::Tool;
+    if (item.contains("tool_call_id") && item.at("tool_call_id").is_string()) {
+        turn.tool_call_id = item.at("tool_call_id").get<std::string>();
+    }
+    parse_content_parts(item.at("content"), turn, index);
+    return turn;
+}
+
+ChatTurn parse_assistant_message(const Json& item, std::size_t index) {
+    if (item.contains("audio") && !item.at("audio").is_null()) {
+        bad_request("assistant audio history requires resolving a previous audio response, which "
+                    "NInfer cannot provide",
+                    "messages", "assistant_history_not_supported");
+    }
+
+    ChatTurn turn;
+    turn.role       = ChatRole::Assistant;
+    turn.tool_calls = parse_assistant_tool_calls(item, index);
+    if (std::optional<ToolCall> legacy_call = parse_legacy_assistant_function_call(item, index)) {
+        turn.tool_calls.insert(turn.tool_calls.begin(), std::move(*legacy_call));
+    }
+    const std::optional<std::string> reasoning = parse_assistant_reasoning(item, index);
+    if (item.contains("content") && !item.at("content").is_null()) {
+        parse_content_parts(item.at("content"), turn, index);
+    }
+    if (item.contains("refusal") && !item.at("refusal").is_null()) {
+        if (!item.at("refusal").is_string()) {
+            bad_request("assistant refusal must be a string", "messages");
+        }
+        std::string refusal = item.at("refusal").get<std::string>();
+        if (!refusal.empty()) {
+            turn.content.push_back(ContentPart{
+                .kind = ContentKind::Text, .text = std::move(refusal), .type_raw = "refusal"});
+        }
+    }
+    if (reasoning) { turn.reasoning_content = *reasoning; }
+    return turn;
+}
+
+ChatTurn parse_regular_message(const Json& item, std::size_t index, ChatRole role) {
+    if (item.contains("tool_calls") && !item.at("tool_calls").is_null()) {
+        if (!item.at("tool_calls").is_array()) {
+            bad_request("tool_calls must be an array", "messages");
+        }
+        if (!item.at("tool_calls").empty()) {
+            bad_request("non-empty tool_calls are only valid on assistant messages", "messages");
+        }
+    }
+    if (!item.contains("content") || item.at("content").is_null()) {
+        bad_request("message " + std::to_string(index) + " must have content", "messages");
+    }
+
+    ChatTurn turn;
+    turn.role = role;
+    parse_content_parts(item.at("content"), turn, index);
+    return turn;
+}
+
+ChatTurn parse_message(const Json& item, std::size_t index) {
+    if (!item.is_object() || !item.contains("role") || !item.at("role").is_string()) {
+        bad_request("message " + std::to_string(index) + " must be an object with a string role",
+                    "messages");
+    }
+    const std::string role_name = item.at("role").get<std::string>();
+    const bool legacy_function  = role_name == "function";
+    const ChatRole role         = legacy_function ? ChatRole::Tool : parse_message_role(role_name);
+
+    validate_message_name(item, legacy_function);
+    if (legacy_function) { (void)require_function_name(item, "messages"); }
+    validate_non_assistant_fields(item, role);
+
+    if (role == ChatRole::Tool) { return parse_tool_message(item, index, legacy_function); }
+    validate_non_tool_call_id(item);
+    if (role == ChatRole::Assistant) { return parse_assistant_message(item, index); }
+    return parse_regular_message(item, index, role);
+}
+
 void parse_messages(const Json& body, GenerationRequest& output) {
     if (!body.contains("messages")) { bad_request("missing required field: messages", "messages"); }
     const Json& messages = body.at("messages");
@@ -456,130 +557,7 @@ void parse_messages(const Json& body, GenerationRequest& output) {
     }
     output.messages.reserve(messages.size());
     for (std::size_t index = 0; index < messages.size(); ++index) {
-        const Json& item = messages.at(index);
-        if (!item.is_object() || !item.contains("role") || !item.at("role").is_string()) {
-            bad_request("message " + std::to_string(index) +
-                            " must be an object with a string role",
-                        "messages");
-        }
-        const std::string role_name = item.at("role").get<std::string>();
-        const bool legacy_function  = role_name == "function";
-        const ChatRole role = legacy_function ? ChatRole::Tool : parse_message_role(role_name);
-
-        if (item.contains("name") && !item.at("name").is_null()) {
-            if (!item.at("name").is_string()) {
-                bad_request("message name must be a string", "messages");
-            }
-            const std::string name = item.at("name").get<std::string>();
-            if (!name.empty() && !legacy_function) {
-                bad_request(
-                    "a non-empty message name changes participant identity, which NInfer's chat "
-                    "template cannot represent",
-                    "messages", "message_name_not_supported");
-            }
-        }
-        if (legacy_function) { (void)require_function_name(item, "messages"); }
-        if (role != ChatRole::Assistant && item.contains("function_call") &&
-            !item.at("function_call").is_null()) {
-            bad_request("function_call is only valid on assistant messages", "messages");
-        }
-        if (role != ChatRole::Assistant) {
-            for (const char* key : {"reasoning", "reasoning_content"}) {
-                if (item.contains(key) && !item.at(key).is_null()) {
-                    if (!item.at(key).is_string()) {
-                        bad_request(std::string(key) + " must be a string", "messages");
-                    }
-                    if (!item.at(key).get<std::string>().empty()) {
-                        bad_request(std::string(key) + " is only valid on assistant messages",
-                                    "messages");
-                    }
-                }
-            }
-        }
-
-        ChatTurn turn;
-        turn.role = role;
-        if (role == ChatRole::Tool) {
-            if (item.contains("tool_calls") && !item.at("tool_calls").is_null()) {
-                if (!item.at("tool_calls").is_array()) {
-                    bad_request("tool_calls must be an array", "messages");
-                }
-                if (!item.at("tool_calls").empty()) {
-                    bad_request("tool messages cannot contain tool_calls", "messages");
-                }
-            }
-            if (!legacy_function &&
-                (!item.contains("tool_call_id") || !item.at("tool_call_id").is_string())) {
-                bad_request("tool messages must contain a string tool_call_id", "messages");
-            }
-            if (item.contains("tool_call_id") && !item.at("tool_call_id").is_null() &&
-                !item.at("tool_call_id").is_string()) {
-                bad_request("tool_call_id must be a string", "messages");
-            }
-            if (!item.contains("content") || item.at("content").is_null()) {
-                bad_request("tool messages must contain content", "messages");
-            }
-            if (item.contains("tool_call_id") && item.at("tool_call_id").is_string()) {
-                turn.tool_call_id = item.at("tool_call_id").get<std::string>();
-            }
-            parse_content_parts(item.at("content"), turn, index);
-            output.messages.push_back(std::move(turn));
-            continue;
-        }
-
-        if (item.contains("tool_call_id") && !item.at("tool_call_id").is_null()) {
-            if (!item.at("tool_call_id").is_string()) {
-                bad_request("tool_call_id must be a string", "messages");
-            }
-            if (!item.at("tool_call_id").get<std::string>().empty()) {
-                bad_request("a non-empty tool_call_id is only valid on tool messages", "messages");
-            }
-        }
-        if (role == ChatRole::Assistant) {
-            if (item.contains("audio") && !item.at("audio").is_null()) {
-                bad_request(
-                    "assistant audio history requires resolving a previous audio response, which "
-                    "NInfer cannot provide",
-                    "messages", "assistant_history_not_supported");
-            }
-            turn.tool_calls = parse_assistant_tool_calls(item, index);
-            if (std::optional<ToolCall> legacy_call =
-                    parse_legacy_assistant_function_call(item, index)) {
-                turn.tool_calls.insert(turn.tool_calls.begin(), std::move(*legacy_call));
-            }
-            const std::optional<std::string> reasoning = parse_assistant_reasoning(item, index);
-            if (item.contains("content") && !item.at("content").is_null()) {
-                parse_content_parts(item.at("content"), turn, index);
-            }
-            if (item.contains("refusal") && !item.at("refusal").is_null()) {
-                if (!item.at("refusal").is_string()) {
-                    bad_request("assistant refusal must be a string", "messages");
-                }
-                std::string refusal = item.at("refusal").get<std::string>();
-                if (!refusal.empty()) {
-                    turn.content.push_back(
-                        ContentPart{ContentKind::Text, std::move(refusal), "refusal"});
-                }
-            }
-            if (reasoning) { turn.reasoning_content = *reasoning; }
-            output.messages.push_back(std::move(turn));
-            continue;
-        }
-
-        if (item.contains("tool_calls") && !item.at("tool_calls").is_null()) {
-            if (!item.at("tool_calls").is_array()) {
-                bad_request("tool_calls must be an array", "messages");
-            }
-            if (!item.at("tool_calls").empty()) {
-                bad_request("non-empty tool_calls are only valid on assistant messages",
-                            "messages");
-            }
-        }
-        if (!item.contains("content") || item.at("content").is_null()) {
-            bad_request("message " + std::to_string(index) + " must have content", "messages");
-        }
-        parse_content_parts(item.at("content"), turn, index);
-        output.messages.push_back(std::move(turn));
+        output.messages.push_back(parse_message(messages.at(index), index));
     }
 }
 
@@ -779,10 +757,10 @@ void parse_sampling(const Json& body, GenerationRequest& output) {
 
     // vLLM and SGLang expose top_k/min_p on their OpenAI-compatible endpoints; both map directly
     // to NInfer's native sampler and are useful for Qwen's published sampling presets.
-    sampling.top_k = get_int(body, "top_k");
+    sampling.top_k = optional_int(body, "top_k");
     sampling.min_p = get_number(body, "min_p");
 
-    if (const std::optional<int> count = get_int(body, "n")) {
+    if (const std::optional<int> count = optional_int(body, "n")) {
         if (*count != 1) {
             bad_request("n requests multiple completions, while NInfer produces one completion per "
                         "request; only n=1 is supported",
@@ -859,10 +837,10 @@ void parse_stream_options(const Json& body, OpenAIChatRequest& output) {
 }
 
 void parse_output_limit(const Json& body, const RequestLimits& limits, OpenAIChatRequest& output) {
-    std::optional<int> limit = get_int(body, "max_completion_tokens");
+    std::optional<int> limit = optional_int(body, "max_completion_tokens");
     const char* param        = "max_completion_tokens";
     if (!limit) {
-        limit = get_int(body, "max_tokens");
+        limit = optional_int(body, "max_tokens");
         param = "max_tokens";
     }
     if (limit) {

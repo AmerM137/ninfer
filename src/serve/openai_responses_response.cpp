@@ -1,14 +1,10 @@
 #include "serve/openai_responses.h"
 
 #include "serve/generation_service.h"
+#include "serve/openai_common.h"
 
 #include <algorithm>
-#include <array>
-#include <chrono>
-#include <cstdint>
-#include <cstdio>
 #include <iterator>
-#include <random>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -18,22 +14,6 @@ namespace ninfer::serve {
 namespace {
 
 using Json = nlohmann::json;
-
-std::string random_id(const char* prefix) {
-    static thread_local std::mt19937_64 rng{std::random_device{}()};
-    std::uniform_int_distribution<std::uint64_t> distribution;
-    std::array<char, 48> buffer{};
-    std::snprintf(buffer.data(), buffer.size(), "%016llx%016llx",
-                  static_cast<unsigned long long>(distribution(rng)),
-                  static_cast<unsigned long long>(distribution(rng)));
-    return std::string(prefix) + "_" + buffer.data();
-}
-
-std::int64_t completion_time_now() {
-    return std::chrono::duration_cast<std::chrono::seconds>(
-               std::chrono::system_clock::now().time_since_epoch())
-        .count();
-}
 
 std::string response_status(ninfer::FinishReason reason) {
     switch (reason) {
@@ -176,7 +156,7 @@ BuiltOpenAIResponse build_response(const std::string& id, std::int64_t created_a
 
     Json response            = response_common(id, created_at, request, runtime);
     response["status"]       = status;
-    response["completed_at"] = status == "completed" ? Json(completion_time_now()) : Json(nullptr);
+    response["completed_at"] = status == "completed" ? Json(unix_time_now()) : Json(nullptr);
     response["error"]        = nullptr;
     response["output"]       = built.output_items;
     response["incomplete_details"] =
@@ -510,9 +490,5 @@ std::string OpenAIResponsesEventStream::failed(const ApiError& error) {
                                     {"message", error.message}};
     return sse(impl_->event("response.failed", Json{{"response", response}}));
 }
-
-std::string new_openai_response_id() { return random_id("resp"); }
-
-std::string new_openai_response_item_id(const char* prefix) { return random_id(prefix); }
 
 } // namespace ninfer::serve

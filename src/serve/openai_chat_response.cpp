@@ -6,10 +6,6 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
-#include <array>
-#include <cstdint>
-#include <cstdio>
-#include <random>
 #include <stdexcept>
 #include <string_view>
 #include <utility>
@@ -18,6 +14,13 @@ namespace ninfer::serve {
 namespace {
 
 using Json = nlohmann::json;
+
+struct CompletionUsage {
+    int prompt_tokens     = 0;
+    int completion_tokens = 0;
+    int cached_tokens     = 0;
+    int reasoning_tokens  = 0;
+};
 
 const char* finish_reason(ninfer::FinishReason reason) {
     switch (reason) {
@@ -33,21 +36,12 @@ const char* finish_reason(ninfer::FinishReason reason) {
     return "stop";
 }
 
-std::string random_identifier(const char* prefix) {
-    static thread_local std::mt19937_64 rng{std::random_device{}()};
-    std::uniform_int_distribution<std::uint64_t> distribution;
-    std::array<char, 32> buffer{};
-    std::snprintf(buffer.data(), buffer.size(), "%016llx",
-                  static_cast<unsigned long long>(distribution(rng)));
-    return std::string(prefix) + buffer.data();
-}
-
 std::vector<ToolCall>
 materialize_tool_calls(const std::vector<ninfer::GeneratedToolCall>& generated) {
     std::vector<ToolCall> calls;
     calls.reserve(generated.size());
     for (const ninfer::GeneratedToolCall& call : generated) {
-        calls.push_back(ToolCall{.id             = random_identifier("call_"),
+        calls.push_back(ToolCall{.id             = new_openai_chat_tool_call_id(),
                                  .name           = call.name,
                                  .arguments_json = call.arguments_json});
     }
@@ -128,7 +122,7 @@ void require_prefix(std::string_view complete, std::string_view streamed, const 
 
 OpenAIChatResponseIdentity make_openai_chat_response_identity(std::string model) {
     return OpenAIChatResponseIdentity{
-        .id      = random_identifier("chatcmpl-"),
+        .id      = new_openai_chat_completion_id(),
         .model   = std::move(model),
         .created = unix_time_now(),
     };

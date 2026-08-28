@@ -108,7 +108,4 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-std::string new_openai_response_id();
-std::string new_openai_response_item_id(const char* prefix);
-
 } // namespace ninfer::serve

@@ -47,13 +47,6 @@ struct RequestLimits {
     int default_max_tokens = 8192;
 };
 
-struct CompletionUsage {
-    int prompt_tokens     = 0;
-    int completion_tokens = 0;
-    int cached_tokens     = 0;
-    int reasoning_tokens  = 0;
-};
-
 enum class ContentKind {
     Text,
     Image,

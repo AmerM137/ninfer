@@ -1,10 +1,8 @@
 #include "serve/openai_responses.h"
+#include "serve/openai_common.h"
+#include "serve/request_validation.h"
 
 #include <algorithm>
-#include <cctype>
-#include <cmath>
-#include <cstdint>
-#include <limits>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -17,51 +15,8 @@ namespace {
 
 using Json = nlohmann::json;
 
-[[noreturn]] void bad_request(std::string message, std::string param = {}, std::string code = {}) {
-    ApiError error;
-    error.status  = 400;
-    error.type    = "invalid_request_error";
-    error.message = std::move(message);
-    error.param   = std::move(param);
-    error.code    = std::move(code);
-    throw ApiException(std::move(error));
-}
-
 void require_object(const Json& value, std::string_view name = "request body") {
     if (!value.is_object()) { bad_request(std::string(name) + " must be a JSON object"); }
-}
-
-bool optional_bool(const Json& object, const char* key, bool fallback) {
-    if (!object.contains(key) || object.at(key).is_null()) { return fallback; }
-    if (!object.at(key).is_boolean()) { bad_request(std::string(key) + " must be a boolean", key); }
-    return object.at(key).get<bool>();
-}
-
-std::optional<double> optional_number(const Json& object, const char* key) {
-    if (!object.contains(key) || object.at(key).is_null()) { return std::nullopt; }
-    if (!object.at(key).is_number()) { bad_request(std::string(key) + " must be a number", key); }
-    const double value = object.at(key).get<double>();
-    if (!std::isfinite(value)) { bad_request(std::string(key) + " must be finite", key); }
-    return value;
-}
-
-std::optional<int> optional_int(const Json& object, const char* key) {
-    if (!object.contains(key) || object.at(key).is_null()) { return std::nullopt; }
-    if (!object.at(key).is_number_integer()) {
-        bad_request(std::string(key) + " must be an integer", key);
-    }
-    if (object.at(key).is_number_unsigned()) {
-        const std::uint64_t value = object.at(key).get<std::uint64_t>();
-        if (value > static_cast<std::uint64_t>(std::numeric_limits<int>::max())) {
-            bad_request(std::string(key) + " is out of range", key);
-        }
-        return static_cast<int>(value);
-    }
-    const std::int64_t value = object.at(key).get<std::int64_t>();
-    if (value < std::numeric_limits<int>::min() || value > std::numeric_limits<int>::max()) {
-        bad_request(std::string(key) + " is out of range", key);
-    }
-    return static_cast<int>(value);
 }
 
 void require_string_hint(const Json& body, const char* key, std::size_t max_bytes = 0) {
@@ -72,20 +27,12 @@ void require_string_hint(const Json& body, const char* key, std::size_t max_byte
     }
 }
 
-bool valid_function_name(std::string_view name) {
-    if (name.empty() || name.size() > 64) { return false; }
-    for (const unsigned char byte : name) {
-        if (std::isalnum(byte) == 0 && byte != '_' && byte != '-') { return false; }
-    }
-    return true;
-}
-
 std::string require_function_name(const Json& object, const char* param) {
     if (!object.contains("name") || !object.at("name").is_string()) {
         bad_request("function name must be a string", param);
     }
     const std::string name = object.at("name").get<std::string>();
-    if (!valid_function_name(name)) {
+    if (!valid_tool_name(name, 64)) {
         bad_request("function name must match [A-Za-z0-9_-]{1,64}", param);
     }
     return name;
@@ -179,6 +126,121 @@ struct ParsedMessage {
     Json canonical;
 };
 
+void append_message_text(ParsedMessage& parsed, Json& content, const std::string& text,
+                         const std::string& wire_type, const Json* wire,
+                         std::size_t& breakpoint_count) {
+    ContentPart part;
+    part.kind     = ContentKind::Text;
+    part.text     = text;
+    part.type_raw = wire_type;
+    if (wire != nullptr) { apply_shared_breakpoint(part, *wire, breakpoint_count); }
+    parsed.turn.content.push_back(std::move(part));
+
+    Json canonical;
+    if (wire_type == "refusal") {
+        canonical = Json{{"type", "refusal"}, {"refusal", text}};
+    } else {
+        canonical = Json{{"type", wire_type}, {"text", text}};
+        if (wire_type == "output_text") {
+            canonical["annotations"] = wire != nullptr && wire->contains("annotations")
+                                           ? wire->at("annotations")
+                                           : Json::array();
+            if (wire != nullptr && wire->contains("logprobs")) {
+                canonical["logprobs"] = wire->at("logprobs");
+            }
+        }
+    }
+    if (wire != nullptr && wire->contains("prompt_cache_breakpoint")) {
+        canonical["prompt_cache_breakpoint"] = wire->at("prompt_cache_breakpoint");
+    }
+    content.push_back(std::move(canonical));
+}
+
+void parse_message_content_part(const Json& value, ChatRole role, ParsedMessage& parsed,
+                                Json& content, std::size_t& breakpoint_count) {
+    if (!value.is_object() || !value.contains("type") || !value.at("type").is_string()) {
+        bad_request("input message content parts must have a string type", "input");
+    }
+    const std::string type = value.at("type").get<std::string>();
+    if (type == "input_text") {
+        if (!value.contains("text") || !value.at("text").is_string()) {
+            bad_request("input_text must contain a string text", "input");
+        }
+        append_message_text(parsed, content, value.at("text").get<std::string>(), type, &value,
+                            breakpoint_count);
+        return;
+    }
+    if (type == "output_text") {
+        if (role != ChatRole::Assistant) {
+            bad_request("output_text is only valid on assistant messages", "input");
+        }
+        if (!value.contains("text") || !value.at("text").is_string()) {
+            bad_request("output_text must contain a string text", "input");
+        }
+        if (value.contains("annotations") && !value.at("annotations").is_null() &&
+            !value.at("annotations").is_array()) {
+            bad_request("output_text.annotations must be an array", "input");
+        }
+        if (value.contains("logprobs") && !value.at("logprobs").is_null() &&
+            !value.at("logprobs").is_array()) {
+            bad_request("output_text.logprobs must be an array", "input");
+        }
+        append_message_text(parsed, content, value.at("text").get<std::string>(), type, &value,
+                            breakpoint_count);
+        return;
+    }
+    if (type == "refusal") {
+        if (role != ChatRole::Assistant) {
+            bad_request("refusal is only valid on assistant messages", "input");
+        }
+        if (!value.contains("refusal") || !value.at("refusal").is_string()) {
+            bad_request("refusal must contain a string refusal", "input");
+        }
+        append_message_text(parsed, content, value.at("refusal").get<std::string>(), type, &value,
+                            breakpoint_count);
+        return;
+    }
+    if (type == "input_image") {
+        if (role != ChatRole::User && role != ChatRole::Assistant) {
+            bad_request("input_image is only supported on user or assistant messages", "input");
+        }
+        ContentPart part;
+        part.kind     = ContentKind::Image;
+        part.type_raw = type;
+        part.source   = parse_image_source(value);
+        apply_shared_breakpoint(part, value, breakpoint_count);
+        parsed.turn.content.push_back(std::move(part));
+        Json canonical{
+            {"type", "input_image"}, {"image_url", value.at("image_url")}, {"detail", "auto"}};
+        if (value.contains("prompt_cache_breakpoint")) {
+            canonical["prompt_cache_breakpoint"] = value.at("prompt_cache_breakpoint");
+        }
+        content.push_back(std::move(canonical));
+        return;
+    }
+    if (type == "input_video") {
+        if (role != ChatRole::User) {
+            bad_request("input_video is only supported on user messages", "input");
+        }
+        ContentPart part;
+        part.kind     = ContentKind::Video;
+        part.type_raw = type;
+        part.source   = parse_video_source(value);
+        parsed.turn.content.push_back(std::move(part));
+        content.push_back(Json{{"type", "input_video"}, {"video_url", value.at("video_url")}});
+        return;
+    }
+    if (type == "input_file") {
+        bad_request("input_file requires a Files API, which NInfer does not provide", "input",
+                    "file_inputs_not_supported");
+    }
+    if (type == "input_audio") {
+        bad_request("input_audio is not supported by the Engine", "input",
+                    "audio_inputs_not_supported");
+    }
+    bad_request("unsupported message content type: " + type, "input", "modality_not_supported");
+}
+
 ParsedMessage parse_message_item(const Json& item, std::size_t index,
                                  std::size_t& breakpoint_count) {
     if (!item.contains("role") || !item.at("role").is_string()) {
@@ -210,114 +272,16 @@ ParsedMessage parse_message_item(const Json& item, std::size_t index,
     }
 
     ParsedMessage parsed;
-    parsed.turn.role       = parsed_role;
-    Json content           = Json::array();
-    const auto append_text = [&](const std::string& text, const std::string& wire_type,
-                                 const Json* wire) {
-        ContentPart part;
-        part.kind     = ContentKind::Text;
-        part.text     = text;
-        part.type_raw = wire_type;
-        if (wire != nullptr) { apply_shared_breakpoint(part, *wire, breakpoint_count); }
-        parsed.turn.content.push_back(std::move(part));
-
-        Json canonical;
-        if (wire_type == "refusal") {
-            canonical = Json{{"type", "refusal"}, {"refusal", text}};
-        } else {
-            canonical = Json{{"type", wire_type}, {"text", text}};
-            if (wire_type == "output_text") {
-                canonical["annotations"] = wire != nullptr && wire->contains("annotations")
-                                               ? wire->at("annotations")
-                                               : Json::array();
-                if (wire != nullptr && wire->contains("logprobs")) {
-                    canonical["logprobs"] = wire->at("logprobs");
-                }
-            }
-        }
-        if (wire != nullptr && wire->contains("prompt_cache_breakpoint")) {
-            canonical["prompt_cache_breakpoint"] = wire->at("prompt_cache_breakpoint");
-        }
-        content.push_back(std::move(canonical));
-    };
+    parsed.turn.role = parsed_role;
+    Json content     = Json::array();
 
     if (item.at("content").is_string()) {
-        append_text(item.at("content").get<std::string>(),
-                    parsed_role == ChatRole::Assistant ? "output_text" : "input_text", nullptr);
+        append_message_text(parsed, content, item.at("content").get<std::string>(),
+                            parsed_role == ChatRole::Assistant ? "output_text" : "input_text",
+                            nullptr, breakpoint_count);
     } else if (item.at("content").is_array()) {
         for (const Json& value : item.at("content")) {
-            if (!value.is_object() || !value.contains("type") || !value.at("type").is_string()) {
-                bad_request("input message content parts must have a string type", "input");
-            }
-            const std::string type = value.at("type").get<std::string>();
-            if (type == "input_text") {
-                if (!value.contains("text") || !value.at("text").is_string()) {
-                    bad_request("input_text must contain a string text", "input");
-                }
-                append_text(value.at("text").get<std::string>(), type, &value);
-            } else if (type == "output_text") {
-                if (parsed_role != ChatRole::Assistant) {
-                    bad_request("output_text is only valid on assistant messages", "input");
-                }
-                if (!value.contains("text") || !value.at("text").is_string()) {
-                    bad_request("output_text must contain a string text", "input");
-                }
-                if (value.contains("annotations") && !value.at("annotations").is_null() &&
-                    !value.at("annotations").is_array()) {
-                    bad_request("output_text.annotations must be an array", "input");
-                }
-                if (value.contains("logprobs") && !value.at("logprobs").is_null() &&
-                    !value.at("logprobs").is_array()) {
-                    bad_request("output_text.logprobs must be an array", "input");
-                }
-                append_text(value.at("text").get<std::string>(), type, &value);
-            } else if (type == "refusal") {
-                if (parsed_role != ChatRole::Assistant) {
-                    bad_request("refusal is only valid on assistant messages", "input");
-                }
-                if (!value.contains("refusal") || !value.at("refusal").is_string()) {
-                    bad_request("refusal must contain a string refusal", "input");
-                }
-                append_text(value.at("refusal").get<std::string>(), type, &value);
-            } else if (type == "input_image") {
-                if (parsed_role != ChatRole::User && parsed_role != ChatRole::Assistant) {
-                    bad_request("input_image is only supported on user or assistant messages",
-                                "input");
-                }
-                ContentPart part;
-                part.kind     = ContentKind::Image;
-                part.type_raw = type;
-                part.source   = parse_image_source(value);
-                apply_shared_breakpoint(part, value, breakpoint_count);
-                parsed.turn.content.push_back(std::move(part));
-                Json canonical{{"type", "input_image"},
-                               {"image_url", value.at("image_url")},
-                               {"detail", "auto"}};
-                if (value.contains("prompt_cache_breakpoint")) {
-                    canonical["prompt_cache_breakpoint"] = value.at("prompt_cache_breakpoint");
-                }
-                content.push_back(std::move(canonical));
-            } else if (type == "input_video") {
-                if (parsed_role != ChatRole::User) {
-                    bad_request("input_video is only supported on user messages", "input");
-                }
-                ContentPart part;
-                part.kind     = ContentKind::Video;
-                part.type_raw = type;
-                part.source   = parse_video_source(value);
-                parsed.turn.content.push_back(std::move(part));
-                content.push_back(
-                    Json{{"type", "input_video"}, {"video_url", value.at("video_url")}});
-            } else if (type == "input_file") {
-                bad_request("input_file requires a Files API, which NInfer does not provide",
-                            "input", "file_inputs_not_supported");
-            } else if (type == "input_audio") {
-                bad_request("input_audio is not supported by the Engine", "input",
-                            "audio_inputs_not_supported");
-            } else {
-                bad_request("unsupported message content type: " + type, "input",
-                            "modality_not_supported");
-            }
+            parse_message_content_part(value, parsed_role, parsed, content, breakpoint_count);
         }
     } else {
         bad_request("input message content must be a string or array", "input");

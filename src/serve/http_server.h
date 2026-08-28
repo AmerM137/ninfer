@@ -18,6 +18,10 @@
 
 namespace ninfer::serve {
 
+void write_openai_error(httplib::Response& response, const ApiError& error);
+void write_anthropic_error(httplib::Response& response, const ApiError& error,
+                           const std::string& request_id);
+
 // cpp-httplib invokes the error handler for every application response with status >= 400. Only
 // an empty 413 is its own pre-routing payload-limit rejection; application-authored errors must be
 // left untouched.

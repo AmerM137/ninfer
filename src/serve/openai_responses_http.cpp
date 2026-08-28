@@ -1,7 +1,9 @@
 #include "serve/http_server.h"
 
+#include "serve/http_transport.h"
 #include "serve/openai_common.h"
 #include "serve/openai_responses.h"
+#include "serve/request_validation.h"
 
 #include <nlohmann/json.hpp>
 
@@ -25,28 +27,22 @@ namespace {
 
 using Json = nlohmann::json;
 
-class ClientDisconnected final : public std::exception {
-public:
-    [[nodiscard]] const char* what() const noexcept override { return "client disconnected"; }
-};
-
-struct StreamingResponse {
-    PreparedRequest prepared;
+struct PendingResponseStorage {
     std::vector<ChatTurn> input_turns;
     std::vector<Json> input_items;
     OpenAIResponseContext previous_context;
     std::string session_key;
+    bool enabled = false;
+};
+
+struct StreamingResponse {
+    PreparedRequest prepared;
+    PendingResponseStorage storage;
     RequestLogContext log_context;
     std::unique_ptr<OpenAIResponsesEventStream> encoder;
     std::atomic<bool> cancelled{false};
-    bool store   = false;
     bool started = false;
 };
-
-void write_error(httplib::Response& response, const ApiError& error) {
-    response.status = error.status;
-    response.set_content(make_error_body(error), "application/json");
-}
 
 ApiError responses_error(ApiError error) {
     if (error.param == "messages") { error.param = "input"; }
@@ -72,59 +68,30 @@ ApiError response_not_found(const std::string& id) {
     return error;
 }
 
-void validate_model(const std::string& requested, const std::string& available) {
-    if (requested == available) { return; }
-    ApiError error;
-    error.status  = 404;
-    error.type    = "invalid_request_error";
-    error.param   = "model";
-    error.code    = "model_not_found";
-    error.message = "model '" + requested + "' not found";
-    throw ApiException(std::move(error));
-}
-
-Json parse_json_body(const httplib::Request& request) {
-    try {
-        return Json::parse(request.body);
-    } catch (const std::exception&) {
-        ApiError error;
-        error.status  = 400;
-        error.type    = "invalid_request_error";
-        error.message = "request body is not valid JSON";
-        throw ApiException(std::move(error));
-    }
-}
-
-bool disconnected(const httplib::Request& request) {
-    return request.is_connection_alive && !request.is_connection_alive();
-}
-
-void write_stream_item(httplib::DataSink& sink, StreamingResponse& request,
-                       const std::string& item) {
-    if (request.cancelled.load(std::memory_order_acquire) ||
-        !sink.write(item.data(), item.size())) {
-        request.cancelled.store(true, std::memory_order_release);
-        throw ClientDisconnected();
-    }
-}
-
-void write_stream_items(httplib::DataSink& sink, StreamingResponse& request,
-                        std::vector<std::string> items) {
-    for (const std::string& item : items) { write_stream_item(sink, request, item); }
-}
-
-void set_owned_content(httplib::Response& response, std::string body,
-                       std::shared_ptr<RequestLifetime> lifetime) {
-    response.set_content(std::move(body), "application/json");
-    response.hold_resource(std::move(lifetime));
-}
-
 OpenAIResponseContext terminal_context(OpenAIResponseContext previous,
                                        std::vector<ChatTurn> input_turns,
                                        std::vector<ChatTurn> output_history) {
     OpenAIResponseContext input =
         append_openai_response_context(std::move(previous), std::move(input_turns));
     return append_openai_response_context(std::move(input), std::move(output_history));
+}
+
+void commit_stored_response(OpenAIResponsesStore& store, PendingResponseStorage pending,
+                            std::string id, const Json& response,
+                            std::vector<ChatTurn> output_history, bool preserve_thinking) {
+    if (!pending.enabled) { return; }
+    if (pending.session_key.empty()) {
+        throw std::logic_error("stored Response has no Engine session key");
+    }
+    StoredOpenAIResponse stored;
+    stored.id                = std::move(id);
+    stored.session_key       = std::move(pending.session_key);
+    stored.response          = response;
+    stored.input_items       = std::move(pending.input_items);
+    stored.context           = terminal_context(std::move(pending.previous_context),
+                                                std::move(pending.input_turns), std::move(output_history));
+    stored.preserve_thinking = preserve_thinking;
+    store.put(std::move(stored));
 }
 
 OpenAIResponsesRuntimeValues runtime_values(const PreparedRequest& prepared,
@@ -140,13 +107,7 @@ OpenAIResponsesRuntimeValues runtime_values(const PreparedRequest& prepared,
 
 [[noreturn]] void invalid_query(std::string message, std::string param,
                                 std::string code = "invalid_value") {
-    ApiError error;
-    error.status  = 400;
-    error.type    = "invalid_request_error";
-    error.param   = std::move(param);
-    error.code    = std::move(code);
-    error.message = std::move(message);
-    throw ApiException(std::move(error));
+    bad_request(std::move(message), std::move(param), std::move(code));
 }
 
 void reject_unknown_query(const httplib::Request& request,
@@ -285,14 +246,14 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
         RequestLimits limits;
         limits.default_max_tokens = options_.default_max_tokens;
         request = parse_openai_responses_create_request(parse_json_body(req), limits);
-        validate_model(request.prompt.model, public_model_id_);
+        validate_openai_model(request.prompt.model, public_model_id_);
         resolved = resolve_openai_responses_prompt(request.prompt, openai_responses_store_, id,
                                                    request.store);
     } catch (const ApiException& exception) {
-        write_error(res, responses_error(exception.error()));
+        write_openai_error(res, responses_error(exception.error()));
         return;
     } catch (const std::exception& exception) {
-        write_error(res, internal_error(exception));
+        write_openai_error(res, internal_error(exception));
         return;
     }
 
@@ -308,18 +269,18 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
         prepared = service_->prepare(
             resolved.generation,
             request.stream ? GenerationConsumerMode::Streaming : GenerationConsumerMode::Aggregate,
-            [&req] { return disconnected(req); }, std::move(resolved.cache_hints));
+            [&req] { return client_disconnected(req); }, std::move(resolved.cache_hints));
     } catch (const ApiException& exception) {
         const ApiError error = responses_error(exception.error());
         log_request_rejected(make_request_rejection_log_context(
             req_id, "openai_responses", resolved.generation, metadata, error));
-        write_error(res, error);
+        write_openai_error(res, error);
         return;
     } catch (const std::exception& exception) {
         const ApiError error = internal_error(exception);
         log_request_rejected(make_request_rejection_log_context(
             req_id, "openai_responses", resolved.generation, metadata, error));
-        write_error(res, error);
+        write_openai_error(res, error);
         return;
     }
 
@@ -332,67 +293,61 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
     if (!request.stream) {
         try {
             const GenerationOutcome outcome =
-                service_->run(prepared, nullptr, [&req] { return disconnected(req); });
+                service_->run(prepared, nullptr, [&req] { return client_disconnected(req); });
             const OpenAIResponsesRuntimeValues runtime = runtime_values(prepared, &outcome);
             BuiltOpenAIResponse response =
                 make_openai_response_object(id, created, request, runtime, outcome);
-            if (request.store) {
-                if (!resolved.session_key) {
-                    throw std::logic_error("stored Response has no Engine session key");
-                }
-                StoredOpenAIResponse stored;
-                stored.id                = id;
-                stored.session_key       = *resolved.session_key;
-                stored.response          = response.body;
-                stored.input_items       = std::move(request.prompt.input_items);
-                stored.context           = terminal_context(std::move(resolved.parent),
-                                                            std::move(request.prompt.input_turns),
-                                                            std::move(response.output_history));
-                stored.preserve_thinking = prepared.preserve_thinking;
-                openai_responses_store_.put(std::move(stored));
-            }
+            PendingResponseStorage storage;
+            storage.input_turns      = std::move(request.prompt.input_turns);
+            storage.input_items      = std::move(request.prompt.input_items);
+            storage.previous_context = std::move(resolved.parent);
+            if (resolved.session_key) { storage.session_key = std::move(*resolved.session_key); }
+            storage.enabled = request.store;
+            commit_stored_response(openai_responses_store_, std::move(storage), id, response.body,
+                                   std::move(response.output_history), prepared.preserve_thinking);
             log_request_done(log_context, outcome);
-            set_owned_content(res, response.body.dump(), prepared.lifetime);
+            set_owned_json_content(res, response.body.dump(), prepared.lifetime);
         } catch (const ApiException& exception) {
             const ApiError error = responses_error(exception.error());
             log_request_error(log_context, error.message);
-            write_error(res, error);
+            write_openai_error(res, error);
         } catch (const std::exception& exception) {
             log_request_error(log_context, exception.what());
-            write_error(res, internal_error(exception));
+            write_openai_error(res, internal_error(exception));
         }
         return;
     }
 
-    auto stream              = std::make_shared<StreamingResponse>();
-    stream->prepared         = std::move(prepared);
-    stream->input_turns      = std::move(request.prompt.input_turns);
-    stream->input_items      = std::move(request.prompt.input_items);
-    stream->previous_context = std::move(resolved.parent);
-    if (resolved.session_key) { stream->session_key = std::move(*resolved.session_key); }
-    stream->log_context = log_context;
-    stream->store       = request.store;
-    stream->encoder     = std::make_unique<OpenAIResponsesEventStream>(
+    auto stream                      = std::make_shared<StreamingResponse>();
+    stream->prepared                 = std::move(prepared);
+    stream->storage.input_turns      = std::move(request.prompt.input_turns);
+    stream->storage.input_items      = std::move(request.prompt.input_items);
+    stream->storage.previous_context = std::move(resolved.parent);
+    if (resolved.session_key) { stream->storage.session_key = std::move(*resolved.session_key); }
+    stream->storage.enabled = request.store;
+    stream->log_context     = log_context;
+    stream->encoder         = std::make_unique<OpenAIResponsesEventStream>(
         id, created, std::move(request), runtime_values(stream->prepared));
 
-    res.set_header("Cache-Control", "no-cache");
-    res.set_header("X-Accel-Buffering", "no");
+    prepare_sse_response(res);
     res.set_chunked_content_provider(
         "text/event-stream",
-        [this, stream](std::size_t, httplib::DataSink& sink) -> bool {
+        [this, stream, id](std::size_t, httplib::DataSink& sink) -> bool {
             if (stream->started) {
                 sink.done();
                 return true;
             }
             stream->started = true;
             try {
-                write_stream_items(sink, *stream, stream->encoder->start());
+                write_stream_items(sink, stream->cancelled, stream->encoder->start());
                 StreamSink output;
                 output.on_reasoning = [&](const std::string& text) {
-                    write_stream_items(sink, *stream, stream->encoder->reasoning_delta(text));
+                    write_stream_items(sink, stream->cancelled,
+                                       stream->encoder->reasoning_delta(text));
                 };
                 output.on_content = [&](const std::string& text) {
-                    write_stream_items(sink, *stream, stream->encoder->content_delta(text));
+                    write_stream_items(sink, stream->cancelled,
+                                       stream->encoder->content_delta(text));
                 };
                 output.is_cancelled = [&] {
                     return stream->cancelled.load(std::memory_order_acquire) ||
@@ -401,24 +356,14 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
 
                 const GenerationOutcome outcome      = service_->run(stream->prepared, &output);
                 OpenAIResponsesStreamFinish finished = stream->encoder->finish(outcome);
-                if (stream->store) {
-                    if (stream->session_key.empty()) {
-                        throw std::logic_error("stored Response has no Engine session key");
-                    }
-                    StoredOpenAIResponse stored;
-                    stored.id                = finished.response.body.at("id").get<std::string>();
-                    stored.session_key       = stream->session_key;
-                    stored.response          = finished.response.body;
-                    stored.input_items       = std::move(stream->input_items);
-                    stored.context           = terminal_context(std::move(stream->previous_context),
-                                                                std::move(stream->input_turns),
-                                                                std::move(finished.response.output_history));
-                    stored.preserve_thinking = stream->prepared.preserve_thinking;
-                    openai_responses_store_.put(std::move(stored));
-                }
-                write_stream_items(sink, *stream, std::move(finished.events_before_terminal));
+                commit_stored_response(openai_responses_store_, std::move(stream->storage), id,
+                                       finished.response.body,
+                                       std::move(finished.response.output_history),
+                                       stream->prepared.preserve_thinking);
+                write_stream_items(sink, stream->cancelled, finished.events_before_terminal);
                 log_request_done(stream->log_context, outcome);
-                write_stream_item(sink, *stream, stream->encoder->terminal(finished.response));
+                write_stream_item(sink, stream->cancelled,
+                                  stream->encoder->terminal(finished.response));
                 sink.done();
                 return true;
             } catch (const ClientDisconnected& exception) {
@@ -428,7 +373,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                 const ApiError error = responses_error(exception.error());
                 log_request_error(stream->log_context, error.message);
                 try {
-                    write_stream_item(sink, *stream, stream->encoder->failed(error));
+                    write_stream_item(sink, stream->cancelled, stream->encoder->failed(error));
                     sink.done();
                     return true;
                 } catch (const ClientDisconnected&) { return false; }
@@ -436,7 +381,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                 const ApiError error = internal_error(exception);
                 log_request_error(stream->log_context, error.message);
                 try {
-                    write_stream_item(sink, *stream, stream->encoder->failed(error));
+                    write_stream_item(sink, stream->cancelled, stream->encoder->failed(error));
                     sink.done();
                     return true;
                 } catch (const ClientDisconnected&) { return false; }
@@ -451,28 +396,30 @@ void HttpServer::handle_response_input_tokens(const httplib::Request& req, httpl
         limits.default_max_tokens = options_.default_max_tokens;
         OpenAIResponsesPromptRequest request =
             parse_openai_responses_input_tokens_request(parse_json_body(req), limits);
-        validate_model(request.model, public_model_id_);
+        validate_openai_model(request.model, public_model_id_);
         OpenAIResponsesResolvedPrompt resolved =
             resolve_openai_responses_prompt(request, openai_responses_store_, std::nullopt, false);
-        const int tokens = service_->count_prompt_tokens(resolved.generation,
-                                                         [&req] { return disconnected(req); });
+        const int tokens = service_->count_prompt_tokens(
+            resolved.generation, [&req] { return client_disconnected(req); });
         res.set_content(make_openai_response_input_tokens_body(tokens), "application/json");
     } catch (const ApiException& exception) {
-        write_error(res, responses_error(exception.error()));
-    } catch (const std::exception& exception) { write_error(res, internal_error(exception)); }
+        write_openai_error(res, responses_error(exception.error()));
+    } catch (const std::exception& exception) {
+        write_openai_error(res, internal_error(exception));
+    }
 }
 
 void HttpServer::handle_response_get(const httplib::Request& req, httplib::Response& res) {
     try {
         validate_retrieve_query(req);
     } catch (const ApiException& exception) {
-        write_error(res, exception.error());
+        write_openai_error(res, exception.error());
         return;
     }
     const std::string id                                     = path_response_id(req);
     const std::shared_ptr<const StoredOpenAIResponse> stored = openai_responses_store_.get(id);
     if (!stored) {
-        write_error(res, response_not_found(id));
+        write_openai_error(res, response_not_found(id));
         return;
     }
     res.set_content(stored->response.dump(), "application/json");
@@ -481,7 +428,7 @@ void HttpServer::handle_response_get(const httplib::Request& req, httplib::Respo
 void HttpServer::handle_response_delete(const httplib::Request& req, httplib::Response& res) {
     const std::string id = path_response_id(req);
     if (!openai_responses_store_.erase(id)) {
-        write_error(res, response_not_found(id));
+        write_openai_error(res, response_not_found(id));
         return;
     }
     res.set_content(Json{{"id", id}, {"object", "response.deleted"}, {"deleted", true}}.dump(),
@@ -492,18 +439,18 @@ void HttpServer::handle_response_input_items(const httplib::Request& req, httpli
     const std::string id                                     = path_response_id(req);
     const std::shared_ptr<const StoredOpenAIResponse> stored = openai_responses_store_.get(id);
     if (!stored) {
-        write_error(res, response_not_found(id));
+        write_openai_error(res, response_not_found(id));
         return;
     }
     try {
         res.set_content(paginated_input_items(req, stored->input_items).dump(), "application/json");
-    } catch (const ApiException& exception) { write_error(res, exception.error()); }
+    } catch (const ApiException& exception) { write_openai_error(res, exception.error()); }
 }
 
 void HttpServer::handle_response_cancel(const httplib::Request& req, httplib::Response& res) {
     const std::string id = path_response_id(req);
     if (!openai_responses_store_.get(id)) {
-        write_error(res, response_not_found(id));
+        write_openai_error(res, response_not_found(id));
         return;
     }
     ApiError error;
@@ -512,7 +459,7 @@ void HttpServer::handle_response_cancel(const httplib::Request& req, httplib::Re
     error.code    = "background_not_supported";
     error.message = "only background responses can be cancelled; NInfer does not support "
                     "background execution";
-    write_error(res, error);
+    write_openai_error(res, error);
 }
 
 void HttpServer::handle_response_compact(const httplib::Request&, httplib::Response& res) {
@@ -522,7 +469,7 @@ void HttpServer::handle_response_compact(const httplib::Request&, httplib::Respo
     error.param   = "context_management";
     error.code    = "compaction_not_supported";
     error.message = "Responses compaction is not supported";
-    write_error(res, error);
+    write_openai_error(res, error);
 }
 
 } // namespace ninfer::serve
