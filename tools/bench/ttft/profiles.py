@@ -141,11 +141,11 @@ PROFILE_ARGS: dict[str, tuple[str, ...]] = {
         "--max-shared-prefixes", 1,
         "--max-long-anchors-per-continuation", 0,
     ),
-    "shared-replacement": _args(
-        "--max-context", 8192,
-        "--kv-capacity", 8192,
+    "shared-value": _args(
+        "--max-context", 16384,
+        "--kv-capacity", 16384,
         "--max-concurrency", 1,
-        "--device-state-slots", 2,
+        "--device-state-slots", 3,
         "--host-state-slots", 0,
         "--host-kv-mib", 0,
         "--max-private-continuations", 1,
