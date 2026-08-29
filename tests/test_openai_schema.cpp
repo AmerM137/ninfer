@@ -393,6 +393,28 @@ int test_messages_and_media() {
     failures += check(api_error([&] { (void)parse(body); }).code == "message_name_not_supported",
                       "message name rejected");
 
+    body = base_request();
+    body["messages"].push_back(Json{
+        {"role", "assistant"},
+        {"content", nullptr},
+        {"tool_calls",
+         Json::array({Json{{"id", "call_1"},
+                           {"type", "function"},
+                           {"function", Json{{"name", "get_status"}, {"arguments", "{}"}}}}})}});
+    body["messages"].push_back(Json{
+        {"role", "tool"}, {"name", "get_status"}, {"tool_call_id", "call_1"}, {"content", "ok"}});
+    const GenerationRequest named_tool_history = parse(body).generation;
+    const ChatTurn& named_tool                 = named_tool_history.messages.back();
+    failures += check(named_tool.role == ninfer::ChatRole::Tool &&
+                          named_tool.tool_call_id == "call_1" && !named_tool.tool_result_name &&
+                          named_tool.content.size() == 1 && named_tool.content[0].text == "ok",
+                      "tool message name is an ignored compatibility extension");
+
+    body["messages"].back()["name"] = Json::array();
+    failures +=
+        check(api_error([&] { (void)parse(body); }).message == "message name must be a string",
+              "tool message name remains type checked");
+
     body                           = base_request();
     body["messages"][0]["name"]    = "";
     body["messages"][0]["content"] = Json::array();
