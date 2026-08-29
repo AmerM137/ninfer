@@ -55,7 +55,6 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         cache.max_private_continuations         = concurrency;
         cache.max_shared_prefixes               = 0;
         cache.max_long_anchors_per_continuation = 0;
-        cache.max_cache_markers_per_request     = cache.max_cache_markers_per_request.value_or(4U);
         return options;
     }
 
@@ -65,7 +64,6 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         cache.max_private_continuations.value_or(static_cast<std::uint32_t>(default_private));
     cache.max_shared_prefixes               = cache.max_shared_prefixes.value_or(concurrency);
     cache.max_long_anchors_per_continuation = cache.max_long_anchors_per_continuation.value_or(2U);
-    cache.max_cache_markers_per_request     = cache.max_cache_markers_per_request.value_or(4U);
 
     if (*cache.max_private_continuations < concurrency) {
         throw std::invalid_argument(

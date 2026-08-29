@@ -309,6 +309,26 @@ int test_tools() {
                      Json{{"role", "tool"}, {"tool_call_id", "call_1"}, {"content", "sunny"}}});
     failures += check(parse(history).generation.has_tool_history(),
                       "tool-call history follows wire types without inventing JSON validation");
+
+    Json mixed_assistant        = base_request();
+    mixed_assistant["messages"] = Json::array(
+        {Json{{"role", "user"}, {"content", "inspect"}},
+         Json{{"role", "assistant"},
+              {"content", "I will inspect it"},
+              {"tool_calls",
+               Json::array({Json{
+                   {"id", "call_2"},
+                   {"type", "function"},
+                   {"function", Json{{"name", "inspect"}, {"arguments", R"({"path":"a"})"}}}}})}}});
+    const GenerationRequest mixed_request  = parse(mixed_assistant).generation;
+    const ninfer::PromptInput mixed_prompt = prompt(mixed_request);
+    failures += check(mixed_request.messages[1].cache_boundary_after &&
+                          !mixed_request.messages[1].content[0].cache_boundary_after &&
+                          !mixed_prompt.context_cache.markers.empty() &&
+                          mixed_prompt.context_cache.markers.back().location ==
+                              ninfer::PromptCacheMarkerLocation::MessageBoundary &&
+                          mixed_prompt.context_cache.markers.back().after_message_count == 2,
+                      "automatic caching stops after a complete assistant text/tool-call turn");
     return failures;
 }
 

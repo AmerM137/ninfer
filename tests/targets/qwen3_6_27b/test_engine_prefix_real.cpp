@@ -45,7 +45,6 @@ ninfer::EngineOptions host_restore_engine_options(const char* artifact) {
     options.context_cache.max_private_continuations         = 2;
     options.context_cache.max_shared_prefixes               = 0;
     options.context_cache.max_long_anchors_per_continuation = 0;
-    options.context_cache.max_cache_markers_per_request     = 0;
     return options;
 }
 
@@ -66,7 +65,6 @@ ninfer::EngineOptions shared_replacement_engine_options(const char* artifact) {
     options.context_cache.max_private_continuations         = 2;
     options.context_cache.max_shared_prefixes               = 1;
     options.context_cache.max_long_anchors_per_continuation = 0;
-    options.context_cache.max_cache_markers_per_request     = 1;
     return options;
 }
 
@@ -85,7 +83,6 @@ ninfer::EngineOptions private_long_anchor_engine_options(const char* artifact) {
     options.context_cache.max_private_continuations         = 2;
     options.context_cache.max_shared_prefixes               = 0;
     options.context_cache.max_long_anchors_per_continuation = 1;
-    options.context_cache.max_cache_markers_per_request     = 1;
     return options;
 }
 
@@ -106,7 +103,6 @@ ninfer::EngineOptions last_alias_engine_options(const char* artifact) {
     options.context_cache.max_private_continuations         = 2;
     options.context_cache.max_shared_prefixes               = 0;
     options.context_cache.max_long_anchors_per_continuation = 0;
-    options.context_cache.max_cache_markers_per_request     = 0;
     return options;
 }
 
@@ -127,7 +123,6 @@ ninfer::EngineOptions concurrent_engine_options(const char* artifact) {
     options.context_cache.max_private_continuations         = 8;
     options.context_cache.max_shared_prefixes               = 0;
     options.context_cache.max_long_anchors_per_continuation = 0;
-    options.context_cache.max_cache_markers_per_request     = 0;
     return options;
 }
 
@@ -147,7 +142,6 @@ ninfer::EngineOptions pressure_resume_engine_options(const char* artifact) {
     options.context_cache.max_private_continuations         = 4;
     options.context_cache.max_shared_prefixes               = 0;
     options.context_cache.max_long_anchors_per_continuation = 0;
-    options.context_cache.max_cache_markers_per_request     = 1;
     return options;
 }
 
@@ -418,6 +412,8 @@ int exercise_host_restore(const char* artifact) {
 
 int exercise_shared_replacement_and_full_capacity_reuse(const char* artifact) {
     ninfer::EngineOptions engine_options = shared_replacement_engine_options(artifact);
+    engine_options.max_context           = 1024;
+    engine_options.kv_capacity           = ninfer::KvCapacityPolicy::explicit_capacity(1024);
     engine_options.context_cache.max_private_continuations = 1;
     ninfer::Engine engine(std::move(engine_options));
     ninfer::RequestOptions capture_request;
@@ -426,6 +422,17 @@ int exercise_shared_replacement_and_full_capacity_reuse(const char* artifact) {
     capture_request.execution.allow_prefix_reuse      = true;
     capture_request.stop.include_model_defaults       = false;
 
+    const auto plain_prompt = [](std::string text) {
+        ninfer::PromptInput input;
+        ninfer::ChatMessage user;
+        user.role = ninfer::ChatRole::User;
+        user.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text, .text = std::move(text), .media = {}});
+        input.messages.push_back(std::move(user));
+        input.options.enable_thinking = false;
+        input.context_cache.retention = ninfer::CacheRetentionHint::Disposable;
+        return input;
+    };
     const auto tool_prompt = [](std::string tool_json, std::string question) {
         ninfer::PromptInput input;
         ninfer::ChatMessage user;
@@ -435,17 +442,55 @@ int exercise_shared_replacement_and_full_capacity_reuse(const char* artifact) {
         input.messages.push_back(std::move(user));
         input.options.enable_thinking = false;
         input.options.tool_jsons.push_back(std::move(tool_json));
+        input.context_cache.markers.push_back(ninfer::PromptCacheMarker{
+            .kind             = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+            .evidence         = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+            .location         = ninfer::PromptCacheMarkerLocation::ToolBoundary,
+            .after_tool_count = 1,
+        });
         input.context_cache.retention = ninfer::CacheRetentionHint::Disposable;
         return input;
     };
 
-    const std::string alpha_tool =
-        R"({"type":"function","function":{"name":"alpha","description":"stable lookup schema","parameters":{"type":"object","properties":{"key":{"type":"string"}},"required":["key"]}}})";
-    const std::string bravo_tool =
-        R"({"type":"function","function":{"name":"bravo","description":"stable lookup schema","parameters":{"type":"object","properties":{"key":{"type":"string"}},"required":["key"]}}})";
+    std::string observed_text;
+    for (std::uint32_t index = 0; index < 4; ++index) { observed_text += "observed-prefix "; }
+    const ninfer::GenerationResult observed_first =
+        engine.generate(engine.prepare(plain_prompt(observed_text)), capture_request);
+    const ninfer::RuntimeStats after_observed_first = engine.runtime_stats();
+    const ninfer::GenerationResult observed_second =
+        engine.generate(engine.prepare(plain_prompt(observed_text)), capture_request);
+    const ninfer::RuntimeStats after_observed_second = engine.runtime_stats();
+    if (observed_first.generated_token_ids.size() != 1 ||
+        observed_second.generated_token_ids.size() != 1 ||
+        after_observed_first.active_captures_completed != 1 ||
+        after_observed_second.active_captures_completed !=
+            after_observed_first.active_captures_completed + 1U) {
+        std::cerr << "observed-prefix private/shared capture sequence changed: "
+                  << after_observed_first.active_captures_completed << '/'
+                  << after_observed_second.active_captures_completed << '\n';
+        return 1;
+    }
 
-    const ninfer::GenerationResult first = engine.generate(
-        engine.prepare(tool_prompt(alpha_tool, "Use alpha once.")), capture_request);
+    const ninfer::GenerationResult observed_filler = engine.generate(
+        engine.prepare(plain_prompt("Unrelated private endpoint.")), capture_request);
+    const ninfer::GenerationResult observed_reuse =
+        engine.generate(engine.prepare(plain_prompt(observed_text)), capture_request);
+    if (observed_filler.generated_token_ids.size() != 1 ||
+        observed_reuse.generated_token_ids.size() != 1 ||
+        observed_reuse.prefix_reuse_path != ninfer::PrefixReusePath::SharedStablePrefix ||
+        observed_reuse.reused_prompt_tokens == 0) {
+        std::cerr << "promoted shared prefix was not reusable after private eviction: path="
+                  << static_cast<int>(observed_reuse.prefix_reuse_path)
+                  << " reused=" << observed_reuse.reused_prompt_tokens << '\n';
+        return 1;
+    }
+
+    std::string long_description;
+    for (std::uint32_t index = 0; index < 240; ++index) { long_description += "stable-schema "; }
+    const std::string bravo_tool =
+        std::string(R"({"type":"function","function":{"name":"bravo","description":")") +
+        long_description +
+        R"(","parameters":{"type":"object","properties":{"key":{"type":"string"}},"required":["key"]}}})";
     const ninfer::GenerationResult replacement = engine.generate(
         engine.prepare(tool_prompt(bravo_tool, "Use bravo once.")), capture_request);
     const ninfer::RuntimeStats after_replacement = engine.runtime_stats();
@@ -455,16 +500,8 @@ int exercise_shared_replacement_and_full_capacity_reuse(const char* artifact) {
     }
     // Remove the exact private endpoint without publishing another shared marker. The following
     // identical Bravo prompt must therefore materialize from the retained shared prefix.
-    ninfer::PromptInput filler;
-    ninfer::ChatMessage filler_user;
-    filler_user.role = ninfer::ChatRole::User;
-    filler_user.parts.push_back(ninfer::MessagePart{
-        .kind = ninfer::MessagePartKind::Text, .text = "Unrelated private endpoint.", .media = {}});
-    filler.messages.push_back(std::move(filler_user));
-    filler.options.enable_thinking = false;
-    filler.context_cache.retention = ninfer::CacheRetentionHint::Disposable;
     const ninfer::GenerationResult filled =
-        engine.generate(engine.prepare(std::move(filler)), capture_request);
+        engine.generate(engine.prepare(plain_prompt("Another private endpoint.")), capture_request);
     const ninfer::RuntimeStats after_filler = engine.runtime_stats();
     if (filled.generated_token_ids.size() != 1) {
         std::cerr << "shared replacement fixture did not displace the exact private endpoint\n";
@@ -479,7 +516,7 @@ int exercise_shared_replacement_and_full_capacity_reuse(const char* artifact) {
         engine.prepare(tool_prompt(bravo_tool, "Use bravo once.")), full_capacity_request);
     const ninfer::RuntimeStats after_reuse = engine.runtime_stats();
 
-    if (first.generated_token_ids.size() != 1 || reused.generated_token_ids.size() != 1) {
+    if (reused.generated_token_ids.size() != 1) {
         std::cerr << "shared replacement fixture did not complete all requests\n";
         return 1;
     }
