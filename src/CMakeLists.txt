@@ -86,6 +86,7 @@ add_library(ninfer_ops STATIC
   ops/launcher/scatter.cu
   ops/launcher/sigmoid_gate_mul.cu
   ops/launcher/silu_and_mul.cu
+  ops/launcher/target_logprobs.cu
   ops/launcher/vision_pos_embed.cu
   # Softmax Attention and KV-cache state transitions.
   ops/softmax_attention/dense/causal_cache/causal_softmax_attention.cpp
@@ -265,6 +266,7 @@ add_library(ninfer_ops STATIC
   ops/wrapper/sigmoid_mul.cpp
   ops/wrapper/silu_mul.cpp
   ops/wrapper/sparse_moe.cpp
+  ops/wrapper/target_logprobs.cpp
   ops/wrapper/vision_pos_embed.cpp)
 ninfer_internal_includes(ninfer_ops)
 ninfer_cuda_archive(ninfer_ops)
