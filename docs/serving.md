@@ -63,6 +63,15 @@ cannot be combined with `--vision`. A later request cannot enable a capability o
 Every OpenAI-compatible response carries a unique `x-request-id` header, including streaming and
 error responses. Anthropic endpoints use their separate `request-id` contract.
 
+All three generation SSE endpoints emit the standard `: keep-alive` comment after five seconds
+without a protocol event. The comment is transport-only: SSE clients ignore it, and it does not
+change generated text, event ordering, usage, stored Responses, or request logs. On Linux, accepted
+connections also use TCP keepalive and a 15-second `TCP_USER_TIMEOUT`; together with the heartbeat,
+a dead or unacknowledging peer is normally cancelled within about 20 seconds, including while the
+request is waiting or prefilling. A peer whose TCP stack remains connected and acknowledges data
+cannot be distinguished from a reading application; proxies must close their upstream NInfer
+connection when the downstream client disappears.
+
 ## OpenAI Chat Completions
 
 ```bash
