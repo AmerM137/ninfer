@@ -2,6 +2,7 @@
 #include "targets/qwen3_6/impl/runtime/program.h"
 #include "targets/qwen3_6/impl/runtime/rebuild_work.h"
 
+#include "core/nvtx.h"
 #include "targets/qwen3_6/impl/runtime/schedule.h"
 #include "ninfer/ops/gdn_replay.h"
 #include "ninfer/ops/linear.h"
@@ -1047,11 +1048,11 @@ std::vector<float> ProgramImplCore::causal_score(PreparedPromptData&& prompt,
             Tensor hidden      = score_hidden->slice(1, 0, columns);
             ops::linear(hidden, model.output_head, logits, device.stream);
             CUDA_CHECK(cudaMemcpyAsync(target_ids.data, staged_targets.data(), target_ids.bytes(),
-                                       cudaMemcpyHostToDevice, device.stream));
+                                                    cudaMemcpyHostToDevice, device.stream));
             ops::target_logprobs(logits, target_ids, TextConfig::token_domain, logprobs,
-                                 device.stream);
+                                              device.stream);
             CUDA_CHECK(cudaMemcpyAsync(score_logprobs_host->data(), logprobs.data, logprobs.bytes(),
-                                       cudaMemcpyDeviceToHost, device.stream));
+                                                    cudaMemcpyDeviceToHost, device.stream));
             device.synchronize();
             const auto* host = static_cast<const float*>(score_logprobs_host->data());
             output.insert(output.end(), host, host + staged_columns);
@@ -9678,6 +9679,7 @@ void ProgramImplCore::ordered_reset(SequenceState& sequence) {
 
 void ProgramImplCore::prepare_graphs() {
     if (!use_cuda_graph) { return; }
+    nvtx::ScopedRange prepare_range(nvtx::Name::CudaGraphPrepare, nvtx::Category::Graph);
 
     std::array<StateImageHandle, kMaximumConcurrency> capture_states{};
     for (std::uint32_t row = 0; row < max_concurrency; ++row) {
@@ -10435,6 +10437,8 @@ runtime::BatchedGeneratedRound
 ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
                                        std::span<const runtime::RoundBudget> budgets,
                                        runtime::ExecutionTiming* failed_timing) {
+    nvtx::ScopedRange round_range(nvtx::Name::DecodeOrdinaryRound, nvtx::Category::Decode,
+                                  static_cast<std::uint64_t>(lanes.size()));
     runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Submit, failed_timing);
     if (speculative_backend != SpeculativeBackend::None) {
         throw std::logic_error("ordinary batch execution requires the ordinary backend");
@@ -10468,6 +10472,9 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
 
     const auto start = Clock::now();
     try {
+        std::optional<nvtx::ScopedRange> submit_range;
+        submit_range.emplace(nvtx::Name::DecodeOrdinarySubmit, nvtx::Category::Decode,
+                             static_cast<std::uint64_t>(lanes.size()));
         DecodeGraphExecutable* executable = nullptr;
         ops::CausalAttentionExecutionEnvelope envelope{maximum_frontier + 1, maximum_frontier + 1};
         if (use_cuda_graph) {
@@ -10509,8 +10516,13 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
         mark_workspace_usage(workspace_plan.ordinary_round);
         schedule::ordinary_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
                                         envelope, executable);
+        submit_range.reset();
         timing.begin_wait();
-        device.synchronize();
+        {
+            nvtx::ScopedRange wait_range(nvtx::Name::DecodeOrdinaryWait, nvtx::Category::Control,
+                                         static_cast<std::uint64_t>(lanes.size()));
+            device.synchronize();
+        }
         timing.end_wait();
 
         const double seconds = std::chrono::duration<double>(Clock::now() - start).count();
@@ -10544,6 +10556,8 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
     } catch (...) {
         timing.begin_wait();
         try {
+            nvtx::ScopedRange wait_range(nvtx::Name::DecodeOrdinaryWait, nvtx::Category::Control,
+                                         static_cast<std::uint64_t>(lanes.size()));
             device.synchronize();
         } catch (...) {}
         timing.end_wait();
@@ -10556,6 +10570,8 @@ runtime::BatchedGeneratedRound
 ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                                   std::span<const runtime::RoundBudget> budgets,
                                   runtime::ExecutionTiming* failed_timing) {
+    nvtx::ScopedRange round_range(nvtx::Name::DecodeMtpRound, nvtx::Category::Mtp,
+                                  static_cast<std::uint64_t>(lanes.size()));
     runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Submit, failed_timing);
     if (speculative_backend != SpeculativeBackend::Mtp || !io.mtp_decode ||
         decoder->mtp_cache() == nullptr) {
@@ -10594,6 +10610,9 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
 
     const auto started = Clock::now();
     try {
+        std::optional<nvtx::ScopedRange> submit_range;
+        submit_range.emplace(nvtx::Name::DecodeMtpSubmit, nvtx::Category::Mtp,
+                             static_cast<std::uint64_t>(lanes.size()));
         DecodeGraphExecutable* executable = nullptr;
         schedule::MtpCausalAttentionEnvelopes envelopes =
             mtp_causal_attention_envelopes(maximum_frontier, draft_window, capacity);
@@ -10657,8 +10676,13 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         mark_workspace_usage(workspace_plan.mtp_round);
         schedule::mtp_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
                                    draft_window, envelopes, executable);
+        submit_range.reset();
         timing.begin_wait();
-        device.synchronize();
+        {
+            nvtx::ScopedRange wait_range(nvtx::Name::DecodeMtpWait, nvtx::Category::Control,
+                                         static_cast<std::uint64_t>(lanes.size()));
+            device.synchronize();
+        }
         timing.end_wait();
 
         const double seconds = std::chrono::duration<double>(Clock::now() - started).count();
@@ -10716,6 +10740,8 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
     } catch (...) {
         timing.begin_wait();
         try {
+            nvtx::ScopedRange wait_range(nvtx::Name::DecodeMtpWait, nvtx::Category::Control,
+                                         static_cast<std::uint64_t>(lanes.size()));
             device.synchronize();
         } catch (...) {}
         timing.end_wait();
@@ -10728,6 +10754,8 @@ runtime::BatchedGeneratedRound
 ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                                      std::span<const runtime::RoundBudget> budgets,
                                      runtime::ExecutionTiming* failed_timing) {
+    nvtx::ScopedRange round_range(nvtx::Name::DecodeDFlashRound, nvtx::Category::DFlash,
+                                  static_cast<std::uint64_t>(lanes.size()));
     runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Submit, failed_timing);
     if (speculative_backend != SpeculativeBackend::DFlash || !io.dflash_decode || !dflash) {
         throw std::logic_error("DFlash batch execution requires the DFlash backend");
@@ -10774,6 +10802,9 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
 
     const auto started = Clock::now();
     try {
+        std::optional<nvtx::ScopedRange> submit_range;
+        submit_range.emplace(nvtx::Name::DecodeDFlashSubmit, nvtx::Category::DFlash,
+                             static_cast<std::uint64_t>(lanes.size()));
         DecodeGraphExecutable* executable   = nullptr;
         schedule::DFlashEnvelopes envelopes = dflash_envelopes(0, maximum_frontier, draft_window);
         ops::CausalAttentionExecutionEnvelope target_envelope{1, maximum_target_tokens};
@@ -10832,8 +10863,13 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         mark_workspace_usage(workspace_plan.dflash_round);
         schedule::dflash_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
                                       draft_window, envelopes, target_envelope, executable);
+        submit_range.reset();
         timing.begin_wait();
-        device.synchronize();
+        {
+            nvtx::ScopedRange wait_range(nvtx::Name::DecodeDFlashWait, nvtx::Category::Control,
+                                         static_cast<std::uint64_t>(lanes.size()));
+            device.synchronize();
+        }
         timing.end_wait();
 
         const double seconds = std::chrono::duration<double>(Clock::now() - started).count();
@@ -10890,6 +10926,8 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
     } catch (...) {
         timing.begin_wait();
         try {
+            nvtx::ScopedRange wait_range(nvtx::Name::DecodeDFlashWait, nvtx::Category::Control,
+                                         static_cast<std::uint64_t>(lanes.size()));
             device.synchronize();
         } catch (...) {}
         timing.end_wait();

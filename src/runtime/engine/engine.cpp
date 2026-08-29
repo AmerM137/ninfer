@@ -1,6 +1,7 @@
 #include "ninfer/engine.h"
 
 #include "core/device.h"
+#include "core/nvtx.h"
 #include "runtime/contract/sampling.h"
 #include "runtime/contract/types.h"
 #include "runtime/engine/causal_score_core.h"
@@ -216,6 +217,7 @@ public:
 
     explicit Impl(EngineOptions engine_options)
         : options(normalize_engine_options(std::move(engine_options))), device(options.device) {
+        nvtx::ScopedRange load_range(nvtx::Name::EngineLoad, nvtx::Category::Runtime);
         auto constructed  = targets::construct_target(options, device);
         active            = std::move(constructed.active);
         load              = std::move(constructed.load);
@@ -264,6 +266,7 @@ Engine::Engine(Engine&&) noexcept            = default;
 Engine& Engine::operator=(Engine&&) noexcept = default;
 
 PreparedPrompt Engine::prepare(PromptInput input, const PreparationControl& control) const {
+    nvtx::ScopedRange prepare_range(nvtx::Name::FrontendPrepare, nvtx::Category::Runtime);
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     const SamplingMode sampling_mode =
         input.options.enable_thinking ? SamplingMode::Thinking : SamplingMode::NonThinking;
@@ -284,6 +287,8 @@ PreparedPrompt Engine::prepare(PromptInput input, const PreparationControl& cont
 
 PreparedPrompt Engine::prepare_tokens(std::vector<TokenId> token_ids,
                                       bool allow_prefix_identity) const {
+    nvtx::ScopedRange prepare_range(nvtx::Name::FrontendPrepare, nvtx::Category::Runtime,
+                                    static_cast<std::uint64_t>(token_ids.size()));
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     return std::visit(
         [&](const auto& target_ptr) -> PreparedPrompt {
@@ -316,6 +321,8 @@ std::vector<TokenId> Engine::tokenize_text(std::string_view text) const {
 }
 
 std::vector<float> Engine::score_tokens(std::vector<TokenId> tokens, std::uint32_t first_target) {
+    nvtx::ScopedRange score_range(nvtx::Name::Score, nvtx::Category::Scoring,
+                                  static_cast<std::uint64_t>(tokens.size()));
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     if (impl_->options.purpose != EnginePurpose::CausalScoring) {
         throw std::logic_error("score_tokens requires a CausalScoring Engine");

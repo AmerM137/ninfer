@@ -1256,6 +1256,7 @@ private:
     }
 
     void run_prefill_step(const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start) {
+        nvtx::ScopedRange prefill_range(nvtx::Name::Prefill, nvtx::Category::Prefill);
         EnginePhaseScope setup(*this, EngineHostPhase::CommitOutput);
         const auto prefill_lane = scheduler_.prefill_lane();
         if (!prefill_lane) { throw std::logic_error("no request owns staged prefill"); }
@@ -1669,6 +1670,8 @@ private:
 
     void run_decode_round(const RoundMembership& membership,
                           const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start) {
+        nvtx::ScopedRange decode_range(nvtx::Name::Decode, nvtx::Category::Decode,
+                                       static_cast<std::uint64_t>(membership.size));
         ProgramCallScope program_call(*this);
         auto pending = instance_.program->decode(
             membership.sequence_span(), membership.budget_span(), &program_call.failed_timing());
@@ -1678,6 +1681,8 @@ private:
     }
 
     void run_control_batch(const ControlMembership& membership) {
+        nvtx::ScopedRange control_range(nvtx::Name::ControlBatch, nvtx::Category::Control,
+                                        static_cast<std::uint64_t>(membership.size));
         EnginePhaseScope phase(*this, EngineHostPhase::CommitOutput);
         if (membership.empty() || membership.row_stride == 0 ||
             membership.tokens.size() !=
