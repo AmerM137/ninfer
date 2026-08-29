@@ -371,4 +371,7 @@ if(NINFER_BUILD_SERVE)
   target_link_libraries(ninfer_serve
     PUBLIC ninfer_engine Threads::Threads
     PRIVATE ninfer_media_acquire CUDA::cudart)
+  if(WIN32)
+    target_link_libraries(ninfer_serve PRIVATE bcrypt)
+  endif()
 endif()

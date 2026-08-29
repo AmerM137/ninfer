@@ -1,0 +1,38 @@
+{
+  "version": 6,
+  "configurePresets": [
+    {
+      "name": "windows",
+      "displayName": "Windows MSVC",
+      "description": "Release build with MSVC and NVCC's supported cl host compiler.",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_PREFIX_PATH": "C:/libs/ffmpeg-n6.1.2;C:/libs/curl"
+      }
+    },
+    {
+      "name": "windows-clangcl",
+      "displayName": "Windows clang-cl",
+      "description": "Release C/C++ build with clang-cl; CUDA continues to use cl as its host compiler.",
+      "inherits": "windows",
+      "binaryDir": "${sourceDir}/build-clangcl",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "clang-cl",
+        "CMAKE_CXX_COMPILER": "clang-cl",
+        "CMAKE_CUDA_HOST_COMPILER": "cl"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "windows",
+      "configurePreset": "windows"
+    },
+    {
+      "name": "windows-clangcl",
+      "configurePreset": "windows-clangcl"
+    }
+  ]
+}

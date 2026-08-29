@@ -224,6 +224,49 @@ struct PrefillWork {
     [[nodiscard]] friend constexpr bool operator==(PrefillWork, PrefillWork) noexcept = default;
 };
 
+namespace detail {
+
+struct U64Product {
+    std::uint64_t low  = 0;
+    std::uint64_t high = 0;
+};
+
+// Exact 64x64 -> 128 multiplication expressed with 32-bit partial products.  The runtime needs
+// only the saturated 64-bit result or a fixed-point right shift, so this avoids a compiler-only
+// integer extension while preserving their arithmetic exactly.
+[[nodiscard]] constexpr U64Product multiply_u64(std::uint64_t left,
+                                                 std::uint64_t right) noexcept {
+    constexpr std::uint64_t kMask = 0xffffffffULL;
+    const std::uint64_t left_low  = left & kMask;
+    const std::uint64_t left_high = left >> 32U;
+    const std::uint64_t right_low = right & kMask;
+    const std::uint64_t right_high = right >> 32U;
+    const std::uint64_t low_low = left_low * right_low;
+    const std::uint64_t low_high = left_low * right_high;
+    const std::uint64_t high_low = left_high * right_low;
+    const std::uint64_t high_high = left_high * right_high;
+    const std::uint64_t middle = (low_low >> 32U) + (low_high & kMask) + (high_low & kMask);
+    return {
+        .low = (low_low & kMask) | (middle << 32U),
+        .high = high_high + (low_high >> 32U) + (high_low >> 32U) + (middle >> 32U),
+    };
+}
+
+[[nodiscard]] constexpr std::uint64_t saturating_add_u64(std::uint64_t left,
+                                                          std::uint64_t right) noexcept {
+    return right > std::numeric_limits<std::uint64_t>::max() - left
+               ? std::numeric_limits<std::uint64_t>::max()
+               : left + right;
+}
+
+[[nodiscard]] constexpr std::uint64_t saturating_product_u64(std::uint64_t left,
+                                                              std::uint64_t right) noexcept {
+    const U64Product product = multiply_u64(left, right);
+    return product.high == 0 ? product.low : std::numeric_limits<std::uint64_t>::max();
+}
+
+} // namespace detail
+
 // Exact prefill feature definition for a suffix beginning after prefix_tokens. Attention work is
 // prefix*suffix + suffix*(suffix+1)/2 and all arithmetic saturates.
 [[nodiscard]] inline PrefillWork make_prefill_work(std::uint64_t prefix_tokens,
@@ -237,15 +280,14 @@ struct PrefillWork {
     result.tokens                       = suffix_tokens;
     result.vision_items                 = vision_items;
     result.vision_patches               = vision_patches;
-    const unsigned __int128 suffix      = suffix_tokens;
-    const unsigned __int128 linear      = static_cast<unsigned __int128>(prefix_tokens) * suffix;
-    const unsigned __int128 triangular  = suffix * (suffix + 1U) / 2U;
-    constexpr unsigned __int128 maximum = ~static_cast<unsigned __int128>(0);
-    const unsigned __int128 attention =
-        triangular > maximum - linear ? maximum : linear + triangular;
-    result.attention_pairs = attention > std::numeric_limits<std::uint64_t>::max()
-                                 ? std::numeric_limits<std::uint64_t>::max()
-                                 : static_cast<std::uint64_t>(attention);
+    const std::uint64_t linear = detail::saturating_product_u64(prefix_tokens, suffix_tokens);
+    const std::uint64_t triangular =
+        suffix_tokens == std::numeric_limits<std::uint64_t>::max()
+            ? std::numeric_limits<std::uint64_t>::max()
+            : ((suffix_tokens & 1U) == 0
+                   ? detail::saturating_product_u64(suffix_tokens / 2U, suffix_tokens + 1U)
+                   : detail::saturating_product_u64(suffix_tokens, (suffix_tokens + 1U) / 2U));
+    result.attention_pairs = detail::saturating_add_u64(linear, triangular);
     return result;
 }
 

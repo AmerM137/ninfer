@@ -13,7 +13,11 @@
 #include <stdexcept>
 #include <string>
 
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <unistd.h>
+#endif
 
 namespace {
 
@@ -239,9 +243,14 @@ void test_schema_validation() {
 }
 
 void test_resolution_and_atomic_upserts() {
+#ifdef _WIN32
+    const std::string process_tag = std::to_string(static_cast<long long>(::GetCurrentProcessId()));
+#else
+    const std::string process_tag = std::to_string(static_cast<long long>(::getpid()));
+#endif
     const std::filesystem::path directory =
         std::filesystem::temp_directory_path() /
-        ("ninfer-context-cost-test-" + std::to_string(static_cast<long long>(::getpid())));
+        ("ninfer-context-cost-test-" + process_tag);
     std::filesystem::create_directories(directory);
     const std::filesystem::path path = directory / "presets.json";
     try {
