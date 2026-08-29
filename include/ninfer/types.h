@@ -32,6 +32,11 @@ enum class KvCacheStorage : std::uint8_t {
     Fp8E4M3Row256,
 };
 
+enum class EnginePurpose : std::uint8_t {
+    Generation,
+    CausalScoring,
+};
+
 enum class KvCapacityMode : std::uint8_t {
     Explicit,
     Automatic,
@@ -103,8 +108,9 @@ struct ContextCostOptions {
 
 struct EngineOptions {
     std::filesystem::path artifact_path;
+    EnginePurpose purpose              = EnginePurpose::Generation;
     int device                         = 0;
-    std::uint32_t max_context          = 2048; // Exact logical ceiling of each request.
+    std::uint32_t max_context          = 2048; // Logical ceiling of one request or score window.
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(2048);
     std::uint32_t max_concurrency      = 1;
     std::uint32_t max_pending_requests = 16;

@@ -1480,6 +1480,11 @@ PreparedPrompt Frontend::prepare_tokens(std::vector<TokenId> token_ids,
     return PreparedPrompt(std::move(prepared));
 }
 
+std::vector<TokenId> Frontend::tokenize_text(std::string_view text) const {
+    if (impl_ == nullptr) { throw std::logic_error("frontend is empty"); }
+    return impl_->tokenizer->encode(text);
+}
+
 OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,
                                             const StopPolicy& caller_stop,
                                             const OutputOptions& output,
