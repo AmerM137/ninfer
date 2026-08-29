@@ -7058,30 +7058,21 @@ ProgramImplCore::inspect_capture(const CaptureOffer& offer, const SharedPrefixHa
         state_store->can_recycle_checkpoint_destination(*sequence.rewrite_state);
     detail::PhysicalResources added;
     detail::PhysicalResources active_removed;
+    std::optional<KVActiveSnapshotShape> text_snapshot_shape;
+    std::optional<KVActiveSnapshotShape> backend_snapshot_shape;
     if (publish_shared) {
         if (!sequence.kv) { throw std::logic_error("capture source has no KV bundle"); }
-        const std::uint32_t page_size = static_cast<std::uint32_t>(kPagedKVPageSize);
-        const std::uint32_t main_full = group.frontier / page_size;
-        for (std::uint32_t page = 0; page < main_full; ++page) {
-            const LogicalKVPageHandle logical =
-                text_kv_addresses->logical_page(sequence.kv->text, page);
-            if (text_kv_pages->address_references(logical) == 1) {
-                ++active_removed.device.main_kv_pages;
-            }
-        }
-        if (group.frontier % page_size != 0) { ++added.device.main_kv_pages; }
+        text_snapshot_shape =
+            text_kv_addresses->active_snapshot_shape(sequence.kv->text, sequence.text_kv_valid);
+        active_removed.device.main_kv_pages = text_snapshot_shape->unique_full_pages;
+        added.device.main_kv_pages          = text_snapshot_shape->copied_pages();
 
         if (sequence.kv->backend) {
             const std::uint32_t backend_frontier = backend_kv_valid(sequence);
-            const std::uint32_t backend_full     = backend_frontier / page_size;
-            for (std::uint32_t page = 0; page < backend_full; ++page) {
-                const LogicalKVPageHandle logical =
-                    backend_kv_addresses->logical_page(*sequence.kv->backend, page);
-                if (backend_kv_pages->address_references(logical) == 1) {
-                    ++active_removed.device.backend_kv_pages;
-                }
-            }
-            if (backend_frontier % page_size != 0) { ++added.device.backend_kv_pages; }
+            backend_snapshot_shape               = backend_kv_addresses->active_snapshot_shape(
+                *sequence.kv->backend, backend_frontier);
+            active_removed.device.backend_kv_pages = backend_snapshot_shape->unique_full_pages;
+            added.device.backend_kv_pages          = backend_snapshot_shape->copied_pages();
         }
     }
 
@@ -7216,21 +7207,19 @@ ProgramImplCore::inspect_capture(const CaptureOffer& offer, const SharedPrefixHa
                 state_images->host_layout(), runtime::ContextTransferDirection::DeviceToDevice,
                 true));
         }
-        if (group.frontier % kPagedKVPageSize != 0) {
+        if (text_snapshot_shape->copied_pages() != 0) {
             recovery.push_back(kv_transfer_requirement(
                 runtime::ContextResourceClass::MainKV,
                 runtime::ContextTransferDirection::DeviceToDevice,
-                plan_host_kv_page_layout(text_kv_pages->physical_pool().geometry()), 1));
+                plan_host_kv_page_layout(text_kv_pages->physical_pool().geometry()),
+                text_snapshot_shape->copied_pages()));
         }
-        const std::uint32_t projected_backend_frontier =
-            speculative_backend == SpeculativeBackend::Mtp      ? group.frontier - 1U
-            : speculative_backend == SpeculativeBackend::DFlash ? group.frontier
-                                                                : 0U;
-        if (projected_backend_frontier % kPagedKVPageSize != 0) {
+        if (backend_snapshot_shape && backend_snapshot_shape->copied_pages() != 0) {
             recovery.push_back(kv_transfer_requirement(
                 runtime::ContextResourceClass::BackendKV,
                 runtime::ContextTransferDirection::DeviceToDevice,
-                plan_host_kv_page_layout(backend_kv_pages->physical_pool().geometry()), 1));
+                plan_host_kv_page_layout(backend_kv_pages->physical_pool().geometry()),
+                backend_snapshot_shape->copied_pages()));
         }
         assessment.projected_recovery_ns =
             NINFER_QWEN36_RUNTIME_NS::recovery_cost_ns(recovery, {}, machine_cost);

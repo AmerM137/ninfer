@@ -634,8 +634,8 @@ public:
                     continue;
                 }
                 owner_policies.push_back(typename CapturePlanner::OwnerPolicy{
-                    .ordinal              = slot,
-                    .private_prior_weight = private_prior_weight(entry.retention),
+                    .ordinal                  = slot,
+                    .private_retention_weight = private_retention_weight(entry.retention),
                 });
                 if (entry.summary.endpoint) {
                     append_private_checkpoint(slot, *entry.summary.endpoint);
@@ -652,9 +652,9 @@ public:
                 if (entry.state != SharedCatalogState::Catalogued || !entry.handle) { continue; }
                 const std::uint32_t ordinal = catalog_count_ + slot;
                 owner_policies.push_back(typename CapturePlanner::OwnerPolicy{
-                    .ordinal                = ordinal,
-                    .private_prior_weight   = 0,
-                    .explicit_shared_credit = entry.explicit_credit,
+                    .ordinal                  = ordinal,
+                    .private_retention_weight = 0,
+                    .explicit_shared_credit   = entry.explicit_credit,
                 });
                 checkpoint_policies.push_back(typename CapturePlanner::CheckpointPolicy{
                     .owner_ordinal = ordinal,
@@ -1291,7 +1291,7 @@ private:
         return count;
     }
 
-    [[nodiscard]] static std::uint32_t private_prior_weight(RetentionClass retention) noexcept {
+    [[nodiscard]] static std::uint32_t private_retention_weight(RetentionClass retention) noexcept {
         switch (retention) {
         case RetentionClass::Disposable:
             return 1;
@@ -1587,11 +1587,11 @@ private:
                     append_checkpoint(checkpoint);
                 }
                 owner_policies.push_back(MaterializationOwnerPolicy{
-                    .ordinal              = slot,
-                    .retention_class      = entry.retention,
-                    .selected_hit_count   = selected_hits,
-                    .last_hit_epoch       = newest_hit_epoch(entry),
-                    .private_prior_weight = private_prior_weight(entry.retention),
+                    .ordinal                  = slot,
+                    .retention_class          = entry.retention,
+                    .selected_hit_count       = selected_hits,
+                    .last_hit_epoch           = newest_hit_epoch(entry),
+                    .private_retention_weight = private_retention_weight(entry.retention),
                 });
             }
             for (std::uint32_t slot = 0; slot < shared_catalog_count_; ++slot) {
@@ -1604,12 +1604,12 @@ private:
                 shared_owners.push_back(&*entry.handle);
                 shared_owner_ordinals.push_back(ordinal);
                 owner_policies.push_back(MaterializationOwnerPolicy{
-                    .ordinal                = ordinal,
-                    .retention_class        = RetentionClass::SharedStable,
-                    .selected_hit_count     = entry.observation.selected_hit_count,
-                    .last_hit_epoch         = entry.observation.last_hit_epoch,
-                    .private_prior_weight   = 0,
-                    .explicit_shared_credit = entry.explicit_credit,
+                    .ordinal                  = ordinal,
+                    .retention_class          = RetentionClass::SharedStable,
+                    .selected_hit_count       = entry.observation.selected_hit_count,
+                    .last_hit_epoch           = entry.observation.last_hit_epoch,
+                    .private_retention_weight = 0,
+                    .explicit_shared_credit   = entry.explicit_credit,
                 });
                 checkpoint_policies.push_back(MaterializationCheckpointPolicy{
                     .owner_ordinal      = ordinal,
@@ -1809,8 +1809,8 @@ private:
                 continue;
             }
             projected_owners.push_back(ContextPortfolioOwnerPolicy{
-                .ordinal              = slot,
-                .private_prior_weight = private_prior_weight(entry.retention),
+                .ordinal                  = slot,
+                .private_retention_weight = private_retention_weight(entry.retention),
             });
             if (entry.summary.endpoint) {
                 append_existing(slot, *entry.handle, *entry.summary.endpoint);
@@ -1878,12 +1878,15 @@ private:
             const std::uint64_t split_cost          = program.shared_capture_split_cost_ns(
                 *planned->plan, prompt, frontiers, cost_model_);
             if (value.saturated ||
-                split_cost > std::numeric_limits<std::uint64_t>::max() - value.baseline) {
+                value.private_transition_loss >
+                    std::numeric_limits<std::uint64_t>::max() - value.baseline_public_value) {
                 continue;
             }
-            const std::uint64_t threshold = value.baseline + split_cost;
-            if (value.target <= threshold) { continue; }
-            const std::uint64_t gain = value.target - threshold;
+            std::uint64_t threshold = value.baseline_public_value + value.private_transition_loss;
+            if (split_cost > std::numeric_limits<std::uint64_t>::max() - threshold) { continue; }
+            threshold += split_cost;
+            if (value.target_public_value <= threshold) { continue; }
+            const std::uint64_t gain = value.target_public_value - threshold;
             const bool better        = gain > selected_gain ||
                                 (gain == selected_gain &&
                                  (selected_shared_frontiers.empty() ||

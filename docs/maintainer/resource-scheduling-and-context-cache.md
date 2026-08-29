@@ -364,6 +364,17 @@ capacity 和 placement 独立。
 具体 page geometry、Host packed extent、COW 和 block-table publication 由
 [Paged KV Context Store](paged-kv-cache.md)定义。
 
+Prefix Fork 后的 active address 可以按以下顺序同时包含共享与私有页：
+
+```text
+immutable full pages | unique mutable full pages | optional unique mutable tail
+```
+
+Active capture 对不可变整页只增加引用，对唯一可写整页原地 Freeze；非对齐尾页保留给 checkpoint，并只
+复制一页作为新的 active writer。对齐 frontier 不发生 KV copy，后续增长再物化新的 writer page。
+Program 的 capture assessment、reservation 和 commit 使用同一个 snapshot-shape 分析，因此资源信用、
+transfer cost 与实际可提交的页所有权条件一致。
+
 State 与 KV 可以独立 placement，例如 State 在 Device、Main KV 部分在 Device、其余 Main KV 在 Host，
 backend KV 采用另一种 coverage。Checkpoint 只有在全部 required components 至少保留一份有效 replica
 时才继续存在。
@@ -570,10 +581,10 @@ ResourceManager 保存最近 32 个成功 materialize 为 Active 的请求。每
 cache key。有 Engine session key 的请求使用其稳定 digest 作为 domain；无 session key 的每个请求形成独立
 domain。
 
-对 demand \(q\)、checkpoint \(p\) 和完整 portfolio state \(S\)：
+对 checkpoint \(p\) 和完整 portfolio state \(S\)：
 
 \[
-Saving(q,p,S)=\max(0,\ Rebuild(p)-Recovery(p,S))
+Saving(p,S)=\max(0,\ Rebuild(p)-Recovery(p,S))
 \]
 
 `Rebuild` 是从 root 到该 frontier 的 canonical prefill cost；`Recovery` 是 Program 根据实际 State/KV
@@ -581,16 +592,26 @@ placement 返回的最小 restore、copy 和必要 interval-prefill cost。每�
 checkpoints 中的最大 saving：
 
 \[
-EmpiricalValue(S)=\sum_q\max_{p\ matches\ q}Saving(q,p,S)
+EmpiricalValue(S)=\sum_q\max_{p\ matches\ q}Saving(p,S)
 \]
 
-因此 tools、instructions 和 full-prompt 等嵌套 prefixes 不会对同一个未来请求重复计价。完整价值为：
+因此 tools、instructions 和 full-prompt 等嵌套 prefixes 不会对同一个未来请求重复计价。再加上尚未到期
+的显式 shared credit，得到公共价值：
 
 \[
-V(S)=EmpiricalValue(S)+PrivatePrior(S)+SharedCredit(S)
+PublicValue(S)=EmpiricalValue(S)+SharedCredit(S)
 \]
 
-Private prior 是 owner-scoped synthetic demand，只取 owner 内 retained checkpoints 的最大 saving：
+Private retention 表示每个 owner 还有一次未观测的后续复用。比较 baseline \(S_b\) 与 target \(S_t\) 时，
+保持 checkpoint identity 不变，先计算每个 checkpoint 的 saving 损失，再在 owner 内取最大值：
+
+\[
+PrivateLoss_o(S_b,S_t)=w_o\max_{p\in o}
+\max(0,Saving(p,S_b)-Saving(p,S_t))
+\]
+
+不同 owners 的 `PrivateLoss` 相加。这样不会把同一 continuation 的嵌套 checkpoints 全部当作未来请求，
+也不会让一个仍然可用的末端 checkpoint 掩盖较早 TurnClosure 或 long anchor 的损失。权重为：
 
 | Private retention | prior weight |
 |---|---:|
@@ -605,14 +626,16 @@ Shared owner 没有固定 retention multiplier。`ExplicitBoundary` 或 `Request
 对 mandatory materialization 的 candidate identity state \(I_c\) 和 pressure target \(T\)：
 
 \[
-FutureLoss_c(T)=\max(0,V(I_c)-V(T)),\qquad
+FutureLoss_c(T)=\max(0,PublicValue(I_c)-PublicValue(T))
++\sum_o PrivateLoss_o(I_c,T),\qquad
 J(c,T)=Now(c,T)+FutureLoss_c(T)
 \]
 
 对 optional shared capture，比较 private-only state \(S_b\) 与 complete shared target \(S_t\)：
 
 \[
-NetGain=V(S_t)-V(S_b)-ImmediateDelta
+NetGain=PublicValue(S_t)-PublicValue(S_b)
+-\sum_o PrivateLoss_o(S_b,S_t)-ImmediateDelta
 \]
 
 执行前 candidate subset 另减精确 `SplitCost`；capture offer 到达后 split 已经发生，不再重复计费。
@@ -621,7 +644,7 @@ NetGain=V(S_t)-V(S_b)-ImmediateDelta
 正收益时保持 baseline。
 
 Selected source 的合法 `ConsumedToActive` 是 ownership transfer，不计作 eviction。其他随 pressure
-删除或降级的 checkpoints 通过完整 portfolio value 进入 future loss。
+删除或降级的 checkpoints 通过 public value 与 private transition loss 进入 future loss。
 
 ### 8.4 Lower bound
 

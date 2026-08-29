@@ -27,12 +27,12 @@ struct MaterializationCheckpointPolicy {
 };
 
 struct MaterializationOwnerPolicy {
-    std::uint32_t ordinal              = 0;
-    RetentionClass retention_class     = RetentionClass::RecentPrivate;
-    std::uint64_t selected_hit_count   = 0;
-    std::uint64_t last_hit_epoch       = 0;
-    std::uint32_t private_prior_weight = 0;
-    bool explicit_shared_credit        = false;
+    std::uint32_t ordinal                  = 0;
+    RetentionClass retention_class         = RetentionClass::RecentPrivate;
+    std::uint64_t selected_hit_count       = 0;
+    std::uint64_t last_hit_epoch           = 0;
+    std::uint32_t private_retention_weight = 0;
+    bool explicit_shared_credit            = false;
 };
 
 template <class Package>
@@ -539,9 +539,9 @@ private:
         portfolio_owner_scratch_.clear();
         for (const MaterializationOwnerPolicy& policy : owner_policies) {
             portfolio_owner_scratch_.push_back(ContextPortfolioOwnerPolicy{
-                .ordinal                = policy.ordinal,
-                .private_prior_weight   = policy.private_prior_weight,
-                .explicit_shared_credit = policy.explicit_shared_credit,
+                .ordinal                  = policy.ordinal,
+                .private_retention_weight = policy.private_retention_weight,
+                .explicit_shared_credit   = policy.explicit_shared_credit,
             });
         }
         portfolio_checkpoint_scratch_.clear();
@@ -579,10 +579,16 @@ private:
         }
         const ContextPortfolioValueResult portfolio =
             portfolio_value_.fold(portfolio_owner_scratch_, portfolio_checkpoint_scratch_);
-        cost.future_loss_ns = portfolio.saturated && portfolio_degraded
-                                  ? std::numeric_limits<std::uint64_t>::max()
-                                  : portfolio.loss;
-        cost.total_ns       = cost.now_ns;
+        if (portfolio.saturated && portfolio_degraded) {
+            cost.future_loss_ns = std::numeric_limits<std::uint64_t>::max();
+        } else {
+            cost.future_loss_ns =
+                portfolio.baseline_public_value > portfolio.target_public_value
+                    ? portfolio.baseline_public_value - portfolio.target_public_value
+                    : 0;
+            planning_saturating_add(cost.future_loss_ns, portfolio.private_transition_loss);
+        }
+        cost.total_ns = cost.now_ns;
         planning_saturating_add(cost.total_ns, cost.future_loss_ns);
         cost.lower_bound_ns = assessment.machine.minimum_request_ns;
         planning_saturating_add(cost.lower_bound_ns, cost.future_loss_ns);

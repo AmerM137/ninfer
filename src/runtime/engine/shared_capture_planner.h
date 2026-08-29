@@ -31,9 +31,9 @@ public:
     using PressureTargetHandle = typename Package::PressureTargetHandle;
 
     struct OwnerPolicy {
-        std::uint32_t ordinal              = 0;
-        std::uint32_t private_prior_weight = 0;
-        bool explicit_shared_credit        = false;
+        std::uint32_t ordinal                  = 0;
+        std::uint32_t private_retention_weight = 0;
+        bool explicit_shared_credit            = false;
     };
 
     struct CheckpointPolicy {
@@ -158,8 +158,8 @@ public:
         return Result{
             .pressure                = std::move(*pressure),
             .owner_outcomes          = std::move(outcomes),
-            .baseline_value          = selected_value.baseline,
-            .target_value            = selected_value.target,
+            .baseline_value          = selected_value.baseline_public,
+            .target_value            = selected_value.target_public,
             .immediate_ns            = selected_value.immediate,
             .net_gain                = selected_value.gain,
             .stable_scenario_ordinal = input.stable_scenario_ordinal,
@@ -179,12 +179,13 @@ private:
     };
 
     struct TransitionValue {
-        std::uint64_t baseline  = 0;
-        std::uint64_t target    = 0;
-        std::uint64_t immediate = 0;
-        std::uint64_t gain      = 0;
-        bool positive           = false;
-        bool saturated          = false;
+        std::uint64_t baseline_public = 0;
+        std::uint64_t target_public   = 0;
+        std::uint64_t private_loss    = 0;
+        std::uint64_t immediate       = 0;
+        std::uint64_t gain            = 0;
+        bool positive                 = false;
+        bool saturated                = false;
 
         [[nodiscard]] friend constexpr bool operator==(TransitionValue,
                                                        TransitionValue) noexcept = default;
@@ -258,9 +259,9 @@ private:
         owner_scratch_.clear();
         for (const OwnerPolicy& policy : input.owner_policies) {
             owner_scratch_.push_back(ContextPortfolioOwnerPolicy{
-                .ordinal                = policy.ordinal,
-                .private_prior_weight   = policy.private_prior_weight,
-                .explicit_shared_credit = policy.explicit_shared_credit,
+                .ordinal                  = policy.ordinal,
+                .private_retention_weight = policy.private_retention_weight,
+                .explicit_shared_credit   = policy.explicit_shared_credit,
             });
         }
         const std::uint32_t candidate_ordinal = next_candidate_ordinal(input.owner_policies);
@@ -270,9 +271,9 @@ private:
             has_shared_candidate_evidence(input.capture->shared_evidence,
                                           SharedCandidateEvidence::RequestedAutomatic);
         owner_scratch_.push_back(ContextPortfolioOwnerPolicy{
-            .ordinal                = candidate_ordinal,
-            .private_prior_weight   = 0,
-            .explicit_shared_credit = candidate_credit,
+            .ordinal                  = candidate_ordinal,
+            .private_retention_weight = 0,
+            .explicit_shared_credit   = candidate_credit,
         });
 
         checkpoint_scratch_.clear();
@@ -321,21 +322,29 @@ private:
             saturating_multiply(input.private_baseline_immediate_ns, multiplier);
         const std::uint64_t immediate =
             target_immediate > baseline_immediate ? target_immediate - baseline_immediate : 0;
-        const bool saturated = portfolio.saturated ||
-                               target_immediate == std::numeric_limits<std::uint64_t>::max() ||
-                               baseline_immediate == std::numeric_limits<std::uint64_t>::max();
-        const std::uint64_t threshold =
-            immediate > std::numeric_limits<std::uint64_t>::max() - portfolio.baseline
-                ? std::numeric_limits<std::uint64_t>::max()
-                : portfolio.baseline + immediate;
-        const bool positive = !saturated && portfolio.target > threshold;
+        bool saturated = portfolio.saturated ||
+                         target_immediate == std::numeric_limits<std::uint64_t>::max() ||
+                         baseline_immediate == std::numeric_limits<std::uint64_t>::max();
+        std::uint64_t threshold  = portfolio.baseline_public_value;
+        const auto add_threshold = [&](std::uint64_t increment) {
+            if (increment > std::numeric_limits<std::uint64_t>::max() - threshold) {
+                threshold = std::numeric_limits<std::uint64_t>::max();
+                saturated = true;
+            } else {
+                threshold += increment;
+            }
+        };
+        add_threshold(portfolio.private_transition_loss);
+        add_threshold(immediate);
+        const bool positive = !saturated && portfolio.target_public_value > threshold;
         return TransitionValue{
-            .baseline  = portfolio.baseline,
-            .target    = portfolio.target,
-            .immediate = immediate,
-            .gain      = positive ? portfolio.target - threshold : 0,
-            .positive  = positive,
-            .saturated = saturated,
+            .baseline_public = portfolio.baseline_public_value,
+            .target_public   = portfolio.target_public_value,
+            .private_loss    = portfolio.private_transition_loss,
+            .immediate       = immediate,
+            .gain            = positive ? portfolio.target_public_value - threshold : 0,
+            .positive        = positive,
+            .saturated       = saturated,
         };
     }
 

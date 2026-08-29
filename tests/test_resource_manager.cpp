@@ -1442,6 +1442,138 @@ ActiveRequest start_active(FakeManager& manager, FakeProgram& program, std::uint
     return ActiveRequest{.lane = lane, .sequence = sequence};
 }
 
+void test_private_portfolio_loss_keeps_checkpoint_identity_fixed() {
+    using ninfer::runtime::ContextPortfolioCheckpointValue;
+    using ninfer::runtime::ContextPortfolioOwnerPolicy;
+    using ninfer::runtime::ContextPortfolioValue;
+
+    const std::array owners{
+        ContextPortfolioOwnerPolicy{.ordinal = 0, .private_retention_weight = 4},
+    };
+    const std::array checkpoints{
+        ContextPortfolioCheckpointValue{
+            .owner_ordinal        = 0,
+            .rebuild_ns           = 1000,
+            .baseline_recovery_ns = 100,
+            .target_recovery_ns   = 100,
+        },
+        ContextPortfolioCheckpointValue{
+            .owner_ordinal        = 0,
+            .rebuild_ns           = 800,
+            .baseline_recovery_ns = 100,
+            .target_recovery_ns   = 800,
+        },
+    };
+    ContextPortfolioValue value;
+    const auto result = value.fold(owners, checkpoints);
+    require(result.baseline_public_value == 0 && result.target_public_value == 0 &&
+                result.private_transition_loss == 2800 && !result.saturated,
+            "a surviving endpoint masked loss of an earlier private checkpoint");
+}
+
+void test_portfolio_demand_and_owner_aggregation() {
+    using ninfer::runtime::ContextPortfolioCheckpointValue;
+    using ninfer::runtime::ContextPortfolioOwnerPolicy;
+    using ninfer::runtime::ContextPortfolioValue;
+
+    {
+        const std::array owners{ContextPortfolioOwnerPolicy{.ordinal = 0}};
+        const std::array checkpoints{
+            ContextPortfolioCheckpointValue{
+                .owner_ordinal        = 0,
+                .demand_mask          = 1,
+                .rebuild_ns           = 1000,
+                .baseline_recovery_ns = 200,
+                .target_recovery_ns   = 500,
+            },
+            ContextPortfolioCheckpointValue{
+                .owner_ordinal        = 0,
+                .demand_mask          = 1,
+                .rebuild_ns           = 800,
+                .baseline_recovery_ns = 200,
+                .target_recovery_ns   = 400,
+            },
+        };
+        ContextPortfolioValue value;
+        const auto result = value.fold(owners, checkpoints);
+        require(result.baseline_public_value == 800 && result.target_public_value == 500 &&
+                    result.private_transition_loss == 0,
+                "nested checkpoints counted one empirical demand more than once");
+    }
+
+    {
+        const std::array owners{
+            ContextPortfolioOwnerPolicy{.ordinal = 0, .private_retention_weight = 1},
+            ContextPortfolioOwnerPolicy{.ordinal = 1, .private_retention_weight = 4},
+        };
+        const std::array checkpoints{
+            ContextPortfolioCheckpointValue{
+                .owner_ordinal        = 0,
+                .rebuild_ns           = 1000,
+                .baseline_recovery_ns = 100,
+                .target_recovery_ns   = 400,
+            },
+            ContextPortfolioCheckpointValue{
+                .owner_ordinal        = 1,
+                .rebuild_ns           = 1000,
+                .baseline_recovery_ns = 100,
+                .target_recovery_ns   = 200,
+            },
+        };
+        ContextPortfolioValue value;
+        const auto result = value.fold(owners, checkpoints);
+        require(result.private_transition_loss == 700,
+                "private checkpoint transition losses were not summed across owners");
+    }
+}
+
+void test_shared_capture_subtracts_private_transition_loss() {
+    using Planner = ninfer::runtime::SharedCapturePlanner<FakePackage>;
+
+    FakeProgram program;
+    program.required_pressure_actions             = 1;
+    program.require_evictions                     = true;
+    program.pressure_target_immediate_ns_override = 0;
+    FakeCaptureAssessment capture{
+        .shared_evidence       = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+        .projected_recovery_ns = 0,
+        .publishes_shared      = true,
+        .physically_feasible   = false,
+    };
+    FakeContinuationHandle owner{7, 0};
+    const std::array<const FakeContinuationHandle*, 1> private_owners{&owner};
+    const std::array<std::uint32_t, 1> private_ordinals{0};
+    const std::array<Planner::OwnerPolicy, 1> owner_policies{
+        Planner::OwnerPolicy{.ordinal = 0, .private_retention_weight = 4},
+    };
+    const std::array<Planner::CheckpointPolicy, 1> checkpoint_policies{
+        Planner::CheckpointPolicy{
+            .owner_ordinal        = 0,
+            .checkpoint           = CheckpointRef{.kind     = CheckpointKind::SessionEndpoint,
+                                                  .frontier = 16,
+                                                  .ordinal  = 0},
+            .rebuild_ns           = 1000,
+            .baseline_recovery_ns = 0,
+        },
+    };
+
+    Planner planner;
+    const auto result = planner.plan(program, test_cost_model(),
+                                     Planner::Input{
+                                         .capture                = &capture,
+                                         .private_owners         = private_owners,
+                                         .private_owner_ordinals = private_ordinals,
+                                         .shared_owners          = {},
+                                         .shared_owner_ordinals  = {},
+                                         .owner_policies         = owner_policies,
+                                         .checkpoint_policies    = checkpoint_policies,
+                                         .candidate_rebuild_ns   = 1000,
+                                     });
+    require(result && result->baseline_value == 0 && result->target_value == 1000 &&
+                result->immediate_ns == 0 && result->net_gain == 600,
+            "shared capture gain did not subtract the private capability transition loss");
+}
+
 void test_equal_lower_bound_does_not_short_circuit_tie_break() {
     using Planner = ninfer::runtime::MaterializationPlanner<FakePackage>;
 
@@ -2228,6 +2360,11 @@ void test_shortlist_collision_requires_program_exact_verification() {
 } // namespace
 
 int main() {
+    run_test("private checkpoint identity loss",
+             test_private_portfolio_loss_keeps_checkpoint_identity_fixed);
+    run_test("portfolio demand and owner aggregation", test_portfolio_demand_and_owner_aggregation);
+    run_test("shared capture private transition loss",
+             test_shared_capture_subtracts_private_transition_loss);
     run_test("equal lower-bound tie-break",
              test_equal_lower_bound_does_not_short_circuit_tie_break);
     run_test("feasible identity pressure improvement",

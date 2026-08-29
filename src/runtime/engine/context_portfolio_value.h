@@ -11,9 +11,9 @@
 namespace ninfer::runtime {
 
 struct ContextPortfolioOwnerPolicy {
-    std::uint32_t ordinal              = 0;
-    std::uint32_t private_prior_weight = 0;
-    bool explicit_shared_credit        = false;
+    std::uint32_t ordinal                  = 0;
+    std::uint32_t private_retention_weight = 0;
+    bool explicit_shared_credit            = false;
 };
 
 struct ContextPortfolioCheckpointValue {
@@ -25,14 +25,15 @@ struct ContextPortfolioCheckpointValue {
 };
 
 struct ContextPortfolioValueResult {
-    std::uint64_t baseline = 0;
-    std::uint64_t target   = 0;
-    std::uint64_t loss     = 0;
-    bool saturated         = false;
+    std::uint64_t baseline_public_value   = 0;
+    std::uint64_t target_public_value     = 0;
+    std::uint64_t private_transition_loss = 0;
+    bool saturated                        = false;
 };
 
-// Folds one complete inactive checkpoint portfolio. A demand record receives only the best
-// matching checkpoint saving, so nested prefixes cannot count the same future request twice.
+// Folds one complete inactive checkpoint portfolio. Empirical demands and explicit shared credit
+// form public portfolio values. A private owner contributes the largest loss of one concrete
+// checkpoint capability, so a surviving later checkpoint cannot mask damage to an earlier one.
 class ContextPortfolioValue {
 public:
     ContextPortfolioValue() { owner_scratch_.reserve(32U); }
@@ -50,9 +51,9 @@ public:
                 throw std::logic_error("portfolio owner policy ordinal is duplicated");
             }
             owner_scratch_.push_back(
-                OwnerValue{.ordinal                = policy.ordinal,
-                           .private_prior_weight   = policy.private_prior_weight,
-                           .explicit_shared_credit = policy.explicit_shared_credit});
+                OwnerValue{.ordinal                  = policy.ordinal,
+                           .private_retention_weight = policy.private_retention_weight,
+                           .explicit_shared_credit   = policy.explicit_shared_credit});
         }
 
         for (const ContextPortfolioCheckpointValue& checkpoint : checkpoints) {
@@ -72,6 +73,9 @@ public:
                     : 0;
             owner->baseline_best = std::max(owner->baseline_best, baseline_saving);
             owner->target_best   = std::max(owner->target_best, target_saving);
+            owner->private_transition_loss =
+                std::max(owner->private_transition_loss,
+                         baseline_saving > target_saving ? baseline_saving - target_saving : 0);
             for (std::uint32_t bit = 0; bit < 32U; ++bit) {
                 if ((checkpoint.demand_mask & (1U << bit)) == 0) { continue; }
                 baseline_demand[bit] = std::max(baseline_demand[bit], baseline_saving);
@@ -81,32 +85,30 @@ public:
 
         ContextPortfolioValueResult result;
         for (std::size_t bit = 0; bit < baseline_demand.size(); ++bit) {
-            add(result.baseline, baseline_demand[bit], result.saturated);
-            add(result.target, target_demand[bit], result.saturated);
+            add(result.baseline_public_value, baseline_demand[bit], result.saturated);
+            add(result.target_public_value, target_demand[bit], result.saturated);
         }
         for (const OwnerValue& owner : owner_scratch_) {
-            if (owner.private_prior_weight != 0) {
-                add_weighted(result.baseline, owner.baseline_best, owner.private_prior_weight,
-                             result.saturated);
-                add_weighted(result.target, owner.target_best, owner.private_prior_weight,
-                             result.saturated);
+            if (owner.private_retention_weight != 0) {
+                add_weighted(result.private_transition_loss, owner.private_transition_loss,
+                             owner.private_retention_weight, result.saturated);
             }
             if (owner.explicit_shared_credit) {
-                add(result.baseline, owner.baseline_best, result.saturated);
-                add(result.target, owner.target_best, result.saturated);
+                add(result.baseline_public_value, owner.baseline_best, result.saturated);
+                add(result.target_public_value, owner.target_best, result.saturated);
             }
         }
-        result.loss = result.baseline > result.target ? result.baseline - result.target : 0;
         return result;
     }
 
 private:
     struct OwnerValue {
-        std::uint32_t ordinal              = 0;
-        std::uint32_t private_prior_weight = 0;
-        bool explicit_shared_credit        = false;
-        std::uint64_t baseline_best        = 0;
-        std::uint64_t target_best          = 0;
+        std::uint32_t ordinal                  = 0;
+        std::uint32_t private_retention_weight = 0;
+        bool explicit_shared_credit            = false;
+        std::uint64_t baseline_best            = 0;
+        std::uint64_t target_best              = 0;
+        std::uint64_t private_transition_loss  = 0;
     };
 
     static void add(std::uint64_t& value, std::uint64_t increment, bool& saturated) noexcept {
