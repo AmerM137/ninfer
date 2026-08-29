@@ -23,6 +23,44 @@
         "CMAKE_CXX_COMPILER": "clang-cl",
         "CMAKE_CUDA_HOST_COMPILER": "cl"
       }
+    },
+    {
+      "name": "windows-debug",
+      "displayName": "Windows MSVC Debug",
+      "description": "Debug build with MSVC and just-my-code debugging enabled.",
+      "inherits": "windows",
+      "binaryDir": "${sourceDir}/build-debug",
+      "environment": {
+        "CXXFLAGS": "/JMC"
+      },
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "BUILD_TESTING": "OFF"
+      }
+    },
+    {
+      "name": "windows-clangcl-debug",
+      "displayName": "Windows clang-cl Debug",
+      "description": "Debug C/C++ build with clang-cl and just-my-code debugging enabled.",
+      "inherits": "windows-clangcl",
+      "binaryDir": "${sourceDir}/build-clangcl-debug",
+      "environment": {
+        "CXXFLAGS": "/JMC"
+      },
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "BUILD_TESTING": "OFF"
+      }
+    },
+    {
+      "name": "windows-cuda-debug",
+      "displayName": "Windows CUDA Debug",
+      "description": "MSVC debug build with CUDA device debugging enabled.",
+      "inherits": "windows-debug",
+      "binaryDir": "${sourceDir}/build-cuda-debug",
+      "cacheVariables": {
+        "CMAKE_CUDA_FLAGS": "-G"
+      }
     }
   ],
   "buildPresets": [
@@ -33,6 +71,18 @@
     {
       "name": "windows-clangcl",
       "configurePreset": "windows-clangcl"
+    },
+    {
+      "name": "windows-debug",
+      "configurePreset": "windows-debug"
+    },
+    {
+      "name": "windows-clangcl-debug",
+      "configurePreset": "windows-clangcl-debug"
+    },
+    {
+      "name": "windows-cuda-debug",
+      "configurePreset": "windows-cuda-debug"
     }
   ]
 }
