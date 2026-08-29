@@ -1604,7 +1604,8 @@ std::optional<qwen3_6::detail::PressureDecision> ProgramImplCore::inspect_pressu
             checkpoint_was_dropped || already_changed || !state_store->valid(state) ||
             state_store->role(state) != StateImageRole::CheckpointImmutable ||
             state_store->source_pins(state) != 0 || !state_exclusive_to_sequence(sequence, state) ||
-            std::find(released_states.begin(), released_states.end(), state) !=
+            std::find_if(released_states.begin(), released_states.end(),
+                         [&](StateImageHandle released) { return released == state; }) !=
                 released_states.end() ||
             (protection != nullptr && protection->state && *protection->state == state)) {
             return false;
@@ -2356,7 +2357,8 @@ std::optional<qwen3_6::detail::PressureDecision> ProgramImplCore::inspect_checkp
     std::vector<StateImageHandle> unique_states;
     unique_states.reserve(dropped_states.size());
     for (const DroppedState& dropped : dropped_states) {
-        if (std::find(unique_states.begin(), unique_states.end(), dropped.state) ==
+        if (std::find_if(unique_states.begin(), unique_states.end(),
+                         [&](StateImageHandle state) { return state == dropped.state; }) ==
             unique_states.end()) {
             unique_states.push_back(dropped.state);
         }
@@ -2486,7 +2488,8 @@ bool ProgramImplCore::pressure_decision_valid(
             state_store->source_pins(*state) != 0 ||
             !state_exclusive_to_sequence(sequence, *state) ||
             (protection != nullptr && protection->state && *protection->state == *state) ||
-            std::find(targeted_states.begin(), targeted_states.end(), *state) !=
+            std::find_if(targeted_states.begin(), targeted_states.end(),
+                         [&](StateImageHandle targeted) { return targeted == *state; }) !=
                 targeted_states.end()) {
             return false;
         }
@@ -2523,7 +2526,8 @@ bool ProgramImplCore::pressure_decision_valid(
             for (std::uint32_t offset = 0; offset < action.page_count; ++offset) {
                 const std::uint32_t page_offset = action.begin_page + offset;
                 const LogicalKVPageHandle page  = addresses->logical_page(*address, page_offset);
-                if (std::find(targeted.begin(), targeted.end(), page) != targeted.end() ||
+                if (std::find_if(targeted.begin(), targeted.end(),
+                                 [&](LogicalKVPageHandle prior) { return prior == page; }) != targeted.end() ||
                     pages->writer_references(page) != 0 || pages->source_pins(page) != 0 ||
                     protected_materialization_page(protection, *addresses, page_offset, page,
                                                    resource ==
@@ -2617,7 +2621,8 @@ bool ProgramImplCore::shared_pressure_decision_valid(
             for (std::uint32_t offset = 0; offset < action.page_count; ++offset) {
                 const std::uint32_t page_offset = action.begin_page + offset;
                 const LogicalKVPageHandle page  = addresses->logical_page(*address, page_offset);
-                if (std::find(targeted.begin(), targeted.end(), page) != targeted.end() ||
+                if (std::find_if(targeted.begin(), targeted.end(),
+                                 [&](LogicalKVPageHandle prior) { return prior == page; }) != targeted.end() ||
                     pages->writer_references(page) != 0 || pages->source_pins(page) != 0 ||
                     protected_materialization_page(protection, *addresses, page_offset, page,
                                                    resource ==
@@ -2819,7 +2824,8 @@ std::optional<detail::PhysicalPressureEffect> ProgramImplCore::combined_pressure
             }
             if (!state_store->valid(*state) ||
                 (protection != nullptr && protection->state && *protection->state == *state) ||
-                std::find(pressure_states.begin(), pressure_states.end(), *state) !=
+                std::find_if(pressure_states.begin(), pressure_states.end(),
+                             [&](StateImageHandle pressure) { return pressure == *state; }) !=
                     pressure_states.end()) {
                 return false;
             }
@@ -3212,8 +3218,9 @@ std::optional<detail::PhysicalPressureEffect> ProgramImplCore::combined_pressure
 
     std::vector<StateImageHandle> selected_states;
     const auto append_state = [&](StateImageHandle state) {
-        if (state_store->valid(state) && std::find(selected_states.begin(), selected_states.end(),
-                                                   state) == selected_states.end()) {
+        if (state_store->valid(state) &&
+            std::find_if(selected_states.begin(), selected_states.end(),
+                         [&](StateImageHandle selected) { return selected == state; }) == selected_states.end()) {
             selected_states.push_back(state);
         }
     };

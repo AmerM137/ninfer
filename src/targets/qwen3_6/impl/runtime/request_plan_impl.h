@@ -574,7 +574,8 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
         for (const LongAnchorCheckpoint& anchor : source->long_anchors) {
             optional_states.push_back(anchor.state);
         }
-        if (std::find(optional_states.begin(), optional_states.end(), endpoint) !=
+        if (std::find_if(optional_states.begin(), optional_states.end(),
+                         [&](StateImageHandle state) { return state == endpoint; }) !=
             optional_states.end()) {
             plan->source_disposition = runtime::ClaimDisposition::Retained;
         } else {
@@ -582,7 +583,8 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
             unique.reserve(optional_states.size());
             for (const StateImageHandle state : optional_states) {
                 if (!state_store->valid(state) ||
-                    std::find(unique.begin(), unique.end(), state) != unique.end()) {
+                    std::find_if(unique.begin(), unique.end(),
+                                 [&](StateImageHandle prior) { return prior == state; }) != unique.end()) {
                     continue;
                 }
                 unique.push_back(state);
@@ -620,7 +622,8 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
         unique.reserve(optional_states.size());
         for (const StateImageHandle state : optional_states) {
             if (!state_store->valid(state) ||
-                std::find(unique.begin(), unique.end(), state) != unique.end()) {
+                std::find_if(unique.begin(), unique.end(),
+                             [&](StateImageHandle prior) { return prior == state; }) != unique.end()) {
                 continue;
             }
             unique.push_back(state);

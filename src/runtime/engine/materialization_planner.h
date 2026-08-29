@@ -662,7 +662,8 @@ private:
 
     [[nodiscard]] static bool contains(std::span<const PressureTargetHandle> handles,
                                        PressureTargetHandle target) noexcept {
-        return std::find(handles.begin(), handles.end(), target) != handles.end();
+        return std::find_if(handles.begin(), handles.end(),
+                            [&](PressureTargetHandle handle) { return handle == target; }) != handles.end();
     }
 
     [[nodiscard]] static MaterializationDiagnostics
