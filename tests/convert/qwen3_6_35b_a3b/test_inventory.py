@@ -73,3 +73,54 @@ def test_key_dense_moe_mtp_and_vision_signatures() -> None:
     assert len(inventory.DFLASH_TENSOR_SPECS) == 51
     assert len(inventory.TENSOR_SPECS) == 934
     assert len(inventory.OBJECT_SPECS) == 940
+
+
+def test_runtime_view_parents_are_present_in_the_converted_inventory() -> None:
+    """Protect physical parents consumed through runtime aliases and row views."""
+
+    tensors = _tensors()
+    assert tensors["text/token_embedding"].shape == (248320, 2048)
+    assert tensors["text/output_head"].shape == (248320, 2048)
+    assert tensors["text/draft_head"].shape == (131072, 2048)
+
+    row_views = {
+        "text/layers/3/attention/query_key_gate_value": (
+            (0, 4096),
+            (4096, 4608),
+            (4608, 8704),
+            (8704, 9216),
+        ),
+        "text/layers/0/gdn/a_b_projection": ((0, 32), (32, 64)),
+        "text/layers/0/gdn/query_key_value_z": (
+            (0, 2048),
+            (2048, 4096),
+            (4096, 8192),
+            (8192, 12288),
+        ),
+        "text/layers/0/moe/router_shared_gate": ((0, 256), (256, 257)),
+        "text/layers/0/moe/shared_gate_up": ((0, 512), (512, 1024)),
+        "mtp/layer/attention/query_key_gate_value": (
+            (0, 4096),
+            (4096, 4608),
+            (4608, 8704),
+            (8704, 9216),
+        ),
+        "dflash/layers/0/attention/query_key_value": (
+            (0, 4096),
+            (4096, 5120),
+            (5120, 6144),
+        ),
+        "dflash/layers/0/mlp/gate_up": ((0, 6144), (6144, 12288)),
+    }
+    for name, ranges in row_views.items():
+        rows = tensors[name].shape[0]
+        assert ranges[0][0] == 0
+        assert ranges[-1][1] == rows
+        assert all(begin < end for begin, end in ranges)
+        assert all(
+            left[1] == right[0]
+            for left, right in zip(ranges, ranges[1:])
+        )
+
+    # DFlash reuses the Text embedding/output objects; its mask embedding is row 248077.
+    assert 248077 < tensors["text/token_embedding"].shape[0]

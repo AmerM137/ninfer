@@ -3,7 +3,7 @@
 `ninfer_bench` measures the complete public `ninfer::Engine` route against a `.ninfer` artifact.
 The `bench/ops/` `ninfer_<op>_bench` executables measure central public Op contracts while leaving
 implementation selection behind those contracts. Target benchmarks measure Program/model
-composition. Correctness and model parity live outside this directory; development rules are in
+composition. Correctness lives in the affected test suites; development rules are in
 [`../docs/maintainer/op-development.md`](../docs/maintainer/op-development.md).
 
 The frozen request corpus for the separate black-box Serve TTFT tool is documented under
