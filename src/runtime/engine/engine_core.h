@@ -1208,9 +1208,20 @@ private:
             post_capture_state == EngineRequestState::ModelFinished) {
             throw std::logic_error("committed capture offer has invalid Engine ownership");
         }
-        const bool permit_transfer = !has_pending_requests();
-        const auto reserved        = resources_.reserve_active_capture(
-            *instance_.program, *request->lane, std::move(offer), permit_transfer,
+        std::uint64_t blocked = 0;
+        {
+            std::lock_guard lock(queue_mutex_);
+            blocked = pending_.size();
+        }
+        for (const auto& active : slots_) {
+            if (active != nullptr && active != request && !active->terminal_reason) { ++blocked; }
+        }
+        const std::uint32_t blocked_runnable_requests =
+            blocked > std::numeric_limits<std::uint32_t>::max()
+                ? std::numeric_limits<std::uint32_t>::max()
+                : static_cast<std::uint32_t>(blocked);
+        const auto reserved = resources_.reserve_active_capture(
+            *instance_.program, *request->lane, std::move(offer), blocked_runnable_requests,
             CancellationFlagView{&request->cancelled});
         if (reserved == ResourceManagement::ActiveCaptureReserveResult::Skipped) { return; }
         request->capture_pending    = true;

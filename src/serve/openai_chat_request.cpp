@@ -1,4 +1,5 @@
 #include "serve/openai_chat.h"
+#include "serve/openai_common.h"
 #include "serve/request_validation.h"
 
 #include <algorithm>
@@ -351,6 +352,9 @@ void parse_content_parts(const Json& content, ChatTurn& turn, std::size_t index)
         } else {
             bad_request("content type '" + type + "' is not supported", "messages",
                         "modality_not_supported");
+        }
+        if (parse_openai_prompt_cache_breakpoint(part, "messages")) {
+            parsed.cache_boundary_after = CacheBoundary{};
         }
         turn.content.push_back(std::move(parsed));
     }
@@ -888,6 +892,8 @@ OpenAIChatRequest parse_chat_completion_request(const Json& body, const RequestL
     }
     output.model = body.at("model").get<std::string>();
 
+    const OpenAIPromptCachePolicy cache_policy = parse_openai_prompt_cache_policy(body);
+
     parse_tools(body, output.generation);
     parse_tool_choice(body, output.generation);
     parse_parallel_tool_calls(body, output.generation);
@@ -900,6 +906,7 @@ OpenAIChatRequest parse_chat_completion_request(const Json& body, const RequestL
     const TemplateOptions template_options = parse_template_options(body);
     output.generation.enable_thinking      = template_options.enable_thinking;
     output.generation.preserve_thinking    = template_options.preserve_thinking;
+    apply_openai_prompt_cache_policy(output.generation, cache_policy);
     return output;
 }
 

@@ -246,6 +246,28 @@ returns HTTP 400 `media_budget_exceeded`. HTTP 413 `request_too_large` is reserv
 body that exceeds `--max-request-mib` before JSON parsing; it is not used for model-context or media
 resource errors.
 
+## OpenAI prompt caching
+
+Chat Completions and Responses translate OpenAI cache hints into optional shared-prefix write
+candidates:
+
+- omitted `prompt_cache_options` creates a default implicit candidate at the latest representable
+  content boundary;
+- `mode:"implicit"` requests the same automatic candidate explicitly;
+- `mode:"explicit"` disables that implicit write for the request;
+- `prompt_cache_breakpoint:{"mode":"explicit"}` on supported content creates an explicit
+  candidate.
+
+One request carries at most four distinct writes. An implicit target occupies one slot unless it
+coincides with an explicit target; the remaining slots contain the latest explicit boundaries.
+Earlier schema-valid historical breakpoints are accepted but are not new write candidates. Exact
+reads of already-published prefixes do not require the request to repeat a marker.
+
+These fields are optimization hints. A legal boundary that cannot be represented as an exact
+rendered-token frontier is ignored without changing prompt content. `prompt_cache_key` is not an
+Engine session key or prefix identity. Valid TTL/retention values are accepted, but NInfer does not
+promise their wall-clock residency; physical retention follows the resource scheduler.
+
 ## OpenAI Responses Core
 
 NInfer implements the typed-Item and semantic-event core of the OpenAI
@@ -315,7 +337,7 @@ wire response contains typed `output` Items.
 | `background` | omitted or `false` |
 | `include` | omitted or an empty array |
 | `stream_options.include_obfuscation` | optional boolean; accepted as a transport hint, but this local server emits no padding |
-| cache and client hints | valid `prompt_cache_key`, `prompt_cache_options`, `prompt_cache_retention`, `safety_identifier`, and `user` values are accepted without being mapped to Engine session identity |
+| cache and client hints | `prompt_cache_key`, `prompt_cache_options`, `prompt_cache_retention`, and explicit breakpoints follow [OpenAI prompt caching](#openai-prompt-caching); `safety_identifier` and `user` are accepted as client hints |
 
 Unknown top-level fields fail with `unknown_parameter`. Recognized but unsupported features fail
 with a field-specific 400 error instead of being silently ignored.
@@ -351,9 +373,10 @@ System and developer message Items retain their positions in the input array. To
 role lowering occurs only in the Qwen family frontend.
 
 An `input_text`, `input_image`, or tool-result part may carry
-`prompt_cache_breakpoint:{"mode":"explicit"}`. Up to four such values become shared stable-prefix
-boundaries; they affect reuse opportunities, not prompt identity or output semantics. String
-message status/phase metadata is accepted but has no Qwen prompt representation.
+`prompt_cache_breakpoint:{"mode":"explicit"}`. Write selection follows
+[OpenAI prompt caching](#openai-prompt-caching); boundaries affect reuse opportunities, not prompt
+identity or output semantics. String message status/phase metadata is accepted but has no Qwen
+prompt representation.
 
 `input_file`, `input_audio`, image `file_id`, non-`auto` image detail, reasoning metadata without raw
 reasoning text, partial tool Items, and other Item/content types are not supported. HTTP media URLs
@@ -577,14 +600,20 @@ User turn must provide exactly one leading result for every declared ID; valid r
 by ID and normalized to call order. A history that begins with results remains valid as a truncated
 or imported conversation.
 
-Ephemeral `cache_control` on the request, tools, System blocks, and User text/image frontiers is a
-best-effort retention hint. NInfer maps representable breakpoints to exact prompt frontiers, keeps
-the latest markers allowed by the Engine configuration, and ignores TTL and unrepresentable cache
-hints rather than rejecting generation. Reuse still requires exact rendered-token compatibility;
-aggregate usage reports verified reused tokens in `cache_read_input_tokens` and leaves cache
-creation unknown. Streaming emits `message_start` after Engine admission commits the prefix
-selection and before transfer/prefill output, so its uncached/cache-read split is already exact;
-terminal cumulative usage matches the aggregate response.
+Block-level ephemeral `cache_control` on tools and supported System/User/Assistant/tool-history
+blocks creates explicit shared-prefix candidates. At most four distinct block-level breakpoints are
+accepted. Request-level `cache_control` targets the last cacheable block: it merges with an explicit
+breakpoint at the same target and TTL, conflicts at the same target with a different TTL, and needs
+an available fifth slot when four different explicit targets already exist. TTL must be `5m` or
+`1h`; it is a protocol hint, not a wall-clock residency guarantee.
+
+NInfer maps representable boundaries to exact prompt frontiers and ignores a legal but
+unrepresentable advisory boundary without changing the prompt. Reuse still requires exact rendered
+identity and can read an existing owner without another `cache_control`. Aggregate usage reports
+verified reused tokens in `cache_read_input_tokens` and leaves cache creation unknown. Streaming
+emits `message_start` after Engine admission commits the prefix selection and before
+transfer/prefill output, so its uncached/cache-read split is already exact; terminal cumulative
+usage matches the aggregate response.
 
 Documents, Search Results, Files, Structured Outputs, server-tool results, container uploads, and
 other execution-dependent blocks are rejected with the missing capability identified. Metadata,
@@ -663,7 +692,6 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--max-private-continuations N` | private continuation descriptor capacity | `2 * max-concurrency` |
 | `--max-shared-prefixes N` | shared stable-prefix descriptor capacity | `max-concurrency` |
 | `--max-long-anchors-per-continuation N` | private long-anchor limit per continuation | `2` |
-| `--max-cache-markers-per-request N` | caller marker input-complexity bound | `4` |
 | `--no-thinking` | disable thinking by default | thinking on |
 | `--preserve-thinking` | preserve closed-turn assistant reasoning by default | off |
 | `--cors` | permissive browser CORS headers | off |
