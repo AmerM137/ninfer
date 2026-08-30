@@ -174,17 +174,7 @@ The evaluator reports token-weighted fixed-window causal perplexity and writes a
 record under `profiles/perplexity/`. See [Perplexity evaluation](docs/perplexity.md) for the metric,
 corpus, custom-text mode, and comparison rules.
 
-## Artifact and startup notes
-
-Current builds accept only version-2 `.ninfer` containers. All five published downloads are version
-2. Migration is needed only for Qwen3.6 artifacts downloaded before their version-2 publication:
-
-```bash
-python3 -m tools.artifact.migrate_v1_to_v2 models/qwen3_6_27b.ninfer
-```
-
-Use the same command with the exact older Qwen3.6 NVFP4 or 35B-A3B file. Migration updates container
-metadata without rewriting the weight payload.
+## Startup notes
 
 GPU residency is fixed at process startup. `--spec` selects speculative decoding residency, and
 `--vision` selects Vision residency. DFlash is available for text-only Qwen3.6-35B-A3B execution.
