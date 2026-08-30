@@ -306,7 +306,7 @@ normalization and chunked-workspace accesses. These deterministic byte counts de
 implementation-level tensor traffic; physical DRAM/L2 sectors and cache reuse still require NCU.
 
 ```bash
-cmake --build build --parallel --target ninfer_gated_delta_net_bench ninfer_gdn_layer_bench
+cmake --build build --parallel --target ninfer_gated_delta_net_bench
 ./build/bench/ninfer_gated_delta_net_bench \
   --running --value-heads 32 --sweep --warmup 20 --repeat 100 --csv
 ./build/bench/ninfer_gated_delta_net_bench \
@@ -314,9 +314,6 @@ cmake --build build --parallel --target ninfer_gated_delta_net_bench ninfer_gdn_
 ./build/bench/ninfer_gated_delta_net_bench \
   --chunked-only --value-heads 32 --tokens 1024 --breakdown \
   --warmup 20 --repeat 100
-./build/bench/ninfer_gdn_layer_bench \
-  --t-sweep 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16 \
-  --route fused --norm-control fused --qk-norm fused --warmup 20 --repeat 500
 ```
 
 ## GDN input-projection Op benchmark
