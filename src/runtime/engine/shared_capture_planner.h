@@ -209,7 +209,12 @@ private:
 
     [[nodiscard]] static bool contains(std::span<const PressureTargetHandle> values,
                                        PressureTargetHandle target) noexcept {
-        return std::find(values.begin(), values.end(), target) != values.end();
+        // Keep this explicit: clang-cl can direct std::find on this 16-byte value through an
+        // MSVC STL vectorized path that only has 1/2/4/8-byte implementations.
+        for (const PressureTargetHandle value : values) {
+            if (value == target) { return true; }
+        }
+        return false;
     }
 
     [[nodiscard]] static const CheckpointPolicy*

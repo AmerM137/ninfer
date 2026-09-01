@@ -1261,8 +1261,8 @@ private:
         std::size_t count = 0;
         for (const PrefixDemandRecord& demand : demand_window_) {
             if (!demand_matches(demand, key) ||
-                std::find(domains.begin(), domains.begin() + static_cast<std::ptrdiff_t>(count),
-                          demand.domain) != domains.begin() + static_cast<std::ptrdiff_t>(count)) {
+                contains_reuse_domain(std::span<const ReuseDomainId>(domains.data(), count),
+                                      demand.domain)) {
                 continue;
             }
             domains[count++] = demand.domain;
@@ -1278,8 +1278,8 @@ private:
         const std::size_t begin = demand_window_.size() == kDemandWindowCapacity ? 1U : 0U;
         const auto append       = [&](const PrefixDemandRecord& demand) {
             if (!demand_matches(demand, key) ||
-                std::find(domains.begin(), domains.begin() + static_cast<std::ptrdiff_t>(count),
-                                demand.domain) != domains.begin() + static_cast<std::ptrdiff_t>(count)) {
+                contains_reuse_domain(std::span<const ReuseDomainId>(domains.data(), count),
+                                      demand.domain)) {
                 return;
             }
             domains[count++] = demand.domain;
@@ -1289,6 +1289,16 @@ private:
         }
         append(provisional);
         return count;
+    }
+
+    [[nodiscard]] static bool contains_reuse_domain(std::span<const ReuseDomainId> domains,
+                                                     ReuseDomainId target) noexcept {
+        // Keep this explicit: clang-cl can direct std::find on this 16-byte value through an
+        // MSVC STL vectorized path that only has 1/2/4/8-byte implementations.
+        for (const ReuseDomainId domain : domains) {
+            if (domain == target) { return true; }
+        }
+        return false;
     }
 
     [[nodiscard]] static std::uint32_t private_retention_weight(RetentionClass retention) noexcept {
