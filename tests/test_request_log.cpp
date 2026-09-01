@@ -1,4 +1,4 @@
-#include "serve/console_log.h"
+#include "serve/operational_log.h"
 #include "serve/request_log.h"
 
 #include <nlohmann/json.hpp>
@@ -279,9 +279,6 @@ int main() {
     failures += check(started.at("request").at("requested_reasoning_effort").is_null() &&
                           started.at("request").at("resolved_reasoning_effort") == "xhigh",
                       "requested and resolved reasoning effort are not distinguished");
-    failures += check(format_request_start(context).find("reasoning_effort=default->xhigh") !=
-                          std::string::npos,
-                      "human request log omits default reasoning resolution");
     failures += check(started.at("request").at("preserve_thinking") == true &&
                           started.at("request").at("preserve_thinking_semantic_change") == true,
                       "resolved preserve-thinking metadata missing");
@@ -295,12 +292,11 @@ int main() {
                       "request-scoped media preparation diagnostics missing");
 
     ApiError preparation_error;
-    preparation_error.status = 400;
-    preparation_error.type   = "invalid_request_error";
-    preparation_error.param  = "messages";
-    preparation_error.code   = "context_length_exceeded";
-    preparation_error.message =
-        "prepared prompt has 270000 tokens, exceeding Engine max_context 262144";
+    preparation_error.status                          = 400;
+    preparation_error.type                            = "invalid_request_error";
+    preparation_error.param                           = "messages";
+    preparation_error.code                            = "context_length_exceeded";
+    preparation_error.message                         = "sentinel-client-value\nsecond-record";
     GenerationRequest rejected_request                = request;
     rejected_request.reasoning_effort                 = RequestedReasoningEffort::High;
     const RequestRejectionLogContext rejected_context = make_request_rejection_log_context(
@@ -319,17 +315,24 @@ int main() {
                       "rejection log fabricated a resolved reasoning effort");
     failures += check(rejected.at("error").at("status") == 400 &&
                           rejected.at("error").at("code") == "context_length_exceeded" &&
-                          rejected.at("error").at("param") == "messages",
+                          rejected.at("error").at("param") == "messages" &&
+                          rejected.at("error").at("message") == preparation_error.message,
                       "preparation rejection API error missing");
-    failures += check(
-        format_request_rejected(rejected_context)
-                    .find("rejected phase=prepare protocol=anthropic_messages") !=
-                std::string::npos &&
-            format_request_rejected(rejected_context).find("code=context_length_exceeded") !=
-                std::string::npos &&
-            format_request_rejected(rejected_context).find("reasoning_effort=high->unresolved") !=
-                std::string::npos,
-        "human preparation rejection log is incomplete");
+    const OperationalRecord client_rejection = render_request_rejected(rejected_context);
+    failures +=
+        check(client_rejection.severity == OperationalSeverity::Info &&
+                  client_rejection.message.find("status=rejected") != std::string::npos &&
+                  client_rejection.message.find("error_code=\"context_length_exceeded\"") !=
+                      std::string::npos &&
+                  client_rejection.message.find("sentinel-client-value") == std::string::npos &&
+                  client_rejection.message.find('\n') == std::string::npos,
+              "operational rejection severity or client-data policy mismatch");
+    RequestRejectionLogContext overload_context = rejected_context;
+    overload_context.error.status               = 429;
+    overload_context.error.code                 = "server_overloaded";
+    failures +=
+        check(render_request_rejected(overload_context).severity == OperationalSeverity::Warning,
+              "operational overload rejection is not warning severity");
 
     GenerationOutcome outcome;
     outcome.prompt_tokens                   = 401;
@@ -435,23 +438,18 @@ int main() {
     failures += check(error.at("error").at("message") == "generation failed",
                       "request error message missing");
 
+    const OperationalRecord internal_failure = render_request_failure(
+        context,
+        make_internal_request_failure(RequestFailurePhase::Generation, "sentinel-internal-detail"));
     failures +=
-        check(format_request_start(context).find("thinking=on") != std::string::npos &&
-                  format_request_start(context).find("thinking_budget=256") != std::string::npos,
-              "human request log omits resolved thinking control");
-    failures +=
-        check(format_request_start(context).find("preserve_thinking=on") != std::string::npos,
-              "human request log omits preserve-thinking mode");
-    failures += check(format_request_done(context, outcome).find("reuse=private_response_replay") !=
-                          std::string::npos,
-                      "human request log omits response checkpoint reuse path");
-    failures +=
-        check(format_request_done(context, outcome).find("host=15.00ms") != std::string::npos &&
-                  format_request_done(context, outcome).find("decode-host=5000.0us/round") !=
-                      std::string::npos,
-              "human request log omits Engine Host exposure");
-    failures += check(format_request_start(context).find("submitted") != std::string::npos,
-                      "human request log mislabels a submitted request");
+        check(internal_failure.severity == OperationalSeverity::Error &&
+                  internal_failure.message.find("sentinel-internal-detail") == std::string::npos,
+              "operational internal failure severity or data policy mismatch");
+    const OperationalRecord disconnected = render_request_failure(
+        context, make_client_disconnected_failure(RequestFailurePhase::Transport));
+    failures += check(disconnected.severity == OperationalSeverity::Info &&
+                          disconnected.message.find("status=cancelled") != std::string::npos,
+                      "client disconnect is not an informational cancellation");
 
     ThroughputReport throughput;
     throughput.interval_seconds                         = 2.0;
@@ -501,16 +499,6 @@ int main() {
                                .context_progress_invocations  = 4,
                                .stats_publication_invocations = 5,
     };
-    const std::string human_throughput = format_throughput(throughput);
-    failures += check(human_throughput.find("prefill=50.0tok/s") != std::string::npos &&
-                          human_throughput.find("decode=20.0tok/s") != std::string::npos &&
-                          human_throughput.find("materializing=1") != std::string::npos &&
-                          human_throughput.find("capture_pending=1") != std::string::npos &&
-                          human_throughput.find("terminal_pending=1") != std::string::npos &&
-                          human_throughput.find("avg_decode_batch=1.80") != std::string::npos &&
-                          human_throughput.find("host=15.00ms") != std::string::npos &&
-                          human_throughput.find("decode-host=1000.0us/round") != std::string::npos,
-                      "human throughput report mismatch");
     const Json throughput_json =
         Json::parse(format_throughput_json("serve-test", 5000, throughput));
     failures += check(throughput_json.at("event") == "throughput", "throughput event mismatch");
@@ -562,12 +550,6 @@ int main() {
             throughput_json.at("context_cache").at("pressure").at("private_owners_degraded") == 1 &&
             !throughput_json.at("context_cache").contains("last_materialization"),
         "context-cache throughput statistics missing or not interval-scoped");
-
-    const std::string console_prefix =
-        format_console_log_prefix(std::chrono::system_clock::time_point{}, ConsoleLogLevel::Info);
-    failures += check(console_prefix.starts_with('[') &&
-                          console_prefix.ends_with("] [info] ninfer-serve: "),
-                      "console log prefix mismatch");
 
     const std::filesystem::path log_path =
         std::filesystem::temp_directory_path() /

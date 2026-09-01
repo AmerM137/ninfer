@@ -3,6 +3,7 @@
 #include "targets/qwen3_6/impl/runtime/rebuild_work.h"
 
 #include "core/nvtx.h"
+#include "core/startup.h"
 #include "targets/qwen3_6/impl/runtime/schedule.h"
 #include "ninfer/ops/gdn_replay.h"
 #include "ninfer/ops/linear.h"
@@ -724,7 +725,7 @@ void instantiate_graph_family(DecodeGraphFamily& family, const char* label, Devi
 } // namespace
 
 ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const SequencePlanImpl& plan,
-                                 DeviceContext& device_in)
+                                 DeviceContext& device_in, const StartupObserver& startup_observer)
     : model(model_in), device(device_in), capacity(plan.capacity), kv_capacity(plan.kv_capacity),
       max_concurrency(plan.max_concurrency), context_cache(plan.context_cache),
       continuation_capacity(normalized_private_capacity(plan.context_cache)),
@@ -824,8 +825,14 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     state_images =
         std::make_unique<qwen3_6::StateImageDevicePool>(backing, plan.persistent.state_images);
     if (plan.context_cache.host_state_slots != 0) {
+        const std::uint64_t host_state_bytes =
+            static_cast<std::uint64_t>(state_images->host_layout().image_bytes) *
+            plan.context_cache.host_state_slots;
+        StartupPhaseScope host_state_phase(startup_observer, StartupPhase::HostStatePin,
+                                           StartupProgressUnit::Bytes, host_state_bytes);
         host_state_images = std::make_unique<qwen3_6::HostStatePool>(
             state_images->host_layout(), plan.context_cache.host_state_slots);
+        host_state_phase.complete(host_state_bytes, host_state_bytes);
     }
     const std::uint64_t logical_state_capacity =
         static_cast<std::uint64_t>(state_images->slot_count()) +
@@ -885,9 +892,15 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
                 plan_host_kv_page_layout(backend->page_pool().geometry());
             if (backend_layout != layouts.front()) { layouts.push_back(std::move(backend_layout)); }
         }
+        StartupPhaseScope host_kv_phase(
+            startup_observer, StartupPhase::HostKvPin, StartupProgressUnit::Bytes,
+            static_cast<std::uint64_t>(plan.context_cache.host_kv_capacity_bytes));
         host_kv_arena = std::make_unique<HostKVArena>(
             plan.context_cache.host_kv_capacity_bytes,
             std::span<const HostKVPageLayout>(layouts.data(), layouts.size()));
+        host_kv_phase.complete(
+            static_cast<std::uint64_t>(plan.context_cache.host_kv_capacity_bytes),
+            static_cast<std::uint64_t>(plan.context_cache.host_kv_capacity_bytes));
         std::size_t minimum_stride = layouts.front().page_stride;
         for (const HostKVPageLayout& layout : layouts) {
             minimum_stride = std::min(minimum_stride, layout.page_stride);
@@ -979,7 +992,11 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     CUDA_CHECK(cudaMemsetAsync(token_counts.data, 0, token_counts.bytes(), device.stream));
     CUDA_CHECK(cudaMemsetAsync(sampling_config.data, 0, sampling_config.bytes(), device.stream));
     device.synchronize();
-    prepare_graphs();
+    if (use_cuda_graph) {
+        StartupPhaseScope graph_phase(startup_observer, StartupPhase::CudaGraphPrepare);
+        prepare_graphs();
+        graph_phase.complete();
+    }
     work.reset();
     work.reset_peak();
     workspace_logical_peak_bytes = 0;

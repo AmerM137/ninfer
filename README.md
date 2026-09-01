@@ -94,9 +94,14 @@ Run a one-shot CLI request with a 32,768-token allocation:
   --lm-head-draft
 ```
 
-Answer content is written to stdout. Loading progress, reasoning, timings, throughput, memory, and
-speculative-decoding statistics are written to stderr. Use `--messages FILE` and `--vision` for
-structured image/video input; see the [CLI guide](docs/cli.md) and [committed examples](examples/cli/).
+Answer content is written to stdout. Structured startup/runtime-error records and the CLI-owned
+reasoning, timing, throughput, memory, and speculative-decoding report are written to stderr;
+reasoning and the result report remain unprefixed product output. On a terminal, weight
+materialization additionally uses one transient progress line. Redirected stderr receives only
+persistent structured phase records, including rate-limited progress for long loads. Option and
+local input errors remain direct command diagnostics. Use `--messages FILE` and `--vision` for
+structured image/video input; see the [CLI guide](docs/cli.md) and
+[committed examples](examples/cli/).
 
 ## Resource-aware long-context reuse
 

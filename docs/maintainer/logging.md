@@ -2,8 +2,8 @@
 
 This document is the authority for repository-owned C++ operational logging. It defines what is a
 log, which layer owns it, how records are formatted, and which other output contracts must remain
-separate. The product logging runtime exists under `src/product/logging`; existing producers retain
-their current output until they are deliberately cut over to this contract.
+separate. CLI, Serve, and Perplexity construct the shared product logging runtime; their resident
+operational producers follow this contract.
 
 ## 1. Output classes
 
@@ -13,9 +13,9 @@ same contract.
 | Class | Examples | Owner and representation |
 |---|---|---|
 | Operational log | startup phases, readiness, request lifecycle summaries, throughput, recoverable warnings and errors | application-owned spdlog logger |
-| Product result | CLI answer/reasoning/token report, help text, perplexity result table | the relevant application renderer |
+| Product result | CLI answer/reasoning/token report, help and local command/input diagnostics, perplexity result table | the relevant application renderer |
 | Machine measurement | request JSONL, benchmark raw/summary JSON, conversion and evaluation reports | the defining typed schema and writer |
-| Emergency diagnostic | CUDA abort path and cleanup failure after ordinary logging may be unavailable | minimal direct stderr writer in Core |
+| Emergency diagnostic | CUDA abort/invariant path, cleanup failure, or logging-sink failure after ordinary logging may be unavailable | minimal direct stderr writer at the owning low-level boundary |
 
 NVTX ranges are profiler annotations, not logs. Tests and benchmark executables may write failure or
 result reports directly because those streams are their observable product, not a resident process
@@ -59,9 +59,9 @@ It produces local wall time with millisecond precision, the lowercase spdlog lev
 logger name, and one complete message. Examples:
 
 ```text
-[2026-09-01 21:14:50.971] [info] [ninfer-serve] startup phase=host-kv-pin status=begin bytes=51539607552
-[2026-09-01 21:15:22.774] [info] [ninfer-serve] startup phase=host-kv-pin status=complete bytes=51539607552 duration_ms=31803.1
-[2026-09-01 21:15:23.102] [info] [ninfer-serve] request id=42 status=done prompt_tokens=55055 cache_hit_tokens=55048 ttft_ms=75.2
+[2026-09-01 21:14:50.971] [info] [ninfer-serve] startup phase=host-kv-pin status=begin total_bytes=51539607552
+[2026-09-01 21:15:22.774] [info] [ninfer-serve] startup phase=host-kv-pin status=complete completed_bytes=51539607552 total_bytes=51539607552 duration_ms=31803.100
+[2026-09-01 21:15:23.102] [info] [ninfer-serve] request id=42 status=done prompt_tokens=55055 prefix_cache_hit_tokens=55048 ttft_ms=75.200
 ```
 
 Messages start with a stable event noun and then stable `key=value` fields. Field names use
@@ -96,7 +96,8 @@ reported once through the emergency stderr path; logging must not recursively lo
 ## 5. Data policy
 
 Operational records may contain request IDs, protocol/model identities, non-secret configuration,
-counts, timings, cache paths, and summarized state transitions. They must not contain:
+counts, timings, cache paths, and summarized state transitions. Resident Serve request, response,
+and HTTP records must not contain:
 
 - API keys, authorization headers, cookies, signed URLs, or credentials;
 - prompt text, generated content, reasoning text, tool arguments/results, or prior conversation;
@@ -105,8 +106,12 @@ counts, timings, cache paths, and summarized state transitions. They must not co
 - full data URLs or unredacted query strings.
 
 Filesystem paths are permitted only when they are operator-selected local configuration or output
-paths and are necessary to diagnose the operation. A component that cannot prove a value safe emits
-an identity/count/digest or omits it.
+paths and are necessary to diagnose the operation. A component that cannot prove a resident-service
+value safe emits an identity/count/digest or omits it. Serve request/response/HTTP operational
+records never include raw `ApiError.message`, arbitrary `exception.what()`, a request body, or an
+unclassified request path. Trusted startup/configuration errors and the local one-shot CLI's own
+input diagnostics may retain their detailed exception text. The protocol response and request
+JSONL may retain an exact error string when their independent contracts require it.
 
 ## 6. Producer rules
 
@@ -117,10 +122,40 @@ generic pinned-buffer primitive. Serve owns HTTP and request lifecycle severity.
 streams and must never prefix generated answer or reasoning data with operational-log metadata.
 
 Progress producers emit a typed begin before a potentially blocking operation, bounded progress
-updates when available, and one complete or failed terminal event. Rate limiting belongs to the
-product renderer. Producers do not print ad hoc dots, percentages, carriage-return lines, or
-duplicate completion summaries.
+updates when available, and one complete or failed terminal event. This guarantee covers normal
+return and C++ exception unwinding; a fatal CUDA `abort()` uses the emergency diagnostic path and
+does not unwind typed scopes. Rate limiting belongs to the product renderer. Producers do not print
+ad hoc dots, percentages, carriage-return lines, or duplicate completion summaries.
 
-When a producer is migrated, remove its superseded formatter and direct operational write in the
-same change. Do not retain dual spdlog/custom paths, redirect one rendered string into another
-schema, or add new direct operational `std::cerr`, `std::cout`, `printf`, or `fprintf` calls.
+When stderr is a terminal, `ninfer_product_logging` may render one transient startup progress line
+below the persistent spdlog records. The progress-aware stderr sink owns the same mutex as normal
+records: it erases the transient line before a log record and redraws it afterward. Only a phase
+with real byte progress displays a percentage, pipeline rate, or ETA. Completion erases the line and
+emits the ordinary structured terminal record. Redirected stderr never receives this transient
+line, carriage returns, or progress-bar text; it receives rate-limited structured progress records.
+
+Engine startup is an inclusive typed hierarchy. `engine-startup` contains CUDA initialization,
+artifact inspection, target planning, weight materialization, target/frontend/Program construction,
+and Engine finalization. `weights-staging-pin` is nested in `weights-materialize`; Host State pin,
+Host KV pin, and CUDA Graph preparation are nested in `program-initialize`. Nested durations explain
+their parent and must not be added to it. Disabled zero-capacity phases are omitted. Byte progress is
+reported as submitted work, while only a synchronized terminal event reports completed bytes.
+
+Serve owns request failure classification and severity. A prepared generation request receives one
+machine terminal: `request_done` immediately after `GenerationService::run()` returns, or
+`request_error` if it does not return an outcome. Response rendering, Responses storage, and terminal
+transport happen after that transaction; their failures are operational `response` records and do
+not create a second request JSONL terminal.
+
+There is no dual spdlog/custom operational path. Product results, machine measurements, and the
+explicit emergency cases above remain direct outputs because they are different contracts.
+
+## 7. Verification policy
+
+Logging tests protect NInfer-owned observable semantics, not spdlog internals or private object
+shape. The request-log test covers the consumed JSONL schema plus Serve failure severity and the
+rule that arbitrary client error text is absent from operational output. The corpus consumer test
+protects its exact schema-version agreement with Serve. Startup ordering and presentation are
+verified through real terminal and redirected startup paths when that code changes; synthetic
+observer, formatter snapshot, registry, color, mutex, getter, and constructor tests are not
+retained.

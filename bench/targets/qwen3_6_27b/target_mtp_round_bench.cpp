@@ -158,7 +158,9 @@ int run(const Options& options) {
     const auto resolution = ninfer::runtime::resolve_kv_capacity(
         engine.kv_capacity, planner.capacity_curve(), std::numeric_limits<std::size_t>::max());
     auto sequence = std::move(planner).finalize(resolution.main_page_groups);
-    auto program  = target::Package::create_program(*model, std::move(sequence), device);
+    const ninfer::StartupObserver startup_observer;
+    auto program =
+        target::Package::create_program(*model, std::move(sequence), device, startup_observer);
     ninfer::runtime::ResolvedExecutionOptions execution;
     execution.requested_output_tokens = 1 + measured_rounds * (options.draft_tokens + 1);
     execution.allow_prefix_reuse      = false;
