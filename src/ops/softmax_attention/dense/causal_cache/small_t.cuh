@@ -120,8 +120,8 @@ __device__ __forceinline__ int causal_small_t_active_splits(int window, int laun
 }
 
 template <typename Geometry>
-__device__ __forceinline__ int causal_small_t_fp8_active_splits(int window, int launch_capacity,
-                                                                int tokens) {
+__device__ __forceinline__ int
+causal_small_t_quantized_active_splits(int window, int launch_capacity, int tokens) {
     int splits = causal_small_t_default_splits<Geometry>(window);
     if constexpr (Geometry::SmallTSplitScale == 1) {
         if (tokens == 1 && window > 8198) { splits = Geometry::SmallTMaximumSplits; }
@@ -131,6 +131,15 @@ __device__ __forceinline__ int causal_small_t_fp8_active_splits(int window, int 
 
 __device__ __forceinline__ int causal_small_t_tc_swz(int row, int col) {
     return (((col >> 3) ^ (row & 7)) << 3) | (col & 7);
+}
+
+template <typename Byte>
+__device__ __forceinline__ void causal_small_t_store_byte_swizzled(Byte* tile, int row, int d,
+                                                                   int d_b16_stride, Byte code) {
+    const int col_b16 = d >> 1;
+    const int byte    = d & 1;
+    const int off     = (row * d_b16_stride + causal_small_t_tc_swz(row, col_b16)) * 2 + byte;
+    tile[off]         = code;
 }
 
 __device__ __forceinline__ int causal_small_t_tc_swz32(int row, int col) {

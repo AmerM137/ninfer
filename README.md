@@ -223,12 +223,18 @@ All registered model IDs support:
 - image, multi-image, video, and mixed multimodal messages;
 - chunked prefill, exact-batch CUDA Graph decode, and startup-bounded batched decode;
 - MTP speculative decoding with draft windows from one to five;
-- BF16, INT8 group-64, and row-scaled FP8 E4M3 KV storage;
+- BF16, INT8 group-64, row-scaled FP8 E4M3, NVFP4 group-16, and asymmetric K8V4 KV storage;
 - offline causal-perplexity scoring with the same Text model and selectable KV storage;
 - private and shared exact-prefix reuse with Device/Host State and KV retention;
 - model-aware sampling defaults and explicit sampler overrides;
 - OpenAI Responses Core, OpenAI Chat Completions, and Anthropic Messages, including streaming,
   tools, local response state, token counting, and usage accounting.
+
+The exact low-bit KV selectors are `--kv-dtype nvfp4` (144-byte K and V vectors) and
+`--kv-dtype k8v4` (258-byte FP8 K plus 144-byte NVFP4 V vectors), all for D256. These runtime
+cache choices are independent of the registered artifact's weight format. NVFP4 attention does
+not quantize Q: prompt and small-T use FP16 rotated Q and exactly expanded FP16 K with FP32 QK
+accumulation; K8V4 retains its FP8 Q/K path.
 
 The 35B-A3B target additionally supports text-only DFlash with draft windows from one to fifteen.
 
