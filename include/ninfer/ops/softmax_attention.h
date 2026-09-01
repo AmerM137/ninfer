@@ -29,8 +29,9 @@ struct ContextAttentionExecutionEnvelope {
  * Shared numerical contract.
  *
  * Every entry computes stable scaled dot-product Softmax Attention. Query head h reads KV head
- * floor(h / (Hq/Hkv)). Public BF16 inputs and BF16 cache rows are interpreted after their storage
- * boundary. For a declared visible key set J, the independent mathematical oracle is
+ * floor(h / (Hq/Hkv)). Public BF16 inputs and persistent cache rows are interpreted after their
+ * storage boundary. In the BFloat16 cache profile, K is stored as BF16 and V as
+ * FP16_RNE(BF16 input). For a declared visible key set J, the independent mathematical oracle is
  *
  *   score[j]       = scale * dot(FP64(q[:,h,i]), FP64(k[:,kvh,j]))
  *   probability[j] = exp(score[j] - max(score)) / sum_x exp(score[x] - max(score))
@@ -53,15 +54,16 @@ struct ContextAttentionExecutionEnvelope {
  * stable Softmax, PV, and R^T in FP64 and compares the final BF16 production output. Its delta
  * from the unquantized BF16/FP64 oracle above is separate quantization-quality evidence.
  *
- * The qualified FP8 and K8V4 compute profiles use native E4M3FN QK MMA with FP32 accumulation;
- * NVFP4 uses FP16 Q and exactly expanded FP16 K with native FP16 QK MMA and FP32 accumulation in
- * both prompt and small-T routes. NVFP4 never quantizes Q to FP4 or FP8. All three keep Softmax,
- * split state, merge, normalization, and Hadamard reductions in FP32. P is never quantized to
- * FP8/FP4: it is cast once to FP16 at the PV MMA boundary. V is represented exactly as an FP16
- * operand, PV uses FP16 Tensor Cores with FP32 accumulation, and only the final public output is
- * stored as BF16. These arithmetic paths are implementation profiles rather than extra public
- * tensor boundaries. Every cache route has one named numerical criterion and is checked directly
- * against its independent oracle; route-to-route parity is only supplementary evidence.
+ * The qualified BFloat16 compute profile keeps Q/K and persistent K at BF16, stores persistent V
+ * as FP16, and uses native BF16 QK and FP16 P/V MMA with FP32 accumulation. The qualified
+ * FP8 and K8V4 profiles use native E4M3FN QK MMA with FP32 accumulation; NVFP4 uses FP16 Q and
+ * exactly expanded FP16 K with native FP16 QK MMA and FP32 accumulation in both prompt and small-T
+ * routes. NVFP4 never quantizes Q to FP4 or FP8. All four keep Softmax, split state, merge,
+ * normalization, and applicable Hadamard reductions in FP32. P is never quantized to FP8/FP4;
+ * PV uses FP16 Tensor Cores with FP32 accumulation, and only the final public output is stored as
+ * BF16. These arithmetic paths are implementation profiles rather than extra public tensor
+ * boundaries. Every cache route has one named numerical criterion and is checked directly against
+ * its independent oracle; route-to-route parity is only supplementary evidence.
  * Those criteria apply to the registered geometries, tested extents, conformance matrix, and
  * target-representative activation range; they are not universal error bounds for arbitrary
  * adversarial BF16 tensors.
@@ -174,7 +176,8 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
  * The registered profile is D=128, Hq=32, Hkv=8 (group 4), scale=1/sqrt(128), T=1..16, and
  * B=1..8. q/out are contiguous BF16 [128,32,T,B], query_k/query_v are contiguous BF16
  * [128,8,T,B], and context_lengths, valid_columns, and table_rows are contiguous device I32 [B].
- * The read-only paged BF16 context uses head-major page planes [128,64,Nphysical,8].
+ * The read-only paged BFloat16 context uses head-major BF16 K and FP16 V planes
+ * [128,64,Nphysical,8].
  *
  * For row b, let L=context_lengths[b] and V=valid_columns[b]. Every live query i<V attends the
  * complete logical set consisting of context rows [0,L) followed by every temporary query K/V row

@@ -384,6 +384,9 @@ remain consistent.
 - GDN `g`, `beta`, and recurrent state are FP32;
 - the unquantized GQA oracle evaluates dot products, stable softmax, and value reduction in FP64
   from BF16 Q/K/V; it is the semantic reference used to report cache-quantization quality;
+- the BF16 KV production profile stores persistent K as BF16 and V as FP16, uses BF16 Q/K and FP16
+  P/V Tensor Core operands, and retains QK, PV, and split merge accumulation in FP32 before the
+  final BF16 output;
 - low-bit weight storage changes representation, not the intended dequantized matrix;
 - INT8-G64 KV stores FP16 scales and signed codes, and its ideal logical K/V values are their FP32
   decode;

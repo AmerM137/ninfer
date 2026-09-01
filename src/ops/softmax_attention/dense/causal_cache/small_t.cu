@@ -107,7 +107,7 @@ void launch_tc_partial_bf16(const Tensor& q, CacheInput input, const Tensor& pos
         <<<grid, kBlock, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(q.data), input,
             static_cast<const std::int32_t*>(pos.data), static_cast<__nv_bfloat16*>(cache_k.data),
-            static_cast<__nv_bfloat16*>(cache_v.data),
+            static_cast<__half*>(cache_v.data),
             static_cast<const std::int32_t*>(cache.block_tables.data),
             invocation.valid_columns == nullptr
                 ? nullptr
@@ -116,9 +116,8 @@ void launch_tc_partial_bf16(const Tensor& q, CacheInput input, const Tensor& pos
                 ? nullptr
                 : static_cast<const std::int32_t*>(invocation.table_rows->data),
             cache.block_tables.ne[0], invocation.width, invocation.full_width,
-            invocation.column_begin, logical_capacity, scale,
-            static_cast<__nv_bfloat16*>(partial_acc.data), static_cast<float*>(partial_m.data),
-            static_cast<float*>(partial_l.data));
+            invocation.column_begin, logical_capacity, scale, static_cast<float*>(partial_acc.data),
+            static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data));
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -302,45 +301,47 @@ void causal_attention_small_t_launch_for(const Tensor& q, CacheInput input, cons
     constexpr int kDChunk      = 64;
     const dim3 reduce_grid(Geometry::QHeads, div_up(kCausalHeadDim, kDChunk),
                            invocation.width * invocation.batch_size);
-    const auto launch_reduce = [&]<bool Int8, bool MultiBatch, bool Masked, bool Offset>() {
-        causal_attention_small_t_reduce_output_kernel<Geometry, kDChunk, Int8, MultiBatch, Masked,
-                                                      Offset>
-            <<<reduce_grid, kReduceBlock, 0, stream>>>(
-                static_cast<const __nv_bfloat16*>(partial_acc.data),
-                static_cast<const float*>(partial_m.data),
-                static_cast<const float*>(partial_l.data),
-                static_cast<const std::int32_t*>(pos.data),
-                invocation.valid_columns == nullptr
-                    ? nullptr
-                    : static_cast<const std::int32_t*>(invocation.valid_columns->data),
-                invocation.width, invocation.full_width, invocation.column_begin,
-                invocation.batch_size, splits, static_cast<__nv_bfloat16*>(out.data));
-    };
-    const bool masked         = invocation.valid_columns != nullptr;
-    const auto launch_profile = [&]<bool Int8, bool MultiBatch, bool Masked>() {
-        if (invocation.column_begin == 0) {
-            launch_reduce.template operator()<Int8, MultiBatch, Masked, false>();
-        } else {
-            launch_reduce.template operator()<Int8, MultiBatch, Masked, true>();
-        }
-    };
-    const auto launch_for_dtype = [&]<bool Int8>() {
+    const auto launch_reduce =
+        [&]<typename PartialAcc, bool Int8, bool MultiBatch, bool Masked, bool Offset>() {
+            causal_attention_small_t_reduce_output_kernel<PartialAcc, Geometry, kDChunk, Int8,
+                                                          MultiBatch, Masked, Offset>
+                <<<reduce_grid, kReduceBlock, 0, stream>>>(
+                    static_cast<const PartialAcc*>(partial_acc.data),
+                    static_cast<const float*>(partial_m.data),
+                    static_cast<const float*>(partial_l.data),
+                    static_cast<const std::int32_t*>(pos.data),
+                    invocation.valid_columns == nullptr
+                        ? nullptr
+                        : static_cast<const std::int32_t*>(invocation.valid_columns->data),
+                    invocation.width, invocation.full_width, invocation.column_begin,
+                    invocation.batch_size, splits, static_cast<__nv_bfloat16*>(out.data));
+        };
+    const bool masked = invocation.valid_columns != nullptr;
+    const auto launch_profile =
+        [&]<typename PartialAcc, bool Int8, bool MultiBatch, bool Masked>() {
+            if (invocation.column_begin == 0) {
+                launch_reduce.template operator()<PartialAcc, Int8, MultiBatch, Masked, false>();
+            } else {
+                launch_reduce.template operator()<PartialAcc, Int8, MultiBatch, Masked, true>();
+            }
+        };
+    const auto launch_for_dtype = [&]<typename PartialAcc, bool Int8>() {
         if (invocation.batch_size == 1) {
             if (masked) {
-                launch_profile.template operator()<Int8, false, true>();
+                launch_profile.template operator()<PartialAcc, Int8, false, true>();
             } else {
-                launch_profile.template operator()<Int8, false, false>();
+                launch_profile.template operator()<PartialAcc, Int8, false, false>();
             }
         } else if (masked) {
-            launch_profile.template operator()<Int8, true, true>();
+            launch_profile.template operator()<PartialAcc, Int8, true, true>();
         } else {
-            launch_profile.template operator()<Int8, true, false>();
+            launch_profile.template operator()<PartialAcc, Int8, true, false>();
         }
     };
     if (cache.storage == KvCacheStorage::Int8Group64) {
-        launch_for_dtype.template operator()<true>();
+        launch_for_dtype.template operator()<__nv_bfloat16, true>();
     } else {
-        launch_for_dtype.template operator()<false>();
+        launch_for_dtype.template operator()<float, false>();
     }
     CUDA_CHECK(cudaGetLastError());
 }

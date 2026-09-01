@@ -764,10 +764,12 @@ encoder or audio projection tower. Token presence is not evidence of an audio in
 - Public activation, cache, and recurrent-state dtypes are stated by their owning Op/state contract.
   In particular, GDN recurrent matrices and decay controls are FP32, while registered BF16,
   INT8-G64, FP8-E4M3FN-row256, NVFP4-G16, and K8V4 KV formats remain real persistent
-  representation boundaries. The two FP4-value profiles use FP32 forward/inverse Hadamard and QK
-  accumulation; P/V MMA uses FP16 operands and FP32 accumulation, with no FP8/FP4 P quantization.
-  Their production routes are checked against independent exact-codec FP64 represented-value
-  attention oracles, with the unquantized BF16/FP64 delta reported separately.
+  representation boundaries. The BF16 profile stores persistent K as BF16 and V as FP16, uses
+  BF16 Q/K and FP16 P/V MMA, and keeps QK, PV, and split merge accumulation in FP32. The two
+  FP4-value profiles use FP32 forward/inverse Hadamard and QK accumulation; P/V MMA uses FP16
+  operands and FP32 accumulation, with no FP8/FP4 P quantization. Their production routes are
+  checked against independent exact-codec FP64 represented-value attention oracles, with the
+  unquantized BF16/FP64 delta reported separately.
 - Every floating-point Op uses one independent naive FP32/FP64 mathematical oracle over its logical
   inputs. Packed weights are decoded from their stored codes and exact stored scales. Exact
   transforms and codecs use exact oracles.
@@ -791,12 +793,12 @@ Let `C=max_concurrency` and `P=min(prefill_chunk,max_context)`.
 
 The Program-owned memory classes are:
 
-| State | Shape basis | BF16/FP32 payload at 262144 context | Lifetime |
+| State | Shape basis | BF16/FP16/FP32 payload at 262144 context | Lifetime |
 |---|---|---:|---|
-| Text GQA K and V | 10 layers × context × 2 heads × 256 × 2 planes | 5.0 GiB BF16 | active sequence |
-| MTP K and V | 1 layer × context × 2 heads × 256 × 2 planes | 0.5 GiB BF16 | active sequence when MTP enabled |
-| DFlash current and turn-checkpoint local K/V | 2 copies × 5 layers × 4096 positions × 8 heads × 128 × 2 planes × `C` lanes | about 160 MiB × `C` BF16 | Program lifetime when DFlash enabled |
-| DFlash full context K and V | 1 layer × context × 8 heads × 128 × 2 planes | 1.0 GiB BF16 | active sequence when DFlash enabled |
+| Text GQA K and V | 10 layers × context × 2 heads × 256 × 2 planes | 5.0 GiB BF16-K/FP16-V | active sequence |
+| MTP K and V | 1 layer × context × 2 heads × 256 × 2 planes | 0.5 GiB BF16-K/FP16-V | active sequence when MTP enabled |
+| DFlash current and turn-checkpoint local K/V | 2 copies × 5 layers × 4096 positions × 8 heads × 128 × 2 planes × `C` lanes | about 160 MiB × `C` BF16-K/FP16-V | Program lifetime when DFlash enabled |
+| DFlash full context K and V | 1 layer × context × 8 heads × 128 × 2 planes | 1.0 GiB BF16-K/FP16-V | active sequence when DFlash enabled |
 | GDN convolution history | 30 layers × 8192 channels × 3 columns × `2C` | 1.406 MiB × `2C` BF16 | Program lifetime; current and turn-checkpoint slots |
 | GDN recurrent matrices | 30 layers × 32 heads × 128 × 128 × `2C` | 60 MiB × `2C` FP32 | Program lifetime; current and turn-checkpoint slots |
 | ReplaySSM records | 30 layers × `C` rows × `draft_window+1` convolution/key/value/gate columns | backend/window dependent | Program lifetime with MTP or DFlash; one pending round |

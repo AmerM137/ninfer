@@ -81,7 +81,7 @@ struct TestCacheLayout {
 TestCacheLayout test_cache_layout(KvCacheStorage storage) {
     switch (storage) {
     case KvCacheStorage::BFloat16:
-        return {{DType::BF16, kHeadDim, DType::U8, 0}, {DType::BF16, kHeadDim, DType::U8, 0}};
+        return {{DType::BF16, kHeadDim, DType::U8, 0}, {DType::FP16, kHeadDim, DType::U8, 0}};
     case KvCacheStorage::Int8Group64:
         return {{DType::I8, kHeadDim, DType::FP16, kQuantGroups},
                 {DType::I8, kHeadDim, DType::FP16, kQuantGroups}};
@@ -396,6 +396,12 @@ float f16_bits_to_f32(std::uint16_t bits) {
 
 float round_to_f16(float value) { return f16_bits_to_f32(f32_to_f16_bits(value)); }
 
+std::vector<std::uint16_t> to_f16_bits(const std::vector<float>& values) {
+    std::vector<std::uint16_t> bits(values.size());
+    for (std::size_t i = 0; i < values.size(); ++i) { bits[i] = f32_to_f16_bits(values[i]); }
+    return bits;
+}
+
 std::int32_t round_even_to_i32(float value) {
     const float lower_f  = std::floor(value);
     const float fraction = value - lower_f;
@@ -471,7 +477,7 @@ struct HostCache {
     std::int32_t max_context;
     std::int32_t logical_capacity;
     std::vector<std::uint16_t> k_bf16;
-    std::vector<std::uint16_t> v_bf16;
+    std::vector<std::uint16_t> v_fp16;
     std::vector<std::int8_t> k_i8;
     std::vector<std::int8_t> v_i8;
     std::vector<std::uint8_t> k_fp8;
@@ -728,7 +734,7 @@ HostCache make_cache(const Geometry& geometry, KvCacheStorage storage, std::int3
     HostCache cache{geometry, storage, max_context, logical_capacity};
     if (storage == KvCacheStorage::BFloat16) {
         cache.k_bf16 = to_bf16_bits(logical_k);
-        cache.v_bf16 = to_bf16_bits(logical_v);
+        cache.v_fp16 = to_f16_bits(logical_v);
         return cache;
     }
 
@@ -855,7 +861,7 @@ void append_cache(HostCache& cache, const std::vector<float>& k, const std::vect
                     const std::size_t target =
                         cache_index(geometry, cache.logical_capacity, head, position, d);
                     cache.k_bf16[target] = f32_to_bf16(k[source]);
-                    cache.v_bf16[target] = f32_to_bf16(v[source]);
+                    cache.v_fp16[target] = f32_to_f16_bits(v[source]);
                 }
                 continue;
             }
@@ -921,7 +927,8 @@ double cache_value(const HostCache& cache, bool key, std::int32_t head, std::int
                    std::int32_t d) {
     const std::size_t code = cache_index(cache.geometry, cache.logical_capacity, head, position, d);
     if (cache.storage == KvCacheStorage::BFloat16) {
-        return static_cast<double>(bf16_to_f32(key ? cache.k_bf16[code] : cache.v_bf16[code]));
+        return key ? static_cast<double>(bf16_to_f32(cache.k_bf16[code]))
+                   : static_cast<double>(f16_bits_to_f32(cache.v_fp16[code]));
     }
 
     if (key) { return static_cast<double>(cache.logical_k_quantized[code]); }
@@ -1046,7 +1053,7 @@ public:
                 scatter_paged(cache.k_bf16, kHeadDim, geometry_, logical_capacity_,
                               block_table_host_, physical_pages_);
             const auto v_physical =
-                scatter_paged(cache.v_bf16, kHeadDim, geometry_, logical_capacity_,
+                scatter_paged(cache.v_fp16, kHeadDim, geometry_, logical_capacity_,
                               block_table_host_, physical_pages_);
             k_.copy_from_host(k_physical.data(), k_physical.size() * sizeof(std::uint16_t));
             v_.copy_from_host(v_physical.data(), v_physical.size() * sizeof(std::uint16_t));
@@ -1167,7 +1174,7 @@ public:
             const auto v_physical = copy_from_guarded<std::uint16_t>(v_, v_code_elements_);
             cache.k_bf16          = gather_paged<std::uint16_t>(k_physical, kHeadDim, geometry_,
                                                                 logical_capacity_, block_table_host_);
-            cache.v_bf16          = gather_paged<std::uint16_t>(v_physical, kHeadDim, geometry_,
+            cache.v_fp16          = gather_paged<std::uint16_t>(v_physical, kHeadDim, geometry_,
                                                                 logical_capacity_, block_table_host_);
         } else if (storage_ == KvCacheStorage::Int8Group64) {
             const auto k_physical  = copy_from_guarded<std::int8_t>(k_, k_code_elements_);
@@ -1481,7 +1488,7 @@ private:
         for (std::size_t row = 0; row < rows_; ++row) {
             const std::span<const std::int32_t> table = row_table(row);
             scatter_paged_into(rows[row].k_bf16, kHeadDim, geometry_, logical_capacity_, table, k);
-            scatter_paged_into(rows[row].v_bf16, kHeadDim, geometry_, logical_capacity_, table, v);
+            scatter_paged_into(rows[row].v_fp16, kHeadDim, geometry_, logical_capacity_, table, v);
         }
     }
 
@@ -1605,7 +1612,7 @@ int verify_cache(const std::string& label, const HostCache& got, const HostCache
     int failures = 0;
     if (expected.storage == KvCacheStorage::BFloat16) {
         failures += verify_exact((label + " cache-k").c_str(), got.k_bf16, expected.k_bf16);
-        failures += verify_exact((label + " cache-v").c_str(), got.v_bf16, expected.v_bf16);
+        failures += verify_exact((label + " cache-v").c_str(), got.v_fp16, expected.v_fp16);
     } else if (expected.storage == KvCacheStorage::Int8Group64) {
         if (verify_private_key_representation) {
             failures += verify_exact((label + " cache-k-code").c_str(), got.k_i8, expected.k_i8);

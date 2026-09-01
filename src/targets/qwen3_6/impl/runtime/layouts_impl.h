@@ -164,13 +164,17 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     if constexpr (Variant::supports_dflash) {
         if (plan.features.dflash()) {
             DFlashPersistentLayout& dflash = out.dflash.emplace();
+            const PagedKVStorageLayout full_storage =
+                paged_kv_storage_layout(KvCacheStorage::BFloat16, DFlashConfig::head_dim);
             KVPageGeometry full_geometry{
                 .page_tokens        = kPagedKVPageSize,
                 .device_plane_order = PagedKVPlaneOrder::HeadMajor,
                 .planes =
                     {
-                        {DType::BF16, DFlashConfig::head_dim, DFlashConfig::kv_heads, 256},
-                        {DType::BF16, DFlashConfig::head_dim, DFlashConfig::kv_heads, 256},
+                        {full_storage.key.data_dtype, full_storage.key.data_leading_extent,
+                         DFlashConfig::kv_heads, 256},
+                        {full_storage.value.data_dtype, full_storage.value.data_leading_extent,
+                         DFlashConfig::kv_heads, 256},
                     },
             };
             dflash.full = qwen3_6::PagedKVCacheLayout{
@@ -183,11 +187,10 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                         .logical_page_capacity = logical_pages,
                         .table_rows            = static_cast<std::int32_t>(plan.max_concurrency),
                     }),
-                .layers      = 1,
-                .max_context = plan.capacity,
-                .kv_heads    = DFlashConfig::kv_heads,
-                .layer_storage =
-                    paged_kv_storage_layout(KvCacheStorage::BFloat16, DFlashConfig::head_dim),
+                .layers        = 1,
+                .max_context   = plan.capacity,
+                .kv_heads      = DFlashConfig::kv_heads,
+                .layer_storage = full_storage,
             };
             dflash.prefill_features = add_tensor(
                 builder, DType::BF16, {DFlashConfig::feature_rows, effective_prefill_chunk},

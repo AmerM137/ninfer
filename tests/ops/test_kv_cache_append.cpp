@@ -51,7 +51,7 @@ TestCacheLayout test_cache_layout(KvCacheStorage storage) {
     switch (storage) {
     case KvCacheStorage::BFloat16:
         return {{DType::BF16, kFullHeadDim, DType::U8, 0},
-                {DType::BF16, kFullHeadDim, DType::U8, 0}};
+                {DType::FP16, kFullHeadDim, DType::U8, 0}};
     case KvCacheStorage::Int8Group64:
         return {{DType::I8, kFullHeadDim, DType::FP16, kFullGroups},
                 {DType::I8, kFullHeadDim, DType::FP16, kFullGroups}};
@@ -139,6 +139,10 @@ float f16_bits_to_f32(std::uint16_t bits) {
         magnitude = std::ldexp(1.0f + static_cast<float>(mantissa) / 1024.0f, exp - 15);
     }
     return negative ? -magnitude : magnitude;
+}
+
+std::uint16_t bf16_bits_to_f16_bits(std::uint16_t bits) {
+    return f32_to_f16_bits(bf16_to_f32(bits));
 }
 
 std::int32_t round_even_to_i32(float value) {
@@ -477,7 +481,7 @@ int full_append_case(int kv_heads, KvCacheStorage storage, int tokens = 3) {
                     const auto target =
                         full_cache_index(kFullHeadDim, d, head, position, page, kv_heads);
                     expected_k[target] = input_k[source];
-                    expected_v[target] = input_v[source];
+                    expected_v[target] = bf16_bits_to_f16_bits(input_v[source]);
                 }
             }
         }
@@ -739,6 +743,14 @@ std::vector<std::uint16_t> patterned_bits(std::size_t count, std::uint32_t seed)
     return bits;
 }
 
+std::vector<std::uint16_t> finite_patterned_bf16_bits(std::size_t count, std::uint32_t seed) {
+    auto bits = patterned_bits(count, seed);
+    for (auto& value : bits) {
+        if ((value & 0x7f80u) == 0x7f80u) { value ^= 0x0080u; }
+    }
+    return bits;
+}
+
 void append_oracle(std::vector<std::uint16_t>& cache_k, std::vector<std::uint16_t>& cache_v,
                    const std::vector<std::uint16_t>& input_k,
                    const std::vector<std::uint16_t>& input_v,
@@ -753,7 +765,7 @@ void append_oracle(std::vector<std::uint16_t>& cache_k, std::vector<std::uint16_
                 const auto dst = cyclic ? cyclic_cache_index(d, head, slot)
                                         : paged_cache_index(d, head, position, mapping);
                 cache_k[dst]   = input_k[src];
-                cache_v[dst]   = input_v[src];
+                cache_v[dst]   = bf16_bits_to_f16_bits(input_v[src]);
             }
         }
     }
@@ -763,7 +775,7 @@ PagedKVBatchLayerView paged_view(GuardedDeviceBuffer& k, GuardedDeviceBuffer& v,
                                  DeviceBuffer& block_table, int table_rows = 1) {
     return {
         .k_pages      = Tensor(k.data(), DType::BF16, {kHeadDim, kPage, kPhysicalPages, kKVHeads}),
-        .v_pages      = Tensor(v.data(), DType::BF16, {kHeadDim, kPage, kPhysicalPages, kKVHeads}),
+        .v_pages      = Tensor(v.data(), DType::FP16, {kHeadDim, kPage, kPhysicalPages, kKVHeads}),
         .block_tables = Tensor(block_table.p, DType::I32, {kLogicalPages, table_rows}),
         .head_dim     = kHeadDim,
         .num_kv_heads = kKVHeads,
@@ -775,7 +787,7 @@ CyclicKVCacheLayerView cyclic_view(GuardedDeviceBuffer& k, GuardedDeviceBuffer& 
                                    int lane_capacity = 1) {
     return {
         .k        = Tensor(k.data(), DType::BF16, {kHeadDim, kWindow, kKVHeads, lane_capacity}),
-        .v        = Tensor(v.data(), DType::BF16, {kHeadDim, kWindow, kKVHeads, lane_capacity}),
+        .v        = Tensor(v.data(), DType::FP16, {kHeadDim, kWindow, kKVHeads, lane_capacity}),
         .capacity = kWindow,
         .padded_capacity = kWindow,
         .num_kv_heads    = kKVHeads,
@@ -794,7 +806,7 @@ int run_case(int tokens, int commit_count, int first_position, bool cyclic,
         static_cast<std::size_t>(kHeadDim) * kKVHeads * (cyclic ? kWindow : kPage * kPhysicalPages);
     const auto host_k = patterned_bits(input_count, 0x10203040u + static_cast<unsigned>(tokens));
     const auto host_v =
-        patterned_bits(input_count, 0x50607080u + static_cast<unsigned>(commit_count));
+        finite_patterned_bf16_bits(input_count, 0x50607080u + static_cast<unsigned>(commit_count));
     const auto initial_k = patterned_bits(cache_count, 0x90a0b0c0u);
     const auto initial_v = patterned_bits(cache_count, 0xd0e0f001u);
     std::vector<std::int32_t> positions(static_cast<std::size_t>(tokens));
@@ -862,7 +874,7 @@ int cyclic_graph_replay_case() {
     const std::size_t input_count = static_cast<std::size_t>(kHeadDim) * kKVHeads * tokens;
     const std::size_t cache_count = static_cast<std::size_t>(kHeadDim) * kWindow * kKVHeads;
     const auto host_k             = patterned_bits(input_count, 0x11223344u);
-    const auto host_v             = patterned_bits(input_count, 0x55667788u);
+    const auto host_v             = finite_patterned_bf16_bits(input_count, 0x55667788u);
     const auto initial_k          = patterned_bits(cache_count, 0x99aabbccu);
     const auto initial_v          = patterned_bits(cache_count, 0xddeeff01u);
     std::vector<std::int32_t> positions(tokens);
@@ -938,7 +950,7 @@ int paged_graph_replay_case() {
     const std::size_t cache_count =
         static_cast<std::size_t>(kHeadDim) * kPage * kKVHeads * kPhysicalPages;
     const auto host_k    = patterned_bits(input_count, 0x12345678u);
-    const auto host_v    = patterned_bits(input_count, 0x87654321u);
+    const auto host_v    = finite_patterned_bf16_bits(input_count, 0x87654321u);
     const auto initial_k = patterned_bits(cache_count, 0xabcdef01u);
     const auto initial_v = patterned_bits(cache_count, 0x10fedcbau);
     std::vector<std::int32_t> positions(tokens);
@@ -1024,7 +1036,7 @@ int batch_selector_case(bool cyclic) {
     const std::size_t lane_cache_count =
         static_cast<std::size_t>(kHeadDim) * kKVHeads * (cyclic ? kWindow : kPage * kPhysicalPages);
     const auto host_k    = patterned_bits(row_input_count * batch, 0x31415926u);
-    const auto host_v    = patterned_bits(row_input_count * batch, 0x27182818u);
+    const auto host_v    = finite_patterned_bf16_bits(row_input_count * batch, 0x27182818u);
     const auto initial_k = patterned_bits(lane_cache_count * (cyclic ? batch : 1), 0x16180339u);
     const auto initial_v = patterned_bits(lane_cache_count * (cyclic ? batch : 1), 0x57721566u);
     const std::vector<std::int32_t> tables{0, 1, 2, 3, 4, 5};
@@ -1049,7 +1061,7 @@ int batch_selector_case(bool cyclic) {
                                      cyclic_cache_index(d, head, position % kWindow)
                                : paged_cache_index(d, head, position, mapping);
                     expected_k[dst] = host_k[src];
-                    expected_v[dst] = host_v[src];
+                    expected_v[dst] = bf16_bits_to_f16_bits(host_v[src]);
                 }
             }
         }

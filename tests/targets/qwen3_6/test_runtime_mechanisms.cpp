@@ -64,11 +64,11 @@ void test_decoder_layout() {
                bf16.text_kv.execution_tables.spec.logical_page_capacity == 3 &&
                bf16.text_kv.execution_tables.spec.table_rows == 1,
            "Text KV separates five physical pages from three logical pages");
-    expect(std::all_of(bf16.text_kv.pages.planes.begin(), bf16.text_kv.pages.planes.end(),
-                       [](const ninfer::DeviceKVPlaneLayout& plane) {
-                           return plane.geometry.dtype == ninfer::DType::BF16;
-                       }),
-           "BF16 KV has no scale planes");
+    expect(bf16.text_kv.pages.planes[0].geometry.dtype == ninfer::DType::BF16 &&
+               bf16.text_kv.pages.planes[1].geometry.dtype == ninfer::DType::FP16 &&
+               bf16.text_kv.pages.planes[2].geometry.dtype == ninfer::DType::BF16 &&
+               bf16.text_kv.pages.planes[3].geometry.dtype == ninfer::DType::FP16,
+           "BF16 KV has BF16 K and FP16 V without scale planes");
     expect(!bf16.mtp_kv.has_value(), "disabled MTP omits KV storage");
     expect(bf16.kv_payload_bytes() == bf16.text_kv.payload_bytes(), "BF16 KV payload accounting");
 

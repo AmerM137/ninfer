@@ -263,7 +263,8 @@ template <class Allocator>
 SmallTWorkspace allocate_small_t_workspace(Allocator& workspace, std::int32_t q_heads,
                                            std::int32_t tokens, std::int32_t splits,
                                            std::int32_t batch_size, KvCacheStorage cache_storage) {
-    const bool fp32_acc = cache_storage == KvCacheStorage::Fp8E4M3Row256 ||
+    const bool fp32_acc = cache_storage == KvCacheStorage::BFloat16 ||
+                          cache_storage == KvCacheStorage::Fp8E4M3Row256 ||
                           cache_storage == KvCacheStorage::Nvfp4Group16 ||
                           cache_storage == KvCacheStorage::Fp8KeyNvfp4Value;
     return {

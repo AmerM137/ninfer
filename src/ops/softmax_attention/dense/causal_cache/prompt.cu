@@ -52,7 +52,7 @@ void causal_attention_prompt_attention_launch_for(const Tensor& q, const Tensor&
             <<<attention_grid, kCausalPromptThreads, kCausalPromptSmemBytes, stream>>>(
                 static_cast<const __nv_bfloat16*>(q.data),
                 static_cast<const __nv_bfloat16*>(cache_k.data),
-                static_cast<const __nv_bfloat16*>(cache_v.data), metadata,
+                static_cast<const __half*>(cache_v.data), metadata,
                 static_cast<const std::int32_t*>(positions.data), scale,
                 static_cast<__nv_bfloat16*>(out.data), tokens);
     }
