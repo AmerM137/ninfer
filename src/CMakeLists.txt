@@ -300,6 +300,11 @@ if(NINFER_BUILD_PROMPT_INPUT)
 endif()
 
 if(NINFER_BUILD_APPS OR BUILD_TESTING)
+  add_library(ninfer_product_logging STATIC
+    product/logging/logging.cpp)
+  ninfer_internal_includes(ninfer_product_logging)
+  target_link_libraries(ninfer_product_logging PUBLIC spdlog::spdlog)
+
   add_library(ninfer_product_load_progress STATIC
     product/load_progress/load_progress.cpp)
   ninfer_internal_includes(ninfer_product_load_progress)
