@@ -85,6 +85,12 @@ if(NINFER_BUILD_MEDIA_ACQUIRE)
 endif()
 find_package(Threads REQUIRED)
 
+if(NINFER_BUILD_APPS OR BUILD_TESTING)
+  # Product operational logging is an offline, repository-pinned dependency. Core-only builds do
+  # not configure or link it.
+  add_subdirectory(third_party/spdlog)
+endif()
+
 if(WIN32)
   # The shared FFmpeg runtime must sit beside every binary that loads it: the
   # two apps and the media-linked test executables. swresample never appears

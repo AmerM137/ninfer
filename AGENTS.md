@@ -2,6 +2,15 @@
 
 These rules apply to the whole repository.
 
+## Merge requirements
+
+Whenever changes from `master` are merged, preserve the Windows-port-specific commits and
+behavior while resolving conflicts; do not drop those changes merely because the corresponding
+code differs on `master`.
+
+After merging changes from `master`, build and test the resulting tree with both the `cl` and
+`clang-cl` toolchains before considering the merge verified.
+
 ## Governing objective
 
 Complete the user's explicit deliverable within the applicable product contract. For the declared
@@ -181,8 +190,8 @@ govern a live decision in the current task.
 These boundaries govern ordinary implementation work. An explicit architecture task may revise
 them, but must update the corresponding active authorities and affected implementation together.
 
-- `.ninfer` is the only C++ product artifact. Do not add `.qus` fallback, extension detection,
-  compatibility shims, or a second product lane.
+- `.ninfer` is the only C++ product artifact. Do not add extension detection, compatibility shims,
+  or a second product lane.
 - `include/ninfer/engine.h` and `include/ninfer/types.h` are the opaque Engine interface used by
   in-tree applications and owning host values. NInfer does not currently install or export a C++
   SDK. `include/ninfer/ops/` contains repository-internal semantic Op contracts.

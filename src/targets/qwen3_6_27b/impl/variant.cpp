@@ -18,6 +18,16 @@
 #define NINFER_QWEN36_RUNTIME_NS qwen3_6_27b_runtime
 #include "targets/qwen3_6/impl/runtime/instantiate.h"
 
+namespace {
+using CapturePressureCandidate =
+    ::ninfer::targets::qwen3_6::CapturePressureCandidate<
+        ::ninfer::targets::qwen3_6_27b::detail::Variant>;
+using CapturePressureCandidateMoveAssignment =
+    CapturePressureCandidate& (CapturePressureCandidate::*)(CapturePressureCandidate&&) noexcept;
+[[maybe_unused]] constexpr CapturePressureCandidateMoveAssignment
+    kCapturePressureCandidateMoveAssignment = &CapturePressureCandidate::operator=;
+} // namespace
+
 namespace ninfer::targets::qwen3_6_27b::detail {
 namespace {
 
