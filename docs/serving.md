@@ -745,7 +745,7 @@ they do not infer request behavior from process-global counter deltas.
 | `server_start` | target/weights identity and artifact, resolved Engine and context-cache capacities, registered thinking/non-thinking sampler defaults plus process overrides, thinking-history and thinking-budget defaults, Device arenas, the optional non-additive Vision layout inside the unified workspace, Host State/KV capacity and occupancy, KV sizing ledger, CUDA Graph allowance, CUDA/GPU environment, and redacted argv |
 | `request_start` | protocol, resolved sampler and seed, requested and effective reasoning effort, thinking mode and optional budget, Responses semantic-change flag, output budget, stream/message/tool shape |
 | `request_rejected` | parsed request shape, requested reasoning effort with unresolved effective value, media-item count, `phase: "prepare"`, and the exact HTTP status/type/code/parameter/message for a synchronous preparation rejection |
-| `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, request-owned materialization cost/search/bound diagnostics, thinking-budget application counters, unrounded request-stage seconds, per-request Engine Host exposure, and complete speculative-decoding counters |
+| `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, request-owned materialization cost/search diagnostics, thinking-budget application counters, unrounded request-stage seconds, per-request Engine Host exposure, and complete speculative-decoding counters |
 | `request_error` | the resolved request configuration and generation error message |
 | `throughput` | interval token/decode/context-cache pressure counter deltas, authoritative worker Host-work deltas, current scheduler/resource gauges, and decode-round batch statistics |
 
@@ -756,11 +756,10 @@ the template has no tiered default. A preparation rejection always leaves the re
 
 `request_done.materialization` is the immutable decision committed for that request. It reports predicted immediate,
 future-loss and total nanoseconds; evaluated targets and projection work; planning/search nanoseconds; stop reason;
-model-optimal and budget-exhausted flags; the best remaining lower bound and absolute/relative gap; selected degradation
-units; and whether the selected target was the maximal root fallback. Stop reasons are `no_pressure`, `model_optimal`,
-`queue_exhausted`, `target_budget`, `expansion_capacity`, `time_budget`, and `value_of_next_expansion`.
-`model_optimal` is relative to the configured machine/cache-value model, semantic target graph, and canonical stage
-contract—not a claim that observed TTFT is globally optimal. Aborted planning attempts are not published.
+the budget-exhausted flag; selected degradation units; and whether the selected target was the maximal root fallback.
+Stop reasons are `no_pressure`, `queue_exhausted`, `target_budget`, `expansion_capacity`, `time_budget`, and
+`value_of_next_expansion`. Search is bounded and heuristic; these diagnostics do not claim model or global optimality.
+Aborted planning attempts are not published.
 
 `request_done.timings_seconds` contains `prepare`, `ttft`, `vision`, `prefill`, `decode`, and `total`
 as full-precision JSON numbers. Its `speculative` object contains `backend`, `draft_window`, `rounds`,

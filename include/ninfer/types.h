@@ -576,12 +576,9 @@ enum class PrefixReusePath : std::uint8_t {
     SharedStablePrefix,
 };
 
-// Why pressure planning stopped for the materialization decision committed to one request.
-// "ModelOptimal" is relative to the configured target graph, canonical transaction order, and
-// numerical cost model; it is not a claim about globally optimal observed TTFT.
+// Why bounded pressure planning stopped for the materialization decision committed to one request.
 enum class MaterializationStopReason : std::uint8_t {
     NoPressure,
-    ModelOptimal,
     QueueExhausted,
     TargetBudget,
     ExpansionCapacity,
@@ -594,8 +591,6 @@ materialization_stop_reason_name(MaterializationStopReason reason) noexcept {
     switch (reason) {
     case MaterializationStopReason::NoPressure:
         return "no_pressure";
-    case MaterializationStopReason::ModelOptimal:
-        return "model_optimal";
     case MaterializationStopReason::QueueExhausted:
         return "queue_exhausted";
     case MaterializationStopReason::TargetBudget:
@@ -611,21 +606,17 @@ materialization_stop_reason_name(MaterializationStopReason reason) noexcept {
 }
 
 struct MaterializationDiagnostics {
-    std::uint64_t predicted_now_ns              = 0;
-    std::uint64_t predicted_future_loss_ns      = 0;
-    std::uint64_t predicted_total_ns            = 0;
-    std::uint32_t targets_evaluated             = 0;
-    std::uint64_t projection_work               = 0;
-    std::uint64_t planning_elapsed_ns           = 0;
-    std::uint64_t search_elapsed_ns             = 0;
-    MaterializationStopReason stop_reason       = MaterializationStopReason::NoPressure;
-    bool model_optimal                          = true;
-    bool budget_exhausted                       = false;
-    std::uint64_t best_remaining_lower_bound_ns = 0;
-    std::uint64_t absolute_bound_gap_ns         = 0;
-    double relative_bound_gap                   = 0.0;
-    std::uint32_t selected_degradation_units    = 0;
-    bool selected_maximal_fallback              = false;
+    std::uint64_t predicted_now_ns           = 0;
+    std::uint64_t predicted_future_loss_ns   = 0;
+    std::uint64_t predicted_total_ns         = 0;
+    std::uint32_t targets_evaluated          = 0;
+    std::uint64_t projection_work            = 0;
+    std::uint64_t planning_elapsed_ns        = 0;
+    std::uint64_t search_elapsed_ns          = 0;
+    MaterializationStopReason stop_reason    = MaterializationStopReason::NoPressure;
+    bool budget_exhausted                    = false;
+    std::uint32_t selected_degradation_units = 0;
+    bool selected_maximal_fallback           = false;
 
     [[nodiscard]] friend constexpr bool
     operator==(const MaterializationDiagnostics&,

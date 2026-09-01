@@ -315,11 +315,7 @@ Json materialization_json(const ninfer::MaterializationDiagnostics& diagnostics)
         {"planning_elapsed_ns", diagnostics.planning_elapsed_ns},
         {"search_elapsed_ns", diagnostics.search_elapsed_ns},
         {"stop_reason", ninfer::materialization_stop_reason_name(diagnostics.stop_reason)},
-        {"model_optimal", diagnostics.model_optimal},
         {"budget_exhausted", diagnostics.budget_exhausted},
-        {"best_remaining_lower_bound_ns", diagnostics.best_remaining_lower_bound_ns},
-        {"absolute_bound_gap_ns", diagnostics.absolute_bound_gap_ns},
-        {"relative_bound_gap", diagnostics.relative_bound_gap},
         {"selected_degradation_units", diagnostics.selected_degradation_units},
         {"selected_maximal_fallback", diagnostics.selected_maximal_fallback},
     };

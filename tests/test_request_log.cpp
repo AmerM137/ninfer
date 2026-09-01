@@ -365,21 +365,17 @@ int main() {
     outcome.metrics.speculative_fallback_steps        = 2;
     outcome.metrics.speculative_accepted_per_position = {290, 240, 190};
     outcome.metrics.materialization                   = {
-                          .predicted_now_ns              = 200000,
-                          .predicted_future_loss_ns      = 50000,
-                          .predicted_total_ns            = 250000,
-                          .targets_evaluated             = 7,
-                          .projection_work               = 31,
-                          .planning_elapsed_ns           = 9000,
-                          .search_elapsed_ns             = 6000,
-                          .stop_reason                   = ninfer::MaterializationStopReason::ModelOptimal,
-                          .model_optimal                 = true,
-                          .budget_exhausted              = false,
-                          .best_remaining_lower_bound_ns = 250000,
-                          .absolute_bound_gap_ns         = 0,
-                          .relative_bound_gap            = 0.0,
-                          .selected_degradation_units    = 2,
-                          .selected_maximal_fallback     = false,
+                          .predicted_now_ns           = 200000,
+                          .predicted_future_loss_ns   = 50000,
+                          .predicted_total_ns         = 250000,
+                          .targets_evaluated          = 7,
+                          .projection_work            = 31,
+                          .planning_elapsed_ns        = 9000,
+                          .search_elapsed_ns          = 6000,
+                          .stop_reason                = ninfer::MaterializationStopReason::QueueExhausted,
+                          .budget_exhausted           = false,
+                          .selected_degradation_units = 2,
+                          .selected_maximal_fallback  = false,
     };
     outcome.thinking = ninfer::ThinkingBudgetStats{.configured_budget     = 256,
                                                    .model_thinking_tokens = 256,
@@ -421,8 +417,9 @@ int main() {
               "speculative position counts missing");
     failures += check(done.at("materialization").at("predicted_total_ns") == 250000 &&
                           done.at("materialization").at("targets_evaluated") == 7 &&
-                          done.at("materialization").at("stop_reason") == "model_optimal" &&
-                          done.at("materialization").at("model_optimal") == true,
+                          done.at("materialization").at("stop_reason") == "queue_exhausted" &&
+                          !done.at("materialization").contains("model_optimal") &&
+                          !done.at("materialization").contains("absolute_bound_gap_ns"),
                       "request-owned materialization diagnostics missing");
     failures += check(
         done.at("engine_timing").at("queue_wait_seconds") == 0.001 &&
