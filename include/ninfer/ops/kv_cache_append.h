@@ -52,15 +52,14 @@ struct KVCacheAppendPrefixExecutionEnvelope {
  * vector occupies 128 code bytes plus 16 scale bytes. K8V4 uses the existing 256-byte row-scaled
  * FP8 K code plus one FP16 scale, and the 144-byte NVFP4 representation for V.
  *
- * FP8 applies the fixed normalized D256 Hadamard preparation to K; NVFP4 applies it to K and V;
- * K8V4 applies it to both while using FP8 for K and NVFP4 for V. Every transform is evaluated in
- * FP32 from represented BF16 source values. The paired causal consumer applies the same transform
- * to Q and, for rotated V, the FP32 inverse transform after attention. The transform and raw
- * code/scale bytes are not standalone mathematical outputs. Standalone and fused append produce
- * byte-identical cache representations. Every addressed code/value and scale is overwritten, and
- * no unrelated cache row is read or written. Inputs and every cache plane/table are pairwise
- * non-overlapping. The Op owns no persistent allocation, frontier, request identity, or commit
- * authority.
+ * INT8 and FP8 apply the fixed normalized D256 Hadamard preparation to K; NVFP4 and K8V4 apply it
+ * to both K and V. Every transform is evaluated in FP32 from represented BF16 source values. The
+ * paired Q and output interpretation belongs to the causal softmax_attention contract. Transform
+ * results and raw code/scale bytes are not standalone mathematical outputs. Standalone and fused
+ * append produce byte-identical cache representations. Every addressed code/value and scale is
+ * overwritten, and no unrelated cache row is read or written. Inputs and every cache plane/table
+ * are pairwise non-overlapping. The Op owns no persistent allocation, frontier, request identity,
+ * or commit authority.
  */
 void kv_cache_append(const Tensor& k, const Tensor& v, const Tensor& positions,
                      PagedKVLayerView cache, cudaStream_t stream);

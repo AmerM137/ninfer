@@ -31,7 +31,6 @@ endif()
 add_executable(ninfer-perplexity
   perplexity/main.cpp
   perplexity/corpus.cpp
-  perplexity/digest.cpp
   perplexity/evaluation.cpp)
 target_include_directories(ninfer-perplexity PRIVATE
   ${PROJECT_SOURCE_DIR}/include

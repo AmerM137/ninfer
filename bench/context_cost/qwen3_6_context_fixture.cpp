@@ -399,12 +399,15 @@ std::vector<TextCase> text_cases(std::uint32_t chunk) {
 }
 
 std::uint64_t attention_pairs(std::uint32_t prefix, std::uint32_t suffix) {
-    const unsigned __int128 pairs = static_cast<unsigned __int128>(prefix) * suffix +
-                                    static_cast<unsigned __int128>(suffix) * (suffix + 1ULL) / 2U;
-    if (pairs > std::numeric_limits<std::uint64_t>::max()) {
+    const std::uint64_t prefix_pairs = static_cast<std::uint64_t>(prefix) * suffix;
+    const std::uint64_t suffix_pairs = suffix % 2 == 0
+                                           ? (static_cast<std::uint64_t>(suffix) / 2U) * (suffix + 1U)
+                                           : static_cast<std::uint64_t>(suffix) *
+                                                 ((static_cast<std::uint64_t>(suffix) + 1U) / 2U);
+    if (prefix_pairs > std::numeric_limits<std::uint64_t>::max() - suffix_pairs) {
         throw std::overflow_error("prefill attention-pair count exceeds uint64");
     }
-    return static_cast<std::uint64_t>(pairs);
+    return prefix_pairs + suffix_pairs;
 }
 
 std::vector<std::uint8_t> block_ppm(int width, int height, std::uint8_t value) {

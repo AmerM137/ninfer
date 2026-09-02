@@ -106,7 +106,10 @@ python3 -m pytest \
 
 The Python suites cover generic artifact framing and exact converter inventories, source recipes,
 encoders, and payload verification. Model execution and real-artifact binding are tested through
-the C++ target and Engine suites below; there is no Python inference implementation.
+the C++ target and Engine suites below; there is no Python inference implementation. The two
+official source-resource preflight checks are opt-in: set `NINFER_QWEN3_6_27B_MODEL` and/or
+`NINFER_QWEN3_6_35B_A3B_MODEL` to the corresponding source checkpoint directory. Only those
+source-dependent checks are skipped when their variable is absent.
 
 The C++ prefix/MTP integration test is separately opt-in because it loads the full artifact and
 runs the real engine:

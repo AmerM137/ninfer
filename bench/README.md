@@ -64,8 +64,6 @@ Example:
   -p 512,2048 -n 128 -pg '2048,128' -r 5 --warmup 1
 ```
 
-`bf16` selects BF16 KV storage, `int8` selects INT8 group-64, `fp8` selects row-scaled E4M3 D256,
-`nvfp4` selects group-16 E2M1 K/V with UE4M3 scales, and `k8v4` selects FP8 K plus NVFP4 V.
 MTP is enabled with
 `--mtp-draft-tokens`; `--lm-head-draft` selects the optimized proposal head. CUDA Graph decode is
 enabled by default.
@@ -393,8 +391,7 @@ counts, or kernel-name filters in these benchmarks.
 append-and-attend and cached-only. It covers the registered D256 H24/KV4 and H16/KV2 geometries
 with BF16, INT8-G64, FP8-E4M3FN-row256, NVFP4-G16, and K8V4 KV storage. Production dispatch
 receives the caller-visible execution envelope and owns all decode, prompt, Small-T, and split-KV
-choices. The exact new selectors are `--kv-dtype nvfp4` and `--kv-dtype k8v4`; `all` emits each as
-an independent row.
+choices. `all` emits every storage mode as an independent row.
 
 Append-and-attend accepts `--batch 1,2,4,8`; each ordinary `--context L` point gives every row the
 same context and all `W` columns are valid. One exact mixed profile uses `--row-contexts`,
@@ -486,8 +483,8 @@ instruction utilization require a profiler capture of the complete public call.
 
 `ninfer_kv_cache_append_bench` unifies the two public append contracts without combining them in
 one timed body. `--mode full` calls full D256 KV publication for KV4/KV2 and BF16, INT8-G64,
-FP8-E4M3FN-row256, NVFP4-G16, or K8V4 caches. Its report keeps key/value vector bytes separate, so
-the asymmetric K8V4 payload is 258+144 rather than a doubled common vector size. `--mode prefix`
+FP8-E4M3FN-row256, NVFP4-G16, or K8V4 caches. Its report keeps key/value vector bytes separate for
+asymmetric storage profiles. `--mode prefix`
 calls device-count prefix publication for BF16 D128/KV8
 linear or 4096-slot cyclic caches; `T` is the public envelope and `C` is the device commit count.
 Every measured interval or captured graph contains exactly one selected public append call.

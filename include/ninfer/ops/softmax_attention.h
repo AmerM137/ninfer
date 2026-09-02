@@ -41,27 +41,24 @@ struct ContextAttentionExecutionEnvelope {
  * Op output is promoted to FP64 for comparison; storage rounding belongs to the Op criterion and
  * is not reproduced by the oracle.
  *
- * A causal INT8-G64 V row is interpreted by decoding each signed code c with its stored FP16 scale
- * bits: FP32(c) * FP32(scale_bits). A causal FP8-E4M3FN V row has one stored FP16 scale for D256;
- * each finite code e is decoded as FP32(e) * FP32(scale_bits). NVFP4-G16 K/V use sixteen packed
- * E2M1 groups, each with one stored UE4M3 scale; K8V4 combines row-scaled FP8 K with NVFP4-G16 V.
- * Quantized K uses the paired physical representation written by kv_cache_append; its
- * original-coordinate logical row is consumed through the matching Q/K profile. NVFP4 and K8V4
- * additionally store R*V for the normalized Hadamard R=H256/16, and apply R^T after the complete
- * attention reduction. Their represented-value conformance oracle independently evaluates RQ,
- * RK, and RV in FP32. K8V4 applies the exact FP8 Q/K codecs; NVFP4 rounds RQ once to FP16 and
- * exactly expands the persistent NVFP4 K/V representation to FP16. The oracle then evaluates QK,
- * stable Softmax, PV, and R^T in FP64 and compares the final BF16 production output. Its delta
- * from the unquantized BF16/FP64 oracle above is separate quantization-quality evidence.
+ * Quantized cache rows use the exact represented values defined by kv_cache_append. Quantized K
+ * is consumed through its matching Q/K profile. NVFP4 and K8V4 store R*V for the normalized
+ * Hadamard R=H256/16 and apply R^T after the complete attention reduction. Their represented-value
+ * conformance oracle independently evaluates RQ, RK, and RV in FP32. K8V4 applies the exact FP8
+ * Q/K codecs; NVFP4 rounds RQ once to FP16 and exactly expands the persistent NVFP4 K/V
+ * representation to FP16. The oracle then evaluates QK, stable Softmax, PV, and R^T in FP64 and
+ * compares the final BF16 production output. Its delta from the unquantized BF16/FP64 oracle above
+ * is separate quantization-quality evidence.
  *
- * The qualified BFloat16 compute profile keeps Q/K and persistent K at BF16, stores persistent V
- * as FP16, and uses native BF16 QK and FP16 P/V MMA with FP32 accumulation. The qualified
- * FP8 and K8V4 profiles use native E4M3FN QK MMA with FP32 accumulation; NVFP4 uses FP16 Q and
- * exactly expanded FP16 K with native FP16 QK MMA and FP32 accumulation in both prompt and small-T
- * routes. NVFP4 never quantizes Q to FP4 or FP8. All four keep Softmax, split state, merge,
- * normalization, and applicable Hadamard reductions in FP32. P is never quantized to FP8/FP4;
- * PV uses FP16 Tensor Cores with FP32 accumulation, and only the final public output is stored as
- * BF16. These arithmetic paths are implementation profiles rather than extra public tensor
+ * The qualified BFloat16 compute profile keeps Q/K and persistent K at BF16 and uses native BF16
+ * QK plus FP16 P/V MMA. INT8-G64 uses native signed-INT8 Q/K MMA; its prompt route uses FP16 P/V
+ * MMA and its small-T route uses BF16 P/V MMA. FP8 and K8V4 use native E4M3FN QK MMA, while NVFP4
+ * uses FP16 Q and exactly expanded FP16 K with native FP16 QK MMA in both prompt and small-T
+ * routes. NVFP4 never quantizes Q to FP4 or FP8. INT8 QK accumulates each group in INT32 and
+ * combines represented group products in FP32; the other QK profiles accumulate in FP32. Every
+ * profile retains FP32 accumulation for PV, split state, merge, normalization, and applicable
+ * Hadamard reductions. P is never quantized to FP8/FP4, and only the final public output is stored
+ * as BF16. These arithmetic paths are implementation profiles rather than extra public tensor
  * boundaries. Every cache route has one named numerical criterion and is checked directly against
  * its independent oracle; route-to-route parity is only supplementary evidence.
  * Those criteria apply to the registered geometries, tested extents, conformance matrix, and
@@ -133,6 +130,9 @@ void packed_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
  * through the inert tail; an empty row uses zero positions. Other tail values are safe dummies.
  * Tail columns do not mutate cache and produce exact BF16 zero.
  *
+ * The registered prompt route consumes the paged cache directly and requires zero transient
+ * workspace. Small-T routes may use the split state returned by the capacity query below.
+ *
  * The caller guarantees that the maximum p+1 over live rows lies within envelope. The envelope is
  * a host launch/workspace resource promise over that batch maximum, not a mask and not persistent
  * state. Inputs, output, every cache plane/table, and live workspace suballocations are pairwise
@@ -163,7 +163,7 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
 /**
  * Return transient capacity for every W in the inclusive interval at one exact batch size. The
  * head geometry, cache dtype, and execution envelope are fixed implementation-profile inputs.
- * Invalid profiles or intervals throw; a legal prompt route may return zero.
+ * Invalid profiles or intervals throw; an interval containing only prompt routes returns zero.
  */
 [[nodiscard]] std::size_t causal_softmax_attention_workspace_capacity_bytes(
     AttentionHeadGeometry geometry, KvCacheStorage cache_storage,
