@@ -179,6 +179,10 @@ int main() {
                           configured.media_preprocess_threads == 6,
                       "media preparation limits did not reach serving options");
 
+    const ServeOptions logging = parse({"ninfer-serve", "model.ninfer", "--log-level", "debug"});
+    failures += check(logging.log_level == ninfer::product::LogLevel::Debug,
+                      "log level did not reach serving options");
+
     const ServeOptions context_cache =
         parse({"ninfer-serve", "model.ninfer", "--device-state-slots", "3", "--host-state-slots",
                "5", "--host-kv-mib", "64", "--max-private-continuations", "9",
@@ -299,6 +303,8 @@ int main() {
     failures +=
         check(serve_usage_text("ninfer-serve").find("--log-stats-interval-ms") != std::string::npos,
               "serve help omits --log-stats-interval-ms");
+    failures += check(serve_usage_text("ninfer-serve").find("--log-level") != std::string::npos,
+                      "serve help omits the log-level control");
     failures += check(serve_usage_text("ninfer-serve").find("--media-preprocess-threads") !=
                           std::string::npos,
                       "serve help omits media preparation controls");

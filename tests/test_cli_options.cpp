@@ -66,6 +66,17 @@ int main() {
     failures +=
         check(help.find("nvfp4") != std::string::npos && help.find("k8v4") != std::string::npos,
               "CLI help omits a production KV storage mode");
+    const ninfer::cli::Options logging =
+        parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--log-level", "debug"});
+    failures += check(logging.log_level == ninfer::product::LogLevel::Debug,
+                      "CLI log level was not parsed");
+    failures += check(help.find("--log-level") != std::string::npos,
+                      "CLI help omits the log-level control");
+    failures += check(rejects([] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                                       "--log-level", "verbose"});
+                      }),
+                      "CLI accepted an unknown log level");
     failures +=
         check(rejects([] {
                   (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--top-k", "21"});

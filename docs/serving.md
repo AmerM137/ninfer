@@ -743,6 +743,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--pending-timeout-ms N` | maximum preparation-plus-admission wait | `30000` |
 | `--prefill-chunk N` | text-prefill chunk | `1024` |
 | `--log-stats-interval-ms N` | aggregate throughput report interval; `0` disables it | `5000` |
+| `--log-level trace\|debug\|info\|warning\|error\|critical\|off` | pretty stderr verbosity | `info` |
 | `--device N` | CUDA device index | `0` |
 | `--context-cost-presets FILE` | optional runtime context-cost preset registry | generic + compiled defaults |
 | `--max-request-mib N` | body-size limit before JSON parsing | `384` |
@@ -800,18 +801,14 @@ zero-valued flags.
 
 Run `./build/apps/ninfer-serve --help` for the exact option contract.
 
-Serve writes operational records to stderr using
-`[YYYY-MM-DD HH:MM:SS.mmm] [level] [ninfer-serve] message`. Startup records expose CUDA setup,
-including Engine startup, artifact inspection, target planning/finalization, weight materialization,
-pinned staging, frontend/Program construction, Host State and Host KV pinning, CUDA Graph
-preparation, Engine finalization, Serve warmup, and readiness. Interactive terminals show one
-transient weight-materialization progress line. Redirected stderr contains only persistent
-structured phase records, including rate-limited progress for long loads. Nested startup phase
-durations explain their inclusive parent and must not be summed. Normal lifecycle and client
-rejections are `info`; overload, timeout, and upstream failures are `warning`; internal operation
-failures are `error`; a process-level unrecoverable failure is `critical`. Operational request
-records contain stable classifications and counts, never prompts, generated text, request bodies,
-credentials, or arbitrary client error messages.
+Serve writes human-readable operational records to stderr using
+`YYYY-MM-DD HH:MM:SS.mmm  LEVEL  message`. Normal output covers material startup milestones,
+readiness, request lifecycle, fixed-interval throughput, and shutdown; `--log-level debug` exposes
+internal startup and resource-planning detail. A terminal may use one transient line during startup,
+but Serve throughput is always a persistent record. Redirected stderr contains no terminal control
+sequences. Pretty values use readable units and rounded rates; use the independent request JSONL for
+complete fields and full precision. Operational records never contain prompts, generated text,
+request bodies, credentials, or arbitrary client error messages.
 
 ## Structured request log
 
@@ -819,9 +816,6 @@ credentials, or arbitrary client error messages.
 in append mode and flushes every event, so successive model or MTP blocks may share one campaign
 file. The parent directory must already exist. Failure to open the file aborts startup; the log path
 is also rejected if it resolves to the model artifact.
-
-Add `--request-log-jsonl profiles/bench/run/server.requests.jsonl` to the startup command to write
-the log at that path.
 
 Every line is one `ninfer_serve_request_log` schema-v19 JSON object. All events carry
 `timestamp_unix_ms` and a process-unique `server_instance_id`; request IDs are monotonic only within
@@ -880,12 +874,12 @@ response rendering, Responses storage, or terminal transport failures are operat
 events only and do not add a second JSONL terminal. Schema/model validation rejections before
 preparation and token-count-only calls are not measurement requests and do not receive request IDs.
 
-By default the server also reports aggregate activity every five seconds. `prefill` counts prompt
-suffix tokens actually computed during the interval, excluding prefix-cache hits; `decode` counts
-tokens finally committed by decode rounds, excluding the first token produced by prefill. For MTP
-and DFlash this is the accepted committed output, not draft or rejected tokens.
-The operational field `average_decode_batch` and JSONL `average_size` are decode row-rounds divided
-by decode rounds during the same interval. The
+By default the server persistently reports aggregate activity every five seconds. `prefill` counts
+prompt suffix tokens actually computed during the interval, excluding prefix-cache hits; `decode`
+counts tokens finally committed by decode rounds, excluding the first token produced by prefill.
+For MTP and DFlash this is the accepted committed output, not draft or rejected tokens.
+Pretty `batch` and JSONL `average_size` are decode row-rounds divided by decode rounds during the
+same interval. The
 `running`, `prefilling`, `decode_ready`, `waiting`, `materializing`, `capture_pending`, and
 `terminal_pending` fields are the Engine scheduler snapshot at the end of the interval. The JSONL
 `context_cache` object reports selection, capture, transfer, COW, pressure spill, private/shared
@@ -902,9 +896,10 @@ mutually exclusive Host phases and their `total`; `device_wait_seconds` is separ
 `detail_subset_seconds` and `detail_invocations` expose admission, context-transaction, replica, and
 stats-publication slow paths; these detail values are already contained in a top-level Host phase
 and must not be added to `total`. Per-round, per-row-round, and per-invocation normalized values are
-`null` when their denominator is zero. The operational interval record contains token rates,
-scheduler gauges, total Host-active milliseconds, and average decode batch; use JSONL for complete
-measurement analysis.
+`null` when their denominator is zero. Pretty throughput contains nonzero token rates and counts,
+the current running/prefill/decode-ready composition, nonzero waiting/materialization/terminal
+states, average decode batch, and Host-active time plus its fraction of the interval. Use JSONL for
+complete measurement analysis.
 Intervals with context materialization or retention activity are retained even when they contain no
 token execution; only fully idle intervals are omitted. Downstream measurement should prefer the
 raw counters and seconds over rounded stderr rates.
@@ -949,11 +944,10 @@ defined in [Resource scheduling and context cache](maintainer/resource-schedulin
 Compatible prefixes are reused for both text and multimodal histories unless the server starts with
 `--no-prefix-reuse`. A multimodal hit additionally requires matching token types, three-axis MRoPE
 positions, encoded-media digest, grid, and consumer spans. Media wholly inside a matched prefix
-skips Vision execution, while new suffix media is encoded normally. The operational completion
-record reports the reused token count as `prefix_cache_hit_tokens=`.
-
-The operational completion record reports one of six `prefix_reuse_path` values: `root`,
-`private_endpoint`, `private_turn_closure`, `private_response_replay`, `private_long_anchor`, or
+skips Vision execution, while new suffix media is encoded normally. The pretty completion record
+shows `cache N (P%, path)` using readable path labels; JSONL retains the exact
+`prefix_cache_hit_tokens` and `prefix_reuse_path` fields. Machine paths are `root`,
+`private_endpoint`, `private_turn_closure`, `private_response_replay`, `private_long_anchor`, and
 `shared_stable_prefix`. Reuse validation covers KV, recurrent state, hidden state, selected-backend
 state, and the exact prompt frontier. With stable `preserve_thinking=true`, the auxiliary checkpoint
 rolls to the message frontier immediately before the current response's deterministic generation

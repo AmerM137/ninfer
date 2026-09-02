@@ -31,8 +31,10 @@ benchmark-report, and external protocol behavior. Repository verification princi
   `test_tool_call_parser.cpp` — current protocol translation, Responses Item/state/SSE behavior,
   and incremental tool-call behavior;
 - `test_request_log.cpp` — the consumed request JSONL schema and exact measurement fields, plus
-  Serve-owned failure severity and exclusion of arbitrary client error text from operational
-  records;
+  representative Serve request/throughput pretty records, failure severity, zero-field elision,
+  and exclusion of arbitrary client error text;
+- `test_pretty_logging.cpp` — observable Service/Tool prefixes and separation of executable identity
+  from the human-readable record body;
 - `test_http_error_handler.cpp` — protocol-shaped payload-limit errors and application-error
   preservation;
 - `test_ninfer_bench_support.cpp` — product benchmark CLI, timing boundary, and schema-v13 reports;

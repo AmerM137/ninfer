@@ -1,5 +1,5 @@
 #include "serve/request_log.h"
-#include "product/logging/logging.h"
+#include "product/logging/pretty_format.h"
 #include "product/speculative_options.h"
 
 #include <spdlog/logger.h>
@@ -869,8 +869,8 @@ void JsonlRequestLog::append(std::string record) {
         }
     }
     if (report_failure && logger_ != nullptr) {
-        logger_->error("request_log status=failed phase=write path={}",
-                       product::quote_log_value(path_));
+        logger_->error("request log disabled | write failed | {}",
+                       product::format_pretty_text(path_));
     }
 }
 
