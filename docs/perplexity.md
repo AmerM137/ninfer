@@ -19,8 +19,7 @@ English reference text, English long-form text, Chinese reference text, and NInf
 
 The default evaluation uses a 4,096-token context and a 2,048-token stride. Use `--context` and
 `--stride` to change that protocol, or score one UTF-8 file with `--text FILE`. The available Main
-KV representations are `bf16`, `int8`, `fp8`, `nvfp4`, and `k8v4`. Reports retain the exact
-selected external name in `execution.kv_dtype`.
+KV representations are `bf16`, `int8`, `fp8`, `nvfp4`, and `k8v4`.
 
 ```bash
 ./build/apps/ninfer-perplexity models/qwen3_8_27b.ninfer \
@@ -30,15 +29,15 @@ selected external name in `execution.kv_dtype`.
 ```
 
 Run `./build/apps/ninfer-perplexity --help` for the complete command surface. The evaluator loads
-the model once, verifies and tokenizes every selected stream before scoring, and writes structured
+the model once, reads and tokenizes every selected stream before scoring, and writes structured
 startup plus closed preflight/scoring/stream phase records to stderr. Long scoring emits throttled
 progress between its begin and terminal records. Interactive weight loading uses the same transient
 progress line as the other applications. The final domain/overall table remains product output on
 stdout; the independent machine report is `report.json` under `profiles/perplexity/` unless
 `--output` supplies an empty directory.
 
-The fixed 64K comparison protocol uses the same registered artifact and full corpus for every
-mode with `--context 65536 --stride 32768`; `--quick` is not part of that acceptance run.
+For KV-format comparisons, the recommended long-context profile is the full corpus with
+`--context 65536 --stride 32768` and without `--quick`.
 
 ## Metric
 
@@ -62,18 +61,11 @@ retaining up to `context-stride` preceding tokens as local context. Streams neve
 
 ## Comparing runs
 
-For a numerical comparison, keep the corpus bytes and stream order, tokenizer output, context,
-stride, Prefill chunk, score tile, and all execution settings fixed except the variable being
-measured. Compare KV formats with the same artifact. Compare weight formats with the same KV format
-and first confirm that both artifacts tokenize every stream identically.
+For a numerical comparison, keep the corpus, context, stride, and execution settings fixed except
+the variable being measured. Compare KV formats with the same artifact and weight formats with the
+same KV format.
 
 The corpus name is a workload scale, not an exact token count. Exact input and scored-token counts
 are runtime results from the current artifact tokenizer and are recorded in each report. Reports
 contain unrounded NLL/PPL values for every window, stream, domain, and the token-weighted overall
 aggregate.
-
-Verify the fixed corpus without loading a model:
-
-```bash
-python3 tools/perplexity/prepare_corpus.py --check
-```

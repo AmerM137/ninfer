@@ -353,8 +353,6 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
         stream_report["id"]              = stream.source.id;
         stream_report["domain"]          = stream.source.domain;
         stream_report["path"]            = stream.source.path.string();
-        stream_report["bytes"]           = stream.source.text.size();
-        stream_report["sha256"]          = stream.source.sha256;
         stream_report["input_tokens"]    = stream.tokens.size();
         stream_report["unscored_tokens"] = 1;
         stream_report["seconds"]         = stream_seconds;

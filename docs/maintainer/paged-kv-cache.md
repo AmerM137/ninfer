@@ -81,7 +81,7 @@ MTP 与 DFlash 在一个 Engine 内互斥，因此当前最多有两个 growing 
 Main Text 与 MTP 使用 Engine 选择的 BF16、INT8-G64、FP8-E4M3FN-row256、NVFP4-G16 或 K8V4
 KV profile；DFlash Full 使用自己的 BF16 profile。`BFloat16` 名称下的物理 layout 为 BF16 K、FP16 V，
 写入端将 BF16 V 一次转换为 FP16。K8V4 是封闭的非对称 profile，不是运行时 bit-width 组合：K 固定为
-FP8-row256，V 固定为 NVFP4-G16。
+FP8-E4M3FN-row256，V 固定为 NVFP4-G16。
 
 `PagedKVStorageLayout` 将选定的 closed profile 解析为 K/V data/scale plane schema；target planner 按
 layer 展开该 schema 并确定 plane ordinal。Common pool implementation 仍只接收已展开的
@@ -264,8 +264,9 @@ address=base+d\,nb_0+o\,nb_1+g\,nb_2+h\,nb_3
 \]
 
 Code 与 scale planes 使用同一个 \(g\)，但使用各自 Tensor 的 leading coordinate 和 strides。
-Exact persistent codec 由对应 target model 与 consuming Op 定义；allocator 只解释 plane bytes、order
-和 page-group identity。
+Exact persistent codec 由 [`kv_cache_append.h`](../../include/ninfer/ops/kv_cache_append.h) 定义，
+consumer arithmetic 由 [`softmax_attention.h`](../../include/ninfer/ops/softmax_attention.h) 定义；
+allocator 只解释 plane bytes、order 和 page-group identity。
 
 D256 Main/MTP profile 的单 token/head 物理 payload 为：
 
@@ -685,8 +686,6 @@ request、pool kind或allocator state。Kernel correctness不能依赖相邻 log
 Paging 不引入 gather-to-contiguous cache或与 context 长度成比例的 staging copy。Route-specific tile、
 split、warp和shared-memory方案可以独立优化，只要保持同一 logical Attention、persistent codec与上述
 address contract。Op 的数值与性能准入规则见 [Op development](op-development.md)。
-当前 NVFP4 prompt consumer 在寄存器和 CTA shared-memory tile 中直接解码 paged K/V；它不申请
-transient global workspace，也不物化完整 K、V 或 P 中间张量。
 
 ---
 
@@ -750,7 +749,8 @@ consumer，且 replay in-flight期间不得改写同一 row。
 | public paged consumer views | `src/core/paged_kv_cache.h` |
 | growing-cache Ops | `include/ninfer/ops/`, `src/ops/` |
 
-Exact model state、KV codec 和 backend mathematics 见
+Exact model state 和 backend mathematics 见
 [Qwen3.6-27B model](qwen3.6-27b-model.md)与
-[Qwen3.6-35B-A3B model](qwen3.6-35b-a3b-model.md)。路径用于定位当前实现，不把文件或类名本身提升为
+[Qwen3.6-35B-A3B model](qwen3.6-35b-a3b-model.md)；persistent KV codec 和 causal consumer
+numerical contract 由上表中的 growing-cache Ops 定义。路径用于定位当前实现，不把文件或类名本身提升为
 外部接口。
