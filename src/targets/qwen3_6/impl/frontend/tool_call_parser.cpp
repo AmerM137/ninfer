@@ -403,55 +403,121 @@ bool decode_parameter(std::string_view encoded_value, const Contract::Parameter*
     return true;
 }
 
-bool parse_raw_parameter(std::string_view parameters, std::size_t& pos, RawToolCall& call) {
-    if (!starts_with_at(parameters, pos, kParamOpen)) { return false; }
-    const std::size_t name_begin = pos + kParamOpen.size();
-    const std::size_t name_end   = parameters.find('>', name_begin);
-    if (name_end == std::string_view::npos || name_end == name_begin) { return false; }
-    const std::string_view name = parameters.substr(name_begin, name_end - name_begin);
-    if (std::any_of(call.parameters.begin(), call.parameters.end(),
-                    [&](const RawParameter& existing) { return existing.name == name; })) {
+class QwenToolRegionParser {
+public:
+    QwenToolRegionParser(std::string_view text, std::size_t max_name_length,
+                         const Contract& contract)
+        : text_(text), max_name_length_(max_name_length), contract_(contract) {}
+
+    bool parse(std::vector<RawToolCall>& calls) const {
+        std::size_t pos = 0;
+        for (;;) {
+            skip_format_whitespace(text_, pos);
+            if (pos == text_.size()) { return !calls.empty(); }
+
+            RawToolCall call;
+            if (!parse_tool_call(pos, call)) { return false; }
+            calls.push_back(std::move(call));
+        }
+    }
+
+private:
+    bool consume(std::size_t& pos, std::string_view token) const {
+        if (!starts_with_at(text_, pos, token)) { return false; }
+        pos += token.size();
+        return true;
+    }
+
+    bool parse_tool_call(std::size_t& pos, RawToolCall& call) const {
+        if (!consume(pos, kToolOpen)) { return false; }
+        skip_format_whitespace(text_, pos);
+        if (!parse_function(pos, call)) { return false; }
+        skip_format_whitespace(text_, pos);
+        return consume(pos, kToolClose);
+    }
+
+    bool parse_function(std::size_t& pos, RawToolCall& call) const {
+        if (!consume(pos, kFunctionOpen)) { return false; }
+        const std::size_t name_begin = pos;
+        const std::size_t name_end   = text_.find('>', name_begin);
+        if (name_end == std::string_view::npos || name_end == name_begin) { return false; }
+        call.name = text_.substr(name_begin, name_end - name_begin);
+        if (!valid_function_name(call.name, max_name_length_)) { return false; }
+        if (contract_.enforce_declared_names &&
+            find_tool_contract(contract_, call.name) == nullptr) {
+            return false;
+        }
+        pos = name_end + 1;
+
+        for (;;) {
+            skip_format_whitespace(text_, pos);
+            if (consume(pos, kFunctionClose)) { return true; }
+            if (!parse_parameter(pos, call)) { return false; }
+        }
+    }
+
+    bool parse_parameter(std::size_t& pos, RawToolCall& call) const {
+        if (!consume(pos, kParamOpen)) { return false; }
+        const std::size_t name_begin = pos;
+        const std::size_t name_end   = text_.find('>', name_begin);
+        if (name_end == std::string_view::npos || name_end == name_begin) { return false; }
+        const std::string_view name = text_.substr(name_begin, name_end - name_begin);
+        if (std::any_of(call.parameters.begin(), call.parameters.end(),
+                        [&](const RawParameter& existing) { return existing.name == name; })) {
+            return false;
+        }
+
+        const std::size_t value_begin = name_end + 1;
+        std::size_t value_end         = 0;
+        if (!find_parameter_close(value_begin, value_end)) { return false; }
+        call.parameters.push_back(RawParameter{
+            .name = name, .value = text_.substr(value_begin, value_end - value_begin)});
+        pos = value_end + kParamClose.size();
+        return true;
+    }
+
+    bool find_parameter_open_before(std::size_t scan, std::size_t limit,
+                                    std::size_t& open_end) const {
+        std::size_t candidate = text_.find(kParamOpen, scan);
+        while (candidate != std::string_view::npos && candidate < limit) {
+            const std::size_t name_begin = candidate + kParamOpen.size();
+            const std::size_t name_end   = text_.find('>', name_begin);
+            if (name_end != std::string_view::npos && name_end < limit && name_end != name_begin) {
+                open_end = name_end + 1;
+                return true;
+            }
+            candidate = text_.find(kParamOpen, candidate + 1);
+        }
         return false;
     }
 
-    const std::size_t value_begin = name_end + 1;
-    const std::size_t value_end   = parameters.find(kParamClose, value_begin);
-    if (value_end == std::string_view::npos) { return false; }
-    call.parameters.push_back(RawParameter{
-        .name = name, .value = parameters.substr(value_begin, value_end - value_begin)});
-    pos = value_end + kParamClose.size();
-    return true;
-}
+    bool find_parameter_close(std::size_t value_begin, std::size_t& value_end) const {
+        std::size_t depth = 1;
+        std::size_t scan  = value_begin;
+        for (;;) {
+            const std::size_t close = text_.find(kParamClose, scan);
+            if (close == std::string_view::npos) { return false; }
 
-bool parse_raw_tool_call(std::string_view block, std::size_t max_name_length,
-                         const Contract& contract, RawToolCall& call) {
-    std::size_t pos = 0;
-    skip_format_whitespace(block, pos);
-    if (!starts_with_at(block, pos, kFunctionOpen)) { return false; }
-    const std::size_t name_begin = pos + kFunctionOpen.size();
-    const std::size_t name_end   = block.find('>', name_begin);
-    if (name_end == std::string_view::npos || name_end == name_begin) { return false; }
-    call.name = block.substr(name_begin, name_end - name_begin);
-    if (!valid_function_name(call.name, max_name_length)) { return false; }
-    if (contract.enforce_declared_names && find_tool_contract(contract, call.name) == nullptr) {
-        return false;
+            std::size_t nested_open_end = 0;
+            if (find_parameter_open_before(scan, close, nested_open_end)) {
+                ++depth;
+                scan = nested_open_end;
+                continue;
+            }
+
+            --depth;
+            if (depth == 0) {
+                value_end = close;
+                return true;
+            }
+            scan = close + kParamClose.size();
+        }
     }
 
-    pos                            = name_end + 1;
-    const std::size_t function_end = block.find(kFunctionClose, pos);
-    if (function_end == std::string_view::npos) { return false; }
-    const std::string_view parameters = block.substr(pos, function_end - pos);
-    std::size_t parameter_pos         = 0;
-    for (;;) {
-        skip_format_whitespace(parameters, parameter_pos);
-        if (parameter_pos == parameters.size()) { break; }
-        if (!parse_raw_parameter(parameters, parameter_pos, call)) { return false; }
-    }
-
-    pos = function_end + kFunctionClose.size();
-    skip_format_whitespace(block, pos);
-    return pos == block.size();
-}
+    std::string_view text_;
+    std::size_t max_name_length_;
+    const Contract& contract_;
+};
 
 bool decode_raw_tool_call(const RawToolCall& raw, const Contract& contract,
                           GeneratedToolCall& decoded) {
@@ -510,27 +576,18 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
     ParsedToolCallOutput out;
     out.content = rtrim_format_whitespace(std::string_view(text).substr(0, first));
 
-    std::size_t pos = first;
-    while (pos < text.size()) {
-        skip_format_whitespace(text, pos);
-        if (pos == text.size()) { break; }
-        if (!starts_with_at(text, pos, kToolOpen)) { return fallback(text); }
-        const std::size_t inner_begin = pos + kToolOpen.size();
-        const std::size_t close       = text.find(kToolClose, inner_begin);
-        if (close == std::string::npos) { return fallback(text); }
+    std::vector<RawToolCall> raw_calls;
+    const std::string_view tool_region = std::string_view(text).substr(first);
+    const QwenToolRegionParser parser(tool_region, max_tool_name_length, contract);
+    if (!parser.parse(raw_calls)) { return fallback(text); }
 
-        RawToolCall raw;
-        if (!parse_raw_tool_call(std::string_view(text).substr(inner_begin, close - inner_begin),
-                                 max_tool_name_length, contract, raw)) {
-            return fallback(text);
-        }
+    out.tool_calls.reserve(raw_calls.size());
+    for (const RawToolCall& raw : raw_calls) {
         GeneratedToolCall decoded;
         if (!decode_raw_tool_call(raw, contract, decoded)) { return fallback(text); }
         out.tool_calls.push_back(std::move(decoded));
-        pos = close + kToolClose.size();
     }
 
-    if (out.tool_calls.empty()) { return fallback(text); }
     out.is_tool_call_response = true;
     return out;
 }

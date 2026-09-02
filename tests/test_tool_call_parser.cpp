@@ -164,6 +164,58 @@ int test_declared_strings_preserve_text() {
     return failures;
 }
 
+int test_string_values_preserve_embedded_tool_markup() {
+    const auto contract       = contract_for("bash", Json{{"command", Json{{"type", "string"}}},
+                                                          {"timeout", Json{{"type", "integer"}}}});
+    const std::string command = "python3 - <<'PY'\n"
+                                "import re\n"
+                                "pattern = r'<parameter=edits>\\n(.*?)\\n</parameter>'\n"
+                                "print(pattern)\n"
+                                "PY";
+    const std::string text    = tool_call("bash", {{"command", command}, {"timeout", "30"}});
+    const auto parsed         = fi::parse_qwen_tool_call_output(text, 64, contract);
+
+    int failures = 0;
+    failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1,
+                      "balanced parameter markup inside a string broke the tool call");
+    if (parsed.tool_calls.size() != 1) { return failures; }
+    const Json args = Json::parse(parsed.tool_calls.front().arguments_json);
+    failures += check(args.at("command") == command,
+                      "embedded parameter markup was removed from the string value");
+    failures +=
+        check(args.at("timeout") == 30, "sibling parameter after embedded markup was not parsed");
+
+    const std::string nested_markup =
+        "literal closes: </function> and </tool_call>\n"
+        "<function=fake>body</function>\n"
+        "<tool_call>body</tool_call>\n"
+        "<parameter=outer>before<parameter=inner>value</parameter>after</parameter>";
+    const std::string nested_text = tool_call("bash", {{"command", nested_markup}});
+    const auto nested             = fi::parse_qwen_tool_call_output(nested_text, 64, contract);
+    failures += check(nested.is_tool_call_response && nested.tool_calls.size() == 1,
+                      "nested tool markup inside a string broke outer structure");
+    if (nested.tool_calls.size() == 1) {
+        const Json nested_args = Json::parse(nested.tool_calls.front().arguments_json);
+        failures += check(nested_args.at("command") == nested_markup,
+                          "nested function/tool/parameter markup was not preserved exactly");
+    }
+    return failures;
+}
+
+int test_unrepresentable_parameter_delimiters_fall_back() {
+    const auto contract = contract_for("bash", Json{{"command", Json{{"type", "string"}}}});
+    const std::string unmatched_open =
+        tool_call("bash", {{"command", "echo '<parameter=unterminated>'"}});
+    const std::string standalone_close = tool_call("bash", {{"command", "echo '</parameter>'"}});
+
+    int failures = 0;
+    failures += check_rejected(unmatched_open, contract,
+                               "unbalanced nested parameter open was silently repaired");
+    failures += check_rejected(standalone_close, contract,
+                               "standalone parameter close was guessed to be string content");
+    return failures;
+}
+
 int test_declared_json_types() {
     const auto contract = contract_for(
         "configure", Json{{"count", Json{{"type", "integer"}}},
@@ -530,6 +582,32 @@ int test_incremental_fallback_preserves_bytes() {
     return failures;
 }
 
+int test_incremental_embedded_parameter_markup() {
+    auto contract = output_contract_for("bash", Json{{"command", Json{{"type", "string"}}}});
+    const std::string command = "pattern='<parameter=inner>value</parameter>'\n"
+                                "printf '%s' \"$pattern\"";
+    const std::string text    = tool_call("bash", {{"command", command}});
+
+    fi::ToolCallOutputDecoder decoder(std::move(contract), 64);
+    std::string visible;
+    constexpr std::size_t kChunk = 7;
+    for (std::size_t offset = 0; offset < text.size(); offset += kChunk) {
+        visible += decoder.feed(std::string_view(text).substr(offset, kChunk));
+    }
+    auto terminal = decoder.finish();
+
+    int failures = 0;
+    failures +=
+        check(visible.empty() && terminal.content.empty() && terminal.tool_calls.size() == 1,
+              "chunked embedded parameter markup was not committed as a tool call");
+    if (terminal.tool_calls.size() == 1) {
+        const Json args = Json::parse(terminal.tool_calls.front().arguments_json);
+        failures += check(args.at("command") == command,
+                          "chunked embedded parameter markup changed string bytes");
+    }
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -537,6 +615,8 @@ int main() {
     failures += test_basic_legacy_parsing();
     failures += test_multiple_calls();
     failures += test_declared_strings_preserve_text();
+    failures += test_string_values_preserve_embedded_tool_markup();
+    failures += test_unrepresentable_parameter_delimiters_fall_back();
     failures += test_declared_json_types();
     failures += test_boolean_boundary();
     failures += test_exact_integer_boundary();
@@ -549,6 +629,7 @@ int main() {
     failures += test_all_or_nothing_commit();
     failures += test_incremental_valid_and_boolean();
     failures += test_incremental_fallback_preserves_bytes();
+    failures += test_incremental_embedded_parameter_markup();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

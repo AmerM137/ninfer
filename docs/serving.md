@@ -155,6 +155,11 @@ be valid JSON of an admitted top-level type. Mathematically integral JSON number
 JSON booleans. Schemas without a supported explicit type retain untyped inference. NInfer does not
 perform recursive JSON Schema validation or constrained decoding.
 
+String parameters preserve function/tool-call markers and balanced nested
+`<parameter=...>...</parameter>` text as value bytes. The Qwen wire format has no delimiter escape,
+so an unmatched nested parameter opener or a standalone `</parameter>` cannot be represented
+unambiguously; either causes the complete tool-call region to fall back to ordinary content.
+
 Message roles retain their input order through schema translation. The Qwen family frontend maps
 both `system` and `developer` to system-class ChatML blocks at their original positions; it does not
 move later instructions to the beginning of the conversation. A leading instruction keeps the
