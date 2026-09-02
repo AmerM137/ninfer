@@ -147,10 +147,13 @@ The request `model` must equal the public model ID: the artifact `identity.model
 the explicit `--model-id` override. Reasoning is returned separately as `reasoning_content`; answer
 text remains in `content`.
 
-Across Chat Completions, Responses, and Anthropic Messages, an explicit top-level tool-parameter
-type controls conversion of Qwen's untyped parameter text. String-admitting values remain strings;
-other explicitly typed values are decoded as JSON without coercion. NInfer does not validate
-generated arguments against the full JSON Schema.
+Across Chat Completions, Responses, and Anthropic Messages, a direct top-level tool-parameter
+`type`, or an `anyOf`/`oneOf` composed entirely of explicit primitive types, controls conversion of
+Qwen's untyped parameter text. String-admitting values remain strings; other declared values must
+be valid JSON of an admitted top-level type. Mathematically integral JSON numbers satisfy
+`integer`; booleans additionally accept case-insensitive `true` and `false` and are normalized to
+JSON booleans. Schemas without a supported explicit type retain untyped inference. NInfer does not
+perform recursive JSON Schema validation or constrained decoding.
 
 Message roles retain their input order through schema translation. The Qwen family frontend maps
 both `system` and `developer` to system-class ChatML blocks at their original positions; it does not
