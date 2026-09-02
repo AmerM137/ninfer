@@ -526,16 +526,46 @@ struct GenerationStart {
     std::uint32_t reused_prompt_tokens = 0;
 };
 
+// Cumulative prompt frontier published only after the corresponding Program work has completed.
+// The Engine owns the request-relative clock and accounting; protocol adapters choose names and
+// units for the wire representation.
+struct PromptProgress {
+    std::uint32_t total_prompt_tokens     = 0;
+    std::uint32_t reused_prompt_tokens    = 0;
+    std::uint32_t processed_prompt_tokens = 0;
+    std::uint64_t elapsed_ns              = 0;
+};
+
+// Cumulative timing snapshot at one stable output-commit boundary. Generated tokens count model
+// and Engine-injected tokens accepted into the sequence, independently of whether the Frontend has
+// enough visible bytes to publish an OutputDelta for that boundary.
+struct GenerationTimingObservation {
+    std::uint32_t generated_tokens      = 0;
+    std::uint64_t prompt_elapsed_ns     = 0;
+    std::uint64_t generation_elapsed_ns = 0;
+};
+
 class OutputSink {
 public:
-    virtual ~OutputSink()                     = default;
-    virtual void start(GenerationStart start) = 0;
-    virtual void publish(OutputDelta delta)   = 0;
+    virtual ~OutputSink()                                   = default;
+    virtual void start(GenerationStart start)               = 0;
+    virtual void progress(PromptProgress progress)          = 0;
+    virtual void timing(GenerationTimingObservation timing) = 0;
+    virtual void publish(OutputDelta delta)                 = 0;
 };
 
 enum class OutputConsumerMode : std::uint8_t {
     Aggregate,
     Streaming,
+};
+
+// Observation affects only request publication. It never changes model execution, output
+// semantics, scheduling, or cache selection. Live observations require a Streaming consumer;
+// phase timings may also be retained for an Aggregate terminal response.
+struct GenerationObservationOptions {
+    bool phase_timings   = false;
+    bool live_timings    = false;
+    bool prompt_progress = false;
 };
 
 class CancellationView {
@@ -566,7 +596,12 @@ struct GenerationTimings {
     double vision_seconds      = 0.0;
     double prefill_seconds     = 0.0;
     double decode_seconds      = 0.0;
-    double total_seconds       = 0.0;
+    // Request wall phases at committed model-state boundaries. Prompt begins when admission and
+    // its exact reuse choice are published and ends at the first accepted output token. Generation
+    // spans the first through last accepted output token and therefore has N-1 token intervals.
+    double prompt_wall_seconds     = 0.0;
+    double generation_wall_seconds = 0.0;
+    double total_seconds           = 0.0;
 };
 
 // Wall elapsed time directly observed in Engine-owned regions. "Exposed" values are latency

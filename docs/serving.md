@@ -106,6 +106,8 @@ The endpoint supports:
 - `n:1`, text-only `modalities`, and `response_format: {"type":"text"}`;
 - non-streaming responses and server-sent event streams;
 - `stream_options.include_usage`;
+- llama.cpp-compatible terminal `timings`, plus opt-in `timings_per_token` and
+  streaming `return_progress` observations;
 - non-strict function tools with `tool_choice` `auto`, `none`, or `allowed_tools` in `auto` mode,
   parallel calls enabled, assistant tool-call history, tool-result messages, and legacy
   function-call history;
@@ -214,6 +216,67 @@ finish-reason chunk and `[DONE]`. When `stream_options.include_usage` is true, a
 and reasoning-token details; choices carry `logprobs: null` when log probabilities were not
 requested, and aggregate assistant messages carry `refusal: null` because refusal output is not
 supported.
+
+### llama.cpp-compatible request observations
+
+Every successful Chat Completions response includes a top-level `timings` object. This is a
+llama.cpp-compatible response extension, not an OpenAI field. In a stream it is attached to the
+last JSON chunk before `[DONE]`: the empty `choices` usage chunk when
+`stream_options.include_usage` is true, otherwise the finish-reason chunk.
+
+```json
+{
+  "timings": {
+    "cache_n": 4096,
+    "prompt_n": 4096,
+    "prompt_ms": 83.0,
+    "prompt_per_token_ms": 0.020263671875,
+    "prompt_per_second": 49349.39759036145,
+    "predicted_n": 129,
+    "predicted_ms": 1140.0,
+    "predicted_per_token_ms": 8.90625,
+    "predicted_per_second": 112.28070175438596
+  }
+}
+```
+
+`cache_n` is the exact Engine-proven reused prompt prefix and `prompt_n` is the remaining prompt
+suffix, so `cache_n + prompt_n` equals `usage.prompt_tokens`. Prompt time starts when admission
+commits that exact reuse choice and ends when the first output token is committed. Generation time
+starts at that first token and ends at the last committed output token. Accordingly, generation
+speed uses `max(predicted_n - 1, 0)` token intervals; the first token belongs to prompt latency and
+is not counted again as a decode interval. Zero-token, one-token, zero-duration, and exact-cache-hit
+cases report finite zero rates rather than `NaN` or infinity. Speculative requests additionally
+include terminal `draft_n` and `draft_n_accepted` when draft work occurred.
+
+Set top-level `timings_per_token: true` on a streaming request to attach the latest cumulative
+timing snapshot to each visible reasoning or content chunk. This does not enable terminal timings,
+which are always present. A model commit that is temporarily hidden by UTF-8, stop-string,
+reasoning, or tool-call buffering still advances the cumulative token count; the next visible chunk
+observes that committed frontier. The option increases response serialization and transport volume
+and is off by default.
+
+Set top-level `return_progress: true` together with `stream: true` to receive prompt-processing
+chunks:
+
+```json
+{
+  "prompt_progress": {
+    "total": 8192,
+    "cache": 4096,
+    "processed": 6144,
+    "time_ms": 41
+  }
+}
+```
+
+The initial event has `processed == cache`. Later cumulative events are published only after the
+corresponding prefill unit commits, may be coalesced when the consumer is slower than prefill, and
+never move backwards. The final event has `processed == total` and precedes the first output delta.
+For an exact full-prefix hit, the initial event already has `cache == processed == total` and no
+synthetic prompt work is reported. `time_ms` is elapsed wall time since committed admission;
+clients may calculate actual suffix progress as `(processed-cache)/(total-cache)` when the
+denominator is nonzero.
 
 ### Multimodal request
 

@@ -200,6 +200,83 @@ int exercise_registered_frontend(const ninfer::Engine& engine) {
     return 0;
 }
 
+class ObservationSink final : public ninfer::OutputSink {
+public:
+    void start(ninfer::GenerationStart start) override {
+        if (started_) { valid_ = false; }
+        started_ = true;
+        start_   = start;
+    }
+
+    void progress(ninfer::PromptProgress progress) override {
+        if (!started_ || timing_seen_ ||
+            progress.total_prompt_tokens != start_.prompt.prompt_tokens ||
+            progress.reused_prompt_tokens != start_.reused_prompt_tokens ||
+            progress.processed_prompt_tokens < last_processed_ ||
+            progress.processed_prompt_tokens > progress.total_prompt_tokens ||
+            progress.elapsed_ns < last_progress_elapsed_ns_) {
+            valid_ = false;
+        }
+        last_processed_           = progress.processed_prompt_tokens;
+        last_progress_elapsed_ns_ = progress.elapsed_ns;
+    }
+
+    void timing(ninfer::GenerationTimingObservation timing) override {
+        if (!started_ || last_processed_ != start_.prompt.prompt_tokens ||
+            (timing_seen_ && (timing.generated_tokens < last_timing_.generated_tokens ||
+                              timing.prompt_elapsed_ns != last_timing_.prompt_elapsed_ns ||
+                              timing.generation_elapsed_ns < last_timing_.generation_elapsed_ns))) {
+            valid_ = false;
+        }
+        timing_seen_ = true;
+        last_timing_ = timing;
+    }
+
+    void publish(ninfer::OutputDelta) override {
+        if (!timing_seen_) { valid_ = false; }
+    }
+
+    [[nodiscard]] bool valid_for(const ninfer::GenerationResult& result) const {
+        return valid_ && started_ && timing_seen_ && start_.reused_prompt_tokens == 0 &&
+               last_processed_ == start_.prompt.prompt_tokens &&
+               last_timing_.generated_tokens == result.generated_token_ids.size() &&
+               result.timings.prompt_wall_seconds > 0.0 &&
+               result.timings.generation_wall_seconds >= 0.0;
+    }
+
+private:
+    ninfer::GenerationStart start_;
+    ninfer::GenerationTimingObservation last_timing_;
+    std::uint32_t last_processed_           = 0;
+    std::uint64_t last_progress_elapsed_ns_ = 0;
+    bool started_                           = false;
+    bool timing_seen_                       = false;
+    bool valid_                             = true;
+};
+
+int exercise_stream_observations(ninfer::Engine& engine) {
+    std::vector<ninfer::TokenId> prompt(2050, 198);
+    ninfer::RequestOptions request;
+    request.execution.requested_output_tokens = 3;
+    request.execution.sampling.temperature    = 0.0F;
+    request.execution.allow_prefix_reuse      = false;
+    request.stop.include_model_defaults       = false;
+    const ninfer::GenerationObservationOptions observation{
+        .phase_timings = true, .live_timings = true, .prompt_progress = true};
+
+    ObservationSink sink;
+    ninfer::GenerationHandle generation =
+        engine.submit(engine.prepare_tokens(std::move(prompt)), std::move(request),
+                      ninfer::OutputConsumerMode::Streaming, observation);
+    const ninfer::GenerationResult result = generation.wait(&sink);
+    if (result.generated_token_ids.size() != 3 || !sink.valid_for(result)) {
+        std::cerr
+            << "stream observations lost prompt progress, commit timing, or publication order\n";
+        return 1;
+    }
+    return 0;
+}
+
 int exercise_full_prefill_chunk(ninfer::Engine& engine) {
     constexpr std::size_t kChunkTokens = 1024;
     std::vector<ninfer::TokenId> prompt(kChunkTokens, 198);
@@ -1613,6 +1690,7 @@ int exercise_artifact(const char* artifact, std::string_view expected_target) {
             return result;
         }
         if (const int result = exercise_registered_frontend(engine); result != 0) { return result; }
+        if (const int result = exercise_stream_observations(engine); result != 0) { return result; }
         if (const int result = exercise_full_prefill_chunk(engine); result != 0) { return result; }
         if (const int result = exercise_rewrite_checkpoints(engine); result != 0) { return result; }
         if (const int result = exercise_prefix(engine); result != 0) { return result; }
@@ -1662,6 +1740,20 @@ int main() {
         std::cout << "skip: neither NINFER_QWEN3_6_27B_WEIGHTS nor "
                      "NINFER_QWEN3_6_27B_NVFP4_WEIGHTS nor a Qwen3.8 equivalent is set\n";
         return 77;
+    }
+    if (scenario != nullptr && std::string_view(scenario) == "stream-observations") {
+        const char* artifact = groupwise != nullptr && *groupwise != '\0' ? groupwise : nvfp4;
+        if (artifact == nullptr || *artifact == '\0') {
+            std::cerr << "stream-observations requires a Qwen3.6 27B artifact\n";
+            return 1;
+        }
+        ninfer::EngineOptions configured = engine_options(artifact);
+        configured.enable_vision         = false;
+        configured.context_cache         = ninfer::ContextCacheOptions{.enabled = false};
+        ninfer::Engine engine(std::move(configured));
+        const int result = exercise_stream_observations(engine);
+        if (result == 0) { std::cout << "ok\n"; }
+        return result;
     }
     if (scenario != nullptr && std::string_view(scenario) == "pressure-resume") {
         if (qwen38_nvfp4 == nullptr || *qwen38_nvfp4 == '\0') {

@@ -22,12 +22,14 @@ struct RequestLifetime;
 struct RequestCapacity;
 
 struct GenerationMetrics {
-    double prepare_seconds = 0.0;
-    double ttft_seconds    = 0.0;
-    double vision_seconds  = 0.0;
-    double prefill_seconds = 0.0;
-    double decode_seconds  = 0.0;
-    double total_seconds   = 0.0;
+    double prepare_seconds         = 0.0;
+    double ttft_seconds            = 0.0;
+    double vision_seconds          = 0.0;
+    double prefill_seconds         = 0.0;
+    double decode_seconds          = 0.0;
+    double prompt_wall_seconds     = 0.0;
+    double generation_wall_seconds = 0.0;
+    double total_seconds           = 0.0;
     ninfer::GenerationEngineTiming engine_timing;
 
     SpeculativeBackend speculative_backend    = SpeculativeBackend::None;
@@ -57,6 +59,8 @@ struct GenerationOutcome {
 
 struct StreamSink {
     std::function<void(const ninfer::GenerationStart& start)> on_start;
+    std::function<void(const ninfer::PromptProgress& progress)> on_progress;
+    std::function<void(const ninfer::GenerationTimingObservation& timing)> on_timing;
     std::function<void(const std::string& delta_text)> on_content;
     std::function<void(const std::string& delta_text)> on_reasoning;
     std::function<bool()> is_cancelled;
@@ -115,8 +119,9 @@ public:
 
     [[nodiscard]] PreparedRequest prepare(const GenerationRequest& req,
                                           GenerationConsumerMode consumer_mode,
-                                          std::function<bool()> is_cancelled = {},
-                                          ContextCacheHints context_cache    = {}) const;
+                                          ninfer::GenerationObservationOptions observation = {},
+                                          std::function<bool()> is_cancelled               = {},
+                                          ContextCacheHints context_cache = {}) const;
     [[nodiscard]] int count_prompt_tokens(const GenerationRequest& req,
                                           std::function<bool()> is_cancelled = {}) const;
 
@@ -139,6 +144,7 @@ private:
 
     [[nodiscard]] PreparedRequest
     prepare_impl(const GenerationRequest& req, GenerationConsumerMode consumer_mode,
+                 ninfer::GenerationObservationOptions observation,
                  std::function<bool()> is_cancelled, ContextCacheHints context_cache,
                  CacheParticipation cache_participation, DeadlinePolicy deadline_policy) const;
     [[nodiscard]] std::shared_ptr<RequestLifetime>
