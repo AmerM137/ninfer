@@ -17,7 +17,8 @@
 namespace ninfer::serve {
 namespace {
 
-using Json = nlohmann::json;
+using Json        = nlohmann::json;
+using OrderedJson = nlohmann::ordered_json;
 
 std::string random_identifier(const char* prefix) {
     static thread_local std::mt19937_64 random{std::random_device{}()};
@@ -43,8 +44,8 @@ std::vector<ToolCall> materialize_tool_calls(const GenerationOutcome& outcome) {
     return result;
 }
 
-Json parse_tool_input(const ToolCall& call) {
-    Json input = Json::parse(call.arguments_json, nullptr, false);
+OrderedJson parse_tool_input(const ToolCall& call) {
+    OrderedJson input = OrderedJson::parse(call.arguments_json, nullptr, false);
     if (input.is_discarded() || !input.is_object()) {
         throw std::logic_error("Engine produced non-object Anthropic tool input");
     }
@@ -182,32 +183,32 @@ std::string make_anthropic_sse_error(const ApiError& error, const std::string& r
 
 std::string make_anthropic_messages_response(const AnthropicResponseIdentity& identity,
                                              const GenerationOutcome& outcome) {
-    Json content = Json::array();
+    OrderedJson content = OrderedJson::array();
     if (!outcome.reasoning.empty()) {
         // Claude clients expect a non-empty opaque value. The response identity already has the
         // required lifetime, so Thinking introduces no independent state or credential.
-        content.push_back(Json{{"type", "thinking"},
-                               {"thinking", outcome.reasoning},
-                               {"signature", identity.message_id}});
+        content.push_back(OrderedJson{{"type", "thinking"},
+                                      {"thinking", outcome.reasoning},
+                                      {"signature", identity.message_id}});
     }
     if (!outcome.text.empty()) {
-        content.push_back(Json{{"type", "text"}, {"text", outcome.text}});
+        content.push_back(OrderedJson{{"type", "text"}, {"text", outcome.text}});
     }
     for (const ToolCall& call : materialize_tool_calls(outcome)) {
-        content.push_back(Json{{"type", "tool_use"},
-                               {"id", call.id},
-                               {"name", call.name},
-                               {"input", parse_tool_input(call)}});
+        content.push_back(OrderedJson{{"type", "tool_use"},
+                                      {"id", call.id},
+                                      {"name", call.name},
+                                      {"input", parse_tool_input(call)}});
     }
     const StopPresentation stop = stop_presentation(outcome);
-    return Json{{"id", identity.message_id},
-                {"type", "message"},
-                {"role", "assistant"},
-                {"model", identity.model},
-                {"content", std::move(content)},
-                {"stop_reason", stop.reason},
-                {"stop_sequence", stop.sequence},
-                {"usage", final_usage(outcome)}}
+    return OrderedJson{{"id", identity.message_id},
+                       {"type", "message"},
+                       {"role", "assistant"},
+                       {"model", identity.model},
+                       {"content", std::move(content)},
+                       {"stop_reason", stop.reason},
+                       {"stop_sequence", stop.sequence},
+                       {"usage", final_usage(outcome)}}
         .dump();
 }
 

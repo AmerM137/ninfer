@@ -17,7 +17,7 @@
 
 namespace {
 
-using Json = nlohmann::json;
+using Json = ninfer::serve::RequestJson;
 using namespace ninfer::serve;
 
 int check(bool condition, const std::string& message) {
@@ -536,6 +536,18 @@ int test_tools_and_effective_subset() {
     failures += check(disabled.prompt.generation.tool_choice.mode == ToolChoiceMode::None &&
                           !disabled.prompt.generation.uses_tools(),
                       "tool_choice none disables generation tools without deleting their echo");
+
+    const Json ordered = Json::parse(
+        R"({"model":"m","input":"probe","tools":[{"type":"function","name":"probe","parameters":{"type":"object","properties":{"zeta":{"type":"string"},"alpha":{"type":"integer"}}}}]})");
+    const OpenAIResponsesCreateRequest ordered_request =
+        parse_openai_responses_create_request(ordered, limits());
+    const ninfer::PromptInput ordered_prompt =
+        to_prompt_input(ordered_request.prompt.generation, ResolvedPromptSemantics{}, {});
+    failures += check(
+        ordered_prompt.options.tool_jsons.size() == 1 &&
+            ordered_prompt.options.tool_jsons.front() ==
+                R"({"type":"function","function":{"name":"probe","parameters":{"type":"object","properties":{"zeta":{"type":"string"},"alpha":{"type":"integer"}}},"strict":false}})",
+        "OpenAI Responses changed tool-schema member order before PromptInput");
     return failures;
 }
 
@@ -962,8 +974,8 @@ int test_input_tokens_uses_shared_state_path() {
     failures += check(resolved.generation.tools.size() == 1 &&
                           resolved.generation.tools[0].name == "mcp__clock__now",
                       "input token counting uses the namespace tool translation path");
-    failures += check(Json::parse(make_openai_response_input_tokens_body(9)) ==
-                          Json{{"object", "response.input_tokens"}, {"input_tokens", 9}},
+    failures += check(nlohmann::json::parse(make_openai_response_input_tokens_body(9)) ==
+                          nlohmann::json{{"object", "response.input_tokens"}, {"input_tokens", 9}},
                       "input token count response shape");
     return failures;
 }

@@ -5,6 +5,7 @@
 #include <iostream>
 #include <limits>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -64,6 +65,25 @@ ninfer::EngineOptions shared_replacement_engine_options(const char* artifact) {
     options.context_cache.host_kv_capacity_bytes = 256ULL << 20;
     options.context_cache.max_private_continuations         = 2;
     options.context_cache.max_shared_prefixes               = 1;
+    options.context_cache.max_long_anchors_per_continuation = 0;
+    return options;
+}
+
+ninfer::EngineOptions anthropic_prefix_regression_engine_options(const char* artifact) {
+    ninfer::EngineOptions options;
+    options.artifact_path                    = artifact;
+    options.max_context                      = 2048;
+    options.kv_capacity                      = ninfer::KvCapacityPolicy::explicit_capacity(2048);
+    options.prefill_chunk                    = 512;
+    options.speculative.backend              = ninfer::SpeculativeBackend::Mtp;
+    options.speculative.draft_tokens         = 3;
+    options.speculative.proposal_head        = ninfer::ProposalHead::Optimized;
+    options.max_concurrency                  = 1;
+    options.max_pending_requests             = 1;
+    options.context_cache.device_state_slots = 1;
+    options.context_cache.host_state_slots   = 4;
+    options.context_cache.host_kv_capacity_bytes            = 512ULL << 20;
+    options.context_cache.max_private_continuations         = 1;
     options.context_cache.max_long_anchors_per_continuation = 0;
     return options;
 }
@@ -656,6 +676,176 @@ int exercise_shared_replacement_and_full_capacity_reuse(const char* artifact) {
                   << after_replacement.shared_active_references << '/'
                   << after_filler.shared_active_references << '/'
                   << after_reuse.shared_active_references << '\n';
+        return 1;
+    }
+    return 0;
+}
+
+int exercise_anthropic_prefix_regression(const char* artifact) {
+    ninfer::Engine engine(anthropic_prefix_regression_engine_options(artifact));
+    if (!engine.options().context_cache.max_shared_prefixes ||
+        *engine.options().context_cache.max_shared_prefixes !=
+            ninfer::kMaximumExplicitPromptCacheMarkers) {
+        std::cerr << "single-concurrency Engine did not expose four default shared prefixes\n";
+        return 1;
+    }
+
+    const auto conversation = [](bool followup, const ninfer::GenerationResult* first = nullptr) {
+        ninfer::PromptInput input;
+        input.options.enable_thinking   = true;
+        input.options.preserve_thinking = true;
+        input.context_cache.session_key = "anthropic-prefix-regression";
+        input.context_cache.retention   = ninfer::CacheRetentionHint::LiveSession;
+
+        ninfer::ChatMessage user;
+        user.role = ninfer::ChatRole::User;
+        user.parts.push_back(ninfer::MessagePart{.kind  = ninfer::MessagePartKind::Text,
+                                                 .text  = "Reply with exactly the word blue.",
+                                                 .media = {}});
+        input.messages.push_back(std::move(user));
+        if (!followup) { return input; }
+        if (first == nullptr) { throw std::logic_error("followup fixture has no source result"); }
+
+        ninfer::ChatMessage assistant;
+        assistant.role              = ninfer::ChatRole::Assistant;
+        assistant.reasoning_content = first->reasoning;
+        if (!first->content.empty()) {
+            assistant.parts.push_back(ninfer::MessagePart{
+                .kind = ninfer::MessagePartKind::Text, .text = first->content, .media = {}});
+        }
+        input.messages.push_back(std::move(assistant));
+        ninfer::ChatMessage next;
+        next.role = ninfer::ChatRole::User;
+        next.parts.push_back(ninfer::MessagePart{.kind  = ninfer::MessagePartKind::Text,
+                                                 .text  = "Now reply with exactly the word green.",
+                                                 .media = {}});
+        input.messages.push_back(std::move(next));
+        return input;
+    };
+    const auto generation_options = [](std::uint32_t outputs, bool model_stops) {
+        ninfer::RequestOptions options;
+        options.execution.requested_output_tokens = outputs;
+        options.execution.sampling.temperature    = 0.0F;
+        options.execution.allow_prefix_reuse      = true;
+        options.stop.include_model_defaults       = model_stops;
+        return options;
+    };
+
+    const ninfer::GenerationResult first =
+        engine.generate(engine.prepare(conversation(false)), generation_options(192, true));
+    if (first.reasoning.empty() || first.content.empty() ||
+        first.finish_reason != ninfer::FinishReason::StopToken) {
+        std::cerr << "endpoint regression fixture did not produce a closed reasoning response: "
+                  << "reasoning=" << first.reasoning.size() << " content=" << first.content.size()
+                  << " finish=" << static_cast<int>(first.finish_reason) << '\n';
+        return 1;
+    }
+    const ninfer::RuntimeStats before_followup = engine.runtime_stats();
+    const ninfer::GenerationResult followup =
+        engine.generate(engine.prepare(conversation(true, &first)), generation_options(1, false));
+    const ninfer::RuntimeStats after_followup = engine.runtime_stats();
+    const std::uint64_t followup_prefill =
+        after_followup.computed_prefill_tokens - before_followup.computed_prefill_tokens;
+    if (followup.generated_token_ids.size() != 1 ||
+        followup.prefix_reuse_path != ninfer::PrefixReusePath::PrivateEndpoint ||
+        followup.reused_prompt_tokens == 0 ||
+        followup_prefill != followup.prompt.prompt_tokens - followup.reused_prompt_tokens) {
+        std::cerr << "model-output reasoning frontier did not resume from PrivateEndpoint: path="
+                  << static_cast<int>(followup.prefix_reuse_path)
+                  << " reused=" << followup.reused_prompt_tokens
+                  << " prompt=" << followup.prompt.prompt_tokens << " computed=" << followup_prefill
+                  << '\n';
+        return 1;
+    }
+
+    const auto tool_definition = [](std::string name, std::string word) {
+        std::string description;
+        for (std::uint32_t index = 0; index < 160; ++index) {
+            description += word;
+            description.push_back(' ');
+        }
+        return std::string(R"({"type":"function","function":{"name":")") + name +
+               R"(","description":")" + description +
+               R"(","parameters":{"type":"object","properties":{"value":{"type":"string"}},"required":["value"]}}})";
+    };
+    const std::string alpha   = tool_definition("alpha", "stable-alpha");
+    const std::string bravo   = tool_definition("bravo", "stable-bravo");
+    const std::string charlie = tool_definition("charlie", "branch-charlie");
+    const auto tool_prompt    = [](std::vector<std::string> tools, std::string question) {
+        ninfer::PromptInput input;
+        input.options.enable_thinking = false;
+        input.options.tool_jsons      = std::move(tools);
+        input.context_cache.retention = ninfer::CacheRetentionHint::Disposable;
+        input.context_cache.allow_engine_automatic_shared_prefixes = false;
+        for (std::uint32_t count = 1; count <= input.options.tool_jsons.size(); ++count) {
+            input.context_cache.markers.push_back(ninfer::PromptCacheMarker{
+                   .kind             = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+                   .evidence         = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+                   .location         = ninfer::PromptCacheMarkerLocation::ToolBoundary,
+                   .after_tool_count = count,
+            });
+        }
+        ninfer::ChatMessage user;
+        user.role = ninfer::ChatRole::User;
+        user.parts.push_back(ninfer::MessagePart{
+               .kind = ninfer::MessagePartKind::Text, .text = std::move(question), .media = {}});
+        input.messages.push_back(std::move(user));
+        return input;
+    };
+    const auto filler_prompt = [](std::string text) {
+        ninfer::PromptInput input;
+        input.options.enable_thinking = false;
+        input.context_cache.retention = ninfer::CacheRetentionHint::Disposable;
+        input.context_cache.allow_engine_automatic_shared_prefixes = false;
+        ninfer::ChatMessage user;
+        user.role = ninfer::ChatRole::User;
+        user.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text, .text = std::move(text), .media = {}});
+        input.messages.push_back(std::move(user));
+        return input;
+    };
+
+    const ninfer::RequestOptions one_token = generation_options(1, false);
+    const ninfer::GenerationResult seed    = engine.generate(
+        engine.prepare(tool_prompt({alpha, bravo}, "Use one listed function.")), one_token);
+    const ninfer::GenerationResult first_filler = engine.generate(
+        engine.prepare(filler_prompt("Replace the private seed continuation.")), one_token);
+    if (seed.generated_token_ids.size() != 1 || first_filler.generated_token_ids.size() != 1) {
+        std::cerr << "shared compact fixture did not establish its seed and filler\n";
+        return 1;
+    }
+
+    const ninfer::RuntimeStats before_late = engine.runtime_stats();
+    const ninfer::GenerationResult late    = engine.generate(
+        engine.prepare(tool_prompt({alpha, bravo}, "Use one listed function.")), one_token);
+    const ninfer::RuntimeStats after_late = engine.runtime_stats();
+    const std::uint64_t late_prefill =
+        after_late.computed_prefill_tokens - before_late.computed_prefill_tokens;
+    const ninfer::GenerationResult second_filler = engine.generate(
+        engine.prepare(filler_prompt("Replace the private late continuation.")), one_token);
+    const ninfer::RuntimeStats before_branch = engine.runtime_stats();
+    const ninfer::GenerationResult branch    = engine.generate(
+        engine.prepare(tool_prompt({alpha, charlie}, "Use one listed function.")), one_token);
+    const ninfer::RuntimeStats after_branch = engine.runtime_stats();
+    const std::uint64_t branch_prefill =
+        after_branch.computed_prefill_tokens - before_branch.computed_prefill_tokens;
+
+    if (late.prefix_reuse_path != ninfer::PrefixReusePath::SharedStablePrefix ||
+        branch.prefix_reuse_path != ninfer::PrefixReusePath::SharedStablePrefix ||
+        late.generated_token_ids.size() != 1 || branch.generated_token_ids.size() != 1 ||
+        late.reused_prompt_tokens <= branch.reused_prompt_tokens ||
+        branch.reused_prompt_tokens == 0 || second_filler.generated_token_ids.size() != 1 ||
+        late_prefill != late.prompt.prompt_tokens - late.reused_prompt_tokens ||
+        branch_prefill != branch.prompt.prompt_tokens - branch.reused_prompt_tokens) {
+        std::cerr << "default shared catalog did not retain nested compact frontiers: late_path="
+                  << static_cast<int>(late.prefix_reuse_path)
+                  << " late_reused=" << late.reused_prompt_tokens
+                  << " late_prompt=" << late.prompt.prompt_tokens
+                  << " late_computed=" << late_prefill
+                  << " branch_path=" << static_cast<int>(branch.prefix_reuse_path)
+                  << " branch_reused=" << branch.reused_prompt_tokens
+                  << " branch_prompt=" << branch.prompt.prompt_tokens
+                  << " branch_computed=" << branch_prefill << '\n';
         return 1;
     }
     return 0;
@@ -1752,6 +1942,16 @@ int main() {
         configured.context_cache         = ninfer::ContextCacheOptions{.enabled = false};
         ninfer::Engine engine(std::move(configured));
         const int result = exercise_stream_observations(engine);
+        if (result == 0) { std::cout << "ok\n"; }
+        return result;
+    }
+    if (scenario != nullptr && std::string_view(scenario) == "anthropic-prefix-regression") {
+        if (qwen38_nvfp4 == nullptr || *qwen38_nvfp4 == '\0') {
+            std::cerr << "anthropic-prefix-regression requires "
+                         "NINFER_QWEN3_8_27B_NVFP4_WEIGHTS\n";
+            return 1;
+        }
+        const int result = exercise_anthropic_prefix_regression(qwen38_nvfp4);
         if (result == 0) { std::cout << "ok\n"; }
         return result;
     }

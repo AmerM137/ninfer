@@ -174,6 +174,13 @@ both `system` and `developer` to system-class ChatML blocks at their original po
 move later instructions to the beginning of the conversation. A leading instruction keeps the
 artifact template's existing tool/reasoning-instruction composition.
 
+Prompt-bearing JSON objects retain their received member order through request parsing and prompt
+rendering, including tool schemas and historical tool inputs. Canonical model-origin tool arguments
+retain that member order in aggregate and streaming responses, so an unmodified replay reconstructs
+the same ordered tool call. NInfer does not canonicalize semantically equivalent JSON: if a client
+reorders members, inserts defaults, or otherwise rewrites a tool object, the changed rendered input
+does not match the model-held endpoint and can reuse only an earlier exact checkpoint.
+
 At startup, NInfer resolves prompt capabilities from the exact `frontend/chat_template.jinja`
 resource embedded in the loaded artifact. It does not infer them from the request's `model` field,
 the artifact identity, or a target profile. A recognized effort-capable template exposes `low`,
@@ -651,6 +658,13 @@ is an Assistant prefill: generation continues its existing text instead of openi
 Assistant prefill cannot contain media, Thinking, or tool calls and cannot start with Thinking
 enabled.
 
+Claude Code may place its attribution metadata in the first block of a top-level System array. If
+that block is a text block beginning exactly with `x-anthropic-billing-header:`, NInfer consumes the
+whole block before token counting, prompt preparation, and cache identity construction. The rule is
+positional: a string-form System value, a later array block, or an inline System message with the
+same text remains ordinary prompt content. A `cache_control` marker attached to the consumed block
+is consumed with it rather than moved to adjacent content.
+
 `max_tokens` is optional for local clients and otherwise uses `--default-max-tokens`; a positive
 value is the complete output budget. `max_tokens:0` is rejected because NInfer does not expose a
 completed zero-output cache-prewarm lifecycle. `temperature`, `top_p`, `top_k`, and
@@ -770,7 +784,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--host-state-slots N` | pinned Host StateImage capacity | `8` |
 | `--host-kv-mib N` | shared pinned Host Main/Backend KV byte capacity in MiB | `8192` |
 | `--max-private-continuations N` | private continuation descriptor capacity | `2 * max-concurrency` |
-| `--max-shared-prefixes N` | shared stable-prefix descriptor capacity | `max-concurrency` |
+| `--max-shared-prefixes N` | Engine-wide shared stable-prefix descriptor capacity | `max(max-concurrency, 4)` |
 | `--max-long-anchors-per-continuation N` | private long-anchor limit per continuation | `2` |
 | `--no-thinking` | disable thinking by default | thinking on |
 | `--preserve-thinking` | preserve closed-turn assistant reasoning by default | off |

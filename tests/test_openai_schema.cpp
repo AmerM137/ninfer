@@ -15,7 +15,7 @@
 
 namespace {
 
-using Json = nlohmann::json;
+using Json = ninfer::serve::RequestJson;
 using namespace ninfer::serve;
 
 int check(bool condition, const std::string& label) {
@@ -342,6 +342,15 @@ int test_tools() {
                               ninfer::PromptCacheMarkerLocation::MessageBoundary &&
                           mixed_prompt.context_cache.markers.back().after_message_count == 2,
                       "automatic caching stops after a complete assistant text/tool-call turn");
+
+    const Json ordered = Json::parse(
+        R"({"model":"qwen","messages":[{"role":"user","content":"probe"}],"tools":[{"type":"function","function":{"name":"probe","parameters":{"type":"object","properties":{"zeta":{"type":"string"},"alpha":{"type":"integer"}}}}}]})");
+    const ninfer::PromptInput ordered_prompt = prompt(parse(ordered).generation);
+    failures += check(
+        ordered_prompt.options.tool_jsons.size() == 1 &&
+            ordered_prompt.options.tool_jsons.front() ==
+                R"({"type":"function","function":{"name":"probe","parameters":{"type":"object","properties":{"zeta":{"type":"string"},"alpha":{"type":"integer"}}},"strict":false}})",
+        "OpenAI Chat changed tool-schema member order before PromptInput");
     return failures;
 }
 

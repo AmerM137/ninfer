@@ -4,6 +4,7 @@
 // GenerationRequest; response builders consume protocol-neutral GenerationOutcome values.
 
 #include "serve/request.h"
+#include "serve/request_json.h"
 
 #include <nlohmann/json.hpp>
 
@@ -28,7 +29,7 @@ struct OpenAIChatRequest {
     bool return_progress   = false;
 };
 
-OpenAIChatRequest parse_chat_completion_request(const nlohmann::json& body,
+OpenAIChatRequest parse_chat_completion_request(const RequestJson& body,
                                                 const RequestLimits& limits);
 
 struct OpenAIChatResponseIdentity {

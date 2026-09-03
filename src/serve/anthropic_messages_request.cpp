@@ -17,7 +17,7 @@
 namespace ninfer::serve {
 namespace {
 
-using Json = nlohmann::json;
+using Json = RequestJson;
 
 constexpr std::size_t kMaxToolNameLength = 128;
 
@@ -346,17 +346,20 @@ ChatTurn parse_assistant_blocks(const Json& content) {
     return assistant;
 }
 
-ChatTurn parse_system_value(const Json& value, const char* param) {
+ChatTurn parse_system_value(const Json& value, const char* param, std::size_t first_block = 0) {
     ChatTurn system;
     system.role = ChatRole::System;
     if (value.is_string()) {
+        if (first_block != 0) { throw std::logic_error("string system value has a block offset"); }
         system.content.push_back(text_part(value.get<std::string>()));
         return system;
     }
     if (!value.is_array()) {
         bad_request("system content must be a string or an array of text blocks", param);
     }
-    for (const Json& block : value) {
+    if (first_block > value.size()) { throw std::logic_error("system block offset is invalid"); }
+    for (std::size_t index = first_block; index < value.size(); ++index) {
+        const Json& block = value[index];
         if (require_block_type(block, param) != "text") {
             bad_request("only text system blocks are supported", param,
                         "content_block_not_supported");
@@ -370,7 +373,20 @@ ChatTurn parse_system_value(const Json& value, const char* param) {
 
 void parse_system(const Json& body, GenerationRequest& request) {
     if (!body.contains("system") || body.at("system").is_null()) { return; }
-    request.messages.push_back(parse_system_value(body.at("system"), "system"));
+    const Json& value                             = body.at("system");
+    constexpr std::string_view kAttributionPrefix = "x-anthropic-billing-header:";
+    std::size_t first_block                       = 0;
+    if (value.is_array() && !value.empty()) {
+        const Json& first = value.front();
+        if (first.is_object() && first.contains("type") && first.at("type").is_string() &&
+            first.at("type").get_ref<const std::string&>() == "text" && first.contains("text") &&
+            first.at("text").is_string() &&
+            first.at("text").get_ref<const std::string&>().starts_with(kAttributionPrefix)) {
+            first_block = 1;
+        }
+    }
+    ChatTurn system = parse_system_value(value, "system", first_block);
+    if (!system.content.empty()) { request.messages.push_back(std::move(system)); }
 }
 
 std::vector<ParsedMessage> normalize_same_role_messages(std::vector<ParsedMessage> messages) {
@@ -954,7 +970,7 @@ void apply_anthropic_prompt_cache_policy(const Json& body, GenerationRequest& re
             explicit_boundaries.push_back(&turn.cache_boundary_after);
         }
     }
-    if (explicit_boundaries.size() > 4U) {
+    if (explicit_boundaries.size() > kMaximumExplicitPromptCacheMarkers) {
         bad_request("at most four block-level cache_control breakpoints are supported per request",
                     "cache_control", "too_many_cache_breakpoints");
     }
@@ -988,7 +1004,7 @@ void apply_anthropic_prompt_cache_policy(const Json& body, GenerationRequest& re
         automatic_target->value().evidence |= ninfer::SharedCandidateEvidence::RequestedAutomatic;
         return;
     }
-    if (explicit_boundaries.size() == 4U) {
+    if (explicit_boundaries.size() == kMaximumExplicitPromptCacheMarkers) {
         bad_request("request-level cache_control needs a fifth distinct cache write after four "
                     "block-level breakpoints",
                     "cache_control", "too_many_cache_breakpoints");

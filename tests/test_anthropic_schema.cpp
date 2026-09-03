@@ -11,12 +11,13 @@
 #include <iterator>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
 namespace {
 
-using Json = nlohmann::json;
+using Json = ninfer::serve::RequestJson;
 using namespace ninfer::serve;
 
 int check(bool condition, const std::string& message) {
@@ -192,6 +193,76 @@ int test_message_normalization() {
     return failures;
 }
 
+int test_attribution_system_block() {
+    const auto attributed = [](std::string fingerprint) {
+        Json body        = base_request();
+        body["thinking"] = Json{{"type", "disabled"}};
+        body["system"]   = Json::array(
+            {Json{{"type", "text"},
+                    {"text", "x-anthropic-billing-header: cc_version=2.1; cch=" + fingerprint}},
+               Json{{"type", "text"},
+                    {"text", "real system"},
+                    {"cache_control", Json{{"type", "ephemeral"}}}}});
+        return body;
+    };
+
+    const Json first_body                 = attributed(".89c");
+    const GenerationRequest first_request = parse(first_body).generation;
+    const ninfer::PromptInput first       = prompt(first_request);
+    const ninfer::PromptInput second      = prompt(parse(attributed(".8f7")).generation);
+    const ninfer::PromptInput counted =
+        prompt(parse_anthropic_count_tokens_request(first_body).generation);
+
+    const auto has_real_system = [](const ninfer::PromptInput& input) {
+        return input.messages.size() == 2 &&
+               input.messages.front().role == ninfer::ChatRole::System &&
+               input.messages.front().parts.size() == 1 &&
+               input.messages.front().parts.front().text == "real system" &&
+               input.context_cache.markers.size() == 1 &&
+               input.context_cache.markers.front().location ==
+                   ninfer::PromptCacheMarkerLocation::LeadingInstructionBoundary;
+    };
+    int failures =
+        check(has_real_system(first) && has_real_system(second) && has_real_system(counted) &&
+                  first.messages.front().parts.front().text ==
+                      second.messages.front().parts.front().text &&
+                  first.context_cache.markers == second.context_cache.markers &&
+                  first.context_cache.markers == counted.context_cache.markers,
+              "Anthropic attribution changed model input or Count Tokens lowering");
+
+    Json attribution_only        = base_request();
+    attribution_only["thinking"] = Json{{"type", "disabled"}};
+    attribution_only["system"]   = Json::array(
+        {Json{{"type", "text"}, {"text", "x-anthropic-billing-header: cc_version=2.1"}}});
+    const GenerationRequest without_empty = parse(attribution_only).generation;
+    failures += check(without_empty.messages.size() == 1 &&
+                          without_empty.messages.front().role == ninfer::ChatRole::User,
+                      "attribution-only system produced an empty model turn");
+
+    Json non_first        = base_request();
+    non_first["thinking"] = Json{{"type", "disabled"}};
+    non_first["system"] =
+        Json::array({Json{{"type", "text"}, {"text", "real system"}},
+                     Json{{"type", "text"}, {"text", "x-anthropic-billing-header: user text"}}});
+    const GenerationRequest preserved_non_first = parse(non_first).generation;
+    failures += check(preserved_non_first.messages.size() == 2 &&
+                          preserved_non_first.messages.front().content.size() == 2 &&
+                          preserved_non_first.messages.front().content.back().text ==
+                              "x-anthropic-billing-header: user text",
+                      "non-first attribution-like system text was consumed");
+
+    Json string_system                       = base_request();
+    string_system["thinking"]                = Json{{"type", "disabled"}};
+    string_system["system"]                  = "x-anthropic-billing-header: ordinary string";
+    const GenerationRequest preserved_string = parse(string_system).generation;
+    failures += check(preserved_string.messages.size() == 2 &&
+                          preserved_string.messages.front().content.size() == 1 &&
+                          preserved_string.messages.front().content.front().text ==
+                              "x-anthropic-billing-header: ordinary string",
+                      "ordinary string system content was consumed as attribution");
+    return failures;
+}
+
 Json tool_use(std::string id, std::string name = "lookup") {
     return Json{{"type", "tool_use"},
                 {"id", std::move(id)},
@@ -355,6 +426,42 @@ int test_tools() {
     body["tools"] = Json::array({ordinary_tool(), ordinary_tool()});
     failures += check(api_param([&] { (void)parse(body); }) == "tools",
                       "duplicate tool names were accepted");
+    return failures;
+}
+
+int test_prompt_object_order() {
+    const auto parse_raw = [](std::string_view input) {
+        const std::string body =
+            R"({"model":"claude-local","thinking":{"type":"disabled"},"tools":[{"name":"probe","input_schema":{"type":"object","properties":{"zeta":{"type":"string"},"alpha":{"type":"object","properties":{"yankee":{"type":"integer"},"bravo":{"type":"boolean"}}}}}}],"messages":[{"role":"user","content":"run probe"},{"role":"assistant","content":[{"type":"tool_use","id":"toolu_order","name":"probe","input":)" +
+            std::string(input) +
+            R"(}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_order","content":"done"}]}],"max_tokens":32})";
+        return parse(Json::parse(body)).generation;
+    };
+
+    const std::string original      = R"({"zeta":"last","alpha":{"yankee":2,"bravo":true}})";
+    const GenerationRequest request = parse_raw(original);
+    const auto assistant =
+        std::find_if(request.messages.begin(), request.messages.end(),
+                     [](const ChatTurn& turn) { return turn.role == ninfer::ChatRole::Assistant; });
+    const ninfer::PromptInput translated = prompt(request);
+    const std::string expected_tool =
+        R"({"type":"function","function":{"name":"probe","parameters":{"type":"object","properties":{"zeta":{"type":"string"},"alpha":{"type":"object","properties":{"yankee":{"type":"integer"},"bravo":{"type":"boolean"}}}}},"strict":false}})";
+    int failures = check(assistant != request.messages.end() && assistant->tool_calls.size() == 1 &&
+                             assistant->tool_calls.front().arguments_json == original &&
+                             translated.options.tool_jsons.size() == 1 &&
+                             translated.options.tool_jsons.front() == expected_tool,
+                         "Anthropic request changed prompt-bearing object member order");
+
+    const GenerationRequest reordered =
+        parse_raw(R"({"alpha":{"yankee":2,"bravo":true},"zeta":"last"})");
+    const auto reordered_assistant =
+        std::find_if(reordered.messages.begin(), reordered.messages.end(),
+                     [](const ChatTurn& turn) { return turn.role == ninfer::ChatRole::Assistant; });
+    failures +=
+        check(reordered_assistant != reordered.messages.end() &&
+                  reordered_assistant->tool_calls.size() == 1 &&
+                  reordered_assistant->tool_calls.front().arguments_json != original,
+              "Anthropic request treated reordered tool input as the original representation");
     return failures;
 }
 
@@ -546,11 +653,12 @@ int test_tool_call_presentation() {
     const AnthropicResponseIdentity identity =
         make_anthropic_response_identity("req_tool", "claude-local");
     GenerationOutcome outcome;
-    outcome.text          = "I need one more check.";
-    outcome.finish_reason = ninfer::FinishReason::StopToken;
+    outcome.text                = "I need one more check.";
+    outcome.finish_reason       = ninfer::FinishReason::StopToken;
+    const std::string arguments = R"({"zeta":"last","alpha":{"yankee":2,"bravo":true}})";
     outcome.tool_calls.push_back(ninfer::GeneratedToolCall{
         .name           = "Edit",
-        .arguments_json = R"({"file_path":"/tmp/probe.cpp","new_string":"new","old_string":"old"})",
+        .arguments_json = arguments,
     });
 
     const Json aggregate = Json::parse(make_anthropic_messages_response(identity, outcome));
@@ -559,8 +667,9 @@ int test_tool_call_presentation() {
                   aggregate.at("content").at(0).at("type") == "text" &&
                   aggregate.at("content").at(1).at("type") == "tool_use" &&
                   aggregate.at("content").at(1).at("name") == "Edit" &&
+                  aggregate.at("content").at(1).at("input").dump() == arguments &&
                   !aggregate.at("content").at(1).at("input").contains("replace_all"),
-              "aggregate Anthropic response demoted an omitted argument tool call");
+              "aggregate Anthropic response changed ordered tool input");
 
     AnthropicMessagesStream stream(identity, 10);
     std::vector<std::string> events{stream.start()};
@@ -581,9 +690,7 @@ int test_tool_call_presentation() {
             saw_edit_start = event.at("content_block").at("name") == "Edit";
         } else if (event.at("type") == "content_block_delta" &&
                    event.at("delta").at("type") == "input_json_delta") {
-            const Json input = Json::parse(event.at("delta").at("partial_json").get<std::string>());
-            saw_arguments =
-                input.at("file_path") == "/tmp/probe.cpp" && !input.contains("replace_all");
+            saw_arguments = event.at("delta").at("partial_json").get<std::string>() == arguments;
         } else if (event.at("type") == "message_delta") {
             saw_tool_stop = event.at("delta").at("stop_reason") == "tool_use";
         }
@@ -676,8 +783,10 @@ int main() {
     int failures = 0;
     failures += test_envelope_and_field_policy();
     failures += test_message_normalization();
+    failures += test_attribution_system_block();
     failures += test_tool_history();
     failures += test_tools();
+    failures += test_prompt_object_order();
     failures += test_thinking_and_count_tokens();
     failures += test_thinking_history_transport_metadata();
     failures += test_content_and_cache_hints();
