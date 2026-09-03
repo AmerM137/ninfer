@@ -292,6 +292,48 @@ struct GeneratedToolCall {
     std::string arguments_json;
 };
 
+// Terminal interpretation of model-origin tool-call markup. Parameter schemas guide JSON
+// normalization but do not validate the call; only a structure/identity failure can return a
+// complete marker region to ordinary content.
+enum class ToolCallParseFallbackReason : std::uint8_t {
+    None,
+    MalformedStructure,
+    DuplicateParameter,
+    InvalidToolName,
+    UndeclaredTool,
+    TrailingContent,
+};
+
+[[nodiscard]] inline constexpr const char*
+tool_call_parse_fallback_reason_name(ToolCallParseFallbackReason reason) noexcept {
+    switch (reason) {
+    case ToolCallParseFallbackReason::None:
+        return "none";
+    case ToolCallParseFallbackReason::MalformedStructure:
+        return "malformed_structure";
+    case ToolCallParseFallbackReason::DuplicateParameter:
+        return "duplicate_parameter";
+    case ToolCallParseFallbackReason::InvalidToolName:
+        return "invalid_tool_name";
+    case ToolCallParseFallbackReason::UndeclaredTool:
+        return "undeclared_tool";
+    case ToolCallParseFallbackReason::TrailingContent:
+        return "trailing_content";
+    }
+    return "malformed_structure";
+}
+
+struct ToolCallParseDiagnostics {
+    bool marker_seen                            = false;
+    std::uint32_t structured_call_count         = 0;
+    std::uint32_t empty_arguments_omitted       = 0;
+    std::uint32_t schema_mismatch_arguments     = 0;
+    ToolCallParseFallbackReason fallback_reason = ToolCallParseFallbackReason::None;
+
+    [[nodiscard]] friend constexpr bool
+    operator==(const ToolCallParseDiagnostics&, const ToolCallParseDiagnostics&) noexcept = default;
+};
+
 // Wire-independent conversation authority. Protocol adapters preserve these roles and their
 // ordering; a target frontend owns any model-specific role lowering.
 enum class ChatRole : std::uint8_t {
@@ -705,6 +747,7 @@ struct GenerationResult {
     std::string content;
     std::string reasoning;
     std::vector<GeneratedToolCall> tool_calls;
+    ToolCallParseDiagnostics tool_call_parse;
     std::uint32_t reasoning_tokens = 0;
     FinishReason finish_reason     = FinishReason::None;
     std::optional<std::string> matched_stop_string;

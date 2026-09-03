@@ -849,6 +849,7 @@ private:
         result.content                 = std::move(request->content);
         result.reasoning               = std::move(request->reasoning);
         result.tool_calls              = request->output.take_tool_calls();
+        result.tool_call_parse         = request->output.tool_call_parse_diagnostics();
         result.reasoning_tokens        = request->output.reasoning_tokens();
         result.finish_reason           = reason;
         result.matched_stop_string     = request->output.matched_stop_string();

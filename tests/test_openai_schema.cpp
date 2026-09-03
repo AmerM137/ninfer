@@ -628,16 +628,19 @@ int test_aggregate_response() {
         "aggregate timings use exact cache and N-1 generation intervals");
 
     outcome.text.clear();
-    outcome.tool_calls.push_back(
-        ninfer::GeneratedToolCall{.name = "weather", .arguments_json = R"({"city":"Paris"})"});
+    outcome.tool_calls.push_back(ninfer::GeneratedToolCall{
+        .name = "Edit",
+        .arguments_json =
+            R"({"file_path":"/tmp/probe.cpp","old_string":"old","new_string":"new"})"});
     response         = Json::parse(make_chat_completion_response(identity(), outcome));
     const Json& call = response["choices"][0]["message"]["tool_calls"][0];
     failures += check(response["choices"][0]["finish_reason"] == "tool_calls" &&
                           response["choices"][0]["message"]["content"].is_null(),
                       "aggregate tool call has OpenAI terminal shape");
-    failures += check(call["id"].get<std::string>().starts_with("call_") &&
-                          call["function"]["name"] == "weather",
-                      "OpenAI adapter owns wire tool-call identifiers");
+    failures += check(
+        call["id"].get<std::string>().starts_with("call_") && call["function"]["name"] == "Edit" &&
+            !Json::parse(call["function"]["arguments"].get<std::string>()).contains("replace_all"),
+        "OpenAI adapter owns wire tool-call identifiers");
     return failures;
 }
 
@@ -679,14 +682,15 @@ int test_stream_response() {
     OpenAIChatStream tool_stream(identity(), false);
     (void)tool_stream.start();
     GenerationOutcome tool_outcome;
-    tool_outcome.tool_calls.push_back(
-        ninfer::GeneratedToolCall{.name = "weather", .arguments_json = "{}"});
+    tool_outcome.tool_calls.push_back(ninfer::GeneratedToolCall{
+        .name = "Edit", .arguments_json = R"({"file_path":"/tmp/probe.cpp"})"});
     tool_outcome.finish_reason                 = ninfer::FinishReason::StopToken;
     const std::vector<std::string> tool_events = tool_stream.finish(tool_outcome);
     const Json tool_delta                      = parse_sse(tool_events[0]);
     failures += check(
         tool_delta["choices"][0]["delta"]["tool_calls"][0]["id"].get<std::string>().starts_with(
             "call_") &&
+            tool_delta["choices"][0]["delta"]["tool_calls"][0]["function"]["name"] == "Edit" &&
             parse_sse(tool_events[1])["choices"][0]["finish_reason"] == "tool_calls",
         "stream encoder owns stable OpenAI tool-call shape");
     return failures;

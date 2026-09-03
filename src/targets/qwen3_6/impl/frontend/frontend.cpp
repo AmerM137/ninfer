@@ -945,6 +945,7 @@ public:
     PublishedOutput preview_output;
     fi::ToolCallOutputDecoder tool_call_output;
     std::vector<GeneratedToolCall> tool_calls;
+    ToolCallParseDiagnostics tool_call_parse;
     bool preview_ready = false;
 };
 
@@ -1230,6 +1231,7 @@ PublishedOutput OutputSession::commit_preview() {
     if (impl_->state.terminal) {
         fi::ToolCallOutputDecoder::Terminal terminal = impl_->tool_call_output.finish();
         impl_->tool_calls                            = std::move(terminal.tool_calls);
+        impl_->tool_call_parse                       = terminal.diagnostics;
         if (!terminal.content.empty()) {
             OutputDelta* content = nullptr;
             for (OutputDelta& delta : output) {
@@ -1248,6 +1250,10 @@ PublishedOutput OutputSession::commit_preview() {
 
 std::vector<GeneratedToolCall> OutputSession::take_tool_calls() noexcept {
     return impl_ != nullptr ? std::move(impl_->tool_calls) : std::vector<GeneratedToolCall>{};
+}
+
+ToolCallParseDiagnostics OutputSession::tool_call_parse_diagnostics() const noexcept {
+    return impl_ != nullptr ? impl_->tool_call_parse : ToolCallParseDiagnostics{};
 }
 
 std::uint32_t OutputSession::reasoning_tokens() const noexcept {

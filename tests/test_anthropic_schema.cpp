@@ -584,6 +584,58 @@ int test_aggregate_and_errors() {
     return failures;
 }
 
+int test_tool_call_presentation() {
+    const AnthropicResponseIdentity identity =
+        make_anthropic_response_identity("req_tool", "claude-local");
+    GenerationOutcome outcome;
+    outcome.text          = "I need one more check.";
+    outcome.finish_reason = ninfer::FinishReason::StopToken;
+    outcome.tool_calls.push_back(ninfer::GeneratedToolCall{
+        .name           = "Edit",
+        .arguments_json = R"({"file_path":"/tmp/probe.cpp","new_string":"new","old_string":"old"})",
+    });
+
+    const Json aggregate =
+        Json::parse(make_anthropic_messages_response(identity, outcome, thinking_signer()));
+    int failures =
+        check(aggregate.at("stop_reason") == "tool_use" && aggregate.at("content").size() == 2 &&
+                  aggregate.at("content").at(0).at("type") == "text" &&
+                  aggregate.at("content").at(1).at("type") == "tool_use" &&
+                  aggregate.at("content").at(1).at("name") == "Edit" &&
+                  !aggregate.at("content").at(1).at("input").contains("replace_all"),
+              "aggregate Anthropic response demoted an omitted argument tool call");
+
+    AnthropicMessagesStream stream(identity, 10, thinking_signer());
+    std::vector<std::string> events{stream.start()};
+    std::vector<std::string> content = stream.content_delta(outcome.text);
+    events.insert(events.end(), std::make_move_iterator(content.begin()),
+                  std::make_move_iterator(content.end()));
+    std::vector<std::string> terminal = stream.finish(outcome);
+    events.insert(events.end(), std::make_move_iterator(terminal.begin()),
+                  std::make_move_iterator(terminal.end()));
+
+    bool saw_edit_start = false;
+    bool saw_arguments  = false;
+    bool saw_tool_stop  = false;
+    for (const std::string& wire : events) {
+        const Json event = parse_event(wire);
+        if (event.at("type") == "content_block_start" &&
+            event.at("content_block").at("type") == "tool_use") {
+            saw_edit_start = event.at("content_block").at("name") == "Edit";
+        } else if (event.at("type") == "content_block_delta" &&
+                   event.at("delta").at("type") == "input_json_delta") {
+            const Json input = Json::parse(event.at("delta").at("partial_json").get<std::string>());
+            saw_arguments =
+                input.at("file_path") == "/tmp/probe.cpp" && !input.contains("replace_all");
+        } else if (event.at("type") == "message_delta") {
+            saw_tool_stop = event.at("delta").at("stop_reason") == "tool_use";
+        }
+    }
+    failures += check(saw_edit_start && saw_arguments && saw_tool_stop,
+                      "Anthropic stream did not terminate the recovered Edit as tool_use");
+    return failures;
+}
+
 int test_stream() {
     const AnthropicResponseIdentity identity =
         make_anthropic_response_identity("req_stream", "claude-local");
@@ -673,6 +725,7 @@ int main() {
     failures += test_thinking_history_integrity();
     failures += test_content_and_cache_hints();
     failures += test_aggregate_and_errors();
+    failures += test_tool_call_presentation();
     failures += test_stream();
     if (failures != 0) {
         std::cerr << failures << " Anthropic adapter checks failed\n";

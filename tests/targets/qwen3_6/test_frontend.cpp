@@ -1647,13 +1647,14 @@ int test_structured_tool_output() {
     input.messages.push_back(std::move(message));
     input.options.enable_thinking = false;
     input.options.tool_jsons.push_back(
-        R"({"type":"function","function":{"name":"TaskUpdate","parameters":{"type":"object","properties":{"taskId":{"type":"string"}}}}})");
+        R"({"type":"function","function":{"name":"TaskUpdate","parameters":{"type":"object","properties":{"taskId":{"type":"string"},"enabled":{"type":"boolean"},"count":{"type":"integer"}},"required":["taskId"]}}})");
     auto prompt = frontend.prepare(std::move(input));
     auto session =
         frontend.make_output_session(prompt, {}, ninfer::OutputOptions{.tool_name_max_length = 64});
 
     const std::string generated =
         "Calling.  \n<tool_call>\n<function=TaskUpdate>\n<parameter=taskId>\n1\n"
+        "</parameter>\n<parameter=enabled>\n</parameter>\n<parameter=count>\nmany\n"
         "</parameter>\n</function>\n</tool_call>";
     const std::vector<ninfer::TokenId> tokens = fixture_tokenizer().encode(generated);
     const auto decision = session.preview_model(tokens, static_cast<std::uint32_t>(tokens.size()),
@@ -1666,10 +1667,20 @@ int test_structured_tool_output() {
     const std::vector<ninfer::GeneratedToolCall> calls = session.take_tool_calls();
     failures += check(calls.size() == 1 && calls.front().name == "TaskUpdate",
                       "frontend did not publish the structured tool call");
+    failures += check(session.tool_call_parse_diagnostics() ==
+                          ninfer::ToolCallParseDiagnostics{
+                              .marker_seen               = true,
+                              .structured_call_count     = 1,
+                              .empty_arguments_omitted   = 1,
+                              .schema_mismatch_arguments = 1,
+                              .fallback_reason = ninfer::ToolCallParseFallbackReason::None,
+                          },
+                      "frontend did not retain tool-call parse diagnostics");
     if (!calls.empty()) {
         const nlohmann::json arguments = nlohmann::json::parse(calls.front().arguments_json);
-        failures += check(arguments.at("taskId").is_string() && arguments.at("taskId") == "1",
-                          "frontend changed the declared string argument type");
+        failures += check(arguments.at("taskId").is_string() && arguments.at("taskId") == "1" &&
+                              !arguments.contains("enabled") && arguments.at("count") == "many",
+                          "frontend did not preserve normalized tool arguments");
     }
     return failures;
 }

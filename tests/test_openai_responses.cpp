@@ -392,8 +392,10 @@ int test_response_output_history_round_trip() {
     outcome.reasoning     = "I should inspect both paths.";
     outcome.text          = "Let me check:";
     outcome.finish_reason = ninfer::FinishReason::StopToken;
-    outcome.tool_calls.push_back(
-        ninfer::GeneratedToolCall{.name = "read_file", .arguments_json = R"({"path":"a"})"});
+    outcome.tool_calls.push_back(ninfer::GeneratedToolCall{
+        .name = "Edit",
+        .arguments_json =
+            R"({"file_path":"/tmp/probe.cpp","old_string":"old","new_string":"new"})"});
     outcome.tool_calls.push_back(
         ninfer::GeneratedToolCall{.name = "read_file", .arguments_json = R"({"path":"b"})"});
     const BuiltOpenAIResponse built =
@@ -418,6 +420,14 @@ int test_response_output_history_round_trip() {
         check(built.output_history.size() == 1 && replay.prompt.input_turns.size() == 5 &&
                   same_assistant_turn(replay.prompt.input_turns[1], built.output_history[0]),
               "Responses output Items did not round-trip to their stored assistant history");
+    const auto edit_item =
+        std::find_if(built.output_items.begin(), built.output_items.end(), [](const Json& item) {
+            return item.at("type") == "function_call" && item.at("name") == "Edit";
+        });
+    failures += check(
+        edit_item != built.output_items.end() &&
+            !Json::parse(edit_item->at("arguments").get<std::string>()).contains("replace_all"),
+        "Responses output changed an omitted optional tool argument");
 
     GenerationOutcome incomplete;
     incomplete.reasoning     = "unfinished reasoning";

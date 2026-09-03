@@ -154,12 +154,15 @@ the explicit `--model-id` override. Reasoning is returned separately as `reasoni
 text remains in `content`.
 
 Across Chat Completions, Responses, and Anthropic Messages, a direct top-level tool-parameter
-`type`, or an `anyOf`/`oneOf` composed entirely of explicit primitive types, controls conversion of
-Qwen's untyped parameter text. String-admitting values remain strings; other declared values must
-be valid JSON of an admitted top-level type. Mathematically integral JSON numbers satisfy
-`integer`; booleans additionally accept case-insensitive `true` and `false` and are normalized to
-JSON booleans. Schemas without a supported explicit type retain untyped inference. NInfer does not
-perform recursive JSON Schema validation or constrained decoding.
+`type`, or an `anyOf`/`oneOf` composed entirely of explicit primitive types, guides conversion of
+Qwen's untyped parameter text. It does not decide whether structurally complete markup is a tool
+call. String-admitting values remain strings, including the empty string. An empty block for a
+declared non-string parameter is omitted. Admitted JSON values retain their JSON type;
+case-insensitive boolean text is normalized to `true` or `false`. A nonempty schema mismatch remains
+a structured call: valid JSON retains its represented type and other text becomes a JSON string so
+the tool consumer can report the validation error and continue the agent loop. Schemas without a
+supported explicit type retain untyped inference. NInfer does not apply defaults, enforce required
+properties, perform recursive JSON Schema validation, or use constrained decoding.
 
 String parameters preserve function/tool-call markers and balanced nested
 `<parameter=...>...</parameter>` text as value bytes. The Qwen wire format has no delimiter escape,
@@ -809,6 +812,8 @@ but Serve throughput is always a persistent record. Redirected stderr contains n
 sequences. Pretty values use readable units and rounded rates; use the independent request JSONL for
 complete fields and full precision. Operational records never contain prompts, generated text,
 request bodies, credentials, or arbitrary client error messages.
+If a tool marker is returned to text because its structure or tool identity cannot be represented,
+Serve emits one warning with only the failure classification, never the generated markup.
 
 ## Structured request log
 
@@ -817,7 +822,7 @@ in append mode and flushes every event, so successive model or MTP blocks may sh
 file. The parent directory must already exist. Failure to open the file aborts startup; the log path
 is also rejected if it resolves to the model artifact.
 
-Every line is one `ninfer_serve_request_log` schema-v19 JSON object. All events carry
+Every line is one `ninfer_serve_request_log` schema-v20 JSON object. All events carry
 `timestamp_unix_ms` and a process-unique `server_instance_id`; request IDs are monotonic only within
 that server instance. Successful request-start records include request-scoped acquisition,
 media-preprocessing wall/work, tokenizer, cache hit/miss/single-flight, and payload-size fields;
@@ -828,7 +833,7 @@ they do not infer request behavior from process-global counter deltas.
 | `server_start` | target/weights identity and artifact, resolved Engine and context-cache capacities, registered thinking/non-thinking sampler defaults plus process overrides, thinking-history and thinking-budget defaults, Device arenas, the optional non-additive Vision layout inside the unified workspace, Host State/KV capacity and occupancy, KV sizing ledger, CUDA Graph allowance, CUDA/GPU environment, and redacted argv |
 | `request_start` | protocol, resolved sampler and seed, requested and effective reasoning effort, thinking mode and optional budget, Responses semantic-change flag, output budget, stream/message/tool shape |
 | `request_rejected` | parsed request shape, requested reasoning effort with unresolved effective value, media-item count, `phase: "prepare"`, and the exact HTTP status/type/code/parameter/message for a synchronous preparation rejection |
-| `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, request-owned materialization cost/search diagnostics, thinking-budget application counters, unrounded request-stage seconds, per-request Engine Host exposure, and complete speculative-decoding counters |
+| `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, tool-call parse diagnostics, request-owned materialization cost/search diagnostics, thinking-budget application counters, unrounded request-stage seconds, per-request Engine Host exposure, and complete speculative-decoding counters |
 | `request_error` | the resolved request configuration and the generation, cancellation, or pre-outcome transport terminal message |
 | `throughput` | interval token/decode/context-cache pressure counter deltas, authoritative worker Host-work deltas, current scheduler/resource gauges, and decode-round batch statistics |
 
@@ -836,6 +841,12 @@ they do not infer request behavior from process-global counter deltas.
 `resolved_reasoning_effort` is `none`, a native effort tier, or `null` when thinking is enabled but
 the template has no tiered default. A preparation rejection always leaves the resolved field
 `null`.
+
+`request_done.result.tool_call_parse` records whether a complete marker was seen, the structured
+call count, empty non-string arguments omitted during normalization, schema-mismatched arguments
+preserved for consumer validation, and a stable text-fallback reason. Fallback reasons are `none`,
+`malformed_structure`, `duplicate_parameter`, `invalid_tool_name`, `undeclared_tool`, and
+`trailing_content`. These counters contain no tool arguments or generated text.
 
 `request_done.materialization` is the immutable decision committed for that request. It reports predicted immediate,
 future-loss and total nanoseconds; evaluated targets and projection work; planning/search nanoseconds; stop reason;
