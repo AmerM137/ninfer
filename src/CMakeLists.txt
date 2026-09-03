@@ -322,6 +322,7 @@ if(NINFER_BUILD_APPS OR BUILD_TESTING)
   endif()
   add_library(ninfer_product_logging STATIC
     product/logging/logging.cpp
+    product/logging/pretty_format.cpp
     product/logging/startup_log.cpp)
   ninfer_internal_includes(ninfer_product_logging)
   target_link_libraries(ninfer_product_logging PUBLIC spdlog::spdlog)
@@ -361,7 +362,6 @@ if(NINFER_BUILD_SERVE)
     serve/openai_responses_request.cpp
     serve/openai_responses_state.cpp
     serve/openai_responses_response.cpp
-    serve/anthropic_thinking_signature.cpp
     serve/anthropic_messages_request.cpp
     serve/anthropic_messages_response.cpp
     serve/anthropic_messages_http.cpp

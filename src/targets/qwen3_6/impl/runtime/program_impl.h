@@ -8778,12 +8778,50 @@ PendingBatch ProgramImplCore::decode(std::span<const SequenceHandle> members,
     }
 }
 
+// Begin and ordinary rounds may already have provisional identity through the accepted extent;
+// speculative and forced spans arrive with identity at their base. Both are Program-owned pending
+// states, and this is their single accepted-prefix identity commit.
+void ProgramImplCore::commit_generated_prefix_identity(
+    SequenceState& sequence, std::uint32_t base_ledger_frontier,
+    std::span<const TokenId> accepted_tokens,
+    std::optional<std::uint32_t> prefix_execution_split_after) {
+    if (base_ledger_frontier > sequence.ledger.size() ||
+        accepted_tokens.size() > sequence.ledger.size() - base_ledger_frontier ||
+        sequence.ledger.size() != base_ledger_frontier + accepted_tokens.size() ||
+        !std::equal(accepted_tokens.begin(), accepted_tokens.end(),
+                    sequence.ledger.begin() + static_cast<std::ptrdiff_t>(base_ledger_frontier)) ||
+        (prefix_execution_split_after &&
+         (*prefix_execution_split_after == 0 ||
+          *prefix_execution_split_after > accepted_tokens.size()))) {
+        throw std::logic_error("committed generated-prefix identity has an invalid span");
+    }
+    const bool already_appended = sequence.prefix_identity.size() == sequence.ledger.size() &&
+                                  sequence.prefix_digests.size() == sequence.ledger.size();
+    const bool awaits_append = sequence.prefix_identity.size() == base_ledger_frontier &&
+                               sequence.prefix_digests.size() == base_ledger_frontier;
+    if (!already_appended && !awaits_append) {
+        throw std::logic_error("generated-prefix identity is not at its base or committed extent");
+    }
+    if (already_appended && !prefix_execution_split_after) { return; }
+    sequence.prefix_identity.truncate(base_ledger_frontier);
+    sequence.prefix_digests.truncate(base_ledger_frontier);
+    sequence.prefix_identity.append_generated(accepted_tokens.size(), sequence.rope_delta,
+                                              prefix_execution_split_after);
+    sequence.prefix_digests.append_generated(accepted_tokens, sequence.rope_delta,
+                                             prefix_execution_split_after);
+    if (sequence.prefix_identity.size() != sequence.ledger.size() ||
+        sequence.prefix_digests.size() != sequence.ledger.size()) {
+        throw std::logic_error("committed generated-prefix identity changed the ledger shape");
+    }
+}
+
 runtime::ExecutionTiming ProgramImplCore::append_forced_tokens(
     std::span<const SequenceHandle> members, std::span<const TokenId> row_major_tokens,
-    std::uint32_t row_stride, runtime::ExecutionTiming* failed_timing) {
+    std::uint32_t row_stride, std::span<const std::optional<std::uint32_t>> prefix_execution_splits,
+    runtime::ExecutionTiming* failed_timing) {
     runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Submit, failed_timing);
     if (pending_transaction_ || members.empty() || members.size() > max_concurrency ||
-        row_stride == 0 ||
+        row_stride == 0 || prefix_execution_splits.size() != members.size() ||
         row_major_tokens.size() != static_cast<std::size_t>(row_stride) * members.size()) {
         throw std::invalid_argument("forced-token membership is invalid");
     }
@@ -8814,6 +8852,10 @@ runtime::ExecutionTiming ProgramImplCore::append_forced_tokens(
             throw std::logic_error("forced-token sequence frontier is invalid");
         }
         validate_licensed_tokens(row_major_tokens.subspan(row * row_stride, row_stride));
+        if (prefix_execution_splits[row] &&
+            (*prefix_execution_splits[row] == 0 || *prefix_execution_splits[row] > row_stride)) {
+            throw std::logic_error("forced-token execution split is outside its row");
+        }
         lanes[row] = lane;
     }
 
@@ -8847,9 +8889,10 @@ runtime::ExecutionTiming ProgramImplCore::append_forced_tokens(
             RequestControl& request  = requests[lane];
             const std::span<const TokenId> forced =
                 row_major_tokens.subspan(row * row_stride, row_stride);
-            const std::uint32_t base = sequence.execution_frontier;
-            const std::uint32_t end  = base + row_stride;
-            const auto started       = Clock::now();
+            const std::uint32_t base_ledger_frontier = sequence.ledger_frontier;
+            const std::uint32_t base                 = sequence.execution_frontier;
+            const std::uint32_t end                  = base + row_stride;
+            const auto started                       = Clock::now();
 
             if (speculative_backend == SpeculativeBackend::DFlash &&
                 sequence.dflash_context_frontier < base) {
@@ -8942,8 +8985,8 @@ runtime::ExecutionTiming ProgramImplCore::append_forced_tokens(
             timing.end_wait();
             work.reset();
 
-            sequence.prefix_identity.append_generated(row_stride, sequence.rope_delta);
-            sequence.prefix_digests.append_generated(forced, sequence.rope_delta);
+            commit_generated_prefix_identity(sequence, base_ledger_frontier, forced,
+                                             prefix_execution_splits[row]);
             advance_rebuild_work(sequence, end, prefill_chunk);
             sequence.execution_frontier = end;
             sequence.ledger_frontier    = end + 1U;
@@ -9010,6 +9053,7 @@ CommitResult ProgramImplCore::commit(PendingBatch&& pending,
         std::array<std::uint32_t, kMaximumConcurrency> accepted{};
         std::array<std::uint8_t, kMaximumConcurrency> terminal{};
         std::array<std::uint8_t, kMaximumConcurrency> cancelled{};
+        std::array<std::optional<std::uint32_t>, kMaximumConcurrency> prefix_execution_splits{};
         for (std::size_t row = 0; row < row_count; ++row) {
             const std::uint32_t lane                = ContractAccess::lane(members[row]).value;
             lanes[row]                              = lane;
@@ -9023,12 +9067,16 @@ CommitResult ProgramImplCore::commit(PendingBatch&& pending,
             if ((decision.cancelled && (decision.accepted_tokens != 0 || !decision.terminal)) ||
                 (!decision.cancelled &&
                  (decision.accepted_tokens == 0 || decision.accepted_tokens > candidate.produced ||
-                  (!decision.terminal && decision.accepted_tokens != candidate.produced)))) {
+                  (!decision.terminal && decision.accepted_tokens != candidate.produced))) ||
+                (decision.prefix_execution_split_after &&
+                 (decision.cancelled || *decision.prefix_execution_split_after == 0 ||
+                  *decision.prefix_execution_split_after > decision.accepted_tokens))) {
                 throw std::logic_error("pending transaction decision is invalid");
             }
-            accepted[row]  = decision.accepted_tokens;
-            terminal[row]  = decision.terminal ? 1U : 0U;
-            cancelled[row] = decision.cancelled ? 1U : 0U;
+            accepted[row]                = decision.accepted_tokens;
+            terminal[row]                = decision.terminal ? 1U : 0U;
+            cancelled[row]               = decision.cancelled ? 1U : 0U;
+            prefix_execution_splits[row] = decision.prefix_execution_split_after;
             if (decision.cancelled) {
                 timings[row]     = requests[lane].timings;
                 speculative[row] = std::move(requests[lane].speculative_stats);
@@ -9036,11 +9084,14 @@ CommitResult ProgramImplCore::commit(PendingBatch&& pending,
         }
 
         timing.pause();
-        timing.include(resolve_pending_raw(
-            std::span<const std::uint32_t>(lanes.data(), row_count),
-            std::span<const std::uint32_t>(accepted.data(), row_count),
-            std::span<const std::uint8_t>(terminal.data(), row_count),
-            std::span<const std::uint8_t>(cancelled.data(), row_count), failed_timing));
+        timing.include(
+            resolve_pending_raw(std::span<const std::uint32_t>(lanes.data(), row_count),
+                                std::span<const std::uint32_t>(accepted.data(), row_count),
+                                std::span<const std::uint8_t>(terminal.data(), row_count),
+                                std::span<const std::uint8_t>(cancelled.data(), row_count),
+                                std::span<const std::optional<std::uint32_t>>(
+                                    prefix_execution_splits.data(), row_count),
+                                failed_timing));
         timing.resume_post();
         pending_transaction_.reset();
 
@@ -9917,16 +9968,18 @@ ProgramImplCore::resolve_prefill_raw(std::uint32_t lane, bool terminal,
         throw std::logic_error("prefill resolution requires a pending prefill token");
     }
     return resolve_non_speculative_pending(active_sequence(lane), requests[lane], 1, terminal,
-                                           failed_timing);
+                                           std::nullopt, failed_timing);
 }
 
 runtime::ExecutionTiming ProgramImplCore::resolve_pending_raw(
     std::span<const std::uint32_t> lanes, std::span<const std::uint32_t> accepted_tokens,
     std::span<const std::uint8_t> terminal, std::span<const std::uint8_t> cancelled,
+    std::span<const std::optional<std::uint32_t>> prefix_execution_splits,
     runtime::ExecutionTiming* failed_timing) {
     runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Post, failed_timing);
     if (lanes.empty() || lanes.size() > max_concurrency || accepted_tokens.size() != lanes.size() ||
-        terminal.size() != lanes.size() || cancelled.size() != lanes.size()) {
+        terminal.size() != lanes.size() || cancelled.size() != lanes.size() ||
+        prefix_execution_splits.size() != lanes.size()) {
         throw std::invalid_argument("pending batch resolution has inconsistent membership");
     }
 
@@ -9945,9 +9998,9 @@ runtime::ExecutionTiming ProgramImplCore::resolve_pending_raw(
             }
         } else {
             timing.pause();
-            timing.include(resolve_non_speculative_pending(active_sequence(lane), requests[lane],
-                                                           accepted_tokens.front(),
-                                                           terminal.front() != 0, failed_timing));
+            timing.include(resolve_non_speculative_pending(
+                active_sequence(lane), requests[lane], accepted_tokens.front(),
+                terminal.front() != 0, prefix_execution_splits.front(), failed_timing));
             timing.resume_post();
         }
         return timing.finish();
@@ -9966,9 +10019,9 @@ runtime::ExecutionTiming ProgramImplCore::resolve_pending_raw(
                 }
             } else {
                 timing.pause();
-                timing.include(resolve_non_speculative_pending(active_sequence(lane),
-                                                               requests[lane], accepted_tokens[row],
-                                                               terminal[row] != 0, failed_timing));
+                timing.include(resolve_non_speculative_pending(
+                    active_sequence(lane), requests[lane], accepted_tokens[row], terminal[row] != 0,
+                    prefix_execution_splits[row], failed_timing));
                 timing.resume_post();
             }
         }
@@ -10111,9 +10164,9 @@ runtime::ExecutionTiming ProgramImplCore::resolve_pending_raw(
                     ? mtp_host_egress->licensed_tokens.data() + row * width
                     : dflash_host_egress->licensed_tokens.data() + row * width;
             sequence.ledger.insert(sequence.ledger.end(), token_base, token_base + committed);
-            sequence.prefix_identity.append_generated(committed, sequence.rope_delta);
-            sequence.prefix_digests.append_generated(
-                std::span<const TokenId>(token_base, committed), sequence.rope_delta);
+            commit_generated_prefix_identity(sequence, pending.base_S,
+                                             std::span<const TokenId>(token_base, committed),
+                                             prefix_execution_splits[row]);
             advance_rebuild_work(sequence, pending.base_E + committed, prefill_chunk);
             sequence.execution_frontier = pending.base_E + committed;
             sequence.ledger_frontier    = pending.base_S + committed;
@@ -12153,10 +12206,10 @@ ProgramImplCore::decode_raw(std::span<const std::uint32_t> lanes,
     return decode_dflash_batch(lanes, budgets, failed_timing);
 }
 
-runtime::ExecutionTiming
-ProgramImplCore::resolve_non_speculative_pending(SequenceState& sequence, RequestControl& request,
-                                                 std::uint32_t accepted_tokens, bool terminal,
-                                                 runtime::ExecutionTiming* failed_timing) {
+runtime::ExecutionTiming ProgramImplCore::resolve_non_speculative_pending(
+    SequenceState& sequence, RequestControl& request, std::uint32_t accepted_tokens, bool terminal,
+    std::optional<std::uint32_t> prefix_execution_split_after,
+    runtime::ExecutionTiming* failed_timing) {
     runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Post, failed_timing);
     if (request.lifecycle != Lifecycle::Pending) {
         throw std::logic_error("pending resolution requires a pending generated round");
@@ -12166,6 +12219,14 @@ ProgramImplCore::resolve_non_speculative_pending(SequenceState& sequence, Reques
         request.pending.produced != 1 || accepted_tokens != 1) {
         throw std::logic_error("non-speculative pending round must commit its single token");
     }
+
+    const std::uint32_t base_ledger_frontier = request.pending.kind == PendingKind::Begin
+                                                   ? request.pending.prompt_tokens
+                                                   : request.pending.base_S;
+    commit_generated_prefix_identity(
+        sequence, base_ledger_frontier,
+        std::span<const TokenId>(sequence.ledger).subspan(base_ledger_frontier, accepted_tokens),
+        prefix_execution_split_after);
 
     switch (request.pending.kind) {
     case PendingKind::Begin:

@@ -314,6 +314,22 @@ Program 的 exact verification 可以使用：
 
 Session key、marker、hash 和 prefix index 只缩小 candidate 集合，不证明命中。
 
+`rewrite_execution_frontiers` 也是 exact identity 的一部分。它记录 replay/root prefill 必须分段的 exact
+token frontiers，使重建路径采用与原生成路径一致的 execution decomposition；不能为了采用 endpoint 而忽略。
+当 NInfer 自己生成的 accepted output 形成可由历史 renderer 精确重建的边界时，所有权链固定为：
+
+```text
+Frontend detects the model-output reconstruction boundary
+  -> Engine transports relative accepted-prefix metadata
+  -> Program atomically commits resident identity and shortlist digest
+```
+
+Frontend 只在 canonical boundary 恰好结束于 token frontier 时发布 metadata，并让 preview rollback、stop
+truncation 和 speculative partial accept 服从同一个 accepted-prefix transaction。Program 把相对位置转换为
+resident absolute frontier，并与 token ledger、State/KV 和 backend state 一起提交；它不扫描输出文本。
+ResourceManager 不推断或放宽这个事实。这样未经客户端改写的 NInfer 输出可以继续采用 exact endpoint；客户端
+重排 tool JSON、补默认值或改写历史仍是不同的 rendered identity，只能匹配更早的合法 checkpoint。
+
 ### 4.6 Request cache participation
 
 每个请求在进入 Engine 前固定一种语义：
@@ -466,6 +482,12 @@ Shared prefix 的三个状态不能混为一谈：
 外部协议或 C++ `PromptInput` 每个请求最多提交四个显式 markers。Frontend 还可以生成最多三个 Engine
 candidates：全部 tools 之后、连续 leading System/Developer 之后，以及 full prompt。相同 frontier 合并，
 因此每个请求最多七个 prepared candidates。这个固定上限不是启动配置。
+
+Shared catalog 是 Engine-wide 公共容量，不是每条 lineage 的配额。启用 context cache 时，默认 logical
+capacity 同时覆盖 active concurrency 下限和单请求最多四个显式 markers，即
+`max(max_concurrency, kMaximumExplicitPromptCacheMarkers)`；显式配置仍完整覆盖默认值。这个下限允许较早的
+稳定层与较晚的滚动 marker 同时成为 owner，但是否 capture、保留或替换仍只由通用 portfolio/pressure
+planning 决定，不提供 Claude、compact 或 token-position 特例。
 
 Candidate 保存 evidence flags。策略含义为：
 
