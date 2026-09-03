@@ -30,12 +30,6 @@ enum class ParsePurpose {
     bad_request(std::move(message), "messages", "invalid_tool_history");
 }
 
-[[noreturn]] void invalid_thinking_signature() {
-    bad_request("assistant Thinking blocks must include the signature returned by NInfer and be "
-                "passed back unmodified",
-                "messages", "invalid_thinking_signature");
-}
-
 const Json& require_object(const Json& body) {
     if (!body.is_object()) { bad_request("request body must be a JSON object"); }
     return body;
@@ -305,7 +299,7 @@ std::vector<ParsedUserBlock> parse_user_blocks(const Json& content) {
     return result;
 }
 
-ChatTurn parse_assistant_blocks(const Json& content, const AnthropicThinkingSigner& signer) {
+ChatTurn parse_assistant_blocks(const Json& content) {
     ChatTurn assistant;
     assistant.role = ChatRole::Assistant;
     for (std::size_t index = 0; index < content.size(); ++index) {
@@ -322,13 +316,8 @@ ChatTurn parse_assistant_blocks(const Json& content, const AnthropicThinkingSign
             }
             const std::string thinking =
                 require_string(block, "thinking", "messages", "thinking block");
-            if (!block.contains("signature") || !block.at("signature").is_string()) {
-                invalid_thinking_signature();
-            }
-            const std::string signature = block.at("signature").get<std::string>();
-            if (signature.empty() || !signer.verify(thinking, index, signature)) {
-                invalid_thinking_signature();
-            }
+            // NInfer has no encrypted reasoning state to restore. The wire signature is therefore
+            // intentionally outside the lowered request; only visible Thinking reaches the model.
             assistant.reasoning_content += thinking;
         } else if (type == "redacted_thinking") {
             if (cache_boundary(block, "messages")) {
@@ -542,8 +531,7 @@ void lower_messages(std::vector<ParsedMessage> messages, GenerationRequest& requ
     }
 }
 
-void parse_messages(const Json& body, GenerationRequest& request,
-                    const AnthropicThinkingSigner& signer) {
+void parse_messages(const Json& body, GenerationRequest& request) {
     if (!body.contains("messages")) { bad_request("missing required field: messages", "messages"); }
     const Json& messages = body.at("messages");
     if (!messages.is_array() || messages.empty()) {
@@ -614,7 +602,7 @@ void parse_messages(const Json& body, GenerationRequest& request,
             bad_request("message content must be a string or an array", "messages");
         }
         if (role == ChatRole::Assistant) {
-            message.turn = parse_assistant_blocks(content, signer);
+            message.turn = parse_assistant_blocks(content);
         } else {
             message.user_blocks = parse_user_blocks(content);
         }
@@ -1012,10 +1000,10 @@ void apply_anthropic_prompt_cache_policy(const Json& body, GenerationRequest& re
 }
 
 void parse_common_prompt(const Json& body, GenerationRequest& request, ParsePurpose purpose,
-                         int effective_max_tokens, const AnthropicThinkingSigner& signer) {
+                         int effective_max_tokens) {
     lower_tools(body, request);
     parse_system(body, request);
-    parse_messages(body, request, signer);
+    parse_messages(body, request);
     parse_thinking(body, request, purpose, effective_max_tokens);
     parse_effort(body, request, purpose);
     apply_anthropic_prompt_cache_policy(body, request);
@@ -1035,8 +1023,7 @@ void parse_common_prompt(const Json& body, GenerationRequest& request, ParsePurp
 } // namespace
 
 AnthropicMessagesRequest parse_anthropic_messages_request(const Json& body,
-                                                          const RequestLimits& limits,
-                                                          const AnthropicThinkingSigner& signer) {
+                                                          const RequestLimits& limits) {
     require_object(body);
     AnthropicMessagesRequest result;
     result.model                           = parse_model(body);
@@ -1058,19 +1045,18 @@ AnthropicMessagesRequest parse_anthropic_messages_request(const Json& body,
     }
 
     parse_common_prompt(body, result.generation, ParsePurpose::Messages,
-                        result.generation.max_tokens, signer);
+                        result.generation.max_tokens);
     parse_generation_fields(body, result.generation);
     return result;
 }
 
-AnthropicCountTokensRequest
-parse_anthropic_count_tokens_request(const Json& body, const AnthropicThinkingSigner& signer) {
+AnthropicCountTokensRequest parse_anthropic_count_tokens_request(const Json& body) {
     require_object(body);
     AnthropicCountTokensRequest result;
     result.model                           = parse_model(body);
     result.generation.tool_name_max_length = kMaxToolNameLength;
     parse_common_prompt(body, result.generation, ParsePurpose::CountTokens,
-                        std::numeric_limits<int>::max(), signer);
+                        std::numeric_limits<int>::max());
     return result;
 }
 

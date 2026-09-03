@@ -181,13 +181,14 @@ std::string make_anthropic_sse_error(const ApiError& error, const std::string& r
 }
 
 std::string make_anthropic_messages_response(const AnthropicResponseIdentity& identity,
-                                             const GenerationOutcome& outcome,
-                                             const AnthropicThinkingSigner& signer) {
+                                             const GenerationOutcome& outcome) {
     Json content = Json::array();
     if (!outcome.reasoning.empty()) {
+        // Claude clients expect a non-empty opaque value. The response identity already has the
+        // required lifetime, so Thinking introduces no independent state or credential.
         content.push_back(Json{{"type", "thinking"},
                                {"thinking", outcome.reasoning},
-                               {"signature", signer.sign(outcome.reasoning, 0)}});
+                               {"signature", identity.message_id}});
     }
     if (!outcome.text.empty()) {
         content.push_back(Json{{"type", "text"}, {"text", outcome.text}});
@@ -215,8 +216,8 @@ std::string make_anthropic_count_tokens_response(int input_tokens) {
 }
 
 AnthropicMessagesStream::AnthropicMessagesStream(AnthropicResponseIdentity identity,
-                                                 int input_tokens, AnthropicThinkingSigner signer)
-    : identity_(std::move(identity)), signer_(std::move(signer)), input_tokens_(input_tokens) {}
+                                                 int input_tokens)
+    : identity_(std::move(identity)), input_tokens_(input_tokens) {}
 
 std::string AnthropicMessagesStream::start() { return start_with_cache(std::nullopt); }
 
@@ -270,16 +271,11 @@ std::vector<std::string> AnthropicMessagesStream::reasoning_delta(const std::str
 std::vector<std::string> AnthropicMessagesStream::close_thinking() {
     std::vector<std::string> events;
     if (!thinking_open_) { return events; }
-    if (!signature_sent_) {
-        events.push_back(event(
-            "content_block_delta",
-            Json{{"type", "content_block_delta"},
-                 {"index", thinking_index_},
-                 {"delta", Json{{"type", "signature_delta"},
-                                {"signature", signer_.sign(reasoning_, static_cast<std::size_t>(
-                                                                           thinking_index_))}}}}));
-        signature_sent_ = true;
-    }
+    events.push_back(event(
+        "content_block_delta",
+        Json{{"type", "content_block_delta"},
+             {"index", thinking_index_},
+             {"delta", Json{{"type", "signature_delta"}, {"signature", identity_.message_id}}}}));
     events.push_back(event("content_block_stop",
                            Json{{"type", "content_block_stop"}, {"index", thinking_index_}}));
     thinking_open_ = false;

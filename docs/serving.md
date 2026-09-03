@@ -660,9 +660,10 @@ completed zero-output cache-prewarm lifecycle. `temperature`, `top_p`, `top_k`, 
 
 Thinking supports `disabled`, `adaptive`, and `enabled`. Enabled Thinking requires
 `budget_tokens >= 1024` and less than `max_tokens`, and that budget is passed to Engine. Visible
-Thinking is returned with an opaque local signature; SSE emits its `signature_delta` before
-closing the block. Assistant Thinking blocks must be passed back unmodified with that signature;
-signatures belong to the current serve process and are invalid after it restarts.
+Thinking is returned with an opaque compatibility signature; SSE emits its `signature_delta`
+before closing the block. Request lowering reconstructs the local prompt from the visible
+`thinking` text and treats `signature` as non-semantic transport metadata, so retained history
+remains usable across serve restarts.
 `display:"omitted"` is rejected because NInfer cannot provide Anthropic's
 encrypted hidden-reasoning restore semantics. `preserve_thinking` remains a NInfer extension for
 closed-turn Qwen reasoning history. `output_config.effort` is checked against the loaded template's
