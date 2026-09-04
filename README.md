@@ -250,6 +250,16 @@ capacities remain fixed for the process lifetime.
 
 Run the relevant `--help` for the exact current option contract.
 
+## Support
+
+NInfer is a personal project that I develop out of interest. If you find it useful and would like
+to support its continued development, you can [support the project on Ko-fi](https://ko-fi.com/neroued).
+
+Support is entirely voluntary. It is not a purchase or investment and does not come with financial
+returns, promised services or features, or a role in project decisions. The project's direction,
+priorities, technical choices, and release schedule remain independently determined by the
+maintainer.
+
 ## License
 
 NInfer is licensed under the [Apache License 2.0](LICENSE).
