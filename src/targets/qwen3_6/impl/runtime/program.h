@@ -208,6 +208,8 @@ struct ResourceCandidateState {
     // target can release Host replicas instead of being mistaken for a structurally invalid node.
     std::size_t blocked_host_allocation_bytes = 0;
     detail::PhysicalDemand demand;
+    // Resources released by consuming this private owner alone. Shared aliases are intentionally
+    // absent; complete pressure targets settle their joint reference graph separately.
     detail::PhysicalResources source_resources;
     NINFER_QWEN36_RUNTIME_NS::ReusePath reuse = NINFER_QWEN36_RUNTIME_NS::ReusePath::Root;
     std::uint32_t reuse_base                  = 0;
@@ -421,7 +423,6 @@ struct SequenceState {
     std::array<TokenId, qwen3_6::kMtpDecodeMaximumDrafts> mtp_drafts{};
     std::uint32_t mtp_draft_count = 0;
     bool tail_hidden_valid        = false;
-    bool state_source_retained    = false;
     bool endpoint_valid           = false;
     RewriteCheckpoint rewrite_checkpoint;
     std::vector<LongAnchorCheckpoint> long_anchors;
@@ -1010,9 +1011,12 @@ private:
                                             std::uint64_t generation) const noexcept;
     [[nodiscard]] bool has_unsettled_state_fork() const noexcept;
     [[nodiscard]] bool valid_pending(const PendingBatch& pending) const noexcept;
-    [[nodiscard]] detail::PhysicalResources resident_resources(const SequenceState& sequence) const;
+    // Per-owner resources are intentionally distinct from global physical occupancy: an aliased
+    // allocation contributes only when removing this owner would release it.
     [[nodiscard]] detail::PhysicalResources
-    resident_resources(const SharedPrefixState& shared) const;
+    owner_exclusive_resources(const SequenceState& sequence) const;
+    [[nodiscard]] detail::PhysicalResources
+    owner_exclusive_resources(const SharedPrefixState& shared) const;
     [[nodiscard]] detail::PhysicalResources physical_occupancy() const noexcept;
     [[nodiscard]] bool physical_peak_fits(detail::PhysicalResources peak) const noexcept;
     [[nodiscard]] StateImageHandle
@@ -1142,7 +1146,8 @@ private:
     void clear_lane_best_effort(SequenceState& sequence, RequestControl& request) noexcept;
     void ordered_reset(SequenceState& sequence);
     [[nodiscard]] StateImageSelectors state_selectors(const SequenceState& sequence) const;
-    [[nodiscard]] std::uint32_t state_footprint(const SequenceState& sequence) const noexcept;
+    [[nodiscard]] detail::PhysicalResources
+    sequence_exclusive_state_resources(const SequenceState& sequence) const;
     [[nodiscard]] std::uint32_t owned_checkpoint_references(const SequenceState& sequence,
                                                             StateImageHandle state) const noexcept;
     [[nodiscard]] bool state_exclusive_to_sequence(const SequenceState& sequence,
