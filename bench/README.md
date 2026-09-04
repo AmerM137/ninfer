@@ -734,16 +734,22 @@ once, so it is a distribution-aware useful-traffic lower bound rather than measu
 Its peak percentage uses the device's theoretical DDR bandwidth. `logical_tflops` counts the
 router plus eight routed and one shared gate/up and down matrix products.
 
-## DFlash LinearPair benchmark
+## W8 context K/V LinearPair benchmark
 
-`ninfer_linear_pair_bench` measures one public `linear_pair()` call over the exact adjacent W8
-`[1024,2048]` K/V row views. It uses cold-cache CUDA Graph replay, accepts an arbitrary token list
-or sweep, and reports route-neutral effective bandwidth, logical FLOP/s, and calculated T=1 linear
-extrapolation.
+`ninfer_linear_pair_bench` measures one public `linear_pair()` call over exact adjacent W8
+`[1024,K]` K/V row views of a `[6144,K]` QKV parent, for the registered `K=2048` and `K=5120`
+geometries. It uses cold-cache eager execution or CUDA Graph replay, accepts an arbitrary token
+list or sweep, and reports route-neutral effective bandwidth, logical FLOP/s, and calculated T=1
+linear extrapolation.
 
 ```bash
-cmake --build build --parallel --target ninfer_linear_pair_bench
-./build/bench/ninfer_linear_pair_bench --sweep 1:128:1 --warmup 5 --repeat 30
+cmake --build build -j --target ninfer_linear_pair_bench
+./build/bench/ninfer_linear_pair_bench \
+  --k 2048 --sweep 1:128:1 --execution graph --warmup 5 --repeat 30
+./build/bench/ninfer_linear_pair_bench \
+  --k 5120 --tokens 8,16,24,32,40,48,56,64 --execution graph --warmup 5 --repeat 30
+./build/bench/ninfer_linear_pair_bench \
+  --k 5120 --tokens 128,1024,2048 --execution eager --warmup 5 --repeat 30
 ```
 
 ## MTP exact-transform benchmark
