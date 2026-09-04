@@ -3,7 +3,12 @@
 
 #include <spdlog/logger.h>
 
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#else
 #include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -20,33 +25,35 @@ namespace {
 class StderrCapture {
 public:
     StderrCapture() {
-        if (::pipe(pipe_) != 0) { throw std::runtime_error(std::strerror(errno)); }
-        saved_ = ::dup(STDERR_FILENO);
-        if (saved_ < 0 || ::dup2(pipe_[1], STDERR_FILENO) < 0) {
+        if (make_pipe(pipe_) != 0) { throw std::runtime_error(std::strerror(errno)); }
+        saved_ = duplicate(stderr_fd());
+        if (saved_ < 0 || duplicate_to(pipe_[1], stderr_fd()) < 0) {
             throw std::runtime_error(std::strerror(errno));
         }
-        ::close(pipe_[1]);
+        close_fd(pipe_[1]);
         pipe_[1] = -1;
     }
 
     ~StderrCapture() {
         if (saved_ >= 0) {
-            (void)::dup2(saved_, STDERR_FILENO);
-            ::close(saved_);
+            (void)duplicate_to(saved_, stderr_fd());
+            close_fd(saved_);
         }
-        if (pipe_[0] >= 0) { ::close(pipe_[0]); }
+        if (pipe_[0] >= 0) { close_fd(pipe_[0]); }
     }
 
     std::string finish() {
         std::fflush(stderr);
-        if (::dup2(saved_, STDERR_FILENO) < 0) { throw std::runtime_error(std::strerror(errno)); }
-        ::close(saved_);
+        if (duplicate_to(saved_, stderr_fd()) < 0) {
+            throw std::runtime_error(std::strerror(errno));
+        }
+        close_fd(saved_);
         saved_ = -1;
 
         std::string output;
         std::array<char, 4096> buffer{};
         for (;;) {
-            const ssize_t count = ::read(pipe_[0], buffer.data(), buffer.size());
+            const auto count = read_fd(pipe_[0], buffer.data(), buffer.size());
             if (count == 0) { break; }
             if (count < 0) {
                 if (errno == EINTR) { continue; }
@@ -54,12 +61,30 @@ public:
             }
             output.append(buffer.data(), static_cast<std::size_t>(count));
         }
-        ::close(pipe_[0]);
+        close_fd(pipe_[0]);
         pipe_[0] = -1;
         return output;
     }
 
 private:
+#ifdef _WIN32
+    static int make_pipe(int (&pipe)[2]) { return ::_pipe(pipe, 4096, _O_BINARY); }
+    static int stderr_fd() { return ::_fileno(stderr); }
+    static int duplicate(int fd) { return ::_dup(fd); }
+    static int duplicate_to(int source, int destination) { return ::_dup2(source, destination); }
+    static int close_fd(int fd) { return ::_close(fd); }
+    static int read_fd(int fd, char* data, std::size_t size) {
+        return ::_read(fd, data, static_cast<unsigned int>(size));
+    }
+#else
+    static int make_pipe(int (&pipe)[2]) { return ::pipe(pipe); }
+    static int stderr_fd() { return STDERR_FILENO; }
+    static int duplicate(int fd) { return ::dup(fd); }
+    static int duplicate_to(int source, int destination) { return ::dup2(source, destination); }
+    static int close_fd(int fd) { return ::close(fd); }
+    static ssize_t read_fd(int fd, char* data, std::size_t size) { return ::read(fd, data, size); }
+#endif
+
     int pipe_[2]{-1, -1};
     int saved_ = -1;
 };
