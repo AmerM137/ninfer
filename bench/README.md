@@ -622,9 +622,9 @@ workspace capacity queried for the requested interval.
 ```bash
 cmake --build build --parallel --target ninfer_q5_linear_add_bench
 ./build/bench/ninfer_q5_linear_add_bench \
-  --k 6144 --t-sweep 1,2,4,8,16,24,32,48 --warmup 10 --repeat 50
+  --k 6144 --t-sweep 1,2,4,8,16,24,32,48,49,56,64,192,193 --warmup 10 --repeat 50
 ./build/bench/ninfer_q5_linear_add_bench \
-  --k 17408 --t-sweep 1,2,4,8,16,24,32,48 --warmup 10 --repeat 50
+  --k 17408 --t-sweep 1,2,4,8,16,24,32,48,49,56,64,192,193 --warmup 10 --repeat 50
 ```
 
 ## BF16 LinearAdd Op benchmark
