@@ -38,6 +38,12 @@ The active references under [`maintainer/`](maintainer/) record current architec
 artifact, and maintenance contracts. These files are not additional user workflows or installed
 API documentation.
 
+The agreed [model configuration, weight binding, and execution target architecture](maintainer/model-weight-execution.md)
+defines the intended model/artifact/Op boundaries, converter responsibilities, runtime support
+checks, and end-to-end design examples. It is a design contract, not a claim of implemented
+container or runtime support, and contains no migration plan. The references below continue to
+describe the delivered implementation.
+
 Runtime and Op references:
 
 - [Engine architecture, execution ownership, scheduling, and request lifecycles](maintainer/engine-architecture.md)
