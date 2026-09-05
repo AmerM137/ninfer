@@ -597,6 +597,19 @@ cmake --build build --parallel --target ninfer_q4_linear_swiglu_bench
   --t-sweep 1,2,4,8,16,24,32,40,48 --warmup 10 --repeat 50
 ```
 
+## NVFP4 LinearSwiGLU Op benchmark
+
+`ninfer_nvfp4_linear_swiglu_bench` measures the public NVFP4
+`[34816,5120] -> [17408,T]` profile. The A4 sweep includes both fused route seams and the
+larger materialized/TMA paths.
+
+```bash
+cmake --build build --parallel --target ninfer_nvfp4_linear_swiglu_bench
+./build/bench/ninfer_nvfp4_linear_swiglu_bench \
+  --policy a4 --t-sweep 5,48,49,56,64,65,96,97,128,256,1024 \
+  --warmup 10 --repeat 50
+```
+
 ## FP8 LinearSwiGLU Op benchmark
 
 `ninfer_fp8_linear_swiglu_bench` measures the public row-scaled FP8 `[34816,5120] ->
