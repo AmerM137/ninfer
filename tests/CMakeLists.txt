@@ -250,6 +250,7 @@ set(ninfer_op_tests
   cast
   prepare_ragged_prefix
   scatter
+  scatter_bf16_batch
   target_logprobs
   position)
 foreach(op IN LISTS ninfer_op_tests)

@@ -310,6 +310,27 @@ cmake --build build -j --target ninfer_embedding_bench
 ./build/bench/ninfer_embedding_bench --format fp8-d5120 --tokens 128 --profile
 ```
 
+## Batched feature scatter benchmark
+
+`ninfer_scatter_bf16_batch_bench` measures five public `scatter_bf16_batch` calls. Each copies
+one `[D,W,B]` source into a different D-row slice of the same `[5*D,W,8]` parent pool; default
+D=5120 matches DFlash2 feature capture. The calls use nonuniform exact BF16 bit patterns,
+permuted lane IDs and `--counts full|one|ragged|zero`. The measurement is the sum of five
+consecutive captures, without intervening model layers; it does not establish Engine latency.
+
+CSV reports live columns, bytes, zero scratch, Graph nodes/calls and median/min/p95 latency.
+`--graph-calls 32 --cache warm` repeats the entire five-call capture in one Graph and normalizes
+time per capture, so a bundle has 160 kernel nodes. Cold mode flushes 256 MiB before the timed
+interval, not between the five calls or individual repetitions within a bundle.
+
+```bash
+cmake --build build -j --target ninfer_scatter_bf16_batch_bench
+./build/bench/ninfer_scatter_bf16_batch_bench --widths 1,2,8,9,16 --batches 1,8 --counts full
+./build/bench/ninfer_scatter_bf16_batch_bench --widths 2,8,16 --batches 1,8 \
+  --counts ragged --cache warm --graph-calls 32 --csv-out /tmp/feature-scatter.csv
+./build/bench/ninfer_scatter_bf16_batch_bench --widths 16 --batches 8 --profile
+```
+
 ## RMSNorm Op benchmark
 
 `ninfer_rmsnorm_bench` measures public RMSNorm, with `--kind dflash2_hidden` for plain D=5120,
