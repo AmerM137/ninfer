@@ -248,6 +248,7 @@ set(ninfer_op_tests
   sampling
   scalar
   cast
+  prepare_ragged_prefix
   scatter
   target_logprobs
   position)
