@@ -498,7 +498,8 @@ larger than measurement uncertainty and must not introduce an avoidable latency 
 a universal percentage threshold: the task records the timing conditions and the scale needed to
 distinguish its candidates.
 
-Review and report the pointwise curve, not only its minimum, maximum, average, or selected route.
+When the deliverable covers a latency-sensitive interval, review and report its pointwise curve,
+not only its minimum, maximum, average, or selected route.
 At minimum, identify the largest adjacent-extent increase and every route or schedule seam in the
 measured interval. An unexplained material jump blocks a claim that the interval is smooth: either
 change the kernel or dispatch, or record why the complete candidate matrix shows that the jump is
@@ -513,14 +514,12 @@ policy does not prove that a particular accelerator route ran, so roofline evide
 and measure the implementation that production dispatch actually selects. These are completion
 requirements for the large-extent region, not a mandatory position in the development order.
 
-When a valid simple Op is the development surface for a related fused Op or epilogue, tune the
-shared computation across the current registered problem's required extent domain and performance
-regions before adapting it. Make the selected kernel bodies parameterizable at their output
-boundary, then immediately adapt them to the actual complete Op before moving to another problem.
-Do not enter the fused Op with only a provisional route, and do not turn this into a
-repository-wide simple-Op phase. The complete public fused Op, including its epilogue, post work,
-workspace traffic, outputs, and state effects, may still change the final fused route and supplies
-its own completion evidence.
+Choose the development surface from the requested complete Op. A related simple Op can help
+isolate shared computation when that answers a live design question, but completing a separate
+simple-Op tuning campaign is not a prerequisite for a fused Op. Reuse suitable kernel bodies at
+their output boundary when useful, and evaluate plausible routes through the complete public fused
+Op. Its epilogue, post work, workspace traffic, outputs, and state effects determine its selected
+route and completion evidence; an isolated contraction result cannot substitute for them.
 
 Before timing, qualify each candidate arithmetic profile against the independent oracle. After
 encoding the selected instances and boundaries in production dispatch, requalify boundary and
@@ -546,7 +545,9 @@ Preserve only the context needed to interpret the result, as required by `AGENTS
 
 ## 8. Change checklist
 
-For a new or changed device transformation:
+For a new or changed device transformation, apply the relevant contract checks below. They do not
+require separate artifacts or a fixed execution order, and unchanged contracts need not be
+rewritten:
 
 1. classify the complete semantic boundary and reject schedule decisions, raw transfers,
    container lifecycle operations, and partial implementation helpers;
