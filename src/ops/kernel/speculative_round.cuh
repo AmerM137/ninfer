@@ -4,7 +4,7 @@
 // Match: contiguous request-major state and BF16 verification logits.
 // Algorithm assumptions: small vocabularies use one cooperative block; the
 // registered full-vocabulary stochastic route uses the sampling partial/group
-// pipeline and caller-owned workspace, while greedy commit remains one thread.
+// pipeline and caller-owned workspace. Sparse acceptance and emission use one warp per request.
 
 #include "ops/kernel/sampling_device.cuh"
 
@@ -15,8 +15,6 @@
 
 namespace ninfer::ops {
 
-inline constexpr int kSparseSpeculativeDrafts     = 7;
-inline constexpr int kSparseSpeculativeColumns    = 8;
 inline constexpr int kSparseSpeculativeCandidates = 16;
 
 __global__ void speculative_prepare_verify_inputs_kernel(const std::int32_t* anchors,
@@ -99,52 +97,120 @@ __device__ __forceinline__ float speculative_sparse_probability(const std::int32
     return probability;
 }
 
-__device__ __forceinline__ int
-speculative_pick_sparse_residual(const std::int32_t* target_ids, const float* target_prob,
-                                 std::int32_t target_support, const std::int32_t* candidate_ids,
-                                 const float* proposal_q, float uniform) {
-    float mass = 0.0f;
-    for (int item = 0; item < target_support; ++item) {
-        const float q = speculative_sparse_probability(candidate_ids, proposal_q, target_ids[item]);
-        mass += fmaxf(target_prob[item] - q, 0.0f);
+// One warp owns a request. Each draft's acceptance event is independent given the provided
+// path and its conditional p/q distributions; the first failed event determines the prefix.
+__device__ __forceinline__ void speculative_sparse_warp_store(const int* drafts, int k, int row,
+                                                              int accepted_count, int terminal,
+                                                              int* lengths, int* anchors,
+                                                              int* licensed_tokens,
+                                                              int* licensed_counts, int* accepted) {
+    const int lane = threadIdx.x & 31;
+    if (lane <= k)
+        licensed_tokens[row * (k + 1) + lane] = lane < accepted_count    ? drafts[row * k + lane]
+                                                : lane == accepted_count ? terminal
+                                                                         : 0;
+    if (lane == 0) {
+        licensed_counts[row] = accepted_count + 1;
+        accepted[row]        = accepted_count;
+        anchors[row]         = terminal;
+        lengths[row] += accepted_count + 1;
     }
-    if (!(mass > 0.0f)) { return target_ids[0]; }
-
-    const float goal = uniform * mass;
-    float cumulative = 0.0f;
-    int selected     = target_ids[target_support - 1];
-    for (int item = 0; item < target_support; ++item) {
-        const float q = speculative_sparse_probability(candidate_ids, proposal_q, target_ids[item]);
-        const float residual = fmaxf(target_prob[item] - q, 0.0f);
-        if (!(residual > 0.0f)) { continue; }
-        cumulative += residual;
-        selected = target_ids[item];
-        if (goal < cumulative) { return selected; }
-    }
-    return selected;
 }
 
-__launch_bounds__(32) __global__ void speculative_accept_sparse_greedy_kernel(
-    const std::int32_t* target_tokens, const std::int32_t* drafts,
-    const std::int32_t* current_extents, std::int32_t* round_lengths, std::int32_t* round_anchors,
-    std::int32_t* licensed_tokens, std::int32_t* licensed_counts, std::int32_t* accepted,
-    std::int32_t batch) {
-    const int row = static_cast<int>(threadIdx.x);
-    if (row >= batch) { return; }
+__device__ __forceinline__ void speculative_sparse_warp_greedy(const int* target_tokens,
+                                                               const int* drafts, int* lengths,
+                                                               int* anchors, int* licensed_tokens,
+                                                               int* licensed_counts, int* accepted,
+                                                               int row, int extent, int k) {
+    const int lane = threadIdx.x & 31;
+    const bool reject =
+        lane < extent && target_tokens[row * (k + 1) + lane] != drafts[row * k + lane];
+    const unsigned mask = __ballot_sync(0xffffffffU, reject);
+    const int a         = mask ? __ffs(mask) - 1 : extent;
+    const int terminal  = target_tokens[row * (k + 1) + a];
+    speculative_sparse_warp_store(drafts, k, row, a, terminal, lengths, anchors, licensed_tokens,
+                                  licensed_counts, accepted);
+}
 
-    int extent = current_extents[row];
-    extent =
-        extent < 0 ? 0 : (extent > kSparseSpeculativeDrafts ? kSparseSpeculativeDrafts : extent);
-    const std::int32_t* row_targets = target_tokens + row * kSparseSpeculativeColumns;
-    const std::int32_t* row_drafts  = drafts + row * kSparseSpeculativeDrafts;
-    std::int32_t* row_tokens        = licensed_tokens + row * kSparseSpeculativeColumns;
-    int accepted_count              = 0;
-    while (accepted_count < extent && row_targets[accepted_count] == row_drafts[accepted_count]) {
-        ++accepted_count;
+__global__ __launch_bounds__(256) void speculative_accept_sparse_warp_greedy_kernel(
+    const int* target_tokens, const int* drafts, const int* current_extents, int* lengths,
+    int* anchors, int* licensed_tokens, int* licensed_counts, int* accepted, int k) {
+    const int row    = threadIdx.x / 32;
+    const int extent = min(k, max(0, current_extents[row]));
+    speculative_sparse_warp_greedy(target_tokens, drafts, lengths, anchors, licensed_tokens,
+                                   licensed_counts, accepted, row, extent, k);
+}
+
+__device__ __forceinline__ void speculative_sparse_warp_accept(
+    SamplingWorkspace workspace, const int* drafts, const int* candidate_ids,
+    const float* proposal_q, const SamplingConfig& cfg, int k, int row, int extent, bool greedy,
+    int* lengths, int* anchors, int* licensed_tokens, int* licensed_counts, int* accepted) {
+    const int lane       = threadIdx.x & 31;
+    const int old_length = lengths[row];
+    bool reject          = false;
+    if (lane < extent) {
+        const int d = drafts[row * k + lane];
+        if (greedy)
+            reject = workspace.dist_idx[sampling_dist_offset(lane, 0)] != d;
+        else {
+            const int support = workspace.dist_support[lane];
+            float pd          = 0.0f;
+            for (int j = 0; j < support; ++j) {
+                const int at = sampling_dist_offset(lane, j);
+                if (workspace.dist_idx[at] == d) {
+                    pd = workspace.dist_prob[at];
+                    break;
+                }
+            }
+            const int at   = (row * k + lane) * kSparseSpeculativeCandidates;
+            const float qd = speculative_sparse_probability(candidate_ids + at, proposal_q + at, d);
+            const float u  = sampling_uniform(cfg.seed, old_length + lane + 1,
+                                              kSamplePurposeSpeculativeAccept, 0);
+            reject         = !(pd >= qd || u * qd < pd);
+        }
     }
-    speculative_store_accept_result<false>(
-        row_drafts, kSparseSpeculativeDrafts, row, accepted_count, row_targets[accepted_count],
-        round_lengths, round_anchors, row_tokens, licensed_counts, accepted, nullptr);
+    const unsigned failures = __ballot_sync(0xffffffffU, reject);
+    const int a             = failures ? __ffs(failures) - 1 : extent;
+    int terminal;
+    if (greedy)
+        terminal = workspace.dist_idx[sampling_dist_offset(a, 0)];
+    else {
+        const int n  = workspace.dist_support[a];
+        int token    = 0;
+        float weight = 0.0f;
+        if (lane < n) {
+            const int at = sampling_dist_offset(a, lane);
+            token        = workspace.dist_idx[at];
+            weight       = workspace.dist_prob[at];
+            if (a < extent) {
+                const int q_at = (row * k + a) * kSparseSpeculativeCandidates;
+                weight         = fmaxf(weight - speculative_sparse_probability(candidate_ids + q_at,
+                                                                               proposal_q + q_at, token),
+                                       0.0f);
+            }
+        }
+        float cdf = weight;
+#pragma unroll
+        for (int offset = 1; offset < 32; offset *= 2) {
+            const float earlier = __shfl_up_sync(0xffffffffU, cdf, offset);
+            if (lane >= offset) cdf += earlier;
+        }
+        const float mass = __shfl_sync(0xffffffffU, cdf, 31);
+        const int purpose =
+            a < extent ? kSamplePurposeSpeculativeCorrection : kSamplePurposeSpeculativeBonus;
+        const float u           = sampling_uniform(cfg.seed, old_length + a + 1, purpose, 0);
+        const float goal        = u * mass;
+        const unsigned positive = __ballot_sync(0xffffffffU, lane < n && weight > 0.0f);
+        const unsigned candidates =
+            __ballot_sync(0xffffffffU, lane < n && weight > 0.0f && goal < cdf);
+        const int selected = !(mass > 0.0f) ? 0
+                             : candidates   ? __ffs(candidates) - 1
+                             : positive     ? 31 - __clz(positive)
+                                            : 0;
+        terminal           = __shfl_sync(0xffffffffU, token, selected);
+    }
+    speculative_sparse_warp_store(drafts, k, row, a, terminal, lengths, anchors, licensed_tokens,
+                                  licensed_counts, accepted);
 }
 
 // Commits the round's accepted tokens plus one correction/bonus token, then
@@ -404,31 +470,34 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
     int extent      = current_extents[row];
     extent          = extent < 0 ? 0 : (extent > k ? k : extent);
     if (col > extent) { return; }
-    const SamplingConfig cfg              = configs[row];
-    const std::int32_t* row_targets       = target_tokens + row * cols;
-    const std::int32_t* row_drafts        = drafts + row * k;
-    std::int32_t* row_tokens              = licensed_tokens + row * cols;
-    const std::int32_t* row_candidate_ids = nullptr;
-    const float* row_proposal_q           = nullptr;
-    if constexpr (SparseProposal) {
-        row_candidate_ids = candidate_ids + row * k * kSparseSpeculativeCandidates;
-        row_proposal_q    = proposal_q + row * k * kSparseSpeculativeCandidates;
-    }
+    const SamplingConfig cfg        = configs[row];
+    const std::int32_t* row_targets = target_tokens + row * cols;
+    const std::int32_t* row_drafts  = drafts + row * k;
+    std::int32_t* row_tokens        = licensed_tokens + row * cols;
     if (token_domain <= kSamplerTileItems) { return; }
     const bool greedy    = !(cfg.temperature > 0.0f);
     const bool penalties = cfg.presence_penalty != 0.0f || cfg.frequency_penalty != 0.0f;
 
     if (greedy && !penalties) {
-        if (tid == 0 && col == 0 && group == 0) {
-            int a = 0;
-            while (a < extent && row_targets[a] == row_drafts[a]) { ++a; }
-            const int t_star = row_targets[a];
-            speculative_store_accept_result<!SparseProposal>(row_drafts, k, row, a, t_star, lengths,
-                                                             anchors, row_tokens, licensed_counts,
-                                                             accepted, &cfg);
+        if constexpr (SparseProposal) {
+            if (tid < 32 && col == 0 && group == 0)
+                speculative_sparse_warp_greedy(target_tokens, drafts, lengths, anchors,
+                                               licensed_tokens, licensed_counts, accepted, row,
+                                               extent, k);
+        } else {
+
+            if (tid == 0 && col == 0 && group == 0) {
+                int a = 0;
+                while (a < extent && row_targets[a] == row_drafts[a]) { ++a; }
+                const int t_star = row_targets[a];
+                speculative_store_accept_result<!SparseProposal>(row_drafts, k, row, a, t_star,
+                                                                 lengths, anchors, row_tokens,
+                                                                 licensed_counts, accepted, &cfg);
+            }
         }
         return;
     }
+
 
     workspace = speculative_workspace_row(workspace, workspace_row_stride, row);
 
@@ -496,95 +565,123 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
     }
     __syncthreads();
 
-    if (greedy) {
+    if constexpr (SparseProposal) {
+        __shared__ int last_column;
+        if (greedy) {
+            if (tid == 0) {
+                workspace.dist_idx[sampling_dist_offset(col, 0)] = cand_idx[0];
+                workspace.group_done[col]                        = 0;
+                __threadfence();
+                last_column = atomicAdd(workspace.speculative_finalize_count, 1) + 1 == extent + 1;
+            }
+            __syncthreads();
+            if (last_column && tid < 32)
+                speculative_sparse_warp_accept(workspace, drafts, candidate_ids, proposal_q, cfg, k,
+                                               row, extent, true, lengths, anchors, licensed_tokens,
+                                               licensed_counts, accepted);
+            if (last_column && tid == 0) *workspace.speculative_finalize_count = 0;
+            return;
+        }
+        sampling_normalize_support(cfg, cand_val, cand_idx, prob, &n_support, cap);
         if (tid == 0) {
-            workspace.dist_idx[sampling_dist_offset(col, 0)] = cand_idx[0];
-            workspace.group_done[col]                        = 0;
+            workspace.dist_support[col] = n_support;
+            for (int j = 0; j < n_support; ++j) {
+                const int at            = sampling_dist_offset(col, j);
+                workspace.dist_idx[at]  = cand_idx[j];
+                workspace.dist_prob[at] = prob[j];
+            }
+            workspace.group_done[col] = 0;
+            __threadfence();
+            last_column = atomicAdd(workspace.speculative_finalize_count, 1) + 1 == extent + 1;
+        }
+        __syncthreads();
+        if (last_column && tid < 32)
+            speculative_sparse_warp_accept(workspace, drafts, candidate_ids, proposal_q, cfg, k,
+                                           row, extent, false, lengths, anchors, licensed_tokens,
+                                           licensed_counts, accepted);
+        if (last_column && tid == 0) *workspace.speculative_finalize_count = 0;
+        return;
+    } else {
+
+        if (greedy) {
+            if (tid == 0) {
+                workspace.dist_idx[sampling_dist_offset(col, 0)] = cand_idx[0];
+                workspace.group_done[col]                        = 0;
+                __threadfence();
+                const int done_cols = atomicAdd(workspace.speculative_finalize_count, 1) + 1;
+                if (done_cols == extent + 1) {
+                    int a     = 0;
+                    int tstar = 0;
+                    for (int i = 0; i <= extent; ++i) {
+                        const int selected = workspace.dist_idx[sampling_dist_offset(i, 0)];
+                        if (i < extent && selected == row_drafts[i]) {
+                            a = i + 1;
+                            continue;
+                        }
+                        tstar = selected;
+                        break;
+                    }
+                    speculative_store_accept_result<!SparseProposal>(
+                        row_drafts, k, row, a, tstar, lengths, anchors, row_tokens, licensed_counts,
+                        accepted, &cfg);
+                    *workspace.speculative_finalize_count = 0;
+                }
+            }
+            return;
+        }
+
+        sampling_normalize_support(cfg, cand_val, cand_idx, prob, &n_support, cap);
+
+        if (tid == 0) {
+            workspace.dist_support[col] = n_support;
+            for (int j = 0; j < n_support; ++j) {
+                const int off            = sampling_dist_offset(col, j);
+                workspace.dist_idx[off]  = cand_idx[j];
+                workspace.dist_prob[off] = prob[j];
+            }
+            workspace.group_done[col] = 0;
             __threadfence();
             const int done_cols = atomicAdd(workspace.speculative_finalize_count, 1) + 1;
             if (done_cols == extent + 1) {
-                int a     = 0;
-                int tstar = 0;
+                const int L = lengths[row];
+                int a       = 0;
+                int tstar   = 0;
                 for (int i = 0; i <= extent; ++i) {
-                    const int selected = workspace.dist_idx[sampling_dist_offset(i, 0)];
-                    if (i < extent && selected == row_drafts[i]) {
-                        a = i + 1;
-                        continue;
+                    const int n            = workspace.dist_support[i];
+                    const int* dist_idx    = workspace.dist_idx + sampling_dist_offset(i, 0);
+                    const float* dist_prob = workspace.dist_prob + sampling_dist_offset(i, 0);
+                    if (i < extent) {
+                        const int d = row_drafts[i];
+                        float pd    = 0.0f;
+                        for (int j = 0; j < n; ++j) {
+                            if (dist_idx[j] == d) {
+                                pd = dist_prob[j];
+                                break;
+                            }
+                        }
+                        const float u           = sampling_uniform(cfg.seed, L + i + 1,
+                                                                   kSamplePurposeSpeculativeAccept, 0u);
+                        const bool accept_draft = u < pd;
+                        if (accept_draft) {
+                            a = i + 1;
+                            continue;
+                        }
+                        const float ur = sampling_uniform(cfg.seed, L + i + 1,
+                                                          kSamplePurposeSpeculativeCorrection, 0u);
+
+                        tstar = sampling_pick_from_support(dist_idx, dist_prob, n, d, ur);
+
+                        break;
                     }
-                    tstar = selected;
-                    break;
+                    const float u = sampling_uniform(cfg.seed, L + extent + 1,
+                                                     kSamplePurposeSpeculativeBonus, 0u);
+                    tstar         = sampling_pick_from_support(dist_idx, dist_prob, n, -1, u);
                 }
                 speculative_store_accept_result<!SparseProposal>(row_drafts, k, row, a, tstar,
                                                                  lengths, anchors, row_tokens,
                                                                  licensed_counts, accepted, &cfg);
                 *workspace.speculative_finalize_count = 0;
             }
-        }
-        return;
-    }
-
-    sampling_normalize_support(cfg, cand_val, cand_idx, prob, &n_support, cap);
-
-    if (tid == 0) {
-        workspace.dist_support[col] = n_support;
-        for (int j = 0; j < n_support; ++j) {
-            const int off            = sampling_dist_offset(col, j);
-            workspace.dist_idx[off]  = cand_idx[j];
-            workspace.dist_prob[off] = prob[j];
-        }
-        workspace.group_done[col] = 0;
-        __threadfence();
-        const int done_cols = atomicAdd(workspace.speculative_finalize_count, 1) + 1;
-        if (done_cols == extent + 1) {
-            const int L = lengths[row];
-            int a       = 0;
-            int tstar   = 0;
-            for (int i = 0; i <= extent; ++i) {
-                const int n            = workspace.dist_support[i];
-                const int* dist_idx    = workspace.dist_idx + sampling_dist_offset(i, 0);
-                const float* dist_prob = workspace.dist_prob + sampling_dist_offset(i, 0);
-                if (i < extent) {
-                    const int d = row_drafts[i];
-                    float pd    = 0.0f;
-                    for (int j = 0; j < n; ++j) {
-                        if (dist_idx[j] == d) {
-                            pd = dist_prob[j];
-                            break;
-                        }
-                    }
-                    const float u =
-                        sampling_uniform(cfg.seed, L + i + 1, kSamplePurposeSpeculativeAccept, 0u);
-                    bool accept_draft         = u < pd;
-                    const std::int32_t* q_ids = nullptr;
-                    const float* q_prob       = nullptr;
-                    if constexpr (SparseProposal) {
-                        q_ids          = row_candidate_ids + i * kSparseSpeculativeCandidates;
-                        q_prob         = row_proposal_q + i * kSparseSpeculativeCandidates;
-                        const float qd = speculative_sparse_probability(q_ids, q_prob, d);
-                        accept_draft   = pd >= qd || u * qd < pd;
-                    }
-                    if (accept_draft) {
-                        a = i + 1;
-                        continue;
-                    }
-                    const float ur = sampling_uniform(cfg.seed, L + i + 1,
-                                                      kSamplePurposeSpeculativeCorrection, 0u);
-                    if constexpr (SparseProposal) {
-                        tstar = speculative_pick_sparse_residual(dist_idx, dist_prob, n, q_ids,
-                                                                 q_prob, ur);
-                    } else {
-                        tstar = sampling_pick_from_support(dist_idx, dist_prob, n, d, ur);
-                    }
-                    break;
-                }
-                const float u =
-                    sampling_uniform(cfg.seed, L + extent + 1, kSamplePurposeSpeculativeBonus, 0u);
-                tstar = sampling_pick_from_support(dist_idx, dist_prob, n, -1, u);
-            }
-            speculative_store_accept_result<!SparseProposal>(row_drafts, k, row, a, tstar, lengths,
-                                                             anchors, row_tokens, licensed_counts,
-                                                             accepted, &cfg);
-            *workspace.speculative_finalize_count = 0;
         }
     }
 }
