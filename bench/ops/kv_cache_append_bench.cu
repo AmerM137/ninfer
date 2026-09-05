@@ -67,6 +67,8 @@ struct Options {
     std::int32_t context         = 128;
     int warmup                   = 5;
     int repeat                   = 50;
+    int graph_calls              = 1;
+    int max_count                = -1;
     bool profile                 = false;
     std::string csv_out;
 };
@@ -82,6 +84,9 @@ struct Result {
     CacheState cache;
     std::int32_t tokens;
     std::int32_t committed;
+    std::int32_t max_count;
+    std::size_t graph_nodes;
+    int graph_calls;
     double logical_cache_bytes;
     double key_vector_bytes;
     double value_vector_bytes;
@@ -99,7 +104,8 @@ struct Result {
                  "[--layout paged|cyclic|all] [--tokens T,...] [--counts C,...] "
                  "[--cyclic-capacity 2048|4096] [--batch B] "
                  "[--context L] [--execution eager|graph|both] [--cache cold|warm|both] "
-                 "[--warmup N] [--repeat N] [--profile] [--csv-out PATH]\n",
+                 "[--warmup N] [--repeat N] [--graph-calls N] [--max-count N] [--profile] "
+                 "[--csv-out PATH]\n",
                  message);
     std::exit(2);
 }
@@ -227,6 +233,12 @@ Options parse_options(int argc, char** argv) {
             options.warmup = parse_i32(next("--warmup requires a value"), 0, 10000, "--warmup");
         } else if (argument == "--repeat") {
             options.repeat = parse_i32(next("--repeat requires a value"), 1, 10000, "--repeat");
+        } else if (argument == "--graph-calls") {
+            options.graph_calls =
+                parse_i32(next("--graph-calls requires a value"), 1, 64, "--graph-calls");
+        } else if (argument == "--max-count") {
+            options.max_count =
+                parse_i32(next("--max-count requires a value"), 0, 4096, "--max-count");
         } else if (argument == "--profile") {
             options.profile = true;
         } else if (argument == "--csv-out") {
@@ -258,6 +270,8 @@ Options parse_options(int argc, char** argv) {
         (options.mode != Mode::Prefix || options.layout != LayoutChoice::Cyclic)) {
         usage("--batch greater than one requires --mode prefix --layout cyclic");
     }
+    if (options.graph_calls > 1 && (options.execution != Execution::Graph || options.profile))
+        usage("graph bundles require --execution graph and no --profile");
     return options;
 }
 
@@ -405,7 +419,7 @@ CyclicKVCacheLayerView make_prefix_cyclic_view(DeviceBuffer& k, DeviceBuffer& v,
 class PrefixCase {
 public:
     PrefixCase(std::int32_t tokens, std::int32_t committed, bool cyclic,
-               std::int32_t cyclic_capacity, std::int32_t batch)
+               std::int32_t cyclic_capacity, std::int32_t batch, int maximum)
         : tokens_(tokens), committed_(committed), cyclic_(cyclic),
           k_(bench::make_bf16(static_cast<std::size_t>(kPrefixHeadDim) * kPrefixKvHeads * tokens *
                               batch)),
@@ -432,11 +446,13 @@ public:
                              : make_prefix_paged_view(cache_k_, cache_v_, block_table_)),
           cyclic_view_(cyclic ? make_prefix_cyclic_view(cache_k_, cache_v_, cyclic_capacity, batch)
                               : CyclicKVCacheLayerView{}),
-          envelope_{0, static_cast<std::uint32_t>(tokens)} {
+          envelope_{0, static_cast<std::uint32_t>(maximum)} {
+        if (maximum > tokens || committed > maximum)
+            throw std::invalid_argument("prefix count/envelope exceeds extent");
         if (!cyclic && batch != 1) {
             throw std::invalid_argument("paged prefix benchmark requires B=1");
         }
-        if (cyclic && (tokens > cyclic_capacity || committed > cyclic_capacity)) {
+        if (cyclic && (maximum > cyclic_capacity || committed > cyclic_capacity)) {
             throw std::invalid_argument("cyclic prefix extent exceeds capacity");
         }
         const std::int32_t start = cyclic ? 2 * cyclic_capacity - 3 : 0;
@@ -570,18 +586,19 @@ bench::ColdTiming measure(Case& data, Execution execution, CacheState cache,
 
 void report(const Result& result) {
     const double seconds = result.timing.median_us * 1.0e-6;
-    const double gbps    = result.useful_bytes / seconds / 1.0e9;
+    const double gbps    = seconds > 0 ? result.useful_bytes / seconds / 1.0e9 : 0.0;
     std::printf("mode=%-6s geometry=%-9s kv=%-6s layout=%-6s B=%d ring=%4d "
-                "execution=%-5s cache=%-4s T=%4d C=%4d median=%8.3f us min=%8.3f us p95=%8.3f us "
+                "execution=%-5s cache=%-4s T=%4d C=%4d max_count=%d graph_nodes=%zu graph_calls=%d "
+                "median=%8.3f us min=%8.3f us p95=%8.3f us "
                 "logical=%.0f physical=%.0f (K=%.0f V=%.0f) useful=%8.1f GB/s "
                 "(%5.1f%% of %.0f)\n",
                 mode_name(result.mode), result.geometry, storage_name(result.storage),
                 result.layout, result.batch, result.cyclic_capacity,
                 execution_name(result.execution), cache_name(result.cache), result.tokens,
-                result.committed, result.timing.median_us, result.timing.min_us,
-                result.timing.p95_us, result.logical_cache_bytes, result.physical_cache_bytes,
-                result.key_vector_bytes, result.value_vector_bytes, gbps,
-                gbps / kRtx5090DramGBs * 100.0, kRtx5090DramGBs);
+                result.committed, result.max_count, result.graph_nodes, result.graph_calls,
+                result.timing.median_us, result.timing.min_us, result.timing.p95_us,
+                result.logical_cache_bytes, result.physical_cache_bytes, result.key_vector_bytes,
+                result.value_vector_bytes, gbps, gbps / kRtx5090DramGBs * 100.0, kRtx5090DramGBs);
 }
 
 void write_csv(const Options& options, const std::vector<Result>& results) {
@@ -590,7 +607,8 @@ void write_csv(const Options& options, const std::vector<Result>& results) {
     if (!path.parent_path().empty()) { std::filesystem::create_directories(path.parent_path()); }
     std::ofstream output(path);
     if (!output) { throw std::runtime_error("failed to open CSV output"); }
-    output << "mode,geometry,kv_dtype,layout,batch,cyclic_capacity,execution,cache,T,committed,"
+    output << "mode,geometry,kv_dtype,layout,batch,cyclic_capacity,execution,cache,T,committed,max_"
+              "count,graph_nodes,graph_calls,"
               "logical_cache_bytes,key_vector_bytes,value_vector_bytes,physical_cache_bytes,"
               "useful_bytes,"
               "median_us,min_us,p95_us\n";
@@ -599,6 +617,7 @@ void write_csv(const Options& options, const std::vector<Result>& results) {
                << storage_name(result.storage) << ',' << result.layout << ',' << result.batch << ','
                << result.cyclic_capacity << ',' << execution_name(result.execution) << ','
                << cache_name(result.cache) << ',' << result.tokens << ',' << result.committed << ','
+               << result.max_count << ',' << result.graph_nodes << ',' << result.graph_calls << ','
                << result.logical_cache_bytes << ',' << result.key_vector_bytes << ','
                << result.value_vector_bytes << ',' << result.physical_cache_bytes << ','
                << result.useful_bytes << ',' << result.timing.median_us << ','
@@ -611,8 +630,9 @@ void profile_case(Case& data, const char* label, const Options& options, DeviceB
                   cudaStream_t stream) {
     const Execution execution = options.execution;
     const CacheState cache = options.cache == CacheMode::Cold ? CacheState::Cold : CacheState::Warm;
+    const bool empty       = options.mode == Mode::Prefix && options.max_count == 0;
     bench::TimedGraph graph;
-    if (execution == Execution::Graph) {
+    if (execution == Execution::Graph && !empty) {
         data.launch(stream);
         CUDA_CHECK(cudaStreamSynchronize(stream));
         graph.capture(stream, [&](cudaStream_t launch_stream) { data.launch(launch_stream); });
@@ -629,7 +649,7 @@ void profile_case(Case& data, const char* label, const Options& options, DeviceB
                 execution_name(execution), cache_name(cache));
     std::fflush(stdout);
     CUDA_CHECK(cudaProfilerStart());
-    if (execution == Execution::Graph)
+    if (execution == Execution::Graph && !empty)
         graph.launch(stream);
     else
         data.launch(stream);
@@ -660,11 +680,18 @@ void collect_case(Case& data, Mode mode, const char* geometry, KvCacheStorage st
                   double key_vector_bytes, double value_vector_bytes, double physical_cache_bytes,
                   double useful_bytes, const Options& options, DeviceBuffer& flush,
                   cudaStream_t stream, std::vector<Result>& results) {
+    const bool empty = mode == Mode::Prefix && options.max_count == 0;
     bench::TimedGraph graph;
-    if (options.execution != Execution::Eager) {
+    if (empty) {
         data.launch(stream);
         CUDA_CHECK(cudaStreamSynchronize(stream));
-        graph.capture(stream, [&](cudaStream_t launch_stream) { data.launch(launch_stream); });
+    }
+    if (options.execution != Execution::Eager && !empty) {
+        data.launch(stream);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        graph.capture(stream, [&](cudaStream_t launch_stream) {
+            for (int call = 0; call < options.graph_calls; ++call) data.launch(launch_stream);
+        });
     }
     for (const Execution execution : {Execution::Eager, Execution::Graph}) {
         if ((options.execution == Execution::Eager && execution != Execution::Eager) ||
@@ -686,13 +713,22 @@ void collect_case(Case& data, Mode mode, const char* geometry, KvCacheStorage st
                           cache,
                           tokens,
                           committed,
+                          mode == Mode::Prefix
+                              ? (options.max_count < 0 ? tokens : options.max_count)
+                              : tokens,
+                          execution == Execution::Graph && !empty ? graph.nodes() : 0,
+                          options.graph_calls,
                           logical_cache_bytes,
                           key_vector_bytes,
                           value_vector_bytes,
                           physical_cache_bytes,
                           useful_bytes,
-                          measure(data, execution, cache, &graph, flush, stream, options.warmup,
-                                  options.repeat)};
+                          empty ? bench::ColdTiming{}
+                                : measure(data, execution, cache, &graph, flush, stream,
+                                          options.warmup, options.repeat)};
+            result.timing.median_us /= options.graph_calls;
+            result.timing.min_us /= options.graph_calls;
+            result.timing.p95_us /= options.graph_calls;
             report(result);
             results.push_back(result);
         }
@@ -728,12 +764,15 @@ int main(int argc, char** argv) {
                 if (options.counts.front() > options.tokens.front()) {
                     usage("prefix count exceeds T");
                 }
-                if (cyclic && (options.tokens.front() > options.cyclic_capacity ||
-                               options.counts.front() > options.cyclic_capacity)) {
+                if (cyclic &&
+                    ((options.max_count < 0 ? options.tokens.front() : options.max_count) >
+                         options.cyclic_capacity ||
+                     options.counts.front() > options.cyclic_capacity)) {
                     usage("cyclic prefix extent exceeds capacity");
                 }
                 PrefixCase data(options.tokens.front(), options.counts.front(), cyclic,
-                                options.cyclic_capacity, options.batch);
+                                options.cyclic_capacity, options.batch,
+                                options.max_count < 0 ? options.tokens.front() : options.max_count);
                 const std::string label =
                     std::string("mode=prefix layout=") +
                     (cyclic ? "cyclic capacity=" + std::to_string(options.cyclic_capacity) +
@@ -773,13 +812,18 @@ int main(int argc, char** argv) {
                 }
                 for (const std::int32_t tokens : options.tokens) {
                     for (const std::int32_t committed : options.counts) {
-                        if (committed > tokens) { continue; }
-                        if (cyclic && (tokens > options.cyclic_capacity ||
+                        if (committed > tokens ||
+                            (options.max_count >= 0 && committed > options.max_count)) {
+                            continue;
+                        }
+                        if (cyclic && ((options.max_count < 0 ? tokens : options.max_count) >
+                                           options.cyclic_capacity ||
                                        committed > options.cyclic_capacity)) {
                             continue;
                         }
                         PrefixCase data(tokens, committed, cyclic, options.cyclic_capacity,
-                                        options.batch);
+                                        options.batch,
+                                        options.max_count < 0 ? tokens : options.max_count);
                         constexpr double kPrefixVectorBytes = kPrefixHeadDim * 2.0;
                         const double cache_bytes = static_cast<double>(committed) * options.batch *
                                                    kPrefixKvHeads * (2.0 * kPrefixVectorBytes);

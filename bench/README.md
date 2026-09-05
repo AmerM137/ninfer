@@ -561,10 +561,13 @@ instruction utilization require a profiler capture of the complete public call.
 `ninfer_kv_cache_append_bench` unifies the two public append contracts without combining them in
 one timed body. `--mode full` calls full D256 KV publication for KV4/KV2 and BF16, INT8-G64,
 FP8-E4M3FN-row256, NVFP4-G16, or K8V4 caches. Its report keeps key/value vector bytes separate for
-asymmetric storage profiles. `--mode prefix`
-calls device-count prefix publication for BF16 D128/KV8
-linear or 4096-slot cyclic caches; `T` is the public envelope and `C` is the device commit count.
-Every measured interval or captured graph contains exactly one selected public append call.
+asymmetric storage profiles. `--mode prefix` calls device-count prefix publication for BF16
+D128/KV8 paged caches or cyclic caches with `--cyclic-capacity 2048|4096`. `T` is the physical input
+width and `C` is the actual device commit count. `--max-count N` selects the host envelope upper
+bound (default T), independently of C. Each default measurement contains one public call;
+`--graph-calls 32 --execution graph --cache warm` captures 32 calls and reports latency per call,
+with the total Graph node count. A cold bundle flushes L2 only before its first call. Profiling
+uses one public call.
 
 ```bash
 cmake --build build --parallel --target ninfer_kv_cache_append_bench
@@ -576,8 +579,9 @@ cmake --build build --parallel --target ninfer_kv_cache_append_bench
   --layout all --execution graph --cache cold --warmup 10 --repeat 61
 ```
 
-Prefix useful traffic is 8192 bytes per committed token; `C=0` still exercises the public
-device-count contract and reports zero useful bytes.
+Prefix useful traffic is 8192 bytes per committed token, multiplied by the batch size. `C=0`
+with a positive envelope still exercises device count handling and reports zero useful bytes.
+`--max-count 0 --counts 0` produces no kernels and reports zero GPU time.
 
 ## Masked-block preparation Op benchmark
 
