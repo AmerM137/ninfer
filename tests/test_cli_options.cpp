@@ -61,6 +61,11 @@ int main() {
                           dflash_vision.speculative.backend == ninfer::SpeculativeBackend::DFlash &&
                           dflash_vision.speculative.draft_tokens == 7,
                       "CLI did not preserve the combined DFlash and Vision startup features");
+    const ninfer::cli::Options dflash2 = parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                                                "--spec", "dflash2", "--draft-tokens", "7"});
+    failures += check(dflash2.speculative.backend == ninfer::SpeculativeBackend::DFlash2 &&
+                          dflash2.speculative.draft_tokens == 7,
+                      "CLI did not select the DFlash2 binding path");
     const ninfer::cli::Options nvfp4 =
         parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--kv-dtype", "nvfp4"});
     failures += check(nvfp4.kv_cache == ninfer::KvCacheStorage::Nvfp4Group16,
