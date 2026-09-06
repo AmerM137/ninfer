@@ -27,8 +27,12 @@ Generation purpose 的 NInfer Engine 固定运行：
 - 不抢占已经激活的请求；
 - 每个 decode round 将全部 decode-ready 请求组成一个紧凑批次。
 
-Text、Vision、prefix reuse、MTP、DFlash、CLI 和 HTTP serving 都通过公共 `ninfer::Engine` 路径。
-MTP 和 DFlash 是 Program 内部的执行后端，不产生第二套请求调度或结果发布机制。
+Text、Vision、prefix reuse、MTP、DFlash/DFlash2、CLI 和 HTTP serving 都通过公共 `ninfer::Engine` 路径。
+MTP、DFlash 和 DFlash2 是 Program 内部的执行后端，不产生第二套请求调度或结果发布机制。
+Qwen3.8-27B 的 DFlash2 支持启动固定 K=1..15、full/optimized proposal head、Text/Vision 和
+exact-batch CUDA Graph。它复用 family-owned masked-draft 状态事务，五层 local context
+属于 StateImage，不分配 full backend KV；独立 context frontier 与 main frontier 的关系、
+条件 proposal q 和最终提交规则见 [DFlash2](qwen3.8-27b-dflash2.md)。
 
 同一个公共 Engine 还提供启动时固定的 CausalScoring purpose。它只服务离线文本评分：
 `CausalScoreCore` 串行调用 Program，窗口使用临时的空 State 与 Main KV，不创建请求、continuation、
