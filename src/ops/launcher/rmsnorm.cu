@@ -47,24 +47,14 @@ void launch_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor* z, Tens
         }
     }
     if constexpr (Epilogue == RmsEpilogue::Offset) {
-        if (aligned2 && d == 256 && (rows <= 1024 || rows > 2560)) {
-            // Four rows per CTA exposes small Q/K batches; eight rows amortizes scheduling
-            // at 513..1024 rows. The existing 16-row CTA remains faster at 1025..2560.
-            if (rows <= 512 || rows > 2560) {
-                constexpr int block = 128;
-                rmsnorm_warp_bf16x2_kernel<Epilogue, block, true, 256>
-                    <<<static_cast<unsigned>((rows + 3) / 4), block, 0, stream>>>(
-                        reinterpret_cast<const __nv_bfloat162*>(x_bf16),
-                        reinterpret_cast<const __nv_bfloat162*>(w_bf16), nullptr,
-                        reinterpret_cast<__nv_bfloat162*>(out_bf16), d, rows, eps);
-            } else {
-                constexpr int block = 256;
-                rmsnorm_warp_bf16x2_kernel<Epilogue, block, true, 256>
-                    <<<static_cast<unsigned>((rows + 7) / 8), block, 0, stream>>>(
-                        reinterpret_cast<const __nv_bfloat162*>(x_bf16),
-                        reinterpret_cast<const __nv_bfloat162*>(w_bf16), nullptr,
-                        reinterpret_cast<__nv_bfloat162*>(out_bf16), d, rows, eps);
-            }
+        if (aligned2 && d == 256) {
+            // One warp per row, four rows per CTA across both query and key projections.
+            constexpr int block = 128;
+            rmsnorm_warp_bf16x2_kernel<Epilogue, block, true, 256>
+                <<<static_cast<unsigned>((rows + 3) / 4), block, 0, stream>>>(
+                    reinterpret_cast<const __nv_bfloat162*>(x_bf16),
+                    reinterpret_cast<const __nv_bfloat162*>(w_bf16), nullptr,
+                    reinterpret_cast<__nv_bfloat162*>(out_bf16), d, rows, eps);
             return;
         }
     }
