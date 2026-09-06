@@ -510,7 +510,14 @@ same context and all `W` columns are valid. One exact mixed profile uses `--row-
 `--valid-columns`, and `--table-rows`, each with exactly `B` entries. Cached-only remains B=1.
 The timed call consumes the whole batch once; metadata copies and graph capture remain outside the
 interval. Uniform full-width profiles use the dense public contract; exact partial profiles use
-device-resident valid extents. Reported useful bytes/FLOPs sum only valid row work.
+device-resident valid extents. Q/K/V contain nonuniform finite values; initial cache rows are encoded
+by the public KV append Op before timing. Reported useful bytes/FLOPs sum only valid row work.
+`graph_nodes` counts the complete capture. `workspace_bytes` is the per-Op public capacity query
+and `workspace_peak_bytes` is the observed peak; the arena is empty after each call. For short warm
+Ops, `--execution graph --cache warm --graph-calls 32` captures 32 consecutive calls to reduce CPU
+submission gaps. Reported times are normalized per Op, and the CSV records `graph_calls`. Repeated
+append calls overwrite the same positions with identical values; this is a warm Op measurement,
+not 32 speculative rounds. Cold measurements require one call per graph.
 
 ```bash
 cmake --build build --parallel --target ninfer_causal_softmax_attention_bench
@@ -536,19 +543,13 @@ cmake --build build --parallel --target ninfer_causal_softmax_attention_bench
   --execution eager --cache cold --warmup 10 --repeat 61
 ```
 
-For FP8, NVFP4, and K8V4 points the report and CSV expose separate QK/PV FLOPs, their
-full-public-Op-equivalent TFLOP/s, a mixed Tensor Core floor, separate
-`key_vector_bytes`/`value_vector_bytes`, actual `physical_cache_bytes`, and a one-stream
-persistent-KV payload. The per-contraction rates deliberately divide by complete Op latency and
-are explanatory, not isolated MMA throughput. The QK ceilings are `419 TFLOP/s` for the E4M3/FP32
-FP8 and K8V4 routes and `209.5 TFLOP/s` for the FP16/FP32 NVFP4 route; PV uses the
-`209.5 TFLOP/s` FP16/FP32 ceiling in all three modes. The CSV records both operand-specific peaks
-alongside mixed peak utilization so a storage-format label cannot silently select the wrong peak.
-Persistent K+V bytes per D256 token/head are 516 for FP8, 288 for NVFP4, and 402 for K8V4
-(258-byte K plus 144-byte V). Effective bandwidth uses the measured `1674.5 GB/s` cold pure-read
-ceiling and does not inflate the numerator with Q/output, append traffic, metadata, workspace, or
-duplicate cache reads. These roofline fields explain a complete public-Op result; they are not an
-acceptance threshold.
+The report exposes separate QK/PV logical FLOPs, their full-public-Op-equivalent TFLOP/s,
+`key_vector_bytes`/`value_vector_bytes`, and `physical_cache_bytes`. Persistent K+V bytes per D256
+vector are 516 for FP8, 288 for NVFP4, and 402 for K8V4 (258-byte K plus 144-byte V).
+`unique_kv_bytes` counts each visible persistent KV vector once; `unique_kv_gbps` divides it by
+complete Op latency. Payload rates exclude repeated reads and do not measure DRAM bandwidth.
+Logical FLOPs do not model private operand conversion, padding, or additional quantization work;
+the benchmark therefore does not infer Tensor Core utilization from a storage-format label.
 
 `ninfer_context_softmax_attention_bench` measures the public read-only context-plus-query contract
 at Q32/KV8/D128 with BF16 context storage. `T` is a complete non-causal query block and `L` is its

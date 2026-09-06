@@ -80,6 +80,11 @@ Every participating comparison emits one `OP_ERROR_STATS` record containing the 
 actual error, active limit, and error-to-limit ratio. The switch changes reporting only; the same
 statistics still drive the normal verdict. Passing tests remain quiet without it.
 
+The variable-width DFlash2 target-attention subset can be run with
+`./build/tests/ninfer_softmax_attention_test --dflash2-only`. It covers D256/Q24/KV4 across all five
+cache codecs, W=2..16, B=1..8, request-local prefixes, cache effects, and Graph metadata/input
+updates. The default executable also runs the existing attention geometries and prefill tests.
+
 Linear tests are independently runnable by weight and activation-compute profile:
 
 ```bash
