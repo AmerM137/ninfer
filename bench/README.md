@@ -819,8 +819,14 @@ times one replay. Profiling follows the same selection. CSV and terminal rows id
 mode and captured node count; the terminal header records the GPU and CUDA runtime. Cold samples
 flush 256 MiB before the complete Op; warm samples reuse the same buffers.
 
+Q4/Q5 and FP8 target fixtures initialize nonuniform valid signed codes, stored scales and BF16
+activations. `workspace_bytes` is the exact query for the displayed T, `workspace_peak_bytes` is
+the arena peak observed during the public call/capture, and `workspace_capacity_bytes` is the
+allocation reserved for the entire requested sweep. Logical GB/s counts semantic tensor/weight
+bytes; it is not a measured DRAM utilization percentage.
+
 ```bash
-cmake --build build --parallel --target ninfer_attn_input_proj_bench
+cmake --build build -j --target ninfer_attn_input_proj_bench
 ./build/bench/ninfer_attn_input_proj_bench \
   --format all --tokens 1,2,4,8,12,16,32,64,128,256,512,1024 \
   --cache cold --warmup 10 --repeat 50 \
@@ -829,7 +835,7 @@ cmake --build build --parallel --target ninfer_attn_input_proj_bench
   --format nvfp4 --nvfp4-policy a4 --tokens 1024 \
   --cache cold --warmup 10 --profile
 ./build/bench/ninfer_attn_input_proj_bench \
-  --format fp8 --fp8-policy a8 --tokens 1 \
+  --format fp8 --fp8-policy a8 --tokens 1,5,32,64,65,96,128 \
   --cache cold --warmup 10 --repeat 50
 ./build/bench/ninfer_attn_input_proj_bench \
   --format w8-dflash2-qkv --tokens 8,16,32,53,54,64,65,96,128,1024 \

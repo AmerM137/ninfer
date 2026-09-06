@@ -10,6 +10,7 @@
 
 #include <cuda_profiler_api.h>
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>
 
 #include <algorithm>
 #include <cerrno>
@@ -30,7 +31,7 @@ using namespace ninfer;
 namespace {
 
 constexpr std::size_t kFlushBytes = std::size_t{256} << 20;
-constexpr double kRtx5090DramGBs  = 1792.0;
+
 
 enum class Format : std::uint8_t { Q4Q5, W8Qgkv, W8Qkv, W8DFlash2Qkv, Bf16, Nvfp4, Fp8, All };
 enum class CacheMode : std::uint8_t { Cold, Warm, Both };
@@ -58,7 +59,9 @@ struct Result {
     std::uint64_t logical_bytes;
     double useful_flops;
     bench::ColdTiming timing;
-    std::size_t graph_nodes = 0;
+    std::size_t graph_nodes              = 0;
+    std::size_t workspace_capacity_bytes = 0;
+    std::size_t workspace_peak_bytes     = 0;
 };
 
 struct Measurement {
@@ -253,18 +256,19 @@ void report(const Result& result) {
     const double tflops  = result.useful_flops / seconds / 1.0e12;
     std::printf("entry=attn_input_proj format=%-8s policy=%-3s cache=%-4s execution=%-5s "
                 "graph_nodes=%zu T=%4d "
-                "workspace=%9zu median=%9.3f us min=%9.3f us p95=%9.3f us "
-                "logical=%8.1f GB/s (%5.1f%% of %.0f) math=%8.2f TFLOP/s\n",
+                "workspace=%9zu capacity=%9zu peak=%9zu median=%9.3f us min=%9.3f us p95=%9.3f us "
+                "logical=%8.1f GB/s math=%8.2f TFLOP/s\n",
                 result.format, result.policy, cache_name(result.cache),
                 result.graph_nodes ? "graph" : "eager", result.graph_nodes, result.tokens,
-                result.workspace_bytes, result.timing.median_us, result.timing.min_us,
-                result.timing.p95_us, gbps, gbps / kRtx5090DramGBs * 100.0, kRtx5090DramGBs,
-                tflops);
+                result.workspace_bytes, result.workspace_capacity_bytes,
+                result.workspace_peak_bytes, result.timing.median_us, result.timing.min_us,
+                result.timing.p95_us, gbps, tflops);
 }
 
 void append_result(std::vector<Result>& results, const char* format, const char* policy,
                    std::int32_t tokens, CacheState cache, std::size_t workspace_bytes,
-                   std::uint64_t logical_bytes, double useful_flops, Measurement measurement) {
+                   std::uint64_t logical_bytes, double useful_flops, Measurement measurement,
+                   std::size_t capacity = 0, std::size_t peak = 0) {
     Result result{format,
                   policy,
                   tokens,
@@ -273,13 +277,87 @@ void append_result(std::vector<Result>& results, const char* format, const char*
                   logical_bytes,
                   useful_flops,
                   measurement.timing,
-                  measurement.graph_nodes};
+                  measurement.graph_nodes,
+                  capacity,
+                  peak};
     report(result);
     results.push_back(result);
 }
 
 std::uint64_t tensor_bytes(std::int32_t rows, std::int32_t tokens) {
     return static_cast<std::uint64_t>(rows) * static_cast<std::uint64_t>(tokens) * 2ULL;
+}
+
+__device__ unsigned mix_bits(unsigned v) {
+    v ^= v >> 16;
+    v *= 0x7feb352dU;
+    v ^= v >> 15;
+    v *= 0x846ca68bU;
+    return v ^ (v >> 16);
+}
+
+__global__ void fill_input(__nv_bfloat16* x, std::size_t n) {
+    const std::size_t i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < n)
+        x[i] = __float2bfloat16_rn(
+            (float(mix_bits(static_cast<unsigned>(i) + 913U) >> 8) * (2.f / 16777216.f) - 1.f) *
+            .01f);
+}
+
+DeviceBuffer varied_input(std::size_t n) {
+    DeviceBuffer x(n * 2);
+    fill_input<<<(n + 255) / 256, 256>>>(static_cast<__nv_bfloat16*>(x.p), n);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+    return x;
+}
+
+template <bool Five>
+__device__ unsigned group_code(unsigned group, int lane) {
+    constexpr int span = Five ? 31 : 15, limit = Five ? 15 : 7;
+    return static_cast<unsigned>(int(mix_bits(group * 64 + lane + 175U) % span) - limit) &
+           (Five ? 31 : 15);
+}
+
+template <bool Five>
+__global__ void fill_groupwise(std::uint8_t* low, std::uint8_t* high, std::uint16_t* scales,
+                               unsigned groups) {
+    const unsigned group = blockIdx.x * blockDim.x + threadIdx.x;
+    if (group >= groups) return;
+    for (int i = 0; i < 32; ++i)
+        low[group * 32 + i] = (group_code<Five>(group, 2 * i) & 15) |
+                              ((group_code<Five>(group, 2 * i + 1) & 15) << 4);
+    if constexpr (Five)
+        for (int i = 0; i < 8; ++i) {
+            unsigned byte = 0;
+            for (int bit = 0; bit < 8; ++bit)
+                byte |= (group_code<Five>(group, i * 8 + bit) >> 4) << bit;
+            high[group * 8 + i] = byte;
+        }
+    scales[group] = 0x3000U + (mix_bits(group + 1345U) & 1023U);
+}
+
+void vary_groupwise(bench::PackedQuantizedWeight& weight) {
+    auto* bytes       = static_cast<std::uint8_t*>(weight.storage.p);
+    auto* scales      = reinterpret_cast<std::uint16_t*>(bytes + weight.scale_offset);
+    const auto groups = static_cast<unsigned>(weight.scale_bytes / 2);
+    if (weight.weight.qtype == QType::Q4G64_F16S)
+        fill_groupwise<false><<<(groups + 255) / 256, 256>>>(bytes, nullptr, scales, groups);
+    else
+        fill_groupwise<true>
+            <<<(groups + 255) / 256, 256>>>(bytes, bytes + weight.high_offset, scales, groups);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+}
+
+__global__ void fill_fp8(std::uint8_t* codes, std::uint16_t* scales, std::size_t n, int rows) {
+    const std::size_t i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < n) {
+        unsigned code = mix_bits(static_cast<unsigned>(i) + 7413U) & 255;
+        if ((code & 127) == 127) --code; // E4M3FN has no infinities; exclude its two NaN words.
+        codes[i] = code;
+    }
+    if (i < rows) scales[i] = 0x3b80U + (mix_bits(static_cast<unsigned>(i) + 873U) & 255U);
 }
 
 void run_q4q5(const Options& options, DeviceBuffer& flush, cudaStream_t stream,
@@ -293,7 +371,9 @@ void run_q4q5(const Options& options, DeviceBuffer& flush, cudaStream_t stream,
         QType::Q4G64_F16S, parent_rows, hidden, hidden, {0x31, 0x00, 0x3c00});
     bench::PackedQuantizedWeight gv = bench::make_row_split_weight(
         QType::Q5G64_F16S, parent_rows, hidden, hidden, {0x31, 0xa5, 0x3c00});
-    DeviceBuffer input = bench::make_bf16(static_cast<std::size_t>(hidden) * max_tokens);
+    vary_groupwise(qk);
+    vary_groupwise(gv);
+    DeviceBuffer input = varied_input(static_cast<std::size_t>(hidden) * max_tokens);
     DeviceBuffer q(static_cast<std::size_t>(q_rows) * max_tokens * 2);
     DeviceBuffer gate(static_cast<std::size_t>(q_rows) * max_tokens * 2);
     DeviceBuffer k(static_cast<std::size_t>(kv_rows) * max_tokens * 2);
@@ -340,7 +420,9 @@ void run_four_output(const Options& options, const char* format, QType qtype,
     const std::size_t workspace_bytes = ops::attn_input_proj_workspace_capacity_bytes(
         qtype, parent_rows, hidden, policy, min_tokens, max_tokens);
     WorkspaceArena workspace(std::max<std::size_t>(workspace_bytes, 1));
-    DeviceBuffer input = bench::make_bf16(static_cast<std::size_t>(hidden) * max_tokens);
+    DeviceBuffer input = qtype == QType::FP8_E4M3FN_ROW_BF16S
+                             ? varied_input(static_cast<std::size_t>(hidden) * max_tokens)
+                             : bench::make_bf16(static_cast<std::size_t>(hidden) * max_tokens);
     DeviceBuffer q(static_cast<std::size_t>(q_rows) * max_tokens * 2);
     DeviceBuffer gate(static_cast<std::size_t>(q_rows) * max_tokens * 2);
     DeviceBuffer k(static_cast<std::size_t>(kv_rows) * max_tokens * 2);
@@ -351,6 +433,8 @@ void run_four_output(const Options& options, const char* format, QType qtype,
         Tensor tg(gate.p, DType::BF16, {q_rows, tokens});
         Tensor tk(k.p, DType::BF16, {kv_rows, tokens});
         Tensor tv(v.p, DType::BF16, {kv_rows, tokens});
+        const auto exact_workspace = ops::attn_input_proj_workspace_capacity_bytes(
+            qtype, parent_rows, hidden, policy, tokens, tokens);
         const auto launch = [&](cudaStream_t launch_stream) {
             if (implicit_a16_entry) {
                 ops::attn_input_proj(x, fixture.weight, tq, tg, tk, tv, launch_stream);
@@ -373,10 +457,13 @@ void run_four_output(const Options& options, const char* format, QType qtype,
             if ((options.cache == CacheMode::Cold && cache != CacheState::Cold) ||
                 (options.cache == CacheMode::Warm && cache != CacheState::Warm))
                 continue;
-            append_result(results, format, policy_name(policy), tokens, cache, workspace_bytes,
-                          logical, flops,
-                          measure_public(launch, cache, flush, stream, options.warmup,
-                                         options.repeat, options.graph));
+            workspace.reset_peak();
+            const auto measurement = measure_public(launch, cache, flush, stream, options.warmup,
+                                                    options.repeat, options.graph);
+            if (workspace.used() != 0 || workspace.peak_used() > exact_workspace)
+                throw std::runtime_error("public projection exceeds its workspace query");
+            append_result(results, format, policy_name(policy), tokens, cache, exact_workspace,
+                          logical, flops, measurement, workspace_bytes, workspace.peak_used());
         }
     }
 }
@@ -425,6 +512,12 @@ void run_w8_qkv(const Options& options, const char* label, std::int32_t hidden, 
 void run_fp8(const Options& options, DeviceBuffer& flush, cudaStream_t stream,
              std::vector<Result>& results) {
     auto weight = bench::make_fp8_weight(14336, 5120);
+    auto* data  = static_cast<std::uint8_t*>(weight.storage.p);
+    fill_fp8<<<(weight.low_bytes + 255) / 256, 256>>>(
+        data, reinterpret_cast<std::uint16_t*>(data + weight.scale_offset), weight.low_bytes,
+        14336);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
     run_four_output(options, "fp8", QType::FP8_E4M3FN_ROW_BF16S, options.fp8_policy, false, 5120,
                     6144, 1024, 14336, weight, flush, stream, results);
 }
@@ -436,15 +529,16 @@ void write_csv(const Options& options, const std::vector<Result>& results) {
     std::ofstream output(path);
     if (!output) throw std::runtime_error("failed to open CSV output");
     output << "entry,format,policy,cache,T,workspace_bytes,logical_bytes,useful_flops,"
-              "median_us,min_us,p95_us,execution,graph_nodes\n";
+              "median_us,min_us,p95_us,execution,graph_nodes,workspace_capacity_bytes,workspace_"
+              "peak_bytes\n";
     for (const Result& result : results) {
         output << "attn_input_proj," << result.format << ',' << result.policy << ','
                << cache_name(result.cache) << ',' << result.tokens << ',' << result.workspace_bytes
                << ',' << result.logical_bytes << ',' << result.useful_flops << ','
                << result.timing.median_us << ',' << result.timing.min_us << ','
                << result.timing.p95_us << ',' << (result.graph_nodes ? "graph" : "eager") << ',';
-        if (result.graph_nodes) output << result.graph_nodes;
-        output << '\n';
+        output << result.graph_nodes << ',' << result.workspace_capacity_bytes << ','
+               << result.workspace_peak_bytes << '\n';
     }
 }
 
