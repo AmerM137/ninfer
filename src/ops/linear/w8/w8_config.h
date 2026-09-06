@@ -90,22 +90,6 @@ template <class Geometry, int ActiveTokens>
 struct W8LinearSmallTProductionSchedule;
 
 template <int ActiveTokens>
-struct W8LinearSmallTProductionSchedule<W8VocabularyProjectionGeometry, ActiveTokens> {
-    static_assert(ActiveTokens >= kW8VocabularyFirstSmallT);
-    static_assert(ActiveTokens <= kW8VocabularyLastSmallT);
-
-    static constexpr int kTileTokens = ActiveTokens <= 8    ? 8
-                                       : ActiveTokens <= 16 ? 16
-                                       : ActiveTokens <= 24 ? 24
-                                       : ActiveTokens <= 32 ? 32
-                                                            : 40;
-    static constexpr int kKWarps     = ActiveTokens <= 32 ? 8 : 4;
-    static constexpr auto kScaleAccess =
-        ActiveTokens > 4 ? W8SmallTMmaScaleAccess::Shared : W8SmallTMmaScaleAccess::Direct;
-    using Type = W8SmallTMmaSchedule<kKWarps, kTileTokens, 2, kScaleAccess>;
-};
-
-template <int ActiveTokens>
 struct W8LinearSmallTProductionSchedule<W8MtpInputProjectionGeometry, ActiveTokens> {
     static_assert(ActiveTokens >= kW8MtpInputFirstSmallT);
     static_assert(ActiveTokens <= kW8MtpInputLastSmallT);

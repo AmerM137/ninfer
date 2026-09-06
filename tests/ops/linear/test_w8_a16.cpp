@@ -29,12 +29,13 @@ int feature_conformance() {
 int w8_a16_conformance() {
     int failures = 0;
 
-    constexpr std::array kN248320K5120{
-        a16(1),  a16(6),  a16(16), a16(17), a16(32), a16(33),
-        a16(34), a16(48), a16(49), a16(64), a16(65),
-    };
+    std::vector<Invocation> kN248320K5120;
+    for (int t = 1; t <= 128; ++t) kN248320K5120.push_back(a16(t));
+    kN248320K5120.push_back(a16(129));
+    for (int t : {7, 33, 64, 65, 128})
+        kN248320K5120.push_back({t, CallForm::Policy, ninfer::ops::LinearPolicy::A16Only, true});
     failures += run_shape("W8_A16", ActivationCompute::A16, make_w8g32_f16s_weight,
-                          {248320, 5120, 197U, Comparison::Sampled, false, kN248320K5120});
+                          {248320, 5120, 197U, Comparison::Sampled, true, kN248320K5120});
 
     constexpr std::array kN5120K10240{
         a16(1),  a16(4),  a16(5),  a16(8),  a16(9),  a16(16), a16(17), a16(24),

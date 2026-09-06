@@ -268,8 +268,7 @@ using Launch = void (*)(const Tensor&, const Weight&, std::int32_t, const Linear
 template <int Capacity>
 void launch_tile(const Tensor& hidden, const Weight& head, std::int32_t valid_rows,
                   const LinearTopKWorkspace& workspace, cudaStream_t stream) {
-    using Schedule = typename W8LinearSmallTProductionSchedule<W8VocabularyProjectionGeometry,
-                                                               Capacity>::Type;
+    using Schedule = W8SmallTMmaSchedule<8, Capacity, 2, W8SmallTMmaScaleAccess::Shared>;
     w8_grouped_ksplit_topk_kernel<Capacity, Schedule>
         <<<workspace.producer_groups, Schedule::kThreads, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(hidden.data),
