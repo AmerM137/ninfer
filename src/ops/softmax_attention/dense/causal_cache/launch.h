@@ -28,10 +28,6 @@ std::int32_t causal_attention_split_capacity(std::int32_t q_heads, std::int32_t 
                                              CausalAttentionExecutionEnvelope envelope,
                                              std::int32_t batch_size = 1);
 
-std::int32_t causal_attention_chunk_tokens(std::int32_t q_heads, std::int32_t width,
-                                           std::int32_t batch_size, KvCacheStorage storage,
-                                           CausalAttentionExecutionEnvelope envelope);
-
 CausalAttentionRoute causal_attention_resolve_route(std::int32_t q_heads, std::int32_t width,
                                                     std::int32_t batch_size, KvCacheStorage storage,
                                                     CausalAttentionExecutionEnvelope envelope);

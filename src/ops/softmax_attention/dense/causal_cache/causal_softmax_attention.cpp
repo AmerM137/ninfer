@@ -22,6 +22,18 @@ constexpr std::int32_t kMaximumBatchSize             = 8;
 constexpr std::uint32_t kTwoChunkPromptVisibleKeys   = 512;
 constexpr std::uint32_t kThreeChunkPromptVisibleKeys = 1024;
 
+std::int32_t causal_attention_chunk_tokens(std::int32_t q_heads, std::int32_t width,
+                                           std::int32_t batch_size, KvCacheStorage storage,
+                                           CausalAttentionExecutionEnvelope envelope) {
+    if (q_heads == 16) return 6;
+    // Balance the two narrow BF16 chunks; INT8 benefits from 5+4/5 at long contexts.
+    if (batch_size == 1 && ((storage == KvCacheStorage::BFloat16 && width >= 9 && width <= 12) ||
+                            (storage == KvCacheStorage::Int8Group64 && width >= 9 && width <= 10 &&
+                             envelope.max_visible_keys > 4096)))
+        return (width + 1) / 2;
+    return 8;
+}
+
 void require_causal_geometry(AttentionHeadGeometry geometry, const char* op) {
     if (!valid_attention_head_geometry(geometry) || geometry.head_dim != kHeadDim ||
         !((geometry.query_heads == 24 && geometry.kv_heads == 4) ||
@@ -275,9 +287,9 @@ void for_each_small_t_chunk(const Tensor& q, const Tensor& positions, WorkspaceA
                             Tensor& out, Launch&& launch) {
     for (std::int32_t begin = 0; begin < q.ne[2];
          begin +=
-         detail::causal_attention_chunk_tokens(q.ne[1], q.ne[2], 1, cache_storage, envelope)) {
+         causal_attention_chunk_tokens(q.ne[1], q.ne[2], 1, cache_storage, envelope)) {
         const std::int32_t count = std::min(
-            detail::causal_attention_chunk_tokens(q.ne[1], q.ne[2], 1, cache_storage, envelope),
+            causal_attention_chunk_tokens(q.ne[1], q.ne[2], 1, cache_storage, envelope),
             q.ne[2] - begin);
         auto chunk_scope = workspace.scope();
         const std::int32_t splits =
@@ -296,9 +308,9 @@ void launch_chunked_small_t(const Tensor& q, const Tensor& k, const Tensor& v,
                             CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
                             Tensor& out, cudaStream_t stream) {
     for (std::int32_t begin = 0; begin < q.ne[2];
-         begin += detail::causal_attention_chunk_tokens(q.ne[1], q.ne[2], q.ne[3], cache.storage,
+         begin += causal_attention_chunk_tokens(q.ne[1], q.ne[2], q.ne[3], cache.storage,
                                                         envelope)) {
-        const std::int32_t count  = std::min(detail::causal_attention_chunk_tokens(
+        const std::int32_t count  = std::min(causal_attention_chunk_tokens(
                                                 q.ne[1], q.ne[2], q.ne[3], cache.storage, envelope),
                                              q.ne[2] - begin);
         auto chunk_scope          = workspace.scope();
@@ -330,22 +342,6 @@ void launch_cached_chunked_small_t(const Tensor& q, const Tensor& positions, flo
 
 namespace detail {
 
-std::int32_t causal_attention_chunk_tokens(std::int32_t q_heads, std::int32_t width,
-                                           std::int32_t batch_size, KvCacheStorage storage,
-                                           CausalAttentionExecutionEnvelope envelope) {
-    if (q_heads == 16) return 6;
-    // Two 3-row-tile kernels avoid the wider key tile used by a 4-token NVFP4 tail.
-    if (storage == KvCacheStorage::Nvfp4Group16 && batch_size > 1 && width == 12 &&
-        envelope.max_visible_keys <= 320)
-        return 6;
-    // Balance the two narrow BF16 chunks; INT8 benefits from 5+4/5 at long contexts.
-    if (batch_size == 1 && ((storage == KvCacheStorage::BFloat16 && width >= 9 && width <= 12) ||
-                            (storage == KvCacheStorage::Int8Group64 && width >= 9 && width <= 10 &&
-                             envelope.max_visible_keys > 4096)))
-        return (width + 1) / 2;
-    return 8;
-}
-
 CausalAttentionRoute causal_attention_resolve_route(std::int32_t q_heads, std::int32_t width,
                                                     std::int32_t batch_size, KvCacheStorage storage,
                                                     CausalAttentionExecutionEnvelope envelope) {
@@ -354,23 +350,19 @@ CausalAttentionRoute causal_attention_resolve_route(std::int32_t q_heads, std::i
             std::uint32_t prompt_limit = 0;
             switch (storage) {
             case KvCacheStorage::BFloat16:
-                prompt_limit = width <= 2    ? 128
-                               : width <= 6  ? 192
-                               : width <= 8  ? 320
-                               : width <= 12 ? 512
-                                             : 640;
+                prompt_limit = width <= 4 ? 128 : width <= 8 ? 256 : 640;
                 break;
             case KvCacheStorage::Int8Group64:
-                prompt_limit = width <= 8 ? 0 : width <= 12 ? 256 : 320;
+                prompt_limit = width <= 8 ? 0 : 256;
                 break;
             case KvCacheStorage::Fp8E4M3Row256:
                 prompt_limit = width <= 4 ? 0 : width <= 8 ? 128 : 320;
                 break;
             case KvCacheStorage::Nvfp4Group16:
-                prompt_limit = width <= 6 ? 0 : width <= 8 ? 64 : 256;
+                prompt_limit = width <= 8 ? 0 : 256;
                 break;
             case KvCacheStorage::Fp8KeyNvfp4Value:
-                prompt_limit = width <= 2 ? 0 : width <= 6 ? 32 : width <= 8 ? 128 : 320;
+                prompt_limit = width <= 4 ? 0 : width <= 8 ? 128 : 320;
                 break;
             }
             if (envelope.max_visible_keys <= prompt_limit) return CausalAttentionRoute::Prompt;
@@ -433,11 +425,11 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
         if (route == detail::CausalAttentionRoute::SmallT) { return chunk_capacity(width); }
         std::size_t maximum = 0;
         for (std::int32_t begin = 0; begin < width;
-             begin += detail::causal_attention_chunk_tokens(q_heads, width, batch_size,
+             begin += causal_attention_chunk_tokens(q_heads, width, batch_size,
                                                             cache_storage, envelope)) {
             maximum = std::max(
                 maximum,
-                chunk_capacity(std::min(detail::causal_attention_chunk_tokens(
+                chunk_capacity(std::min(causal_attention_chunk_tokens(
                                             q_heads, width, batch_size, cache_storage, envelope),
                                         width - begin)));
         }
