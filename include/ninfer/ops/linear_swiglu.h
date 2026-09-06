@@ -59,8 +59,7 @@ linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gate_up_rows,
  *   storage rounding belongs to LinearSwiGLU's named activation-compute criterion, not the oracle.
  *   Production routes may fuse or materialize gate/up and may choose their natural accumulator,
  *   staging, and workspace precision; those private choices are not semantic rounding boundaries.
- *   Under AllowA8, row-scaled FP8 resolves T=1 and every T>=3 to A8 and T=2 to fused A16 SIMT;
- *   A16Only uses fused A16 kernels for every positive T.
+ *   AllowA8 permits FP8 activation quantization; route thresholds are implementation choices.
  *
  * Effects:
  *   Writes the full output; x/weight and output must not alias.
