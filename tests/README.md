@@ -210,11 +210,11 @@ and prefix restore. Zero extra Device StateImage slots exercise Host snapshot/re
 
 ```bash
 cmake --build build -j --target ninfer_qwen3_8_27b_dflash2_real_test
-NINFER_QWEN3_8_27B_DFLASH2_WEIGHTS=out/qwen3_8_27b_dflash2.ninfer \
+NINFER_QWEN3_8_27B_DFLASH2_WEIGHTS=out/qwen3_8_27b.ninfer \
   build/tests/ninfer_qwen3_8_27b_dflash2_real_test 15 1 1 8
-NINFER_QWEN3_8_27B_DFLASH2_WEIGHTS=out/qwen3_8_27b_dflash2.ninfer \
+NINFER_QWEN3_8_27B_DFLASH2_WEIGHTS=out/qwen3_8_27b.ninfer \
   build/tests/ninfer_qwen3_8_27b_dflash2_real_test 7 1 0 2 bf16 1 0
-NINFER_QWEN3_8_27B_DFLASH2_WEIGHTS=out/qwen3_8_27b_nvfp4_dflash2.ninfer \
+NINFER_QWEN3_8_27B_DFLASH2_WEIGHTS=out/qwen3_8_27b_nvfp4.ninfer \
   build/tests/ninfer_qwen3_8_27b_dflash2_real_test 2 0 0 2 int8
 ```
 
@@ -222,3 +222,8 @@ Arguments are K, Graph enabled, optimized head enabled, maximum B, target KV (`b
 Vision enabled, and extra Device StateImage slots. Defaults are `15 1 1 8 bf16 0 3`. Run GPU
 integration tests serially. The individual Op suites remain the numerical/state-transition oracle;
 the fixed Engine fixture does not define bit parity across arbitrary floating-point routes.
+
+The old/new Qwen3.8 binding matrix uses `out/qwen3_8_27b_old.ninfer` and
+`out/qwen3_8_27b_nvfp4_old.ninfer` for the legacy inventories, and the canonical filenames above
+for the companion artifacts. The legacy paths may be overridden with
+`NINFER_QWEN3_8_27B_OLD_WEIGHTS` and `NINFER_QWEN3_8_27B_NVFP4_OLD_WEIGHTS`.
