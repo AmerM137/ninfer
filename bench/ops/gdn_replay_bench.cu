@@ -253,7 +253,7 @@ std::vector<ops::GdnReplayFoldRow> make_rows(std::int32_t batch, std::int32_t wi
             constexpr std::int32_t kMixed[kRecordCapacity] = {0, 1, 2, 3, 16, 7, 12, 5};
             commit                                         = std::min(width, kMixed[row]);
         }
-        rows[static_cast<std::size_t>(row)] = {kSlots[row], commit};
+        rows[static_cast<std::size_t>(row)] = {kSlots[row], kSlots[row], commit};
     }
     return rows;
 }
