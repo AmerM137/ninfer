@@ -354,23 +354,26 @@ cmake --build build -j --target ninfer_rmsnorm_bench
 
 ## GDN control-projection Op benchmark
 
-`ninfer_gdn_gating_proj_bench` measures the registered BF16 control projection. With
-`--norm-control`, it measures the complete 27B two-weight RMSNorm/control contract; adding `--35b`
-selects the 35B contiguous-parent form. `--candidate auto` uses production dispatch;
-`--candidate composed` is the explicit RMSNorm-plus-control comparison. Every row reports the
-selected route and transient workspace after a 256 MiB L2 flush.
+`ninfer_gdn_gating_proj_bench` measures the complete public `gdn_norm_gating_proj` (`--op norm`,
+default) or `gdn_gating_proj` (`--op control`). `--geometry 27b` uses D5120/H48 and defaults to the
+Qwen3.8 contiguous BF16 `[96,5120]` parent; `--weights split` measures the two-weight form.
+`--geometry 35b` uses the D2048/H32 parent. All numerical inputs are nonuniform represented values.
+
+The benchmark reports eager/Graph latency, graph call/node counts, and the public point workspace
+query against its measured peak. Cold runs flush 256 MiB before each call. For short warm Ops,
+`--graph-calls 16` captures consecutive calls and normalizes times per Op; it requires Graph/warm.
+`--profile` brackets one selected workload with CUDA profiler APIs. Production owns all dispatch.
 
 ```bash
-cmake --build build --parallel --target ninfer_gdn_gating_proj_bench
+cmake --build build -j --target ninfer_gdn_gating_proj_bench
 ./build/bench/ninfer_gdn_gating_proj_bench \
-  --norm-control --candidate auto \
-  -p 1,2,3,4,5,6,8,16,32,48 --warmup 10 --repeat 200
+  --geometry 27b --op norm --weights parent --tokens 1,2,4,8,9,16,32,64,128 \
+  --execution graph --cache cold --warmup 10 --repeat 61
 ./build/bench/ninfer_gdn_gating_proj_bench \
-  --35b --norm-control --candidate auto \
-  -p 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16 --warmup 10 --repeat 200
+  --geometry 27b --op norm --tokens 1,2,4,8,9,16,32,64,128 \
+  --execution graph --cache warm --graph-calls 16 --csv-out /tmp/gdn-norm-warm.csv
 ./build/bench/ninfer_gdn_gating_proj_bench \
-  --35b --norm-control --candidate composed \
-  -p 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16 --warmup 10 --repeat 200
+  --geometry 35b --op norm --tokens 16 --execution graph --cache cold --profile
 ```
 
 ## Dynamic grouped-convolution prepare Op benchmark

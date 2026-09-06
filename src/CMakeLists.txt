@@ -170,6 +170,7 @@ add_library(ninfer_ops STATIC
   ops/gdn_input_proj/w8/w8_gdn_input_gemm_mma.cu
   ops/gdn_input_proj/w8/w8_gdn_input_gemm_splitk.cu
   ops/gdn_input_proj/w8/w8_gdn_input_plan.cpp
+  ops/gdn_gating_proj/bf16/bf16_gdn_norm_gating_proj_27.cu
   ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.cu
   ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_plan.cpp
   ops/dynamic_grouped_conv/bf16/bf16_dynamic_grouped_conv_prepare_partial.cu
