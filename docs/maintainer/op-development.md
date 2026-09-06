@@ -361,7 +361,12 @@ common reporting behavior belong in [`tests/README.md`](../../tests/README.md).
 
 ### 6.1 Oracle
 
-Every floating-point Op uses one independent naive FP32/FP64 mathematical oracle over the logical
+Choose the reference and comparison from the observable promise of the Op. A tensor's floating-point
+dtype alone does not determine its acceptance test. Identify the outputs, state effects, explicit
+representation boundaries, and the realistic failure that the check must detect before selecting
+an oracle.
+
+For an Op whose promise is a mathematical computation, use one independent naive FP32/FP64 oracle over the logical
 values represented by its public inputs. Test-owned fixture code independently decodes packed
 values before invoking the oracle. The oracle evaluates the complete formula at high precision and
 retains that result. It does not reproduce a production route's staging casts, activation
@@ -370,8 +375,17 @@ output.
 
 Exact transforms and codecs use an independent exact oracle. A fused oracle evaluates the complete
 fused formula instead of composing production Ops. A stateful oracle computes both output and new
-state. Another GPU route, target reference, generated model output, or pairwise implementation
-parity is supplementary evidence, never a second oracle.
+state. For such mathematical contracts, another GPU route, generated model output, or pairwise
+implementation parity is supplementary evidence, not the mathematical oracle.
+
+When the contract instead requires exact equivalence to a specified execution, that execution is
+the reference. ReplaySSM record/fold must preserve the corresponding snapshot outputs and committed
+state bit for bit. Compare the same initial state, physical block, inputs, and arithmetic policy;
+for each committed prefix, select the corresponding snapshot from that same block. Re-running a
+shorter projection can choose different arithmetic and is not an equivalent reference. Check raw
+record copies, untouched state, invalid tails, and zero-commit effects according to their contracts.
+A separate FP64 recurrence does not establish this equivalence and is not required for its acceptance.
+If the snapshot computation itself changes, validate its mathematical contract separately.
 
 The oracle determines correctness but does not prescribe production arithmetic. Private precision,
 instruction operands, reduction association, staging, workspace representation, and kernel
