@@ -14,6 +14,11 @@ endif()
 
 project(ninfer LANGUAGES C CXX CUDA)
 
+# NInfer uses C++20 but does not use C++ modules. Disable CMake's module
+# dependency scanning so Ninja does not introduce unnecessary dynamic CXX
+# dependency edges into the CUDA device-link graph.
+set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
+
 # --- Global settings ---------------------------------------------------------
 option(NINFER_BUILD_APPS "Build the NInfer CLI and server" ON)
 option(BUILD_TESTING "Build NInfer tests" OFF)
