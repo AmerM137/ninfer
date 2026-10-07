@@ -284,7 +284,8 @@ resource 对象自身只提供原始字节。
 ### 5.3 对象范围与共享
 
 所有对象按 offset 递增排列，ID 唯一，字节区间互不重叠且位于逻辑 payload 内。
-Tensor offset 满足 layout 的 256-byte 对象对齐，raw resource 的对齐为 1。
+Tensor offset 满足所选 layout 注册的对象对齐要求，raw resource 的对齐为 1。
+当前已注册 tensor layouts 均要求 256 bytes；文件 payload 的 4096-byte 对齐与对象对齐分别规定。
 Tensor bytes 等于对应 `(format,layout,shape)` 的 encoded size。
 
 对象间隙和末尾未引用的逻辑 payload 字节没有加载语义。常规 writer 只为对齐留空，并在最后
@@ -460,7 +461,8 @@ Weight divisor 和 block scales 属于权重 codec，activation divisor 属于�
 
 ### 9.1 Frontend 资源引用
 
-组件的 resources 键由对应 Frontend 合同解释，常用上游文件角色可以直接使用原文件名：
+组件的 resources 键由消费它的模型/组件合同解释。当前 Frontend 资源角色由对应
+Frontend 合同拥有，常用上游文件角色可以直接使用原文件名：
 
 ```json
 {
@@ -472,6 +474,8 @@ Weight divisor 和 block scales 属于权重 codec，activation divisor 属于�
 ```
 
 这些值全部引用 resource 对象。它们是对象引用，实际资源字节随 artifact 保存。
+通用容器不把资源限定为 Frontend 文件；模型定义的二进制控制资源也必须由对应组件
+显式声明字节含义和消费者，不能将全部资源一律当作 UTF-8/JSON 或交给 Frontend 解析。
 Vision 的 processor 资源可放在 vision.resources 中，启用功能时按依赖取得。
 
 V3 可以在相应资源对象中承载自定义 chat template。资源保存原始字节，模板的识别与渲染由

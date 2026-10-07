@@ -64,3 +64,20 @@ Model cards contain official artifact facts and source provenance. The
 [conversion guide](weight-conversion.md) is the entry point for making an artifact. Exact config
 fields, parameter expansion and native supported domains are maintained by the code linked from
 these references.
+
+## Planned Qwen4Exp support
+
+Qwen3.8-Flash-Next is a Qwen4Exp checkpoint. Start with the support plan for shared conventions,
+weight decisions and current progress, then read the relevant execution design. The model is not
+yet integrated; its 20 pure Linear problems are supported and qualified. Proposed storage and Op
+interfaces stay in these design documents until implemented.
+
+| Design | Responsibility |
+|---|---|
+| [Support plan and model weights](maintainer/qwen3_8-flash-next-model.md) | entry point, architecture, quantization, merged matrices, artifact/residency, cross-Op handoffs and remaining work |
+| [Converter implementation](maintainer/qwen3_8-flash-next-converter.md) | code changes, source mapping, logical bindings, ModelOpt import, NF4/MTP encoding and artifact writing |
+| [HC / Gated Residual](maintainer/qwen3_8-flash-next-hc.md) | grouped normalization, mixing, residual fusion, interfaces and Main/MTP boundary features |
+| [GDN](maintainer/qwen3_8-flash-next-gdn.md) | full layer flow, projection/convolution/control extensions, sigmoid output gating and ReplaySSM integration |
+| [QSA](maintainer/qwen3_8-flash-next-qsa.md) | preparation, indexer, sparse GQA, selection, candidate records and tail state |
+| [Shared KV page extension](maintainer/qwen3_8-flash-next-paged-kv.md) | planned plane row spans, capacity, coverage, COW and offload; current storage remains in the stable Paged KV reference |
+| [PLE](maintainer/qwen3_8-flash-next-ple.md) | NF4 SSD binding, async row reads, prefetch, gated convolution, HC handoff and accepted-prefix state |
