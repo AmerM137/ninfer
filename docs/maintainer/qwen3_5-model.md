@@ -213,6 +213,11 @@ The shared expert always executes and is outside top-k. Logical expert id e iden
 and the corresponding expert matrices. Physical bank ordering and fused dispatch preserve that
 relationship. Router loss coefficients and training-only outputs add no inference term.
 
+[Expert weight cache design](expert-weight-cache.md) specifies the planned 35B-A3B offload
+container and loading split: sufficient VRAM retains direct GPU materialization and the existing
+fused path; only the offload route establishes complete Host expert backing. It does not change
+the current all-device capability or the MoE formula above.
+
 ## Prefill, decode and MTP
 
 Text prefill gathers embedding columns, replaces media placeholders with Vision outputs, and runs

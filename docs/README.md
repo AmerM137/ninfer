@@ -45,6 +45,7 @@ other references own narrower contracts:
 | Document | Responsibility |
 |---|---|
 | [Engine architecture](maintainer/engine-architecture.md) | model/config/weight ownership, loading-to-execution flow, requests, scheduling, transactions and graphs |
+| [Expert weight cache design](maintainer/expert-weight-cache.md) | planned Qwen3.5-35B-A3B loading modes, complete Host backing for offload, GPU replica storage, whole-layer prefill and CPU/GPU decode |
 | [Build system](maintainer/build-system.md) | CMake targets, explicit source ownership, CUDA compilation boundaries, presets and developer configuration |
 | [Artifact container](maintainer/artifact-container.md) | v3 directory, objects, logical bindings, Uses, resources and file framing/sharding |
 | [Numeric formats](maintainer/tensor-formats.md) | represented values, codes/scales, conversion arithmetic and numerical interpretation |
