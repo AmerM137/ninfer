@@ -77,6 +77,7 @@ until implemented.
 |---|---|
 | [Support plan and model weights](maintainer/qwen3_8-flash-next-model.md) | entry point, architecture, quantization, merged matrices, artifact/residency, cross-Op handoffs and remaining work |
 | [Weight conversion](maintainer/qwen3_8-flash-next-converter.md) | source mapping, logical bindings, ModelOpt import, NF4/MTP encoding, artifact writing and the local command |
+| [Main workspace tasks](maintainer/qwen3_8-flash-next-main-tasks.md) | implementation order, shared storage/state/I/O work, secondary-workspace dependencies and the PLE header plan |
 | [Independent Op tasks](maintainer/qwen3_8-flash-next-independent-ops.md) | two batches for the secondary workspace, fixed PLE interfaces, file ownership and integration boundaries |
 | [HC / Gated Residual](maintainer/qwen3_8-flash-next-hc.md) | grouped normalization, mixing, residual fusion, interfaces and Main/MTP boundary features |
 | [GDN](maintainer/qwen3_8-flash-next-gdn.md) | full layer flow, projection/convolution/control extensions, sigmoid output gating and ReplaySSM integration |

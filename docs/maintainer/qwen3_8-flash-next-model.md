@@ -41,6 +41,7 @@ Qwen3.8-Flash-Next 是本文的 checkpoint 实例，数学架构为 Qwen4Exp，�
 |---|---|---|
 | 本文 | 实例架构、来源/recipe、合并与行序、持久表示、整模预算、支持进度 | 所有工作先读；converter、binder、planner 从这里取参数 |
 | [Converter 实现方案](qwen3_8-flash-next-converter.md) | 代码改动、来源映射、parent/Binding/Use 生成、流式编码与写出顺序 | 实现 converter 与 codec |
+| [主工作区任务清单](qwen3_8-flash-next-main-tasks.md) | 主侧推进顺序、共享存储/状态/I/O 分工、子侧依赖与 PLE 头文件实施方案 | 优先交付共享接口，再推进复杂 Op 与模型接入 |
 | [子工作区任务清单](qwen3_8-flash-next-independent-ops.md) | 两批独立计算任务、文件分工、共享接口与主工作区交接 | 并行推进低影响面的实现 |
 | [HC / Gated Residual](qwen3_8-flash-next-hc.md) | 完整数学、Mix/CombineNorm 接口、激活寿命、Main/MTP 末端特征 | 实现 HC、层间残差融合与 MTP 特征交接 |
 | [GDN](qwen3_8-flash-next-gdn.md) | 整层计算、投影/卷积/门控调用、recurrent state 与 ReplaySSM 接入 | 实现 Qwen4Exp GDN 层及相应 Op 扩展 |

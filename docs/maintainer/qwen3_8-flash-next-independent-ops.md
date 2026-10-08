@@ -162,6 +162,9 @@ lut[scale*16+code] = BF16_RNE(codebook[code] * E4M3FN(scale) / divisor)
 
 ## 5. 两个工作区的交接
 
+主侧完整推进顺序见[主工作区任务清单](qwen3_8-flash-next-main-tasks.md)。其中 M1 优先
+落地共享 `ple.h`，作为 B1 的直接前置；A1—A4、B2/B3 可按本清单独立推进。
+
 | 边界 | 子工作区交付 | 主工作区负责 |
 |---|---|---|
 | HC | 完整计算家族及容量查询 | 层间调用、激活寿命、Main/MTP 末端特征保存与恢复 |
