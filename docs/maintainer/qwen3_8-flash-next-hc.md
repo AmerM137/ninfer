@@ -571,7 +571,7 @@ history pool。只在 StateImage 与其他必要状态都完整到达、身份/�
 现有 [rmsnorm](../../include/ninfer/ops/rmsnorm.h) 的公开 affine 是 [D]，不能把
 [2560,4,M] 展成 [2560,4*M] 后无条件共享该向量。可复用底层归约设施，但要补齐
 per-stream affine 的语义与资格化。
-[gated_rmsnorm](../../include/ninfer/ops/gated_rmsnorm.h) 是另一个数学合同，不用它的
+[silu_gated_rmsnorm](../../include/ninfer/ops/rmsnorm.h) 是另一个数学合同，不用它的
 名字或 SiLU-gate 公式代替本 HC。
 
 ### 8.2 HC Mix 的内部路线

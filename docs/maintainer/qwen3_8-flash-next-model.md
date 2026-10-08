@@ -878,7 +878,7 @@ provenance 中，consumer 应从正式 config/objects/bindings/uses 获取。
 | QSA | [五种主 KV 编码的 Prepare 与 Sparse GQA、Indexer、tail extract 已实现](qwen3_8-flash-next-qsa.md) | 模型调度接入待实现 |
 | 共享 KV 页组 | [扩展设计已定](qwen3_8-flash-next-paged-kv.md)，未实现 | s=1/4 geometry、Host/Device layout、COW/迁移、容量与模型 views |
 | PLE | [数学、I/O、接口已定](qwen3_8-flash-next-ple.md)；独立加载实验已完成 | 生产 reader/LUT、Gate/Conv/state extract、Graph 交接与统一提交 |
-| GDN | [计算与实现要求已定](qwen3_8-flash-next-gdn.md)，待实现 | Qwen4Exp 原生层编排、Op 几何/类型扩展、sigmoid 输出门控、conv/recurrent records 与 36 层 ReplaySSM |
+| GDN | [A1 输出 norm、A2 控制投影已实现并通过数学资格验证](qwen3_8-flash-next-gdn.md)；完整层待实现 | Q8 QKVZ 的 projection/snapshot/record 扩展、36 层 ReplaySSM、原生层编排与状态接入 |
 | MoE / expert 流式执行 | NVFP4 bank 与精度已定；执行接口和调度待细化 | 路由/shared、grouped GEMM/fused MoE、A16/A4、cache lease/eviction/搬运重叠 |
 | Vision | BF16 矩阵项已完成，组件未接入 | 原生 config/绑定、bias/norm/attention/merger、媒体特征替换与位置数据 |
 | 原生 MTP | 权重、HC 特征和 QSA 局部状态已定；整轮流程待细化 | draft/verify/bridge、Main/Backend 前沿关系、接受/拒绝及恢复 |
@@ -887,6 +887,10 @@ provenance 中，consumer 应从正式 config/objects/bindings/uses 获取。
 
 现有生产入口仍是 Qwen3.5 系列；本架构 converter 已完成，原生模型执行尚未接入。
 源码中的其他 Qwen3.8 checkpoint 不代表 Flash-Next 已可运行。
+
+[独立 Op 清单](qwen3_8-flash-next-independent-ops.md)中的 A1/A2 已完成实现、数学资格与性能验收，
+RMSNorm/GDN control 家族也已统一接口、代码组织、测试和 bench。
+独立 Op 的完成不代替完整 GDN 层或模型执行验收。
 
 ### 11.2 尚需细化的执行合同
 

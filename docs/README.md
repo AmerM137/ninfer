@@ -71,15 +71,19 @@ these references.
 Qwen3.8-Flash-Next is a Qwen4Exp checkpoint. Start with the support plan for shared conventions,
 weight decisions and current progress, then read the relevant execution design. The model is not
 yet integrated into the Engine; the converter is implemented and its 20 pure Linear problems
-are supported and qualified. Proposed storage and Op interfaces stay in these design documents
-until implemented.
+are supported and qualified. A1 sigmoid-gated RMSNorm and A2 BF16 `[96,2560]` control projection
+are implemented and mathematically qualified. Their current contracts live in
+[rmsnorm.h](../include/ninfer/ops/rmsnorm.h) and
+[gdn_control.h](../include/ninfer/ops/gdn_control.h). Proposed storage and remaining Op interfaces
+stay in these design documents until implemented; the support plan tracks remaining layer/model
+integration.
 
 | Design | Responsibility |
 |---|---|
 | [Support plan and model weights](maintainer/qwen3_8-flash-next-model.md) | entry point, architecture, quantization, merged matrices, artifact/residency, cross-Op handoffs and remaining work |
 | [Weight conversion](maintainer/qwen3_8-flash-next-converter.md) | source mapping, logical bindings, ModelOpt import, NF4/MTP encoding, artifact writing and the local command |
 | [Main workspace tasks](maintainer/qwen3_8-flash-next-main-tasks.md) | implementation order, shared storage/state/I/O work, secondary-workspace dependencies and the PLE header plan |
-| [Independent Op tasks](maintainer/qwen3_8-flash-next-independent-ops.md) | two batches for the secondary workspace, fixed PLE interfaces, file ownership and integration boundaries |
+| [Independent Op tasks](maintainer/qwen3_8-flash-next-independent-ops.md) | completed A1/A2 scope, remaining tasks in two batches, fixed PLE interfaces, file ownership and integration boundaries |
 | [HC / Gated Residual](maintainer/qwen3_8-flash-next-hc.md) | grouped normalization, mixing, residual fusion, interfaces and Main/MTP boundary features |
 | [GDN](maintainer/qwen3_8-flash-next-gdn.md) | full layer flow, projection/convolution/control extensions, sigmoid output gating and ReplaySSM integration |
 | [QSA](maintainer/qwen3_8-flash-next-qsa.md) | preparation, indexer, sparse GQA, selection, candidate records and tail state |

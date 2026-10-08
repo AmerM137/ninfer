@@ -1,6 +1,6 @@
 # Qwen3.8-Flash-Next：子工作区任务清单
 
-更新日期：2026-10-08。**第一批与第二批的任务、接口边界和文件分工已确定，待实现。**
+更新日期：2026-10-08。**A1/A2 已实现并通过独立数学资格验证；A3/A4 与第二批待实现。**
 
 子工作区负责下表七项独立计算。主工作区负责共享存储、状态、读取服务和模型执行接入。
 本文件维护任务范围与协作边界；数学、数值表示及接口分别由
@@ -22,33 +22,36 @@
 
 “影响面”描述需要共同修改的代码与合同；“难度”描述计算实现和优化工作量。
 
-| ID | 批次 | 任务 | 影响面 | 难度 |
-|---|---|---|---|---|
-| A1 | 第一批 | Sigmoid-gated RMSNorm | 现有 gated RMSNorm 家族内部 | 低 |
-| A2 | 第一批 | GDN 合并 AB 控制投影的新几何 | 控制投影 wrapper、plan、kernel、容量查询 | 中 |
-| A3 | 第一批 | HC expand、grouped norm、combine、combine-norm | 新增独立 HC Op 家族，消费/产生 forward 激活 | 中 |
-| A4 | 第一批 | HC block/final Mix | HC 家族内部，复用 Linear 与私有 workspace | 中至高 |
-| B1 | 第二批 | PLE Gate | 固定 projection/record views 下的独立 GPU 计算 | 中 |
-| B2 | 第二批 | PLE token hash | 模型内的纯 Host 数学函数 | 低至中 |
-| B3 | 第二批 | NF4→BF16 LUT 与行解码 | Core 数值辅助，不依赖文件或请求对象 | 中 |
+| ID | 批次 | 任务 | 影响面 | 难度 | 实现与数学资格 |
+|---|---|---|---|---|---|
+| A1 | 第一批 | Sigmoid-gated RMSNorm | RMSNorm 家族内部 | 低 | 已完成 |
+| A2 | 第一批 | GDN 合并 AB 控制投影的新几何 | 控制投影 wrapper、plan、kernel、容量查询 | 中 | 已完成 |
+| A3 | 第一批 | HC expand、grouped norm、combine、combine-norm | 新增独立 HC Op 家族，消费/产生 forward 激活 | 中 | 待实现 |
+| A4 | 第一批 | HC block/final Mix | HC 家族内部，复用 Linear 与私有 workspace | 中至高 | 待实现 |
+| B1 | 第二批 | PLE Gate | 固定 projection/record views 下的独立 GPU 计算 | 中 | 待实现 |
+| B2 | 第二批 | PLE token hash | 模型内的纯 Host 数学函数 | 低至中 | 待实现 |
+| B3 | 第二批 | NF4→BF16 LUT 与行解码 | Core 数值辅助，不依赖文件或请求对象 | 中 | 待实现 |
 
 批次是建议推进顺序。B2/B3 已有完整输入/输出定义，可按主工作区需要提前合入。
+完整模型接入的状态由[支持总览 §11.1](qwen3_8-flash-next-model.md#111-当前状态)维护。
 
 ## 3. 第一批
 
 ### A1. Sigmoid-gated RMSNorm
 
-在 `include/ninfer/ops/gated_rmsnorm.h` 增加 `sigmoid_gated_rmsnorm`，实现
+已在 [RMSNorm 合同](../../include/ninfer/ops/rmsnorm.h)实现 `sigmoid_gated_rmsnorm`，计算
 `RMSNorm(x, gamma) * sigmoid(z)`。本实例 x/z/out 为 BF16 `[128,48,T,B]`，
 gamma 为 BF16 `[128]`，沿 128 维归约、使用直接乘数 gamma。出口为 BF16。
 
 完整 norm 与 gate 是一个数学 Op，中间不增加公开 BF16 舍入点；入口无 workspace。
-既有 SiLU-gated 入口继续使用自己的数学语义。实现归现有 RMSNorm wrapper/launcher/kernel
-家族。详见 [GDN §3.2](qwen3_8-flash-next-gdn.md#32-新增-sigmoid-gated-rmsnorm-声明)。
+既有 SiLU-gated 入口已对称命名为 `silu_gated_rmsnorm`，两种 gate 都使用直接乘数 gamma。
+实现统一归 `src/ops/rmsnorm/`；两种 gate 的资格验证保留在
+[同一个测试文件](../../tests/ops/rmsnorm/test_gated.cpp)，bench 统一由 `ninfer_rmsnorm_bench` 选择。
+详见 [GDN §3.2](qwen3_8-flash-next-gdn.md#32-sigmoid-gated-rmsnorm)。
 
 ### A2. GDN 合并 AB 控制投影
 
-扩展既有 `gdn_gating_proj` 的合并 parent 形式：
+已扩展 `gdn_control_proj` 的合并 parent 形式，并通过完整投影与非线性的独立数学验证：
 
 | 输入/输出 | 表示 |
 |---|---|
@@ -58,11 +61,14 @@ gamma 为 BF16 `[128]`，沿 128 维归约、使用直接乘数 gamma。出口�
 | g、beta | 各 FP32 `[48,M]` |
 
 完整计算包括 AB 投影与 `g=-exp(A_log)*softplus(a+dt_bias)`、`beta=sigmoid(b)`。
-入口直接消费 HC 产生的 x，采用不带 input norm 的形式。补齐 heads=48、input_rows=2560
-的容量查询及执行规划，保持整个复合公式的数值合同。
+入口直接消费 HC 产生的 x，采用不带 input norm 的形式。heads=48、input_rows=2560
+的权重准备、容量查询及执行规划已补齐；该新几何不属于带 input norm 的入口支持域。
 
-文件范围为 `include/ninfer/ops/gdn_gating_proj.h`、对应 wrapper、
-`src/ops/gdn_gating_proj/` 与其测试/调优入口。
+公共声明统一在 [GDN control 合同](../../include/ninfer/ops/gdn_control.h)，执行与容量查询
+消费同一份 prepared `ProjectionWeights`；`GdnControlOutputs` 组织 g/beta 输出。
+合并 parent 使用零拷贝 row views，权重准备不做运行时重排。
+实现、测试与 bench 分别归 `src/ops/gdn_control/`、`tests/ops/gdn_control/`、
+`bench/ops/gdn_control/`，bench 入口为 `ninfer_gdn_control_bench`。
 
 ### A3. HC 基础计算
 
@@ -168,7 +174,7 @@ lut[scale*16+code] = BF16_RNE(codebook[code] * E4M3FN(scale) / divisor)
 | 边界 | 子工作区交付 | 主工作区负责 |
 |---|---|---|
 | HC | 完整计算家族及容量查询 | 层间调用、激活寿命、Main/MTP 末端特征保存与恢复 |
-| GDN | A1 输出 norm、A2 控制投影 | 输入投影/snapshot/record 家族、36 层 fold、原生 GDN 层和状态接入 |
+| GDN | 已完成 A1 输出 norm、A2 控制投影的实现与数学资格 | 输入投影/snapshot/record 家族、36 层 fold、原生 GDN 层和状态接入 |
 | PLE Gate | 从 K/V 与 residual 产生 U/N | shared views、record 预留、ConvAdd/Norm、state extraction |
 | PLE hash | 有序全局行号 | 资源绑定、原始 ID 历史、候选窗口与提交、行/页调度 |
 | NF4 decode | 不可变 LUT 和 Host 行解码 | divisor/backing 绑定、LUT 所有权、SSD/cache、pinned E、H2D |

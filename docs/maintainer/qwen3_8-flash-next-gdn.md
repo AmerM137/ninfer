@@ -1,9 +1,9 @@
 # Qwen3.8-Flash-Next：GDN 计算流程与实现要求
 
-更新日期：2026-10-08。**计算与存储方案已确定，Qwen4Exp 的 GDN 层待实现。**
+更新日期：2026-10-08。**A1 输出 norm 与 A2 控制投影已实现并通过独立数学资格验证；Qwen4Exp 的完整 GDN 层待实现。**
 
 本文定义 Qwen4Exp GDN 从 HC 输入到输出回注的计算流程、Op 组合、状态与记录，以及
-需要实现的内容。层级编排位于新的 `src/models/qwen4_exp/execution/`，复用适用的中央
+实现进度与剩余工作。层级编排位于新的 `src/models/qwen4_exp/execution/`，复用适用的中央
 Ops 和 kernel。现有 recurrence、卷积和 ReplaySSM 是实现基础。
 
 [支持总览](qwen3_8-flash-next-model.md)维护量化、矩阵合并、卷积持久布局与整体进度；
@@ -12,7 +12,7 @@ Ops 和 kernel。现有 recurrence、卷积和 ReplaySSM 是实现基础。
 
 阅读入口：[参数与张量](#1-参数与张量)、[完整流程](#2-完整计算流程)、
 [Op 边界](#3-op-边界与数值表示)、[各执行路径](#4-各执行路径)、
-[状态与记录](#5-状态记录与生命周期)、[实现清单](#6-需要实现的内容)、[验收](#7-验收)。
+[状态与记录](#5-状态记录与生命周期)、[实现进度](#6-实现进度与剩余工作)、[验收](#7-验收)。
 
 ## 1. 参数与张量
 
@@ -114,7 +114,7 @@ beta[h,t] = sigmoid(b[h,t])
 ```
 
 g/beta 为每个 V head、每个 token 一对标量。A_log/dt_bias 已在 artifact 中精确展开为
-FP32，控制输入/出口均直接采用 FP32。AB 投影和非线性组成现有 `gdn_gating_proj` 的
+FP32，控制向量与 g/beta 出口均直接采用 FP32。AB 投影和非线性组成 `gdn_control_proj` 的
 完整数学；a/b 可以是内部中间值，不要求模型持有两个额外 BF16 buffers。
 
 QKVZ 与 AB 消费同一份实际 BF16 x，两分支在 recurrence 处汇合；执行编排明确它们的
@@ -190,44 +190,40 @@ streams。Injection 是 attention HC 已产生的 FP32 系数。HC 的 residual/
 
 ### 3.1 调用分工
 
-| 计算 | 采用的入口 | 本实例需要的工作 |
+| 计算 | 采用的入口 | 本实例状态 / 所需工作 |
 |---|---|---|
-| AB → g/beta | `gdn_gating_proj`，合并 parent 形式 | 增加 BF16 [96,2560]，沿用 FP32 A_log/dt_bias |
+| AB → g/beta | `gdn_control_proj`，合并 parent 形式 | BF16 [96,2560] 已实现并通过数学资格验证，沿用 FP32 A_log/dt_bias |
 | 独立 QKVZ 投影 | `gdn_input_proj`，single-parent 形式 | 增加 Q8 [16384,2560]、A16Only |
 | 独立卷积 | `causal_conv1d_silu_split` | 复用既有 2048/2048/6144 分路与 [10240,4] 权重合同 |
 | 投影＋卷积＋snapshot | `gdn_input_proj_conv_snapshot` | 增加上述 Q8 parent，输出连续 Q/K/V/Z 与 conv snapshot |
 | 投影＋卷积＋record | `gdn_input_proj_conv_record` | 增加上述 Q8 parent，保持与 snapshot 的精确执行关系 |
 | recurrence | `gated_delta_net` / `gated_delta_net_batch_update` | 复用 16/48/128 几何 |
 | verify recurrence | `gated_delta_net_replay_record` | 复用逐层 record 入口与实际输入记录 |
-| output norm＋sigmoid | `sigmoid_gated_rmsnorm` | 在现有 gated RMSNorm 家族增加该数学形式 |
+| output norm＋sigmoid | `sigmoid_gated_rmsnorm` | 已实现并通过完整 norm/gate 公式的数学资格验证 |
 | output projection | `linear`，Q8 [2560,6144] | 已有纯 Linear 支持 |
 | accepted-prefix fold | `GdnReplayFoldPlan` | 增加 36 层、16/48 heads、10240 conv channels 的全层几何 |
 | residual 回注 | `hc_combine_norm` | 按 HC 专题实现和调用 |
 
 上述复合入口的实现可复用现有 kernel 与调优结果；模型通过公共 Op 合同调用。
-投影家族已有 `cudaStream_t` 入口保持其签名，新数学入口采用 `DeviceExecutionView`。
+已实现的控制家族以 [gdn_control.h](../../include/ninfer/ops/gdn_control.h) 为接口权威：
+`gdn_control` 处理已有 a/b，`gdn_control_proj` 包含投影，`gdn_norm_control_proj` 另外包含
+offset input RMSNorm 并产生显式 BF16 normalized 输出。后两者采用 `DeviceExecutionView`
+与 caller-owned workspace，输出分别由 `GdnControlOutputs`、`GdnNormControlOutputs` 组织。
+本实例使用不带 input norm 的入口；带 norm 形式仅支持既有 K=5120/2048 几何。
 
-### 3.2 新增 sigmoid-gated RMSNorm 声明
+[prepare_gdn_control_proj_weights](../../include/ninfer/ops/weight_input.h) 从 A/B `WeightInput`
+得到非 owning 的 [ProjectionWeights](../../include/ninfer/ops/projection_weights.h)，由执行与容量
+查询共同消费。合并 parent 的 row views 零拷贝，backing 由调用者持有，不增加运行时权重重排。
 
-目标位置为既有 `include/ninfer/ops/gated_rmsnorm.h`，以下声明尚未实现：
+### 3.2 Sigmoid-gated RMSNorm
 
-```cpp
-namespace ninfer::ops {
-
-void sigmoid_gated_rmsnorm(
-    const Tensor& x,
-    const Tensor& weight,
-    const Tensor& z,
-    float eps,
-    Tensor& out,
-    DeviceExecutionView execution);
-
-} // namespace ninfer::ops
-```
+`sigmoid_gated_rmsnorm` 与对称命名的 `silu_gated_rmsnorm` 已统一实现于 RMSNorm 家族，
+公共声明与支持域由 [rmsnorm.h](../../include/ninfer/ops/rmsnorm.h) 维护。
 
 沿最快轴 D=ne[0] 计算第 2.5 节的复合公式。本实例 x/z/out 为连续 BF16
 `[128,48,T,B]`，weight 为 BF16 `[128]`；通用 shape 规则沿用同家族：x/z/out 同形、
-D 和其余 extents 为正、weight 为 `[D]`、eps 正且有限。输入和输出不重叠，输出完整覆盖。
+D 和其余 extents 为正、weight 为 `[D]`、eps 正且有限。只读输入可以共享 backing，
+输出不与任何输入重叠，输入保持不变，输出完整覆盖。
 无 workspace、状态读写或持久中间量；执行参数提供 stream 与正的物理 SM 数。
 数学 oracle 使用 represented inputs 的完整 FP64 norm/gate 公式，不复制实现中的私有 casts。
 
@@ -251,7 +247,7 @@ snapshot 执行。分开的 projection+conv 是一种实现组合，不是所有
 ## 4. 各执行路径
 
 以下为模型调用顺序，省略参数绑定和 workspace 实参。所有路径先调用 HC 得到 x 与
-injection，再用 `gdn_gating_proj` 产生 g/beta；末端均执行 sigmoid-gated norm、output
+injection，再用 `gdn_control_proj` 产生 g/beta；末端均执行 sigmoid-gated norm、output
 Linear 和 HC combine。Program 显式提供旧状态与目标状态槽。
 
 ### 4.1 Prefill、Replay 与 CausalScoring
@@ -381,18 +377,18 @@ x 在两个投影分支完成后可复用；q/k/v 和 g/beta 在 recurrence 及�
 Z 保留到 gated norm，r 保留到 output Linear，y 与层外 injection 保留到 HC combine。
 Replay records 的寿命延续至所有相关接受/恢复决定结束，不随本层临时激活一起释放。
 
-## 6. 需要实现的内容
+## 6. 实现进度与剩余工作
 
-| 所属 | 实现内容 | 完成后的直接结果 |
+| 所属 | 实现内容 | 当前状态 / 结果 |
 |---|---|---|
-| Converter / binder | 按总览生成 QKVZ、AB、output parents；GDN conv 离线转置；绑定 FP32 控制向量与 BF16 norm | 原生参数直接指向规定表示，无运行时权重重排 |
-| Weight preparation | 为新 Q8 QKVZ、BF16 AB 增加对应几何与 A16 许可检查 | 加载、容量规划、执行消费同一组原生 operands |
-| GDN input projection 家族 | 扩展独立 projection、snapshot、record 三种已有语义及其公开容量查询 | 新 Q8 [16384,2560] 在实际调用域可用 |
-| GDN control 家族 | 扩展不带 input norm 的合并 AB [96,2560] 入口与容量查询，控制向量沿用 FP32 | BF16 x/AB 与 FP32 controls → FP32 g/beta |
-| Gated RMSNorm 家族 | 新增 `sigmoid_gated_rmsnorm` 及独立数学资格验证 | 输出 r，供已完成的 output Linear 使用 |
-| Replay fold | 增加 36/16/48/10240 几何的校验、launch 支持和精确验证 | 一次采用全部 36 层的对应前缀 |
-| Qwen4Exp execution | 按第 4 节实现各路径，组合 HC 与中央 Ops | 新架构自己的完整 GDN 层 |
-| Program / planner | 状态、records、显式 workspace、Graph、候选基准及提交恢复 | 正确的容量和数据寿命；完整模型事务 |
+| Converter / binder | 按总览生成 QKVZ、AB、output parents；GDN conv 离线转置；绑定 FP32 控制向量与 BF16 norm | Converter 已完成；原生 binder 接入待实现 |
+| Weight preparation | 为新 Q8 QKVZ、BF16 AB 增加对应几何与 A16 许可检查 | BF16 AB 已完成；Q8 QKVZ 的复合入口准备待扩展 |
+| GDN input projection 家族 | 扩展独立 projection、snapshot、record 三种已有语义及其公开容量查询 | 待扩展新 Q8 [16384,2560] |
+| GDN control 家族 | 不带 input norm 的合并 AB [96,2560] 入口、权重准备与容量查询，控制向量沿用 FP32 | 已实现并通过数学资格验证，产生 FP32 g/beta |
+| RMSNorm 家族 | `sigmoid_gated_rmsnorm` 与 `silu_gated_rmsnorm` 的完整数学资格验证 | 已完成，sigmoid 形式输出 r 供 output Linear 使用 |
+| Replay fold | 增加 36/16/48/10240 几何的校验、launch 支持和精确验证 | 待实现全部 36 层的前缀恢复 |
+| Qwen4Exp execution | 按第 4 节实现各路径，组合 HC 与中央 Ops | 完整 GDN 层待实现 |
+| Program / planner | 状态、records、显式 workspace、Graph、候选基准及提交恢复 | 容量、数据寿命与完整模型事务待接入 |
 
 ### 6.1 容量查询与支持域
 
@@ -403,8 +399,12 @@ Replay records 的寿命延续至所有相关接受/恢复决定结束，不随�
 - snapshot/record 的 query 消费同一份 `ProjectionWeights`，另传实际 B 和 T 区间。
   执行入口使用 `GdnProjectionOutputs` / `GdnConvOutputs` 分组输出视图，以及
   `GdnConvSnapshotState` / `GdnConvSourceState` 分组状态池与设备选择器；这些视图均不拥有存储。
-- `gdn_gating_proj_workspace_capacity_bytes`：heads=48、input_rows=2560、M 区间。
+- `gdn_control_proj_workspace_capacity_bytes`：消费 prepared `ProjectionWeights` 与闭区间
+  `[first,last]`；已覆盖 BF16 [96,2560]。Query 只检查权重 metadata，不要求已上传 backing。
+  `gdn_norm_control_proj_workspace_capacity_bytes` 使用相同参数形式，但不支持 K=2560。
 - `gated_delta_net_workspace_capacity_bytes`：qk_heads=16、value_heads=48、T 区间。
+
+`sigmoid_gated_rmsnorm` 无 workspace，无需容量查询。
 
 复合 query 包含其内部路线的峰值临时空间，公开输出、states 和 records 由 Program
 另行规划。Query 与实际调用选择同一条路线；顺序执行的临时空间可以复用。
@@ -417,7 +417,9 @@ GDN 核心 recurrence、head 分组、L2 normalization、conv 数学和 record/f
 
 Qwen4Exp execution 直接取得 HC 产生的 x，并向 HC 交付独立 y。其原生参数和层调用由
 本架构实现；Op 的选择依据显式几何、表示和状态形式。通用 Op 头文件在实现时更新支持域，
-本文继续维护整层组合与交接。
+本文继续维护整层组合与交接。已完成的实现按 `src/ops/rmsnorm/` 与 `src/ops/gdn_control/`
+两个家族组织，各自维护构建清单；公共校验、规划/容量与执行分工明确，私有 CUDA 文件按数值
+几何组织。测试与 bench 使用相同家族目录，模型通过 prepared operands 和公共输出结构调用。
 
 ## 7. 验收
 
@@ -440,10 +442,17 @@ Qwen4Exp execution 直接取得 HC 产生的 x，并向 HC 交付独立 y。其�
 output projection。数值计算与 exact state restoration 使用各自判据。性能测量针对实际
 复合 Op 或明确的完整层范围；本文件不规定 kernel 数、tile 或调优阈值。
 
+A1/A2 及本次涉及的既有 RMSNorm/GDN control 入口已通过独立 FP64 oracle 与公共合同检查，
+包括 eager、改变输入后的 Graph replay、完整输出、输入保留与输出 guards。执行命令和判据
+入口见 [Tests](../../tests/README.md)；实际 Op 测量范围见 [Benchmarks](../../bench/README.md)。
+完整 GDN 层、Program/Engine 接入的进度见
+[支持总览 §11.1](qwen3_8-flash-next-model.md#111-当前状态)。
+
 ## 8. 来源与实现入口
 
 - [固定 Transformers 实现](https://github.com/huggingface/transformers/blob/8073e6dcaea9aa4b42acf2d92ec72148786bbaeb/src/transformers/models/qwen4_exp/modeling_qwen4_exp.py)：GatedDeltaNet、RMSNormGated 与 decoder HC 调用。
-- [Input projection 合同](../../include/ninfer/ops/gdn_input_proj.h)、[control projection](../../include/ninfer/ops/gdn_gating_proj.h)、[卷积](../../include/ninfer/ops/causal_conv1d_silu.h)：已有数学与需要扩展的入口。
+- [Input projection 合同](../../include/ninfer/ops/gdn_input_proj.h)、[卷积](../../include/ninfer/ops/causal_conv1d_silu.h)：已有数学与需要扩展的入口。
+- [GDN control 合同](../../include/ninfer/ops/gdn_control.h)：已实现的逐元素控制、控制投影、norm/control 投影与容量查询。
 - [Recurrence](../../include/ninfer/ops/gated_delta_net.h)、[fold](../../include/ninfer/ops/gdn_replay.h)：逐层执行与精确前缀恢复。
-- [Gated RMSNorm](../../include/ninfer/ops/gated_rmsnorm.h)：现有 SiLU 形式及新 sigmoid 形式所属家族。
+- [RMSNorm](../../include/ninfer/ops/rmsnorm.h)：普通/offset norm 及已实现的 SiLU/sigmoid gated 形式。
 - [State pool](../../src/core/linear_attention_state.h)、[record layout](../../src/core/gdn_replay_records.h)：Program 所用的既有存储容器。
