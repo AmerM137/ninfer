@@ -4,17 +4,13 @@ set(ninfer_op_tests
   silu_mul
   residual_add
   sigmoid_mul
-  rmsnorm
   rmsnorm_pack_tail
-  gated_rmsnorm
   l2norm
   kimi_delta_attention
   causal_conv1d_silu
   layer_norm
   embedding
   argmax
-  gdn_gating
-  gdn_gating_proj
   rope
   vision_pos_embed
   sampling
@@ -114,3 +110,5 @@ include("${CMAKE_CURRENT_LIST_DIR}/linear_swiglu/tests.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/gdn_input_proj/tests.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/ple/tests.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/linear_attention/gated_delta_net/tests.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/rmsnorm/tests.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/gdn_control/tests.cmake")

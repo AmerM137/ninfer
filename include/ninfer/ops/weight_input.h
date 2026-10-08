@@ -1,7 +1,6 @@
 #pragma once
 
 #include "core/weight_view.h"
-#include "ninfer/ops/linear.h"
 #include "ninfer/ops/projection_weights.h"
 #include "ninfer/ops/sparse_moe.h"
 
@@ -33,8 +32,8 @@ struct WeightInput {
                                                                const WeightInput& key,
                                                                const WeightInput& value,
                                                                const WeightInput& z);
-[[nodiscard]] ProjectionWeights prepare_gdn_gating_proj_weights(const WeightInput& a,
-                                                                const WeightInput& b);
+[[nodiscard]] ProjectionWeights prepare_gdn_control_proj_weights(const WeightInput& a,
+                                                                 const WeightInput& b);
 [[nodiscard]] SingleProjectionWeight prepare_linear_swiglu_weight(const WeightInput& gate,
                                                                   const WeightInput& up);
 [[nodiscard]] SparseMoeWeights
