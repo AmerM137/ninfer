@@ -69,13 +69,14 @@ these references.
 
 Qwen3.8-Flash-Next is a Qwen4Exp checkpoint. Start with the support plan for shared conventions,
 weight decisions and current progress, then read the relevant execution design. The model is not
-yet integrated; its 20 pure Linear problems are supported and qualified. Proposed storage and Op
-interfaces stay in these design documents until implemented.
+yet integrated into the Engine; the converter is implemented and its 20 pure Linear problems
+are supported and qualified. Proposed storage and Op interfaces stay in these design documents
+until implemented.
 
 | Design | Responsibility |
 |---|---|
 | [Support plan and model weights](maintainer/qwen3_8-flash-next-model.md) | entry point, architecture, quantization, merged matrices, artifact/residency, cross-Op handoffs and remaining work |
-| [Converter implementation](maintainer/qwen3_8-flash-next-converter.md) | code changes, source mapping, logical bindings, ModelOpt import, NF4/MTP encoding and artifact writing |
+| [Weight conversion](maintainer/qwen3_8-flash-next-converter.md) | source mapping, logical bindings, ModelOpt import, NF4/MTP encoding, artifact writing and the local command |
 | [HC / Gated Residual](maintainer/qwen3_8-flash-next-hc.md) | grouped normalization, mixing, residual fusion, interfaces and Main/MTP boundary features |
 | [GDN](maintainer/qwen3_8-flash-next-gdn.md) | full layer flow, projection/convolution/control extensions, sigmoid output gating and ReplaySSM integration |
 | [QSA](maintainer/qwen3_8-flash-next-qsa.md) | preparation, indexer, sparse GQA, selection, candidate records and tail state |

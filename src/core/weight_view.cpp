@@ -95,6 +95,24 @@ WeightGeometry weight_geometry(QType format, QuantLayout layout,
     const auto n       = shape[0];
     const auto k       = shape[1];
     out.padded_columns = k;
+    if (layout == QuantLayout::RowPagedG16_4K) {
+        if (format != QType::NF4_G16_E4M3FN || k % 16) {
+            throw std::invalid_argument("paged NF4 requires K%16=0");
+        }
+        out.alignment           = 4096;
+        out.group_size          = 16;
+        out.code_bytes_per_row  = k / 2;
+        out.scale_bytes_per_row = k / 16;
+        out.row_bytes           = add(k / 2, k / 16);
+        out.rows_per_page       = 4096 / out.row_bytes;
+        if (!out.rows_per_page) { throw std::invalid_argument("NF4 row exceeds page"); }
+        out.page_count     = add(n, out.rows_per_page - 1) / out.rows_per_page;
+        out.code_bytes     = mul(n, out.code_bytes_per_row);
+        out.scale_bytes    = mul(n, out.scale_bytes_per_row);
+        out.divisor_offset = mul(out.page_count, 4096);
+        out.bytes          = add(out.divisor_offset, 4);
+        return out;
+    }
     if (layout == QuantLayout::RowSplit) {
         std::uint64_t high_per_group = 0;
         switch (format) {
@@ -184,11 +202,22 @@ bool is_complete_weight(const WeightView& view) {
     return end == parent->geometry.elements;
 }
 
+std::uint64_t weight_paged_row_offset(const WeightGeometry& geometry, std::uint64_t row) {
+    if (geometry.layout != QuantLayout::RowPagedG16_4K || geometry.shape.size() != 2 ||
+        !geometry.rows_per_page || row >= geometry.shape[0]) {
+        throw std::invalid_argument("invalid paged weight row");
+    }
+    return row / geometry.rows_per_page * 4096 + row % geometry.rows_per_page * geometry.row_bytes;
+}
+
 std::uint64_t weight_scale_offset(const WeightGeometry& geometry, std::uint64_t row,
                                   std::uint64_t group) {
     if (geometry.shape.size() != 2 || !geometry.group_size || row >= geometry.shape[0] ||
         group >= geometry.padded_columns / geometry.group_size) {
         throw std::invalid_argument("weight scale coordinate exceeds its parent");
+    }
+    if (geometry.layout == QuantLayout::RowPagedG16_4K) {
+        return weight_paged_row_offset(geometry, row) + geometry.code_bytes_per_row + group;
     }
     if (geometry.layout == QuantLayout::BlockScaleK16M128x4) {
         const auto inner = row % 128;
@@ -202,6 +231,9 @@ WeightRowPlanes weight_row_planes(const WeightRegion& region) {
     validate_region(region);
     const auto& parent = *region.parent;
     const auto& g      = parent.geometry;
+    if (g.layout == QuantLayout::RowPagedG16_4K) {
+        throw std::invalid_argument("paged weights require per-row encoded addressing");
+    }
     if (!parent.data || g.shape.size() != 2 || region.begin % g.shape[1] ||
         region.end % g.shape[1]) {
         throw std::invalid_argument("row view requires resident complete logical rows");

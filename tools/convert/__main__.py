@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from contextlib import ExitStack
 import importlib.util
+import json
 from pathlib import Path
 import sys
 from collections.abc import Mapping
@@ -12,7 +13,8 @@ from collections.abc import Mapping
 from .official_recipes import RECIPES
 from .pipeline import convert
 from .proposal import DEFAULT_RANKING, add_official_proposal
-from .qwen3_5 import build_model
+from .qwen3_5 import build_model as build_qwen3_5
+from .qwen4_exp import build_model as build_qwen4_exp
 from .recipe import Recipe
 from .sources.safetensors import SafetensorsSource
 
@@ -43,9 +45,21 @@ class SourceInputs(Mapping):
         return len(set(self._sources) | set(self._paths))
 
     def provenance(self):
-        return {
-            name: {"path": str(source.path)} for name, source in self._sources.items()
-        }
+        result = {}
+        for name, source in self._sources.items():
+            record = {"path": str(source.path)}
+            manifest = source.root / "source-manifest.json"
+            if manifest.is_file():
+                data = json.loads(manifest.read_text())
+                record.update(
+                    {
+                        key: data[key]
+                        for key in ("repository", "revision")
+                        if key in data
+                    }
+                )
+            result[name] = record
+        return result
 
 
 def _pairs(values, label):
@@ -143,6 +157,14 @@ def main(argv=None):
         companions = {
             key: sources[key] for key in ("dflash", "dflash2") if key in components
         }
+        architectures = base.config.get("architectures", [])
+        qwen4_exp = architectures in (
+            ["Qwen4ExpForConditionalGeneration"],
+            ["Qwen4ExpForCausalLM"],
+        )
+        if qwen4_exp and args.proposal:
+            raise ValueError("Qwen4Exp does not have an indexed proposal head")
+        build_model = build_qwen4_exp if qwen4_exp else build_qwen3_5
         model = build_model(
             base,
             components=components,

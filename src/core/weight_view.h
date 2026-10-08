@@ -47,6 +47,9 @@ struct WeightGeometry {
     std::uint64_t scale_offset        = 0;
     std::uint64_t scale_bytes         = 0;
     std::uint64_t divisor_offset      = 0;
+    std::uint64_t row_bytes           = 0;
+    std::uint64_t rows_per_page       = 0;
+    std::uint64_t page_count          = 0;
 };
 
 [[nodiscard]] WeightGeometry weight_geometry(QType format, QuantLayout layout,
@@ -76,6 +79,9 @@ struct WeightView {
 [[nodiscard]] bool is_complete_weight(const WeightView& view);
 [[nodiscard]] std::uint64_t weight_scale_offset(const WeightGeometry& geometry, std::uint64_t row,
                                                 std::uint64_t group);
+// Byte offset of a complete NF4 encoded row within its paged parent.
+[[nodiscard]] std::uint64_t weight_paged_row_offset(const WeightGeometry& geometry,
+                                                    std::uint64_t row);
 
 struct WeightRowPlanes {
     const std::byte* codes        = nullptr;

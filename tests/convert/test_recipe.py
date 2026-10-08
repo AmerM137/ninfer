@@ -15,6 +15,8 @@ from tools.convert.methods import grouped_absmax, import_encoded
 from tools.convert.model import Model, Parameter
 from tools.artifact.tensor_output import TensorOutput
 from tools.convert.recipe import Recipe
+from tools.convert.recipe import AuxiliaryReference
+from tools.convert.methods import AuxiliaryValue, cast_direct
 from tools.convert.sources.logical import EncodedRows, LogicalSource, array_source
 
 
@@ -69,6 +71,65 @@ def _assert_quantized_rows(artifact, part, amplitudes, format):
     assert scales[first:last].view(torch.int16).tolist() == [
         [word, word] for word in expected
     ]
+
+
+def test_expert_parents_preserve_bank_order_and_shared_auxiliary(tmp_path):
+    model = Model({"text": {"config": {}}})
+    values = {}
+    for role, offset in (("gate", 0), ("up", 32)):
+        data = (torch.arange(24) + offset).to(torch.bfloat16).reshape(3, 2, 4)
+        values[role] = data
+        model.add(
+            Parameter(role, (3, 2, 4), array_source(data, role), inputs=("hidden",))
+        )
+    recipe = Recipe(model)
+    recipe.auxiliary_tensor(
+        "layer_scales", AuxiliaryValue("fp32", (1, 2), struct.pack("<ff", 2.0, 3.0))
+    )
+    for role in values:
+        recipe.use(
+            role,
+            "hidden",
+            auxiliaries={
+                "activation_input_divisor": AuxiliaryReference("layer_scales", 0)
+            },
+        )
+    # Deliberately insert reverse order; placement and Binding order are independent.
+    for expert in (2, 1, 0):
+        recipe.parent(
+            [
+                (role, expert * 8, (expert + 1) * 8, array_source(data[expert], role))
+                for role, data in values.items()
+            ],
+            shape=(4, 4),
+            format="bf16",
+            method=cast_direct,
+            order=(expert,),
+        )
+    prepared = recipe.prepare(device="cpu", rows_per_chunk=1)
+    path = tmp_path / "experts.ninfer"
+    _write(path, model, prepared)
+    with Artifact(path) as artifact:
+        for role in values:
+            actual = []
+            parts = binding_parts(artifact.directory.bindings[role], artifact.by_id)
+            assert len(parts) == 3
+            for object_id, begin, end in parts:
+                parent = torch.frombuffer(
+                    bytearray(artifact.read_object(object_id)), dtype=torch.bfloat16
+                )
+                actual.append(parent[begin:end])
+            assert torch.equal(torch.cat(actual), values[role].flatten())
+        references = [
+            use["auxiliaries"]["activation_input_divisor"]
+            for use in artifact.directory.uses
+        ]
+        assert (
+            references[0]
+            == references[1]
+            == {"parts": [{"object": "auxiliary/shared/layer_scales", "range": [0, 1]}]}
+        )
+        assert len(prepared.auxiliaries) == 1
 
 
 def test_mixed_attention_uses_two_parents_and_distinct_permissions(tmp_path):

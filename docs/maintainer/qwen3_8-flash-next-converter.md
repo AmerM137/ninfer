@@ -1,8 +1,8 @@
-# Qwen3.8-Flash-Next：权重转换实现方案
+# Qwen3.8-Flash-Next：权重转换
 
 更新日期：2026-10-08。
 
-在现有 converter 中增加 `qwen3_8_flash_next` recipe，输出 V3 `.ninfer`。
+现有 converter 的 `qwen3_8_flash_next` recipe 输出 V3 `.ninfer`，实现覆盖 Text、Vision、MTP。
 精度、合并矩阵和字节布局以[模型权重方案](qwen3_8-flash-next-model.md)为准。
 
 ## 1. 代码改动
@@ -49,7 +49,7 @@ config 及选中的 processor 资源直接使用本地源文件。首版不增�
 4. 编码 MTP experts；逐 shard 扫描并编码 PLE。
 5. 使用现有 writer 完成文件集合，沿用 `.conversion.json` 记录来源和编码方法。
 
-先实现 format/layout 和模型映射，再接入导入与自量化方法，最后运行完整转换。
+实际对象放置与写出顺序为资源/辅助值、主常驻权重、Vision、MTP、主 experts、PLE。
 
 ## 4. 逻辑参数目录与源映射
 
@@ -175,5 +175,27 @@ Pipeline 的对象顺序为：资源/辅助值 → 主常驻权重 → Vision/MT
 主 experts 按 layer/expert/gate_up,down 排列，PLE 起点按 4096 B 对齐。Writer 根据完整
 对象计划计算 offsets 和分卷；各 job 有界读写，不整体保留大表或 expert bank。
 
-实现 NF4 后同步更新通用数值格式与布局文档；模型总览继续维护实例 recipe 和容量。
+通用数值格式与布局文档已同步；模型总览继续维护实例 recipe 和容量。
 PLE conv 当前使用 channel 连续，布局性能留待其 Op 实现时核实。
+
+## 7. 本地转换命令
+
+```bash
+OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 /home/neroued/miniconda3/envs/py311/bin/python -m tools.convert \
+  --model /home/neroued/models/llm/qwen/Qwen3.8-Flash-Next/base-hf-bf16 \
+  --recipe qwen3_8_flash_next \
+  --source nvidia_experts=/home/neroued/models/llm/qwen/Qwen3.8-Flash-Next/nvidia-nvfp4-experts/experts.safetensors.index.json \
+  --components text,vision,mtp \
+  --device cuda --rows-per-chunk 16384 \
+  --name qwen3.8-flash-next \
+  --out out/qwen3_8_flash_next.ninfer
+```
+
+CUDA 编码器首次使用时编译并缓存。`stored_scale_mse` 在 GPU 上以 FP64 比较误差，
+只剪掉 clipping 下界已超过当前最佳误差的 scale；候选域仍是全部 126 个正有限 words。
+转换沿用 `.conversion.json`，记录来源 revision、`qwen4_exp_v1` 映射、编码方法和文件集合。
+
+2026-10-08 已按该命令生成 Text、Vision、MTP 全组件：入口及三个 `.part-0001..0003`
+分卷共 107025649668 bytes。最终产物通过 C++ reader 的全部对象几何检查；直接参数与
+Q8 投影抽样逐 word 比对、NVIDIA 编码抽样、全部 expert Use 校准引用、128 个 PLE
+shard 的 divisor/末页 padding 和 NF4/MTP 独立 CPU 编码抽样均通过。

@@ -1,6 +1,6 @@
 # Qwen3.8-Flash-Next：支持计划与模型权重
 
-更新日期：2026-10-08。**支持计划总入口；模型尚未接入，20 项纯 Linear 已完成。**
+更新日期：2026-10-08。**支持计划总入口；Converter 与完整权重已完成，20 项纯 Linear 已完成，模型执行尚未接入。**
 
 Qwen3.8-Flash-Next 是本文的 checkpoint 实例，数学架构为 Qwen4Exp，目标代码模块为
 `qwen4_exp`。本计划覆盖 Text、可选 Vision 和原生 MTP；架构、绑定和执行按原生模块
@@ -555,7 +555,7 @@ CPU expert 计算、固定 GPU 常驻层或固定 grouped-GEMM tile。
 
 ### 7.1 新数值格式 `nf4_g16_e4m3fn`
 
-这是待注册的新 format，不是 NVFP4，也不是 bitsandbytes 的通用文件布局。
+该 format 已注册，通用定义见[数值格式 §3.5](tensor-formats.md#35-nf4_g16_e4m3fn)。
 对 rank-2 `[N,K]` 表，沿 K 每 16 个值一个 E4M3FN scale，整个对象一个正有限 FP32
 weight divisor d。每行独立分组，不跨行；本模型 K=160。
 
@@ -777,6 +777,8 @@ Text-only 约 97.317072 GiB；启用 Vision+MTP 后的固定 GPU 权重 payload 
 其余对象按相应 layout（主要为 256-byte）对齐；对象间空隙约 12.6 MiB，另需
 JSON/Binding/Use/Frontend 和文件 framing 空间。表中的 NF4 payload 已包含页内 padding。
 最终产物由 writer 按实际 encoded size/offset 给出精确总量，不将 payload 当作文件大小。
+本机已生成 `out/qwen3_8_flash_next.ninfer` 及 `.part-0001`、`.part-0002`、`.part-0003`，
+全部组件共 51396 个对象，文件总长 **107025649668 bytes（99.675404 GiB）**。
 A_log/dt_bias 展开使逻辑 payload 增加 6912 B；对象对齐可能吸收该增量，文件长度和
 Device arena 容量应分别计算。PLE conv 转置不增加 payload。
 
@@ -850,8 +852,9 @@ index 的 294912 个字段来自 9 个文件；主 experts 生成 49152 个 rank
 两个 BF16 bank 自量化生成 1024 个，共 50176 个 expert 对象。三份 INT64 tensor 合成
 280-byte 控制 Resource，另生成一个 [48,2] FP32 activation auxiliary。
 共享引用不复制参数；amax/编码的多次扫描不算逻辑重复保存。组件未选择、来源被替代和
-实际取值必须在 source coverage 中区分。这些核对未生成实际编码文件，也未验证全部
-权重的量化误差。详细实施和验收见 [Converter 方案](qwen3_8-flash-next-converter.md)。
+实际取值在 source coverage 中区分。转换实现与本地命令见
+[权重转换](qwen3_8-flash-next-converter.md)。编码数值规则按独立参考核对；整模任务精度
+需要在模型执行接入后评估。
 
 Provenance 至少记录源路径/revision、选取范围、每种 encoder 和参数、ModelOpt multiplier
 转换约定、合并/置换版本及组件选择。实际数值、矩阵 shape、scale、激活许可不得仅藏在
@@ -865,9 +868,9 @@ provenance 中，consumer 应从正式 config/objects/bindings/uses 获取。
 
 | 工作 | 当前状态 | 下一完成条件 / 入口 |
 |---|---|---|
-| 源权重与 recipe | 本地来源具备；精度、合并、NVFP4 scalar 关系与容量已核对 | §2、§4；实际导入仍需检查 codes/block scales |
+| 源权重与 recipe | 本地来源具备；完整转换已完成，导入时已检查 NVFP4 scales/scalars | §2、§4；组合精度在模型执行接入后评估 |
 | 纯 Linear | **20 项已完成**支持、数学资格与规定点位调优 | §5.5；后续在完整复合 Op 中复用 |
-| Artifact/converter | 表示与映射见本文及 [Converter 方案](qwen3_8-flash-next-converter.md)，生产转换未实现 | Qwen4Exp config/Binding/Use、NVIDIA 导入、MTP NVFP4、NF4 encoder/layout、完整产物验证；PLE conv 布局性能待比较 |
+| Artifact/converter | **已完成** Qwen4Exp config/Binding/Use、NVIDIA 导入、MTP NVFP4、NF4 encoder/layout 和完整产物 | [转换说明与命令](qwen3_8-flash-next-converter.md)；PLE conv 布局性能待 Op 阶段比较 |
 | Loader/驻留 | 所有权与驻留设计已定，未接入 | 固定 GPU 权重、完整 Host expert backing、长期 disk backing、原生 Parameters |
 | HC | [数学与接口已定](qwen3_8-flash-next-hc.md)，未实现 | Mix/CombineNorm 等 Ops、workspace、Main/MTP 末端 pair 与状态搬运 |
 | QSA | [数学与接口已定](qwen3_8-flash-next-qsa.md)，未实现 | Prepare、Indexer、Sparse GQA、tail extract；全部声明 codec 逐路线资格化 |

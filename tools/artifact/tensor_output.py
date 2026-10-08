@@ -6,16 +6,19 @@ ArtifactWriter owns file placement, sharding, write coverage, and publication.
 
 from __future__ import annotations
 
+import numpy as np
 import torch
 
 from .codecs.direct import encode_direct
 from .codecs.fp8_row import encode_fp8_row_scaled
 from .codecs.nvfp4 import encode_nvfp4
+from .codecs.nf4 import divisor_word, nf4_rows
 from .codecs.row_split import encode_row_split, split_row_planes
 from .formats import (
     DirectFormat,
     Fp8RowFormat,
     Nvfp4Format,
+    Nf4Format,
     QuantFormat,
     get_format,
 )
@@ -23,6 +26,7 @@ from .layouts import (
     block_scale_geometry,
     row_scale_geometry,
     row_split_geometry,
+    row_paged_geometry,
 )
 from .schema import TensorObject
 from .writer import ArtifactWriter
@@ -38,6 +42,9 @@ class TensorOutput:
         self.format = get_format(obj.format)
         self._padding_initialized = False
         self._divisor: bytes | None = None
+        self._next_row = 0
+        self._pending_rows = None
+        self._pages_written = 0
 
     def write_bytes(self, offset: int, data: bytes | memoryview) -> None:
         self.writer.write_region(self.object.id, offset, data)
@@ -88,7 +95,9 @@ class TensorOutput:
         if rows <= 0 or row_begin + rows > obj.shape[0]:
             raise ValueError(f"{obj.id}: encoded rows exceed parent")
         self._padding()
-        if isinstance(self.format, QuantFormat):
+        if isinstance(self.format, Nf4Format):
+            self._write_nf4(row_begin, codes, scales, weight_divisor)
+        elif isinstance(self.format, QuantFormat):
             g = row_split_geometry(self.format, obj.shape)
             block = encode_row_split(codes, scales, self.format, (rows, k))
             planes = split_row_planes(block, row_split_geometry(self.format, (rows, k)))
@@ -125,3 +134,34 @@ class TensorOutput:
                 raise ValueError(f"{obj.id}: weight divisor changed between row blocks")
         else:
             raise TypeError(f"{obj.id}: direct format does not accept quantized codes")
+
+    def _write_nf4(self, row_begin, codes, scales, weight_divisor):
+        g = row_paged_geometry(self.format, self.object.shape)
+        if row_begin != self._next_row:
+            raise ValueError("NF4 streaming output requires consecutive rows")
+        divisor = divisor_word(weight_divisor)
+        if self._divisor is not None and self._divisor != divisor:
+            raise ValueError("NF4 divisor changed between row blocks")
+        self._divisor = divisor
+        rows = nf4_rows(codes, scales, g.k)
+        self._next_row += rows.shape[0]
+        if self._pending_rows is not None:
+            rows = np.concatenate((self._pending_rows, rows), axis=0)
+        full, tail = divmod(rows.shape[0], g.rows_per_page)
+        final = self._next_row == g.n
+        count = full + int(final and tail > 0)
+        if count:
+            pages = np.zeros((count, 4096), dtype=np.uint8)
+            used = g.rows_per_page * g.row_bytes
+            pages[:full, :used] = rows[: full * g.rows_per_page].reshape(full, used)
+            if final and tail:
+                pages[full, : tail * g.row_bytes] = rows[
+                    full * g.rows_per_page :
+                ].reshape(-1)
+            self.write_bytes(self._pages_written * 4096, memoryview(pages).cast("B"))
+            self._pages_written += count
+        self._pending_rows = (
+            rows[full * g.rows_per_page :].copy() if tail and not final else None
+        )
+        if final:
+            self.write_bytes(g.weight_divisor_offset, divisor)

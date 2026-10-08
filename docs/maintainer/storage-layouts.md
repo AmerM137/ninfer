@@ -15,10 +15,11 @@ The storage registry contains exactly these identities:
 | `row_split_k128_v1` | tensor layout | `q4_g64_fp16`, `q5_g64_fp16`, `q6_g64_fp16`, `q8_g32_fp16` | rank 2 `[N,K]` | 256 bytes |
 | `block_scale_k16_m128x4_v1` | tensor layout | `nvfp4` | rank 2 `[N,K]`, `N % 128 == 0`, `K % 64 == 0` | 256 bytes |
 | `row_scale_v1` | tensor layout | `fp8_e4m3fn_row_bf16` | rank 2 `[N,K]` | 256 bytes |
+| `row_paged_g16_4k_v1` | tensor layout | `nf4_g16_e4m3fn` | rank 2 `[N,K]`, `K % 16 == 0`, encoded row ≤ 4096 bytes | 4096 bytes |
 | `raw_bytes_v1` | resource encoding | not applicable | nonempty byte string | 1 byte |
 
 These format/layout pairs define the current codec support. Native consumer requirements are
-covered separately in Section 8.
+covered separately in Section 9.
 
 Object alignment applies to the object's payload-relative `offset` in the `.ninfer` JSON. Internal
 plane offsets and padding belong to the selected layout. Inter-object padding belongs to the
@@ -321,7 +322,34 @@ encoded by concatenating the selected code rows, recomputing the scale-plane ali
 row count, and appending the selected scale words in the same row order. It does not decode or
 requantize either plane.
 
-## 6. `raw_bytes_v1`
+## 6. `row_paged_g16_4k_v1`
+
+This independent layout stores NF4 codes and G16 scales together in each row. It has positive
+rank-two shape `[N,K]`, `K % 16 == 0`, and `row_bytes <= 4096`:
+
+```text
+row_bytes             = K/2 + K/16
+rows_per_page         = floor(4096 / row_bytes)
+page_count            = ceil_div(N, rows_per_page)
+row_offset(r)         = floor(r / rows_per_page)*4096 + (r % rows_per_page)*row_bytes
+weight_divisor_offset = page_count*4096
+payload_bytes         = weight_divisor_offset + 4
+```
+
+Each row begins with `K/2` packed-code bytes (low nibble is the even K coordinate), followed by
+`K/16` E4M3FN scale bytes in increasing group order. Rows never cross pages. Page tails and
+unused rows in the final page contain zero bytes. The little-endian FP32 divisor follows the
+complete final page. The tensor object's payload-relative offset is aligned to 4096 bytes.
+
+For `[2500012,160]`, a row occupies 90 bytes, a page holds 45 rows, and 55556 pages plus the
+divisor occupy 227557380 bytes. The final page holds 37 valid rows. A logical zero NF4 group
+uses packed `0x77` codes and scale zero; page padding has no logical values.
+
+`weight_paged_row_offset` and `weight_scale_offset` expose parent-relative C++ addresses;
+`row_paged_geometry` provides the corresponding Python geometry. Paged rows cannot be exposed
+as constant-stride code/scale planes or passed to the current native Linear `Weight` bridge.
+
+## 7. `raw_bytes_v1`
 
 `raw_bytes_v1` is a resource encoding, not a tensor layout. Its enclosing object payload is
 the resource byte string itself:
@@ -336,7 +364,7 @@ trailing padding. The resource object's JSON `bytes` is its exact nonzero length
 returns the complete span unchanged. A model contract assigns a resource name and interprets those
 bytes; the common encoding does not infer that meaning from the name.
 
-## 7. Decode boundary
+## 8. Decode boundary
 
 Layout decoding yields only persistent logical words:
 
@@ -347,13 +375,14 @@ Layout decoding yields only persistent logical words:
   matrix-level FP32 weight divisor;
 - `row_scale_v1` yields the natural row-major E4M3FN code words and one BF16 multiplier per logical
   row;
+- `row_paged_g16_4k_v1` yields packed NF4 codes, natural G16 E4M3FN scales and the object FP32 divisor;
 - `raw_bytes_v1` yields the enclosing resource bytes.
 
 Dequantized values follow the reconstruction rule in `tensor-formats.md`. This document does
 not select a quantization encoder, output dtype, accumulation dtype, kernel, runtime device layout,
 or model consumer.
 
-## 8. Logical views and native operands
+## 9. Logical views and native operands
 
 Bindings address C-order logical element ranges of a parent object. The parent retains its full
 geometry and backing allocation, so a view can locate code and scale planes using the original

@@ -136,6 +136,11 @@ void file_roundtrip(DeviceContext& device, const std::filesystem::path& path, bo
             expected.emplace(placement.object.index, std::move(bytes));
         }
         storage.emplace(materialize(reader, std::move(plan), device));
+        if (writer_fixture) {
+            const auto& paged = storage->device_parent(reader.find("nf4"));
+            require(paged.geometry.bytes == 8196 && paged.weight_scale_divisor == 2.0F,
+                    "NF4 materialization lost paged geometry or the FP32 divisor");
+        }
     }
     for (const auto& [index, bytes] : expected) {
         std::vector<std::byte> actual(bytes.size());

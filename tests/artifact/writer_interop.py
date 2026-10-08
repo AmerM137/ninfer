@@ -4,6 +4,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import struct
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -14,15 +15,26 @@ from tools.artifact.writer import ArtifactWriter
 def main() -> int:
     executable = sys.argv[1]
     data = bytes((index * 37 + 11) % 251 for index in range(130 * 130 * 2))
+    nf4 = bytearray(8192)
+    for row in range(46):
+        offset = row // 45 * 4096 + row % 45 * 90
+        nf4[offset : offset + 80] = b"\x77" * 80
+    nf4.extend(struct.pack("<f", 2.0))
     with tempfile.TemporaryDirectory(prefix="ninfer-writer-interop-") as temporary:
         for label, limit in (("single", 1_000_000), ("sharded", 12288)):
             path = Path(temporary) / f"{label}.ninfer"
             with ArtifactWriter(
                 path,
-                [TensorSpec("matrix", (130, 130), "bf16", "contiguous_le_v1")],
+                [
+                    TensorSpec("matrix", (130, 130), "bf16", "contiguous_le_v1"),
+                    TensorSpec(
+                        "nf4", (46, 160), "nf4_g16_e4m3fn", "row_paged_g16_4k_v1"
+                    ),
+                ],
                 components={"text": {"config": {}}},
                 bindings={
                     "whole": {"object": "matrix"},
+                    "paged_table": {"object": "nf4"},
                     "reordered_rows": {
                         "parts": [
                             {"object": "matrix", "range": [16770, 16900]},
@@ -33,6 +45,7 @@ def main() -> int:
                 max_file_bytes=limit,
             ) as writer:
                 writer.write_object("matrix", data)
+                writer.write_object("nf4", nf4)
             result = subprocess.run([executable, "--writer-fixture", str(path)])
             if result.returncode:
                 return result.returncode

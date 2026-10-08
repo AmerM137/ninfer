@@ -49,14 +49,16 @@ def convert(
     prepared = recipe.prepare(device=str(chosen_device), rows_per_chunk=rows_per_chunk)
     preparation_seconds = time.perf_counter() - start
     metadata = {} if name is None else {"name": name}
-    provenance = {} if provenance is None else provenance
+    provenance = {} if provenance is None else dict(provenance)
+    if recipe.provenance:
+        provenance["recipe_details"] = dict(recipe.provenance)
     resources = [
         ResourceSpec(key, len(value)) for key, value in model.resources.items()
     ]
     specs = (
         resources
-        + [job.spec for job in prepared.weights]
         + [spec for spec, _ in prepared.auxiliaries]
+        + [job.spec for job in prepared.weights]
     )
     report = {
         "components": model.components,
@@ -99,6 +101,8 @@ def convert(
     ) as writer:
         for object_id, data in model.resources.items():
             writer.write_object(object_id, data)
+        for spec, data in prepared.auxiliaries:
+            writer.write_object(spec.id, data)
         for index, job in enumerate(prepared.weights):
             if progress is not None:
                 progress(index, len(prepared.weights), job)
@@ -109,8 +113,6 @@ def convert(
                 raise ValueError(
                     f"{label} [{job.method_name}/{job.spec.format}]: {error}"
                 ) from error
-        for spec, data in prepared.auxiliaries:
-            writer.write_object(spec.id, data)
         report["artifact_id"] = writer.artifact_id.hex()
         report["files"] = [
             {

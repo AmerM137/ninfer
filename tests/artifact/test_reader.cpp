@@ -2,6 +2,7 @@
 #include "artifact/reader.h"
 #include "artifact/fixture.h"
 #include "core/weight_view.h"
+#include "core/nf4.h"
 
 #include <algorithm>
 #include <array>
@@ -111,6 +112,24 @@ void geometry_and_views() {
     require(query.weight_scale_divisor == 2 && query.input_scale_divisor == 3 &&
                 context.input_scale_divisor == 4 && nv_parent.weight_scale_divisor == 2,
             "per-use native parameters changed the parent");
+
+    const auto paged = weight_geometry(QType::NF4_G16_E4M3FN, QuantLayout::RowPagedG16_4K,
+                                       std::array<std::uint64_t, 2>{46, 160});
+    require(paged.alignment == 4096 && paged.row_bytes == 90 && paged.rows_per_page == 45 &&
+                paged.page_count == 2 && paged.divisor_offset == 8192 && paged.bytes == 8196,
+            "NF4 paged geometry differs from its wire representation");
+    require(weight_paged_row_offset(paged, 44) == 3960 &&
+                weight_paged_row_offset(paged, 45) == 4096 &&
+                weight_scale_offset(paged, 45, 9) == 4185,
+            "NF4 lookup crossed a page or scale boundary incorrectly");
+    require(nf4_code_value(0) == -1 && nf4_code_value(7) == 0 && nf4_code_value(15) == 1 &&
+                std::bit_cast<std::uint32_t>(nf4_code_value(8)) == 0x3da2faff,
+            "NF4 codebook changed");
+    WeightParent paged_parent{paged, nvfp4.data(), 2.0F};
+    rejects<std::invalid_argument>([&] { (void)weight_row_planes({&paged_parent, 0, 160}); },
+                                   "paged lookup was exposed as constant-stride planes");
+    rejects<std::invalid_argument>([&] { (void)weight_paged_row_offset(paged, 46); },
+                                   "out-of-bounds paged row accepted");
 }
 
 void invalid_directories() {
