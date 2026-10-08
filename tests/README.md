@@ -38,6 +38,10 @@ GDN projection, snapshot, and record suites live in `ops/gdn_input_proj/`.
 `ops/linear_attention/gated_delta_net/` owns recurrence, Replay record, and fold tests,
 including the original projection/record/fold integration cases and FP64 recurrence reference.
 
+`ops/ple/` qualifies ConvAdd/ConvAddNorm against FP64 formulas and the actual BF16 residual
+boundary, and checks StateExtract as exact word copying. It covers strided pools, accepted
+prefixes, in-place updates, split windows and changing Graph metadata.
+
 ## Build and run
 
 Select a Python environment with the dependencies for the tests first. The maintained environment

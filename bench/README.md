@@ -512,6 +512,22 @@ at graph construction; eager timing includes their submission on every call.
   --op record --value-heads 48 --tokens 2,8,16 --batch 8 --valid mixed
 ```
 
+## PLE convolution and state extraction
+
+`ninfer_ple_bench` measures `--op conv-add|conv-add-norm|state-extract` at H=2560,
+four streams, dilation=3 and nine history columns. It uses the shared Op measurement harness
+described above, with zero global workspace. `--valid` and `--accepted` accept `dense`, `mixed`,
+or comma-separated per-row counts; zero counts are supported. `--offset` selects the convolution
+record window. `--inplace` updates the residual or selected history slots and restores the input
+before each measurement. CSV includes the actual counts, record offset and alias mode.
+
+```bash
+./build/bench/ninfer_ple_bench --op conv-add-norm --tokens 1,16,1024,2048,4096 --cache cold
+./build/bench/ninfer_ple_bench --op conv-add --tokens 16 --batch 8 --valid mixed --offset 5
+./build/bench/ninfer_ple_bench --op state-extract --tokens 16 --batch 8 \
+  --accepted 0,1,2,3,8,9,15,16 --inplace --execution both
+```
+
 ## Softmax Attention Op benchmarks
 
 The four Softmax Attention executables share one harness rule: fixture setup, public workspace

@@ -111,4 +111,5 @@ include("${CMAKE_CURRENT_LIST_DIR}/linear_pair/tests.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/linear_swiglu/tests.cmake")
 
 include("${CMAKE_CURRENT_LIST_DIR}/gdn_input_proj/tests.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/ple/tests.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/linear_attention/gated_delta_net/tests.cmake")

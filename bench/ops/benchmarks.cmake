@@ -60,4 +60,5 @@ ninfer_add_op_bench(ninfer_mtp_pack_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/mtp
 ninfer_add_op_bench(ninfer_proposal_remap_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/proposal_remap_bench.cu")
 
 include("${CMAKE_CURRENT_LIST_DIR}/gdn_input_proj/benchmarks.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/ple/benchmarks.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/linear_attention/gated_delta_net/benchmarks.cmake")

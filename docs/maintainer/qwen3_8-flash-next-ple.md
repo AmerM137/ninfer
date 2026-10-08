@@ -1,6 +1,9 @@
 # Qwen3.8-Flash-Next：PLE 计算、SSD 读取与状态设计
 
-更新日期：2026-10-08。**实现目标已明确，生产实现待完成；卷积布局尚无性能对比。**
+更新日期：2026-10-08。**ConvAdd、ConvAddNorm 和 StateExtract 已实现；Gate、读取服务和
+Program 接入待完成。** 卷积使用 converter 已生成的 channel 连续布局，并已完成与源布局的
+Op 级对照。生产合同见 [ple.h](../../include/ninfer/ops/ple.h)，测试和性能入口分别见
+[Tests](../../tests/README.md)、[Benchmarks](../../bench/README.md#ple-convolution-and-state-extraction)。
 
 本文拥有 Qwen4Exp 的 PLE 数学、文件绑定、异步读取、GPU 交接与接受前缀状态。
 共同约定见[支持总览 §1.3](qwen3_8-flash-next-model.md#13-统一执行约定)；NF4 表示、
@@ -70,7 +73,8 @@ PLE 卷积按[核心存储约定](qwen3_8-flash-next-model.md#54-vision-与其�
 这块 80 KiB 权重常驻 GPU，启动和运行时不再转置；与磁盘上的 NF4 大表分别组织。
 
 采用 channel 连续的依据是 activation/history/output 与后续融合 HC norm 均沿 feature
-组织。Dilation=3 只影响时间索引；布局性能留待 Op 实现时核实，SSD 实验未包含卷积。
+组织。Dilation=3 只影响时间索引。Op 对照未显示两种权重布局有一致优劣，保留上述布局；
+SSD 实验未包含卷积。
 现有 dilation=1 的 `causal_conv1d_silu` 不能直接承担这里的 dilation=3、残差/HC norm
 和候选记录合同。
 
@@ -433,7 +437,7 @@ ple_gate 融合两组 norm、dot、sign/sqrt/sigmoid、V 广播门控与 NormCon
 
 ## 9. GPU 接口
 
-目标头文件为 `include/ninfer/ops/ple.h`，使用既有 Tensor 和 DeviceExecutionView。
+公共合同位于 `include/ninfer/ops/ple.h`，使用既有 Tensor 和 DeviceExecutionView。
 Linear 直接复用既有 `[12800,2560]` BF16/A16 入口，不在 PLE 中新增一套 GEMM API。
 
 ```cpp
