@@ -41,6 +41,7 @@ Qwen3.8-Flash-Next 是本文的 checkpoint 实例，数学架构为 Qwen4Exp，�
 |---|---|---|
 | 本文 | 实例架构、来源/recipe、合并与行序、持久表示、整模预算、支持进度 | 所有工作先读；converter、binder、planner 从这里取参数 |
 | [Converter 实现方案](qwen3_8-flash-next-converter.md) | 代码改动、来源映射、parent/Binding/Use 生成、流式编码与写出顺序 | 实现 converter 与 codec |
+| [子工作区任务清单](qwen3_8-flash-next-independent-ops.md) | 两批独立计算任务、文件分工、共享接口与主工作区交接 | 并行推进低影响面的实现 |
 | [HC / Gated Residual](qwen3_8-flash-next-hc.md) | 完整数学、Mix/CombineNorm 接口、激活寿命、Main/MTP 末端特征 | 实现 HC、层间残差融合与 MTP 特征交接 |
 | [GDN](qwen3_8-flash-next-gdn.md) | 整层计算、投影/卷积/门控调用、recurrent state 与 ReplaySSM 接入 | 实现 Qwen4Exp GDN 层及相应 Op 扩展 |
 | [QSA](qwen3_8-flash-next-qsa.md) | Prepare、Indexer、Sparse GQA、tail 提取、选块与 cache 读写 | 实现稀疏 attention、候选记录与恢复 |
@@ -883,7 +884,7 @@ provenance 中，consumer 应从正式 config/objects/bindings/uses 获取。
 | Program / Engine 集成 | 未实现 | 原生架构注册、planner/StateImage、各执行路径、checkpoint/offload、eager/Graph |
 | 组合质量与整机性能 | 未验证 | A16/A4 recipe 质量、MTP 接受率、内存峰值、TTFT/稳态延迟及真实搬运重叠 |
 
-现有生产入口仍是 Qwen3.5 系列，尚无 `src/models/qwen4_exp` 或本架构 converter。
+现有生产入口仍是 Qwen3.5 系列；本架构 converter 已完成，原生模型执行尚未接入。
 源码中的其他 Qwen3.8 checkpoint 不代表 Flash-Next 已可运行。
 
 ### 11.2 尚需细化的执行合同

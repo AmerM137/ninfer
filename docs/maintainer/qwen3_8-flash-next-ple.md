@@ -267,6 +267,44 @@ LUT 按独立精确/高精度 reference 构造和验证，不能以先 FP32 再 
 E 对应区域写 BF16 +0。一次 batch 的 H2D 发送完整、连续的 BF16 E，避免每行一次小 copy。
 表格式仍是 NF4；E 是 lookup 的激活输出，CPU 解码不是持久权重的运行时 repack。
 
+#### 6.2.1 Host LUT 与行解码接口
+
+以下接口在 `src/core/nf4.h` 声明、`src/core/nf4.cpp` 实现，属于通用数值解码。
+沿用已有 `kNf4CodebookWords`；LUT 和输出存储由调用者提供。
+
+```cpp
+namespace ninfer {
+
+struct Nf4Bf16Lut {
+    std::array<std::uint16_t, 128 * 16> words; // index=scale_word*16+code
+};
+
+void build_nf4_bf16_lut(float weight_divisor, Nf4Bf16Lut& out);
+
+void decode_nf4_row_bf16(
+    std::span<const std::byte> encoded_row,
+    const Nf4Bf16Lut& lut,
+    std::span<std::uint16_t> out_words);
+
+} // namespace ninfer
+```
+
+`build_nf4_bf16_lut` 接收实际存储的 FP32 divisor，按 §6.2 的精确表示值直接舍入为
+BF16 words，保留零的符号。Divisor 必须正且有限；有效 LUT 项的 BF16 结果必须有限。
+每张 LUT 为 4096 B，构建成功后 0..126 的有效 scale slots 全部可读；slot 127 不参与查表。
+Model 在加载阶段为 128 个 shard 构建并持有不可变 LUT，Program 的读取服务只借用它们。
+
+行解码的 K 由 `out_words.size()` 给出，要求 K>0、K%16=0、`K/2+K/16<=4096`，
+`encoded_row.size()` 必须恰为 K/2+K/16。输入是已取得的紧凑行：前 K/2 bytes 是
+low-even packed codes，后 K/16 bytes 是 scales；非法 scale words 按格式合同报错。
+本实例为 90 B → 160 个 BF16 words。输入允许任意字节对齐，输出连续且不与输入/LUT 重叠。
+接口只读输入和 LUT、完整写出该行；内部 SIMD 与分块组织由实现选择。
+
+读取服务先由全局行号选择 shard/LUT，取得 90 B 行，再将输出直接指向
+`E[(b*T+t)*2560+h*160 : ...+160]`。全局行号、页/文件寻址、原始行缓存和 pinned buffer
+寿命属于读取服务；行解码函数不需要这些对象。两种 Host 数值函数均不创建线程、提交 CUDA
+或持有跨调用可变状态。
+
 ### 6.3 ticket、取消与 buffer 寿命
 
 每个窗口记录每行的稳定 sequence identity、候选 epoch、起始输入 frontier、有效长度和
@@ -580,11 +618,52 @@ Row cache 是可丢弃的不可变权重副本，不写入 checkpoint，也不�
 
 ## 11. Host 准备接口
 
+### 11.1 纯 token hash
+
+目标位置为 `src/models/qwen4_exp/ple_hash.h/.cpp`，实现归 `ninfer_model_runtime`。
+输入是 Host 数据，函数按 §3 的既定 hash 数学计算一个序列的一段连续已知 IDs：
+
+```cpp
+namespace ninfer::models::qwen4_exp {
+
+struct PleHashParameters {
+    std::array<std::int64_t, 3> multipliers;
+    std::array<std::int64_t, 16> head_vocab_sizes;
+    std::array<std::int64_t, 16> head_offsets;
+    std::int32_t eos_token_id;
+};
+
+void ple_hash_rows(
+    const PleHashParameters& parameters,
+    std::array<std::int32_t, 2> previous_ids, // 紧邻本段前的 raw [x[-2],x[-1]]
+    std::span<const std::int32_t> input_ids,
+    std::span<std::uint32_t> row_ids);
+
+} // namespace ninfer::models::qwen4_exp
+```
+
+Model 从 280-byte 控制资源逐 word 绑定三个数组，从 config 取得 EOS。输入 ID 属于原始
+词表；缺失历史由调用者填 EOS。Head vocab sizes 为正，各 offset 与 size 所确定的行区间
+落在已绑定的 320001536 行中。乘法显式使用 unsigned modulo-2^64，再解释 signed64 并取
+正模，保留源 INT64 words 的语义。
+
+输出长度恰为 `16*input_ids.size()`，`row_ids[16*t+h]` 是第 t 个输入、第 h 个 head
+的全局行号，顺序为 2-gram heads 0..7、3-gram heads 0..7。输入为空时输出也为空。
+输入/参数与输出不重叠；函数同步完成、不分配输出存储、不保留或修改历史。
+
+窗口内后续 token 使用本段更早的 raw IDs。当前 token 为 EOS 时仍使用它之前的历史；
+上一 token 为 EOS 时，当前查询的更早一项才按 §3 替换。分段调用与一次调用同一串 IDs
+应产生相同结果。追加候选时，读取服务提供追加起点之前的两枚 raw IDs；最终接受前缀的
+raw tail 由 Program 按实际采用的输入维护。Hash 输出保留完整 head 顺序，去重与页映射
+随后由读取服务完成。
+
+### 11.2 读取服务
+
 这是 `src/models/qwen4_exp/program/ple_io.h` 的目标接口，不是公共 Engine API。Model 的
 `PleTableBinding` 提供不可变 cold backing；Program 创建和拥有服务及 CUDA 槽。
 
 ```cpp
-namespace ninfer::qwen4_exp {
+namespace ninfer::models::qwen4_exp {
 
 struct PleTableBinding;
 
@@ -650,7 +729,7 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-} // namespace ninfer::qwen4_exp
+} // namespace ninfer::models::qwen4_exp
 ```
 
 成功 prepare 拷贝 inputs/tails/identities；返回空表示当前没有可用窗口槽，不是 I/O
@@ -714,6 +793,8 @@ WSL 存储栈与 competing transfers 都会改变实际等待。独立链路中�
 |---|---|
 | Converter / format-layout | NF4 encoder、页内 packing、padding/divisor、对象对齐及 V3 写出；conv 离线转为 channel 连续；不生成第二份运行副本 |
 | Artifact / Model | 校验并持有 immutable cold backing、range mapping、控制值与 LUT；不持有可变请求状态 |
+| Core 数值解码 | 构建精确舍入的 NF4→BF16 LUT，解码调用者提供的紧凑行字节 |
+| 模型 Host 数学 | 从显式 raw IDs、两枚历史 ID 和控制参数计算有序全局行号 |
 | Program / PLE 服务 | 有界队列、取行缓存与 leases、HostReady、CUDA 交接、graph 绑定、预取、取消、整体提交 |
 | Central Ops | Gate、dilated ConvAdd/Norm、精确 state extraction；不做文件访问或隐藏 allocation |
 | StateImage / context 事务 | history 和同 frontier raw-token metadata 的 capture/clone/offload/restore |
