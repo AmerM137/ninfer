@@ -1,7 +1,7 @@
 #include "ops/linear/q5/q5_instances.cuh"
 #include "ops/linear/q4/q4_instances.cuh"
 #include "core/weight.h"
-#include "ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_kernels.h"
+#include "ops/gdn_input_proj/q4_q5/kernels.h"
 
 #include "core/device.h"
 #include "core/pdl.cuh"

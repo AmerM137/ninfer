@@ -1,12 +1,13 @@
+#include "ops/gdn_input_proj/conv_output.cuh"
 #include "core/weight.h"
-#include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_plan.h"
+#include "ops/gdn_input_proj/nvfp4/kernels.h"
 
 #include "core/device.h"
-#include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_conv_epilogue.cuh"
 #include "ops/linear/nvfp4/nvfp4_schedule.cuh"
 #include "ops/linear/nvfp4/nvfp4_template_launch.cuh"
 
 namespace ninfer::ops::detail {
+using ConvGeometry = GdnConvGeometry<6144>;
 
 void nvfp4_gdn_snapshot_decode_launch(const Tensor& x, const Weight& weight,
                                       const Tensor& conv_weight, Tensor& conv_states,
@@ -19,12 +20,12 @@ void nvfp4_gdn_snapshot_decode_launch(const Tensor& x, const Weight& weight,
 
     launch_nvfp4_a16_gemv<Nvfp4ScheduleInstance<Schedule, Geometry::kInputRows>>(
         nvfp4_a16_operands(x, weight),
-        make_gdn_conv_output<1>(
+        make_gdn_conv_output<ConvGeometry, 1>(
             conv_weight, conv_states, valid_columns, initial_slot, query, key, value, z,
             SnapshotHistoryPublish{static_cast<__nv_bfloat16*>(conv_states.data),
                                    static_cast<const std::int32_t*>(snapshot_base_slot.data),
-                                   kGdnChannels}),
-        Nvfp4GdnConvEpilogue<1>{}, stream);
+                                   ConvGeometry::channels}),
+        GdnConvRowEpilogue<1>{}, stream);
 }
 
 } // namespace ninfer::ops::detail

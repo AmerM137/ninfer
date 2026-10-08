@@ -1,4 +1,5 @@
 #include "ninfer/ops/weight_input.h"
+#include "ops/gdn_input_proj/operands.h"
 
 #include <algorithm>
 #include <array>
@@ -112,38 +113,30 @@ SingleProjectionWeight single(std::span<const WeightInput> inputs) {
     return {native_weight(view, divisor), policy};
 }
 
-ProjectionWeights input_projection(std::span<const WeightInput, 4> inputs, bool attention) {
-    const auto& q      = matrix(inputs[0]);
-    const auto& k      = matrix(inputs[1]);
-    const auto& third  = matrix(inputs[2]);
-    const auto& fourth = matrix(inputs[3]);
+ProjectionWeights attention_input_projection(std::span<const WeightInput, 4> inputs) {
+    const auto& q = matrix(inputs[0]);
+    const auto& k = matrix(inputs[1]);
+    require(matrix(inputs[2]) == q && matrix(inputs[3]) == k,
+            "attention input: inconsistent gate/value geometry");
     const bool dense =
-        attention ? q == std::vector<std::uint64_t>{6144, 5120} &&
-                        k == std::vector<std::uint64_t>{1024, 5120} && third == q && fourth == k
-                  : q == std::vector<std::uint64_t>{2048, 5120} && k == q &&
-                        third == std::vector<std::uint64_t>{6144, 5120} && fourth == third;
+        q == std::vector<std::uint64_t>{6144, 5120} && k == std::vector<std::uint64_t>{1024, 5120};
     const bool moe =
-        attention ? q == std::vector<std::uint64_t>{4096, 2048} &&
-                        k == std::vector<std::uint64_t>{512, 2048} && third == q && fourth == k
-                  : q == std::vector<std::uint64_t>{2048, 2048} && k == q &&
-                        third == std::vector<std::uint64_t>{4096, 2048} && fourth == third;
-    require(dense || moe, "input projection: unsupported logical projection geometry");
-    const auto joined = concatenate_rows(inputs);
-    if (contiguous(joined)) {
+        q == std::vector<std::uint64_t>{4096, 2048} && k == std::vector<std::uint64_t>{512, 2048};
+    require(dense || moe, "attention input: unsupported logical geometry");
+    if (contiguous(concatenate_rows(inputs))) {
         auto result       = single(inputs);
         const auto format = result.weight.qtype;
-        const bool supported =
-            (moe && format == QType::Q8_G32_FP16) ||
-            (dense && (format == QType::NVFP4 || format == QType::FP8_E4M3FN_ROW_BF16 ||
-                       (attention && format == QType::BF16)));
-        require(supported, "input projection: unsupported single-parent format");
+        require((moe && format == QType::Q8_G32_FP16) ||
+                    (dense && (format == QType::NVFP4 || format == QType::FP8_E4M3FN_ROW_BF16 ||
+                               format == QType::BF16)),
+                "attention input: unsupported single-parent format");
         return result;
     }
-    require(dense, "input projection: unsupported multi-parent geometry");
+    require(dense, "attention input: unsupported multi-parent geometry");
     const auto first  = single(inputs.first<2>());
     const auto second = single(inputs.last<2>());
     require(first.weight.qtype == QType::Q4_G64_FP16 && second.weight.qtype == QType::Q5_G64_FP16,
-            "input projection: paired native form requires Q4 and Q5");
+            "attention input: paired native form requires Q4 and Q5");
     return PairedProjectionWeights{first.weight, second.weight};
 }
 
@@ -177,13 +170,25 @@ ProjectionWeights prepare_attn_input_proj_weights(const WeightInput& query, cons
                                                   const WeightInput& gate,
                                                   const WeightInput& value) {
     const std::array inputs{query, key, gate, value};
-    return input_projection(inputs, true);
+    return attention_input_projection(inputs);
 }
 
 ProjectionWeights prepare_gdn_input_proj_weights(const WeightInput& query, const WeightInput& key,
                                                  const WeightInput& value, const WeightInput& z) {
+    const auto& q = matrix(query);
+    require(q[0] == 2048 && matrix(key) == q && matrix(value) == matrix(z),
+            "GDN input: inconsistent logical projection geometry");
     const std::array inputs{query, key, value, z};
-    return input_projection(inputs, false);
+    const std::span<const WeightInput, 4> rows(inputs);
+    ProjectionWeights result;
+    if (contiguous(concatenate_rows(rows)))
+        result = single(rows);
+    else
+        result =
+            PairedProjectionWeights{single(rows.first<2>()).weight, single(rows.last<2>()).weight};
+    // Native preparation and execution share the family's representation admission.
+    (void)detail::gdn_input::describe_weights(result);
+    return result;
 }
 
 ProjectionWeights prepare_gdn_gating_proj_weights(const WeightInput& a, const WeightInput& b) {

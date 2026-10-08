@@ -1,7 +1,7 @@
-#include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_plan.h"
+#include "ops/gdn_input_proj/nvfp4/kernels.h"
 #include "ops/linear/nvfp4/nvfp4_template_launch.cuh"
 #include "ops/linear/nvfp4/nvfp4_instances.cuh"
-#include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_output.cuh"
+#include "ops/linear/common/output.cuh"
 
 namespace ninfer::ops::detail {
 void nvfp4_gdn_input_a16_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
@@ -15,9 +15,9 @@ void nvfp4_gdn_input_a16_launch(const Tensor& x, const Weight& weight, Tensor& q
         nvfp4_gdn_input_small_t_launch(x, weight, qkv, z, stream);
         return;
     }
-    const auto p        = nvfp4_a16_operands(x, weight);
-    const auto output   = Nvfp4GdnInputOutput{static_cast<__nv_bfloat16*>(qkv.data),
-                                            static_cast<__nv_bfloat16*>(z.data)};
+    const auto p      = nvfp4_a16_operands(x, weight);
+    const auto output = LinearBf16SegmentedOutput<10240, 6144>{
+        static_cast<__nv_bfloat16*>(qkv.data), static_cast<__nv_bfloat16*>(z.data)};
     const auto epilogue = LinearIdentityEpilogue{};
     if (tokens <= 8) {
         launch_nvfp4_a16_sliced_k_mma<Nvfp4ScheduleInstance<Nvfp4SlicedInstance<8, 8, 2>, 5120>>(

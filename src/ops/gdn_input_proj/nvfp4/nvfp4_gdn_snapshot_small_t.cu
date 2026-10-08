@@ -1,8 +1,8 @@
+#include "ops/gdn_input_proj/conv_output.cuh"
 #include "core/weight.h"
-#include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_plan.h"
+#include "ops/gdn_input_proj/nvfp4/kernels.h"
 
 #include "core/device.h"
-#include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_conv_epilogue.cuh"
 #include "ops/linear/nvfp4/nvfp4_schedule.cuh"
 #include "ops/linear/nvfp4/nvfp4_template_launch.cuh"
 
@@ -11,6 +11,8 @@
 #include <utility>
 
 namespace ninfer::ops::detail {
+using ConvGeometry = GdnConvGeometry<6144>;
+
 namespace {
 
 using Launch       = void (*)(const Tensor&, const Weight&, const Tensor&, Tensor&, const Tensor&,
@@ -38,9 +40,9 @@ void launch_exact(const Tensor& x, const Weight& weight, const Tensor& conv_weig
     launch_nvfp4_a16_simt<
         Nvfp4ScheduleInstance<Schedule, Geometry::kInputRows, ActiveTokens, true>>(
         nvfp4_a16_operands(x, weight),
-        make_gdn_conv_output<ActiveTokens>(conv_weight, conv_states, valid_columns, initial_slot,
-                                           query, key, value, z, publish),
-        Nvfp4GdnConvEpilogue<ActiveTokens>{}, stream);
+        make_gdn_conv_output<ConvGeometry, ActiveTokens>(
+            conv_weight, conv_states, valid_columns, initial_slot, query, key, value, z, publish),
+        GdnConvRowEpilogue<ActiveTokens>{}, stream);
 }
 
 template <int ActiveTokens>
@@ -53,7 +55,7 @@ void launch_snapshot_exact(const Tensor& x, const Weight& weight, const Tensor& 
         x, weight, conv_weight, conv_states, valid_columns, initial_slot, query, key, value, z,
         SnapshotHistoryPublish{static_cast<__nv_bfloat16*>(conv_states.data),
                                static_cast<const std::int32_t*>(snapshot_base_slot.data),
-                               kGdnChannels},
+                               ConvGeometry::channels},
         stream);
 }
 
@@ -65,7 +67,7 @@ void launch_record_exact(const Tensor& x, const Weight& weight, const Tensor& co
     launch_exact<ActiveTokens>(x, weight, conv_weight, conv_states, valid_columns, initial_slot,
                                query, key, value, z,
                                RecordColumnPublish{static_cast<__nv_bfloat16*>(conv_record.data),
-                                                   kGdnChannels, ActiveTokens},
+                                                   ConvGeometry::channels, ActiveTokens},
                                stream);
 }
 

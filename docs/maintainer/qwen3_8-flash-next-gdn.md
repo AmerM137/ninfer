@@ -398,10 +398,11 @@ Replay records 的寿命延续至所有相关接受/恢复决定结束，不随�
 
 使用已有公开 queries，并为本实例补齐同一规划事实：
 
-- `gdn_input_proj_workspace_capacity_bytes`：Q8、N=16384、K=2560、A16Only、M 区间。
-- snapshot/record 的 query：使用带 `QType、parent_rows、input_rows、policy` 的既有重载，
-  扩展其 Q8 支持域，另传实际 B 和 T 区间。仅有 Q/K/V 输出宽度不能区分此 parent 与
-  现有其他格式、输入宽度的 parent。
+- `gdn_input_proj_workspace_capacity_bytes`：传入准备后的 `ProjectionWeights` 与 M 区间；
+  本实例为 `SingleProjectionWeight{Q8 [16384,2560], A16Only}`。
+- snapshot/record 的 query 消费同一份 `ProjectionWeights`，另传实际 B 和 T 区间。
+  执行入口使用 `GdnProjectionOutputs` / `GdnConvOutputs` 分组输出视图，以及
+  `GdnConvSnapshotState` / `GdnConvSourceState` 分组状态池与设备选择器；这些视图均不拥有存储。
 - `gdn_gating_proj_workspace_capacity_bytes`：heads=48、input_rows=2560、M 区间。
 - `gated_delta_net_workspace_capacity_bytes`：qk_heads=16、value_heads=48、T 区间。
 

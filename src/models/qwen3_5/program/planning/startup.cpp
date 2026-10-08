@@ -342,10 +342,10 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                     (void)workspace::gdn_projection(layout, config, last);
                     if (path == GdnWorkspacePath::Snapshot) {
                         scratch(layout, execution::gdn_snapshot_workspace_bytes(
-                                            gdn, *config.gdn, batch_size, min_width, max_width));
+                                            gdn, batch_size, min_width, max_width));
                     } else if (path == GdnWorkspacePath::ReplayRecord) {
                         scratch(layout, execution::gdn_record_workspace_bytes(
-                                            gdn, *config.gdn, batch_size, min_width, max_width));
+                                            gdn, batch_size, min_width, max_width));
                     } else {
                         (void)workspace::gdn_prefill_conv(layout, config, last);
                         scratch(layout,

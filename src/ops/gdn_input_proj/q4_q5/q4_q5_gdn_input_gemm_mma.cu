@@ -1,5 +1,5 @@
 #include "core/weight.h"
-#include "ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_kernels.h"
+#include "ops/gdn_input_proj/q4_q5/kernels.h"
 
 #include "core/device.h"
 #include "ops/common/math.h"
@@ -84,20 +84,18 @@ void q4_q5_gdn_input_grouped_mma_launch(const Tensor& x, const Weight& qk_weight
                                         const Weight& value_z_weight, Tensor& qkv, Tensor& z,
                                         Q4Q5GdnInputScheduleId schedule, cudaStream_t stream) {
     switch (schedule) {
-    case Q4Q5GdnInputScheduleId::GroupedMixedMmaR32C32S2:
+    case Q4Q5GdnInputScheduleId::Mma32x32:
         launch_grouped<GemmCfg<32, 32, 64, 16, 16, 2, 1, false, true, true>>(
             x, qk_weight, value_z_weight, qkv, z, stream);
         return;
-    case Q4Q5GdnInputScheduleId::GroupedMixedMmaR32C64S4:
+    case Q4Q5GdnInputScheduleId::Mma32x64:
         launch_grouped<GemmCfg<32, 64, 64, 16, 16, 4, 1, false, true, true>>(
             x, qk_weight, value_z_weight, qkv, z, stream);
         return;
-    case Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C128S2:
+    case Q4Q5GdnInputScheduleId::Mma64x128:
         launch_grouped<GemmCfg<64, 128, 64, 64, 16, 2, 1, false, true, true>>(
             x, qk_weight, value_z_weight, qkv, z, stream);
         return;
-    case Q4Q5GdnInputScheduleId::IndependentDirectFixed:
-        break;
     }
     throw std::logic_error("Q4/Q5 GDN input: grouped MMA schedule is unknown");
 }

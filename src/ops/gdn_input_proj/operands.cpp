@@ -1,0 +1,170 @@
+#include "ops/gdn_input_proj/operands.h"
+
+#include "ops/linear/fp8/fp8_format.h"
+#include "ops/linear/nvfp4/nvfp4_format.h"
+
+#include <initializer_list>
+#include <stdexcept>
+#include <string>
+
+namespace ninfer::ops::detail::gdn_input {
+namespace {
+
+bool aligned(const void* p, std::uintptr_t alignment) {
+    return p && reinterpret_cast<std::uintptr_t>(p) % alignment == 0;
+}
+
+void require_tensor(const Tensor& t, DType dtype, std::int32_t n0, std::int32_t n1, std::int32_t n2,
+                    std::uintptr_t alignment, const char* label) {
+    if (t.dtype != dtype || t.ne[0] != n0 || t.ne[1] != n1 || t.ne[2] != n2 || t.ne[3] != 1 ||
+        !t.is_contiguous() || !aligned(t.data, alignment))
+        throw std::invalid_argument(std::string("GDN input: invalid ") + label);
+}
+
+void require_selector(const Tensor& t, std::int32_t batch, const char* label) {
+    require_tensor(t, DType::I32, batch, 1, 1, alignof(std::int32_t), label);
+}
+
+bool intersects(const void* a, std::size_t a_bytes, const void* b, std::size_t b_bytes) {
+    if (!a || !b || a_bytes == 0 || b_bytes == 0) return false;
+    const auto x = reinterpret_cast<std::uintptr_t>(a);
+    const auto y = reinterpret_cast<std::uintptr_t>(b);
+    return x <= y ? y - x < a_bytes : x - y < b_bytes;
+}
+
+void validate_rowsplit(const Weight& w) {
+    const bool q8    = w.qtype == QType::Q8_G32_FP16;
+    const bool q5    = w.qtype == QType::Q5_G64_FP16;
+    const auto group = q8 ? 32U : 64U;
+    if (w.layout != QuantLayout::RowSplit || w.scale_dtype != DType::FP16 ||
+        w.group_size != group || w.group != static_cast<std::int32_t>(group) || w.ndim != 2 ||
+        w.shape[0] != w.n || w.shape[1] != w.k || w.padded_shape[0] != w.n ||
+        w.padded_shape[1] != w.k || !aligned(w.qdata, 16) || !aligned(w.scales, q8 ? 16 : 4) ||
+        (q5 ? (!aligned(w.qhigh, 16) || w.high_plane_bytes == 0)
+            : (w.qhigh != nullptr || w.high_plane_bytes != 0)))
+        throw std::invalid_argument("GDN input: invalid RowSplit weight representation");
+}
+
+} // namespace
+
+WeightOperands describe_weights(const ProjectionWeights& weights) {
+    if (const auto* pair = std::get_if<PairedProjectionWeights>(&weights)) {
+        const auto& a = pair->first;
+        const auto& b = pair->second;
+        if (a.qtype != QType::Q4_G64_FP16 || b.qtype != QType::Q5_G64_FP16 || a.n != 4096 ||
+            a.k != 5120 || b.n != 12288 || b.k != 5120)
+            throw std::invalid_argument("GDN input: unsupported paired weight geometry");
+        return {Format::Q4Q5, {5120, 6144}, &a, &b, LinearPolicy::A16Only};
+    }
+    const auto& single = std::get<SingleProjectionWeight>(weights);
+    const auto& w      = single.weight;
+    if (!valid_linear_policy(single.policy))
+        throw std::invalid_argument("GDN input: invalid activation permission");
+    if (w.qtype == QType::Q8_G32_FP16) {
+        if (w.n == 12288 && w.k == 2048)
+            return {Format::Q8, {2048, 4096}, &w, nullptr, single.policy};
+        if (w.n == 16384 && w.k == 2560)
+            return {Format::Q8, {2560, 6144}, &w, nullptr, single.policy};
+    }
+    if (w.n == 16384 && w.k == 5120) {
+        if (w.qtype == QType::FP8_E4M3FN_ROW_BF16)
+            return {Format::Fp8, {5120, 6144}, &w, nullptr, single.policy};
+        if (w.qtype == QType::NVFP4)
+            return {Format::Nvfp4, {5120, 6144}, &w, nullptr, single.policy};
+    }
+    throw std::invalid_argument("GDN input: unsupported single-parent weight geometry");
+}
+
+void validate_weights(const WeightOperands& weights) {
+    switch (weights.format) {
+    case Format::Q4Q5:
+        validate_rowsplit(*weights.second);
+        [[fallthrough]];
+    case Format::Q8:
+        validate_rowsplit(*weights.first);
+        break;
+    case Format::Fp8:
+        (void)validate_fp8_weight(*weights.first, "GDN input");
+        break;
+    case Format::Nvfp4:
+        (void)validate_nvfp4_weight(*weights.first, "GDN input");
+        break;
+    }
+}
+
+void validate_interval(std::int32_t first, std::int32_t last) {
+    if (first <= 0 || last < first)
+        throw std::invalid_argument("GDN input: invalid positive column interval");
+}
+
+void validate_batch_interval(Publication publication, std::int32_t batch, std::int32_t first,
+                             std::int32_t last) {
+    validate_interval(first, last);
+    if (batch < 1 || batch > 8 || (batch > 1 && last > 16) ||
+        (publication == Publication::Record && (first < 2 || last > 16)))
+        throw std::invalid_argument("GDN convolution: unsupported batch/token interval");
+}
+
+void validate_projection(const Tensor& x, const WeightOperands& weights,
+                         const GdnProjectionOutputs& outputs) {
+    validate_interval(x.ne[1], x.ne[1]);
+    const auto& g = weights.geometry;
+    require_tensor(x, DType::BF16, g.input_rows, x.ne[1], 1, 16, "x");
+    require_tensor(outputs.qkv, DType::BF16, g.channels(), x.ne[1], 1, 16, "qkv");
+    require_tensor(outputs.z, DType::BF16, g.value_rows, x.ne[1], 1, 16, "z");
+}
+
+Batch validate_convolution(const Tensor& x, const WeightOperands& weights,
+                           const Tensor& convolution, const Tensor& history,
+                           const Tensor& source_slots, const Tensor& valid_columns,
+                           const GdnConvOutputs& outputs, Publication publication,
+                           const Tensor& destination) {
+    const Batch batch{x.ne[1], x.ne[2]};
+    validate_batch_interval(publication, batch.rows, batch.tokens, batch.tokens);
+    const auto& g = weights.geometry;
+    require_tensor(x, DType::BF16, g.input_rows, batch.tokens, batch.rows, 16, "x");
+    require_tensor(convolution, DType::BF16, g.channels(), 4, 1, 16, "convolution weight");
+    if (history.ne[2] < (publication == Publication::Snapshot ? batch.columns() : 1))
+        throw std::invalid_argument("GDN convolution: insufficient history slots");
+    require_tensor(history, DType::BF16, g.channels(), 3, history.ne[2], 16, "history");
+    require_selector(source_slots, batch.rows, "source slots");
+    if (valid_columns.data) require_selector(valid_columns, batch.rows, "valid columns");
+    require_tensor(outputs.query, DType::BF16, g.query_rows, batch.tokens, batch.rows, 16, "query");
+    require_tensor(outputs.key, DType::BF16, g.key_rows, batch.tokens, batch.rows, 16, "key");
+    require_tensor(outputs.value, DType::BF16, g.value_rows, batch.tokens, batch.rows, 16, "value");
+    require_tensor(outputs.z, DType::BF16, g.value_rows, batch.tokens, batch.rows, 16, "z");
+    if (publication == Publication::Snapshot)
+        require_selector(destination, batch.rows, "snapshot bases");
+    else
+        require_tensor(destination, DType::BF16, g.channels(), batch.tokens, batch.rows, 16,
+                       "convolution record");
+    return batch;
+}
+
+void validate_disjoint(const WeightOperands& weights, std::span<const Tensor* const> tensors,
+                       DeviceSpan scratch, const Tensor* alias_first, const Tensor* alias_second) {
+    for (std::size_t i = 0; i < tensors.size(); ++i) {
+        const Tensor& t = *tensors[i];
+        if (!t.data) continue;
+        for (std::size_t j = i + 1; j < tensors.size(); ++j) {
+            if ((tensors[i] == alias_first && tensors[j] == alias_second) ||
+                (tensors[j] == alias_first && tensors[i] == alias_second))
+                continue;
+            if (tensors[j]->data &&
+                intersects(t.data, t.bytes(), tensors[j]->data, tensors[j]->bytes()))
+                throw std::invalid_argument("GDN input: tensor operands overlap");
+        }
+        if (intersects(t.data, t.bytes(), scratch.data, scratch.bytes))
+            throw std::invalid_argument("GDN input: tensor overlaps call-local scratch");
+        for (const Weight* w : {weights.first, weights.second}) {
+            if (w && intersects(t.data, t.bytes(), w->payload, w->payload_bytes))
+                throw std::invalid_argument("GDN input: tensor overlaps weight storage");
+        }
+    }
+    for (const Weight* w : {weights.first, weights.second}) {
+        if (w && intersects(scratch.data, scratch.bytes, w->payload, w->payload_bytes))
+            throw std::invalid_argument("GDN input: scratch overlaps weight storage");
+    }
+}
+
+} // namespace ninfer::ops::detail::gdn_input

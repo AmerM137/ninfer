@@ -1,8 +1,8 @@
 #include "core/weight.h"
-#include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_plan.h"
+#include "ops/gdn_input_proj/nvfp4/kernels.h"
 
 #include "core/device.h"
-#include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_output.cuh"
+#include "ops/linear/common/output.cuh"
 #include "ops/linear/nvfp4/nvfp4_schedule.cuh"
 #include "ops/linear/nvfp4/nvfp4_template_launch.cuh"
 
@@ -29,8 +29,8 @@ void launch_exact(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
     launch_nvfp4_a16_simt<
         Nvfp4ScheduleInstance<Schedule, Geometry::kInputRows, ActiveTokens, true>>(
         nvfp4_a16_operands(x, weight),
-        Nvfp4GdnInputOutput{static_cast<__nv_bfloat16*>(qkv.data),
-                            static_cast<__nv_bfloat16*>(z.data)},
+        LinearBf16SegmentedOutput<10240, 6144>{static_cast<__nv_bfloat16*>(qkv.data),
+                                               static_cast<__nv_bfloat16*>(z.data)},
         LinearIdentityEpilogue{}, stream);
 }
 

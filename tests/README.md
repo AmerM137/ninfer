@@ -34,6 +34,10 @@ presets.
 owns deterministic payload generation, device `Weight` views, row views, and independent logical
 weight decoding.
 
+GDN projection, snapshot, and record suites live in `ops/gdn_input_proj/`.
+`ops/linear_attention/gated_delta_net/` owns recurrence, Replay record, and fold tests,
+including the original projection/record/fold integration cases and FP64 recurrence reference.
+
 ## Build and run
 
 Select a Python environment with the dependencies for the tests first. The maintained environment

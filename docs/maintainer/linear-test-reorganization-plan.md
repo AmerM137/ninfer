@@ -352,10 +352,10 @@ linear/q8_a16/n2560_k6144/dense/t50/policy_a16/form_policy/graph/phase1/sampled
 | 调用者 | 需要保持的验证 |
 |---|---|
 | `test_attn_input_proj.cpp` | 输出拆分、多输出、准备权重和投影数学 |
-| `test_gdn_input_proj.cpp` | Q/K/V/Z 的行范围和投影数学 |
-| `test_gdn_input_proj_conv_snapshot.cpp` | 输出、卷积状态和快照语义 |
-| `test_gdn_input_proj_conv_record.cpp` | record 内容与未触及区域 |
-| `test_gdn_replay_fold.cpp` | record/fold 与规定 snapshot reference 的精确等价 |
+| `gdn_input_proj/test_projection.cpp` | Q/K/V/Z 的行范围和投影数学 |
+| `gdn_input_proj/test_snapshot.cpp` | 输出、卷积状态和快照语义 |
+| `gdn_input_proj/test_record.cpp` | record 内容与未触及区域 |
+| `linear_attention/gated_delta_net/test_fold.cpp` | record/fold 与规定 snapshot reference 的精确等价 |
 | `test_linear_dynamic_grouped_conv_add.cpp` | 迁入新目录并保留完整融合公式 |
 
 将其中采样、BF16 tensor、权重设备持有、表示转换、preservation 和投影基础函数
@@ -528,4 +528,3 @@ SwiGLU 更严负 gate 标准、workspace exact peak 与数学 profile 分组若�
 3. 使用现有 fixture 与 runner；有新数学场景时增加具名 fixture。
 4. 通过稳定 ID 运行新 case，再运行受影响 suite。
 5. 仅新增格式/profile 时修改 manifest；新增 production shape 的支持仍由其独立任务负责。
-

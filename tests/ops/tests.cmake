@@ -8,7 +8,6 @@ set(ninfer_op_tests
   rmsnorm_pack_tail
   gated_rmsnorm
   l2norm
-  gated_delta_net
   kimi_delta_attention
   causal_conv1d_silu
   layer_norm
@@ -98,10 +97,6 @@ ninfer_add_op_test(ninfer_attn_input_proj_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_attn_input_proj.cpp"
   LIBRARIES ninfer_ops)
 
-ninfer_add_op_test(ninfer_gdn_input_proj_test
-  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gdn_input_proj.cpp"
-  LIBRARIES ninfer_ops)
-
 ninfer_add_op_test(ninfer_dynamic_grouped_conv_prepare_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_dynamic_grouped_conv_prepare.cpp"
   LIBRARIES ninfer_ops)
@@ -110,23 +105,10 @@ ninfer_add_op_test(ninfer_linear_dynamic_grouped_conv_add_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_linear_dynamic_grouped_conv_add.cpp"
   LIBRARIES ninfer_ops)
 
-ninfer_add_op_test(ninfer_gdn_input_proj_conv_snapshot_test
-  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gdn_input_proj_conv_snapshot.cpp"
-  LIBRARIES ninfer_ops)
-
-ninfer_add_op_test(ninfer_gdn_input_proj_conv_record_test
-  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gdn_input_proj_conv_record.cpp"
-  LIBRARIES ninfer_ops)
-
-ninfer_add_op_test(ninfer_gated_delta_net_replay_record_test
-  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gated_delta_net_replay_record.cpp"
-  LIBRARIES ninfer_ops)
-
-ninfer_add_op_test(ninfer_gdn_replay_fold_test
-  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gdn_replay_fold.cpp"
-  LIBRARIES ninfer_ops)
-
 include("${CMAKE_CURRENT_LIST_DIR}/linear/tests.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/linear_add/tests.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/linear_pair/tests.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/linear_swiglu/tests.cmake")
+
+include("${CMAKE_CURRENT_LIST_DIR}/gdn_input_proj/tests.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/linear_attention/gated_delta_net/tests.cmake")

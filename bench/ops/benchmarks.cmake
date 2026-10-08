@@ -10,10 +10,8 @@ ninfer_add_op_bench(ninfer_dynamic_grouped_conv_prepare_bench
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/dynamic_grouped_conv_prepare_bench.cu")
 ninfer_add_op_bench(ninfer_linear_dynamic_grouped_conv_add_bench
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/linear_dynamic_grouped_conv_add_bench.cu")
-ninfer_add_op_bench(ninfer_gated_delta_net_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/gated_delta_net_bench.cu")
 ninfer_add_op_bench(ninfer_kimi_delta_attention_bench
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/kimi_delta_attention_bench.cu")
-ninfer_add_op_bench(ninfer_gdn_replay_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/gdn_replay_bench.cu")
 ninfer_add_op_bench(ninfer_rope_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/rope_bench.cu")
 ninfer_add_op_bench(ninfer_rmsnorm_rope_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/rmsnorm_rope_bench.cu")
 ninfer_add_op_bench(ninfer_add_bias_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/add_bias_bench.cu")
@@ -34,9 +32,6 @@ ninfer_add_op_bench(ninfer_causal_conv1d_silu_bench SOURCES "${CMAKE_CURRENT_LIS
 ninfer_add_op_bench(ninfer_linear_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/linear_bench.cu")
 ninfer_add_op_bench(ninfer_linear_topk_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/linear_topk_bench.cu")
 ninfer_add_op_bench(ninfer_candidate_selector_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/candidate_selector_bench.cu")
-ninfer_add_op_bench(ninfer_gdn_input_proj_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/gdn_input_proj_bench.cu")
-ninfer_add_op_bench(ninfer_gdn_input_proj_conv_snapshot_bench
-  SOURCES "${CMAKE_CURRENT_LIST_DIR}/gdn_input_proj_conv_snapshot_bench.cu")
 ninfer_add_op_bench(ninfer_attn_input_proj_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/attn_input_proj_bench.cu")
 ninfer_add_op_bench(ninfer_q8_linear_swiglu_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/q8_linear_swiglu_bench.cu")
 ninfer_add_op_bench(ninfer_nvfp4_linear_swiglu_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/nvfp4_linear_swiglu_bench.cu")
@@ -63,3 +58,6 @@ ninfer_add_op_bench(ninfer_context_kv_materialize_bench
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/context_kv_materialize_bench.cu")
 ninfer_add_op_bench(ninfer_mtp_pack_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/mtp_pack_bench.cu")
 ninfer_add_op_bench(ninfer_proposal_remap_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/proposal_remap_bench.cu")
+
+include("${CMAKE_CURRENT_LIST_DIR}/gdn_input_proj/benchmarks.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/linear_attention/gated_delta_net/benchmarks.cmake")

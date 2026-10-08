@@ -2,11 +2,11 @@
 
 #include "core/weight_view.h"
 #include "ninfer/ops/linear.h"
+#include "ninfer/ops/projection_weights.h"
 #include "ninfer/ops/sparse_moe.h"
 
 #include <optional>
 #include <span>
-#include <variant>
 
 namespace ninfer::ops {
 
@@ -16,17 +16,6 @@ struct WeightInput {
     LinearPolicy policy = LinearPolicy::A16Only;
     std::optional<float> activation_input_divisor;
 };
-
-struct SingleProjectionWeight {
-    Weight weight;
-    LinearPolicy policy = LinearPolicy::A16Only;
-};
-
-struct PairedProjectionWeights {
-    Weight first, second;
-};
-
-using ProjectionWeights = std::variant<SingleProjectionWeight, PairedProjectionWeights>;
 
 // Prepare the existing native forms; no device allocation, upload, execution or graph rewrite.
 // Runtime shape/phase choices and scratch remain with the actual calling Op.

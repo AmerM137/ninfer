@@ -36,13 +36,9 @@ namespace ninfer::ops {
  * and state FP32 [128,128,Hv], where Hqk>=1, Hv>=Hqk, and Hv%Hqk==0. `scale` is 1/sqrt(128). When
  * `normalize_qk` is true, the recurrent implementation consumes raw q/k and applies
  * x / sqrt(sum(x^2) + 1e-6) independently to every 128-element row before using it. When false,
- * q/k are consumed as supplied. The oracle evaluates the complete recurrence and `ideal` naively
- * in FP64 from the represented inputs and FP32 initial state. The BF16 out is promoted and
- * compared directly with that result; output storage rounding belongs to the Op's numerical
- * criterion, not the oracle. The chunked route fuses normalization into preparation and stores
- * one private BF16 Q/K packet per Q/K head. FP32 control matrices and residuals feed native TF32
- * products; readout and state updates use BF16 MMA operands with FP32 accumulators. The master
- * state remains FP32 throughout. Scratch capacity is independent of normalize_qk.
+ * q/k are consumed as supplied. The outputs approximate the complete recurrence above from
+ * represented inputs. The master state is FP32; output storage is BF16. Scratch capacity is
+ * independent of normalize_qk.
  * `execution` supplies the stream and physical SM count for launch decomposition.
  * Inputs and out do not overlap state or one another. `ws` supplies transient storage reported by
  * gated_delta_net_workspace_capacity_bytes; scratch is scoped to the call. T may be any positive
@@ -79,6 +75,12 @@ void gated_delta_net_batch_update(const Tensor& q, const Tensor& k, const Tensor
                                   const Tensor& destination_state_slots, Tensor& out,
                                   cudaStream_t stream);
 
+struct GdnRecurrenceRecords {
+    Tensor key;   // BF16 [128,Hq,T,B], raw represented key words.
+    Tensor value; // BF16 [128,Hv,T,B], raw represented value words.
+    Tensor gate;  // FP32 [2,Hv,T,B], raw {g,beta} words.
+};
+
 /**
  * Op: gated_delta_net_replay_record
  *
@@ -93,14 +95,12 @@ void gated_delta_net_batch_update(const Tensor& q, const Tensor& k, const Tensor
  * [2,Hv,T,B] receive bit-preserving copies of raw k, v, and {g,beta}. The invalid record suffix is
  * unchanged, while the invalid out suffix is exact BF16 zero. Inputs, state, records, and out are
  * pairwise non-overlapping. Valid outputs must be bit-identical to the normalized recurrent
- * execution from the same FP32 initial state and represented inputs; no independent FP64
- * comparison is needed to establish this record/snapshot equivalence.
+ * one-token state-pool execution from the same FP32 initial state and represented inputs.
  */
 void gated_delta_net_replay_record(const Tensor& q, const Tensor& k, const Tensor& v,
                                    const Tensor& g, const Tensor& beta, float scale,
                                    const Tensor& ssm_states, const Tensor& valid_columns,
-                                   const Tensor& initial_state_slots, Tensor& key_record,
-                                   Tensor& value_record, Tensor& gate_record, Tensor& out,
-                                   cudaStream_t stream);
+                                   const Tensor& initial_state_slots, GdnRecurrenceRecords records,
+                                   Tensor& out, cudaStream_t stream);
 
 } // namespace ninfer::ops

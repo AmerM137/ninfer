@@ -1,9 +1,9 @@
 #include "ops/linear/fp8/fp8_template_launch.cuh"
 #include "core/weight.h"
-#include "ops/gdn_input_proj/fp8/fp8_gdn_conv_plan.h"
+#include "ops/gdn_input_proj/fp8/kernels.h"
 
 #include "core/device.h"
-#include "ops/gdn_input_proj/gdn_conv_output.cuh"
+#include "ops/gdn_input_proj/conv_output.cuh"
 #include "ops/linear/fp8/fp8_schedule.cuh"
 #include "ops/linear/fp8/fp8_a16_gemv.cuh"
 #include "ops/linear/fp8/fp8_a16_simt.cuh"
@@ -14,18 +14,9 @@
 #include <utility>
 
 namespace ninfer::ops::detail {
+using ConvGeometry = GdnConvGeometry<6144>;
+
 namespace {
-
-template <int Tokens, class Publish>
-struct Fp8GdnConvEpilogue {
-    [[maybe_unused]] static constexpr int kRowTokens = Tokens;
-
-    template <class Output>
-    __device__ __forceinline__ void apply_row(const Output& output, int row, int,
-                                              const float (&values)[Tokens], int) const {
-        output.store_row(row, values);
-    }
-};
 
 using Geometry = Fp8N16384K5120;
 
@@ -45,12 +36,11 @@ void launch_small_t(const Tensor& x, const Weight& weight, const Tensor& conv_we
         Fp8A16SimtSchedule<8, 2, 16, ActiveTokens, 1, Fp8SimtActivationAccess::SharedPhase,
                            Fp8CodeCache::Default, 1, Fp8SimtBlockOrder::RowsContiguous, 1>;
     static_assert(Schedule::kBlockTokens == ActiveTokens);
-    using Output = GdnConvOutput<ActiveTokens, Publish>;
     launch_fp8_a16_simt<Fp8ScheduleInstance<Schedule, Geometry::kInputRows, ActiveTokens, true>>(
         fp8_a16_operands(x, weight),
-        make_gdn_conv_output<ActiveTokens>(conv_weight, conv_states, valid_columns, initial_slot,
-                                           query, key, value, z, publish),
-        Fp8GdnConvEpilogue<ActiveTokens, Publish>{}, stream);
+        make_gdn_conv_output<ConvGeometry, ActiveTokens>(
+            conv_weight, conv_states, valid_columns, initial_slot, query, key, value, z, publish),
+        GdnConvRowEpilogue<ActiveTokens>{}, stream);
 }
 
 template <int ActiveTokens>
@@ -63,7 +53,7 @@ void launch_snapshot_small_t(const Tensor& x, const Weight& weight, const Tensor
         x, weight, conv_weight, conv_states, valid_columns, initial_slot, query, key, value, z,
         SnapshotHistoryPublish{static_cast<__nv_bfloat16*>(conv_states.data),
                                static_cast<const std::int32_t*>(snapshot_base_slot.data),
-                               kGdnChannels},
+                               ConvGeometry::channels},
         stream);
 }
 
@@ -75,7 +65,7 @@ void launch_record_small_t(const Tensor& x, const Weight& weight, const Tensor& 
     launch_small_t<ActiveTokens>(x, weight, conv_weight, conv_states, valid_columns, initial_slot,
                                  query, key, value, z,
                                  RecordColumnPublish{static_cast<__nv_bfloat16*>(conv_record.data),
-                                                     kGdnChannels, ActiveTokens},
+                                                     ConvGeometry::channels, ActiveTokens},
                                  stream);
 }
 
@@ -87,12 +77,12 @@ void launch_snapshot_decode(const Tensor& x, const Weight& weight, const Tensor&
     using Schedule = Fp8A16GemvSchedule<8, 2, 8, 4, Fp8CodeCache::Default, 2, 2>;
     launch_fp8_a16_gemv<Fp8ScheduleInstance<Schedule, Geometry::kInputRows>>(
         fp8_a16_operands(x, weight),
-        make_gdn_conv_output<1>(
+        make_gdn_conv_output<ConvGeometry, 1>(
             conv_weight, conv_states, valid_columns, initial_slot, query, key, value, z,
             SnapshotHistoryPublish{static_cast<__nv_bfloat16*>(conv_states.data),
                                    static_cast<const std::int32_t*>(snapshot_base_slot.data),
-                                   kGdnChannels}),
-        Fp8GdnConvEpilogue<1, SnapshotHistoryPublish>{}, stream);
+                                   ConvGeometry::channels}),
+        GdnConvRowEpilogue<1>{}, stream);
 }
 
 template <std::size_t... Offsets>

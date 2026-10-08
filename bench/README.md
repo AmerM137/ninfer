@@ -446,114 +446,71 @@ cmake --build build -j --target ninfer_dynamic_grouped_conv_prepare_bench
 ./build/bench/ninfer_dynamic_grouped_conv_prepare_bench --warmup 10 --repeat 80
 ```
 
-## Gated DeltaNet Op benchmark
+## GDN benchmarks
 
-`ninfer_gated_delta_net_bench` measures the BF16 Gated DeltaNet contract with state/head dimension
-128, production Q/K normalization, and any positive, divisible `value_heads >= qk_heads` mapping.
-Running/chunked modes use batch 1; batch-update mode accepts exact `B=1..8` at `T=1`. Every
-measurement is a CUDA Graph replay preceded by a 256 MiB L2 flush outside the timed interval.
+The three GDN executables share `ops/op_measurement.cuh`: CSV fields, option parsing, fixture
+uploads, and timing. Each graph contains one selected Op (or an explicitly named analysis stage),
+with external CUDA events bracketing its body. `kernels` counts kernel nodes only. Eager GPU timing
+includes host launch gaps; host submission time is reported separately. Mutable state is restored
+before each invocation, and cold-cache samples evict 256 MiB from L2 before the timer. These are
+Op measurements, not model throughput measurements.
 
-`--running` measures the public running-state entry and uses its workspace capacity query. The
-current prefill dispatcher uses recurrence below 16 tokens and a two-kernel chunked route at
-larger extents. The chunked route prepares 16-token packets and combines recurrence with output;
-its final packet is padded inside the kernels. `--batch-update` measures the public selected-slot
-update at `T=1`, with `B=1..8`; `--qk-norm composed` retains the B=1 two-L2Norm comparison.
+Common flags are `--execution graph|eager|both`, `--cache cold|warm|both`, `--warmup N`,
+`--repeat N`, `--flush-mib N`, and `--csv-out PATH`. CSV goes to stdout when no path is supplied.
+`--tokens` accepts an exact extent or comma-separated list; `--sweep START:END[:STEP]` accepts an
+inclusive interval. Capacity and actual workspace high-water are reported separately.
 
-`--force-chunked` and `--recurrent-only` call the selected production launchers with fused Q/K
-normalization at matching prefill extents to measure their crossover. `--chunked-only` forces
-the chunked route with pre-normalized BF16 Q/K. These prefill comparisons are independent of
-decode and ReplaySSM. Adding `--breakdown` to a chunked measurement reports isolated
-`chunked.prepare` and `chunked.recurrence` timings using the same production launchers and
-workspace layout.
-
-`stage_share_pct` partitions the sum of isolated-stage medians. Each isolated stage receives its own
-cold-L2 flush, so `relative_to_e2e_pct` is informative but is not an additive partition of the
-pipeline latency.
-
-`logical_bytes` and `logical_gbps` count each contract-visible tensor and state transfer once.
-`tensor_io_request_bytes` and `tensor_io_request_gbps` count CTA tensor I/O requests, including
-repeated Q/K reads in prepare and repeated packet reads across recurrence value tiles. The
-workspace holds BF16 Q/K shared by each Q/K head group and FP32 control packets per value head;
-`workspace_request_bytes` isolates their producer/consumer traffic and any composed normalization
-intermediates. These deterministic byte counts describe requests, not physical DRAM traffic;
-physical DRAM/L2 sectors and cache reuse still require NCU.
+`ninfer_gdn_input_proj_bench` selects `--op projection|snapshot|record`. `--format` and the actual
+`--n`/`--k` identify the stored matrix; `--policy a16|allow-a8|allow-a4` reports the caller's
+activation permission. Supported geometries are Q8 `[12288,2048]` and `[16384,2560]`, and
+Q4/Q5, FP8, or NVFP4 `[16384,5120]`. Q4/Q5 uses the two stored parents `[4096,5120]` and
+`[12288,5120]`. Projection uses M; convolution uses physical T and B, with optional device
+valid-prefix extents supplied by `--valid-columns`.
 
 ```bash
-cmake --build build -j --target ninfer_gated_delta_net_bench
-./build/bench/ninfer_gated_delta_net_bench \
-  --running --value-heads 32 --sweep --warmup 20 --repeat 100 --csv
-./build/bench/ninfer_gated_delta_net_bench \
-  --batch-update --value-heads 32 --batch 8 --qk-norm fused --warmup 20 --repeat 100 --csv
-./build/bench/ninfer_gated_delta_net_bench \
-  --chunked-only --value-heads 32 --tokens 1024 --breakdown \
-  --warmup 20 --repeat 100
+./build/bench/ninfer_gdn_input_proj_bench \
+  --op projection --format q8 --n 16384 --k 2560 --tokens 1,16,1024,2048,4096 --cache cold
+./build/bench/ninfer_gdn_input_proj_bench \
+  --op snapshot --format nvfp4 --n 16384 --k 5120 --policy allow-a4 --sweep 1:17
+./build/bench/ninfer_gdn_input_proj_bench \
+  --op record --format fp8 --n 16384 --k 5120 --policy allow-a8 \
+  --tokens 6 --batch 3 --valid-columns 6,3,1 --csv-out out/bench/gdn-record.csv
 ```
 
-## GDN input-projection Op benchmark
-
-`ninfer_gdn_input_proj_bench` measures all registered public `gdn_input_proj` forms: the 27B
-Q4/Q5 two-parent projection, the 35B Q8 single-parent projection, and the 27B NVFP4 or row-scaled
-FP8 single-parent projection under its admitted policies. Every timed and profiled point is exactly
-one public Op call. Single-parent workspace is queried and allocated through the public capacity
-entry before timing; the benchmark has no private launchers, route controls, or candidate mode.
-
-Cold cache is the primary model-layer condition. Reported logical traffic counts encoded weights
-once, BF16 input once, and QKV/Z outputs once. FLOPs describe the complete registered projection.
-The benchmark reports caller policy rather than inferring a private activation-compute route.
+`ninfer_gated_delta_net_bench` selects `--mode running|batch-update|chunked-raw|chunked-normalized|recurrent`.
+Running and batch-update call public Ops. The other modes force a production mechanism for
+crossover analysis; `chunked-raw` normalizes raw Q/K inside prepare, while `chunked-normalized`
+supplies pre-normalized BF16 inputs and skips that normalization. `--breakdown` additionally
+times the private prepare and recurrence stages. `stage_share_pct` partitions the sum of isolated
+stage medians; `relative_to_total_pct` compares each stage with the complete pipeline. Separate
+cache conditioning means isolated medians are not an additive breakdown of pipeline latency.
+`logical_bytes` counts contract tensors once; `tensor_io_request_bytes` and
+`workspace_request_bytes` estimate CTA requests, not measured DRAM traffic.
 
 ```bash
-cmake --build build --parallel --target ninfer_gdn_input_proj_bench
-./build/bench/ninfer_gdn_input_proj_bench \
-  --format all --tokens 1,2,4,8,12,16,32,64,128,256,512,1024 \
-  --cache cold --warmup 5 --repeat 30 \
-  --csv-out profiles/bench/gdn_input_proj.csv
-./build/bench/ninfer_gdn_input_proj_bench \
-  --format nvfp4 --nvfp4-policy a4 --tokens 1024 --cache cold --profile
-./build/bench/ninfer_gdn_input_proj_bench \
-  --format fp8 --fp8-policy a8 --tokens 1,2,3,4,5,6,7,8 --cache cold
+./build/bench/ninfer_gated_delta_net_bench \
+  --mode running --qk-heads 16 --value-heads 48 --tokens 1,15,16,17,1024 --cache cold
+./build/bench/ninfer_gated_delta_net_bench \
+  --mode batch-update --value-heads 32 --batch 8 --qk-norm fused
+./build/bench/ninfer_gated_delta_net_bench \
+  --mode chunked-raw --value-heads 48 --tokens 1024 --breakdown
 ```
 
-## GDN input projection/convolution Snapshot/Record Op benchmark
-
-`ninfer_gdn_input_proj_conv_snapshot_bench` measures the public Qwen3.6/Qwen3.8 Q4/Q5, NVFP4,
-row-scaled FP8, and Q8 `gdn_input_proj_conv_snapshot` / `gdn_input_proj_conv_record` forms for exact
-`B=1..8`. The timed body is exactly one complete public Op call; the benchmark does not include
-private launchers, candidate selection, duplicated compositions, or route labels. Its default
-`T=1..6` sweep is the production MTP verification interval; Record begins at `T=2`.
-`--form snapshot|record|both` selects the semantic form. NVFP4 accepts public `a16`/`a4`, while FP8
-accepts `a16`/`a8`; the reported profile names caller policy, not a private resolved route.
-
-CUDA Graph replay is the default execution mode. The graph contains external timing event nodes
-around the complete Op body, while L2 eviction stays outside the timed interval. Cold-cache results
-model successive model layers with distinct weights and are the authoritative comparison; warm
-results make launch and cache effects visible. The initial state occupies a slot disjoint from all
-published snapshot slots, so repeated replay does not introduce a benchmark-only state reset.
+`ninfer_gdn_replay_bench` selects `--op fold|record`. Fold measures all specified layers;
+record measures one recurrence layer. Specify actual `--layers`, `--value-heads`, and
+`--conv-channels`; Q/K heads are 16 and head dimension is 128. Fold geometries are
+`48/48/10240`, `30/32/8192`, and `36/48/10240`. Both Ops accept T=2..16 and B=1..8.
+`--commits dense|one|mixed|N[,N...]` selects fold lengths, including zero;
+`--valid dense|mixed|N[,N...]` selects positive record prefixes. Host fold rows are captured
+at graph construction; eager timing includes their submission on every call.
 
 ```bash
-cmake --build build --parallel --target ninfer_gdn_input_proj_conv_snapshot_bench
-./build/bench/ninfer_gdn_input_proj_conv_snapshot_bench \
-  --format q4q5 --sweep 1:6 --execution graph --cache both \
-  --warmup 10 --repeat 100 \
-  --csv-out profiles/bench/gdn_input_proj_conv_snapshot.csv
-./build/bench/ninfer_gdn_input_proj_conv_snapshot_bench \
-  --format q4q5 --form record --tokens 8 --batch 2 \
-  --execution graph --cache cold --warmup 10 --repeat 100
-./build/bench/ninfer_gdn_input_proj_conv_snapshot_bench \
-  --format nvfp4 --nvfp4-policy a4 --sweep 1:17 \
-  --execution graph --cache cold --warmup 10 --repeat 100
-./build/bench/ninfer_gdn_input_proj_conv_snapshot_bench \
-  --format q8 --tokens 16 --batch 8 \
-  --execution graph --cache cold --warmup 10 --repeat 100
-./build/bench/ninfer_gdn_input_proj_conv_snapshot_bench \
-  --format nvfp4 --tokens 6 --batch 3 --valid-columns 6,3,1 \
-  --execution graph --cache cold --warmup 10 --repeat 100
-./build/bench/ninfer_gdn_input_proj_conv_snapshot_bench \
-  --format fp8 --fp8-policy a8 --form both --batch 1 --sweep 1:16 \
-  --execution both --cache both --warmup 5 --repeat 30
+./build/bench/ninfer_gdn_replay_bench \
+  --op fold --layers 36 --value-heads 48 --conv-channels 10240 \
+  --tokens 16 --batch 8 --commits mixed --execution both
+./build/bench/ninfer_gdn_replay_bench \
+  --op record --value-heads 48 --tokens 2,8,16 --batch 8 --valid mixed
 ```
-
-`--execution eager|both` is available only to attribute launch behavior; it calls the same public
-Op with the same operands and workspace.
 
 ## Softmax Attention Op benchmarks
 

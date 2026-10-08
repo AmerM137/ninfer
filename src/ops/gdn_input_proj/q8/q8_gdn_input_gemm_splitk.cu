@@ -2,12 +2,12 @@
 #include "ops/linear/q8/q8_grouped_sliced_k_launch.cuh"
 #include "ops/linear/q8/q8_instances.cuh"
 #include "core/weight.h"
-#include "ops/gdn_input_proj/q8/q8_gdn_input_kernels.h"
+#include "ops/gdn_input_proj/q8/kernels.h"
 
 #include "core/device.h"
 #include "ops/common/mma.cuh"
 #include "ops/common/memory.cuh"
-#include "ops/gdn_input_proj/gdn_conv.cuh"
+#include "ops/gdn_input_proj/conv_output.cuh"
 #include "ops/linear/q8/q8_sliced_k_launch.cuh"
 #include "ops/linear/common/output.cuh"
 
@@ -30,26 +30,6 @@ constexpr int kFirstExactCols          = 2;
 constexpr int kLastProjectionExactCols = 32;
 constexpr int kLastSnapshotExactCols   = 16;
 using Output                           = LinearBf16SegmentedOutput<8192, 4096>;
-
-template <class Publish>
-struct Q8GdnSplitKConvEpilogue {
-    GdnConvEpilogue<Publish> conv;
-    __nv_bfloat16* z;
-
-    template <class Output, int ActiveCols>
-    __device__ __forceinline__ void apply_row(const Output&, int row, int,
-                                              const float (&projected)[ActiveCols], int) const {
-        if (row < 8192) {
-            conv.store(row, projected);
-        } else {
-#pragma unroll
-            for (int token = 0; token < ActiveCols; ++token) {
-                z[static_cast<std::int64_t>(token) * 4096 + row - 8192] =
-                    __float2bfloat16_rn(projected[token]);
-            }
-        }
-    }
-};
 
 template <int ActiveCols>
 void launch_active_cols(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
@@ -74,32 +54,11 @@ void launch_active_cols_conv(const Tensor& x, const Weight& weight, const Tensor
     constexpr int TileCols = ActiveCols <= 8 ? 8 : 16;
     using Geometry         = Q8LinearGeometry<kRows, kHidden>;
     using Schedule         = Q8SlicedKDefault<TileCols, ActiveCols>;
-    const Output ignored_output{static_cast<__nv_bfloat16*>(query.data),
-                                static_cast<__nv_bfloat16*>(z.data)};
-    const Q8GdnSplitKConvEpilogue<Publish> epilogue{
-        {
-            static_cast<const __nv_bfloat16*>(conv_weight.data),
-            static_cast<const __nv_bfloat16*>(conv_states.data),
-            static_cast<const std::int32_t*>(initial_slot.data),
-            valid_columns.data == nullptr ? nullptr
-                                          : static_cast<const std::int32_t*>(valid_columns.data),
-            static_cast<__nv_bfloat16*>(query.data),
-            static_cast<__nv_bfloat16*>(key.data),
-            static_cast<__nv_bfloat16*>(value.data),
-            8192,
-            2048,
-            2048,
-            4096,
-            0,
-            ActiveCols,
-            0,
-            publish,
-        },
-        static_cast<__nv_bfloat16*>(z.data),
-    };
+    const auto output      = make_gdn_conv_output<GdnConvGeometry<4096>, ActiveCols>(
+        conv_weight, conv_states, valid_columns, initial_slot, query, key, value, z, publish);
     launch_q8_a16_sliced_k_mma<
         typename Schedule::template with_problem<Geometry::kInputRows, ActiveCols, true>>(
-        q8_linear_operands(x, weight), ignored_output, epilogue, stream);
+        q8_linear_operands(x, weight), output, GdnConvRowEpilogue<ActiveCols>{}, stream);
 }
 
 template <int ActiveCols>
