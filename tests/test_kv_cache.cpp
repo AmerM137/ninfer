@@ -161,6 +161,91 @@ bool page_payload_zero(ninfer::HostKVAllocationConstView view, std::uint32_t pag
     return true;
 }
 
+int exercise_mixed_row_geometry() {
+    int failures = 0;
+    const ninfer::KVPageGeometry geometry{
+        .planes =
+            {
+                {ninfer::DType::U8, 128, 2, 256},
+                {ninfer::DType::U8, 128, 2, 256},
+                {ninfer::DType::U8, 16, 2, 256},
+                {ninfer::DType::U8, 16, 2, 256},
+                {.dtype          = ninfer::DType::BF16,
+                 .leading_extent = 128,
+                 .head_extent    = 1,
+                 .tokens_per_row = 4},
+            },
+    };
+    ninfer::LayoutBuilder builder;
+    const auto device =
+        ninfer::plan_device_kv_page_pool(builder, {.page_group_count = 3, .geometry = geometry});
+    const auto host = ninfer::plan_host_kv_page_layout(geometry);
+    // Literal NVFP4-G16 K/V + BF16 compressed-key geometry, independent of the layout helper.
+    constexpr std::array<std::array<std::int32_t, 4>, 5> shapes{{
+        {128, 64, 2, 3},
+        {128, 64, 2, 3},
+        {16, 64, 2, 3},
+        {16, 64, 2, 3},
+        {128, 16, 1, 3},
+    }};
+    constexpr std::array<std::size_t, 5> page_bytes{16384, 16384, 2048, 2048, 4096};
+    constexpr std::array<std::size_t, 5> head_bytes{8192, 8192, 1024, 1024, 4096};
+    constexpr std::array<std::size_t, 5> host_offsets{0, 16384, 32768, 34816, 36864};
+    constexpr std::array<std::size_t, 5> device_offsets{0, 49152, 98304, 104448, 110592};
+    for (std::size_t i = 0; i < geometry.planes.size(); ++i) {
+        const auto& plane = device.planes[i].storage;
+        failures += expect(plane.shape == shapes[i], "mixed-row Device plane shape");
+        failures += expect_size(plane.region.offset, device_offsets[i], "mixed-row Device offset");
+        failures += expect_size(plane.region.bytes, 3 * page_bytes[i], "mixed-row Device bytes");
+        failures += expect_size(host.planes[i].offset, host_offsets[i], "mixed-row Host offset");
+        failures += expect_size(host.planes[i].head_payload_bytes, head_bytes[i],
+                                "mixed-row Host head bytes");
+        failures += expect_size(host.planes[i].page_payload_bytes, page_bytes[i],
+                                "mixed-row Host plane bytes");
+    }
+    failures += expect_size(host.page_stride, 40960, "mixed-row Host page stride");
+    failures += expect_size(device.payload_bytes(), 122880, "mixed-row Device payload");
+    failures += expect_size(builder.finish(256), 122880, "mixed-row Device backing");
+
+    // Device slab alignment does not enlarge the canonical packed Host representation.
+    auto aligned                    = geometry;
+    aligned.planes.back().alignment = 65536;
+    ninfer::LayoutBuilder aligned_builder;
+    const auto aligned_device = ninfer::plan_device_kv_page_pool(
+        aligned_builder, {.page_group_count = 3, .geometry = aligned});
+    const auto aligned_host = ninfer::plan_host_kv_page_layout(aligned);
+    failures += expect_size(aligned_device.planes.back().storage.region.offset, 131072,
+                            "mixed-row aligned Device offset");
+    failures += expect_size(aligned_builder.finish(256), 143360, "mixed-row aligned backing");
+    failures += expect_size(aligned_device.payload_bytes(), 122880, "mixed-row aligned payload");
+    failures += expect_size(aligned_host.page_stride, 40960, "mixed-row aligned Host stride");
+
+    const auto rejected = [&](const ninfer::KVPageGeometry& invalid, const std::string& label) {
+        bool device_rejected = false, host_rejected = false;
+        try {
+            ninfer::LayoutBuilder unused;
+            (void)ninfer::plan_device_kv_page_pool(unused,
+                                                   {.page_group_count = 1, .geometry = invalid});
+        } catch (const std::invalid_argument&) { device_rejected = true; }
+        try {
+            (void)ninfer::plan_host_kv_page_layout(invalid);
+        } catch (const std::invalid_argument&) { host_rejected = true; }
+        return expect(device_rejected && host_rejected, label);
+    };
+    for (const std::uint32_t span : {0U, 2U, 256U}) {
+        auto invalid                         = geometry;
+        invalid.planes.back().tokens_per_row = span;
+        failures += rejected(invalid, "unsupported row span accepted by a layout planner");
+    }
+    auto invalid        = geometry;
+    invalid.page_tokens = 63;
+    failures += rejected(invalid, "non-divisible page span accepted by a layout planner");
+    invalid                    = geometry;
+    invalid.device_plane_order = ninfer::PagedKVPlaneOrder::HeadMajor;
+    failures += rejected(invalid, "compressed HeadMajor plane accepted by a layout planner");
+    return failures;
+}
+
 int exercise_reservation_and_mapping(ninfer::DeviceContext& context) {
     int failures = 0;
     ninfer::KVPageGeometry geometry{
@@ -281,6 +366,27 @@ int exercise_layout_and_transfer(ninfer::DeviceContext& context, ninfer::KVPageG
     ninfer::HostContextArena host_backing(host_layout.page_stride * 24, host_layout.page_stride);
     ninfer::HostKVArena host_arena(host_backing,
                                    std::span<const ninfer::HostKVPageLayout>(layouts));
+    for (std::size_t i = 0; i < geometry.planes.size(); ++i) {
+        if (geometry.planes[i].tokens_per_row == 1) { continue; }
+        const auto& plane = source.plane(i);
+        failures +=
+            expect(plane.ne[1] == 16 && plane.nb[1] == plane.ne[0] * plane.nb[0] &&
+                       plane.nb[2] == 16 * plane.nb[1] && plane.nb[3] == plane.ne[2] * plane.nb[2],
+                   label + " compressed Device strides");
+        auto different                     = geometry;
+        different.planes[i].tokens_per_row = 1;
+        failures += expect(host_arena.layout_for(different) == nullptr,
+                           label + " Host layout lookup ignored the row span");
+        auto stale_layout               = source_plan.pages;
+        stale_layout.spec.geometry      = different;
+        stale_layout.planes[i].geometry = different.planes[i];
+        bool stale_rejected             = false;
+        try {
+            ninfer::DeviceKVPagePool stale({source_arena.base(), source_arena.capacity()},
+                                           stale_layout);
+        } catch (const std::logic_error&) { stale_rejected = true; }
+        failures += expect(stale_rejected, label + " Device binding accepted stale row geometry");
+    }
     failures += expect(!host_arena.can_allocate(host_layout, 25),
                        label + " oversized Host extent was reported allocatable");
     std::optional<ninfer::HostKVAllocation> host =
@@ -437,7 +543,8 @@ int exercise_layout_and_transfer(ninfer::DeviceContext& context, ninfer::KVPageG
                         geometry.device_plane_order == ninfer::PagedKVPlaneOrder::PageMajor
                             ? head * plane.nb[2] + physical * plane.nb[3]
                             : physical * plane.nb[2] + head * plane.nb[3];
-                    for (std::int32_t token = 0; token < ninfer::kPagedKVPageSize; ++token) {
+                    const auto row_count = geometry.page_tokens / plane_geometry.tokens_per_row;
+                    for (std::uint32_t token = 0; token < row_count; ++token) {
                         for (std::int32_t element = 0; element < plane_geometry.leading_extent;
                              ++element) {
                             for (std::size_t byte = 0; byte < element_bytes; ++byte) {
@@ -501,7 +608,8 @@ int main() {
 
     try {
         ninfer::DeviceContext context(0);
-        int failures = exercise_reservation_and_mapping(context);
+        int failures = exercise_mixed_row_geometry();
+        failures += exercise_reservation_and_mapping(context);
         failures += exercise_layout_and_transfer(
             context,
             ninfer::KVPageGeometry{
@@ -563,6 +671,37 @@ int main() {
                     },
             },
             "Grouped padded PageMajor", {1, 2, 3, 4});
+        const ninfer::KVPlaneGeometry index_plane{
+            .dtype          = ninfer::DType::BF16,
+            .leading_extent = 128,
+            .head_extent    = 1,
+            .tokens_per_row = 4,
+        };
+        const ninfer::KVPageGeometry mixed_grouped{
+            .planes =
+                {
+                    {ninfer::DType::BF16, 256, 2, 256},
+                    {ninfer::DType::FP16, 256, 2, 256},
+                    {ninfer::DType::BF16, 256, 2, 256},
+                    {ninfer::DType::FP16, 256, 2, 256},
+                    index_plane,
+                    index_plane,
+                },
+        };
+        failures += exercise_layout_and_transfer(context, mixed_grouped,
+                                                 "Mixed-row grouped PageMajor", {2, 4, 5, 6});
+        const ninfer::KVPageGeometry mixed_k8v4{
+            .planes =
+                {
+                    {ninfer::DType::FP8_E4M3FN, 256, 2, 256},
+                    {ninfer::DType::U8, 128, 2, 256},
+                    {ninfer::DType::FP16, 1, 2, 256},
+                    {ninfer::DType::U8, 16, 2, 256},
+                    index_plane,
+                },
+        };
+        failures += exercise_layout_and_transfer(context, mixed_k8v4, "Mixed-row K8V4 PageMajor",
+                                                 {5, 5, 5, 5});
         if (failures != 0) {
             std::cerr << failures << " Paged KV physical-container checks failed\n";
             return 1;

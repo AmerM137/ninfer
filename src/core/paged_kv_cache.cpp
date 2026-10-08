@@ -44,6 +44,7 @@ void validate_geometry(const KVPageGeometry& geometry) {
         if (plane.leading_extent <= 0 || plane.head_extent <= 0) {
             throw std::invalid_argument("Paged KV plane extents must be positive");
         }
+        (void)kv_plane_rows_per_page(geometry, plane);
     }
 }
 
@@ -53,6 +54,20 @@ void increment_generation(std::uint32_t& generation) noexcept {
 }
 
 } // namespace
+
+std::int32_t kv_plane_rows_per_page(const KVPageGeometry& page, const KVPlaneGeometry& plane) {
+    const std::uint32_t span = plane.tokens_per_row;
+    if (span != 1 && span != 4) {
+        throw std::invalid_argument("Paged KV plane token span must be 1 or 4");
+    }
+    if (page.page_tokens == 0 || page.page_tokens % span != 0) {
+        throw std::invalid_argument("Paged KV page token span must be divisible by its row span");
+    }
+    if (span == 4 && page.device_plane_order != PagedKVPlaneOrder::PageMajor) {
+        throw std::invalid_argument("Paged KV four-token rows require PageMajor storage");
+    }
+    return checked_i32(page.page_tokens / span, "Paged KV plane rows per page");
+}
 
 PagedKVBatchLayerView single_row_paged_kv_batch_view(const PagedKVLayerView& cache) {
     return {
@@ -78,18 +93,17 @@ DeviceKVPagePoolLayout plan_device_kv_page_pool(LayoutBuilder& builder,
     layout.planes.reserve(spec.geometry.planes.size());
     for (std::size_t index = 0; index < spec.geometry.planes.size(); ++index) {
         const KVPlaneGeometry& plane = spec.geometry.planes[index];
+        const std::int32_t rows      = kv_plane_rows_per_page(spec.geometry, plane);
         DeviceKVPlaneLayout planned;
         planned.geometry        = plane;
         const std::string label = "Paged KV plane " + std::to_string(index);
         if (spec.geometry.device_plane_order == PagedKVPlaneOrder::PageMajor) {
             planned.storage = builder.add_tensor(
-                plane.dtype,
-                {plane.leading_extent, kPagedKVPageSize, plane.head_extent, physical_pages},
+                plane.dtype, {plane.leading_extent, rows, plane.head_extent, physical_pages},
                 plane.alignment, label);
         } else {
             planned.storage = builder.add_tensor(
-                plane.dtype,
-                {plane.leading_extent, kPagedKVPageSize, physical_pages, plane.head_extent},
+                plane.dtype, {plane.leading_extent, rows, physical_pages, plane.head_extent},
                 plane.alignment, label);
         }
         layout.planes.push_back(planned);
@@ -216,7 +230,7 @@ DeviceKVPagePool::DeviceKVPagePool(DeviceSpan backing, const DeviceKVPagePoolLay
         }
         Tensor plane = planned.storage.bind(backing);
         if (plane.dtype != expected.dtype || plane.ne[0] != expected.leading_extent ||
-            plane.ne[1] != kPagedKVPageSize) {
+            plane.ne[1] != kv_plane_rows_per_page(spec_.geometry, expected)) {
             throw std::logic_error("Paged KV device plane tensor is inconsistent");
         }
         if (spec_.geometry.device_plane_order == PagedKVPlaneOrder::PageMajor) {

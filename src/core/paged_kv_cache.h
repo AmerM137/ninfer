@@ -52,6 +52,9 @@ struct KVPlaneGeometry {
     std::int32_t leading_extent = 0;
     std::int32_t head_extent    = 0;
     std::size_t alignment       = 256;
+    // Original tokens represented by one complete row. A prefix of c original tokens makes
+    // floor(c/tokens_per_row) rows valid; page IDs and coverage remain in the original domain.
+    std::uint32_t tokens_per_row = 1;
 
     friend bool operator==(const KVPlaneGeometry&, const KVPlaneGeometry&) = default;
 };
@@ -68,6 +71,12 @@ struct KVPageGeometry {
 
     friend bool operator==(const KVPageGeometry&, const KVPageGeometry&) = default;
 };
+
+// Shared Device/Host row geometry. Supports spans 1 and 4; span 4 requires PageMajor.
+// The page token span must be positive and divisible by tokens_per_row, and the row count
+// must fit a positive Tensor extent. Data types and feature/head extents remain plane facts.
+[[nodiscard]] std::int32_t kv_plane_rows_per_page(const KVPageGeometry& page,
+                                                  const KVPlaneGeometry& plane);
 
 struct DeviceKVPagePoolSpec {
     std::uint32_t page_group_count = 0;

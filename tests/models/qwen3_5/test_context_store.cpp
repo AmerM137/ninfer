@@ -1120,14 +1120,121 @@ expected_host_records(const ninfer::DeviceKVPagePool& pool,
     return out;
 }
 
-void test_history_prefix_view(ninfer::DeviceContext& context, ninfer::PagedKVPlaneOrder order) {
+void test_mixed_row_frontiers(ninfer::DeviceContext& context) {
+    const ninfer::KVPageGeometry geometry{
+        .planes =
+            {
+                {ninfer::DType::BF16, 8, 2, 256},
+                {.dtype          = ninfer::DType::BF16,
+                 .leading_extent = 128,
+                 .head_extent    = 1,
+                 .tokens_per_row = 4},
+            },
+    };
+    ninfer::LayoutBuilder builder;
+    const auto layout =
+        ninfer::plan_device_kv_page_pool(builder, {.page_group_count = 4, .geometry = geometry});
+    const auto table_layout =
+        ninfer::plan_kv_execution_tables(builder, {.logical_page_capacity = 2, .table_rows = 1});
+    ninfer::DeviceArena arena(builder.finish(256));
+    ninfer::DeviceKVPagePool pool({arena.base(), arena.capacity()}, layout);
+    ninfer::KVExecutionTablePool tables({arena.base(), arena.capacity()}, table_layout, pool);
+    store::LogicalKVPageStore pages(pool, 4);
+    store::KVAddressSpaceStore addresses(pages, tables, 2, 2);
+    const auto address = addresses.create_active(2, 0, context.stream).value();
+    addresses.ensure_mapped_to_tokens(address, 65, context.stream);
+    const std::array initial_pages{addresses.physical_page(address, 0),
+                                   addresses.physical_page(address, 1)};
+    pool.zero_pages(initial_pages, context.stream);
+    context.synchronize();
+    const auto mapping = read_block_table(tables, 0, 2);
+    const auto first   = addresses.logical_page(address, 0);
+    const auto second  = addresses.logical_page(address, 1);
+    const auto check   = [&](std::uint32_t frontier, std::uint32_t first_columns,
+                           std::uint32_t second_columns, std::uint32_t complete_blocks) {
+        expect(addresses.committed_frontier(address) == frontier &&
+                     pages.committed_columns(first) == first_columns &&
+                     pages.committed_columns(second) == second_columns,
+                 "mixed-row coverage must count original tokens on both pages");
+        expect(pages.committed_columns(first) / 4 + pages.committed_columns(second) / 4 ==
+                     complete_blocks,
+                 "mixed-row committed coverage exposed an incomplete or rejected index row");
+    };
+    check(0, 0, 0, 0);
+    addresses.commit_frontier(address, 3);
+    check(3, 3, 0, 0);
+    addresses.commit_frontier(address, 4);
+    check(4, 4, 0, 1);
+    addresses.commit_frontier(address, 6);
+    addresses.set_checkpoint_requirement(address, 6);
+    check(6, 6, 0, 1);
+
+    // Simulate Prepare completing block [4,8), then accept only token 6. The compressed row
+    // contains real bytes but does not acquire committed coverage at frontier 7.
+    const auto& index = pool.plane(1);
+    auto* candidate   = static_cast<std::byte*>(index.data) +
+                      static_cast<std::int64_t>(mapping[0]) * index.nb[3] + index.nb[1];
+    CUDA_CHECK(cudaMemsetAsync(candidate, 0x55, 128 * sizeof(std::uint16_t), context.stream));
+    context.synchronize();
+    check(6, 6, 0, 1);
+    addresses.commit_frontier(address, 7);
+    check(7, 7, 0, 1);
+    std::array<std::uint16_t, 128> observed;
+    std::array<std::uint16_t, 128> expected;
+    expected.fill(0x5555);
+    CUDA_CHECK(cudaMemcpy(observed.data(), candidate, sizeof(observed), cudaMemcpyDeviceToHost));
+    expect(observed == expected,
+           "candidate index row was not present for the partial-prefix check");
+
+    // A replacement token 7 completes the same row without touching the protected prefix.
+    CUDA_CHECK(cudaMemsetAsync(candidate, 0x66, sizeof(observed), context.stream));
+    context.synchronize();
+    addresses.commit_frontier(address, 8);
+    check(8, 8, 0, 2);
+    const auto epoch = pages.content_epoch(first);
+    // Keep the second mapped page reserved for later boundary appends.
+    addresses.destructive_truncate(address, 7);
+    expect(addresses.committed_frontier(address) == 7 && pages.committed_columns(first) == 7 &&
+               pages.content_epoch(first) != epoch && addresses.mapped_pages(address) == 1 &&
+               addresses.reserved_growth_pages(address) == 1,
+           "mixed-row rewind lost token coverage, epoch or released-page reservation");
+    CUDA_CHECK(cudaMemcpy(observed.data(), candidate, sizeof(observed), cudaMemcpyDeviceToHost));
+    expected.fill(0x6666);
+    expect(observed == expected, "rewind must not clear the now-invisible compressed suffix");
+
+    addresses.commit_frontier(address, 63);
+    expect(pages.committed_columns(first) == 63 && pages.committed_columns(first) / 4 == 15,
+           "frontier 63 must leave the last compressed row incomplete");
+    addresses.commit_frontier(address, 64);
+    expect(pages.committed_columns(first) == 64 && pages.committed_columns(first) / 4 == 16,
+           "frontier 64 must complete the last compressed row of the first page");
+    addresses.ensure_mapped_to_tokens(address, 65, context.stream);
+    const auto new_second = addresses.logical_page(address, 1);
+    addresses.commit_frontier(address, 65);
+    expect(pages.committed_columns(first) == 64 && pages.committed_columns(new_second) == 1 &&
+               pages.committed_columns(new_second) / 4 == 0,
+           "frontier 65 needs a second main KV page but no complete index row there");
+    context.synchronize();
+    expect(addresses.release_after_deactivate(address) && pool.allocated_pages() == 0 &&
+               pool.reserved_pages() == 0,
+           "mixed-row frontier exercise leaked page capacity");
+}
+
+void test_history_prefix_view(ninfer::DeviceContext& context, ninfer::PagedKVPlaneOrder order,
+                              bool compressed_index = false) {
     constexpr auto page_size = static_cast<std::uint32_t>(ninfer::kPagedKVPageSize);
     constexpr auto rewrite   = page_size + 13U;
     constexpr auto endpoint  = 3U * page_size + 11U;
-    const ninfer::KVPageGeometry geometry{
+    ninfer::KVPageGeometry geometry{
         .device_plane_order = order,
         .planes             = {{ninfer::DType::I8, 8, 2, 256}, {ninfer::DType::FP16, 1, 2, 256}},
     };
+    if (compressed_index) {
+        geometry.planes.push_back({.dtype          = ninfer::DType::BF16,
+                                   .leading_extent = 128,
+                                   .head_extent    = 1,
+                                   .tokens_per_row = 4});
+    }
     ninfer::LayoutBuilder builder;
     const auto page_layout =
         ninfer::plan_device_kv_page_pool(builder, {.page_group_count = 8, .geometry = geometry});
@@ -1225,15 +1332,17 @@ void test_history_prefix_view(ninfer::DeviceContext& context, ninfer::PagedKVPla
     addresses.destructive_truncate(source, page_size + 5U);
     const auto physical_tail = original_mapping[1];
     for (std::size_t i = 0; i < pool.plane_count(); ++i) {
-        const auto& plane = pool.plane(i);
+        const auto& plane    = pool.plane(i);
+        const auto rows      = page_size / geometry.planes[i].tokens_per_row;
+        const auto first_row = 5U / geometry.planes[i].tokens_per_row;
         for (std::uint32_t head = 0; head < geometry.planes[i].head_extent; ++head) {
             const auto offset =
                 order == ninfer::PagedKVPlaneOrder::PageMajor
                     ? static_cast<std::size_t>(physical_tail) * plane.nb[3] + head * plane.nb[2]
                     : head * plane.nb[3] + static_cast<std::size_t>(physical_tail) * plane.nb[2];
-            const auto error =
-                cudaMemsetAsync(static_cast<std::byte*>(plane.data) + offset + 5 * plane.nb[1], 0,
-                                (page_size - 5) * plane.nb[1], context.stream);
+            const auto error = cudaMemsetAsync(static_cast<std::byte*>(plane.data) + offset +
+                                                   first_row * plane.nb[1],
+                                               0, (rows - first_row) * plane.nb[1], context.stream);
             if (error != cudaSuccess) { throw std::runtime_error("source suffix rewrite failed"); }
         }
     }
@@ -1269,6 +1378,8 @@ int main() {
         test_shared_kv_directory(device);
         test_history_prefix_view(device, ninfer::PagedKVPlaneOrder::PageMajor);
         test_history_prefix_view(device, ninfer::PagedKVPlaneOrder::HeadMajor);
+        test_history_prefix_view(device, ninfer::PagedKVPlaneOrder::PageMajor, true);
+        test_mixed_row_frontiers(device);
         device.synchronize();
     } catch (const std::exception& error) {
         std::cerr << "FAIL: unexpected exception: " << error.what() << '\n';

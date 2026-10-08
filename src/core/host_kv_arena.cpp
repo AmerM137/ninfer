@@ -57,11 +57,12 @@ HostKVPageLayout plan_host_kv_page_layout(const KVPageGeometry& geometry) {
         if (plane.leading_extent <= 0 || plane.head_extent <= 0) {
             throw std::invalid_argument("Host KV plane geometry must be positive");
         }
+        const auto rows = static_cast<std::size_t>(kv_plane_rows_per_page(geometry, plane));
         // Device slab alignment is not part of the canonical packed Host representation.
         cursor = align_up(cursor, kHostKVAlignment, "Host KV plane");
         const std::size_t head_bytes =
-            checked_mul(checked_mul(static_cast<std::size_t>(plane.leading_extent),
-                                    geometry.page_tokens, "Host KV head payload overflow"),
+            checked_mul(checked_mul(static_cast<std::size_t>(plane.leading_extent), rows,
+                                    "Host KV head payload overflow"),
                         dtype_size(plane.dtype), "Host KV head payload overflow");
         const std::size_t page_bytes =
             checked_mul(head_bytes, static_cast<std::size_t>(plane.head_extent),
