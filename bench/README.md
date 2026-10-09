@@ -933,8 +933,9 @@ destinations and restores both source planes outside each timed call. Extraction
   --csv-out out/bench/qsa_tail.csv
 ```
 
-`--op prepare` measures the complete BFloat16-cache `qsa_prepare()` call. `--tokens` selects T,
-`--batch` selects B, and `--axes 1|3` selects current RoPE coordinates. `--base-positions` and
+`--op prepare` measures the complete `qsa_prepare()` call. `--kv-cache bf16|int8|fp8|nvfp4|k8v4`
+selects the main-cache profile (default `bf16`). `--tokens` selects T, `--batch` selects B,
+and `--axes 1|3` selects current RoPE coordinates. `--base-positions` and
 `--valid` set Device metadata; cache pages use a nonsequential mapping. `--layout` controls the
 tail/record views. `--inplace` aliases both Q/IQ outputs and restores their original projection
 words outside every timed call. CSV rows include positions, axes, alias mode, layout and round.
@@ -944,7 +945,7 @@ words outside every timed call. CSV rows include positions, axes, alias mode, la
   --base-positions 63 --inplace --rounds 3 --cache both \
   --csv-out out/bench/qsa_prepare_small.csv
 ./build/bench/ninfer_qsa_bench --op prepare --tokens 128,1024,2048,4096 \
-  --axes 3 --rounds 3 --execution both --cache both \
+  --kv-cache nvfp4 --axes 3 --rounds 3 --execution both --cache both \
   --csv-out out/bench/qsa_prepare_prefill.csv
 ```
 

@@ -11,6 +11,7 @@ namespace ninfer::bench::qsa {
 
 struct PrepareFixture {
     DeviceBuffer q, k, v, iq, ik, wq, wk, wiq, wik, out_q, out_iq, keys, values, index_keys;
+    DeviceBuffer key_scales, value_scales;
     DeviceBuffer positions, rope, valid, table_rows, slots, offsets, tables;
     StatePlane<std::uint16_t> before_raw, record_raw;
     StatePlane<std::int32_t> before_rope, record_rope;
@@ -68,36 +69,41 @@ struct PrepareFixture {
         before_rope.upload();
         record_raw.upload();
         record_rope.upload();
-        positions  = measurement::make_i32(pos);
-        rope       = measurement::make_i32(coords);
-        valid      = measurement::make_i32(counts);
-        table_rows = measurement::make_i32(indices);
-        slots      = measurement::make_i32(indices);
-        offsets    = measurement::make_i32(zero);
-        tables     = measurement::make_i32(table);
-        keys       = make_zeros(std::size_t(pages) * 256 * 64 * 2 * 2);
-        values     = make_zeros(keys.bytes);
-        index_keys = make_zeros(std::size_t(pages) * 128 * 16 * 2);
-        projected  = {Tensor(q.p, DType::BF16, {256, 24, tokens, B}),
-                      Tensor(k.p, DType::BF16, {256, 2, tokens, B}),
-                      Tensor(v.p, DType::BF16, {256, 2, tokens, B}),
-                      Tensor(iq.p, DType::BF16, {128, 4, tokens, B}),
-                      Tensor(ik.p, DType::BF16, {128, tokens, B})};
-        parameters = {Tensor(wq.p, DType::BF16, {256}), Tensor(wk.p, DType::BF16, {256}),
-                      Tensor(wiq.p, DType::BF16, {128}), Tensor(wik.p, DType::BF16, {128})};
+        positions                 = measurement::make_i32(pos);
+        rope                      = measurement::make_i32(coords);
+        valid                     = measurement::make_i32(counts);
+        table_rows                = measurement::make_i32(indices);
+        slots                     = measurement::make_i32(indices);
+        offsets                   = measurement::make_i32(zero);
+        tables                    = measurement::make_i32(table);
+        const auto schema         = paged_kv_storage_layout(o.storage, 256);
+        const auto allocate_plane = [=](DeviceBuffer& buffer, DType dtype, int leading) {
+            if (leading == 0) return Tensor{};
+            buffer = make_zeros(std::size_t(pages) * leading * 64 * 2 * dtype_size(dtype));
+            return Tensor(buffer.p, dtype, {leading, 64, 2, pages});
+        };
+        const auto k_data =
+            allocate_plane(keys, schema.key.data_dtype, schema.key.data_leading_extent);
+        const auto v_data =
+            allocate_plane(values, schema.value.data_dtype, schema.value.data_leading_extent);
+        const auto k_scales =
+            allocate_plane(key_scales, schema.key.scale_dtype, schema.key.scale_leading_extent);
+        const auto v_scales = allocate_plane(value_scales, schema.value.scale_dtype,
+                                             schema.value.scale_leading_extent);
+        index_keys          = make_zeros(std::size_t(pages) * 128 * 16 * 2);
+        projected           = {Tensor(q.p, DType::BF16, {256, 24, tokens, B}),
+                               Tensor(k.p, DType::BF16, {256, 2, tokens, B}),
+                               Tensor(v.p, DType::BF16, {256, 2, tokens, B}),
+                               Tensor(iq.p, DType::BF16, {128, 4, tokens, B}),
+                               Tensor(ik.p, DType::BF16, {128, tokens, B})};
+        parameters          = {Tensor(wq.p, DType::BF16, {256}), Tensor(wk.p, DType::BF16, {256}),
+                               Tensor(wiq.p, DType::BF16, {128}), Tensor(wik.p, DType::BF16, {128})};
         batch   = {Tensor(positions.p, DType::I32, {tokens, B}), Tensor(valid.p, DType::I32, {B}),
                    Tensor(table_rows.p, DType::I32, {B})};
         before  = {before_raw.view, before_rope.view, Tensor(slots.p, DType::I32, {B})};
         records = {record_raw.view, record_rope.view, Tensor(offsets.p, DType::I32, {B})};
         Tensor block_tables(tables.p, DType::I32, {logical, B});
-        cache = {{Tensor(keys.p, DType::BF16, {256, 64, 2, pages}),
-                  Tensor(values.p, DType::FP16, {256, 64, 2, pages}),
-                  {},
-                  {},
-                  block_tables,
-                  256,
-                  2,
-                  KvCacheStorage::BFloat16},
+        cache = {{k_data, v_data, k_scales, v_scales, block_tables, 256, 2, o.storage},
                  {Tensor(index_keys.p, DType::BF16, {128, 16, 1, pages}), block_tables}};
         rho   = Tensor(rope.p, DType::I32, {tokens, A, B});
         query = o.inplace ? projected.query : Tensor(out_q.p, DType::BF16, {256, 24, tokens, B});

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "op_measurement.cuh"
+#include "ninfer/types.h"
 
 namespace ninfer::bench::qsa {
 
@@ -30,6 +31,22 @@ inline std::vector<int> segments(Projection p) {
     throw std::invalid_argument("invalid QSA projection");
 }
 
+inline const char* name(KvCacheStorage storage) {
+    switch (storage) {
+    case KvCacheStorage::BFloat16:
+        return "bf16";
+    case KvCacheStorage::Int8Group64:
+        return "int8";
+    case KvCacheStorage::Fp8E4M3Row256:
+        return "fp8";
+    case KvCacheStorage::Nvfp4Group16:
+        return "nvfp4";
+    case KvCacheStorage::Fp8KeyNvfp4Value:
+        return "k8v4";
+    }
+    throw std::invalid_argument("invalid QSA KV storage");
+}
+
 struct Options {
     measurement::Options timing;
     std::string op    = "input-proj";
@@ -37,7 +54,8 @@ struct Options {
     std::vector<Projection> projections{Projection::QueryGate, Projection::KeyValueIndex,
                                         Projection::Joint};
     std::vector<int> tokens{1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096};
-    int rounds = 1;
+    KvCacheStorage storage = KvCacheStorage::BFloat16;
+    int rounds             = 1;
     std::vector<int> capacities{16}, bases{6};
     std::string valid = "dense", accepted = "dense", layout = "contiguous";
     int batch    = 1;
@@ -58,6 +76,7 @@ inline Options parse_options(int argc, char** argv) {
                          "  --entry split|linear|both\n"
                          "  --tokens M[,M...] or --sweep START:END[:STEP] --rounds N\n"
                          "Prepare: --tokens T[,T...] --batch B --axes 1|3 --inplace\n"
+                         "  --kv-cache bf16|int8|fp8|nvfp4|k8v4 (default bf16)\n"
                          "  --base-positions F[,F...] --valid dense|N[,N...] --layout "
                          "contiguous|layered|unaligned\n"
                          "Tail extraction:\n"
@@ -77,11 +96,21 @@ inline Options parse_options(int argc, char** argv) {
                          flag == "--layout";
         projection_only |= flag == "--entry" || flag == "--projection";
         tail_only |= flag == "--capacity" || flag == "--accepted";
-        prepare_only |= flag == "--axes";
+        prepare_only |= flag == "--axes" || flag == "--kv-cache";
         const auto value = measurement::take(argc, argv, i);
         if (flag == "--op")
             o.op = value;
-        else if (flag == "--axes")
+        else if (flag == "--kv-cache") {
+            bool matched = false;
+            for (auto storage : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64,
+                                 KvCacheStorage::Fp8E4M3Row256, KvCacheStorage::Nvfp4Group16,
+                                 KvCacheStorage::Fp8KeyNvfp4Value})
+                if (value == name(storage)) {
+                    o.storage = storage;
+                    matched   = true;
+                }
+            if (!matched) throw std::invalid_argument("kv-cache: bf16|int8|fp8|nvfp4|k8v4");
+        } else if (flag == "--axes")
             o.axes = measurement::integer(value);
         else if (flag == "--capacity")
             o.capacities = measurement::integers(value);

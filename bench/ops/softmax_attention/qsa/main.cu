@@ -59,7 +59,7 @@ void measure_prepare(const qsa::Options& options, DeviceContext& device, L2Flush
         qsa::PrepareFixture fixture(options, tokens);
         measurement::Row row;
         row.op       = "qsa_prepare";
-        row.format   = "bf16";
+        row.format   = qsa::name(options.storage);
         row.tokens   = tokens;
         row.batch    = options.batch;
         row.valid    = qsa::csv_list(fixture.counts);
