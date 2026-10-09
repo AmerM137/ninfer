@@ -42,6 +42,9 @@ including the original projection/record/fold integration cases and FP64 recurre
 decoded FP64 dots, with separate error checks for each output segment. It covers dispatch boundaries,
 output guards, disjoint slices of a shared allocation, input/weight preservation, and changing-input
 Graph replay. Run it with `ctest --test-dir build -R '^ninfer_qsa_input_proj_test$' --output-on-failure`.
+`ninfer_qsa_tail_extract_test` uses an independent chronological reference and exact word comparisons
+for tail/coordinate extraction, pool aliases, strided layer views, and changing Graph metadata.
+Its partial-initialization cases also check the permitted record reads under Compute Sanitizer initcheck.
 
 `ops/ple/` qualifies ConvAdd/ConvAddNorm against FP64 formulas and the actual BF16 residual
 boundary, and checks StateExtract as exact word copying. It covers strided pools, accepted

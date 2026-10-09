@@ -1,6 +1,6 @@
 # Qwen3.8-Flash-Next：QSA 计算、接口与状态
 
-更新日期：2026-10-09。**分段输入投影已实现；Prepare、tail extraction、Indexer 与 Sparse GQA 待实现。**
+更新日期：2026-10-09。**分段输入投影与 tail extraction 已实现；Prepare、Indexer 与 Sparse GQA 待实现。**
 
 本文拥有 Qwen4Exp Main/MTP 的 QSA 数学、Op 边界、cache 读写与候选状态。
 共同约定见[支持总览 §1.3](qwen3_8-flash-next-model.md#13-统一执行约定)；权重和行序由
@@ -434,7 +434,7 @@ Prepare 的 Q/index-Q 可各自精确 alias 对应 raw 输入；不允许部分�
 
 ## 8. Op 接口
 
-已实现的输入投影合同位于 `include/ninfer/ops/qsa.h`；以下声明是后续 Op 的设计。
+已实现的输入投影与 tail extraction 合同位于 `include/ninfer/ops/qsa.h`；其余入口仍为设计。
 使用既有 Tensor、PagedKVBatchLayerView、KvCacheStorage、WorkspaceArena 和
 DeviceExecutionView；所有声明位于 `ninfer::ops`。
 接口按一个 QSA 层调用；层的选择、权重角色、记录 slab 切片及请求身份留在模型/Program。

@@ -894,17 +894,18 @@ cmake --build build -j --target ninfer_attn_input_proj_bench
 The stateful GDN projection/convolution/snapshot contract remains in its own public Op benchmark;
 it is not a mode of Attention input projection. End-to-end target measurement uses `ninfer_bench`.
 
-## QSA input-projection Op benchmark
+## QSA Op benchmark
 
-`ninfer_qsa_bench` compares the three public A16 `qsa_input_proj()` overloads with the corresponding
-contiguous-output `linear()` calls. `--projection qg|kv-index|qkgv-index|all` selects Q8 `[12288,2560]`,
+`ninfer_qsa_bench --op input-proj` (the default) compares the three public A16 `qsa_input_proj()`
+overloads with the corresponding contiguous-output `linear()` calls.
+`--projection qg|kv-index|qkgv-index|all` selects Q8 `[12288,2560]`,
 BF16 `[1664,2560]`, or BF16 `[13952,2560]`. `--entry split|linear|both` selects the public entries;
 `both` reuses identical weights, inputs, and total output storage and alternates entry order by round.
 The split entry writes each contiguous segment directly and uses zero global workspace.
 
 Timing uses `op_measurement.cuh`: Graph body and eager latency, cold/warm cache, Host submission,
 and actual Graph kernel count. Cold measurements evict 256 MiB before timing. CSV rows include the
-projection and round; fixture creation is outside timing. This measures input projection only.
+projection and round; fixture creation is outside timing.
 
 ```bash
 cmake --build build -j --target ninfer_qsa_bench
@@ -914,6 +915,22 @@ cmake --build build -j --target ninfer_qsa_bench
 ./build/bench/ninfer_qsa_bench --tokens 256,512,1024,2048,4096 \
   --rounds 3 --warmup 10 --repeat 100 --execution both --cache both \
   --csv-out out/bench/qsa_prefill.csv
+```
+
+`--op tail-extract` measures the complete public `qsa_tail_extract()` call. `--capacity` selects
+record capacities R; `--batch`, `--base-positions`, `--valid`, and `--accepted` specify the actual
+Device metadata. A single position/count broadcasts to B rows; a list must contain B values.
+`--accepted dense` retains the valid prefix, while `mixed` varies retention across rows.
+`--layout contiguous|layered|unaligned` selects compact buffers, twelve-layer slab strides, or
+naturally aligned BF16 views requiring scalar word copies. `--inplace` uses the source slots as
+destinations and restores both source planes outside each timed call. Extraction CSV rows use
+`tokens` for R and include base positions, layout, in-place mode and round. There is zero workspace.
+
+```bash
+./build/bench/ninfer_qsa_bench --op tail-extract --capacity 16,4096 --batch 8 \
+  --base-positions 6 --accepted mixed --layout layered --inplace \
+  --rounds 3 --warmup 10 --repeat 100 --execution both --cache both \
+  --csv-out out/bench/qsa_tail.csv
 ```
 
 ## 35B sparse-MoE dFlash benchmark

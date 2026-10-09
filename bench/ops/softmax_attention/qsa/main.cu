@@ -1,4 +1,5 @@
 #include "fixture.cuh"
+#include "tail_fixture.cuh"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/qsa.h"
 
@@ -21,6 +22,35 @@ void launch_split(qsa::Projection projection, qsa::Fixture& f, const Weight& wei
         return;
     }
 }
+
+void measure_tail(const qsa::Options& options, DeviceContext& device, L2FlushBuffer& flush) {
+    measurement::Csv csv(options.timing.csv_out, "base_positions,inplace,layout,round");
+    for (int capacity : options.capacities) {
+        qsa::TailFixture fixture(options, capacity);
+        measurement::Row row;
+        row.op      = "qsa_tail_extract";
+        row.format  = "bf16";
+        row.tokens  = capacity;
+        row.batch   = options.batch;
+        row.valid   = qsa::csv_list(fixture.counts);
+        row.commits = qsa::csv_list(fixture.commits);
+        for (int round = 0; round < options.rounds; ++round)
+            for (const auto& execution :
+                 measurement::selections(options.timing.execution, "graph", "eager"))
+                for (const auto& cache :
+                     measurement::selections(options.timing.cache, "cold", "warm")) {
+                    const auto result = measurement::measure(
+                        [&](auto stream) {
+                            fixture.launch(device.execution_view().on_stream(stream));
+                        },
+                        [&](auto stream) { fixture.restore(stream); }, flush, device.stream,
+                        options.timing, execution, cache);
+                    csv.write(row, result, execution, cache,
+                              qsa::csv_list(fixture.bases) + "," + std::to_string(options.inplace) +
+                                  "," + options.layout + "," + std::to_string(round));
+                }
+    }
+}
 } // namespace
 
 int main(int argc, char** argv) {
@@ -29,6 +59,10 @@ int main(int argc, char** argv) {
         measurement::hardware();
         DeviceContext device;
         L2FlushBuffer flush(options.timing.flush_bytes);
+        if (options.op == "tail-extract") {
+            measure_tail(options, device, flush);
+            return 0;
+        }
         measurement::Csv csv(options.timing.csv_out, "projection,round");
         for (auto projection : options.projections) {
             qsa::Weights weights(projection);
