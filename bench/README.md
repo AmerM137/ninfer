@@ -949,6 +949,23 @@ words outside every timed call. CSV rows include positions, axes, alias mode, la
   --csv-out out/bench/qsa_prepare_prefill.csv
 ```
 
+`--op indexer` measures the complete public `qsa_indexer()` call, including paged scoring and
+Top512 selection. `--contexts L[,L...]` gives each row's visible original-token count at its last
+live query; one value broadcasts to B rows. `--valid` sets live query prefixes. The fixed
+`--context-capacity` envelope defaults to 262144 and is independent of actual context lengths.
+`--layout` selects contiguous, interleaved-page, or naturally aligned BF16 keys. Page mappings are
+nonsequential. CSV includes actual contexts, envelope, layout, caller workspace capacity/peak,
+and Graph kernel count. The index plane is always BF16, independent of main KV encoding.
+
+```bash
+./build/bench/ninfer_qsa_bench --op indexer --tokens 1,8,64,1024,2048,4096 \
+  --contexts 262144 --context-capacity 262144 --rounds 3 --execution graph --cache both \
+  --csv-out out/bench/qsa_indexer.csv
+./build/bench/ninfer_qsa_bench --op indexer --tokens 8 --batch 8 \
+  --contexts 262144,131072,32768,8192,2052,2051,4,0 --valid 8,8,8,8,8,8,4,0 \
+  --rounds 3 --execution graph --cache both --csv-out out/bench/qsa_indexer_mixed.csv
+```
+
 ## 35B sparse-MoE dFlash benchmark
 
 `ninfer_sparse_moe_bench` measures the complete routed-plus-shared post-mixer Op for the 35B Text

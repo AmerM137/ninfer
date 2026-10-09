@@ -1,6 +1,6 @@
 # Qwen3.8-Flash-Next：QSA 计算、接口与状态
 
-更新日期：2026-10-09。**分段输入投影与 tail extraction 已实现；Prepare、Indexer 与 Sparse GQA 待实现。**
+更新日期：2026-10-09。**分段输入投影、五种主 KV 编码的 Prepare、Indexer 与 tail extraction 已实现；Sparse GQA 待实现。**
 
 本文拥有 Qwen4Exp Main/MTP 的 QSA 数学、Op 边界、cache 读写与候选状态。
 共同约定见[支持总览 §1.3](qwen3_8-flash-next-model.md#13-统一执行约定)；权重和行序由
@@ -151,7 +151,8 @@ J[p]      = union({4*g,4*g+1,4*g+2,4*g+3} for g in selected)
 
 四个 index heads 汇总成一份 selection，供全部 24 个主 query heads 使用。ReLU 在
 各 head 点积之后、求和之前；这些 score 不加到主 attention logits 中。
-数学上相同 score 优先较小块号；结果无需按 score 或块号排序，但不得重复。
+BF16 输入以 FP32 累加，不将 score 舍入为 BF16。计算所得 score 相等时优先较小块号；
+数学分数及选中/未选中边界独立对照 FP64 检查。结果无需按 score 或块号排序，但不得重复。
 公共正缩放可以在只求排名的内部实现中省去，不改变选块数学。
 
 未完整的尾部全部参与 attention，最多 3 token；一个完整块没有额外的强制保留资格。
@@ -436,8 +437,8 @@ Prepare 的 Q/index-Q 可各自精确 alias 对应 raw 输入；不允许部分�
 
 ## 8. Op 接口
 
-已实现的输入投影、五种主 KV 编码的 Prepare 与 tail extraction 合同位于
-`include/ninfer/ops/qsa.h`；其余入口仍为设计。
+已实现的输入投影、五种主 KV 编码的 Prepare、Indexer 与 tail extraction 合同位于
+`include/ninfer/ops/qsa.h`；Sparse GQA 入口仍为设计。
 使用既有 Tensor、PagedKVBatchLayerView、KvCacheStorage、WorkspaceArena 和
 DeviceExecutionView；所有声明位于 `ninfer::ops`。
 接口按一个 QSA 层调用；层的选择、权重角色、记录 slab 切片及请求身份留在模型/Program。
@@ -604,9 +605,9 @@ void qsa_indexer(
 `block_counts=min(512,floor((p+1)/4))`；前 count 个块号符合 §3.4，剩余列不定义、
 消费者不得读取。Inert query 的 count 精确为 0，IDs 不定义。
 
-Block IDs 是原 token 域中四-token 块号，跨物理页重映射保持不变。全选时可以产生
-identity IDs，不计算 score；无完整块时不读 index plane。实现不能将未来已物化的
-块、重复块或未初始化 padding 纳入结果。
+Block IDs 是原 token 域中四-token 块号，跨物理页重映射保持不变。全选时产生
+identity IDs，不读 query、index keys 或页表内容；无完整块及 inert query 输出 count=0。
+实现不能将未来已物化的块、重复块或未初始化 padding 纳入结果。
 
 Capacity query 覆盖固定 B 下 [min_tokens,max_tokens] 的全部合法 T；envelope 限制
 所有有效 p+1 的上界且不超过绑定 context ceiling。max_visible_tokens=0 仅允许全 inert。
@@ -615,6 +616,12 @@ Capacity query 覆盖固定 B 下 [min_tokens,max_tokens] 的全部合法 T；en
 Workspace 不含 caller 分配的 selection。分数和候选使用分块复用的有界 scratch，不以
 物化完整 T×history 矩阵作为语义要求。内部可采用 score→TopK 多阶段或融合实现，但必须
 保持完整 TopK：不能用没有正确性保证的局部小候选截断代替全局选择。
+
+当前实现逐窗口执行分页 BF16 Tensor Core 打分、分区 Top512、最终 Top512 合并；
+每个分区保留至多 512 项，因此不会丢弃可能属于全局 Top512 的候选。选择使用
+FP32 score 与逻辑块号组成的完整次序，radix 细化到可以精确确定 512 项为止。
+最大 context 下 workspace 不超过 20 MiB；调用者使用 capacity query 取得实际容量。
+Indexer 不创建持久状态，也不依赖主 K/V 的存储编码。
 
 ### 8.4 Sparse GQA
 
@@ -722,8 +729,10 @@ HC 本身没有逐层历史状态。一个 QSA 层独立完成不构成整个请
 
 T/B、buffer addresses、storage profile 和捕获资源上界固定；positions、有效列、state
 slots、record offsets、page IDs 和 selected count 是 Device 输入。每次捕获声明的合法
-envelope 内，这些值变化不要求改写调用拓扑或 host 同步。短历史全选、无完成块、
-全 inert 等情况可以在既定 launch 中跳过工作。
+envelope 内，这些值变化不要求改写调用拓扑或 host 同步。Indexer 的每个窗口始终使用
+相同打分、分区选择和最终输出阶段；短历史全选、无完成块、全 inert 在这些 kernel 内
+跳过对应工作。固定 worker 网格根据 Device metadata 构造任务映射；各 batch 行可同时
+处于不同历史长度，且同一行中各 query 也按自己的因果位置决定可见块数。
 
 三种路径的数学必须相同：普通调用、graph replay、分块实现。记录和 prepared buffers
 的最后 Device 消费完成前不能复用；host 函数返回本身不是 GPU 使用结束的证明。

@@ -1,6 +1,7 @@
 #include "fixture.cuh"
 #include "tail_fixture.cuh"
 #include "prepare_fixture.cuh"
+#include "indexer_fixture.cuh"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/qsa.h"
 
@@ -82,6 +83,38 @@ void measure_prepare(const qsa::Options& options, DeviceContext& device, L2Flush
                 }
     }
 }
+
+void measure_indexer(const qsa::Options& options, DeviceContext& device, L2FlushBuffer& flush) {
+    measurement::Csv csv(options.timing.csv_out, "contexts,context_capacity,layout,round");
+    for (int tokens : options.tokens) {
+        qsa::IndexerFixture fixture(options, tokens, device.execution_view());
+        measurement::Row row;
+        row.op              = "qsa_indexer";
+        row.format          = "bf16";
+        row.policy          = "fp32_scores";
+        row.tokens          = tokens;
+        row.batch           = options.batch;
+        row.qk_heads        = 4;
+        row.valid           = qsa::csv_list(fixture.lengths);
+        row.workspace_bytes = fixture.workspace_bytes;
+        for (int round = 0; round < options.rounds; ++round)
+            for (const auto& execution :
+                 measurement::selections(options.timing.execution, "graph", "eager"))
+                for (const auto& cache :
+                     measurement::selections(options.timing.cache, "cold", "warm")) {
+                    const auto result = measurement::measure(
+                        [&](auto stream) {
+                            fixture.launch(device.execution_view().on_stream(stream));
+                        },
+                        [](auto) {}, flush, device.stream, options.timing, execution, cache);
+                    row.workspace_peak = fixture.workspace->peak_used();
+                    csv.write(row, result, execution, cache,
+                              qsa::csv_list(fixture.contexts) + "," +
+                                  std::to_string(options.context_capacity) + "," + options.layout +
+                                  "," + std::to_string(round));
+                }
+    }
+}
 } // namespace
 
 int main(int argc, char** argv) {
@@ -90,6 +123,10 @@ int main(int argc, char** argv) {
         measurement::hardware();
         DeviceContext device;
         L2FlushBuffer flush(options.timing.flush_bytes);
+        if (options.op == "indexer") {
+            measure_indexer(options, device, flush);
+            return 0;
+        }
         if (options.op == "tail-extract") {
             measure_tail(options, device, flush);
             return 0;

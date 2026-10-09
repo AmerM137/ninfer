@@ -50,6 +50,12 @@ norm/RoPE/pooling oracle and CPU cache encoders, including exact records, V code
 constructed FP32-exact K cases that distinguish premature BF16 rounding. Ordinary quantized K
 uses a fixed FP32 arithmetic envelope at encoder thresholds. It also checks masked reads,
 in-place outputs, Graph replay and tail handoff across chunks and accepted prefixes.
+`ninfer_qsa_indexer_test` checks the complete visible history against independent FP64 dots and
+Top512 selection. Exactly representable scores require the exact set with lower-ID ties; general
+BF16 operands use a fixed FP32 error bound at the selection boundary. Cases cover page remapping,
+strided keys/tables, mixed row lengths, per-query causality, all-select/inert queries, concentrated
+winners, workspace reuse, and changing metadata in one Graph. Partial initialization checks the
+read footprint under Compute Sanitizer initcheck.
 
 `ops/ple/` qualifies ConvAdd/ConvAddNorm against FP64 formulas and the actual BF16 residual
 boundary, and checks StateExtract as exact word copying. It covers strided pools, accepted
