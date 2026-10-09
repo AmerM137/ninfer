@@ -1,7 +1,7 @@
 #pragma once
 
 #include "ops/softmax_attention/dense/causal_cache/bf16/tile_io.cuh"
-#include "ops/softmax_attention/dense/causal_cache/bf16/softmax.cuh"
+#include "ops/softmax_attention/common/bf16_softmax.cuh"
 #include "ops/softmax_attention/dense/causal_cache/bf16/epilogue.cuh"
 #include <math_constants.h>
 

@@ -58,7 +58,10 @@ struct Options {
     int rounds             = 1;
     std::vector<int> capacities{16}, bases{6};
     std::vector<int> contexts{8192};
-    int context_capacity = 262144;
+    int context_capacity           = 262144;
+    bool context_capacity_explicit = false;
+    int selected_blocks            = 512;
+    std::string selection          = "random";
     std::string valid = "dense", accepted = "dense", layout = "contiguous";
     int batch    = 1;
     int axes     = 1;
@@ -69,12 +72,13 @@ inline Options parse_options(int argc, char** argv) {
     Options o;
     bool token_options = false, state_options = false;
     bool projection_only = false, tail_only = false, prepare_only = false;
-    bool indexer_only = false, base_options = false;
+    bool indexer_only = false, base_options = false, sparse_only = false, cache_option = false;
     for (int i = 1; i < argc; ++i) {
         const std::string_view flag = argv[i];
         if (flag == "--help" || flag == "-h") {
             std::cout << "QSA Op benchmark\n"
-                         "  --op input-proj|tail-extract|prepare|indexer (default input-proj)\n"
+                         "  --op input-proj|tail-extract|prepare|indexer|sparse-gqa (default "
+                         "input-proj)\n"
                          "  --projection qg|kv-index|qkgv-index|all\n"
                          "  --entry split|linear|both\n"
                          "  --tokens M[,M...] or --sweep START:END[:STEP] --rounds N\n"
@@ -84,6 +88,10 @@ inline Options parse_options(int argc, char** argv) {
                          "contiguous|layered|unaligned\n"
                          "Indexer: --tokens T[,T...] --batch B --contexts L[,L...]\n"
                          "  --context-capacity N (fixed envelope, default 262144)\n"
+                         "  --valid dense|N[,N...] --layout contiguous|layered|unaligned\n"
+                         "Sparse GQA: --tokens T[,T...] --batch B --contexts L[,L...]\n"
+                         "  --selection random|shared|contiguous --selected-blocks 0..512\n"
+                         "  --context-capacity N (default maximum L), --kv-cache bf16\n"
                          "  --valid dense|N[,N...] --layout contiguous|layered|unaligned\n"
                          "Tail extraction:\n"
                          "  --capacity R[,R...] --batch B --base-positions F0[,F0...]\n"
@@ -102,17 +110,24 @@ inline Options parse_options(int argc, char** argv) {
                          flag == "--layout";
         projection_only |= flag == "--entry" || flag == "--projection";
         tail_only |= flag == "--capacity" || flag == "--accepted";
-        prepare_only |= flag == "--axes" || flag == "--kv-cache";
+        prepare_only |= flag == "--axes";
+        cache_option |= flag == "--kv-cache";
         indexer_only |= flag == "--contexts" || flag == "--context-capacity";
         base_options |= flag == "--base-positions";
+        sparse_only |= flag == "--selection" || flag == "--selected-blocks";
         const auto value = measurement::take(argc, argv, i);
         if (flag == "--op")
             o.op = value;
         else if (flag == "--contexts")
             o.contexts = measurement::integers(value, 0);
-        else if (flag == "--context-capacity")
-            o.context_capacity = measurement::integer(value, 0);
-        else if (flag == "--kv-cache") {
+        else if (flag == "--selection")
+            o.selection = value;
+        else if (flag == "--selected-blocks")
+            o.selected_blocks = measurement::integer(value, 0);
+        else if (flag == "--context-capacity") {
+            o.context_capacity          = measurement::integer(value, 0);
+            o.context_capacity_explicit = true;
+        } else if (flag == "--kv-cache") {
             bool matched = false;
             for (auto storage : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64,
                                  KvCacheStorage::Fp8E4M3Row256, KvCacheStorage::Nvfp4Group16,
@@ -162,15 +177,23 @@ inline Options parse_options(int argc, char** argv) {
         else if (!measurement::parse(o.timing, flag, value))
             throw std::invalid_argument("unknown option: " + std::string(flag));
     }
-    if (o.op != "input-proj" && o.op != "tail-extract" && o.op != "prepare" && o.op != "indexer")
-        throw std::invalid_argument("op: input-proj|tail-extract|prepare|indexer");
-    if ((o.op == "input-proj" && (state_options || tail_only || prepare_only || indexer_only)) ||
+    if (o.op != "input-proj" && o.op != "tail-extract" && o.op != "prepare" && o.op != "indexer" &&
+        o.op != "sparse-gqa")
+        throw std::invalid_argument("op: input-proj|tail-extract|prepare|indexer|sparse-gqa");
+    if ((o.op != "prepare" && o.op != "sparse-gqa" && cache_option) ||
+        (o.op != "sparse-gqa" && sparse_only) ||
+        (o.op == "sparse-gqa" &&
+         (tail_only || projection_only || prepare_only || base_options || o.inplace)) ||
+        (o.op == "input-proj" && (state_options || tail_only || prepare_only || indexer_only)) ||
         (o.op == "tail-extract" &&
          (token_options || projection_only || prepare_only || indexer_only)) ||
         (o.op == "prepare" && (tail_only || projection_only || indexer_only)) ||
         (o.op == "indexer" &&
          (tail_only || projection_only || prepare_only || base_options || o.inplace)))
         throw std::invalid_argument("options must belong to the selected QSA Op");
+    if (o.selected_blocks > 512 ||
+        (o.selection != "random" && o.selection != "shared" && o.selection != "contiguous"))
+        throw std::invalid_argument("invalid sparse selection/count");
     if (o.batch > 8 || (o.axes != 1 && o.axes != 3) ||
         (o.layout != "contiguous" && o.layout != "layered" && o.layout != "unaligned"))
         throw std::invalid_argument("invalid QSA batch/axes/layout");

@@ -1,6 +1,6 @@
 # Qwen3.8-Flash-Next：QSA 计算、接口与状态
 
-更新日期：2026-10-09。**分段输入投影、五种主 KV 编码的 Prepare、Indexer 与 tail extraction 已实现；Sparse GQA 待实现。**
+更新日期：2026-10-10。**分段输入投影、五种主 KV 编码的 Prepare、Indexer、BF16 主 KV 的 Sparse GQA 与 tail extraction 已实现；其余主 KV 编码的 Sparse GQA 待实现。**
 
 本文拥有 Qwen4Exp Main/MTP 的 QSA 数学、Op 边界、cache 读写与候选状态。
 共同约定见[支持总览 §1.3](qwen3_8-flash-next-model.md#13-统一执行约定)；权重和行序由
@@ -437,8 +437,8 @@ Prepare 的 Q/index-Q 可各自精确 alias 对应 raw 输入；不允许部分�
 
 ## 8. Op 接口
 
-已实现的输入投影、五种主 KV 编码的 Prepare、Indexer 与 tail extraction 合同位于
-`include/ninfer/ops/qsa.h`；Sparse GQA 入口仍为设计。
+已实现的输入投影、五种主 KV 编码的 Prepare、Indexer、BF16 Sparse GQA 与 tail extraction
+合同位于 `include/ninfer/ops/qsa.h`。
 使用既有 Tensor、PagedKVBatchLayerView、KvCacheStorage、WorkspaceArena 和
 DeviceExecutionView；所有声明位于 `ninfer::ops`。
 接口按一个 QSA 层调用；层的选择、权重角色、记录 slab 切片及请求身份留在模型/Program。
@@ -628,10 +628,15 @@ Indexer 不创建持久状态，也不依赖主 K/V 的存储编码。
 ```cpp
 namespace ninfer::ops {
 
+struct QsaSparseGqaExecutionEnvelope {
+    std::uint32_t max_visible_tokens = 262144;
+};
+
 [[nodiscard]] std::size_t qsa_sparse_gqa_workspace_capacity_bytes(
     KvCacheStorage storage,
     std::int32_t min_tokens, std::int32_t max_tokens,
     std::int32_t batch_size,
+    QsaSparseGqaExecutionEnvelope envelope,
     DeviceExecutionView execution);
 
 void qsa_sparse_gqa(
@@ -640,6 +645,7 @@ void qsa_sparse_gqa(
     const PagedKVBatchLayerView& cache,
     const QsaBatchView& batch,
     const QsaBlockSelection& selected,
+    QsaSparseGqaExecutionEnvelope envelope,
     WorkspaceArena& workspace,
     Tensor& out,                         // 连续 BF16 [256,24,T,B]
     DeviceExecutionView execution);
@@ -658,12 +664,15 @@ void qsa_sparse_gqa(
 
 Kernel 按选中块直接读取原 cache，尾部不通过 expanded ID buffer 传递。不读 count
 之后的 IDs，不依赖 IDs 排序，不读未选择的 cache 值来做 masked dense attention。
-Loop/workspace 上界来自固定的 512*4+3 个 selected tokens，因此无需主历史长度的
-额外 host envelope。块寻址仍需完整的合法页表 view。
+当前支持 BFloat16 profile，即 BF16 K / FP16 V。每个 query 至多消费 512*4+3 行。
+Host envelope 提供所有有效 query 的 `p+1` 上界，用于选择计算与 workspace 配置；
+零上界只允许全 inert。它不保证块集为全选，也不替代 Device positions/counts/IDs。
+同一捕获上界内支持混合上下文直接 replay；固定 T/B、views、storage 和设备事实时，
+改变 envelope 保持节点数与顺序，允许 Program 使用既有 Graph update 机制更新配置。
 
 Q/output/gate、selection、cache 与有效 workspace 区域不可写读重叠；只读 views 可共享
 allocation。内部可用 split reduction 或不分 split，capacity query 使用同一 storage、
-T/B 和设备事实规划全部临时空间，不向 Program 暴露私有 partition 参数。
+T/B、envelope 和设备事实规划全部临时空间，不向 Program 暴露私有 partition 参数。
 
 ### 8.5 Tail 状态提取
 

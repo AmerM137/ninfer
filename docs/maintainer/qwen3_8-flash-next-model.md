@@ -875,7 +875,7 @@ provenance 中，consumer 应从正式 config/objects/bindings/uses 获取。
 | Artifact/converter | **已完成** Qwen4Exp config/Binding/Use、NVIDIA 导入、MTP NVFP4、NF4 encoder/layout 和完整产物 | [转换说明与命令](qwen3_8-flash-next-converter.md)；PLE conv 布局性能待 Op 阶段比较 |
 | Loader/驻留 | 所有权与驻留设计已定，未接入 | 固定 GPU 权重、完整 Host expert backing、长期 disk backing、原生 Parameters |
 | HC | [数学与接口已定](qwen3_8-flash-next-hc.md)，未实现 | Mix/CombineNorm 等 Ops、workspace、Main/MTP 末端 pair 与状态搬运 |
-| QSA | [数学与接口已定](qwen3_8-flash-next-qsa.md)，未实现 | Prepare、Indexer、Sparse GQA、tail extract；全部声明 codec 逐路线资格化 |
+| QSA | [Prepare、Indexer、BF16 Sparse GQA、tail extract 已实现](qwen3_8-flash-next-qsa.md) | 其余主 KV 编码的 Sparse GQA 与模型调度接入待实现 |
 | 共享 KV 页组 | [扩展设计已定](qwen3_8-flash-next-paged-kv.md)，未实现 | s=1/4 geometry、Host/Device layout、COW/迁移、容量与模型 views |
 | PLE | [数学、I/O、接口已定](qwen3_8-flash-next-ple.md)；独立加载实验已完成 | 生产 reader/LUT、Gate/Conv/state extract、Graph 交接与统一提交 |
 | GDN | [计算与实现要求已定](qwen3_8-flash-next-gdn.md)，待实现 | Qwen4Exp 原生层编排、Op 几何/类型扩展、sigmoid 输出门控、conv/recurrent records 与 36 层 ReplaySSM |
