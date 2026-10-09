@@ -1,5 +1,6 @@
 #include "fixture.cuh"
 #include "tail_fixture.cuh"
+#include "prepare_fixture.cuh"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/qsa.h"
 
@@ -51,6 +52,36 @@ void measure_tail(const qsa::Options& options, DeviceContext& device, L2FlushBuf
                 }
     }
 }
+
+void measure_prepare(const qsa::Options& options, DeviceContext& device, L2FlushBuffer& flush) {
+    measurement::Csv csv(options.timing.csv_out, "base_positions,axes,inplace,layout,round");
+    for (int tokens : options.tokens) {
+        qsa::PrepareFixture fixture(options, tokens);
+        measurement::Row row;
+        row.op       = "qsa_prepare";
+        row.format   = "bf16";
+        row.tokens   = tokens;
+        row.batch    = options.batch;
+        row.valid    = qsa::csv_list(fixture.counts);
+        row.qk_heads = 24;
+        for (int round = 0; round < options.rounds; ++round)
+            for (const auto& execution :
+                 measurement::selections(options.timing.execution, "graph", "eager"))
+                for (const auto& cache :
+                     measurement::selections(options.timing.cache, "cold", "warm")) {
+                    const auto result = measurement::measure(
+                        [&](auto stream) {
+                            fixture.launch(device.execution_view().on_stream(stream));
+                        },
+                        [&](auto stream) { fixture.restore(stream); }, flush, device.stream,
+                        options.timing, execution, cache);
+                    csv.write(row, result, execution, cache,
+                              qsa::csv_list(fixture.bases) + "," + std::to_string(options.axes) +
+                                  "," + std::to_string(options.inplace) + "," + options.layout +
+                                  "," + std::to_string(round));
+                }
+    }
+}
 } // namespace
 
 int main(int argc, char** argv) {
@@ -61,6 +92,10 @@ int main(int argc, char** argv) {
         L2FlushBuffer flush(options.timing.flush_bytes);
         if (options.op == "tail-extract") {
             measure_tail(options, device, flush);
+            return 0;
+        }
+        if (options.op == "prepare") {
+            measure_prepare(options, device, flush);
             return 0;
         }
         measurement::Csv csv(options.timing.csv_out, "projection,round");

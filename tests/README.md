@@ -45,6 +45,9 @@ Graph replay. Run it with `ctest --test-dir build -R '^ninfer_qsa_input_proj_tes
 `ninfer_qsa_tail_extract_test` uses an independent chronological reference and exact word comparisons
 for tail/coordinate extraction, pool aliases, strided layer views, and changing Graph metadata.
 Its partial-initialization cases also check the permitted record reads under Compute Sanitizer initcheck.
+`ninfer_qsa_prepare_test` checks the complete BFloat16-cache Prepare against an independent FP64
+norm/RoPE/pooling oracle, exact records and V encoding, masked reads, in-place outputs, Graph replay,
+and tail handoff across chunks and accepted prefixes.
 
 `ops/ple/` qualifies ConvAdd/ConvAddNorm against FP64 formulas and the actual BF16 residual
 boundary, and checks StateExtract as exact word copying. It covers strided pools, accepted

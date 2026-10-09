@@ -41,21 +41,25 @@ struct Options {
     std::vector<int> capacities{16}, bases{6};
     std::string valid = "dense", accepted = "dense", layout = "contiguous";
     int batch    = 1;
+    int axes     = 1;
     bool inplace = false;
 };
 
 inline Options parse_options(int argc, char** argv) {
     Options o;
-    bool explicit_tokens    = false;
-    bool projection_options = false, tail_options = false;
+    bool token_options = false, state_options = false;
+    bool projection_only = false, tail_only = false, prepare_only = false;
     for (int i = 1; i < argc; ++i) {
         const std::string_view flag = argv[i];
         if (flag == "--help" || flag == "-h") {
             std::cout << "QSA Op benchmark\n"
-                         "  --op input-proj|tail-extract (default input-proj)\n"
+                         "  --op input-proj|tail-extract|prepare (default input-proj)\n"
                          "  --projection qg|kv-index|qkgv-index|all\n"
                          "  --entry split|linear|both\n"
                          "  --tokens M[,M...] or --sweep START:END[:STEP] --rounds N\n"
+                         "Prepare: --tokens T[,T...] --batch B --axes 1|3 --inplace\n"
+                         "  --base-positions F[,F...] --valid dense|N[,N...] --layout "
+                         "contiguous|layered|unaligned\n"
                          "Tail extraction:\n"
                          "  --capacity R[,R...] --batch B --base-positions F0[,F0...]\n"
                          "  --valid dense|N[,N...] --accepted dense|mixed|N[,N...]\n"
@@ -65,17 +69,20 @@ inline Options parse_options(int argc, char** argv) {
             std::exit(0);
         }
         if (flag == "--inplace") {
-            o.inplace    = true;
-            tail_options = true;
+            o.inplace     = true;
+            state_options = true;
             continue;
         }
-        projection_options |=
-            flag == "--projection" || flag == "--entry" || flag == "--tokens" || flag == "--sweep";
-        tail_options |= flag == "--capacity" || flag == "--batch" || flag == "--base-positions" ||
-                        flag == "--valid" || flag == "--accepted" || flag == "--layout";
+        state_options |= flag == "--batch" || flag == "--base-positions" || flag == "--valid" ||
+                         flag == "--layout";
+        projection_only |= flag == "--entry" || flag == "--projection";
+        tail_only |= flag == "--capacity" || flag == "--accepted";
+        prepare_only |= flag == "--axes";
         const auto value = measurement::take(argc, argv, i);
         if (flag == "--op")
             o.op = value;
+        else if (flag == "--axes")
+            o.axes = measurement::integer(value);
         else if (flag == "--capacity")
             o.capacities = measurement::integers(value);
         else if (flag == "--batch")
@@ -105,8 +112,8 @@ inline Options parse_options(int argc, char** argv) {
             else
                 throw std::invalid_argument("projection: qg|kv-index|qkgv-index|all");
         } else if (flag == "--tokens" || flag == "--sweep") {
-            if (explicit_tokens) throw std::invalid_argument("specify one token list or sweep");
-            explicit_tokens = true;
+            if (token_options) throw std::invalid_argument("specify one token list or sweep");
+            token_options = true;
             o.tokens =
                 flag == "--tokens" ? measurement::integers(value) : measurement::sweep(value);
         } else if (flag == "--rounds")
@@ -114,13 +121,15 @@ inline Options parse_options(int argc, char** argv) {
         else if (!measurement::parse(o.timing, flag, value))
             throw std::invalid_argument("unknown option: " + std::string(flag));
     }
-    if (o.op != "input-proj" && o.op != "tail-extract")
-        throw std::invalid_argument("op: input-proj|tail-extract");
-    if ((o.op == "input-proj" && tail_options) || (o.op == "tail-extract" && projection_options))
+    if (o.op != "input-proj" && o.op != "tail-extract" && o.op != "prepare")
+        throw std::invalid_argument("op: input-proj|tail-extract|prepare");
+    if ((o.op == "input-proj" && (state_options || tail_only || prepare_only)) ||
+        (o.op == "tail-extract" && (token_options || projection_only || prepare_only)) ||
+        (o.op == "prepare" && (tail_only || projection_only)))
         throw std::invalid_argument("options must belong to the selected QSA Op");
-    if (o.batch > 8 ||
+    if (o.batch > 8 || (o.axes != 1 && o.axes != 3) ||
         (o.layout != "contiguous" && o.layout != "layered" && o.layout != "unaligned"))
-        throw std::invalid_argument("invalid tail batch/layout");
+        throw std::invalid_argument("invalid QSA batch/axes/layout");
     return o;
 }
 

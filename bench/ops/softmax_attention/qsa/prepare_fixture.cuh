@@ -1,0 +1,125 @@
+#pragma once
+
+#include "state_fixture.cuh"
+#include "ninfer/ops/qsa.h"
+
+#include <algorithm>
+#include <memory>
+#include <numeric>
+
+namespace ninfer::bench::qsa {
+
+struct PrepareFixture {
+    DeviceBuffer q, k, v, iq, ik, wq, wk, wiq, wik, out_q, out_iq, keys, values, index_keys;
+    DeviceBuffer positions, rope, valid, table_rows, slots, offsets, tables;
+    StatePlane<std::uint16_t> before_raw, record_raw;
+    StatePlane<std::int32_t> before_rope, record_rope;
+    std::unique_ptr<SavedBuffer> saved_q, saved_iq;
+    std::vector<int> bases, counts;
+    ops::QsaProjectionView projected;
+    ops::QsaPrepareParameters parameters;
+    ops::QsaBatchView batch;
+    ops::QsaTailStateView before;
+    ops::QsaRawRecordWriteView records;
+    ops::QsaCacheView cache;
+    Tensor rho, query, index_query;
+
+    PrepareFixture(const Options& o, int tokens)
+        : q(make_bf16(std::size_t(6144) * tokens * o.batch, 101)),
+          k(make_bf16(std::size_t(512) * tokens * o.batch, 103)),
+          v(make_bf16(std::size_t(512) * tokens * o.batch, 107)),
+          iq(make_bf16(std::size_t(512) * tokens * o.batch, 109)),
+          ik(make_bf16(std::size_t(128) * tokens * o.batch, 113)), wq(make_bf16(256, 127)),
+          wk(make_bf16(256, 131)), wiq(make_bf16(128, 137)), wik(make_bf16(128, 139)),
+          out_q(o.inplace ? 0 : q.bytes), out_iq(o.inplace ? 0 : iq.bytes),
+          before_raw(128, 3, o.batch, DType::BF16, o.layout),
+          record_raw(128, tokens, o.batch, DType::BF16, o.layout),
+          before_rope(3, o.batch, 1, DType::I32, o.layout, true),
+          record_rope(3, tokens, o.batch, DType::I32, o.layout),
+          bases(broadcast(o.bases, o.batch)) {
+        const int B = o.batch, A = o.axes;
+        counts            = o.valid == "dense" ? std::vector<int>(B, tokens)
+                                               : broadcast(measurement::integers(o.valid, 0), B);
+        const int logical = (*std::max_element(bases.begin(), bases.end()) + tokens + 63) / 64;
+        const int pages_per_row = (tokens + 126) / 64, pages = B * pages_per_row + 2;
+        std::vector<int> pos(tokens * B, -1), coords(tokens * A * B, -1), table(logical * B, -1),
+            indices(B), zero(B);
+        std::iota(indices.begin(), indices.end(), 0);
+        for (int b = 0; b < B; ++b) {
+            if (counts[b] > tokens || bases[b] > 262144 - counts[b])
+                throw std::invalid_argument("invalid prepare counts/positions");
+            for (int j = 0; j < 3; ++j)
+                for (int c = 0; c < 128; ++c)
+                    before_raw.at(c, j, b) =
+                        j < bases[b] % 4 ? std::uint16_t(0x3e00 + (c * 31 + j * 37) % 512) : 0;
+            for (int axis = 0; axis < 3; ++axis)
+                before_rope.at(axis, b) =
+                    bases[b] % 4 ? bases[b] - bases[b] % 4 + (A == 1 ? 0 : axis * 997) : 0;
+            for (int t = 0; t < counts[b]; ++t) {
+                const int p         = bases[b] + t;
+                pos[t + tokens * b] = p;
+                for (int axis = 0; axis < A; ++axis)
+                    coords[t + tokens * (axis + A * b)] = p + axis * 997;
+                table[p / 64 + logical * b] =
+                    pages - 2 - (b * pages_per_row + p / 64 - bases[b] / 64);
+            }
+        }
+        before_raw.upload();
+        before_rope.upload();
+        record_raw.upload();
+        record_rope.upload();
+        positions  = measurement::make_i32(pos);
+        rope       = measurement::make_i32(coords);
+        valid      = measurement::make_i32(counts);
+        table_rows = measurement::make_i32(indices);
+        slots      = measurement::make_i32(indices);
+        offsets    = measurement::make_i32(zero);
+        tables     = measurement::make_i32(table);
+        keys       = make_zeros(std::size_t(pages) * 256 * 64 * 2 * 2);
+        values     = make_zeros(keys.bytes);
+        index_keys = make_zeros(std::size_t(pages) * 128 * 16 * 2);
+        projected  = {Tensor(q.p, DType::BF16, {256, 24, tokens, B}),
+                      Tensor(k.p, DType::BF16, {256, 2, tokens, B}),
+                      Tensor(v.p, DType::BF16, {256, 2, tokens, B}),
+                      Tensor(iq.p, DType::BF16, {128, 4, tokens, B}),
+                      Tensor(ik.p, DType::BF16, {128, tokens, B})};
+        parameters = {Tensor(wq.p, DType::BF16, {256}), Tensor(wk.p, DType::BF16, {256}),
+                      Tensor(wiq.p, DType::BF16, {128}), Tensor(wik.p, DType::BF16, {128})};
+        batch   = {Tensor(positions.p, DType::I32, {tokens, B}), Tensor(valid.p, DType::I32, {B}),
+                   Tensor(table_rows.p, DType::I32, {B})};
+        before  = {before_raw.view, before_rope.view, Tensor(slots.p, DType::I32, {B})};
+        records = {record_raw.view, record_rope.view, Tensor(offsets.p, DType::I32, {B})};
+        Tensor block_tables(tables.p, DType::I32, {logical, B});
+        cache = {{Tensor(keys.p, DType::BF16, {256, 64, 2, pages}),
+                  Tensor(values.p, DType::FP16, {256, 64, 2, pages}),
+                  {},
+                  {},
+                  block_tables,
+                  256,
+                  2,
+                  KvCacheStorage::BFloat16},
+                 {Tensor(index_keys.p, DType::BF16, {128, 16, 1, pages}), block_tables}};
+        rho   = Tensor(rope.p, DType::I32, {tokens, A, B});
+        query = o.inplace ? projected.query : Tensor(out_q.p, DType::BF16, {256, 24, tokens, B});
+        index_query =
+            o.inplace ? projected.index_query : Tensor(out_iq.p, DType::BF16, {128, 4, tokens, B});
+        if (o.inplace) {
+            saved_q  = std::make_unique<SavedBuffer>(q);
+            saved_iq = std::make_unique<SavedBuffer>(iq);
+        }
+    }
+
+    void restore(cudaStream_t stream) const {
+        if (saved_q) {
+            saved_q->restore(stream);
+            saved_iq->restore(stream);
+        }
+    }
+
+    void launch(DeviceExecutionView execution) {
+        ops::qsa_prepare(projected, parameters, batch, rho, before, cache, records, query,
+                         index_query, execution);
+    }
+};
+
+} // namespace ninfer::bench::qsa

@@ -434,7 +434,8 @@ Prepare 的 Q/index-Q 可各自精确 alias 对应 raw 输入；不允许部分�
 
 ## 8. Op 接口
 
-已实现的输入投影与 tail extraction 合同位于 `include/ninfer/ops/qsa.h`；其余入口仍为设计。
+已实现的输入投影、BFloat16-cache Prepare 与 tail extraction 合同位于
+`include/ninfer/ops/qsa.h`；其余入口仍为设计。
 使用既有 Tensor、PagedKVBatchLayerView、KvCacheStorage、WorkspaceArena 和
 DeviceExecutionView；所有声明位于 `ninfer::ops`。
 接口按一个 QSA 层调用；层的选择、权重角色、记录 slab 切片及请求身份留在模型/Program。
@@ -520,6 +521,10 @@ Q/index-Q 精确 alias 特例外，可写区域不得覆盖任何仍被读取的
 两个 cache 子 view 使用相同的 block-table 地址、shape 与 strides。
 
 ### 8.2 Prepare
+
+`qsa_prepare` 已实现主 cache 的 BFloat16 路线（BF16 K、FP16 V），包括 Q/index-Q
+独立原地更新、压缩 key 与 raw records 写入，零 global workspace。具体已实现合同见
+[`qsa.h`](../../include/ninfer/ops/qsa.h)；其余四种主 KV 编码留待后续接入。
 
 ```cpp
 namespace ninfer::ops {
