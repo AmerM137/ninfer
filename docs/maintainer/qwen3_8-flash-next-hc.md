@@ -1,6 +1,6 @@
 # Qwen3.8-Flash-Next：HC 计算、接口与特征状态
 
-更新日期：2026-10-09。**A3 的展开、grouped norm、combine 与两种 CombineNorm 已实现并通过独立数学资格验证；HC Mix 和模型/状态接入待完成。**
+更新日期：2026-10-09。**A3/A4 的七种 HC 计算形式及 Mix 容量查询已实现并通过独立数学资格验证；模型/状态接入待完成。**
 
 本文拥有 Qwen4Exp 的 HC 完整数学、融合边界、Op 接口和 Main/MTP 特征寿命。
 共同轴、执行与提交约定见[支持总览 §1.3](qwen3_8-flash-next-model.md#13-统一执行约定)；
@@ -226,8 +226,8 @@ hc_grouped_rmsnorm 是相同语义的分开执行方式。
 ### 4.3 一个 Op 与多个 kernel
 
 HC Mix 的完整语义封闭，不要求两次有依赖的 GEMM 在一次 launch 内完成。
-初始实现可以复用 Linear 路线并增加私有 activation/mixing kernels；后续 fused down
-epilogue 或 fused up/mix 仍属于同一个 HC Mix 合同，不暴露新的模型调用分支。
+当前实现复用 BF16 Linear 的 contraction 设施，在 Down 最终归约处融合 activation/injection，
+并按完整 Op 测量选择原生四 stripe 的 Up/mix 融合分工；这些选择不增加模型调用分支。
 
 CombineNorm 合并上一 block 的残差更新与下一次 norm，仍输出并保存 h'。它省去的是
 一次独立 combine 调用以及 norm 对已写 h' 的重新读取，不省略下一 block 所需的 residual。
@@ -271,28 +271,14 @@ hc_expand_norm 的 residual 输出必须与 embedding 按映射逐 word 相同�
 
 ## 6. Op 接口
 
-A3 的接口与支持域由 [gated_residual.h](../../include/ninfer/ops/gated_residual.h) 维护；
-本节的 HC Mix 权重与声明属于待实现的 A4。使用既有 Tensor、Weight、
-WorkspaceArena 和 DeviceExecutionView；所有声明位于 `ninfer::ops`。数学几何固定为
-本文件的 H/C/Rhc。
+全部已实现接口、权重 views、支持域和效果由
+[gated_residual.h](../../include/ninfer/ops/gated_residual.h) 统一维护。使用既有 Tensor、Weight、
+WorkspaceArena 和 DeviceExecutionView；入口位于 `ninfer::ops`，数学几何固定为 H/C/Rhc。
 
 ### 6.1 权重 views 与公共约束
 
-```cpp
-namespace ninfer::ops {
-
-struct HcMixWeights {
-    Weight down_injection; // BF16 Contiguous [324,10240]，无持久 padding
-    Weight up;             // BF16 Contiguous [10240,320]
-};
-
-struct HcFinalMixWeights {
-    Weight down;           // BF16 Contiguous [320,10240]
-    Weight up;             // BF16 Contiguous [10240,320]
-};
-
-} // namespace ninfer::ops
-```
+`HcMixWeights` 绑定普通 down/injection 与 up；`HcFinalMixWeights` 绑定 final down 与 up。
+两组原生 compact BF16 矩阵的几何和行语义见 §2.2；不创建持久 padding 或重排副本。
 
 模型 binder 使用既有 weight preparation 机制解析 parent，再检查这里的配对几何与
 A16Only 许可。Op 只读取原生 Weight views，不读取 artifact 路径、checkpoint 名称或 Use ID。
@@ -326,36 +312,8 @@ combine 仍需要未经 norm 替换的 residual。
 
 ### 6.3 HC Mix 与 final 重载
 
-```cpp
-namespace ninfer::ops {
-
-[[nodiscard]] std::size_t hc_mix_workspace_capacity_bytes(
-    const HcMixWeights& weights,
-    std::int32_t min_tokens, std::int32_t max_tokens,
-    DeviceExecutionView execution);
-
-[[nodiscard]] std::size_t hc_mix_workspace_capacity_bytes(
-    const HcFinalMixWeights& weights,
-    std::int32_t min_tokens, std::int32_t max_tokens,
-    DeviceExecutionView execution);
-
-void hc_mix(
-    const Tensor& normalized,        // BF16 [2560,4,M]
-    const HcMixWeights& weights,
-    WorkspaceArena& workspace,
-    Tensor& block_input,             // BF16 [2560,M]
-    Tensor& injection,               // FP32 [4,M]，已激活
-    DeviceExecutionView execution);
-
-void hc_mix(
-    const Tensor& normalized,        // BF16 [2560,4,M]
-    const HcFinalMixWeights& weights,
-    WorkspaceArena& workspace,
-    Tensor& sample_hidden,           // BF16 [2560,M]
-    DeviceExecutionView execution);
-
-} // namespace ninfer::ops
-```
+已实现两个 `hc_mix` 重载与对应的 `hc_mix_workspace_capacity_bytes` 查询。
+公共声明与完整资源合同以生产头文件为准。
 
 普通形式完整计算 §3.2，final 形式完整计算 §3.4；二者不做 norm 或 residual combine。
 调用者传入 normalized 的语义值，Op 不检查它是否来自某个指定前序 kernel。
@@ -366,12 +324,13 @@ Injection 与 block_input 都在调用后可用；不得把 raw BF16 logits 写�
 承诺逐位等于全 FP32 GEMM；完整 projection/nonlinearity 仍按独立数学判据资格化。
 
 Capacity query 覆盖同一权重几何、设备事实下 [min_tokens,max_tokens] 的全部合法 M。
-它包含私有 a/u/g、activation 整理、GEMM partials 和内部调用的峰值 scratch，不包含公开
-x/j/z 等 caller buffers。无效形状或区间应抛错；只有合法且确实不需要 global scratch
+它计算 256-byte 对齐局部 cursor 起点上的最小 high-water，包含实际使用的私有 u、
+Down partials 及内部对齐，不含末尾 padding 和公开 x/j/z。容量是完整闭区间的最大值，
+不能只查询区间右端；不同分段的容量可能下降。无效形状或区间应抛错；只有合法且确实不需要 global scratch
 的路线才返回零。实际调用与 query 使用同一规划，Program 不复制私有路线阈值。
 
-可先采用“Linear → 私有 activation → Linear → 私有 gate/mix”的实现。共享已有 kernel
-不改变 HC Mix 的完整数学 oracle，也不要求模型看到私有中间 buffer。
+当前分段实现见 §8.2。共享 contraction 设施不改变 HC Mix 的完整数学 oracle，
+模型也不接收私有中间 buffer。
 
 ### 6.4 独立 Combine 与融合 CombineNorm
 
@@ -504,7 +463,7 @@ Qwen3.5 的单流 hidden view 原样复用。MTP 的接受策略和 bridge 实�
 | T=16、B=8 的一组末端 pair 窗口 | 3276800 B = 3.125 MiB |
 
 MTP 的当前工作 multistream 单独按 20 KiB/列计算；不要乘以所有 HC 层数。
-u/g 等私有临时空间由 HC Mix capacity query 给出，不用示意 buffer 大小代替真实峰值。
+u/Down partials 的私有 global workspace 由 HC Mix capacity query 给出，不用示意大小代替真实峰值。
 
 Snapshot offload 把有效末端 fields 随 StateImage 原字节搬运，不给 HC 单独建一个 Host
 history pool。只在 StateImage 与其他必要状态都完整到达、身份/前沿匹配后发布。
@@ -532,28 +491,28 @@ per-stream affine 的独立语义与资格化。
 
 ### 8.2 HC Mix 的内部路线
 
-基础路线：
+实现位于 `src/ops/gated_residual/mix/`，分为公共封装、操作数校验、调度/布局和 CUDA
+launch。Block 与 Final 共享实现机制，分别处理原生 324/320 行 Down 和对应的分段表。
+没有模型专用注册、公开 partial Op 或候选强制开关。
 
-```text
-Linear(z, down_injection)
-    -> 私有 split + a/4 SiLU + b/4 sigmoid*2
-    -> Linear(u, up)
-    -> 私有 sigmoid + 四-stream weighted mean
-```
+Down 在完整 dot 或 split-K 最终归约后直接产生私有 BF16 u，并为 Block 写 FP32 j。
+SiLU/gate 采用已通过完整数学检查的 fast sigmoid；FP32 injection 使用 expf sigmoid。
+非线性不作用于未完成的 partial dots。
 
-Final 重载采用 down-only。Public pure Linear 工作仍针对原先的三种 BF16 shapes；
-它提供矩阵计算基础，不冻结复合 Op 的内部舍入与临时布局。
+Up 的生产分工包括：
 
-优先融合点：
+- 小 M：cp.async 收集原生 `s*H+d` 的四条权重 stripe，同一 CTA 完成 MMA、sigmoid、
+  四流加权均值并直接写 BF16 输出。
+- 中段及较大 M：4D TMA descriptor 从原生 Up 矩阵读取四条 stripe，融合收尾在共享内存中汇总
+  四流。共享布局按 MMA 的行组和 token parity 组织，减少收尾的 bank conflict；TMA stage
+  释放前显式建立 generic→async proxy 顺序。32 行 warp 可同时处理两条 stream，收尾
+  只发布当前 feature 组；它按完整 FP64 oracle 资格化。
 
-1. **Down/injection epilogue**：完成最终 dot/split reduction 后直接生成 u 和 FP32 j，
-   省去中间投影结果及分立 activation 调用。不得对各 split 的 partial dot 分别 SiLU。
-2. **Sigmoid＋gate multiplication＋stream reduction**：一次 kernel 按 feature 汇总四条
-   stream，只写 x，不物化 m 或 m*z。逐 stream 累加与同时保留四路寄存器值可分别评估。
-3. **Up projection＋mix**：小 M 可让同一计算组负责同一个 d 的四个 stream 输出，直接
-   产生 x。较大 M 可继续用成熟 GEMM 加轻量 mix，二者共享 HC Mix 公共合同。
+Down 可采用 GEMV、SIMT、split-K MMA 或 TMA；最终选择由完整 Mix 的 cold/warm 时间、
+尾 tile 和 CTA 波次决定。Up 全部融合投影与加权均值；公共容量查询与执行共用布局，
+仅保留私有 BF16 u 与必要的 FP32 Down partials，不物化全量 a/b/g 或 contributions。
 
-第三项不是普通逐行 GEMM epilogue：x[d] 依赖相隔 H 行的四份 up 结果，普通 GEMM tile
+Up/mix 融合不是普通逐行 GEMM epilogue：x[d] 依赖相隔 H 行的四份 up 结果，普通 GEMM tile
 未必把它们交给同一个 CTA。需要安排输出行分工或保留一个中间 logits buffer；不能让不同
 CTA 无同步地更新同一个 x，也不为此运行时重排 up 权重。
 
@@ -597,11 +556,13 @@ kernel；core 继续只提供存储、布局和原字节传输，不解释 HC ga
 
 ### 9.1 数学 oracle
 
-A3 的五种计算形式已通过独立数学、输出覆盖、输入保留、alias、生产路线边界和改变内容后的
+A3/A4 的七种计算形式已通过独立数学、输出覆盖、输入保留、alias、生产路线边界和改变内容后的
 Graph replay 验证。两种 CombineNorm 同时检查完整公式与实际 residual words 对应的 norm；
 展开复制按原 words 验证。判据由 [HC criteria](../../tests/ops/gated_residual/criteria.h) 维护，
 含 coherent BF16 舍入误差的预算，不复制其他测试分布的 RMS 阈值。命令见
-[Tests](../../tests/README.md)；HC Mix、完整模型交接与恢复仍按下列要求推进。
+[Tests](../../tests/README.md)。Mix 的两个重载在同一测试入口内验证完整 FP64 复合公式，
+不复刻私有 u/g casts；另测原生行序、零权重、injection 饱和、精确 workspace、区间最大值
+及非零外层 arena cursor。完整模型交接与恢复仍按下列要求推进。
 
 - GroupedNorm：从 represented BF16 h/weight 用 FP64 分别计算四个 RMS，验证完整 affine
   和 epsilon；特意构造四条 stream 尺度不同、affine 不同的输入。
@@ -643,7 +604,13 @@ A3 属于新增能力，没有既有 HC 生产实现作为性能基线。报告�
 硬件瓶颈；正确原型与完整独立 Combine＋GroupedNorm 组合仅用于内部候选和执行分解比较。
 内部可以在同一数学合同下选择融合或物化后归约，保持公开 BF16 seam 和零 workspace。
 测量命令、计时边界、GPU 活动前置与组合对照定义见
-[Benchmarks](../../bench/README.md#hc-gated-residual-op-benchmark)。这些结果只覆盖 A3 的 Op 范围。
+[Benchmarks](../../bench/README.md#hc-gated-residual-op-benchmark)。这些结果覆盖 A3 的 Op 范围。
+
+A4 是新增能力，没有既有生产 Mix 性能基线。公共 benchmark 的 `block-mix` / `final-mix`
+计时完整 Down→Up→mix，包含 injection（普通形式）、所选全部 kernels 和实际 scratch。
+候选比较覆盖密集 M=1..128、512/1024 主点及中间支撑点；生产验证覆盖 eager/Graph、
+cold/warm、分段边界和 batch 展平。报告绝对延迟、容量/峰值、Tensor/L2/DRAM 利用及
+计算 roofline 距离，保留融合与 staging 的取舍。Op 测量不构成 Engine 或模型性能结论。
 
 性能沿用现有 Op/Linear 方法论，分别报告 HC Mix、CombineNorm 和包含 block 交接的
 HC 完整调用范围。覆盖实际 decode/verify/prefill 的 M，注明硬件、graph、workspace 和

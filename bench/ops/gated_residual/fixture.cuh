@@ -40,6 +40,10 @@ struct Fixture {
                 cudaMemcpyAsync(input.p, backup.p, input.bytes, cudaMemcpyDeviceToDevice, stream));
     }
 
+    std::size_t workspace_capacity() const { return 0; }
+
+    std::size_t workspace_peak() const { return 0; }
+
     void launch(DeviceExecutionView e) {
         switch (op) {
         case Op::ExpandNorm:
@@ -62,6 +66,9 @@ struct Fixture {
             ops::hc_combine(h, b, j, r, e);
             ops::hc_grouped_rmsnorm(r, w, kEpsilon, z, e);
             break;
+        case Op::BlockMix:
+        case Op::FinalMix:
+            throw std::logic_error("Mix requires its projection fixture");
         }
     }
 

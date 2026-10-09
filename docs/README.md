@@ -72,7 +72,7 @@ Qwen3.8-Flash-Next is a Qwen4Exp checkpoint. Start with the support plan for sha
 weight decisions and current progress, then read the relevant execution design. The model is not
 yet integrated into the Engine; the converter is implemented and its 20 pure Linear problems
 are supported and qualified. A1 sigmoid-gated RMSNorm and A2 BF16 `[96,2560]` control projection
-and A3 HC expansion, grouped norm and residual combination are implemented and mathematically
+and A3/A4 HC expansion, grouped norm, residual combination and block/final Mix are implemented and mathematically
 qualified. Their current contracts live in
 [rmsnorm.h](../include/ninfer/ops/rmsnorm.h),
 [gdn_control.h](../include/ninfer/ops/gdn_control.h), and

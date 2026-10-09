@@ -37,6 +37,8 @@ validation; their shared C++ support compiles once with the independent oracle's
 
 HC residual suites follow the same family layout in `ops/gated_residual/`. ExpandNorm,
 GroupedNorm and Combine have separate test entries; both CombineNorm overloads share one entry.
+Block/Final Mix share `test_mix.cpp`, with represented-input fixtures and a complete FP64 oracle
+in `ops/gated_residual/mix/`.
 
 `ops/quantized_weight.h` is the common packed-weight fixture for Q4/Q5/Q6/Q8, FP8 and NVFP4 Op tests. It
 owns deterministic payload generation, device `Weight` views, row views, and independent logical
@@ -158,12 +160,12 @@ Run the HC residual family:
 ```bash
 cmake --build build -j --target \
   ninfer_hc_expand_norm_test ninfer_hc_grouped_rmsnorm_test \
-  ninfer_hc_combine_test ninfer_hc_combine_norm_test
+  ninfer_hc_combine_test ninfer_hc_combine_norm_test ninfer_hc_mix_test
 ctest --test-dir build --output-on-failure \
-  -R '^ninfer_hc_(expand_norm|grouped_rmsnorm|combine|combine_norm)_test$'
+  -R '^ninfer_hc_(expand_norm|grouped_rmsnorm|combine|combine_norm|mix)_test$'
 ```
 
-The suites independently qualify all five public forms from
+The suites independently qualify all seven public forms from
 [gated_residual.h](../include/ninfer/ops/gated_residual.h). Expansion preserves every BF16 word;
 mathematical outputs use complete FP64 formulas. CombineNorm's full oracle retains the public
 BF16 residual seam, and a second grouped-norm check consumes the actual produced residual words.
@@ -173,7 +175,12 @@ input bits, guards, disjoint/exact in-place output, argument rejection, changing
 Graph replay, and production route boundaries through public calls. Each stream is checked
 separately. Criteria are owned by [HC criteria](ops/gated_residual/criteria.h): coherent BF16
 storage error can approach its unit-roundoff bound, even for unit-scale constant inputs, so
-random-input RMS limits do not define this family's general budget. No workspace is required.
+random-input RMS limits do not define this family's general budget. The five residual forms require
+no workspace. Mix tests both projections/nonlinearities against FP64 without private staging casts,
+with separate BF16 output and FP32 injection criteria. Zero weights, native stream-major row mapping,
+saturation, route boundaries and Graph replay cover both overloads. A finite nonuniform column
+catalog reuses FP64 results across M while checking every produced column. Resource checks include
+exact capacity, one-byte shortage, interval maxima, scratch aliasing and enclosing arena preservation.
 
 Linear tests are independently runnable by weight and activation-compute profile:
 

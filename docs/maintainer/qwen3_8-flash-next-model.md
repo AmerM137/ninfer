@@ -874,7 +874,7 @@ provenance 中，consumer 应从正式 config/objects/bindings/uses 获取。
 | 纯 Linear | **20 项已完成**支持、数学资格与规定点位调优 | §5.5；后续在完整复合 Op 中复用 |
 | Artifact/converter | **已完成** Qwen4Exp config/Binding/Use、NVIDIA 导入、MTP NVFP4、NF4 encoder/layout 和完整产物 | [转换说明与命令](qwen3_8-flash-next-converter.md)；PLE conv 布局性能待 Op 阶段比较 |
 | Loader/驻留 | 所有权与驻留设计已定，未接入 | 固定 GPU 权重、完整 Host expert backing、长期 disk backing、原生 Parameters |
-| HC | [A3 基础 Ops 已实现，数学资格验证与 Op 性能比较已完成](qwen3_8-flash-next-hc.md)；A4 和模型接入待完成 | HC Mix、其 workspace、Main/MTP 末端 pair 与状态搬运 |
+| HC | [A3/A4 的七种计算形式及 Mix 容量查询已实现，独立数学验证与 Op 测量已完成](qwen3_8-flash-next-hc.md)；模型接入待完成 | 层调用、planner、Main/MTP 末端 pair 与状态搬运 |
 | QSA | [五种主 KV 编码的 Prepare 与 Sparse GQA、Indexer、tail extract 已实现](qwen3_8-flash-next-qsa.md) | 模型调度接入待实现 |
 | 共享 KV 页组 | [扩展设计已定](qwen3_8-flash-next-paged-kv.md)，未实现 | s=1/4 geometry、Host/Device layout、COW/迁移、容量与模型 views |
 | PLE | [数学、I/O、接口已定](qwen3_8-flash-next-ple.md)；独立加载实验已完成 | 生产 reader/LUT、Gate/Conv/state extract、Graph 交接与统一提交 |
@@ -889,7 +889,7 @@ provenance 中，consumer 应从正式 config/objects/bindings/uses 获取。
 源码中的其他 Qwen3.8 checkpoint 不代表 Flash-Next 已可运行。
 
 [独立 Op 清单](qwen3_8-flash-next-independent-ops.md)中的 A1/A2 已完成实现、数学资格与性能验收，
-A3 的 HC 基础计算也已完成独立验证和 Op 范围性能比较。
+A3 的 HC 基础计算与 A4 的 block/final Mix、容量查询也已完成独立验证和 Op 范围测量。
 RMSNorm/GDN control 家族也已统一接口、代码组织、测试和 bench。
 独立 Op 的完成不代替完整 GDN 层或模型执行验收。
 

@@ -1,6 +1,6 @@
 # Qwen3.8-Flash-Next：子工作区任务清单
 
-更新日期：2026-10-09。**A1/A2/A3 已实现并通过独立数学资格验证；A4 与第二批待实现。**
+更新日期：2026-10-09。**A1/A2/A3/A4 已实现并通过独立数学资格验证；第二批待实现。**
 
 子工作区负责下表七项独立计算。主工作区负责共享存储、状态、读取服务和模型执行接入。
 本文件维护任务范围与协作边界；数学、数值表示及接口分别由
@@ -27,7 +27,7 @@
 | A1 | 第一批 | Sigmoid-gated RMSNorm | RMSNorm 家族内部 | 低 | 已完成 |
 | A2 | 第一批 | GDN 合并 AB 控制投影的新几何 | 控制投影 wrapper、plan、kernel、容量查询 | 中 | 已完成 |
 | A3 | 第一批 | HC expand、grouped norm、combine、combine-norm | 独立 HC Op 家族，消费/产生 forward 激活 | 中 | 已完成 |
-| A4 | 第一批 | HC block/final Mix | HC 家族内部，复用 Linear 与私有 workspace | 中至高 | 待实现 |
+| A4 | 第一批 | HC block/final Mix | HC 家族内部，复用 Linear 与私有 workspace | 中至高 | 已完成 |
 | B1 | 第二批 | PLE Gate | 固定 projection/record views 下的独立 GPU 计算 | 中 | 待实现 |
 | B2 | 第二批 | PLE token hash | 模型内的纯 Host 数学函数 | 低至中 | 待实现 |
 | B3 | 第二批 | NF4→BF16 LUT 与行解码 | Core 数值辅助，不依赖文件或请求对象 | 中 | 待实现 |
@@ -94,7 +94,7 @@ BF16 offset。保留 HC 设计中的 residual exact-alias 规则与 BF16 residua
 
 ### A4. HC Mix
 
-实现普通与 final 两个 `hc_mix` 重载，以及对应 workspace capacity queries。
+已实现普通与 final 两个 `hc_mix` 重载，以及对应 workspace capacity queries。
 
 | 形式 | BF16 parents `[N,K]` | 公共输出 |
 |---|---|---|
@@ -105,7 +105,10 @@ BF16 offset。保留 HC 设计中的 residual exact-alias 规则与 BF16 residua
 mixing 与四 stream 均值；普通形式另外产生 `2*sigmoid(b/4)`。私有中间量和内部 Linear
 scratch 由同一 workspace 规划覆盖，query 覆盖声明的完整 M 区间。
 
-可以在一个 Op 内组合已有 Linear 与私有 kernel，也可以继续融合优化；保持
+Down 融合最终 activation/injection；Up 采用原生四 stripe 的 MMA/TMA 融合，直接完成
+加权均值。Workspace 只保留 u 与必要的 Down partials。两个重载同入口测试完整独立 FP64
+公式，容量查询与执行共用布局；公共 bench
+增加 `block-mix` / `final-mix`，按完整 Op 测量。保留
 [HC §6.3](qwen3_8-flash-next-hc.md#63-hc-mix-与-final-重载)的完整公共边界。
 A3/A4 共用 HC 家族，由子工作区统一维护。
 
@@ -176,7 +179,7 @@ lut[scale*16+code] = BF16_RNE(codebook[code] * E4M3FN(scale) / divisor)
 
 | 边界 | 子工作区交付 | 主工作区负责 |
 |---|---|---|
-| HC | A3 基础计算已完成；A4 Mix 与其容量查询待实现 | 层间调用、激活寿命、Main/MTP 末端特征保存与恢复 |
+| HC | A3 基础计算与 A4 Mix/容量查询已完成 | 层间调用、激活寿命、Main/MTP 末端特征保存与恢复 |
 | GDN | 已完成 A1 输出 norm、A2 控制投影的实现与数学资格 | 输入投影/snapshot/record 家族、36 层 fold、原生 GDN 层和状态接入 |
 | PLE Gate | 从 K/V 与 residual 产生 U/N | shared views、record 预留、ConvAdd/Norm、state extraction |
 | PLE hash | 有序全局行号 | 资源绑定、原始 ID 历史、候选窗口与提交、行/页调度 |

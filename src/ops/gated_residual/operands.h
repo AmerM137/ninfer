@@ -2,9 +2,9 @@
 
 #include "core/device.h"
 #include "core/tensor.h"
+#include "ops/gated_residual/geometry.h"
 
 namespace ninfer::ops::detail::hc {
-inline constexpr int kWidth = 2560, kStreams = 4;
 enum class Form { ExpandNorm, GroupedNorm, Combine, CombineNorm, AddNorm };
 
 struct Operands {
