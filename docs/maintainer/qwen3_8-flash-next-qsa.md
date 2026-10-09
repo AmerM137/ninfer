@@ -109,8 +109,9 @@ i=0..31，角度为 ρ[axis(i)]*theta^(-2*i/64)，theta=10000000。
 MRoPE sections=[11,11,10] 对应 axis(i)=i%3；纯文本三个轴取相同位置。
 V 保持投影输出，gate 保持原始 logits，不做 Q/K norm。
 
-Q 写 BF16 prepared buffer；K 经 BF16 表示边界后按主 cache codec 存储，V 从 BF16
-投影值进入同一个 codec。新 K/V 在后续 Sparse GQA 中通过已写 cache 读取，包含新行的
+Q 写 BF16 prepared buffer；K 的 norm/RoPE 结果保持 FP32，直接进入主 cache 的变换与
+编码，不增加中间 BF16 舍入。BFloat16 cache 仅在最终 K 写入时舍入为 BF16；V 从 BF16
+投影值进入所选 codec。新 K/V 在后续 Sparse GQA 中通过已写 cache 读取，包含新行的
 路径也必须遵守存储表示。所有有效新 token 都写入 cache，不根据当前选块结果丢弃历史。
 
 ### 3.3 Indexer query 与压缩 key
@@ -197,9 +198,10 @@ attention→sigmoid gate 之间没有额外的公开 BF16 中间 tensor；不能
 kernel 的舍入而固定这些私有 cast。源码框架的 cast 顺序是参考证据，不自动成为新合同。
 
 明确的表示边界是：Linear 的 BF16 输出、raw key 精确记录、压缩均值后的 BF16、
-prepared Q/index-Q 的 BF16、主 KV codec 输入/持久表示、compressed key 的 BF16、
-gated attention 的 BF16 输出。主 KV codec 的位编码沿用
-[kv_cache_append](../../include/ninfer/ops/kv_cache_append.h)；fused append 不另造近似 codec。
+prepared Q/index-Q 的 BF16、主 KV 持久表示、compressed key 的 BF16、
+gated attention 的 BF16 输出。主 KV 的 Hadamard 定义、scale/code 生成规则及解码方式沿用
+[kv_cache_append](../../include/ninfer/ops/kv_cache_append.h)。QSA 的 K 编码直接消费
+norm/RoPE 的 FP32 结果，不继承独立 append 入口的 BF16 输入边界。
 
 Prepare 的 norm/RoPE 数学误差与随后 codec 的表示误差分别解释。数值计算不要求与另一
 route 逐 bit 相等；raw record/tail 搬运则必须逐 word 保留对应执行产生的 BF16。
