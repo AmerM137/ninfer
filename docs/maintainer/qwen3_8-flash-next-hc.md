@@ -1,6 +1,6 @@
 # Qwen3.8-Flash-Next：HC 计算、接口与特征状态
 
-更新日期：2026-10-08。**设计已确定，生产实现待完成。**
+更新日期：2026-10-09。**A3 的展开、grouped norm、combine 与两种 CombineNorm 已实现并通过独立数学资格验证；HC Mix 和模型/状态接入待完成。**
 
 本文拥有 Qwen4Exp 的 HC 完整数学、融合边界、Op 接口和 Main/MTP 特征寿命。
 共同轴、执行与提交约定见[支持总览 §1.3](qwen3_8-flash-next-model.md#13-统一执行约定)；
@@ -271,7 +271,8 @@ hc_expand_norm 的 residual 输出必须与 embedding 按映射逐 word 相同�
 
 ## 6. Op 接口
 
-目标头文件为 `include/ninfer/ops/gated_residual.h`。使用既有 Tensor、Weight、
+A3 的接口与支持域由 [gated_residual.h](../../include/ninfer/ops/gated_residual.h) 维护；
+本节的 HC Mix 权重与声明属于待实现的 A4。使用既有 Tensor、Weight、
 WorkspaceArena 和 DeviceExecutionView；所有声明位于 `ninfer::ops`。数学几何固定为
 本文件的 H/C/Rhc。
 
@@ -309,26 +310,9 @@ Device 内存，也不决定 buffer 或 state slot 的寿命。
 
 ### 6.2 初始展开与独立 grouped norm
 
-```cpp
-namespace ninfer::ops {
-
-void hc_expand_norm(
-    const Tensor& embedding,         // BF16 [2560,M]
-    const Tensor& norm_weight,       // BF16 [2560,4]
-    float epsilon,
-    Tensor& residual,                // BF16 [2560,4,M]
-    Tensor& normalized,              // BF16 [2560,4,M]
-    DeviceExecutionView execution);
-
-void hc_grouped_rmsnorm(
-    const Tensor& residual,          // BF16 [2560,4,M]
-    const Tensor& norm_weight,       // BF16 [2560,4]
-    float epsilon,
-    Tensor& normalized,              // BF16 [2560,4,M]
-    DeviceExecutionView execution);
-
-} // namespace ninfer::ops
-```
+已实现的 `hc_expand_norm` 与 `hc_grouped_rmsnorm` 使用第 2 节的连续 BF16 views、
+独立 per-stream offset affine、正且有限的 epsilon 和 `DeviceExecutionView`。
+声明、完整效果与 alias 规则以生产头文件为准。
 
 hc_expand_norm 按 §3.5 精确复制 embedding 到四条 residual streams，再按 §3.1 产生
 normalized。两个输出完整覆盖，互不重叠且不与输入重叠。输入 embedding 已完成相应
@@ -391,38 +375,8 @@ x/j/z 等 caller buffers。无效形状或区间应抛错；只有合法且确�
 
 ### 6.4 独立 Combine 与融合 CombineNorm
 
-```cpp
-namespace ninfer::ops {
-
-void hc_combine(
-    const Tensor& residual,          // BF16 [2560,4,M]
-    const Tensor& block_output,      // BF16 [2560,M]
-    const Tensor& injection,         // FP32 [4,M]，已激活
-    Tensor& updated_residual,        // BF16 [2560,4,M]
-    DeviceExecutionView execution);
-
-void hc_combine_norm(
-    const Tensor& residual,
-    const Tensor& block_output,
-    const Tensor& injection,
-    const Tensor& next_norm_weight,  // BF16 [2560,4]
-    float epsilon,
-    Tensor& updated_residual,
-    Tensor& normalized,
-    DeviceExecutionView execution);
-
-// 明确的 unit-weight broadcast-add + grouped norm。
-void hc_combine_norm(
-    const Tensor& residual,
-    const Tensor& block_output,
-    const Tensor& next_norm_weight,
-    float epsilon,
-    Tensor& updated_residual,
-    Tensor& normalized,
-    DeviceExecutionView execution);
-
-} // namespace ninfer::ops
-```
+已实现 `hc_combine`，以及带 injection 和 unit-weight broadcast-add 两个
+`hc_combine_norm` 重载。公共声明统一由生产头文件维护。
 
 独立 Combine 执行 §3.3；CombineNorm 执行同一更新和 §5.2 的 norm。无 injection
 重载固定为 j=1，不需要 caller 创建一个全一 gate tensor，不读取或产生 injection。
@@ -560,17 +514,19 @@ history pool。只在 StateImage 与其他必要状态都完整到达、身份/�
 
 ### 8.1 Grouped norm 与 CombineNorm
 
-一个可行起点是一个计算组处理一个 token 的一条 2560 维 stream。Norm 采用 FP32
-统计；affine 使用该 stream 的权重。CombineNorm 先得到 BF16 residual，再直接从
-寄存器中的这个表示进行归约，并写出 residual 和 normalized 两个结果。
+A3 实现归 `src/ops/gated_residual/`，校验、公共入口与 CUDA launch 分工独立，
+家族维护自己的构建清单。归约组处理一个 token 的一条 2560 维 stream；Norm 采用 FP32
+统计；affine 使用该 stream 的权重。CombineNorm 的融合路线先得到 BF16 residual，
+再从寄存器中的这个表示归约并写出两个结果；物化路线先写出公开 residual，再由独立归约
+读取这些实际 words。两者遵循同一个可观察 seam。
 
 初始展开可共享相同 embedding 的统计量，但必须应用四份 affine 并产出四份真实 residual。
 普通路径的四条 stream 不共享统计量。M 较小和较大时可采用不同分工；这些不进入接口。
 不为了与某个 tile 对齐而改变 2560 维统计分母或把 padding 加入 sum-of-squares。
 
 现有 [rmsnorm](../../include/ninfer/ops/rmsnorm.h) 的公开 affine 是 [D]，不能把
-[2560,4,M] 展成 [2560,4*M] 后无条件共享该向量。可复用底层归约设施，但要补齐
-per-stream affine 的语义与资格化。
+[2560,4,M] 展成 [2560,4*M] 后无条件共享该向量。A3 复用底层归约设施，并已补齐
+per-stream affine 的独立语义与资格化。
 [silu_gated_rmsnorm](../../include/ninfer/ops/rmsnorm.h) 是另一个数学合同，不用它的
 名字或 SiLU-gate 公式代替本 HC。
 
@@ -641,6 +597,12 @@ kernel；core 继续只提供存储、布局和原字节传输，不解释 HC ga
 
 ### 9.1 数学 oracle
 
+A3 的五种计算形式已通过独立数学、输出覆盖、输入保留、alias、生产路线边界和改变内容后的
+Graph replay 验证。两种 CombineNorm 同时检查完整公式与实际 residual words 对应的 norm；
+展开复制按原 words 验证。判据由 [HC criteria](../../tests/ops/gated_residual/criteria.h) 维护，
+含 coherent BF16 舍入误差的预算，不复制其他测试分布的 RMS 阈值。命令见
+[Tests](../../tests/README.md)；HC Mix、完整模型交接与恢复仍按下列要求推进。
+
 - GroupedNorm：从 represented BF16 h/weight 用 FP64 分别计算四个 RMS，验证完整 affine
   和 epsilon；特意构造四条 stream 尺度不同、affine 不同的输入。
 - ExpandNorm：residual 按映射逐 word 精确；normalized 与独立 grouped-norm 公式比较。
@@ -675,6 +637,13 @@ kernel；core 继续只提供存储、布局和原字节传输，不解释 HC ga
 两类标准不可互相替代，也不以 HC 最终文本是否正常作为通过依据。
 
 ### 9.3 性能与交付状态
+
+A3 的独立 Op 性能比较覆盖五种形式、分离/原位更新、eager/Graph 和 cold/warm。
+A3 属于新增能力，没有既有 HC 生产实现作为性能基线。报告公开 Op 的绝对延迟、实际访存量与
+硬件瓶颈；正确原型与完整独立 Combine＋GroupedNorm 组合仅用于内部候选和执行分解比较。
+内部可以在同一数学合同下选择融合或物化后归约，保持公开 BF16 seam 和零 workspace。
+测量命令、计时边界、GPU 活动前置与组合对照定义见
+[Benchmarks](../../bench/README.md#hc-gated-residual-op-benchmark)。这些结果只覆盖 A3 的 Op 范围。
 
 性能沿用现有 Op/Linear 方法论，分别报告 HC Mix、CombineNorm 和包含 block 交接的
 HC 完整调用范围。覆盖实际 decode/verify/prefill 的 M，注明硬件、graph、workspace 和

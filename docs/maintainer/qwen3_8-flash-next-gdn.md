@@ -202,7 +202,7 @@ streams。Injection 是 attention HC 已产生的 FP32 系数。HC 的 residual/
 | output norm＋sigmoid | `sigmoid_gated_rmsnorm` | 已实现并通过完整 norm/gate 公式的数学资格验证 |
 | output projection | `linear`，Q8 [2560,6144] | 已有纯 Linear 支持 |
 | accepted-prefix fold | `GdnReplayFoldPlan` | 增加 36 层、16/48 heads、10240 conv channels 的全层几何 |
-| residual 回注 | `hc_combine_norm` | 按 HC 专题实现和调用 |
+| residual 回注 | `hc_combine_norm` | A3 基础 Op 已实现；按 HC 专题接入层调用 |
 
 上述复合入口的实现可复用现有 kernel 与调优结果；模型通过公共 Op 合同调用。
 已实现的控制家族以 [gdn_control.h](../../include/ninfer/ops/gdn_control.h) 为接口权威：

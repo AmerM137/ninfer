@@ -397,15 +397,16 @@ BF16 `[D,H,T,B]`, with a separate D-element reduction for each of the `H*T*B` ro
 and gates are nonuniform represented BF16 values. Defaults are `rmsnorm`, D=128, H=48, T=1, B=1.
 `--sweep START:END[:STEP]` replaces the token list; `--tokens` and `--sweep` are mutually exclusive.
 
-The RMSNorm and GDN control benchmarks share `bench/ops/op_measurement.cuh`. Each sample times one
-complete public Op. Graph GPU timing brackets the captured Op body with external CUDA event
-nodes; eager GPU timing includes host launch gaps. Host submission is measured separately.
+The RMSNorm, GDN control and HC benchmarks share `bench/ops/op_measurement.cuh`. Each sample times
+a complete public Op or an explicitly named composition comparison. Graph GPU timing brackets the
+captured Op body with external CUDA event nodes; eager GPU timing includes host launch gaps.
+Host submission is measured separately.
 Fixture preparation and cold-cache eviction precede the timed interval. CSV reports semantic
 geometry, execution/cache mode, GPU and host median/min/p95 microseconds, `workspace_bytes`,
 `workspace_peak`, and `kernels` (actual captured kernel nodes, excluding event nodes).
 RMSNorm uses zero workspace. These measurements establish Op latency, not Engine latency.
 
-Both benchmarks accept `--execution graph|eager|both`, `--cache cold|warm|both`, `--warmup N`,
+All three benchmarks accept `--execution graph|eager|both`, `--cache cold|warm|both`, `--warmup N`,
 `--repeat N`, `--flush-mib N` and `--csv-out PATH`. Defaults are Graph, both cache modes,
 10 warmups, 100 samples and a 256 MiB cold-cache flush; CSV goes to stdout unless a path is supplied.
 
@@ -462,6 +463,49 @@ cmake --build build -j --target ninfer_gdn_control_bench
   --op norm-projection --heads 32 --input-rows 2048 --tokens 16,17,128
 ./build/bench/ninfer_gdn_control_bench \
   --op control --heads 48 --batch 8 --tokens 1,7,16 --execution both --cache warm
+```
+
+## HC gated residual Op benchmark
+
+`ninfer_gated_residual_bench` measures the five public HC residual forms with
+`--op expand-norm|grouped-rmsnorm|combine|combine-norm|add-norm`. Geometry is fixed at H=2560
+and four streams. Input/output residual and normalized tensors are BF16 `[2560,4,M]`,
+embedding/block tensors are BF16 `[2560,M]`, and activated injection is FP32 `[4,M]`.
+`add-norm` selects the unit-weight overload without an injection operand.
+
+`combine-then-norm` times public `hc_combine` followed by `hc_grouped_rmsnorm` as one interval.
+`add-then-norm` uses the same composition with an all-one FP32 injection prepared before timing.
+These are explicit two-Op decomposition comparisons for a new capability, with no preexisting
+HC production implementation as a performance baseline. Production owns the fused entry's internal
+choice of one or multiple kernels; the benchmark reports actual kernel count.
+
+Defaults are `combine-norm`, tokens=1, batch=1 and `--alias disjoint`. `--alias inplace` is
+available for `combine`, `combine-norm`, `add-norm` and the staged comparisons. Original inputs are
+restored on the measurement stream before each interval, then cold mode flushes the cache. `--tokens T[,T...]`
+or mutually exclusive `--sweep START:END[:STEP]`, together with `--batch B`, gives M=T*B.
+Timing flags, defaults and CSV statistics follow the [RMSNorm benchmark](#rmsnorm-op-benchmark);
+HC adds `alias` and `condition_us`, and workspace capacity/peak are zero. `--condition-us N`
+defaults to 200: register-only GPU work precedes restoration and optional eviction, outside the
+timed Op body. This gives both cache modes an activity prelude without warming operand data or
+locking clocks. It also allows eager submissions to queue behind the prelude; use
+`--condition-us 0` to measure without that setup, and keep the two conditions separate.
+Fixtures allocate only selected operands and an in-place backup when needed. The measurements cover
+Op latency and the named compositions.
+
+```bash
+cmake --build build -j --target ninfer_gated_residual_bench
+./build/bench/ninfer_gated_residual_bench \
+  --op expand-norm --tokens 1,8,128,1024,2048 --execution both --cache both
+./build/bench/ninfer_gated_residual_bench \
+  --op combine-norm --alias inplace --tokens 1,8,128,2048,4096 \
+  --execution graph --cache cold --csv-out /tmp/hc-combine-norm.csv
+./build/bench/ninfer_gated_residual_bench \
+  --op combine-then-norm --alias inplace --tokens 1,8,128,2048,4096 \
+  --execution graph --cache cold --csv-out /tmp/hc-staged.csv
+./build/bench/ninfer_gated_residual_bench \
+  --op add-norm --tokens 1,7,16 --batch 8 --execution both --cache warm
+./build/bench/ninfer_gated_residual_bench \
+  --op combine-norm --tokens 1,128 --execution eager --cache warm --condition-us 0
 ```
 
 ## Dynamic grouped-convolution prepare Op benchmark

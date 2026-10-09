@@ -1,6 +1,6 @@
 # Qwen3.8-Flash-Next：子工作区任务清单
 
-更新日期：2026-10-08。**A1/A2 已实现并通过独立数学资格验证；A3/A4 与第二批待实现。**
+更新日期：2026-10-09。**A1/A2/A3 已实现并通过独立数学资格验证；A4 与第二批待实现。**
 
 子工作区负责下表七项独立计算。主工作区负责共享存储、状态、读取服务和模型执行接入。
 本文件维护任务范围与协作边界；数学、数值表示及接口分别由
@@ -26,7 +26,7 @@
 |---|---|---|---|---|---|
 | A1 | 第一批 | Sigmoid-gated RMSNorm | RMSNorm 家族内部 | 低 | 已完成 |
 | A2 | 第一批 | GDN 合并 AB 控制投影的新几何 | 控制投影 wrapper、plan、kernel、容量查询 | 中 | 已完成 |
-| A3 | 第一批 | HC expand、grouped norm、combine、combine-norm | 新增独立 HC Op 家族，消费/产生 forward 激活 | 中 | 待实现 |
+| A3 | 第一批 | HC expand、grouped norm、combine、combine-norm | 独立 HC Op 家族，消费/产生 forward 激活 | 中 | 已完成 |
 | A4 | 第一批 | HC block/final Mix | HC 家族内部，复用 Linear 与私有 workspace | 中至高 | 待实现 |
 | B1 | 第二批 | PLE Gate | 固定 projection/record views 下的独立 GPU 计算 | 中 | 待实现 |
 | B2 | 第二批 | PLE token hash | 模型内的纯 Host 数学函数 | 低至中 | 待实现 |
@@ -72,7 +72,7 @@ gamma 为 BF16 `[128]`，沿 128 维归约、使用直接乘数 gamma。出口�
 
 ### A3. HC 基础计算
 
-在 `include/ninfer/ops/gated_residual.h` 与 `src/ops/gated_residual/` 实现：
+已在 [gated_residual.h](../../include/ninfer/ops/gated_residual.h) 与 `src/ops/gated_residual/` 实现：
 
 | 入口 | 完整效果 |
 |---|---|
@@ -86,8 +86,11 @@ Residual/normalized 为 BF16 `[2560,4,M]`，block output 为 BF16 `[2560,M]`，
 injection 为 FP32 `[4,M]`，已包含 `2*sigmoid(logit/4)`。Norm 参数是各 stream 独立的
 BF16 offset。保留 HC 设计中的 residual exact-alias 规则与 BF16 residual→norm 边界。
 
-这些入口处理本次 forward 的激活；其实现不依赖 Main/MTP checkpoint。
-完整声明见 [HC §6](qwen3_8-flash-next-hc.md#6-op-接口)。
+这些入口处理本次 forward 的激活，不依赖 Main/MTP checkpoint，全部零 global workspace。
+五种计算形式均通过完整独立 FP64 数学验证；两种 CombineNorm 另外验证实际 BF16 residual seam。
+实现、测试与 bench 分别归 `src/ops/gated_residual/`、`tests/ops/gated_residual/`、
+`bench/ops/gated_residual/`；公共 bench 为 `ninfer_gated_residual_bench`，包含明确的分阶段组合对照。
+数学与交接见 [HC §6](qwen3_8-flash-next-hc.md#6-op-接口)，已实现接口以生产头文件为准。
 
 ### A4. HC Mix
 
@@ -173,7 +176,7 @@ lut[scale*16+code] = BF16_RNE(codebook[code] * E4M3FN(scale) / divisor)
 
 | 边界 | 子工作区交付 | 主工作区负责 |
 |---|---|---|
-| HC | 完整计算家族及容量查询 | 层间调用、激活寿命、Main/MTP 末端特征保存与恢复 |
+| HC | A3 基础计算已完成；A4 Mix 与其容量查询待实现 | 层间调用、激活寿命、Main/MTP 末端特征保存与恢复 |
 | GDN | 已完成 A1 输出 norm、A2 控制投影的实现与数学资格 | 输入投影/snapshot/record 家族、36 层 fold、原生 GDN 层和状态接入 |
 | PLE Gate | 从 K/V 与 residual 产生 U/N | shared views、record 预留、ConvAdd/Norm、state extraction |
 | PLE hash | 有序全局行号 | 资源绑定、原始 ID 历史、候选窗口与提交、行/页调度 |

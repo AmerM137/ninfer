@@ -35,6 +35,9 @@ registration manifest. Both RMSNorm gates remain in one `test_gated.cpp`. GDN co
 represented-input fixtures, the FP64 oracle, semantic cases, the runner and public-contract
 validation; their shared C++ support compiles once with the independent oracle's arithmetic options.
 
+HC residual suites follow the same family layout in `ops/gated_residual/`. ExpandNorm,
+GroupedNorm and Combine have separate test entries; both CombineNorm overloads share one entry.
+
 `ops/quantized_weight.h` is the common packed-weight fixture for Q4/Q5/Q6/Q8, FP8 and NVFP4 Op tests. It
 owns deterministic payload generation, device `Weight` views, row views, and independent logical
 weight decoding.
@@ -149,6 +152,28 @@ error cap while retaining the stricter relative L2 criterion; that estimate is a
 limit, not a worst-case guarantee for arbitrary dot-product conditioning. Criteria apply to whole
 mathematical forms, without private-route or per-case overrides. Use `NINFER_OP_REPORT_STATS=1`
 with verbose CTest output to inspect the same criteria used by the normal verdict.
+
+Run the HC residual family:
+
+```bash
+cmake --build build -j --target \
+  ninfer_hc_expand_norm_test ninfer_hc_grouped_rmsnorm_test \
+  ninfer_hc_combine_test ninfer_hc_combine_norm_test
+ctest --test-dir build --output-on-failure \
+  -R '^ninfer_hc_(expand_norm|grouped_rmsnorm|combine|combine_norm)_test$'
+```
+
+The suites independently qualify all five public forms from
+[gated_residual.h](../include/ninfer/ops/gated_residual.h). Expansion preserves every BF16 word;
+mathematical outputs use complete FP64 formulas. CombineNorm's full oracle retains the public
+BF16 residual seam, and a second grouped-norm check consumes the actual produced residual words.
+Checks cover independent stream scales/affines, offset/zero/negative gains, activated injection
+endpoints, exact BF16 midpoints and their neighbors, epsilon-dominated inputs, complete outputs,
+input bits, guards, disjoint/exact in-place output, argument rejection, changing contents under
+Graph replay, and production route boundaries through public calls. Each stream is checked
+separately. Criteria are owned by [HC criteria](ops/gated_residual/criteria.h): coherent BF16
+storage error can approach its unit-roundoff bound, even for unit-scale constant inputs, so
+random-input RMS limits do not define this family's general budget. No workspace is required.
 
 Linear tests are independently runnable by weight and activation-compute profile:
 
