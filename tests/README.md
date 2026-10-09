@@ -38,6 +38,11 @@ GDN projection, snapshot, and record suites live in `ops/gdn_input_proj/`.
 `ops/linear_attention/gated_delta_net/` owns recurrence, Replay record, and fold tests,
 including the original projection/record/fold integration cases and FP64 recurrence reference.
 
+`ops/softmax_attention/qsa/` qualifies all three A16 `qsa_input_proj` overloads against independently
+decoded FP64 dots, with separate error checks for each output segment. It covers dispatch boundaries,
+output guards, disjoint slices of a shared allocation, input/weight preservation, and changing-input
+Graph replay. Run it with `ctest --test-dir build -R '^ninfer_qsa_input_proj_test$' --output-on-failure`.
+
 `ops/ple/` qualifies ConvAdd/ConvAddNorm against FP64 formulas and the actual BF16 residual
 boundary, and checks StateExtract as exact word copying. It covers strided pools, accepted
 prefixes, in-place updates, split windows and changing Graph metadata.

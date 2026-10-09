@@ -1,6 +1,6 @@
 # Qwen3.8-Flash-Next：QSA 计算、接口与状态
 
-更新日期：2026-10-08。**设计已确定，生产实现待完成。**
+更新日期：2026-10-09。**分段输入投影已实现；Prepare、tail extraction、Indexer 与 Sparse GQA 待实现。**
 
 本文拥有 Qwen4Exp Main/MTP 的 QSA 数学、Op 边界、cache 读写与候选状态。
 共同约定见[支持总览 §1.3](qwen3_8-flash-next-model.md#13-统一执行约定)；权重和行序由
@@ -59,7 +59,7 @@ F 指模型已经物化的输入数量，不能直接使用生成 token 数或 l
 ### 3.1 输入与离线合并的投影
 
 输入 x 是 Attention HC 已组合好的 BF16 [2560,T,B]，不另加普通 Transformer input norm。
-按调用连续列展平为 [2560,M] 后使用已有 Linear 语义；inert 列提供有限安全输入。
+按调用连续列展平为 [2560,M] 后调用 `qsa_input_proj`；inert 列提供有限安全输入。
 
 | 位置 | Parent [N,K] | 权重/许可 | 投影输出行范围 |
 |---|---:|---|---|
@@ -71,8 +71,12 @@ F 指模型已经物化的输入数量，不能直接使用生成 token 数或 l
 
 物理矩阵保持[核心方案](qwen3_8-flash-next-model.md#52-textmtp-的物理投影目录)的定义。
 源 checkpoint 的 Q/gate head interleave 已离线置换，运行时不重新排权重。
-Packed projection 的各段可以用 strided Tensor views 读取；允许未来 Linear epilogue
-直接写分路输出，不要求先进行 activation split/copy。
+输入投影的三个重载及数学合同见 [`qsa.h`](../../include/ninfer/ops/qsa.h)。每个 parent
+仍作一次合并投影，epilogue 直接写出连续 BF16 分段，无 packed activation 中间结果、
+split/copy kernel 或 global scratch。各段至少 16-byte 对齐，可位于同一 allocation 的
+不重叠区域。Q/gate、K/V、index-Q、raw index-K 分别由 `[6144,M]`、`[512,M]`、
+`[512,M]`、`[128,M]` 零拷贝改 view 为后续的 `[256,24,T,B]`、`[256,2,T,B]`、
+`[128,4,T,B]`、`[128,T,B]`。
 
 ```mermaid
 flowchart TD
@@ -412,8 +416,9 @@ spec backend 类型，也不复用另一个 query 的 selection 来近似当前 
 
 | Buffer | 最后消费者 | 是否进入 checkpoint |
 |---|---|---|
-| packed Q/gate parent 输出 | Prepare 与 Sparse GQA 的 gate | 否 |
-| packed KV/index parent 输出 | Prepare（写完 cache/记录） | 否 |
+| 连续 raw Q、index-Q | Prepare；可原地变为 prepared Q、index-Q | 否 |
+| 连续 raw K/V、index-K | Prepare（写完 cache/记录） | 否 |
+| 连续 gate | Sparse GQA | 否 |
 | prepared Q、index-Q | Sparse GQA、Indexer | 否 |
 | selected blocks/count | 紧随其后的 Sparse GQA | 否 |
 | gated attention | O Linear | 否 |
@@ -422,15 +427,16 @@ spec backend 类型，也不复用另一个 query 的 selection 来近似当前 
 | committed/candidate tail | 相应恢复点/工作状态 | 只发布 committed 版本 |
 | main KV/index planes | history/replica owner | 按同一 coverage 保留 |
 
-Packed gate 可带 parent token stride，Sparse GQA 直接消费。未来 projection epilogue
-分流输出后可以缩短 packed parent 寿命，但不需要改变本设计的权重或数学。
+分段投影使各输出按自身消费者管理寿命，gate 不再延长其他投影结果的寿命。
+Prepare 的 Q/index-Q 可各自精确 alias 对应 raw 输入；不允许部分重叠。
 顺序互斥 Op scratch 可复用；prepared tensors、selection 和记录不能与仍存活的输入重叠。
 候选 raw records 不是 Prepare 的调用内临时空间，也不要求将所有其他激活保留到提交。
 
 ## 8. Op 接口
 
-目标头文件为 `include/ninfer/ops/qsa.h`。使用既有 Tensor、PagedKVBatchLayerView、
-KvCacheStorage、WorkspaceArena 和 DeviceExecutionView；所有声明位于 `ninfer::ops`。
+已实现的输入投影合同位于 `include/ninfer/ops/qsa.h`；以下声明是后续 Op 的设计。
+使用既有 Tensor、PagedKVBatchLayerView、KvCacheStorage、WorkspaceArena 和
+DeviceExecutionView；所有声明位于 `ninfer::ops`。
 接口按一个 QSA 层调用；层的选择、权重角色、记录 slab 切片及请求身份留在模型/Program。
 
 ### 8.1 公共 views
@@ -503,14 +509,15 @@ struct QsaIndexerExecutionEnvelope {
 ```
 
 Batch metadata、slots、offsets、base_positions、record valid_columns 和 selection 连续，
-这些整数 Tensor 均为 Device I32。Projection 与 gate 的 feature/head 连续，token/batch stride
-允许来自 packed parent；tail/record views 允许层切片造成的 slot/batch 间隙。Strides
-为正、元素不重叠并满足各 dtype 对齐。不得把非连续切片强行 contiguous reshape。
+这些整数 Tensor 均为 Device I32。Projection 与 gate 完全连续，基地址至少 16-byte 对齐；
+tail/record views 允许层切片造成的 slot/batch 间隙。Strides 为正、元素不重叠并满足各 dtype
+对齐。不得把非连续切片强行 contiguous reshape。
 
 Prepared Q/index-Q 和 Sparse GQA 输出完全连续，基地址至少 16-byte 对齐。
 Tensor 在现有类型中不携带 C++ const
-数据指针；只读/可写性质由下述合同决定。只读输入可以共用 backing；可写区域不得覆盖
-任何仍被读取的输入。两个 cache 子 view 使用相同的 block-table 地址、shape 与 strides。
+数据指针；只读/可写性质由下述合同决定。只读输入可以共用 backing；除 Prepare 的
+Q/index-Q 精确 alias 特例外，可写区域不得覆盖任何仍被读取的输入。
+两个 cache 子 view 使用相同的 block-table 地址、shape 与 strides。
 
 ### 8.2 Prepare
 
@@ -536,6 +543,8 @@ void qsa_prepare(
 
 - 各 shape 的 T/B 一致，主 cache Dq=256/Hkv=2，index cache 为本设计的 BF16 plane。
   epsilon、theta 正且有限；Flash-Next 使用声明中的值。
+- query/index_query 可各自与 projected 的对应输入精确同址、同 shape/strides；其他
+  输出、records、cache 与输入互不重叠。
 - 非空行的 before 对应 p[0,b] 的规范 tail；caller 保证该前沿与已绑定历史对应。
   当前写区间已 reserve/materialize，受保护页已经 COW。
 - `0≤offsets[b]` 且 `offsets[b]+n[b]≤R`。多次写一份记录时，caller 保证其
@@ -551,9 +560,9 @@ void qsa_prepare(
   `[floor(p[0,b]/4), floor((p[0,b]+n[b])/4))` 的 index rows。n[b]=0 不写 cache。
 - 将有效 raw index-K 逐 word 写入对应 records 区间，并保存该 token 的三轴 RoPE 坐标；
   A=1 时复制同一坐标到三轴。不修改 offsets/valid counts，不写 inert 记录列。
-- before、投影、norm、输入位置、页表均不变；不更新 canonical tail、pool metadata、
-  committed coverage 或 request frontier。
-- 可写 Q/index-Q、records、cache planes 彼此不重叠，也不与输入/旧 tail 重叠。
+- 除原地更新的 Q/index-Q 外，before、投影、norm、输入位置、页表均不变；不更新
+  canonical tail、pool metadata、committed coverage 或 request frontier。
+- 可写 Q/index-Q、records、cache planes 彼此不重叠；除上述精确 alias 外，不与输入/旧 tail 重叠。
   不同有效 batch 行的物理写区间不重叠；共享的已提交前缀只读。
 
 Prepare 不需要 caller-owned global scratch；局部 reductions/codec 暂存属于 kernel
@@ -612,7 +621,7 @@ namespace ninfer::ops {
 
 void qsa_sparse_gqa(
     const Tensor& query,                 // BF16 [256,24,T,B]
-    const Tensor& output_gate,           // BF16 [256,24,T,B]，可带 parent strides
+    const Tensor& output_gate,           // 连续 BF16 [256,24,T,B]
     const PagedKVBatchLayerView& cache,
     const QsaBatchView& batch,
     const QsaBlockSelection& selected,
@@ -726,9 +735,9 @@ Indexer 在长上下文仍扫描全部可见 compressed keys。256K 上下文每
 不代表实测流量或时间。Prefill 可跨 query 复用 index key tiles，并分块复用分数 scratch。
 Shared page 的 index 行每页 16 个，tuning 必须考虑跨多个物理页的读取，不假设连续 IDs。
 
-Q/gate 与 KV/index 的持久 parent 已确定；允许改变 activation 输出组织及融合 kernel
-组织，不重新拆分/复制持久权重。缓存 codec、tail 的表示、selected ID 单位与状态寿命
-属于本合同，不能被 tuning 参数暗中改变。
+持久 parent 行序与投影各段的连续输出布局已确定；私有 kernel 组织可调整，
+不重新拆分/复制持久权重。缓存 codec、tail 的表示、selected ID 单位与状态寿命
+同样属于本合同，不能被 tuning 参数暗中改变。
 
 ## 11. 实现验收
 
@@ -756,7 +765,7 @@ Q/gate 与 KV/index 的持久 parent 已确定；允许改变 activation 输出�
 | 四-token 边界 | F%4=0/1/2/3；一次无/一/多完整块；首块跨调用；所有 a=0..u |
 | 因果选块 | 可见长度 1/3/4/5、2047..2053；未来已写块含极大分数但仍不可选 |
 | 页边界 | 63/64/65、255/256/257；index 槽 15→下一页 0；物理 IDs 打乱 |
-| Batch/视图 | B=1..8、T=1 与多列、不同 live counts、全 inert、非连续 parent/state/record 切片 |
+| Batch/视图 | B=1..8、T=1 与多列、不同 live counts、全 inert、连续投影分段、state/record 层切片、Q/index-Q 精确 alias |
 | RoPE | 1-D、不同三轴坐标、块首在旧 tail、非零坐标偏移；logical p 与 ρ 明显不同 |
 | Selection | 无完整块、全选、512 块、任意顺序、同分；padding IDs 故意放无效值且不可读 |
 | 事务 | F0=6/u=4/a=1 等跨块回退、同槽/异槽提取、共享 source、Frontend 截断与 abort |

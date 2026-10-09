@@ -106,6 +106,7 @@ ninfer_add_op_test(ninfer_linear_dynamic_grouped_conv_add_test
   LIBRARIES ninfer_ops)
 
 include("${CMAKE_CURRENT_LIST_DIR}/linear/tests.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/softmax_attention/qsa/tests.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/linear_add/tests.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/linear_pair/tests.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/linear_swiglu/tests.cmake")

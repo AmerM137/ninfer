@@ -23,3 +23,5 @@ target_sources(ninfer_ops PRIVATE
 target_sources(ninfer_nvfp4_non_rdc PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/nvfp4/tiled_launch.cu"
 )
+
+include("${CMAKE_CURRENT_LIST_DIR}/qsa/sources.cmake")

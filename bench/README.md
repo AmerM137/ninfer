@@ -894,6 +894,28 @@ cmake --build build -j --target ninfer_attn_input_proj_bench
 The stateful GDN projection/convolution/snapshot contract remains in its own public Op benchmark;
 it is not a mode of Attention input projection. End-to-end target measurement uses `ninfer_bench`.
 
+## QSA input-projection Op benchmark
+
+`ninfer_qsa_bench` compares the three public A16 `qsa_input_proj()` overloads with the corresponding
+contiguous-output `linear()` calls. `--projection qg|kv-index|qkgv-index|all` selects Q8 `[12288,2560]`,
+BF16 `[1664,2560]`, or BF16 `[13952,2560]`. `--entry split|linear|both` selects the public entries;
+`both` reuses identical weights, inputs, and total output storage and alternates entry order by round.
+The split entry writes each contiguous segment directly and uses zero global workspace.
+
+Timing uses `op_measurement.cuh`: Graph body and eager latency, cold/warm cache, Host submission,
+and actual Graph kernel count. Cold measurements evict 256 MiB before timing. CSV rows include the
+projection and round; fixture creation is outside timing. This measures input projection only.
+
+```bash
+cmake --build build -j --target ninfer_qsa_bench
+./build/bench/ninfer_qsa_bench --projection all --entry both --sweep 1:128 \
+  --rounds 3 --warmup 10 --repeat 100 --execution graph --cache both \
+  --csv-out out/bench/qsa_small.csv
+./build/bench/ninfer_qsa_bench --tokens 256,512,1024,2048,4096 \
+  --rounds 3 --warmup 10 --repeat 100 --execution both --cache both \
+  --csv-out out/bench/qsa_prefill.csv
+```
+
 ## 35B sparse-MoE dFlash benchmark
 
 `ninfer_sparse_moe_bench` measures the complete routed-plus-shared post-mixer Op for the 35B Text
