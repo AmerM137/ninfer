@@ -1,4 +1,4 @@
-#include "ninfer/ops/scatter.h"
+#include "ninfer/ops/indexing.h"
 #include "core/decode_graph.h"
 #include "core/device.h"
 #include "ops/op_tester.h"

@@ -1,4 +1,4 @@
-#include "ninfer/ops/scatter.h"
+#include "ninfer/ops/indexing.h"
 #include "ninfer/ops/speculative_round.h"
 #include "core/device.h"
 #include "core/decode_graph.h"
@@ -90,10 +90,10 @@ int extract_case(std::int32_t source_rows, std::int32_t destination_rows,
     device_destination.fill(0xcd);
     Tensor source_tensor(device_source.data(), DType::BF16, {source_rows, tokens});
     Tensor destination_tensor(device_destination.data(), DType::BF16, {destination_rows, tokens});
-    ops::extract_bf16_columns(source_tensor, source_offset, destination_tensor, nullptr);
+    ops::extract_bf16_features(source_tensor, source_offset, destination_tensor, nullptr);
     cuda_synchronize();
 
-    const std::string label = "extract_bf16_columns source=" + std::to_string(source_rows) +
+    const std::string label = "extract_bf16_features source=" + std::to_string(source_rows) +
                               " offset=" + std::to_string(source_offset) +
                               " rows=" + std::to_string(destination_rows) +
                               " T=" + std::to_string(tokens);
@@ -172,6 +172,6 @@ int main() {
     failures += scatter_case(2048, {5, 1, 3}, 7);
     failures += extract_case(10240, 6144, 4096, 6);
     failures += extract_case(8192, 2048, 2048, 1);
-    std::cout << (failures ? "FAIL" : "OK") << " scatter and extract_bf16_columns\n";
+    std::cout << (failures ? "FAIL" : "OK") << " scatter and extract_bf16_features\n";
     return failures ? 1 : 0;
 }

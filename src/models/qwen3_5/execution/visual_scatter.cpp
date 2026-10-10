@@ -1,7 +1,7 @@
 #include "models/qwen3_5/execution/visual_scatter.h"
 
 #include "core/device.h"
-#include "ninfer/ops/scatter.h"
+#include "ninfer/ops/indexing.h"
 
 #include <stdexcept>
 

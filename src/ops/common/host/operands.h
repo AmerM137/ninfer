@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/tensor.h"
 #include "core/weight.h"
 
 #include <cstddef>
@@ -14,6 +15,23 @@ namespace ninfer::ops::common::operand {
 struct Range {
     std::uintptr_t begin, end;
 };
+
+inline std::int64_t numel(const Tensor& tensor, const char* op) {
+    bool empty = false;
+    for (const auto extent : tensor.ne) {
+        if (extent < 0)
+            throw std::invalid_argument(std::string(op) + ": negative tensor dimension");
+        empty |= extent == 0;
+    }
+    if (empty) return 0;
+    std::int64_t count = 1;
+    for (const auto extent : tensor.ne) {
+        if (count > std::numeric_limits<std::int64_t>::max() / extent)
+            throw std::overflow_error(std::string(op) + ": tensor size overflows int64");
+        count *= extent;
+    }
+    return count;
+}
 
 inline bool aligned(const void* pointer, std::size_t alignment) noexcept {
     return pointer && (reinterpret_cast<std::uintptr_t>(pointer) & (alignment - 1)) == 0;

@@ -12,7 +12,7 @@ set(ninfer_op_tests
   embedding
   argmax
   rope
-  vision_pos_embed
+  embedding_interpolate_add
   sampling
   scalar
   cast

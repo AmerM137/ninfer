@@ -6,7 +6,7 @@
 #include "ninfer/ops/gdn_replay.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/scalar.h"
-#include "ninfer/ops/scatter.h"
+#include "ninfer/ops/indexing.h"
 #include "ninfer/ops/speculative_round.h"
 
 #include <algorithm>

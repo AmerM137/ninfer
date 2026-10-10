@@ -283,7 +283,7 @@ selector. Device-resident per-row lengths stay Device inputs under the Op's capt
   entry, selection, launch and private kernels together in one `.cu`. Use an anonymous namespace
   for local implementation. Extract a `.cuh` only when there is an actual template-sharing or
   source-size reason; do not create forwarding headers and empty plan types.
-- **Templated family:** [RMSNorm](../../src/ops/rmsnorm/sources.cmake) has semantic entries,
+- **Templated family:** [RMSNorm](../../src/ops/normalization/rmsnorm/sources.cmake) has semantic entries,
   operand validation, one dispatch owner, launch bindings and shared kernel bodies. Ordinary,
   offset and gated mathematical forms share appropriate reductions and epilogues. Tuned dimension
   and workload cutoffs live in dispatch, not in the launch bindings.
@@ -338,11 +338,10 @@ For example, an E4M3 conversion belongs to shared numeric/format support; a GEMM
 to Linear. Sharing either does not introduce a model-callable private backend or an intermediate
 numerical boundary. The consuming Op chooses its arithmetic profile and tuned implementation.
 
-Elementwise, RMSNorm and Linear consume the categorized foundation. Other families retain their
-existing helpers and call sites until their own reorganization; shared facilities needed by them
-may be supplied in advance. Keep those callers on their existing implementation rather than
-redirecting them through forwarding aliases. Remove an old provider after its remaining consumers
-migrate, and do not add new consumers to the old paths.
+Families awaiting reorganization retain their existing helpers and call sites until their own
+migration; shared facilities needed by them may be supplied in advance. Keep those callers on
+their existing implementation rather than redirecting them through forwarding aliases. Remove an
+old provider after its remaining consumers migrate, and do not add new consumers to the old paths.
 
 Preserve per-shape compilation units and explicit template ownership. File organization must not
 silently change RDC mode, architecture, compiler precision options or device-link ownership.

@@ -80,4 +80,10 @@ __device__ __forceinline__ __half2 half2_from_bits(std::uint32_t bits) {
     return load_vec<__half2>(&bits);
 }
 
+__device__ __forceinline__ float load_fp16_unaligned(const std::uint8_t* source) {
+    const auto bits =
+        static_cast<std::uint16_t>(source[0]) | (static_cast<std::uint16_t>(source[1]) << 8);
+    return __half2float(__ushort_as_half(static_cast<std::uint16_t>(bits)));
+}
+
 } // namespace ninfer::ops::common

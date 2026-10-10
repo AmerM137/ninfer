@@ -59,6 +59,45 @@ __device__ __forceinline__ float block_reduce_sum(float x, float* sums) {
     return x;
 }
 
+struct WelfordMoments {
+    float mean;
+    float m2;
+    int count;
+};
+
+__device__ __forceinline__ WelfordMoments welford_merge(WelfordMoments a, WelfordMoments b) {
+    if (b.count == 0) return a;
+    if (a.count == 0) return b;
+    const float delta = b.mean - a.mean;
+    const int count   = a.count + b.count;
+    const float ratio = static_cast<float>(b.count) / static_cast<float>(count);
+    return {a.mean + delta * ratio,
+            a.m2 + b.m2 +
+                delta * delta *
+                    (static_cast<float>(a.count) * static_cast<float>(b.count) /
+                     static_cast<float>(count)),
+            count};
+}
+
+__device__ __forceinline__ void welford_update(WelfordMoments& moments, float value) {
+    ++moments.count;
+    const float delta = value - moments.mean;
+    moments.mean += delta / static_cast<float>(moments.count);
+    moments.m2 += delta * (value - moments.mean);
+}
+
+__device__ __forceinline__ WelfordMoments warp_reduce_moments(WelfordMoments value) {
+    for (int offset = kWarpSize / 2; offset > 0; offset >>= 1) {
+        const WelfordMoments other{
+            __shfl_down_sync(kFullWarpMask, value.mean, offset),
+            __shfl_down_sync(kFullWarpMask, value.m2, offset),
+            __shfl_down_sync(kFullWarpMask, value.count, offset),
+        };
+        value = welford_merge(value, other);
+    }
+    return value;
+}
+
 // Finite score/id total order: larger scores win, ties prefer lower ids; signed
 // zero is canonicalized. Key zero is reserved below every valid score/id pair.
 struct ScoreIdOrderGreater {

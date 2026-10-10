@@ -29,7 +29,7 @@
 #include "ninfer/ops/rmsnorm.h"
 #include "ninfer/ops/rope.h"
 #include "ninfer/ops/sparse_moe.h"
-#include "ninfer/ops/scatter.h"
+#include "ninfer/ops/indexing.h"
 #include "ninfer/ops/scalar.h"
 #include "ninfer/ops/sigmoid_mul.h"
 #include "ninfer/ops/silu_mul.h"

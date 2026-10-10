@@ -1,5 +1,5 @@
 // Measures five public feature-slice captures into a strided lane-owned pool.
-#include "ninfer/ops/scatter.h"
+#include "ninfer/ops/indexing.h"
 #include "core/device.h"
 #include "ninfer_bench_common.h"
 

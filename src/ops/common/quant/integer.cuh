@@ -206,6 +206,16 @@ struct Q6RowSplitStorage {
                   "the high-bit plane must divide evenly across a group's chunks");
 };
 
+__device__ __forceinline__ int unpack_q6_code(const std::uint8_t* codes, const std::uint8_t* high,
+                                              int index) {
+    const std::uint8_t low_byte   = codes[index >> 1];
+    const std::uint32_t low       = (index & 1) ? (low_byte >> 4) : (low_byte & 0x0fu);
+    const int high_pos            = index * 2;
+    const std::uint32_t high_bits = (high[high_pos >> 3] >> (high_pos & 7)) & 0x03u;
+    const std::uint32_t value     = low | (high_bits << 4);
+    return (value & 0x20u) ? static_cast<int>(value) - 64 : static_cast<int>(value);
+}
+
 struct Q6SimtDecodeAtom {
     __device__ static __forceinline__ void decode_eight(std::uint32_t packed,
                                                         std::uint16_t high_bits,
@@ -280,6 +290,12 @@ struct Q8RowSplitStorage {
     static constexpr int kHighBytesPerGroup  = 0;
     static constexpr int kScaleBytesPerGroup = 2;
 };
+
+__device__ __forceinline__ __nv_bfloat162 dequant_q8_pair(std::uint16_t packed, float scale) {
+    const auto lo = static_cast<std::int8_t>(packed & 0xffu);
+    const auto hi = static_cast<std::int8_t>(packed >> 8);
+    return __floats2bfloat162_rn(static_cast<float>(lo) * scale, static_cast<float>(hi) * scale);
+}
 
 struct Q8ScalarDecodeAtom {
     static constexpr int kGroupK = Q8RowSplitStorage::kGroupK;

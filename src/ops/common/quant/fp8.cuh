@@ -37,6 +37,12 @@ __device__ __forceinline__ float decode_e4m3(std::uint8_t storage) {
     return static_cast<float2>(value).x;
 }
 
+__device__ __forceinline__ float2 fp8_code2_to_float2(std::uint16_t storage) {
+    __nv_fp8x2_e4m3 value;
+    value.__x = storage;
+    return static_cast<float2>(value);
+}
+
 // Codes use the reciprocal of the represented FP16 scale; nonzero scales clamp to
 // [2^-24, 65504] before FP16-RNE. A zero absmax produces a zero scale and codes.
 struct Fp8Fp16Scale {

@@ -12,7 +12,7 @@
 #include "ninfer/ops/residual_add.h"
 #include "ninfer/ops/rope.h"
 #include "ninfer/ops/softmax_attention.h"
-#include "ninfer/ops/vision_pos_embed.h"
+#include "ninfer/ops/embedding.h"
 
 #include <algorithm>
 #include <cmath>
@@ -334,7 +334,7 @@ void VisionContext::encode(const VisionItemView& item, Tensor& output, DeviceSpa
         copy_host(control.position_table_weights.data(), pos_weights, stream);
         Tensor position_table = parameters_.position_embedding.reshape(
             {dimension(config_.hidden_size), dimension(config_.num_position_embeddings)});
-        ops::vision_pos_embed_add(position_table, pos_indices, pos_weights, x, stream);
+        ops::embedding_interpolate_add(position_table, pos_indices, pos_weights, x, stream);
     }
     for (std::size_t layer = 0; layer < parameters_.layers.size(); ++layer) {
         nvtx::ScopedRange layer_range(nvtx::Name::VisionLayer, nvtx::Category::Vision,

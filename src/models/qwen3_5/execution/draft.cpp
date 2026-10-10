@@ -25,7 +25,7 @@
 #include "ninfer/ops/rmsnorm.h"
 #include "ninfer/ops/rope.h"
 #include "ninfer/ops/scalar.h"
-#include "ninfer/ops/scatter.h"
+#include "ninfer/ops/indexing.h"
 #include "ninfer/ops/sliding_window_attention.h"
 #include "ninfer/ops/softmax_attention.h"
 #include "ninfer/ops/speculative_round.h"

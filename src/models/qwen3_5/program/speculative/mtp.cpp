@@ -4,7 +4,7 @@
 #include "models/qwen3_5/program/execution_context.h"
 #include "core/nvtx.h"
 #include "ninfer/ops/mtp_round.h"
-#include "ninfer/ops/scatter.h"
+#include "ninfer/ops/indexing.h"
 #include "ninfer/ops/scalar.h"
 #include <cuda_runtime.h>
 #include <stdexcept>

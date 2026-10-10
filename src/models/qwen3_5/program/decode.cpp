@@ -7,7 +7,7 @@
 #include "core/device.h"
 #include "ninfer/ops/prepare_ragged_prefix.h"
 #include "ninfer/ops/sampling.h"
-#include "ninfer/ops/scatter.h"
+#include "ninfer/ops/indexing.h"
 
 #include <algorithm>
 #include <chrono>

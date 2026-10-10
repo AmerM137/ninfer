@@ -1,4 +1,4 @@
-#include "ninfer/ops/scatter.h"
+#include "ninfer/ops/indexing.h"
 #include "op_measurement.cuh"
 
 #include <cuda_runtime.h>
