@@ -40,8 +40,6 @@ void validate_weights(const WeightOperands& weights);
 void validate_interval(std::int32_t first, std::int32_t last);
 void validate_batch_interval(Publication publication, std::int32_t batch, std::int32_t first,
                              std::int32_t last);
-void validate_projection(const Tensor& x, const WeightOperands& weights,
-                         const GdnProjectionOutputs& outputs);
 Batch validate_convolution(const Tensor& x, const WeightOperands& weights,
                            const Tensor& convolution, const Tensor& history,
                            const Tensor& source_slots, const Tensor& valid_columns,

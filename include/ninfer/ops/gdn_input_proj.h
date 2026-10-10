@@ -11,11 +11,6 @@
 
 namespace ninfer::ops {
 
-struct GdnProjectionOutputs {
-    Tensor qkv;
-    Tensor z;
-};
-
 struct GdnConvOutputs {
     Tensor query, key, value, z;
 };
@@ -32,45 +27,6 @@ struct GdnConvSnapshotState {
 };
 
 /**
- * Op: gdn_input_proj
- *
- * Math / indexing:
- *   qkv[:,m] = concat(Wq*x[:,m], Wk*x[:,m], Wv*x[:,m]); z[:,m] = Wz*x[:,m].
- *   The logical row order is [query,key,value,z]. Q and K each have 2048 rows.
- *
- * Supported weights / geometry (H=input rows, V=value/z rows, C=4096+V):
- *   Single Q8_G32_FP16 RowSplit [12288,2048]: H=2048, V=4096.
- *   Single Q8_G32_FP16 RowSplit [16384,2560]: H=2560, V=6144.
- *   Single NVFP4 BlockScaleK16M128x4 or FP8_E4M3FN_ROW_BF16 RowScale
- *     [16384,5120]: H=5120, V=6144.
- *   Paired Q4_G64_FP16 RowSplit [4096,5120] for [q,k] and Q5_G64_FP16
- *     RowSplit [12288,5120] for [v,z]: H=5120, V=6144.
- *   Paired operands use A16. Single-parent policy is an activation-compute permission;
- *   Q8 uses A16, FP8 may use A8 when permitted, and NVFP4 may use A4 when permitted.
- *
- * Logical shapes / numeric:
- *   x BF16 [H,M], qkv BF16 [C,M], z BF16 [V,M], contiguous and 16-byte aligned.
- *   M may be any positive representable column count. Weights are decoded according to
- *   their represented format. The outputs approximate the complete matrix products;
- *   internal precision and staging are private implementation choices.
- *
- * Effects / workspace / execution:
- *   Writes both complete outputs; inputs and weight storage are read-only. Tensor operands
- *   are mutually disjoint and do not overlap either weight parent or this call's scratch.
- *   workspace is caller-owned; only a scoped allocation from its current cursor is used.
- *   Existing allocations preceding that cursor may contain inputs or outputs. A zero
- *   capacity performs no allocation. Calls and capacity queries consume the same prepared
- *   weights. Execution uses stream and supports CUDA Graph capture/replay.
- */
-void gdn_input_proj(const Tensor& x, const ProjectionWeights& weights, GdnProjectionOutputs outputs,
-                    WorkspaceArena& workspace, cudaStream_t stream);
-
-/** Minimum call-local capacity covering every M in the inclusive positive interval. */
-[[nodiscard]] std::size_t gdn_input_proj_workspace_capacity_bytes(const ProjectionWeights& weights,
-                                                                  std::int32_t min_columns,
-                                                                  std::int32_t max_columns);
-
-/**
  * Op: gdn_input_proj_conv_snapshot
  *
  * Math / indexing:
@@ -81,7 +37,12 @@ void gdn_input_proj(const Tensor& x, const ProjectionWeights& weights, GdnProjec
  *   snapshot_bases[b]+t. Z bypasses convolution.
  *
  * Logical shapes / supported domain:
- *   The weight representations and H/V/C geometries are those of gdn_input_proj.
+ *   H=input rows, V=value/z rows, C=4096+V. Single Q8-G32/FP16 weights use
+ *   [12288,2048] (V=4096) or [16384,2560] (V=6144). FP8 row-scale and NVFP4
+ *   block-scale weights use [16384,5120] (V=6144). Paired Q4-G64/FP16 [4096,5120]
+ *   and Q5-G64/FP16 [12288,5120] use V=6144. The logical row order is [q,k,v,z].
+ *   Q8 and paired weights use A16. Single-parent LinearPolicy permits A8 for FP8
+ *   or A4 for NVFP4; the implementation selects its internal precision.
  *   x BF16 [H,T,B], conv_weight BF16 [C,4], history BF16 [C,3,S],
  *   query/key BF16 [2048,T,B], value/z BF16 [V,T,B]. All are contiguous and 16-byte
  *   aligned. Selectors are contiguous device I32 [B]. B=1 accepts every positive T;
@@ -100,8 +61,9 @@ void gdn_input_proj(const Tensor& x, const ProjectionWeights& weights, GdnProjec
  *   of the tensors. Device selector values and cross-row slot relationships are caller promises.
  *
  * Workspace / execution:
- *   Uses scoped caller storage as in gdn_input_proj. The capacity query includes the complete
- *   computation. Capture/replay uses the supplied stream and consumes device metadata at replay.
+ *   Uses scoped storage at the caller arena cursor; earlier allocations may hold operands.
+ *   A zero capacity performs no allocation. The query covers the complete computation.
+ * Capture/replay uses the supplied stream and consumes device metadata at replay.
  */
 void gdn_input_proj_conv_snapshot(const Tensor& x, const ProjectionWeights& weights,
                                   const Tensor& conv_weight, GdnConvSnapshotState state,

@@ -1,4 +1,5 @@
 target_sources(ninfer_ops PRIVATE
+  "${CMAKE_CURRENT_LIST_DIR}/q8/projection_n16384_k2560.cu"
   "${CMAKE_CURRENT_LIST_DIR}/execute.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/fp8/fp8_gdn_conv_fused.cu"
   "${CMAKE_CURRENT_LIST_DIR}/fp8/fp8_gdn_input_a8.cu"

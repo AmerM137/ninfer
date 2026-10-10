@@ -3,7 +3,7 @@
 
 #include "core/device.h"
 #include "ops/common/math.h"
-#include "ops/common/rowsplit_grouped_mma.cuh"
+#include "ops/linear/kernels/rowsplit/rowsplit_grouped_mma.cuh"
 #include "ops/common/token_slices.h"
 
 #include <cstdint>

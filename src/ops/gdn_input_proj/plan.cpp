@@ -51,13 +51,6 @@ ConvPlan resolve_conv_plan(const WeightOperands& weights, Batch batch) {
     return plan;
 }
 
-std::size_t projection_capacity(const WeightOperands& weights, std::int32_t first,
-                                std::int32_t last) {
-    validate_interval(first, last);
-    // Quantized activation planes and partial capacity grow monotonically with M.
-    return workspace_bytes(weights, resolve_projection_plan(weights, last), last);
-}
-
 std::size_t convolution_capacity(const WeightOperands& weights, Publication publication,
                                  std::int32_t batch, std::int32_t first, std::int32_t last) {
     validate_batch_interval(publication, batch, first, last);

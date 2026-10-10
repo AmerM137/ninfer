@@ -1,7 +1,7 @@
 #pragma once
 // BF16 control dots, optional input norm, and the complete control epilogue.
 #include "ops/common/math.cuh"
-#include "ops/common/rowsplit_mma.cuh"
+#include "ops/linear/kernels/rowsplit/rowsplit_mma.cuh"
 #include "ops/common/warp.cuh"
 
 #include <cuda_bf16.h>

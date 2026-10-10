@@ -31,12 +31,14 @@ using FfnParameters = std::variant<DenseParameters, ops::SparseMoeWeights>;
 
 struct AttentionParameters {
     ops::ProjectionWeights projection;
+    std::array<std::int32_t, 4> projection_rows;
     Tensor query_norm, key_norm;
     LinearParameters output;
 };
 
 struct GdnParameters {
     ops::ProjectionWeights projection;
+    std::array<std::int32_t, 2> projection_rows;
     ops::ProjectionWeights control;
     Tensor a_log, dt_bias, convolution, norm;
     LinearParameters output;
@@ -58,8 +60,9 @@ struct TextParameters {
 
 struct MtpProjectionParameters {
     LinearParameters packed;
+    std::array<std::int32_t, 4> output_rows;
     // Dense MTP projects K/V and Q/gate independently in its incremental path.
-    // MoE MTP uses its existing complete-parent Attention projection.
+    // MoE MTP uses a complete-parent LinearSplit.
     std::optional<std::array<LinearParameters, 4>> rows;
 };
 

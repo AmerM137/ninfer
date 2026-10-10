@@ -2,6 +2,7 @@
 #include "artifact/fixture.h"
 #include "artifact/reader.h"
 #include "models/qwen3_5/load.h"
+#include "ninfer/ops/linear_split.h"
 
 #include <cuda_runtime.h>
 
@@ -76,6 +77,14 @@ void check_selection(const qwen::LoadPlan& plan, const LoadOptions& options) {
 
 // Exercise native grouping after Reader destruction, independently of Program selection.
 void check_native_inputs(const qwen::Model& model) {
+    const auto split = [](std::span<const ops::WeightInput> inputs, bool two_outputs) {
+        const auto weights = ops::prepare_projection_weights(inputs);
+        std::vector<std::int32_t> rows;
+        for (const auto& input : inputs)
+            rows.push_back(static_cast<std::int32_t>(input.weight.shape[0]));
+        if (two_outputs) rows = {rows[0] + rows[1] + rows[2], rows[3]};
+        return ops::linear_split_workspace_capacity_bytes(weights, rows, 1, 1);
+    };
     const auto linear = [&](qwen::WeightId id) {
         return ops::prepare_linear_weight(model.input(id));
     };
@@ -91,15 +100,19 @@ void check_native_inputs(const qwen::Model& model) {
                 (void)ops::prepare_linear_weight(bank);
                 for (const auto& input : bank) { (void)ops::prepare_linear_weight(input); }
             } else {
-                (void)ops::prepare_attn_input_proj_weights(
-                    model.input(attention->query), model.input(attention->key),
-                    model.input(attention->gate), model.input(attention->value));
+                (void)split(std::array<ops::WeightInput, 4>{{model.input(attention->query),
+                                                             model.input(attention->key),
+                                                             model.input(attention->gate),
+                                                             model.input(attention->value)}},
+                            false);
             }
             (void)linear(attention->output);
         } else {
             const auto& gdn = std::get<qwen::GdnWeights>(weights.mixer);
-            (void)ops::prepare_gdn_input_proj_weights(model.input(gdn.query), model.input(gdn.key),
-                                                      model.input(gdn.value), model.input(gdn.z));
+            (void)split(
+                std::array<ops::WeightInput, 4>{{model.input(gdn.query), model.input(gdn.key),
+                                                 model.input(gdn.value), model.input(gdn.z)}},
+                true);
             (void)ops::prepare_gdn_control_proj_weights(model.input(gdn.a_projection),
                                                         model.input(gdn.b_projection));
             (void)linear(gdn.output);
@@ -148,8 +161,9 @@ void check_native_inputs(const qwen::Model& model) {
         (void)linear(draft.feature_projection);
         for (const auto& layer : draft.layers) {
             const auto& a = layer.attention;
-            (void)ops::prepare_attn_input_proj_weights(model.input(a.query), model.input(a.key),
-                                                       model.input(a.value));
+            (void)split(std::array<ops::WeightInput, 3>{{model.input(a.query), model.input(a.key),
+                                                         model.input(a.value)}},
+                        false);
             const std::array kv{model.input(a.context_key), model.input(a.context_value)};
             (void)ops::prepare_linear_weight(kv);
             (void)linear(a.output);

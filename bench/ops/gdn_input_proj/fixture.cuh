@@ -31,22 +31,17 @@ struct Fixture {
         : options(o), weights(weights), tokens(t), value_rows((o.n - 4096) / 2),
           channels(4096 + value_rows), columns(t * o.batch), slots(columns + o.batch),
           x(make_bf16(std::size_t(o.k) * columns, 101U)),
-          qkv(o.op == "projection" ? make_zeros(std::size_t(channels) * columns * 2)
-                                   : DeviceBuffer{}),
           z(make_zeros(std::size_t(value_rows) * columns * 2)),
-          conv(o.op != "projection" ? make_bf16(std::size_t(channels) * 4, 103U) : DeviceBuffer{}),
-          history(o.op != "projection" ? make_bf16(std::size_t(channels) * 3 * slots, 107U)
-                                       : DeviceBuffer{}),
+          conv(make_bf16(std::size_t(channels) * 4, 103U)),
+          history(make_bf16(std::size_t(channels) * 3 * slots, 107U)),
           saved(o.op == "snapshot" ? std::make_unique<SavedBuffer>(history) : nullptr),
-          q(o.op != "projection" ? make_zeros(std::size_t(2048) * columns * 2) : DeviceBuffer{}),
-          k(o.op != "projection" ? make_zeros(std::size_t(2048) * columns * 2) : DeviceBuffer{}),
-          v(o.op != "projection" ? make_zeros(std::size_t(value_rows) * columns * 2)
-                                 : DeviceBuffer{}),
+          q(make_zeros(std::size_t(2048) * columns * 2)),
+          k(make_zeros(std::size_t(2048) * columns * 2)),
+          v(make_zeros(std::size_t(value_rows) * columns * 2)),
           records(o.op == "record" ? make_zeros(std::size_t(channels) * columns * 2)
                                    : DeviceBuffer{}),
           capacity(workspace_capacity()), arena(256 + capacity) {
         arena.alloc_bytes(256);
-        if (o.op == "projection") return;
         std::vector<int> sources(o.batch), bases(o.batch);
         for (int b = 0; b < o.batch; ++b) {
             sources[b] = columns + b;
@@ -58,8 +53,6 @@ struct Fixture {
     }
 
     std::size_t workspace_capacity() const {
-        if (options.op == "projection")
-            return ops::gdn_input_proj_workspace_capacity_bytes(weights, tokens, tokens);
         if (options.op == "snapshot")
             return ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
                 weights, options.batch, tokens, tokens);
@@ -72,13 +65,6 @@ struct Fixture {
     }
 
     void launch(cudaStream_t s) {
-        if (options.op == "projection") {
-            ops::gdn_input_proj(Tensor(x.p, DType::BF16, {options.k, tokens}), weights,
-                                {Tensor(qkv.p, DType::BF16, {channels, tokens}),
-                                 Tensor(z.p, DType::BF16, {value_rows, tokens})},
-                                arena, s);
-            return;
-        }
         const int b = options.batch;
         Tensor input(x.p, DType::BF16, {options.k, tokens, b}),
             weight(conv.p, DType::BF16, {channels, 4});
@@ -103,7 +89,7 @@ struct Fixture {
     const Options& options;
     const ops::ProjectionWeights& weights;
     int tokens, value_rows, channels, columns, slots;
-    DeviceBuffer x, qkv, z, conv, history;
+    DeviceBuffer x, z, conv, history;
     std::unique_ptr<SavedBuffer> saved;
     DeviceBuffer q, k, v, records, source, base, valid;
     std::size_t capacity;

@@ -1,12 +1,14 @@
 #include "models/qwen3_5/execution/gdn.h"
 #include "ninfer/ops/gdn_control.h"
 #include "ninfer/ops/gdn_input_proj.h"
+#include "ninfer/ops/linear_split.h"
 
 namespace ninfer::models::qwen3_5::execution {
 
 std::size_t gdn_projection_workspace_bytes(const GdnParameters& parameters, std::int32_t first,
                                            std::int32_t last) {
-    return ops::gdn_input_proj_workspace_capacity_bytes(parameters.projection, first, last);
+    return ops::linear_split_workspace_capacity_bytes(parameters.projection,
+                                                      parameters.projection_rows, first, last);
 }
 
 std::size_t gdn_snapshot_workspace_bytes(const GdnParameters& parameters, std::int32_t batch,
@@ -23,7 +25,8 @@ std::size_t gdn_record_workspace_bytes(const GdnParameters& parameters, std::int
 
 void gdn_projection(const Tensor& hidden, const GdnParameters& parameters, Tensor& qkv, Tensor& z,
                     WorkspaceArena& workspace, cudaStream_t stream) {
-    ops::gdn_input_proj(hidden, parameters.projection, {qkv, z}, workspace, stream);
+    std::array outputs{qkv, z};
+    ops::linear_split(hidden, parameters.projection, outputs, workspace, stream);
 }
 
 void gdn_norm_control(const Tensor& residual, const Tensor& norm, float epsilon,

@@ -543,16 +543,14 @@ Common flags are `--execution graph|eager|both`, `--cache cold|warm|both`, `--wa
 `--tokens` accepts an exact extent or comma-separated list; `--sweep START:END[:STEP]` accepts an
 inclusive interval. Capacity and actual workspace high-water are reported separately.
 
-`ninfer_gdn_input_proj_bench` selects `--op projection|snapshot|record`. `--format` and the actual
+`ninfer_gdn_input_proj_bench` selects `--op snapshot|record`. `--format` and the actual
 `--n`/`--k` identify the stored matrix; `--policy a16|allow-a8|allow-a4` reports the caller's
 activation permission. Supported geometries are Q8 `[12288,2048]` and `[16384,2560]`, and
 Q4/Q5, FP8, or NVFP4 `[16384,5120]`. Q4/Q5 uses the two stored parents `[4096,5120]` and
-`[12288,5120]`. Projection uses M; convolution uses physical T and B, with optional device
+`[12288,5120]`. Convolution uses physical T and B, with optional device
 valid-prefix extents supplied by `--valid-columns`.
 
 ```bash
-./build/bench/ninfer_gdn_input_proj_bench \
-  --op projection --format q8 --n 16384 --k 2560 --tokens 1,16,1024,2048,4096 --cache cold
 ./build/bench/ninfer_gdn_input_proj_bench \
   --op snapshot --format nvfp4 --n 16384 --k 5120 --policy allow-a4 --sweep 1:17
 ./build/bench/ninfer_gdn_input_proj_bench \
@@ -939,12 +937,12 @@ cmake --build build --parallel --target ninfer_fp8_linear_add_bench
   --warmup 5 --repeat 30
 ```
 
-## Attention input-projection Op benchmark
+## LinearSplit benchmarks
 
-`ninfer_attn_input_proj_bench` measures every registered public `attn_input_proj()` weight/shape
-contract: the 27B two-parent Q4/Q5 projection; the 35B Q8 Q/K/gate/V and companion Q/K/V
-projections; the DFlash2 Q8 `[6144,5120]` Q/K/V projection; and the 27B BF16, NVFP4, and FP8
-single-parent Q/K/gate/V projections. Fixture packing and public workspace capacity queries happen
+`ninfer_linear_split_multi_output_bench` measures the three/four-output forms of public
+`linear_split()`: Q4/Q5 `[7168+7168,5120]`; Q8 `[9216,2048]`, `[6144,2048]` and
+`[6144,5120]`; and BF16, NVFP4 and FP8 `[14336,5120]`.
+Fixture packing and public workspace capacity queries happen
 before timing. Every sample and profiler range contains exactly one public Op call, so production
 owns format-specific dispatch and launch decomposition.
 `--execution eager` (default) times the public call; `--execution graph` captures that call and
@@ -959,24 +957,32 @@ allocation reserved for the entire requested sweep. Logical GB/s counts semantic
 bytes; it is not a measured DRAM utilization percentage.
 
 ```bash
-cmake --build build -j --target ninfer_attn_input_proj_bench
-./build/bench/ninfer_attn_input_proj_bench \
+cmake --build build -j --target ninfer_linear_split_multi_output_bench
+./build/bench/ninfer_linear_split_multi_output_bench \
   --format all --tokens 1,2,4,8,12,16,32,64,128,256,512,1024 \
   --cache cold --warmup 10 --repeat 50 \
-  --csv-out profiles/bench/attn_input_proj.csv
-./build/bench/ninfer_attn_input_proj_bench \
+  --csv-out profiles/bench/linear_split.csv
+./build/bench/ninfer_linear_split_multi_output_bench \
   --format nvfp4 --nvfp4-policy a4 --tokens 1024 \
   --cache cold --warmup 10 --profile
-./build/bench/ninfer_attn_input_proj_bench \
+./build/bench/ninfer_linear_split_multi_output_bench \
   --format fp8 --fp8-policy a8 --tokens 1,5,32,64,65,96,128 \
   --cache cold --warmup 10 --repeat 50
-./build/bench/ninfer_attn_input_proj_bench \
+./build/bench/ninfer_linear_split_multi_output_bench \
   --format q8-dflash2-qkv --tokens 8,16,32,53,54,64,65,96,128,1024 \
   --execution graph --cache cold --warmup 10 --repeat 50
 ```
 
-The stateful GDN projection/convolution/snapshot contract remains in its own public Op benchmark;
-it is not a mode of Attention input projection. End-to-end target measurement uses `ninfer_bench`.
+`ninfer_linear_split_two_output_bench` covers Q8 `[12288,2048]` and `[16384,2560]`,
+FP8/NVFP4 `[16384,5120]`, and paired Q4/Q5 `[4096+12288,5120]`. It uses the common
+`op_measurement.cuh` options described above; `--n` is the total logical row count.
+
+```bash
+./build/bench/ninfer_linear_split_two_output_bench \
+  --format q8 --n 16384 --k 2560 --tokens 1,16,1024,2048,4096 --cache cold
+```
+
+Stateful projection/convolution remains in `ninfer_gdn_input_proj_bench`.
 
 ## QSA Op benchmark
 

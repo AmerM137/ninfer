@@ -87,10 +87,6 @@ ninfer_add_op_test(ninfer_speculative_round_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_speculative_round.cpp"
   LIBRARIES ninfer_ops)
 
-ninfer_add_op_test(ninfer_attn_input_proj_test
-  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_attn_input_proj.cpp"
-  LIBRARIES ninfer_ops)
-
 ninfer_add_op_test(ninfer_dynamic_grouped_conv_prepare_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_dynamic_grouped_conv_prepare.cpp"
   LIBRARIES ninfer_ops)

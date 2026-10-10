@@ -43,3 +43,10 @@ ninfer_add_op_test(ninfer_linear_bf16_a16_test
 ninfer_add_op_test(ninfer_linear_split_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_split.cpp"
   LIBRARIES ninfer_linear_test_support)
+
+ninfer_add_op_test(ninfer_linear_split_multi_output_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_split_multi_output.cpp"
+  LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_linear_split_two_output_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_split_two_output.cpp"
+  LIBRARIES ninfer_ops)

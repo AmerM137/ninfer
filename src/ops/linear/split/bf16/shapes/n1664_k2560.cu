@@ -35,9 +35,10 @@ auto select_route(int tokens, const Routes& routes) {
     return routes.template tma<S7>();
 }
 
-void launch_split(const Tensor& x, const Weight& weight, std::span<Tensor> out,
+void launch_split(const Tensor& x, Weights weights, std::span<const Tensor> out, WorkspaceArena*,
                   cudaStream_t stream) {
-    using Output = LinearBf16SegmentedOutput<512, 512, 512, 128>;
+    const auto& weight = weights.first;
+    using Output       = LinearBf16SegmentedOutput<512, 512, 512, 128>;
     const Output output{
         {static_cast<__nv_bfloat16*>(out[0].data), static_cast<__nv_bfloat16*>(out[1].data),
          static_cast<__nv_bfloat16*>(out[2].data), static_cast<__nv_bfloat16*>(out[3].data)}};

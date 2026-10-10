@@ -5,7 +5,7 @@
 #include "ops/common/math.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/common/mma.cuh"
-#include "ops/common/rowsplit_mma.cuh"
+#include "ops/linear/kernels/rowsplit/rowsplit_mma.cuh"
 #include "ops/linear/kernels/q4/q4_rowsplit_storage.cuh"
 #include "ops/linear/kernels/q5/q5_rowsplit_storage.cuh"
 #include "ops/linear/kernels/q6/q6_rowsplit_storage.cuh"

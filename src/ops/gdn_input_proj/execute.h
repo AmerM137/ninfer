@@ -6,7 +6,11 @@ namespace ninfer::ops::detail::gdn_input {
 
 struct Scratch;
 
-void launch_projection(const Tensor& x, const WeightOperands& weights, GdnProjectionOutputs outputs,
+struct ProjectedOutputs {
+    Tensor qkv, z;
+};
+
+void launch_projection(const Tensor& x, const WeightOperands& weights, ProjectedOutputs outputs,
                        ProjectionPlan plan, const Scratch& scratch, cudaStream_t stream);
 void launch_snapshot(const Tensor& x, const WeightOperands& weights, const Tensor& conv_weight,
                      GdnConvSnapshotState state, const Tensor& valid, GdnConvOutputs outputs,

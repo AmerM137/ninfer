@@ -28,26 +28,6 @@ void execute_with_scratch(const input::WeightOperands& weights, input::Projectio
 }
 } // namespace
 
-void gdn_input_proj(const Tensor& x, const ProjectionWeights& weights, GdnProjectionOutputs out,
-                    WorkspaceArena& workspace, cudaStream_t stream) {
-    const auto operands = input::describe_weights(weights);
-    input::validate_weights(operands);
-    input::validate_projection(x, operands, out);
-    const auto plan = input::resolve_projection_plan(operands, x.ne[1]);
-    const std::array<const Tensor*, 3> tensors{&x, &out.qkv, &out.z};
-    execute_with_scratch(
-        operands, plan, x.ne[1], false, workspace,
-        [&](DeviceSpan scratch) { input::validate_disjoint(operands, tensors, scratch); },
-        [&](const input::Scratch& scratch) {
-            input::launch_projection(x, operands, out, plan, scratch, stream);
-        });
-}
-
-std::size_t gdn_input_proj_workspace_capacity_bytes(const ProjectionWeights& weights,
-                                                    std::int32_t first, std::int32_t last) {
-    return input::projection_capacity(input::describe_weights(weights), first, last);
-}
-
 void gdn_input_proj_conv_snapshot(const Tensor& x, const ProjectionWeights& weights,
                                   const Tensor& conv_weight, GdnConvSnapshotState state,
                                   const Tensor& valid, GdnConvOutputs out,

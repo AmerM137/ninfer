@@ -1,5 +1,4 @@
 #include "ninfer/ops/weight_input.h"
-#include "ops/gdn_input_proj/operands.h"
 
 #include <algorithm>
 #include <array>
@@ -78,8 +77,7 @@ LinearPolicy common_policy(std::span<const WeightInput> inputs) {
     return result;
 }
 
-SingleProjectionWeight single(std::span<const WeightInput> inputs) {
-    auto view         = concatenate_rows(inputs);
+SingleProjectionWeight single(const WeightView& view, std::span<const WeightInput> inputs) {
     const auto region = contiguous_weight_region(view);
     const auto policy = common_policy(inputs);
     float divisor     = 0;
@@ -113,31 +111,8 @@ SingleProjectionWeight single(std::span<const WeightInput> inputs) {
     return {native_weight(view, divisor), policy};
 }
 
-ProjectionWeights attention_input_projection(std::span<const WeightInput, 4> inputs) {
-    const auto& q = matrix(inputs[0]);
-    const auto& k = matrix(inputs[1]);
-    require(matrix(inputs[2]) == q && matrix(inputs[3]) == k,
-            "attention input: inconsistent gate/value geometry");
-    const bool dense =
-        q == std::vector<std::uint64_t>{6144, 5120} && k == std::vector<std::uint64_t>{1024, 5120};
-    const bool moe =
-        q == std::vector<std::uint64_t>{4096, 2048} && k == std::vector<std::uint64_t>{512, 2048};
-    require(dense || moe, "attention input: unsupported logical geometry");
-    if (contiguous(concatenate_rows(inputs))) {
-        auto result       = single(inputs);
-        const auto format = result.weight.qtype;
-        require((moe && format == QType::Q8_G32_FP16) ||
-                    (dense && (format == QType::NVFP4 || format == QType::FP8_E4M3FN_ROW_BF16 ||
-                               format == QType::BF16)),
-                "attention input: unsupported single-parent format");
-        return result;
-    }
-    require(dense, "attention input: unsupported multi-parent geometry");
-    const auto first  = single(inputs.first<2>());
-    const auto second = single(inputs.last<2>());
-    require(first.weight.qtype == QType::Q4_G64_FP16 && second.weight.qtype == QType::Q5_G64_FP16,
-            "attention input: paired native form requires Q4 and Q5");
-    return PairedProjectionWeights{first.weight, second.weight};
+SingleProjectionWeight single(std::span<const WeightInput> inputs) {
+    return single(concatenate_rows(inputs), inputs);
 }
 
 } // namespace
@@ -150,45 +125,42 @@ SingleProjectionWeight prepare_linear_weight(std::span<const WeightInput> rows) 
     return single(rows);
 }
 
-SingleProjectionWeight prepare_attn_input_proj_weights(const WeightInput& query,
-                                                       const WeightInput& key,
-                                                       const WeightInput& value) {
-    const auto& q = matrix(query);
-    require((q == std::vector<std::uint64_t>{4096, 2048} ||
-             q == std::vector<std::uint64_t>{4096, 5120}) &&
-                matrix(key) == std::vector<std::uint64_t>{1024, q[1]} &&
-                matrix(value) == matrix(key),
-            "QKV input projection: unsupported logical geometry");
-    const std::array inputs{query, key, value};
-    auto result = single(inputs);
-    require(result.weight.qtype == QType::Q8_G32_FP16,
-            "QKV input projection: native form requires Q8");
-    return result;
-}
+ProjectionWeights prepare_projection_weights(std::span<const WeightInput> rows) {
+    const auto view = concatenate_rows(rows);
+    if (contiguous(view)) return single(view, rows);
 
-ProjectionWeights prepare_attn_input_proj_weights(const WeightInput& query, const WeightInput& key,
-                                                  const WeightInput& gate,
-                                                  const WeightInput& value) {
-    const std::array inputs{query, key, gate, value};
-    return attention_input_projection(inputs);
-}
-
-ProjectionWeights prepare_gdn_input_proj_weights(const WeightInput& query, const WeightInput& key,
-                                                 const WeightInput& value, const WeightInput& z) {
-    const auto& q = matrix(query);
-    require(q[0] == 2048 && matrix(key) == q && matrix(value) == matrix(z),
-            "GDN input: inconsistent logical projection geometry");
-    const std::array inputs{query, key, value, z};
-    const std::span<const WeightInput, 4> rows(inputs);
-    ProjectionWeights result;
-    if (contiguous(concatenate_rows(rows)))
-        result = single(rows);
-    else
-        result =
-            PairedProjectionWeights{single(rows.first<2>()).weight, single(rows.last<2>()).weight};
-    // Native preparation and execution share the family's representation admission.
-    (void)detail::gdn_input::describe_weights(result);
-    return result;
+    const auto columns = view.shape[1];
+    WeightView bank{{0, columns}, {}};
+    std::uint64_t elements = 0;
+    std::vector<WeightInput> bank_rows;
+    std::vector<SingleProjectionWeight> banks;
+    const auto finish_bank = [&] {
+        require(elements % columns == 0, "projection parent boundary must align to a matrix row");
+        bank.shape[0] = elements / columns;
+        banks.push_back(single(bank, bank_rows));
+    };
+    for (const auto& input : rows) {
+        bool included = false;
+        for (const auto& part : input.weight.parts) {
+            if (!bank.parts.empty() &&
+                (part.parent != bank.parts.back().parent || part.begin != bank.parts.back().end)) {
+                finish_bank();
+                require(banks.size() < 2, "projection bank requires more than two native regions");
+                bank.parts.clear();
+                bank_rows.clear();
+                elements = 0;
+                included = false;
+            }
+            bank.parts.push_back(part);
+            elements += part.end - part.begin;
+            if (!included) {
+                bank_rows.push_back(input);
+                included = true;
+            }
+        }
+    }
+    finish_bank();
+    return PairedProjectionWeights{banks[0].weight, banks[1].weight};
 }
 
 ProjectionWeights prepare_gdn_control_proj_weights(const WeightInput& a, const WeightInput& b) {

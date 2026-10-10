@@ -105,15 +105,6 @@ void validate_batch_interval(Publication publication, std::int32_t batch, std::i
         throw std::invalid_argument("GDN convolution: unsupported batch/token interval");
 }
 
-void validate_projection(const Tensor& x, const WeightOperands& weights,
-                         const GdnProjectionOutputs& outputs) {
-    validate_interval(x.ne[1], x.ne[1]);
-    const auto& g = weights.geometry;
-    require_tensor(x, DType::BF16, g.input_rows, x.ne[1], 1, 16, "x");
-    require_tensor(outputs.qkv, DType::BF16, g.channels(), x.ne[1], 1, 16, "qkv");
-    require_tensor(outputs.z, DType::BF16, g.value_rows, x.ne[1], 1, 16, "z");
-}
-
 Batch validate_convolution(const Tensor& x, const WeightOperands& weights,
                            const Tensor& convolution, const Tensor& history,
                            const Tensor& source_slots, const Tensor& valid_columns,

@@ -1,6 +1,7 @@
 #include "models/qwen3_5/execution/parameters.h"
 
 #include "core/weight_view.h"
+#include "ninfer/ops/linear_split.h"
 
 #include <limits>
 #include <stdexcept>
@@ -89,24 +90,36 @@ public:
         out.post_attention_norm = tensor(w.post_attention_norm);
         out.ffn                 = ffn(w);
         if (const auto* a = std::get_if<AttentionWeights>(&w.mixer)) {
-            out.mixer = AttentionParameters{
-                ops::prepare_attn_input_proj_weights(model_.input(a->query), model_.input(a->key),
-                                                     model_.input(a->gate), model_.input(a->value)),
-                tensor(a->query_norm), tensor(a->key_norm), linear(a->output)};
+            const std::array inputs{model_.input(a->query), model_.input(a->key),
+                                    model_.input(a->gate), model_.input(a->value)};
+            const std::array rows{
+                dimension(inputs[0].weight.shape[0]), dimension(inputs[1].weight.shape[0]),
+                dimension(inputs[2].weight.shape[0]), dimension(inputs[3].weight.shape[0])};
+            auto projection = ops::prepare_projection_weights(inputs);
+            (void)ops::linear_split_workspace_capacity_bytes(projection, rows, 1, 1);
+            out.mixer = AttentionParameters{std::move(projection), rows, tensor(a->query_norm),
+                                            tensor(a->key_norm), linear(a->output)};
             out.projection_prefetch =
                 prefetch(std::get<AttentionParameters>(out.mixer).projection, a->query);
         } else {
             const auto& g = std::get<GdnWeights>(w.mixer);
-            out.mixer     = GdnParameters{
-                ops::prepare_gdn_input_proj_weights(model_.input(g.query), model_.input(g.key),
-                                                        model_.input(g.value), model_.input(g.z)),
-                ops::prepare_gdn_control_proj_weights(model_.input(g.a_projection),
-                                                          model_.input(g.b_projection)),
-                tensor(g.a_log),
-                tensor(g.dt_bias),
-                tensor(g.convolution),
-                tensor(g.norm),
-                linear(g.output)};
+            const std::array inputs{model_.input(g.query), model_.input(g.key),
+                                    model_.input(g.value), model_.input(g.z)};
+            const std::array rows{dimension(inputs[0].weight.shape[0] + inputs[1].weight.shape[0] +
+                                            inputs[2].weight.shape[0]),
+                                  dimension(inputs[3].weight.shape[0])};
+            auto projection = ops::prepare_projection_weights(inputs);
+            (void)ops::linear_split_workspace_capacity_bytes(projection, rows, 1, 1);
+            out.mixer =
+                GdnParameters{std::move(projection),
+                              rows,
+                              ops::prepare_gdn_control_proj_weights(model_.input(g.a_projection),
+                                                                    model_.input(g.b_projection)),
+                              tensor(g.a_log),
+                              tensor(g.dt_bias),
+                              tensor(g.convolution),
+                              tensor(g.norm),
+                              linear(g.output)};
             out.projection_prefetch =
                 prefetch(std::get<GdnParameters>(out.mixer).projection, g.query);
         }
@@ -129,15 +142,21 @@ public:
         const std::array inputs{model_.input(a.query), model_.input(a.key), model_.input(a.gate),
                                 model_.input(a.value)};
         MtpParameters out;
-        out.input_projection    = linear(w.input_projection);
-        out.embedding_norm      = tensor(w.embedding_norm);
-        out.hidden_norm         = tensor(w.hidden_norm);
-        out.input_norm          = tensor(w.layer.input_norm);
-        out.post_attention_norm = tensor(w.layer.post_attention_norm);
-        out.final_norm          = tensor(w.final_norm);
-        out.projection.packed   = ops::prepare_linear_weight(inputs);
+        out.input_projection       = linear(w.input_projection);
+        out.embedding_norm         = tensor(w.embedding_norm);
+        out.hidden_norm            = tensor(w.hidden_norm);
+        out.input_norm             = tensor(w.layer.input_norm);
+        out.post_attention_norm    = tensor(w.layer.post_attention_norm);
+        out.final_norm             = tensor(w.final_norm);
+        out.projection.packed      = ops::prepare_linear_weight(inputs);
+        out.projection.output_rows = {
+            dimension(inputs[0].weight.shape[0]), dimension(inputs[1].weight.shape[0]),
+            dimension(inputs[2].weight.shape[0]), dimension(inputs[3].weight.shape[0])};
         if (model_.config().text.architecture == Architecture::Qwen3_5) {
             out.projection.rows = {linear(a.query), linear(a.key), linear(a.gate), linear(a.value)};
+        } else {
+            (void)ops::linear_split_workspace_capacity_bytes(out.projection.packed,
+                                                             out.projection.output_rows, 1, 1);
         }
         out.query_norm  = tensor(a.query_norm);
         out.key_norm    = tensor(a.key_norm);
@@ -219,29 +238,37 @@ public:
         out.output_head        = linear(w.output_head_use);
         out.layers.reserve(w.layers.size());
         for (std::size_t i = 0; i < w.layers.size(); ++i) {
-            out.layers.push_back(with_context(
-                std::string(model_.options().speculative_component()) + "/layers/" +
-                    std::to_string(i),
-                [&] {
-                    const auto& layer = w.layers[i];
-                    const auto& a     = layer.attention;
-                    DraftBlockParameters result;
-                    result.input_norm          = tensor(layer.input_norm);
-                    result.post_attention_norm = tensor(layer.post_attention_norm);
-                    result.query_key_value     = ops::prepare_attn_input_proj_weights(
-                        model_.input(a.query), model_.input(a.key), model_.input(a.value));
-                    result.context_key   = linear(a.context_key);
-                    result.context_value = linear(a.context_value);
-                    result.query_norm    = tensor(a.query_norm);
-                    result.key_norm      = tensor(a.key_norm);
-                    result.output        = linear(a.output);
-                    result.mlp           = dense(layer.mlp);
-                    if (layer.attention_conv) {
-                        result.attention_conv = convolution(*layer.attention_conv);
-                    }
-                    if (layer.mlp_conv) { result.mlp_conv = convolution(*layer.mlp_conv); }
-                    return result;
-                }));
+            out.layers.push_back(
+                with_context(std::string(model_.options().speculative_component()) + "/layers/" +
+                                 std::to_string(i),
+                             [&] {
+                                 const auto& layer = w.layers[i];
+                                 const auto& a     = layer.attention;
+                                 DraftBlockParameters result;
+                                 result.input_norm          = tensor(layer.input_norm);
+                                 result.post_attention_norm = tensor(layer.post_attention_norm);
+                                 const std::array inputs{model_.input(a.query), model_.input(a.key),
+                                                         model_.input(a.value)};
+                                 result.query_key_value = ops::prepare_linear_weight(inputs);
+                                 const std::array rows{dimension(inputs[0].weight.shape[0]),
+                                                       dimension(inputs[1].weight.shape[0]),
+                                                       dimension(inputs[2].weight.shape[0])};
+                                 (void)ops::linear_split_workspace_capacity_bytes(
+                                     result.query_key_value, rows, 1, 1);
+                                 result.context_key   = linear(a.context_key);
+                                 result.context_value = linear(a.context_value);
+                                 result.query_norm    = tensor(a.query_norm);
+                                 result.key_norm      = tensor(a.key_norm);
+                                 result.output        = linear(a.output);
+                                 result.mlp           = dense(layer.mlp);
+                                 if (layer.attention_conv) {
+                                     result.attention_conv = convolution(*layer.attention_conv);
+                                 }
+                                 if (layer.mlp_conv) {
+                                     result.mlp_conv = convolution(*layer.mlp_conv);
+                                 }
+                                 return result;
+                             }));
         }
         if (w.selector) {
             out.selector = SelectorParameters{linear(w.selector->hidden_projection),

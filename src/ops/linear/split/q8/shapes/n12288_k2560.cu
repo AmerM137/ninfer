@@ -1,6 +1,6 @@
 #include "ops/linear/split/dispatch.h"
 #include "ops/common/cuda/memory.cuh"
-#include "ops/linear/split/q8/launch.cuh"
+#include "ops/linear/kernels/q8/q8_output_launch.cuh"
 
 namespace ninfer::ops::detail::linear_split {
 namespace {
@@ -46,12 +46,13 @@ auto select_route(int tokens, const Routes& routes) {
     return routes.template mma<Bulk>();
 }
 
-void launch_split(const Tensor& x, const Weight& weight, std::span<Tensor> out,
+void launch_split(const Tensor& x, Weights weights, std::span<const Tensor> out, WorkspaceArena*,
                   cudaStream_t stream) {
-    using Output = LinearBf16SegmentedOutput<6144, 6144>;
+    const auto& weight = weights.first;
+    using Output       = LinearBf16SegmentedOutput<6144, 6144>;
     const Output output{
         {static_cast<__nv_bfloat16*>(out[0].data), static_cast<__nv_bfloat16*>(out[1].data)}};
-    select_route(x.ne[1], Q8SplitRoutes<Output>{q8_linear_operands(x, weight), output, stream});
+    select_route(x.ne[1], Q8A16OutputLaunch<Output>{q8_linear_operands(x, weight), output, stream});
 }
 } // namespace
 

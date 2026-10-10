@@ -37,8 +37,8 @@ Op suites. `ops/quantized_weight.h` owns packed-weight fixtures and independent 
 `ops/direct_bf16_weight.h` owns direct BF16 fixtures. GDN record/fold tests preserve their specified
 snapshot reference separately from projection and recurrence mathematical qualification.
 
-For segmented projection, run
-`ctest --test-dir build -R '^ninfer_linear_split_test$' --output-on-failure`.
+For segmented projection, run the original 2560-input suite and the migrated two/multi-output suites:
+`ctest --test-dir build -R '^ninfer_linear_split(_two_output|_multi_output)?_test$' --output-on-failure`.
 `ninfer_qsa_sparse_gqa_test --kv-cache bf16|fp8|int8|nvfp4|k8v4` selects one cache profile;
 the default checks all five. QSA tail, prepare, indexer and sparse-GQA partial-initialization cases
 also check their permitted read footprints under Compute Sanitizer initcheck.

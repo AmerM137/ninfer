@@ -33,8 +33,6 @@ struct ConvPlan {
 ProjectionPlan resolve_projection_plan(const WeightOperands& weights, std::int32_t columns);
 // Publication does not select arithmetic. Snapshot and record consume the same physical block.
 ConvPlan resolve_conv_plan(const WeightOperands& weights, Batch batch);
-std::size_t projection_capacity(const WeightOperands& weights, std::int32_t first,
-                                std::int32_t last);
 std::size_t convolution_capacity(const WeightOperands& weights, Publication publication,
                                  std::int32_t batch, std::int32_t first, std::int32_t last);
 

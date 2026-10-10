@@ -6,6 +6,8 @@
 #include <cuda_runtime.h>
 
 namespace ninfer::ops::detail {
+void q8_gdn_projection_n16384_k2560(const Tensor&, const Weight&, Tensor&, Tensor&, cudaStream_t);
+
 
 void q8_gdn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                            cudaStream_t stream);

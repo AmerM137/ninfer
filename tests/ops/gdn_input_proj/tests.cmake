@@ -1,6 +1,3 @@
-ninfer_add_op_test(ninfer_gdn_input_proj_test
-  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_projection.cpp"
-  LIBRARIES ninfer_ops)
 ninfer_add_op_test(ninfer_gdn_input_proj_conv_snapshot_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_snapshot.cpp"
   LIBRARIES ninfer_ops)

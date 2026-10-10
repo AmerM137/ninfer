@@ -10,7 +10,7 @@
 
 namespace ninfer::ops::detail::gdn_input {
 
-void launch_projection(const Tensor& x, const WeightOperands& weights, GdnProjectionOutputs out,
+void launch_projection(const Tensor& x, const WeightOperands& weights, ProjectedOutputs out,
                        ProjectionPlan plan, const Scratch& scratch, cudaStream_t stream) {
     const auto& w = *weights.first;
     switch (weights.format) {
@@ -134,9 +134,8 @@ void launch_record(const Tensor& x, const WeightOperands& weights, const Tensor&
         break;
     }
     const Tensor flat_x = x.view({weights.geometry.input_rows, batch.columns()});
-    const GdnProjectionOutputs projected{
-        record.view({weights.geometry.channels(), batch.columns()}),
-        out.z.view({weights.geometry.value_rows, batch.columns()})};
+    const ProjectedOutputs projected{record.view({weights.geometry.channels(), batch.columns()}),
+                                     out.z.view({weights.geometry.value_rows, batch.columns()})};
     launch_projection(flat_x, weights, projected, plan.projection, scratch, stream);
     if (plan.post == ProjectedConvKernel::TokenParallel)
         gdn_projected_conv_parallel_record_launch(record, conv, state.history, valid,
