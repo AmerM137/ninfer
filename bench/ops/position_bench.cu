@@ -1,8 +1,7 @@
 // Exact small-T qualification benchmark for offset_i32_positions.
 #include "ninfer/ops/position.h"
 #include "core/device.h"
-#include "ninfer_bench_common.h"
-#include "ops/launcher/position.h"
+#include "op_measurement.cuh"
 
 #include <cuda_runtime.h>
 
@@ -18,23 +17,6 @@ using namespace ninfer;
 using namespace ninfer::bench;
 
 namespace {
-
-std::vector<int> parse_tokens(const char* raw) {
-    std::vector<int> values;
-    const std::string text(raw);
-    std::size_t begin = 0;
-    while (begin < text.size()) {
-        const std::size_t end  = text.find(',', begin);
-        const std::string item = text.substr(begin, end == std::string::npos ? end : end - begin);
-        const int value        = std::stoi(item);
-        if (value <= 0) { throw std::invalid_argument("tokens must be positive"); }
-        values.push_back(value);
-        if (end == std::string::npos) { break; }
-        begin = end + 1;
-    }
-    if (values.empty()) { throw std::invalid_argument("tokens must not be empty"); }
-    return values;
-}
 
 Result bench_cold_graph(const launch_fn& launch, double bytes, bench::L2FlushBuffer& flush,
                         int warmup, int repeat) {
@@ -89,7 +71,7 @@ Result bench_cold_graph(const launch_fn& launch, double bytes, bench::L2FlushBuf
     return result;
 }
 
-void run(int tokens, int candidate_block, bench::L2FlushBuffer* flush, int warmup, int repeat) {
+void run(int tokens, bench::L2FlushBuffer* flush, int warmup, int repeat) {
     std::vector<std::int32_t> host(static_cast<std::size_t>(tokens));
     for (int i = 0; i < tokens; ++i) { host[static_cast<std::size_t>(i)] = 262144 - tokens + i; }
     DeviceBuffer source(host.size() * sizeof(std::int32_t));
@@ -103,29 +85,22 @@ void run(int tokens, int candidate_block, bench::L2FlushBuffer* flush, int warmu
     Tensor tdestination(destination.p, DType::I32, {tokens});
 
     const auto launch = [&](cudaStream_t stream) {
-        if (candidate_block == 0) {
-            ops::offset_i32_positions(tsource, tdelta, tdestination, stream);
-        } else {
-            ops::detail::offset_i32_positions_block_launch(tsource, tdelta, tdestination,
-                                                           candidate_block, stream);
-        }
+        ops::offset_i32_positions(tsource, tdelta, tdestination, stream);
     };
     const double bytes  = static_cast<double>(tokens * 2 + 1) * sizeof(std::int32_t);
     const Result result = flush == nullptr
                               ? bench_loop(launch, bytes)
                               : bench_cold_graph(launch, bytes, *flush, warmup, repeat);
 
-    const int block = candidate_block == 0 ? 256 : candidate_block;
     char label[128];
-    std::snprintf(label, sizeof(label), "offset_i32_positions T=%d route=%s-b%d-g%d%s", tokens,
-                  candidate_block == 0 ? "production" : "candidate", block,
-                  (tokens + block - 1) / block, flush == nullptr ? "" : "-cold-graph");
+    std::snprintf(label, sizeof(label), "offset_i32_positions T=%d%s", tokens,
+                  flush == nullptr ? "" : " cold-graph");
     print_result(label, result);
 }
 
 } // namespace
 
-int main(int argc, char** argv) {
+int main(int argc, char** argv) try {
     int count = 0;
     if (cudaGetDeviceCount(&count) != cudaSuccess || count == 0) {
         std::printf("SKIP: no usable CUDA device\n");
@@ -133,25 +108,18 @@ int main(int argc, char** argv) {
     }
 
     std::vector<int> tokens{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
-    int candidate_block = 0;
-    bool cold_graph     = false;
-    int warmup          = 20;
-    int repeat          = 200;
+    bool cold_graph = false;
+    int warmup      = 20;
+    int repeat      = 200;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--tokens") && i + 1 < argc) {
-            tokens = parse_tokens(argv[++i]);
-        } else if (!std::strcmp(argv[i], "--candidate-block") && i + 1 < argc) {
-            candidate_block = std::stoi(argv[++i]);
-            if (candidate_block <= 0 || candidate_block > 1024 || candidate_block % 32 != 0) {
-                throw std::invalid_argument(
-                    "candidate block must be a positive multiple of 32 no larger than 1024");
-            }
+            tokens = measurement::integers(argv[++i]);
         } else if (!std::strcmp(argv[i], "--cold-graph")) {
             cold_graph = true;
         } else if (!std::strcmp(argv[i], "--warmup") && i + 1 < argc) {
-            warmup = std::stoi(argv[++i]);
+            warmup = measurement::integer(argv[++i], 0);
         } else if (!std::strcmp(argv[i], "--repeat") && i + 1 < argc) {
-            repeat = std::stoi(argv[++i]);
+            repeat = measurement::integer(argv[++i]);
         } else {
             throw std::invalid_argument("unknown position benchmark argument");
         }
@@ -161,6 +129,10 @@ int main(int argc, char** argv) {
     }
     bench::L2FlushBuffer flush(cold_graph ? 256ULL << 20 : 1);
     bench::L2FlushBuffer* flush_ptr = cold_graph ? &flush : nullptr;
-    for (const int value : tokens) { run(value, candidate_block, flush_ptr, warmup, repeat); }
+    for (const int value : tokens) { run(value, flush_ptr, warmup, repeat); }
     return 0;
+} catch (const std::exception& error) {
+
+    std::fprintf(stderr, "ninfer_position_bench: %s\n", error.what());
+    return 2;
 }

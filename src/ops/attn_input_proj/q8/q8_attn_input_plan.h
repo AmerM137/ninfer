@@ -13,7 +13,6 @@ namespace ninfer::ops::detail {
 enum class Q8AttnInputScheduleId {
     DecodeR8Direct,
     SplitKMmaDirect,
-    SimtR8C4,
     MmaR32C64,
     MmaR32C128,
     MmaR64C64,
@@ -42,14 +41,9 @@ struct Q8AttnInputPlan {
     Q8AttnInputScheduleId schedule;
 };
 
-const char* q8_attn_input_schedule_name(Q8AttnInputScheduleId schedule) noexcept;
 bool q8_attn_input_admits(const Q8AttnInputProblem& problem) noexcept;
 Q8AttnInputPlan q8_attn_input_resolve_plan(const Q8AttnInputProblem& problem);
 
-void q8_attn_input_execute_plan(const Q8AttnInputPlan& plan, const Tensor& x, const Weight& weight,
-                                Tensor& q, Tensor& gate, Tensor& k, Tensor& v, cudaStream_t stream);
-void q8_attn_input_execute_plan(const Q8AttnInputPlan& plan, const Tensor& x, const Weight& weight,
-                                Tensor& q, Tensor& k, Tensor& v, cudaStream_t stream);
 void q8_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                             Tensor& k, Tensor& v, cudaStream_t stream);
 void q8_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& k, Tensor& v,

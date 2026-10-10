@@ -21,20 +21,6 @@ Bf16LinearAddScheduleId bf16_linear_add_select(std::int32_t output_rows, std::in
     return Bf16LinearAddScheduleId::Mma;
 }
 
-const char* bf16_linear_add_schedule_name(Bf16LinearAddScheduleId schedule) noexcept {
-    switch (schedule) {
-    case Bf16LinearAddScheduleId::Decode:
-        return "linear_add.bf16.decode.residual";
-    case Bf16LinearAddScheduleId::SmallT:
-        return "linear_add.bf16.small_t.residual";
-    case Bf16LinearAddScheduleId::AggregateMma:
-        return "linear_add.bf16.aggregate_mma.residual";
-    case Bf16LinearAddScheduleId::Mma:
-        return "linear_add.bf16.mma.residual";
-    }
-    return "linear_add.bf16.unknown";
-}
-
 void bf16_linear_add_dispatch(const Tensor& x, const Weight& weight, Tensor& residual,
                               cudaStream_t stream) {
     switch (bf16_linear_add_select(weight.n, weight.k, x.ne[1])) {

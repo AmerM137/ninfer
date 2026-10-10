@@ -71,9 +71,9 @@ PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const Tok
                                       std::optional<std::uint32_t> split_frontier,
                                       bool finalize_at_end) {
     TextContext card(state.execution.device, state.execution.parameters, state.execution.work,
-                     state.text_kv, state.execution.linear_attention, state.execution.io,
+                     state.text_cache, state.execution.linear_attention, state.execution.io,
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
-                     state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache);
+                     state.text_kv_base, state.mtp_kv, state.mtp_cache);
     configure_text_card(card, state.execution, state.sampling, state.state_source_slot,
                         state.state_destination_slot, state.mtp_proposal_extent);
     card.set_prefill_gpu_timer(state.prefill_gpu_timer);
@@ -96,9 +96,9 @@ PrefillChunkResult prefill_multimodal_chunk(PrefillContext& state, const Prepare
                                             std::optional<std::uint32_t> split_frontier,
                                             bool finalize_at_end) {
     TextContext card(state.execution.device, state.execution.parameters, state.execution.work,
-                     state.text_kv, state.execution.linear_attention, state.execution.io,
+                     state.text_cache, state.execution.linear_attention, state.execution.io,
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
-                     state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache);
+                     state.text_kv_base, state.mtp_kv, state.mtp_cache);
     configure_text_card(card, state.execution, state.sampling, state.state_source_slot,
                         state.state_destination_slot, state.mtp_proposal_extent);
     card.set_prefill_gpu_timer(state.prefill_gpu_timer);
@@ -227,16 +227,6 @@ runtime::PrefillStepResult
 ProgramImpl::advance_prefill_raw(std::uint32_t lane, runtime::ExecutionTiming* failed_timing) {
     if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
     return advance_prefill(active_sequence(lane), requests[lane], failed_timing);
-}
-
-runtime::ExecutionTiming ProgramImpl::resolve_prefill_raw(std::uint32_t lane, bool terminal,
-                                                          runtime::ExecutionTiming* failed_timing) {
-    if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
-    if (requests[lane].pending.kind != PendingKind::Begin) {
-        throw std::logic_error("prefill resolution requires a pending prefill token");
-    }
-    return resolve_non_speculative_pending(active_sequence(lane), requests[lane], 1, terminal,
-                                           std::nullopt, failed_timing);
 }
 
 runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
@@ -515,7 +505,6 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             {device, parameters, work, state_images->linear(),
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
              proposal_head},
-            text_kv_view(sequence),
             mtp_kv_view(sequence),
             decoder->text_kv,
             decoder->mtp_cache(),

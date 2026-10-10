@@ -184,17 +184,6 @@ int q4_a16_conformance() {
 } // namespace
 
 int main() {
-    if (!ninfer::test::linear::cuda_available()) {
-        std::cout << "SKIP: no usable CUDA device\n";
-        return 77;
-    }
-
-    try {
-        const int failures = q4_a16_conformance();
-        std::cout << (failures == 0 ? "OK" : "FAIL") << " Q4_A16 Linear\n";
-        return failures == 0 ? 0 : 1;
-    } catch (const std::exception& error) {
-        std::cerr << "Q4_A16 Linear: " << error.what() << '\n';
-        return 1;
-    }
+    return ninfer::test::linear_common::run_test_main("Q4_A16 Linear",
+                                                      [] { return q4_a16_conformance(); });
 }

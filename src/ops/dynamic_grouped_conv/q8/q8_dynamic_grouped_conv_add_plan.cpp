@@ -32,16 +32,6 @@ std::size_t q8_linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
     return resolve_plan(input_rows, max_width, max_batch).workspace_bytes;
 }
 
-const char* q8_linear_dynamic_grouped_conv_add_route_name(int input_rows, int width, int batch) {
-    switch (resolve_plan(input_rows, width, batch).schedule) {
-    case Q8DynamicConvAddSchedule::TiledMma:
-        return "dynamic_grouped_conv_add.q8.tiled_mma.materialized_bf16";
-    case Q8DynamicConvAddSchedule::MmaK128:
-        return "dynamic_grouped_conv_add.q8.r64_c64_k128.materialized_bf16";
-    }
-    throw std::logic_error("linear dynamic grouped conv add: invalid production schedule");
-}
-
 void q8_linear_dynamic_grouped_conv_add_dispatch(const Tensor& x, const Weight& weight,
                                                  const Tensor& base, const Tensor& delta,
                                                  Tensor& residual, WorkspaceArena& workspace,

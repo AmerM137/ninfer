@@ -26,7 +26,9 @@ Tests are grouped by observable risk, not by mirroring every source file or clas
 `CMakeLists.txt` includes explicit registrations from `cmake/`, `artifact/`, `models/qwen3_5/`
 and `ops/`. Registration helpers live in `cmake/NinferTests.cmake`; included manifests keep
 executables and CTest working directories under `build/tests/`.
-`ops/op_tester.h` and `ops/op_check.h` own only reusable device/guard and comparison mechanics.
+`ops/op_tester.h` and `ops/op_check.h` own reusable device/guard and comparison mechanics.
+`ops/linear_common.h` shares extent checks, explicit sampling recipes, payload preservation and
+0/1/77 entry handling; each projection family keeps its own fixtures and complete oracle.
 Concrete numerical criteria remain named by the semantic Op suite; there are no cross-Op tolerance
 presets.
 
@@ -124,12 +126,12 @@ For a change confined to one Q8 geometry, use the same public conformance cases 
 `./build/tests/ninfer_linear_q8_a16_test --shape N K`. The default CTest invocation still covers
 all registered Q8 geometries.
 
-For a change confined to a newly supported BF16 geometry, use
-`./build/tests/ninfer_linear_bf16_a16_test --shape N K`. This filter currently covers the new
-geometry table; default invocation also runs the older BF16 cases.
+For a change confined to one BF16 geometry, use
+`./build/tests/ninfer_linear_bf16_a16_test --shape N K`. The filter covers all registered BF16
+geometries, including the original projections and selector matrix. The default runs all cases.
 
-Linear, LinearAdd and LinearSwiGLU common implementations each compile once into a test support
-library. Their libraries and CXX Op test executables receive `-fno-fast-math` and `-ffp-contract=off`
+Linear (including both BF16 fixture recipes), LinearAdd (including FP8/NVFP4) and LinearSwiGLU
+common implementations each compile once into a test support library. Their libraries and CXX Op test executables receive `-fno-fast-math` and `-ffp-contract=off`
 on GNU/Clang. The remaining organization, entry-point and oracle-build work is tracked in the
 [Linear test reorganization requirements](../docs/maintainer/linear-test-reorganization-plan.md).
 

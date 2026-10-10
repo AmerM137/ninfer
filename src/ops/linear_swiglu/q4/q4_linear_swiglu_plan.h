@@ -31,8 +31,6 @@ struct Q4LinearSwiGluPlan {
     std::size_t workspace_bytes;
 };
 
-const char* q4_linear_swiglu_schedule_name(Q4LinearSwiGluScheduleId schedule) noexcept;
-
 bool q4_linear_swiglu_admits(const Q4LinearSwiGluProblem& problem) noexcept;
 Q4LinearSwiGluPlan q4_linear_swiglu_resolve_plan(const Q4LinearSwiGluProblem& problem);
 

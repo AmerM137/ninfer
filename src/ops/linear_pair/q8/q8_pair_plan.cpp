@@ -120,22 +120,15 @@ Q8PairScheduleId homogeneous_schedule(Q8PairScheduleId schedule) {
 bool is_concat_schedule(Q8PairScheduleId schedule) noexcept {
     switch (homogeneous_schedule(schedule)) {
     case Q8PairScheduleId::ConcatMmaR32C64:
-    case Q8PairScheduleId::ConcatMmaR32C80:
     case Q8PairScheduleId::ConcatMmaR32C96:
-    case Q8PairScheduleId::ConcatMmaR32C112:
     case Q8PairScheduleId::ConcatMmaR32C128:
-    case Q8PairScheduleId::ConcatMmaR48C64:
     case Q8PairScheduleId::ConcatMmaR48C96:
     case Q8PairScheduleId::ConcatMmaR48C112:
     case Q8PairScheduleId::ConcatMmaR48C128:
-    case Q8PairScheduleId::ConcatMmaR64C64:
-    case Q8PairScheduleId::ConcatMmaR64C80:
     case Q8PairScheduleId::ConcatMmaR64C96:
     case Q8PairScheduleId::ConcatMmaR64C128:
     case Q8PairScheduleId::ConcatMmaR96C64:
-    case Q8PairScheduleId::ConcatMmaR96C80:
     case Q8PairScheduleId::ConcatMmaR96C96:
-    case Q8PairScheduleId::ConcatMmaR96C112:
     case Q8PairScheduleId::ConcatMmaR128C64:
     case Q8PairScheduleId::ConcatMmaR128C80:
         return true;
@@ -145,10 +138,7 @@ bool is_concat_schedule(Q8PairScheduleId schedule) noexcept {
 }
 
 bool uses_mma(Q8PairScheduleId schedule) noexcept {
-    return schedule != Q8PairScheduleId::TwoSimtR8C4 &&
-           schedule != Q8PairScheduleId::DualDecodeR4 &&
-           schedule != Q8PairScheduleId::DualDecodeR8 &&
-           schedule != Q8PairScheduleId::DualDecodeR16;
+    return schedule != Q8PairScheduleId::TwoSimtR8C4 && schedule != Q8PairScheduleId::DualDecodeR4;
 }
 
 std::int32_t schedule_rows(Q8PairScheduleId schedule) {
@@ -158,25 +148,18 @@ std::int32_t schedule_rows(Q8PairScheduleId schedule) {
     case Q8PairScheduleId::DualMmaR32C64:
     case Q8PairScheduleId::DualMmaR32C128:
     case Q8PairScheduleId::ConcatMmaR32C64:
-    case Q8PairScheduleId::ConcatMmaR32C80:
     case Q8PairScheduleId::ConcatMmaR32C96:
-    case Q8PairScheduleId::ConcatMmaR32C112:
     case Q8PairScheduleId::ConcatMmaR32C128:
         return 32;
-    case Q8PairScheduleId::ConcatMmaR48C64:
     case Q8PairScheduleId::ConcatMmaR48C96:
     case Q8PairScheduleId::ConcatMmaR48C112:
     case Q8PairScheduleId::ConcatMmaR48C128:
         return 48;
-    case Q8PairScheduleId::ConcatMmaR64C64:
-    case Q8PairScheduleId::ConcatMmaR64C80:
     case Q8PairScheduleId::ConcatMmaR64C96:
     case Q8PairScheduleId::ConcatMmaR64C128:
         return 64;
     case Q8PairScheduleId::ConcatMmaR96C64:
-    case Q8PairScheduleId::ConcatMmaR96C80:
     case Q8PairScheduleId::ConcatMmaR96C96:
-    case Q8PairScheduleId::ConcatMmaR96C112:
         return 96;
     case Q8PairScheduleId::ConcatMmaR128C64:
     case Q8PairScheduleId::ConcatMmaR128C80:
@@ -191,23 +174,16 @@ std::int32_t schedule_cols(Q8PairScheduleId schedule) {
     case Q8PairScheduleId::TwoSimtR8C4:
         return 4;
     case Q8PairScheduleId::DualDecodeR4:
-    case Q8PairScheduleId::DualDecodeR8:
-    case Q8PairScheduleId::DualDecodeR16:
         return 1;
     case Q8PairScheduleId::DualSplitKMediumC48:
         return 48;
     case Q8PairScheduleId::DualSplitKMediumC64:
     case Q8PairScheduleId::DualMmaR32C64:
     case Q8PairScheduleId::ConcatMmaR32C64:
-    case Q8PairScheduleId::ConcatMmaR48C64:
-    case Q8PairScheduleId::ConcatMmaR64C64:
     case Q8PairScheduleId::ConcatMmaR96C64:
     case Q8PairScheduleId::ConcatMmaR128C64:
         return 64;
     case Q8PairScheduleId::DualSplitKMediumC80:
-    case Q8PairScheduleId::ConcatMmaR32C80:
-    case Q8PairScheduleId::ConcatMmaR64C80:
-    case Q8PairScheduleId::ConcatMmaR96C80:
     case Q8PairScheduleId::ConcatMmaR128C80:
         return 80;
     case Q8PairScheduleId::DualSplitKMediumC88:
@@ -221,9 +197,7 @@ std::int32_t schedule_cols(Q8PairScheduleId schedule) {
     case Q8PairScheduleId::DualSplitKMediumC104:
         return 104;
     case Q8PairScheduleId::DualSplitKMediumC112:
-    case Q8PairScheduleId::ConcatMmaR32C112:
     case Q8PairScheduleId::ConcatMmaR48C112:
-    case Q8PairScheduleId::ConcatMmaR96C112:
         return 112;
     case Q8PairScheduleId::DualSplitKMediumC128:
     case Q8PairScheduleId::DualMmaR32C128:
@@ -235,10 +209,6 @@ std::int32_t schedule_cols(Q8PairScheduleId schedule) {
         return 160;
     case Q8PairScheduleId::DualSplitKMediumC192:
         return 192;
-    case Q8PairScheduleId::DualSplitKMediumC224:
-        return 224;
-    case Q8PairScheduleId::DualSplitKMediumC256:
-        return 256;
     case Q8PairScheduleId::DualSplitKMmaExactT:
         throw std::logic_error("q8 pair exact-T schedule has runtime column tile");
     }
@@ -309,102 +279,6 @@ void require_pair_operands(const Tensor& x, const Weight& first_weight, const We
 }
 
 } // namespace
-
-const char* q8_pair_schedule_name(Q8PairScheduleId schedule) {
-    switch (schedule) {
-    case Q8PairScheduleId::TwoSimtR8C4:
-        return "q8_pair.two_simt.r8.c4";
-    case Q8PairScheduleId::DualDecodeR4:
-        return "q8_pair.dual_decode.k2048.r4";
-    case Q8PairScheduleId::DualDecodeR8:
-        return "q8_pair.dual_decode.k2048.r8";
-    case Q8PairScheduleId::DualDecodeR16:
-        return "q8_pair.dual_decode.k2048.r16";
-    case Q8PairScheduleId::DualSplitKMmaExactT:
-        return "q8_pair.dual_splitk8.mma.r8.exact_t";
-    case Q8PairScheduleId::DualSplitKMediumC48:
-        return "q8_pair.splitk4.mma.r16.c48";
-    case Q8PairScheduleId::DualSplitKMediumC64:
-        return "q8_pair.splitk4.mma.r16.c64";
-    case Q8PairScheduleId::DualSplitKMediumC80:
-        return "q8_pair.splitk4.mma.r16.c80";
-    case Q8PairScheduleId::DualSplitKMediumC88:
-        return "q8_pair.splitk4.mma.r16.c88";
-    case Q8PairScheduleId::DualSplitKMediumC96:
-        return "q8_pair.splitk4.mma.r16.c96";
-    case Q8PairScheduleId::DualSplitKMediumC104:
-        return "q8_pair.splitk4.mma.r16.c104";
-    case Q8PairScheduleId::DualSplitKMediumC112:
-        return "q8_pair.splitk4.mma.r16.c112";
-    case Q8PairScheduleId::DualSplitKMediumC128:
-        return "q8_pair.splitk2.mma.r16.c128";
-    case Q8PairScheduleId::DualSplitKMediumC160:
-        return "q8_pair.splitk2.mma.r16.c160";
-    case Q8PairScheduleId::DualSplitKMediumC192:
-        return "q8_pair.splitk2.mma.r16.c192";
-    case Q8PairScheduleId::DualSplitKMediumC224:
-        return "q8_pair.splitk2.mma.r16.c224";
-    case Q8PairScheduleId::DualSplitKMediumC256:
-        return "q8_pair.splitk2.mma.r16.c256";
-    case Q8PairScheduleId::DualMmaR32C64:
-        return "q8_pair.dual_mma.r32.c64";
-    case Q8PairScheduleId::DualMmaR32C128:
-        return "q8_pair.dual_mma.r32.c128";
-    case Q8PairScheduleId::ConcatMmaR32C64:
-        return "q8_pair.concat_mma.r32.c64";
-    case Q8PairScheduleId::ConcatMmaR32C80:
-        return "q8_pair.concat_mma.r32.c80";
-    case Q8PairScheduleId::ConcatMmaR32C96:
-        return "q8_pair.concat_mma.r32.c96";
-    case Q8PairScheduleId::ConcatMmaR32C112:
-        return "q8_pair.concat_mma.r32.c112";
-    case Q8PairScheduleId::ConcatMmaR32C128:
-        return "q8_pair.concat_mma.r32.c128";
-    case Q8PairScheduleId::ConcatMmaR48C64:
-        return "q8_pair.concat_mma.r48.c64";
-    case Q8PairScheduleId::ConcatMmaR48C96:
-        return "q8_pair.concat_mma.r48.c96";
-    case Q8PairScheduleId::ConcatMmaR48C112:
-        return "q8_pair.concat_mma.r48.c112";
-    case Q8PairScheduleId::ConcatMmaR48C128:
-        return "q8_pair.concat_mma.r48.c128";
-    case Q8PairScheduleId::ConcatMmaR64C64:
-        return "q8_pair.concat_mma.r64.c64";
-    case Q8PairScheduleId::ConcatMmaR64C80:
-        return "q8_pair.concat_mma.r64.c80";
-    case Q8PairScheduleId::ConcatMmaR64C96:
-        return "q8_pair.concat_mma.r64.c96";
-    case Q8PairScheduleId::ConcatMmaR64C128:
-        return "q8_pair.concat_mma.r64.c128";
-    case Q8PairScheduleId::ConcatMmaR96C64:
-        return "q8_pair.concat_mma.r96.c64";
-    case Q8PairScheduleId::ConcatMmaR96C80:
-        return "q8_pair.concat_mma.r96.c80";
-    case Q8PairScheduleId::ConcatMmaR96C96:
-        return "q8_pair.concat_mma.r96.c96";
-    case Q8PairScheduleId::ConcatMmaR96C112:
-        return "q8_pair.concat_mma.r96.c112";
-    case Q8PairScheduleId::ConcatMmaR128C64:
-        return "q8_pair.concat_mma.r128.c64";
-    case Q8PairScheduleId::ConcatMmaR128C80:
-        return "q8_pair.concat_mma.r128.c80";
-    case Q8PairScheduleId::ExactConcatMmaR32C96:
-        return "q8_pair.exact.concat_mma.r32.c96";
-    case Q8PairScheduleId::ExactConcatMmaR32C128:
-        return "q8_pair.exact.concat_mma.r32.c128";
-    case Q8PairScheduleId::ExactConcatMmaR64C96:
-        return "q8_pair.exact.concat_mma.r64.c96";
-    case Q8PairScheduleId::ExactConcatMmaR64C128:
-        return "q8_pair.exact.concat_mma.r64.c128";
-    case Q8PairScheduleId::ExactConcatMmaR96C96:
-        return "q8_pair.exact.concat_mma.r96.c96";
-    case Q8PairScheduleId::ExactConcatMmaR128C64:
-        return "q8_pair.exact.concat_mma.r128.c64";
-    case Q8PairScheduleId::ExactConcatMmaR128C80:
-        return "q8_pair.exact.concat_mma.r128.c80";
-    }
-    return "q8_pair.unknown";
-}
 
 Q8PairProblem q8_pair_problem(const Tensor& x, const Weight& first_weight,
                               const Tensor& first_out) noexcept {
@@ -510,14 +384,10 @@ void launch_exact_tail(Q8PairScheduleId exact_schedule, const Q8PairProblem& pro
 
 } // namespace
 
-void q8_pair_execute_plan(Q8PairPlan plan, const Tensor& x, const Weight& first_weight,
-                          const Weight& second_weight, Tensor& first_out, Tensor& second_out,
-                          cudaStream_t stream) {
+void q8_pair_dispatch(const Tensor& x, const Weight& first_weight, const Weight& second_weight,
+                      Tensor& first_out, Tensor& second_out, cudaStream_t stream) {
     const Q8PairProblem problem = q8_pair_problem(x, first_weight, first_out);
-    const Q8PairPlan resolved   = q8_pair_resolve_plan(problem);
-    if (resolved.schedule != plan.schedule) {
-        throw std::invalid_argument("q8 pair: plan does not match the exact problem");
-    }
+    const Q8PairPlan plan       = q8_pair_resolve_plan(problem);
 
     require_pair_weights(first_weight, second_weight, x.ne[0]);
     if (problem.k == 2048) { require_dflash_row_views(first_weight, second_weight); }
@@ -534,12 +404,6 @@ void q8_pair_execute_plan(Q8PairPlan plan, const Tensor& x, const Weight& first_
     case Q8PairScheduleId::DualDecodeR4:
         q8_pair_decode_r4_launch(x, first_weight, second_weight, first_out, second_out, stream);
         return;
-    case Q8PairScheduleId::DualDecodeR8:
-        q8_pair_decode_r8_launch(x, first_weight, second_weight, first_out, second_out, stream);
-        return;
-    case Q8PairScheduleId::DualDecodeR16:
-        q8_pair_decode_r16_launch(x, first_weight, second_weight, first_out, second_out, stream);
-        return;
     case Q8PairScheduleId::DualSplitKMmaExactT:
         q8_pair_splitk_exact_t_launch(x, first_weight, second_weight, first_out, second_out,
                                       stream);
@@ -554,8 +418,6 @@ void q8_pair_execute_plan(Q8PairPlan plan, const Tensor& x, const Weight& first_
     case Q8PairScheduleId::DualSplitKMediumC128:
     case Q8PairScheduleId::DualSplitKMediumC160:
     case Q8PairScheduleId::DualSplitKMediumC192:
-    case Q8PairScheduleId::DualSplitKMediumC224:
-    case Q8PairScheduleId::DualSplitKMediumC256:
         q8_pair_splitk_medium_launch(plan.schedule, x, first_weight, second_weight, first_out,
                                      second_out, stream);
         return;
@@ -564,12 +426,6 @@ void q8_pair_execute_plan(Q8PairPlan plan, const Tensor& x, const Weight& first_
                      second_weight, first_out, second_out, stream);
         return;
     }
-}
-
-void q8_pair_dispatch(const Tensor& x, const Weight& first_weight, const Weight& second_weight,
-                      Tensor& first_out, Tensor& second_out, cudaStream_t stream) {
-    const Q8PairPlan plan = q8_pair_resolve_plan(q8_pair_problem(x, first_weight, first_out));
-    q8_pair_execute_plan(plan, x, first_weight, second_weight, first_out, second_out, stream);
 }
 
 } // namespace ninfer::ops::detail

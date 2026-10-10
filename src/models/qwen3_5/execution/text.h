@@ -68,12 +68,11 @@ class VisionPrefillSession;
 class TextContext {
 public:
     TextContext(DeviceContext& ctx, const execution::Parameters& weights, WorkspaceArena& work,
-                qwen3_5::PagedKVCacheView kv, LinearAttentionStatePool& state,
+                const qwen3_5::PagedKVCache& batch_text_kv, LinearAttentionStatePool& state,
                 qwen3_5::RoundState& io, Tensor& prefill_hidden, std::uint32_t prefill_chunk,
                 std::uint32_t text_kv_base,
-                qwen3_5::PagedKVCacheView mtp_kv           = qwen3_5::PagedKVCacheView(),
-                const qwen3_5::PagedKVCache* batch_text_kv = nullptr,
-                const qwen3_5::PagedKVCache* batch_mtp_kv  = nullptr);
+                qwen3_5::PagedKVCacheView mtp_kv          = qwen3_5::PagedKVCacheView(),
+                const qwen3_5::PagedKVCache* batch_mtp_kv = nullptr);
     ~TextContext();
 
     TextContext(const TextContext&)            = delete;
@@ -106,10 +105,6 @@ public:
     void set_gdn_state_action(GdnStateAction action, const GdnReplayRecords* replay_records);
 
     [[nodiscard]] const LinearParameters* proposal_head() const noexcept { return proposal_head_; }
-
-    [[nodiscard]] const std::int32_t* proposal_head_ids() const noexcept {
-        return proposal_head_ids_;
-    }
 
     [[nodiscard]] int proposal_head_n() const noexcept { return proposal_head_n_; }
 
@@ -216,10 +211,9 @@ private:
     const Parameters& parameters_;
     const TextConfig& config_;
     WorkspaceArena& work_;
-    qwen3_5::PagedKVCacheView kv_;
     qwen3_5::PagedKVCacheView mtp_kv_;
-    const qwen3_5::PagedKVCache* batch_text_kv_ = nullptr;
-    const qwen3_5::PagedKVCache* batch_mtp_kv_  = nullptr;
+    const qwen3_5::PagedKVCache& batch_text_kv_;
+    const qwen3_5::PagedKVCache* batch_mtp_kv_ = nullptr;
     LinearAttentionStatePool& state_;
     qwen3_5::RoundState& io_;
     Tensor& prefill_hidden_;

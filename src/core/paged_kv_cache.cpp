@@ -130,10 +130,6 @@ std::size_t DeviceKVPagePoolLayout::payload_bytes() const noexcept {
     return total;
 }
 
-std::size_t KVExecutionTableLayout::metadata_bytes() const noexcept {
-    return block_tables.region.bytes;
-}
-
 DeviceKVPageLease::~DeviceKVPageLease() { (void)release(); }
 
 DeviceKVPageLease::DeviceKVPageLease(DeviceKVPageLease&& other) noexcept

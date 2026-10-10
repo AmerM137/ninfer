@@ -9,14 +9,6 @@ SelectorRoute candidate_selector_path_route(int steps, int batch) {
     return steps <= 4 ? SelectorRoute::Direct : SelectorRoute::Lattice;
 }
 
-const char* selector_route_name(SelectorRoute route) {
-    return route == SelectorRoute::Direct ? "direct.t512" : "lattice.t512";
-}
-
-const char* candidate_selector_path_route_name(int steps, int batch) {
-    return selector_route_name(candidate_selector_path_route(steps, batch));
-}
-
 void candidate_selector_path_dispatch(const Tensor& candidate_ids, const Tensor& unary_scores,
                                       const Tensor& projected_hidden, const Tensor& anchors,
                                       const Tensor& predecessor_codebook,

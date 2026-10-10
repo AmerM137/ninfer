@@ -19,18 +19,6 @@ void launch_route(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t st
 
 } // namespace
 
-void q8_linear_swiglu_mma_r32_c32_launch(const Tensor& x, const Weight& w, Tensor& out,
-                                         cudaStream_t stream) {
-    using Schedule = Q8A16MmaSchedule<32, 32, 64, 32, 16, 2, 4>;
-    launch_route<Schedule>(x, w, out, stream);
-}
-
-void q8_linear_swiglu_mma_r32_c48_launch(const Tensor& x, const Weight& w, Tensor& out,
-                                         cudaStream_t stream) {
-    using Schedule = Q8A16MmaSchedule<32, 48, 64, 32, 16, 2, 4>;
-    launch_route<Schedule>(x, w, out, stream);
-}
-
 void q8_linear_swiglu_mma_r32_c64_launch(const Tensor& x, const Weight& w, Tensor& out,
                                          cudaStream_t stream) {
     using Schedule = Q8A16MmaSchedule<32, 64, 64, 32, 16, 2, 3>;

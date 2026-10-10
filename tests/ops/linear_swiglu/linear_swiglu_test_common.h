@@ -1,11 +1,14 @@
 #pragma once
 
 #include "core/weight.h"
-#include "core/tensor.h"
 
 #include <cstdint>
 #include <span>
 #include <string_view>
+
+namespace ninfer::test::quantized_weight {
+struct PackedWeight;
+}
 
 namespace ninfer::test::linear_swiglu {
 
@@ -27,5 +30,10 @@ struct Profile {
 int run_profile(std::string_view label, const Profile& profile,
                 std::span<const std::int32_t> token_cases,
                 std::span<const std::int32_t> graph_cases = {});
+
+int run_negative_gate(std::string_view label, const quantized_weight::PackedWeight& weight,
+                      ActivationCompute activation_compute,
+                      std::span<const std::int32_t> token_cases,
+                      std::span<const std::int32_t> active_columns);
 
 } // namespace ninfer::test::linear_swiglu

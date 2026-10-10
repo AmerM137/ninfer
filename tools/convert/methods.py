@@ -85,10 +85,6 @@ class PrepareRequest:
             raise ValueError("this method has multiple inputs; use request.inputs")
         return self.inputs[0].source
 
-    def require_input_shape(self, shape: tuple[int, ...]) -> None:
-        if self.source.shape != tuple(shape):
-            raise ValueError(f"source shape {self.source.shape} differs from {shape}")
-
     def job(self, *, produce, auxiliaries=None) -> PreparedMethod:
         return PreparedMethod(produce, {} if auxiliaries is None else dict(auxiliaries))
 

@@ -145,15 +145,15 @@ then run the text step (IFBench, AIME25, AIME26, and GPQA-Diamond) and the multi
 RealWorldQA):
 
 ```bash
-eval/run_qwen3_8_27b_nvfp4_reasoning.sh --plan
-eval/run_qwen3_8_27b_nvfp4_reasoning.sh
+eval/run_qwen3_8_27b_reasoning.sh nvfp4 --plan
+eval/run_qwen3_8_27b_reasoning.sh nvfp4
 ```
 
-With no step argument the script runs the two steps back to back, restarting the server between
-them. Pass `text` or `multimodal` to run a single step only, and `--plan` to preview the plan for
-the selected step(s) without starting the server.
+Select `nvfp4` or `groupwise` as the first argument. With no step argument the script runs the two
+steps back to back, restarting the server between them. Pass `text` or `multimodal` to run a single
+step only, and `--plan` before the step to preview the selected plan(s) without starting the server.
 
-The script starts a fresh local server for each step. The text server uses a 252,928-token context
+The script starts a fresh local server for each step. The NVFP4 text server uses a 252,928-token context
 (the largest that fits the RTX 5090 after weights; 262,144 is rejected at startup) and omits
 `--vision`, so Vision's fixed GPU allocations do not reduce the KV pool needed by long reasoning.
 The multimodal server is restarted with `--vision` and an 81,920-token context. Across the cached
@@ -168,7 +168,7 @@ The completed NVFP4 run used `eval/runs/20260818T132336Z-c16a8902` and
 the [NVFP4 model card](../model-cards/Qwen3.8-27B-nvfp4-NInfer/README.md#evaluation).
 
 The Qwen3.8-27B groupwise-int profile runs the same protocol through
-`eval/run_qwen3_8_27b_groupwise_reasoning.sh`. Its 16.96 GiB artifact leaves more GPU memory, so the
+`eval/run_qwen3_8_27b_reasoning.sh groupwise`. Its 16.96 GiB artifact leaves more GPU memory, so the
 text step uses the full 262,144-token context and both steps run at concurrency four (run
 directories `eval/runs/20260819T031655Z-078bd8e0` and `eval/runs/20260819T141750Z-531a236a`; the
 multimodal step was resumed with `ninfer_eval resume` after a local proxy change interrupted

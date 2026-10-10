@@ -53,27 +53,12 @@ int grid_for_q6_grouped(std::int32_t d, std::int32_t T) {
                                                           static_cast<std::int64_t>(group_blocks)));
 }
 
-} // namespace
-
-const char* q8_embed_route_name(Q8EmbedRoute route) {
-    switch (route) {
-    case Q8EmbedRoute::Auto:
-        return "auto";
-    case Q8EmbedRoute::Grouped:
-        return "grouped-b32";
-    case Q8EmbedRoute::Row:
-        return "row-b256";
-    }
-    return "unknown";
-}
-
 void embed_gather_q8_2048_launch(const Tensor& ids, const Weight& table, Tensor& out,
-                                 Q8EmbedRoute route, cudaStream_t stream) {
+                                 cudaStream_t stream) {
     const std::int32_t T = ids.ne[0];
     const auto* codes    = static_cast<const std::uint8_t*>(table.qdata);
     const auto* scales   = static_cast<const std::uint8_t*>(table.scales);
-    if (route == Q8EmbedRoute::Auto) { route = T <= 6 ? Q8EmbedRoute::Grouped : Q8EmbedRoute::Row; }
-    if (route == Q8EmbedRoute::Grouped) {
+    if (T <= 6) {
         const int grid = T * kEmbedGatherQ8Groups;
         embed_gather_q8_grouped_2048_kernel<<<grid, kQ8GroupedBlock, 0, stream>>>(
             static_cast<const std::int32_t*>(ids.data), codes, scales,
@@ -85,6 +70,8 @@ void embed_gather_q8_2048_launch(const Tensor& ids, const Weight& table, Tensor&
     }
     CUDA_CHECK(cudaGetLastError());
 }
+
+} // namespace
 
 void embed_gather_dense_launch(const Tensor& ids, const Tensor& table, Tensor& out,
                                cudaStream_t stream) {
@@ -126,7 +113,7 @@ void embed_gather_q8_launch(const Tensor& ids, const Weight& table, Tensor& out,
     const auto* codes    = static_cast<const std::uint8_t*>(table.qdata);
     const auto* scales   = static_cast<const std::uint8_t*>(table.scales);
     if (d == kEmbedGatherQ8D && table.padded_shape[1] == kEmbedGatherQ8D) {
-        embed_gather_q8_2048_launch(ids, table, out, Q8EmbedRoute::Auto, stream);
+        embed_gather_q8_2048_launch(ids, table, out, stream);
         return;
     }
 

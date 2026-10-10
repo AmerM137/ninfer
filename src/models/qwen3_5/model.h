@@ -1,6 +1,5 @@
 #pragma once
 
-#include "artifact/framing.h"
 #include "artifact/materializer.h"
 #include "models/qwen3_5/config.h"
 #include "models/qwen3_5/frontend/resources.h"
@@ -15,9 +14,6 @@ namespace ninfer::models::qwen3_5 {
 
 struct InstanceInfo {
     std::string name;
-    std::string metadata_json;
-    std::string provenance_json;
-    artifact::ArtifactId artifact_id{};
 };
 
 class LoadPlan;

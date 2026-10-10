@@ -76,22 +76,6 @@ std::size_t materialized_workspace_bytes(std::int32_t rows, std::int32_t cols) {
 
 } // namespace
 
-const char* q4_linear_swiglu_schedule_name(Q4LinearSwiGluScheduleId schedule) noexcept {
-    switch (schedule) {
-    case Q4LinearSwiGluScheduleId::GemvPair:
-        return "linear_swiglu.q4.gemv.paired_rows";
-    case Q4LinearSwiGluScheduleId::SmallTTiled:
-        return "linear_swiglu.q4.mma.small_t.tiled";
-    case Q4LinearSwiGluScheduleId::Materialized:
-        return "linear_swiglu.q4.materialized";
-    case Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C128:
-        return "linear_swiglu.q4.mma.split_half_pair.r32.c128";
-    case Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C128Tail:
-        return "linear_swiglu.q4.mma.split_half_pair.r32.c128.narrow_tail";
-    }
-    return "linear_swiglu.q4.unknown";
-}
-
 bool q4_linear_swiglu_admits(const Q4LinearSwiGluProblem& problem) noexcept {
     return supported_shape(problem) && problem.cols >= 1;
 }

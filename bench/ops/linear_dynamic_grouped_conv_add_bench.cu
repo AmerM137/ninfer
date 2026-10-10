@@ -1,8 +1,7 @@
 #include "core/weight.h"
 #include "ninfer/ops/dynamic_grouped_conv.h"
 
-#include "ninfer_bench_common.h"
-#include "ops/dynamic_grouped_conv/q8/q8_dynamic_grouped_conv_add_plan.h"
+#include "op_measurement.cuh"
 #include "quantized_weight.cuh"
 
 #include <cuda_runtime.h>
@@ -46,20 +45,19 @@ Options parse_args(int argc, char** argv) {
             return argv[++index];
         };
         if (!std::strcmp(argv[index], "--width")) {
-            options.width = std::atoi(next("width"));
-
+            options.width = measurement::integer(next("width"), 0);
         } else if (!std::strcmp(argv[index], "--warmup")) {
-            options.warmup = std::atoi(next("warmup"));
+            options.warmup = measurement::integer(next("warmup"), 0);
         } else if (!std::strcmp(argv[index], "--repeat")) {
-            options.repeat = std::atoi(next("repeat"));
+            options.repeat = measurement::integer(next("repeat"));
         } else if (!std::strcmp(argv[index], "--k")) {
-            options.input_rows = std::atoi(next("K"));
+            options.input_rows = measurement::integer(next("K"), 0);
         } else if (!std::strcmp(argv[index], "--batch")) {
-            options.batch_size = std::atoi(next("batch"));
+            options.batch_size = measurement::integer(next("batch"), 0);
         } else if (!std::strcmp(argv[index], "--flush-mib")) {
-            const long mib = std::strtol(next("flush MiB"), nullptr, 10);
-            if (mib <= 0) { throw std::invalid_argument("flush MiB must be positive"); }
-            options.flush_bytes = static_cast<std::size_t>(mib) << 20;
+            const auto mib = measurement::integer<std::size_t>(
+                next("flush MiB"), 1, std::numeric_limits<std::size_t>::max() >> 20);
+            options.flush_bytes = mib << 20;
         } else if (!std::strcmp(argv[index], "--help") || !std::strcmp(argv[index], "-h")) {
             std::printf("usage: %s [--width 2..16] [--k 4096|17408] [--batch 1..8] [--warmup N] "
                         "[--repeat N] "
@@ -113,7 +111,7 @@ void run_profile(std::int32_t input_rows, const Options& options, bench::L2Flush
                                  2.0 * static_cast<double>(kHidden) * kTaps * kSides +
                                  2.0 * static_cast<double>(kGroups) * kTaps * cols +
                                  4.0 * static_cast<double>(kHidden) * cols;
-            const auto measure = [&](const char* route, auto&& launch) {
+            const auto measure = [&](auto&& launch) {
                 TimedGraph graph;
                 workspace.reset();
                 workspace.reset_peak();
@@ -122,13 +120,11 @@ void run_profile(std::int32_t input_rows, const Options& options, bench::L2Flush
                     restore, graph, flush, stream, options.warmup, options.repeat);
                 const double tflops    = flops / timing.median_us / 1.0e6;
                 const double bandwidth = bytes / timing.median_us / 1.0e3;
-                std::printf("%d,%d,%d,%d,%s,%.3f,%.3f,%.3f,%.2f,%.1f,%zu,%zu\n", input_rows, width,
-                            batch_size, cols, route, timing.median_us, timing.min_us, timing.p95_us,
+                std::printf("%d,%d,%d,%d,%.3f,%.3f,%.3f,%.2f,%.1f,%zu,%zu\n", input_rows, width,
+                            batch_size, cols, timing.median_us, timing.min_us, timing.p95_us,
                             tflops, bandwidth, graph.nodes(), workspace.peak_used());
             };
-            const char* route = ops::detail::q8_linear_dynamic_grouped_conv_add_route_name(
-                input_rows, width, batch_size);
-            measure(route, [&](cudaStream_t capture_stream) {
+            measure([&](cudaStream_t capture_stream) {
                 ops::linear_dynamic_grouped_conv_add(x, packed.weight, base_kernel, finish_delta,
                                                      residual_view, workspace, capture_stream);
             });
@@ -149,7 +145,7 @@ int main(int argc, char** argv) {
         bench::L2FlushBuffer flush(options.flush_bytes);
         cudaStream_t stream = nullptr;
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-        std::printf("C,W,B,T,route,median_us,min_us,p95_us,effective_tflops,effective_gbs,"
+        std::printf("C,W,B,T,median_us,min_us,p95_us,effective_tflops,effective_gbs,"
                     "graph_nodes,workspace_bytes\n");
         for (const std::int32_t input_rows : std::array<std::int32_t, 2>{4096, 17408}) {
             if (options.input_rows != 0 && input_rows != options.input_rows) { continue; }

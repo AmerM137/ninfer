@@ -47,25 +47,13 @@ void q8_pair_concat_mma_launch(Q8PairScheduleId schedule, const Tensor& x,
         dispatch_variant<Q8A16MmaSchedule<32, 64, 64, 32, 16, 2, 3>>(x, first_weight, first_out,
                                                                      second_out, stream);
         return;
-    case Q8PairScheduleId::ConcatMmaR32C80:
-        dispatch_variant<Q8A16MmaSchedule<32, 80, 64, 32, 16, 2, 3>>(x, first_weight, first_out,
-                                                                     second_out, stream);
-        return;
     case Q8PairScheduleId::ConcatMmaR32C96:
         dispatch_variant<Q8A16MmaSchedule<32, 96, 64, 32, 16, 2, 2>>(x, first_weight, first_out,
                                                                      second_out, stream);
         return;
-    case Q8PairScheduleId::ConcatMmaR32C112:
-        dispatch_variant<Q8A16MmaSchedule<32, 112, 64, 32, 16, 2, 2>>(x, first_weight, first_out,
-                                                                      second_out, stream);
-        return;
     case Q8PairScheduleId::ConcatMmaR32C128:
         dispatch_variant<Q8A16MmaSchedule<32, 128, 64, 32, 16, 2, 2>>(x, first_weight, first_out,
                                                                       second_out, stream);
-        return;
-    case Q8PairScheduleId::ConcatMmaR48C64:
-        dispatch_variant<Q8A16MmaSchedule<48, 64, 64, 48, 16, 2, 3>>(x, first_weight, first_out,
-                                                                     second_out, stream);
         return;
     case Q8PairScheduleId::ConcatMmaR48C96:
         dispatch_variant<Q8A16MmaSchedule<48, 96, 64, 48, 16, 2, 2>>(x, first_weight, first_out,
@@ -79,14 +67,6 @@ void q8_pair_concat_mma_launch(Q8PairScheduleId schedule, const Tensor& x,
         dispatch_variant<Q8A16MmaSchedule<48, 128, 64, 48, 16, 2, 2>>(x, first_weight, first_out,
                                                                       second_out, stream);
         return;
-    case Q8PairScheduleId::ConcatMmaR64C64:
-        dispatch_variant<Q8A16MmaSchedule<64, 64, 64, 64, 16, 2, 2>>(x, first_weight, first_out,
-                                                                     second_out, stream);
-        return;
-    case Q8PairScheduleId::ConcatMmaR64C80:
-        dispatch_variant<Q8A16MmaSchedule<64, 80, 64, 64, 16, 2, 2>>(x, first_weight, first_out,
-                                                                     second_out, stream);
-        return;
     case Q8PairScheduleId::ConcatMmaR64C96:
         dispatch_variant<Q8A16MmaSchedule<64, 96, 64, 64, 16, 2, 2>>(x, first_weight, first_out,
                                                                      second_out, stream);
@@ -99,17 +79,9 @@ void q8_pair_concat_mma_launch(Q8PairScheduleId schedule, const Tensor& x,
         dispatch_variant<Q8A16MmaSchedule<96, 64, 64, 48, 16, 2, 2>>(x, first_weight, first_out,
                                                                      second_out, stream);
         return;
-    case Q8PairScheduleId::ConcatMmaR96C80:
-        dispatch_variant<Q8A16MmaSchedule<96, 80, 64, 48, 16, 2, 2>>(x, first_weight, first_out,
-                                                                     second_out, stream);
-        return;
     case Q8PairScheduleId::ConcatMmaR96C96:
         dispatch_variant<Q8A16MmaSchedule<96, 96, 64, 48, 16, 2, 2>>(x, first_weight, first_out,
                                                                      second_out, stream);
-        return;
-    case Q8PairScheduleId::ConcatMmaR96C112:
-        dispatch_variant<Q8A16MmaSchedule<96, 112, 64, 48, 16, 2, 2>>(x, first_weight, first_out,
-                                                                      second_out, stream);
         return;
     case Q8PairScheduleId::ConcatMmaR128C64:
         dispatch_variant<Q8A16MmaSchedule<128, 64, 64, 64, 16, 2, 2>>(x, first_weight, first_out,

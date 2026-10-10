@@ -120,14 +120,8 @@ private:
     std::uint32_t occupied_   = 0;
 };
 
-struct StateImageDeviceSlotView {
-    LinearAttentionStateSlotView linear;
-    Tensor continuation_hidden;
-    std::optional<CyclicKVCacheSlotView> dflash_local;
-};
-
 /**
- * Caller-backed fixed storage for Qwen3.6 continuation state.
+ * Caller-backed fixed storage for Qwen3.5 continuation state.
  *
  * Every absolute slot contains common GDN/hidden state and, for a DFlash Program, its local cyclic
  * K/V state. The pool owns neither slot roles nor logical checkpoint identity.
@@ -143,7 +137,6 @@ public:
 
     [[nodiscard]] std::int32_t slot_count() const noexcept { return linear_.slot_count(); }
 
-    [[nodiscard]] StateImageDeviceSlotView slot_view(std::int32_t slot) const;
     [[nodiscard]] Tensor continuation_hidden_slot(std::int32_t slot) const;
 
     [[nodiscard]] LinearAttentionStatePool& linear() noexcept { return linear_; }

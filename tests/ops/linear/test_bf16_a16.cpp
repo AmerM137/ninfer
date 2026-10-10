@@ -1,8 +1,6 @@
 #include "core/weight.h"
 #include "ninfer/ops/linear.h"
 
-#include "core/decode_graph.h"
-#include "core/device.h"
 #include "ops/direct_bf16_weight.h"
 #include "ops/op_tester.h"
 #include "ops/linear/linear_test_common.h"
@@ -12,13 +10,10 @@
 #include <initializer_list>
 #include <limits>
 #include <set>
-#include <cmath>
 #include <cstdint>
-#include <exception>
 #include <iostream>
 #include <span>
 #include <string>
-#include <thread>
 #include <vector>
 
 namespace {
@@ -27,9 +22,8 @@ using namespace ninfer;
 using namespace ninfer::test;
 using namespace ninfer::test::direct_bf16_weight;
 
-constexpr ReductionCriterion kA16Tolerance{1.0 / 256.0, 1.0 / 256.0, 2.0 / 256.0};
-
-std::vector<std::uint16_t> make_activation_bits(std::int32_t hidden, std::int32_t tokens) {
+std::vector<std::uint16_t> make_bf16_activation(std::int32_t hidden, std::int32_t tokens,
+                                                std::uint32_t) {
     std::vector<std::uint16_t> result(static_cast<std::size_t>(hidden) * tokens);
     for (std::int32_t token = 0; token < tokens; ++token) {
         for (std::int32_t column = 0; column < hidden; ++column) {
@@ -41,37 +35,8 @@ std::vector<std::uint16_t> make_activation_bits(std::int32_t hidden, std::int32_
     return result;
 }
 
-std::vector<float> materialize(std::span<const std::uint16_t> bits) {
-    std::vector<float> result(bits.size());
-    for (std::size_t index = 0; index < bits.size(); ++index) {
-        result[index] = bf16_to_f32(bits[index]);
-    }
-    return result;
-}
-
-std::vector<double> oracle_all_rows(const HostWeight& weight, std::span<const float> activation) {
-    std::vector<double> result(static_cast<std::size_t>(weight.n));
-    const unsigned available   = std::max(1U, std::thread::hardware_concurrency());
-    const std::int32_t threads = std::min(weight.n, static_cast<std::int32_t>(available));
-    std::vector<std::thread> workers;
-    workers.reserve(static_cast<std::size_t>(threads));
-    for (std::int32_t thread = 0; thread < threads; ++thread) {
-        const std::int32_t begin =
-            static_cast<std::int32_t>((static_cast<std::int64_t>(weight.n) * thread) / threads);
-        const std::int32_t end = static_cast<std::int32_t>(
-            (static_cast<std::int64_t>(weight.n) * (thread + 1)) / threads);
-        workers.emplace_back([&, begin, end] {
-            for (std::int32_t row = begin; row < end; ++row) {
-                result[static_cast<std::size_t>(row)] = dot_fp64(weight, row, activation);
-            }
-        });
-    }
-    for (std::thread& worker : workers) { worker.join(); }
-    return result;
-}
-
 std::vector<std::int32_t> sampled_rows(std::int32_t rows) {
-    std::vector<std::int32_t> result{0, 1, rows / 4, rows / 2, (3 * rows) / 4, rows - 2, rows - 1};
+    auto result = linear_common::sampled_indices(rows);
     if (rows == 14336) {
         result.insert(result.end(), {1023, 6143, 6144, 7167, 7168, 13311, 13312});
     }
@@ -81,205 +46,61 @@ std::vector<std::int32_t> sampled_rows(std::int32_t rows) {
 }
 
 std::vector<std::int32_t> sampled_tokens(std::int32_t tokens) {
-    if (tokens <= 32) {
-        std::vector<std::int32_t> result(static_cast<std::size_t>(tokens));
-        for (std::int32_t token = 0; token < tokens; ++token) {
-            result[static_cast<std::size_t>(token)] = token;
-        }
-        return result;
-    }
+    if (tokens <= 32) return linear_common::all_indices(tokens);
     std::vector<std::int32_t> result{0, 1, tokens / 2, tokens - 2, tokens - 1};
     std::sort(result.begin(), result.end());
     result.erase(std::unique(result.begin(), result.end()), result.end());
     return result;
 }
 
-int run_bf16_linear_case(DeviceWeight& weight, std::int32_t tokens, bool replay = false) {
-    const std::int32_t rows                    = weight.host.n;
-    const std::int32_t hidden                  = weight.host.k;
-    std::vector<std::uint16_t> activation_bits = make_activation_bits(hidden, tokens);
-    std::vector<float> activation              = materialize(activation_bits);
-    DeviceBuffer device_activation             = to_device(activation_bits);
-    GuardedDeviceBuffer guarded_output(static_cast<std::size_t>(rows) * tokens *
-                                       sizeof(std::uint16_t));
-    guarded_output.fill(0xff);
+ninfer::test::linear::ShapeCase
+bf16_fixture(std::int32_t n, std::int32_t k, std::uint32_t seed,
+             ninfer::test::linear::Comparison comparison,
+             std::span<const ninfer::test::linear::Invocation> calls) {
+    ninfer::test::linear::ShapeCase shape{n, k, seed, comparison, true, calls};
+    shape.activation_generator   = make_bf16_activation;
+    shape.row_sampler            = sampled_rows;
+    shape.column_sampler         = sampled_tokens;
+    shape.verify_each_invocation = true;
+    return shape;
+}
 
-    Tensor x(device_activation.p, DType::BF16, {hidden, tokens});
-    Tensor output(guarded_output.data(), DType::BF16, {rows, tokens});
-    DeviceArena workspace(256);
-    ops::linear(x, weight.view(), output, ops::LinearPolicy::A16Only, workspace, nullptr);
-    cuda_synchronize();
-
-    if (replay) {
-        DeviceContext context;
-        DecodeGraphDefinition definition;
-        DecodeGraphExecutable graph;
-        definition.capture(context.stream, [&] {
-            ops::linear(x, weight.view(), output, ops::LinearPolicy::A16Only, workspace,
-                        context.stream);
-        });
-        graph.instantiate(definition);
-        graph.launch(context.stream);
-        cuda_synchronize();
-        for (auto& bits : activation_bits) bits ^= 0x8000;
-        activation = materialize(activation_bits);
-        device_activation.copy_from_host(activation_bits.data(), device_activation.bytes);
-        guarded_output.fill(0xff);
-        cuda_synchronize();
-        graph.launch(context.stream);
-        cuda_synchronize();
+int run_bf16_projection(std::int32_t n, std::int32_t k, std::uint32_t seed) {
+    using namespace ninfer::test::linear;
+    // These geometries keep their original activation recipe, weight seeds, and coordinates:
+    // T=1 checks every row; larger T checks the established row/token samples.
+    const std::array full{Invocation{1}};
+    int failures = run_shape("BF16_A16 Linear", ActivationCompute::A16, make_bf16_weight,
+                             bf16_fixture(n, k, seed, Comparison::Full, full));
+    std::vector<Invocation> calls;
+    for (int tokens = 2; tokens <= 33; ++tokens) calls.push_back({tokens});
+    for (int tokens :
+         {63, 64, 65, 66, 95, 96, 97, 98, 127, 128, 129, 130, 191, 192, 193, 194, 1024, 1536}) {
+        calls.push_back({tokens});
     }
-    const std::string suffix = " T=" + std::to_string(tokens) + (replay ? " graph" : " eager");
-    int failures             = guarded_output.verify_guards("BF16_A16 Linear output" + suffix);
-    const std::vector<std::uint16_t> output_bits =
-        from_device<std::uint16_t>(guarded_output.data(), static_cast<std::size_t>(rows) * tokens);
-    for (std::size_t index = 0; index < output_bits.size(); ++index) {
-        const std::uint16_t bits = output_bits[index];
-        if (!std::isfinite(bf16_to_f32(bits))) {
-            std::cerr << "BF16_A16 Linear output" << suffix << " element " << index
-                      << " is not finite\n";
-            ++failures;
-            break;
-        }
+    for (int tokens : {3, 7, 13, 19, 23, 25, 29, 33, 64, 65, 97, 129, 193}) {
+        // The original graph cases also made an eager call before capture.
+        calls.push_back({tokens});
+        calls.push_back({tokens, CallForm::Policy, ops::LinearPolicy::A16Only, true});
     }
-
-    std::vector<double> actual;
-    std::vector<double> expected;
-    if (tokens == 1) {
-        const std::vector<double> complete =
-            oracle_all_rows(weight.host, std::span<const float>(activation));
-        actual.reserve(rows);
-        for (const std::uint16_t bits : output_bits) { actual.push_back(bf16_to_f32(bits)); }
-        expected = complete;
-    } else {
-        const std::vector<std::int32_t> sampled       = sampled_rows(rows);
-        const std::vector<std::int32_t> token_samples = sampled_tokens(tokens);
-        actual.reserve(sampled.size() * token_samples.size());
-        expected.reserve(actual.capacity());
-        for (const std::int32_t row : sampled) {
-            for (const std::int32_t token : token_samples) {
-                actual.push_back(
-                    bf16_to_f32(output_bits[static_cast<std::size_t>(token) * rows + row]));
-                expected.push_back(dot_fp64(
-                    weight.host, row,
-                    std::span<const float>(
-                        activation.data() + static_cast<std::size_t>(token) * hidden, hidden)));
-            }
-        }
-    }
-    failures += verify_reduction("BF16_A16 Linear [" + std::to_string(rows) + "," +
-                                     std::to_string(hidden) + "]" + suffix,
-                                 actual, expected, kA16Tolerance);
-    const std::vector<std::uint16_t> activation_after =
-        from_device<std::uint16_t>(device_activation, activation_bits.size());
-    if (activation_after != activation_bits) {
-        std::cerr << "BF16_A16 Linear" << suffix << " modified its activation\n";
-        ++failures;
-    }
-    failures += weight.verify_preserved("BF16_A16 Linear weight" + suffix);
-    return failures;
+    return failures + run_shape("BF16_A16 Linear", ActivationCompute::A16, make_bf16_weight,
+                                bf16_fixture(n, k, seed, Comparison::Sampled, calls));
 }
 
 int run_selector_linear() {
-    constexpr int n = 256, k = 5120, max_t = 2048;
-    DeviceWeight weight(make_patterned(n, k, 419U));
-    const auto bits       = make_activation_bits(k, max_t);
-    const auto activation = materialize(bits);
-    std::vector<double> oracle(n * max_t);
-    std::vector<std::thread> workers;
-    const int threads = std::min(32U, std::max(1U, std::thread::hardware_concurrency()));
-    for (int worker = 0; worker < threads; ++worker)
-        workers.emplace_back([&, worker] {
-            for (int index = worker; index < n * max_t; index += threads) {
-                const int token = index / n, row = index % n;
-                oracle[index] = dot_fp64(weight.host, row,
-                                         std::span<const float>(activation.data() + token * k, k));
-            }
-        });
-    for (auto& worker : workers) worker.join();
-    DeviceBuffer input = to_device(bits);
-    auto negative      = bits;
-    for (auto& value : negative) value ^= 0x8000;
-    DeviceContext context;
-    int failures   = 0;
-    const auto run = [&](int tokens, bool replay) {
-        const auto capacity = ops::linear_workspace_capacity_bytes(
-            QType::BF16, n, k, ops::LinearPolicy::A16Only, tokens, tokens);
-        DeviceArena scratch(std::max<std::size_t>(capacity, 256));
-        GuardedDeviceBuffer output_buffer(static_cast<std::size_t>(n) * tokens * 2);
-        Tensor x(input.p, DType::BF16, {k, tokens});
-        Tensor output(output_buffer.data(), DType::BF16, {n, tokens});
-        const auto launch = [&] {
-            ops::linear(x, weight.view(), output, ops::LinearPolicy::A16Only, scratch,
-                        context.stream);
-        };
-        DecodeGraphDefinition definition;
-        DecodeGraphExecutable graph;
-        cuda_synchronize();
-        if (replay) {
-            definition.capture(context.stream, launch);
-            graph.instantiate(definition);
-        }
-        const std::string label =
-            "BF16 selector T=" + std::to_string(tokens) + (replay ? " graph" : " eager");
-        for (int phase = 0; phase < (replay ? 2 : 1); ++phase) {
-            const auto& represented = phase == 0 ? bits : negative;
-            if (phase) input.copy_from_host(represented.data(), input.bytes);
-            output_buffer.fill(0xff);
-            cuda_synchronize();
-            if (replay)
-                graph.launch(context.stream);
-            else
-                launch();
-            cuda_synchronize(context.stream);
-            failures += output_buffer.verify_guards(label);
-            if (scratch.peak_used() > capacity || scratch.used() != 0) {
-                std::cerr << label << ": workspace query/scope mismatch\n";
-                ++failures;
-            }
-            const auto actual_bits = from_device<std::uint16_t>(output_buffer.data(), n * tokens);
-            std::vector<double> actual(actual_bits.size()),
-                expected(oracle.begin(), oracle.begin() + n * tokens);
-            for (std::size_t i = 0; i < actual.size(); ++i) actual[i] = bf16_to_f32(actual_bits[i]);
-            if (phase)
-                for (auto& value : expected) value = -value;
-            failures += verify_reduction(label, actual, expected, kA16Tolerance);
-            if (from_device<std::uint16_t>(input, bits.size()) != represented) {
-                std::cerr << label << ": modified input\n";
-                ++failures;
-            }
-        }
-        if (replay) input.copy_from_host(bits.data(), input.bytes);
-    };
-    for (int tokens = 1; tokens <= 120; ++tokens) run(tokens, false);
+    using namespace ninfer::test::linear;
+    std::vector<Invocation> calls;
+    for (int tokens = 1; tokens <= 120; ++tokens) calls.push_back({tokens});
     for (int tokens : {121, 127, 128,  129,  159,  160,  161,  162,  256,  639,  640,
-                       641, 642, 1023, 1024, 1025, 1026, 1279, 1280, 1281, 1282, 2048})
-        run(tokens, false);
-    for (int tokens : {1,   7,   8,   15,  16,  63,  64,  65,   76,   77,   80,   81,
-                       119, 120, 129, 160, 161, 640, 641, 1024, 1025, 1280, 1281, 2048})
-        run(tokens, true);
-    failures += weight.verify_preserved("BF16 selector weight");
-    return failures;
-}
-
-int run_bf16_linear() {
-    int failures = 0;
-    DeviceWeight attention_weight(make_patterned(14336, 5120, 401U));
-    DeviceWeight output_weight(make_patterned(5120, 6144, 409U));
-    for (DeviceWeight* weight : {&attention_weight, &output_weight}) {
-        for (int tokens = 1; tokens <= 33; ++tokens) {
-            failures += run_bf16_linear_case(*weight, tokens);
-        }
-        for (int tokens :
-             {63, 64, 65, 66, 95, 96, 97, 98, 127, 128, 129, 130, 191, 192, 193, 194, 1024, 1536}) {
-            failures += run_bf16_linear_case(*weight, tokens);
-        }
-        for (int tokens : {3, 7, 13, 19, 23, 25, 29, 33, 64, 65, 97, 129, 193}) {
-            failures += run_bf16_linear_case(*weight, tokens, true);
-        }
+                       641, 642, 1023, 1024, 1025, 1026, 1279, 1280, 1281, 1282, 2048}) {
+        calls.push_back({tokens});
     }
-    failures += run_selector_linear();
-    return failures;
+    for (int tokens : {1,   7,   8,   15,  16,  63,  64,  65,   76,   77,   80,   81,
+                       119, 120, 129, 160, 161, 640, 641, 1024, 1025, 1280, 1281, 2048}) {
+        calls.push_back({tokens, CallForm::Policy, ops::LinearPolicy::A16Only, true});
+    }
+    return run_shape("BF16 selector", ActivationCompute::A16, make_bf16_weight,
+                     bf16_fixture(256, 5120, 419U, Comparison::Full, calls));
 }
 
 enum class ColumnDomain { Text, RawPatch, Merger };
@@ -451,9 +272,25 @@ int run_new_bf16_geometry(const Geometry& shape) {
     return failures;
 }
 
-int run_new_bf16(int selected_n = 0, int selected_k = 0) {
+int run_bf16(int selected_n = 0, int selected_k = 0) {
     int failures = 0;
     bool found   = selected_n == 0;
+
+    struct ProjectionFixture {
+        std::int32_t n, k;
+        std::uint32_t seed;
+    };
+
+    for (const auto shape :
+         {ProjectionFixture{14336, 5120, 401U}, ProjectionFixture{5120, 6144, 409U}}) {
+        if (selected_n && (shape.n != selected_n || shape.k != selected_k)) continue;
+        found = true;
+        failures += run_bf16_projection(shape.n, shape.k, shape.seed);
+    }
+    if (selected_n == 0 || (selected_n == 256 && selected_k == 5120)) {
+        found = true;
+        failures += run_selector_linear();
+    }
     for (const auto& shape : kNewGeometries) {
         if (selected_n && (shape.n != selected_n || shape.k != selected_k)) continue;
         found = true;
@@ -466,12 +303,7 @@ int run_new_bf16(int selected_n = 0, int selected_k = 0) {
 } // namespace
 
 int main(int argc, char** argv) {
-    if (ninfer::test::cuda_unavailable()) {
-        std::cout << "SKIP: no usable CUDA device\n";
-        return 77;
-    }
-
-    try {
+    return ninfer::test::linear_common::run_test_main("BF16_A16 Linear", [&] {
         int n = 0, k = 0;
         if (argc == 4 && std::string_view(argv[1]) == "--shape") {
             n = std::stoi(argv[2]);
@@ -480,11 +312,6 @@ int main(int argc, char** argv) {
         } else if (argc != 1) {
             throw std::invalid_argument("usage: ninfer_linear_bf16_a16_test [--shape N K]");
         }
-        const int failures = (n == 0 ? run_bf16_linear() : 0) + run_new_bf16(n, k);
-        std::cout << (failures == 0 ? "OK" : "FAIL") << " BF16_A16 Linear\n";
-        return failures == 0 ? 0 : 1;
-    } catch (const std::exception& error) {
-        std::cerr << "BF16_A16 Linear: " << error.what() << '\n';
-        return 1;
-    }
+        return run_bf16(n, k);
+    });
 }

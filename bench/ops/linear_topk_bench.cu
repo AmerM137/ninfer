@@ -2,7 +2,7 @@
 #include "core/weight.h"
 #include "ninfer/ops/linear_topk.h"
 
-#include "ninfer_bench_common.h"
+#include "op_measurement.cuh"
 #include "quantized_weight.cuh"
 
 #include <cuda_runtime.h>
@@ -13,7 +13,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
-#include <sstream>
 #include <string_view>
 #include <string>
 #include <vector>
@@ -124,20 +123,12 @@ int main(int argc, char** argv) {
             if (flag == "--profile")
                 profile = value;
             else if (flag == "--columns") {
-                std::istringstream input(value);
-                std::string item;
-                while (std::getline(input, item, ',')) {
-                    std::size_t end = 0;
-                    const int n     = std::stoi(item, &end);
-                    if (n < 1 || end != item.size())
-                        throw std::invalid_argument("columns must be positive integers");
-                    columns.push_back(n);
-                }
-                if (columns.empty()) throw std::invalid_argument("columns must not be empty");
+                const auto values = measurement::integers(value);
+                columns.insert(columns.end(), values.begin(), values.end());
             } else if (flag == "--warmup")
-                warmup = std::stoi(value);
+                warmup = measurement::integer(value, 0);
             else if (flag == "--repeat")
-                repeat = std::stoi(value);
+                repeat = measurement::integer(value);
             else
                 throw std::invalid_argument("unknown option: " + flag);
         }

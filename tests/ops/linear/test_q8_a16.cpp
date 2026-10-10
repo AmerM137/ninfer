@@ -161,11 +161,7 @@ int q8_a16_conformance(std::int32_t selected_n = 0, std::int32_t selected_k = 0)
 } // namespace
 
 int main(int argc, char** argv) {
-    if (!ninfer::test::linear::cuda_available()) {
-        std::cout << "SKIP: no usable CUDA device\n";
-        return 77;
-    }
-    try {
+    return ninfer::test::linear_common::run_test_main("Q8_A16 Linear", [&] {
         std::int32_t n = 0, k = 0;
         if (argc == 4 && std::string_view(argv[1]) == "--shape") {
             n = std::stoi(argv[2]);
@@ -174,11 +170,6 @@ int main(int argc, char** argv) {
         } else if (argc != 1) {
             throw std::invalid_argument("usage: ninfer_linear_q8_a16_test [--shape N K]");
         }
-        const int failures = q8_a16_conformance(n, k);
-        std::cout << (failures == 0 ? "OK" : "FAIL") << " Q8_A16 Linear\n";
-        return failures == 0 ? 0 : 1;
-    } catch (const std::exception& error) {
-        std::cerr << "Q8_A16 Linear: " << error.what() << '\n';
-        return 1;
-    }
+        return q8_a16_conformance(n, k);
+    });
 }

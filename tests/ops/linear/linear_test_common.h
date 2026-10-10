@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ninfer/ops/linear.h"
+#include "ops/linear_common.h"
 #include "ops/quantized_weight.h"
 
 #include <cstdint>
@@ -35,6 +36,10 @@ struct Invocation {
 
 enum class ActivationPattern : std::uint8_t { Dense, KTail, Cancellation };
 
+using ActivationGenerator = std::vector<std::uint16_t> (*)(std::int32_t, std::int32_t,
+                                                           std::uint32_t);
+using IndexSampler        = std::vector<std::int32_t> (*)(std::int32_t);
+
 struct ShapeCase {
     std::int32_t n;
     std::int32_t k;
@@ -43,6 +48,12 @@ struct ShapeCase {
     bool verify_input_preservation;
     std::span<const Invocation> invocations;
     ActivationPattern activation_pattern = ActivationPattern::Dense;
+    // Explicit fixture recipes preserve different represented inputs and sample coordinates.
+    // Null callbacks select this family's standard activation and evenly spaced 32-point sample.
+    ActivationGenerator activation_generator = nullptr;
+    IndexSampler row_sampler                 = nullptr;
+    IndexSampler column_sampler              = nullptr;
+    bool verify_each_invocation              = false;
 };
 
 using WeightGenerator = quantized_weight::PackedWeight (*)(std::int32_t, std::int32_t,
@@ -64,8 +75,6 @@ quantized_weight::PackedWeight make_fp8_weight(std::int32_t n, std::int32_t k, s
 
 void cpu_linear_gemm_fp64(const float* weight, const float* activation, double* output,
                           std::int32_t n, std::int32_t k, std::int32_t t);
-
-bool cuda_available();
 
 int run_shape(std::string_view label, ActivationCompute activation_compute,
               WeightGenerator generator, const ShapeCase& shape);

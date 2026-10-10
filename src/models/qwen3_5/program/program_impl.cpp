@@ -327,22 +327,21 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
         std::uint32_t cursor = 0;
         while (cursor < predictor_count) {
             const std::uint32_t nominal = std::min(prefill_chunk, predictor_count - cursor);
-            execution::PrefillContext schedule_state{
-                {device, parameters, work, state_images->linear(), nullptr, io, prefill_hidden,
-                 prefill_chunk, proposal_head},
-                decoder->text_kv.execution_view(text_kv_addresses->execution_row(*address)),
-                {},
-                decoder->text_kv,
-                nullptr,
-                nullptr,
-                cursor,
-                nullptr,
-                nullptr,
-                state_slot,
-                state_slot,
-                0,
-                0,
-                nullptr};
+            execution::PrefillContext schedule_state{{device, parameters, work,
+                                                      state_images->linear(), nullptr, io,
+                                                      prefill_hidden, prefill_chunk, proposal_head},
+                                                     {},
+                                                     decoder->text_kv,
+                                                     nullptr,
+                                                     nullptr,
+                                                     cursor,
+                                                     nullptr,
+                                                     nullptr,
+                                                     state_slot,
+                                                     state_slot,
+                                                     0,
+                                                     0,
+                                                     nullptr};
             mark_workspace_usage(workspace_plan.text_prefill);
             const execution::PrefillChunkResult result = execution::prefill_text_chunk(
                 schedule_state, std::span<const TokenId>(prompt.token_ids), nominal, std::nullopt,

@@ -1,9 +1,11 @@
 #include "core/weight.h"
 #include "ninfer/ops/dynamic_grouped_conv.h"
 #include "core/decode_graph.h"
+#include "core/device.h"
 
 #include "ops/input_projection_test_common.h"
 #include "ops/op_tester.h"
+#include "ops/linear_common.h"
 #include "ops/quantized_weight.h"
 
 #include <algorithm>
@@ -13,7 +15,7 @@
 #include <iostream>
 #include <span>
 #include <string>
-#include <string_view>
+#include <utility>
 #include <vector>
 
 using namespace ninfer;
@@ -32,6 +34,8 @@ constexpr std::int32_t kMaximumCols  = kMaximumWidth * kMaximumBatch;
 constexpr std::array<std::int32_t, 27> kSampledRows{
     0,   7,   8,   15,  16,   17,   31,   32,   63,   64,   127,  128,  255, 256,
     319, 320, 639, 640, 1023, 1024, 2047, 2048, 2559, 2560, 4095, 4096, 5119};
+constexpr std::array<std::pair<int, int>, 6> kGraphCases{
+    {{3, 3}, {13, 5}, {11, 7}, {14, 6}, {15, 6}, {16, 8}}};
 constexpr ReductionCriterion kCriterion{/*relative_l2=*/3.2e-3,
                                         /*gross_absolute=*/1.0e-3,
                                         /*gross_relative=*/2.0e-3};
@@ -172,13 +176,6 @@ std::vector<double> gather_actual(const void* device, std::int32_t width, std::i
     return result;
 }
 
-int verify_preserved(std::string_view label, const DeviceBuffer& device,
-                     std::span<const std::uint16_t> expected) {
-    const std::string owned(label);
-    return verify_exact(owned.c_str(), from_device<std::uint16_t>(device, expected.size()),
-                        std::vector<std::uint16_t>(expected.begin(), expected.end()));
-}
-
 int run_profile(std::int32_t input_rows) {
     const std::vector<float> activation = make_activation(input_rows);
     std::vector<std::uint16_t> activation_bits(activation.size());
@@ -221,42 +218,9 @@ int run_profile(std::int32_t input_rows) {
             Tensor residual_view(residual_device.data(), DType::BF16, {kHidden, width, batch_size});
             const auto expected =
                 result_oracle(projection, base_kernel, finish_delta, residual, width, batch_size);
-            const bool graph_case =
-                (width == 3 && batch_size == 3) || (width == 13 && batch_size == 5) ||
-                (width == 11 && batch_size == 7) || (width == 14 && batch_size == 6) ||
-                (width == 15 && batch_size == 6) || (width == 16 && batch_size == 8);
-            for (int replay = 0; replay < (graph_case ? 2 : 1); ++replay) {
-                residual_device.copy_from_host(residual.data(), bytes);
-                workspace.reset_peak();
-                const auto launch = [&](cudaStream_t stream) {
-                    ops::linear_dynamic_grouped_conv_add(x, weight, base, delta, residual_view,
-                                                         workspace, stream);
-                };
-                if (replay) {
-                    cudaStream_t stream = nullptr;
-                    cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking),
-                               "create stream");
-                    {
-                        DecodeGraphDefinition definition;
-                        DecodeGraphExecutable executable;
-                        definition.capture(stream, [&] { launch(stream); });
-                        executable.instantiate(definition);
-                        for (int iteration = 0; iteration < 2; ++iteration) {
-                            cuda_check(cudaMemcpyAsync(residual_device.data(), residual.data(),
-                                                       bytes, cudaMemcpyHostToDevice, stream),
-                                       "reset graph residual");
-                            executable.launch(stream);
-                            cuda_check(cudaStreamSynchronize(stream), "graph synchronize");
-                        }
-                    }
-                    cuda_check(cudaStreamDestroy(stream), "destroy stream");
-                } else
-                    launch(nullptr);
-                cuda_synchronize();
-                const std::string label = "dynamic conv add C=" + std::to_string(input_rows) +
-                                          " W=" + std::to_string(width) +
-                                          " B=" + std::to_string(batch_size) +
-                                          " graph=" + std::to_string(replay);
+            const bool graph_case = std::find(kGraphCases.begin(), kGraphCases.end(),
+                                              std::pair{width, batch_size}) != kGraphCases.end();
+            const auto verify     = [&](const std::string& label) {
                 failures += verify_reduction(
                     label, gather_actual(residual_device.data(), width, batch_size), expected,
                     kCriterion);
@@ -266,14 +230,50 @@ int run_profile(std::int32_t input_rows) {
                     std::cerr << label << ": workspace mismatch\n";
                     ++failures;
                 }
+            };
+            for (int replay = 0; replay < (graph_case ? 2 : 1); ++replay) {
+                residual_device.copy_from_host(residual.data(), bytes);
+                workspace.reset_peak();
+                const std::string label = "dynamic conv add C=" + std::to_string(input_rows) +
+                                          " W=" + std::to_string(width) +
+                                          " B=" + std::to_string(batch_size) +
+                                          " graph=" + std::to_string(replay);
+                const auto launch = [&](cudaStream_t stream) {
+                    ops::linear_dynamic_grouped_conv_add(x, weight, base, delta, residual_view,
+                                                         workspace, stream);
+                };
+                if (replay) {
+                    DeviceContext context;
+                    cuda_synchronize();
+                    DecodeGraphDefinition definition;
+                    DecodeGraphExecutable executable;
+                    definition.capture(context.stream, [&] { launch(context.stream); });
+                    executable.instantiate(definition);
+                    for (int iteration = 0; iteration < 2; ++iteration) {
+                        cuda_check(cudaMemcpyAsync(residual_device.data(), residual.data(), bytes,
+                                                   cudaMemcpyHostToDevice, context.stream),
+                                   "reset graph residual");
+                        executable.launch(context.stream);
+                        cuda_synchronize(context.stream);
+                        verify(label + " phase=" + std::to_string(iteration));
+                    }
+                } else {
+                    launch(nullptr);
+                    cuda_synchronize();
+                    verify(label);
+                }
             }
         }
 
+    failures += linear_common::verify_preserved(activation_device.p,
+                                                std::as_bytes(std::span(activation_bits)),
+                                                "linear dynamic grouped conv add x");
     failures +=
-        verify_preserved("linear dynamic grouped conv add x", activation_device, activation_bits);
-    failures += verify_preserved("linear dynamic grouped conv add base", base_device, base_kernel);
+        linear_common::verify_preserved(base_device.p, std::as_bytes(std::span(base_kernel)),
+                                        "linear dynamic grouped conv add base");
     failures +=
-        verify_preserved("linear dynamic grouped conv add delta", delta_device, finish_delta);
+        linear_common::verify_preserved(delta_device.p, std::as_bytes(std::span(finish_delta)),
+                                        "linear dynamic grouped conv add delta");
     failures += projection_weight.verify_preserved("linear dynamic grouped conv add weight");
     return failures;
 }
@@ -281,16 +281,6 @@ int run_profile(std::int32_t input_rows) {
 } // namespace
 
 int main() {
-    try {
-        if (cuda_unavailable()) {
-            std::cout << "SKIP: no usable CUDA device\n";
-            return 77;
-        }
-        const int failures = run_profile(4096) + run_profile(17408);
-        std::cout << (failures == 0 ? "OK" : "FAIL") << " linear_dynamic_grouped_conv_add\n";
-        return failures == 0 ? 0 : 1;
-    } catch (const std::exception& error) {
-        std::cerr << "linear_dynamic_grouped_conv_add test: " << error.what() << '\n';
-        return 1;
-    }
+    return linear_common::run_test_main("linear_dynamic_grouped_conv_add",
+                                        [] { return run_profile(4096) + run_profile(17408); });
 }

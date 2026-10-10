@@ -159,22 +159,6 @@ LinearAttentionStateLayerView LinearAttentionStatePool::layer_view(std::uint32_t
     return {.conv = conv_[layer], .recurrent = recurrent_[layer]};
 }
 
-LinearAttentionStateSlotView LinearAttentionStatePool::slot_view(std::int32_t slot) const {
-    validate_layer_slot(*this, 0, slot, "LinearAttentionStatePool slot_view");
-    const auto all   = all_layers_view();
-    Tensor conv      = conv_slot(0, slot);
-    Tensor recurrent = recurrent_slot(0, slot);
-    return {
-        .conv_layer0                 = conv,
-        .recurrent_layer0            = recurrent,
-        .conv_layer_bytes            = conv.bytes(),
-        .recurrent_layer_bytes       = recurrent.bytes(),
-        .conv_layer_pitch_bytes      = all.conv_layer_stride_bytes,
-        .recurrent_layer_pitch_bytes = all.recurrent_layer_stride_bytes,
-        .layers                      = layer_count(),
-    };
-}
-
 LinearAttentionStateAllLayersView LinearAttentionStatePool::all_layers_view() const {
     if (conv_.size() != spec_.layers || recurrent_.size() != spec_.layers || conv_.empty()) {
         throw std::logic_error("LinearAttentionStatePool layer inventory is inconsistent");

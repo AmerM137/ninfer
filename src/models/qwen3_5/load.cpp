@@ -94,9 +94,6 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
     out->materialization = std::move(binder).finish();
     out->info.name       = reader.directory().metadata.value(
         "name", std::string(architecture_name(text.architecture)));
-    out->info.metadata_json   = reader.directory().metadata.dump();
-    out->info.provenance_json = reader.directory().provenance.dump();
-    out->info.artifact_id     = reader.artifact_id();
     return LoadPlan(std::move(out));
 }
 

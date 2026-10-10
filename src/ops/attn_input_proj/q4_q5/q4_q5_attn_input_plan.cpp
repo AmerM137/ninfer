@@ -14,24 +14,6 @@ bool supported_shape(const Q4Q5AttnInputProblem& problem) noexcept {
 
 } // namespace
 
-const char* q4_q5_attn_input_schedule_name(Q4Q5AttnInputScheduleId schedule) noexcept {
-    switch (schedule) {
-    case Q4Q5AttnInputScheduleId::ParentSplitFixed:
-        return "attn_input_proj.q4_q5.parent_split_fixed";
-    case Q4Q5AttnInputScheduleId::MixedR32C32S2:
-        return "attn_input_proj.q4_q5.mixed.r32.c32.s2";
-    case Q4Q5AttnInputScheduleId::MixedR32C64S3:
-        return "attn_input_proj.q4_q5.mixed.r32.c64.s3";
-    case Q4Q5AttnInputScheduleId::PairR32C64S3:
-        return "attn_input_proj.q4_q5.pair.r32.c64.s3";
-    case Q4Q5AttnInputScheduleId::MixedR64C128S2:
-        return "attn_input_proj.q4_q5.mixed.r64.c128.s2";
-    case Q4Q5AttnInputScheduleId::PairR32C64S4:
-        return "attn_input_proj.q4_q5.pair.r32.c64.s4";
-    }
-    return "attn_input_proj.q4_q5.unknown";
-}
-
 bool q4_q5_attn_input_admits(const Q4Q5AttnInputProblem& problem) noexcept {
     return supported_shape(problem) && problem.cols >= 1;
 }

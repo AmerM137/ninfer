@@ -96,16 +96,6 @@ sliding_window_attention_resolve_plan(std::uint32_t window, std::int32_t tokens,
     };
 }
 
-const char* sliding_window_attention_route_name(SlidingWindowAttentionRoute route) {
-    switch (route) {
-    case SlidingWindowAttentionRoute::Direct:
-        return "direct";
-    case SlidingWindowAttentionRoute::SplitKv:
-        return "split_kv";
-    }
-    return "unknown";
-}
-
 void sliding_window_attention_launch(const Tensor& q, const Tensor& query_k, const Tensor& query_v,
                                      const Tensor& positions, const Tensor& valid_columns,
                                      const Tensor& lanes, float scale,

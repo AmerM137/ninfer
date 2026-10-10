@@ -1,13 +1,11 @@
 // Public-Op benchmark for symmetric sliding-window Softmax Attention.
-// Every measured eager launch and captured graph is produced by one public
-// sliding_window_attention() call.
+// Each measured eager launch or graph-bundle entry calls public sliding_window_attention().
 
 #include "ninfer/ops/sliding_window_attention.h"
 
 #include "core/device.h"
 #include "core/cyclic_kv_cache.h"
-#include "ninfer_bench_common.h"
-#include "ops/softmax_attention/sliding_window/launch.h"
+#include "op_measurement.cuh"
 
 #include <cuda_profiler_api.h>
 #include <cuda_bf16.h>
@@ -15,7 +13,6 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
-#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -65,10 +62,6 @@ struct Result {
     std::int32_t batch;
     std::int32_t context;
     std::int32_t envelope_max;
-    std::int32_t key_block;
-    std::int32_t reduce_warps;
-    ops::detail::SlidingWindowAttentionRoute route;
-    std::int32_t split_capacity;
     std::size_t graph_nodes;
     int graph_calls;
     Execution execution;
@@ -91,35 +84,6 @@ struct Result {
     std::exit(2);
 }
 
-std::int32_t parse_i32(std::string_view text, std::int32_t minimum, std::int32_t maximum,
-                       const char* flag) {
-    const std::string value(text);
-    errno       = 0;
-    char* end   = nullptr;
-    long parsed = std::strtol(value.c_str(), &end, 10);
-    if (errno != 0 || end == value.c_str() || *end != '\0' || parsed < minimum ||
-        parsed > maximum) {
-        usage(flag);
-    }
-    return static_cast<std::int32_t>(parsed);
-}
-
-std::vector<std::int32_t> parse_list(const char* text, std::int32_t minimum, std::int32_t maximum,
-                                     const char* flag) {
-    std::vector<std::int32_t> result;
-    std::string_view remaining(text);
-    while (!remaining.empty()) {
-        const std::size_t comma     = remaining.find(',');
-        const std::string_view item = remaining.substr(0, comma);
-        if (item.empty()) { usage(flag); }
-        result.push_back(parse_i32(item, minimum, maximum, flag));
-        if (comma == std::string_view::npos) { break; }
-        remaining.remove_prefix(comma + 1);
-    }
-    if (result.empty()) { usage(flag); }
-    return result;
-}
-
 Options parse_options(int argc, char** argv) {
     Options options;
     for (int index = 1; index < argc; ++index) {
@@ -129,20 +93,22 @@ Options parse_options(int argc, char** argv) {
             return argv[index];
         };
         if (argument == "--tokens") {
-            options.tokens = parse_list(next("--tokens requires a value"), 1, 16, "--tokens");
+            options.tokens = bench::measurement::integers(next("--tokens requires a value"), 1, 16);
         } else if (argument == "--batches") {
-            options.batches = parse_list(next("--batches requires a value"), 1, 8, "--batches");
+            options.batches =
+                bench::measurement::integers(next("--batches requires a value"), 1, 8);
         } else if (argument == "--window") {
-            options.window = parse_i32(next("--window requires a value"), 2048, 4096, "--window");
+            options.window =
+                bench::measurement::integer(next("--window requires a value"), 2048, 4096);
             if (options.window != 2048 && options.window != 4096) {
                 usage("--window expects 2048 or 4096");
             }
         } else if (argument == "--context") {
             options.contexts =
-                parse_list(next("--context requires a value"), 0, 262144, "--context");
+                bench::measurement::integers(next("--context requires a value"), 0, 262144);
         } else if (argument == "--envelope-max") {
             options.envelope_max =
-                parse_i32(next("--envelope-max requires a value"), 0, 262144, "--envelope-max");
+                bench::measurement::integer(next("--envelope-max requires a value"), 0, 262144);
         } else if (argument == "--execution") {
             const std::string_view value(next("--execution requires a value"));
             if (value == "eager")
@@ -164,12 +130,14 @@ Options parse_options(int argc, char** argv) {
             else
                 usage("--cache expects cold, warm, or both");
         } else if (argument == "--warmup") {
-            options.warmup = parse_i32(next("--warmup requires a value"), 0, 10000, "--warmup");
+            options.warmup =
+                bench::measurement::integer(next("--warmup requires a value"), 0, 10000);
         } else if (argument == "--repeat") {
-            options.repeat = parse_i32(next("--repeat requires a value"), 1, 10000, "--repeat");
+            options.repeat =
+                bench::measurement::integer(next("--repeat requires a value"), 1, 10000);
         } else if (argument == "--graph-calls") {
             options.graph_calls =
-                parse_i32(next("--graph-calls requires a value"), 1, 64, "--graph-calls");
+                bench::measurement::integer(next("--graph-calls requires a value"), 1, 64);
         } else if (argument == "--profile") {
             options.profile = true;
         } else if (argument == "--csv-out") {
@@ -308,7 +276,10 @@ const char* execution_name(Execution execution) {
     return execution == Execution::Eager ? "eager" : "graph";
 }
 
-const char* cache_name(CacheState cache) { return cache == CacheState::Cold ? "cold" : "warm"; }
+const char* cache_name(CacheState cache, int graph_calls = 1) {
+    if (cache == CacheState::Warm) return "warm";
+    return graph_calls == 1 ? "cold" : "cold-before-graph-bundle";
+}
 
 double useful_bytes(std::int32_t window, std::int32_t tokens, std::int32_t batch,
                     std::int32_t context) {
@@ -346,16 +317,20 @@ void report(const Result& result) {
     const double gbps    = result.useful_bytes / seconds / 1.0e9;
     const double tflops  = result.useful_flops / seconds / 1.0e12;
     std::printf("entry=sliding_window execution=%-5s cache=%-4s W=%d T=%2d B=%d L=%6d "
-                "max_L=%d key_block=%d reduce_warps=%d route=%s splits=%d graph_nodes=%zu "
+                "max_L=%d graph_nodes=%zu "
                 "graph_calls=%d workspace=%8zu "
                 "median=%9.3f us min=%9.3f us p95=%9.3f us "
-                "useful=%8.1f GB/s (%5.1f%% of %.0f) math=%7.2f TFLOP/s (%5.1f%% of %.1f)\n",
-                execution_name(result.execution), cache_name(result.cache), result.window,
-                result.tokens, result.batch, result.context, result.envelope_max, result.key_block,
-                result.reduce_warps, ops::detail::sliding_window_attention_route_name(result.route),
-                result.split_capacity, result.graph_nodes, result.graph_calls,
-                result.workspace_bytes, result.timing.median_us, result.timing.min_us,
-                result.timing.p95_us, gbps, gbps / kRtx5090DramGBs * 100.0, kRtx5090DramGBs, tflops,
+                "useful=%8.1f GB/s ",
+                execution_name(result.execution), cache_name(result.cache, result.graph_calls),
+                result.window, result.tokens, result.batch, result.context, result.envelope_max,
+                result.graph_nodes, result.graph_calls, result.workspace_bytes,
+                result.timing.median_us, result.timing.min_us, result.timing.p95_us, gbps);
+    if (result.cache == CacheState::Cold && result.graph_calls == 1) {
+        std::printf("DRAM=%5.1f%% of %.0f GB/s ", gbps / kRtx5090DramGBs * 100.0, kRtx5090DramGBs);
+    } else {
+        std::printf("DRAM=n/a ");
+    }
+    std::printf("math=%7.2f TFLOP/s (%5.1f%% of %.1f)\n", tflops,
                 tflops / kDenseBf16TcTflops * 100.0, kDenseBf16TcTflops);
 }
 
@@ -365,16 +340,14 @@ void write_csv(const Options& options, const std::vector<Result>& results) {
     if (!path.parent_path().empty()) { std::filesystem::create_directories(path.parent_path()); }
     std::ofstream output(path);
     if (!output) { throw std::runtime_error("failed to open CSV output"); }
-    output << "entry,execution,cache,window,T,B,context,envelope_max,key_block,reduce_warps,route,"
-              "split_capacity,graph_nodes,graph_calls,"
+    output << "entry,execution,cache,window,T,B,context,envelope_max,"
+              "graph_nodes,graph_calls,"
               "workspace_bytes,useful_bytes,useful_flops,median_us,min_us,p95_us\n";
     for (const Result& result : results) {
         output << "sliding_window," << execution_name(result.execution) << ','
-               << cache_name(result.cache) << ',' << result.window << ',' << result.tokens << ','
-               << result.batch << ',' << result.context << ',' << result.envelope_max << ','
-               << result.key_block << ',' << result.reduce_warps << ','
-               << ops::detail::sliding_window_attention_route_name(result.route) << ','
-               << result.split_capacity << ',' << result.graph_nodes << ',' << result.graph_calls
+               << cache_name(result.cache, result.graph_calls) << ',' << result.window << ','
+               << result.tokens << ',' << result.batch << ',' << result.context << ','
+               << result.envelope_max << ',' << result.graph_nodes << ',' << result.graph_calls
                << ',' << result.workspace_bytes << ',' << result.useful_bytes << ','
                << result.useful_flops << ',' << result.timing.median_us << ','
                << result.timing.min_us << ',' << result.timing.p95_us << '\n';
@@ -440,10 +413,6 @@ int main(int argc, char** argv) {
                 for (const std::int32_t batch : options.batches) {
                     const int maximum = options.envelope_max < 0 ? context : options.envelope_max;
                     Case data(options.window, tokens, batch, context, maximum);
-                    const ops::SlidingWindowAttentionExecutionEnvelope envelope{
-                        0, static_cast<std::uint32_t>(maximum)};
-                    const auto plan = ops::detail::sliding_window_attention_resolve_plan(
-                        static_cast<std::uint32_t>(options.window), tokens, batch, envelope);
                     bench::TimedGraph graph;
                     if (options.execution != Execution::Eager) {
                         data.launch(stream);
@@ -471,10 +440,6 @@ int main(int argc, char** argv) {
                                 batch,
                                 context,
                                 maximum,
-                                plan.key_block,
-                                plan.reduce_warps,
-                                plan.route,
-                                plan.split_capacity,
                                 execution == Execution::Graph ? graph.nodes() : 0,
                                 options.graph_calls,
                                 execution,

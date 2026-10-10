@@ -13,9 +13,6 @@ struct SelectorWorkspace {
 };
 
 SelectorRoute candidate_selector_path_route(int steps, int batch);
-const char* candidate_selector_path_route_name(int steps, int batch);
-const char* selector_route_name(SelectorRoute route);
-
 template <class Allocator>
 SelectorWorkspace allocate_selector_workspace(Allocator& allocator, SelectorRoute route, int steps,
                                               int batch) {

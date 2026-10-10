@@ -35,16 +35,6 @@ void launch_variant(const Tensor& x, const Weight& w, Tensor& residual_out, cuda
 
 } // namespace
 
-void q8_linear_add_decode_r4_launch(const Tensor& x, const Weight& w, Tensor& residual_out,
-                                    cudaStream_t stream) {
-    launch_decode<4>(x, w, residual_out, stream);
-}
-
-void q8_linear_add_decode_r8_launch(const Tensor& x, const Weight& w, Tensor& residual_out,
-                                    cudaStream_t stream) {
-    launch_decode<8>(x, w, residual_out, stream);
-}
-
 void q8_linear_add_decode_r16_launch(const Tensor& x, const Weight& w, Tensor& residual_out,
                                      cudaStream_t stream) {
     launch_decode<16>(x, w, residual_out, stream);
@@ -53,11 +43,6 @@ void q8_linear_add_decode_r16_launch(const Tensor& x, const Weight& w, Tensor& r
 void q8_linear_add_simt_r8_c4_launch(const Tensor& x, const Weight& w, Tensor& residual_out,
                                      cudaStream_t stream) {
     launch_variant<4>(x, w, residual_out, stream);
-}
-
-void q8_linear_add_simt_r8_c8_launch(const Tensor& x, const Weight& w, Tensor& residual_out,
-                                     cudaStream_t stream) {
-    launch_variant<8>(x, w, residual_out, stream);
 }
 
 } // namespace ninfer::ops::detail

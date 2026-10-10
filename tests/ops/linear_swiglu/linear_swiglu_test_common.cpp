@@ -5,6 +5,7 @@
 #include "core/device.h"
 #include "core/decode_graph.h"
 #include "ninfer/ops/linear_swiglu.h"
+#include "ops/linear_common.h"
 #include "ops/op_tester.h"
 #include "ops/quantized_weight.h"
 
@@ -14,11 +15,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
 #include <iostream>
-#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -28,6 +25,8 @@
 
 namespace ninfer::test::linear_swiglu {
 namespace {
+
+using linear_common::checked_elements;
 
 // The criterion belongs to the activation-compute profile, not the weight storage format or a
 // private materialized/fused implementation.
@@ -45,18 +44,16 @@ constexpr ReductionCriterion tolerance_for(ActivationCompute activation_compute)
     throw std::invalid_argument("linear_swiglu test: unknown activation compute profile");
 }
 
-bool cuda_available() { return !test::cuda_unavailable(); }
-
-std::size_t checked_elements(std::int32_t first, std::int32_t second, const char* label) {
-    if (first <= 0 || second <= 0) {
-        throw std::invalid_argument(std::string("linear_swiglu test: invalid ") + label);
+ops::LinearPolicy policy_for(ActivationCompute activation_compute) {
+    switch (activation_compute) {
+    case ActivationCompute::A16:
+        return ops::LinearPolicy::A16Only;
+    case ActivationCompute::A8:
+        return ops::LinearPolicy::AllowA8;
+    case ActivationCompute::A4:
+        return ops::LinearPolicy::AllowA4;
     }
-    const std::size_t a = static_cast<std::size_t>(first);
-    const std::size_t b = static_cast<std::size_t>(second);
-    if (a > std::numeric_limits<std::size_t>::max() / b) {
-        throw std::overflow_error(std::string("linear_swiglu test: ") + label + " overflows");
-    }
-    return a * b;
+    throw std::invalid_argument("linear_swiglu test: unknown activation compute profile");
 }
 
 std::uint64_t mix64(std::uint64_t value) {
@@ -211,35 +208,25 @@ int verify_unchanged(std::string_view label, const test::GuardedDeviceBuffer& de
         std::cerr << label << ": read-only input size mismatch\n";
         return 1;
     }
-    std::vector<std::uint8_t> actual(bytes);
-    device.copy_to_host(actual.data(), actual.size());
-    if (std::memcmp(actual.data(), expected, bytes) == 0) { return 0; }
-    std::cerr << label << ": read-only input was modified\n";
-    return 1;
+    return linear_common::verify_preserved(
+        device.data(), std::span(static_cast<const std::byte*>(expected), bytes), label);
 }
 
 void validate_profile(const Profile& profile) {
-    const bool q4 = profile.qtype == QType::Q4_G64_FP16 && profile.gate_up_rows == 34816 &&
-                    profile.input_rows == 5120 && profile.output_rows == 17408;
-    const bool q8_companion = profile.qtype == QType::Q8_G32_FP16 &&
-                              profile.gate_up_rows == 12288 && profile.input_rows == 2048 &&
-                              profile.output_rows == 6144;
-    const bool q8_dflash2 = profile.qtype == QType::Q8_G32_FP16 && profile.gate_up_rows == 34816 &&
-                            profile.input_rows == 5120 && profile.output_rows == 17408;
-    const bool nvfp4 = profile.qtype == QType::NVFP4 && profile.gate_up_rows == 34816 &&
-                       profile.input_rows == 5120 && profile.output_rows == 17408;
-    const bool fp8 = profile.qtype == QType::FP8_E4M3FN_ROW_BF16 && profile.gate_up_rows == 34816 &&
-                     profile.input_rows == 5120 && profile.output_rows == 17408;
-    if ((!q4 && !q8_companion && !q8_dflash2 && !nvfp4 && !fp8) ||
-        profile.gate_up_rows != 2 * profile.output_rows) {
-        throw std::invalid_argument("linear_swiglu test: profile is not registered");
+    if (profile.input_rows <= 0 || profile.output_rows <= 0 ||
+        profile.gate_up_rows != 2 * static_cast<std::int64_t>(profile.output_rows)) {
+        throw std::invalid_argument("linear_swiglu test: inconsistent projection dimensions");
     }
-    if ((nvfp4 && profile.activation_compute != ActivationCompute::A16 &&
-         profile.activation_compute != ActivationCompute::A4) ||
-        (fp8 && profile.activation_compute != ActivationCompute::A16 &&
-         profile.activation_compute != ActivationCompute::A8) ||
-        (!nvfp4 && !fp8 && profile.activation_compute != ActivationCompute::A16)) {
-        throw std::invalid_argument("linear_swiglu test: invalid activation-compute profile");
+}
+
+void validate_tokens(std::span<const std::int32_t> token_cases) {
+    if (token_cases.empty()) { throw std::invalid_argument("linear_swiglu test: no token cases"); }
+    for (std::size_t index = 0; index < token_cases.size(); ++index) {
+        if (token_cases[index] <= 0 ||
+            (index != 0 && token_cases[index] <= token_cases[index - 1])) {
+            throw std::invalid_argument(
+                "linear_swiglu test: token cases must be positive and increasing");
+        }
     }
 }
 
@@ -249,19 +236,7 @@ int run_profile(std::string_view label, const Profile& profile,
                 std::span<const std::int32_t> token_cases,
                 std::span<const std::int32_t> graph_cases) {
     validate_profile(profile);
-    if (token_cases.empty()) { throw std::invalid_argument("linear_swiglu test: no token cases"); }
-    if (!cuda_available()) {
-        std::cout << "SKIP: no usable CUDA device\n";
-        return 77;
-    }
-
-    for (std::size_t index = 0; index < token_cases.size(); ++index) {
-        if (token_cases[index] <= 0 ||
-            (index != 0 && token_cases[index] <= token_cases[index - 1])) {
-            throw std::invalid_argument(
-                "linear_swiglu test: token cases must be positive and increasing");
-        }
-    }
+    validate_tokens(token_cases);
     const std::int32_t maximum_tokens = token_cases.back();
     for (int tokens : graph_cases)
         if (tokens <= 0 || tokens > maximum_tokens)
@@ -296,11 +271,7 @@ int run_profile(std::string_view label, const Profile& profile,
     device_activation.copy_from_host(host_activation.data(),
                                      host_activation.size() * sizeof(std::uint16_t));
 
-    const ops::LinearPolicy policy =
-        profile.activation_compute == ActivationCompute::A4
-            ? ops::LinearPolicy::AllowA4
-            : (profile.activation_compute == ActivationCompute::A8 ? ops::LinearPolicy::AllowA8
-                                                                   : ops::LinearPolicy::A16Only);
+    const ops::LinearPolicy policy    = policy_for(profile.activation_compute);
     const std::size_t workspace_bytes = ops::linear_swiglu_workspace_capacity_bytes(
         profile.qtype, profile.gate_up_rows, profile.input_rows, policy, 1, maximum_tokens);
     WorkspaceArena workspace(std::max<std::size_t>(workspace_bytes, 256));
@@ -376,6 +347,63 @@ int run_profile(std::string_view label, const Profile& profile,
                                  final_input.data(), final_input.size() * sizeof(std::uint16_t));
     failures += verify_unchanged(std::string(label) + " weight", device_weight,
                                  host_weight.payload.data(), host_weight.payload.size());
+    return failures;
+}
+
+int run_negative_gate(std::string_view label, const quantized_weight::PackedWeight& packed,
+                      ActivationCompute activation_compute,
+                      std::span<const std::int32_t> token_cases,
+                      std::span<const std::int32_t> active_columns) {
+    validate_tokens(token_cases);
+    const std::int32_t rows           = packed.weight.n;
+    const std::int32_t k              = packed.weight.k;
+    const std::int32_t half           = rows / 2;
+    const std::int32_t maximum_tokens = token_cases.back();
+    validate_profile({packed.weight.qtype, rows, k, half, 0, activation_compute});
+
+    std::vector<std::uint16_t> activation(checked_elements(k, maximum_tokens, "activation size"),
+                                          0);
+    double gate = 0.0;
+    double up   = 0.0;
+    for (const std::int32_t column : active_columns) {
+        if (column < 0 || column >= k) {
+            throw std::invalid_argument("linear_swiglu test: negative-gate activation column");
+        }
+        for (std::int32_t token = 0; token < maximum_tokens; ++token) {
+            activation[static_cast<std::size_t>(token) * k + column] = test::f32_to_bf16(1.0F);
+        }
+        gate += quantized_weight::logical_weight_fp64(packed, 0, column);
+        up += quantized_weight::logical_weight_fp64(packed, half, column);
+    }
+    const double ideal = gate / (1.0 + std::exp(-gate)) * up;
+
+    test::GuardedDeviceBuffer weights(packed.payload.size());
+    test::GuardedDeviceBuffer input_storage(activation.size() * sizeof(std::uint16_t));
+    test::GuardedDeviceBuffer output_storage(checked_elements(half, maximum_tokens, "output size") *
+                                             sizeof(std::uint16_t));
+    weights.copy_from_host(packed.payload.data(), packed.payload.size());
+    input_storage.copy_from_host(activation.data(), input_storage.bytes());
+    const Weight weight            = packed.device_weight(weights.data());
+    const ops::LinearPolicy policy = policy_for(activation_compute);
+    WorkspaceArena workspace(ops::linear_swiglu_workspace_capacity_bytes(
+        weight.qtype, rows, k, policy, 1, maximum_tokens));
+
+    // These inputs are exactly representable by A8/A4. Keep the strict criterion that detects
+    // lost projection precision through the negative gate in the complete nonlinear formula.
+    constexpr ReductionCriterion kNegativeGateTolerance{1.0 / 256.0, 0.0, 2.0 / 256.0};
+    int failures = 0;
+    for (const std::int32_t tokens : token_cases) {
+        Tensor input(input_storage.data(), DType::BF16, {k, tokens});
+        Tensor output(output_storage.data(), DType::BF16, {half, tokens});
+        ops::linear_swiglu(input, weight, output, policy, workspace, nullptr);
+        test::cuda_synchronize();
+        const auto elements = checked_elements(half, tokens, "output size");
+        const auto actual   = read_bf16_output(output_storage, elements);
+        const std::vector<double> reference(elements, ideal);
+        failures +=
+            verify_reduction(std::string(label) + " negative gate T=" + std::to_string(tokens),
+                             actual, reference, kNegativeGateTolerance);
+    }
     return failures;
 }
 

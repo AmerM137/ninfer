@@ -7,9 +7,7 @@
 
 namespace ninfer::models::qwen3_5 {
 
-inline constexpr std::uint32_t kPrefillChunkAlignment    = 128;
-inline constexpr std::uint32_t kMaximumMtpDraftTokens    = 5;
-inline constexpr std::uint32_t kMaximumDFlashDraftTokens = 15;
+inline constexpr std::uint32_t kPrefillChunkAlignment = 128;
 
 } // namespace ninfer::models::qwen3_5
 
@@ -73,11 +71,5 @@ struct ContractAccess {
         pending.timing_      = {};
     }
 };
-
-[[nodiscard]] inline std::uint32_t backend_frontier_at(SpeculativeBackend backend,
-                                                       std::uint32_t main_frontier) noexcept {
-    if (backend == SpeculativeBackend::Mtp) { return main_frontier == 0 ? 0U : main_frontier - 1U; }
-    return backend == SpeculativeBackend::DFlash ? main_frontier : 0U;
-}
 
 } // namespace ninfer::models::qwen3_5::detail

@@ -1,6 +1,6 @@
 #pragma once
 
-// Identity-free Qwen3.6 family runtime helper.
+// Identity-free Qwen3.5 family runtime helper.
 
 #include "core/arena.h"
 #include "core/tensor.h"

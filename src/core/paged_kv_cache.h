@@ -103,8 +103,6 @@ struct DeviceKVPagePoolLayout {
 struct KVExecutionTableLayout {
     KVExecutionTableSpec spec;
     TensorRegion block_tables;
-
-    [[nodiscard]] std::size_t metadata_bytes() const noexcept;
 };
 
 [[nodiscard]] DeviceKVPagePoolLayout plan_device_kv_page_pool(LayoutBuilder& builder,

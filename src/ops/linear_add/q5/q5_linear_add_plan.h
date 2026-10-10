@@ -38,8 +38,6 @@ struct Q5LinearAddPlan {
     std::size_t workspace_bytes;
 };
 
-const char* q5_linear_add_schedule_name(Q5LinearAddScheduleId schedule) noexcept;
-
 bool q5_linear_add_admits(const Q5LinearAddProblem& problem) noexcept;
 Q5LinearAddPlan q5_linear_add_resolve_plan(const Q5LinearAddProblem& problem);
 

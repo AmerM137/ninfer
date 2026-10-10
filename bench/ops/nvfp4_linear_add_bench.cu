@@ -2,7 +2,7 @@
 #include "ninfer/ops/linear_add.h"
 
 #include "core/device.h"
-#include "ninfer_bench_common.h"
+#include "op_measurement.cuh"
 #include "quantized_weight.cuh"
 
 #include <cuda_profiler_api.h>
@@ -45,25 +45,6 @@ struct Result {
     double useful_tflops;
 };
 
-std::vector<std::int32_t> parse_t_sweep(std::string_view raw) {
-    std::vector<std::int32_t> result;
-    std::size_t begin = 0;
-    while (begin < raw.size()) {
-        const std::size_t end = raw.find(',', begin);
-        const std::string token(
-            raw.substr(begin, end == std::string_view::npos ? raw.size() - begin : end - begin));
-        const long value = std::stol(token);
-        if (value <= 0 || value > std::numeric_limits<std::int32_t>::max()) {
-            throw std::invalid_argument("--t-sweep values must be positive int32");
-        }
-        result.push_back(static_cast<std::int32_t>(value));
-        if (end == std::string_view::npos) { break; }
-        begin = end + 1;
-    }
-    if (result.empty()) { throw std::invalid_argument("--t-sweep must not be empty"); }
-    return result;
-}
-
 Options parse_options(int argc, char** argv) {
     Options options;
     for (int index = 1; index < argc; ++index) {
@@ -73,9 +54,9 @@ Options parse_options(int argc, char** argv) {
             return argv[index];
         };
         if (argument == "--n") {
-            options.n = std::stoi(std::string(next("--n")));
+            options.n = bench::measurement::integer(next("--n"));
         } else if (argument == "--k") {
-            options.k = std::stoi(std::string(next("--k")));
+            options.k = bench::measurement::integer(next("--k"));
         } else if (argument == "--policy") {
             const std::string_view value = next("--policy");
             if (value == "a16") {
@@ -86,11 +67,11 @@ Options parse_options(int argc, char** argv) {
                 throw std::invalid_argument("--policy must be a16 or a4");
             }
         } else if (argument == "--t-sweep") {
-            options.t_sweep = parse_t_sweep(next("--t-sweep"));
+            options.t_sweep = bench::measurement::integers(next("--t-sweep"));
         } else if (argument == "--warmup") {
-            options.warmup = std::stoi(std::string(next("--warmup")));
+            options.warmup = bench::measurement::integer(next("--warmup"), 0);
         } else if (argument == "--repeat") {
-            options.repeat = std::stoi(std::string(next("--repeat")));
+            options.repeat = bench::measurement::integer(next("--repeat"));
         } else if (argument == "--profile") {
             options.profile = true;
         } else if (argument == "--csv-out") {

@@ -2,15 +2,17 @@
 #include "ninfer/ops/linear_topk.h"
 
 #include "core/device.h"
+#include "core/decode_graph.h"
 #include "ops/op_tester.h"
+#include "ops/linear_common.h"
 #include "ops/quantized_weight.h"
 
 #include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <exception>
 #include <iostream>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -212,9 +214,8 @@ std::vector<double> base_scores(QType qtype, const std::vector<std::uint16_t>& h
     return scores;
 }
 
-template <std::size_t N>
 std::vector<std::pair<float, std::int32_t>>
-expected_order(const std::array<std::int32_t, N>& rows, const std::vector<std::int32_t>* id_map) {
+expected_order(std::span<const std::int32_t> rows, const std::vector<std::int32_t>* id_map) {
     std::vector<std::pair<float, std::int32_t>> candidates;
     candidates.reserve(rows.size());
     for (std::size_t index = 0; index < rows.size(); ++index) {
@@ -257,22 +258,6 @@ int verify_invocation(const char* profile, std::int32_t columns, const Tensor& i
     return failures;
 }
 
-template <class Launch>
-void replay_graph_twice(Launch&& launch, cudaStream_t stream) {
-    cudaGraph_t graph         = nullptr;
-    cudaGraphExec_t execution = nullptr;
-    cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal),
-               "linear_topk begin capture");
-    launch(stream);
-    cuda_check(cudaStreamEndCapture(stream, &graph), "linear_topk end capture");
-    cuda_check(cudaGraphInstantiate(&execution, graph, 0), "linear_topk instantiate graph");
-    cuda_check(cudaGraphLaunch(execution, stream), "linear_topk first graph replay");
-    cuda_check(cudaGraphLaunch(execution, stream), "linear_topk second graph replay");
-    cuda_synchronize(stream);
-    cuda_check(cudaGraphExecDestroy(execution), "linear_topk destroy graph execution");
-    cuda_check(cudaGraphDestroy(graph), "linear_topk destroy graph");
-}
-
 std::vector<int> test_columns() {
     std::vector<int> result;
     for (int n = 1; n <= 120; ++n) result.push_back(n);
@@ -312,106 +297,62 @@ int verify_zero_ties(const FixtureWeight& fixture, const Tensor* id_map,
     return failures + ids.verify_guards("zero-tie ids") + scores.verify_guards("zero-tie scores");
 }
 
-int run_full(QType qtype, const char* profile, const DeviceBuffer& hidden,
-             const std::vector<double>& base_score) {
-    FixtureWeight fixture =
-        qtype == QType::Q8_G32_FP16 ? make_rowsplit(qtype, kFullRows) : make_fp8();
-    for (std::size_t index = 0; index < kFullWinnerRows.size(); ++index) {
-        if (qtype == QType::Q8_G32_FP16) {
-            patch_rowsplit_row(fixture, qtype, kFullWinnerRows[index], factor_for(index));
+struct Profile {
+    QType qtype;
+    const char* label;
+    std::int32_t rows;
+    std::span<const std::int32_t> winner_rows;
+    bool mapped_ids;
+};
+
+int run_profile(const Profile& profile, const DeviceBuffer& hidden,
+                const std::vector<double>& base_score) {
+    FixtureWeight fixture = profile.qtype == QType::FP8_E4M3FN_ROW_BF16
+                                ? make_fp8()
+                                : make_rowsplit(profile.qtype, profile.rows);
+    for (std::size_t index = 0; index < profile.winner_rows.size(); ++index) {
+        if (profile.qtype == QType::FP8_E4M3FN_ROW_BF16) {
+            patch_fp8_row(fixture, profile.winner_rows[index], factor_for(index));
         } else {
-            patch_fp8_row(fixture, kFullWinnerRows[index], factor_for(index));
+            patch_rowsplit_row(fixture, profile.qtype, profile.winner_rows[index],
+                               factor_for(index));
         }
     }
-    if (qtype == QType::Q8_G32_FP16) {
-        patch_rowsplit_row(fixture, qtype, kFullRows - 1, 64.0F);
-    } else {
-        patch_fp8_row(fixture, kFullRows - 1, 64.0F);
-    }
-
-    const auto expected = expected_order(kFullWinnerRows, nullptr);
-    const std::size_t capacity =
-        ops::linear_topk_workspace_capacity_bytes(qtype, kFullRows, kHidden, 1, kMaxColumns);
-    GuardedDeviceBuffer graph_scratch(capacity);
-    WorkspaceArena workspace(DeviceSpan{graph_scratch.data(), graph_scratch.bytes()});
-    DeviceBuffer ids(static_cast<std::size_t>(kTopK) * kMaxColumns * sizeof(std::int32_t));
-    DeviceBuffer scores(static_cast<std::size_t>(kTopK) * kMaxColumns * sizeof(float));
-    int failures = 0;
-    for (int columns : test_columns()) {
-        GuardedDeviceBuffer x(static_cast<std::size_t>(kHidden) * columns * 2);
-        GuardedDeviceBuffer out_ids(static_cast<std::size_t>(kTopK) * columns * 4);
-        GuardedDeviceBuffer out_scores(static_cast<std::size_t>(kTopK) * columns * 4);
-        cuda_check(cudaMemcpy(x.data(), hidden.p, x.bytes(), cudaMemcpyDeviceToDevice),
-                   "copy input fixture");
-        const auto before = from_device<std::uint16_t>(x.data(), x.bytes() / 2);
-        const auto exact  = ops::linear_topk_workspace_capacity_bytes(
-            fixture.weight.qtype, fixture.weight.n, kHidden, columns, columns);
-        GuardedDeviceBuffer scratch(exact);
-        WorkspaceArena point_workspace(DeviceSpan{scratch.data(), exact});
-        Tensor hidden_tensor(x.data(), DType::BF16, {kHidden, columns});
-        Tensor ids_tensor(out_ids.data(), DType::I32, {kTopK, columns});
-        Tensor scores_tensor(out_scores.data(), DType::FP32, {kTopK, columns});
-        out_ids.fill(0xcd);
-        out_scores.fill(0xff);
-        ops::linear_topk(hidden_tensor, fixture.weight, kValidRows, ids_tensor, scores_tensor,
-                         point_workspace, nullptr);
-        cuda_synchronize();
-        failures +=
-            verify_invocation(profile, columns, ids_tensor, scores_tensor, base_score, expected);
-        failures += out_ids.verify_guards("ids tail");
-        failures += out_scores.verify_guards("scores tail");
-        failures += scratch.verify_guards("workspace tail");
-        failures += x.verify_guards("hidden guards");
-        if (from_device<std::uint16_t>(x.data(), x.bytes() / 2) != before) {
-            std::cerr << "linear_topk modified hidden\n";
-            ++failures;
-        }
-        if (point_workspace.used() != 0 || point_workspace.peak_used() > exact) {
-            std::cerr << "linear_topk workspace scope/peak failure\n";
-            ++failures;
+    // The full-head fixture gives a masked-out row a larger score than every valid winner.
+    if (!profile.mapped_ids) {
+        if (profile.qtype == QType::FP8_E4M3FN_ROW_BF16) {
+            patch_fp8_row(fixture, kFullRows - 1, 64.0F);
+        } else {
+            patch_rowsplit_row(fixture, profile.qtype, kFullRows - 1, 64.0F);
         }
     }
 
-    for (int graph_columns : {1,  8,  9,  16, 17, 24, 25, 32,  33,  48,  49, 64,
-                              65, 80, 81, 88, 89, 96, 97, 112, 113, 120, 129}) {
-        Tensor graph_hidden(hidden.p, DType::BF16, {kHidden, graph_columns});
-        Tensor graph_ids(ids.p, DType::I32, {kTopK, graph_columns});
-        Tensor graph_scores(scores.p, DType::FP32, {kTopK, graph_columns});
-        cudaStream_t stream = nullptr;
-        cuda_check(cudaStreamCreate(&stream), "linear_topk create graph stream");
-        replay_graph_twice(
-            [&](cudaStream_t captured_stream) {
-                ops::linear_topk(graph_hidden, fixture.weight, kValidRows, graph_ids, graph_scores,
-                                 workspace, captured_stream);
-            },
-            stream);
-        cuda_check(cudaStreamDestroy(stream), "linear_topk destroy graph stream");
-        failures += verify_invocation(profile, graph_columns, graph_ids, graph_scores, base_score,
-                                      expected);
+    std::vector<std::int32_t> host_map;
+    DeviceBuffer map;
+    Tensor map_tensor;
+    if (profile.mapped_ids) {
+        host_map.resize(profile.rows);
+        for (std::int32_t row = 0; row < profile.rows; ++row) host_map[row] = kValidRows - 1 - row;
+        map        = to_device(host_map);
+        map_tensor = Tensor(map.p, DType::I32, {profile.rows});
     }
-    failures += graph_scratch.verify_guards("graph workspace tail");
-    failures += verify_zero_ties(fixture, nullptr, nullptr);
-    return failures;
-}
-
-int run_q4(const DeviceBuffer& hidden, const std::vector<double>& base_score) {
-    FixtureWeight fixture = make_rowsplit(QType::Q4_G64_FP16, kShortRows);
-    for (std::size_t index = 0; index < kShortWinnerRows.size(); ++index) {
-        patch_rowsplit_row(fixture, QType::Q4_G64_FP16, kShortWinnerRows[index], factor_for(index));
-    }
-    std::vector<std::int32_t> host_map(kShortRows);
-    for (std::int32_t row = 0; row < kShortRows; ++row) { host_map[row] = kValidRows - 1 - row; }
-    DeviceBuffer map(host_map.size() * sizeof(std::int32_t));
-    map.copy_from_host(host_map.data(), map.bytes);
-    const auto expected = expected_order(kShortWinnerRows, &host_map);
+    const auto expected =
+        expected_order(profile.winner_rows, profile.mapped_ids ? &host_map : nullptr);
+    const auto launch = [&](const Tensor& input, Tensor& ids, Tensor& scores,
+                            WorkspaceArena& workspace, cudaStream_t stream) {
+        if (profile.mapped_ids) {
+            ops::linear_topk(input, fixture.weight, map_tensor, ids, scores, workspace, stream);
+        } else {
+            ops::linear_topk(input, fixture.weight, kValidRows, ids, scores, workspace, stream);
+        }
+    };
 
     const std::size_t capacity = ops::linear_topk_workspace_capacity_bytes(
-        QType::Q4_G64_FP16, kShortRows, kHidden, 1, kMaxColumns);
+        profile.qtype, profile.rows, kHidden, 1, kMaxColumns);
     GuardedDeviceBuffer graph_scratch(capacity);
     WorkspaceArena workspace(DeviceSpan{graph_scratch.data(), graph_scratch.bytes()});
     DeviceBuffer ids(static_cast<std::size_t>(kTopK) * kMaxColumns * sizeof(std::int32_t));
     DeviceBuffer scores(static_cast<std::size_t>(kTopK) * kMaxColumns * sizeof(float));
-    Tensor map_tensor(map.p, DType::I32, {kShortRows});
     int failures = 0;
     for (int columns : test_columns()) {
         GuardedDeviceBuffer x(static_cast<std::size_t>(kHidden) * columns * 2);
@@ -429,11 +370,10 @@ int run_q4(const DeviceBuffer& hidden, const std::vector<double>& base_score) {
         Tensor scores_tensor(out_scores.data(), DType::FP32, {kTopK, columns});
         out_ids.fill(0xcd);
         out_scores.fill(0xff);
-        ops::linear_topk(hidden_tensor, fixture.weight, map_tensor, ids_tensor, scores_tensor,
-                         point_workspace, nullptr);
+        launch(hidden_tensor, ids_tensor, scores_tensor, point_workspace, nullptr);
         cuda_synchronize();
-        failures += verify_invocation("q4-optimized", columns, ids_tensor, scores_tensor,
-                                      base_score, expected);
+        failures += verify_invocation(profile.label, columns, ids_tensor, scores_tensor, base_score,
+                                      expected);
         failures += out_ids.verify_guards("ids tail");
         failures += out_scores.verify_guards("scores tail");
         failures += scratch.verify_guards("workspace tail");
@@ -448,26 +388,30 @@ int run_q4(const DeviceBuffer& hidden, const std::vector<double>& base_score) {
         }
     }
 
+    DeviceContext context;
+    cuda_synchronize();
     for (int graph_columns : {1,  8,  9,  16, 17, 24, 25, 32,  33,  48,  49, 64,
                               65, 80, 81, 88, 89, 96, 97, 112, 113, 120, 129}) {
         Tensor graph_hidden(hidden.p, DType::BF16, {kHidden, graph_columns});
         Tensor graph_ids(ids.p, DType::I32, {kTopK, graph_columns});
         Tensor graph_scores(scores.p, DType::FP32, {kTopK, graph_columns});
-        cudaStream_t stream = nullptr;
-        cuda_check(cudaStreamCreate(&stream), "linear_topk create graph stream");
-        replay_graph_twice(
-            [&](cudaStream_t captured_stream) {
-                ops::linear_topk(graph_hidden, fixture.weight, map_tensor, graph_ids, graph_scores,
-                                 workspace, captured_stream);
-            },
-            stream);
-        cuda_check(cudaStreamDestroy(stream), "linear_topk destroy graph stream");
-        failures += verify_invocation("q4-optimized graph", graph_columns, graph_ids, graph_scores,
-                                      base_score, expected);
+        DecodeGraphDefinition definition;
+        DecodeGraphExecutable graph;
+        definition.capture(context.stream, [&] {
+            launch(graph_hidden, graph_ids, graph_scores, workspace, context.stream);
+        });
+        graph.instantiate(definition);
+        for (int replay = 0; replay < 2; ++replay) {
+            graph.launch(context.stream);
+            cuda_synchronize(context.stream);
+            failures += verify_invocation(profile.label, graph_columns, graph_ids, graph_scores,
+                                          base_score, expected);
+        }
     }
     failures += graph_scratch.verify_guards("graph workspace tail");
-    failures += verify_zero_ties(fixture, &map_tensor, &host_map);
-    if (from_device<std::int32_t>(map.p, host_map.size()) != host_map) {
+    failures += verify_zero_ties(fixture, profile.mapped_ids ? &map_tensor : nullptr,
+                                 profile.mapped_ids ? &host_map : nullptr);
+    if (profile.mapped_ids && from_device<std::int32_t>(map.p, host_map.size()) != host_map) {
         std::cerr << "linear_topk modified id map\n";
         ++failures;
     }
@@ -477,25 +421,32 @@ int run_q4(const DeviceBuffer& hidden, const std::vector<double>& base_score) {
 } // namespace
 
 int main() {
-    if (cuda_unavailable()) {
-        std::cout << "SKIP: no usable CUDA device\n";
-        return 77;
-    }
-    try {
+    return linear_common::run_test_main("linear_topk", [] {
         const std::vector<std::uint16_t> host_hidden = make_hidden();
         DeviceBuffer hidden(host_hidden.size() * sizeof(std::uint16_t));
         hidden.copy_from_host(host_hidden.data(), hidden.bytes);
 
         int failures = 0;
-        failures += run_full(QType::Q8_G32_FP16, "q8-full", hidden,
-                             base_scores(QType::Q8_G32_FP16, host_hidden));
-        failures += run_full(QType::FP8_E4M3FN_ROW_BF16, "fp8-full", hidden,
-                             base_scores(QType::FP8_E4M3FN_ROW_BF16, host_hidden));
-        failures += run_q4(hidden, base_scores(QType::Q4_G64_FP16, host_hidden));
-        std::cout << (failures == 0 ? "OK" : "FAIL") << " linear_topk\n";
-        return failures == 0 ? 0 : 1;
-    } catch (const std::exception& error) {
-        std::cerr << "linear_topk: " << error.what() << '\n';
-        return 1;
-    }
+        const Profile profiles[]{
+            {.qtype       = QType::Q8_G32_FP16,
+             .label       = "q8-full",
+             .rows        = kFullRows,
+             .winner_rows = kFullWinnerRows,
+             .mapped_ids  = false},
+            {.qtype       = QType::FP8_E4M3FN_ROW_BF16,
+             .label       = "fp8-full",
+             .rows        = kFullRows,
+             .winner_rows = kFullWinnerRows,
+             .mapped_ids  = false},
+            {.qtype       = QType::Q4_G64_FP16,
+             .label       = "q4-optimized",
+             .rows        = kShortRows,
+             .winner_rows = kShortWinnerRows,
+             .mapped_ids  = true},
+        };
+        for (const Profile& profile : profiles) {
+            failures += run_profile(profile, hidden, base_scores(profile.qtype, host_hidden));
+        }
+        return failures;
+    });
 }

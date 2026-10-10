@@ -28,6 +28,10 @@
 namespace ninfer::test::linear {
 namespace {
 
+using linear_common::all_indices;
+using linear_common::checked_elements;
+using linear_common::evenly_spaced_indices;
+
 constexpr std::size_t kOutputGuardBytes   = 256;
 constexpr std::uint8_t kOutputGuardByte   = 0xa5;
 constexpr std::uint8_t kOutputPoisonByte  = 0xff;
@@ -52,18 +56,6 @@ constexpr ReductionCriterion tolerance_for(ActivationCompute activation_compute)
     throw std::invalid_argument("linear test: unknown activation compute path");
 }
 
-std::size_t checked_elements(std::int32_t first, std::int32_t second, const char* label) {
-    if (first <= 0 || second <= 0) {
-        throw std::invalid_argument(std::string("linear test: invalid ") + label + " extent");
-    }
-    const auto a = static_cast<std::size_t>(first);
-    const auto b = static_cast<std::size_t>(second);
-    if (a > std::numeric_limits<std::size_t>::max() / b) {
-        throw std::overflow_error(std::string("linear test: ") + label + " size overflow");
-    }
-    return a * b;
-}
-
 class GuardedOutput {
 public:
     explicit GuardedOutput(std::size_t words)
@@ -82,27 +74,6 @@ public:
 private:
     GuardedDeviceBuffer storage_;
 };
-
-std::vector<std::int32_t> all_indices(std::int32_t extent) {
-    std::vector<std::int32_t> indices(static_cast<std::size_t>(extent));
-    std::iota(indices.begin(), indices.end(), 0);
-    return indices;
-}
-
-std::vector<std::int32_t> sampled_indices(std::int32_t extent) {
-    std::vector<std::int32_t> result;
-    constexpr std::int32_t kSamples = 32;
-    for (std::int32_t sample = 0; sample < kSamples; ++sample) {
-        const std::int32_t index = static_cast<std::int32_t>(
-            (static_cast<std::int64_t>(extent - 1) * sample) / (kSamples - 1));
-        if (index >= 0 && index < extent &&
-            std::find(result.begin(), result.end(), index) == result.end()) {
-            result.push_back(index);
-        }
-    }
-    std::sort(result.begin(), result.end());
-    return result;
-}
 
 std::vector<std::uint16_t> make_activation(std::int32_t k, std::int32_t t, std::uint32_t seed,
                                            ActivationCompute activation_compute) {
@@ -302,8 +273,6 @@ void cpu_linear_gemm_fp64(const float* weight, const float* activation, double* 
     for (std::thread& worker : workers) { worker.join(); }
 }
 
-bool cuda_available() { return !test::cuda_unavailable(); }
-
 int run_shape(std::string_view label, ActivationCompute activation_compute,
               WeightGenerator generator, const ShapeCase& shape) {
     if (shape.invocations.empty()) {
@@ -317,12 +286,16 @@ int run_shape(std::string_view label, ActivationCompute activation_compute,
     }
 
     const std::vector<std::int32_t> oracle_rows =
-        shape.comparison == Comparison::Full ? all_indices(shape.n) : sampled_indices(shape.n);
+        shape.comparison == Comparison::Full ? all_indices(shape.n)
+        : shape.row_sampler                  ? shape.row_sampler(shape.n)
+                                             : evenly_spaced_indices(shape.n);
     quantized_weight::PackedWeight host_weight = generator(shape.n, shape.k, shape.seed);
     const std::vector<float> oracle_weight =
         quantized_weight::materialize_rows_fp32(host_weight, oracle_rows);
     std::vector<std::uint16_t> activation_bits =
-        make_activation(shape.k, maximum->t, shape.seed + 1U, activation_compute);
+        shape.activation_generator
+            ? shape.activation_generator(shape.k, maximum->t, shape.seed + 1U)
+            : make_activation(shape.k, maximum->t, shape.seed + 1U, activation_compute);
     if (shape.activation_pattern != ActivationPattern::Dense) {
         for (int token = 0; token < maximum->t; ++token) {
             for (int column = 0; column < shape.k; ++column) {
@@ -404,9 +377,10 @@ int run_shape(std::string_view label, ActivationCompute activation_compute,
                 }
 
                 failures += output.verify_guards(case_label);
-                const std::vector<std::int32_t> columns = shape.comparison == Comparison::Full
-                                                              ? all_indices(invocation.t)
-                                                              : sampled_indices(invocation.t);
+                const std::vector<std::int32_t> columns =
+                    shape.comparison == Comparison::Full ? all_indices(invocation.t)
+                    : shape.column_sampler               ? shape.column_sampler(invocation.t)
+                                                         : evenly_spaced_indices(invocation.t);
                 OutputRead actual = read_output(output.data(), shape.n, invocation.t, oracle_rows,
                                                 columns, case_label);
                 failures += actual.failures;
@@ -455,21 +429,19 @@ int run_shape(std::string_view label, ActivationCompute activation_compute,
             std::cerr << case_label << ": unexpected exception: " << error.what() << '\n';
             ++failures;
         }
+        if (shape.verify_each_invocation) {
+            failures += linear_common::verify_preserved(
+                device_activation.p, std::as_bytes(std::span(activation_bits)), case_label);
+            failures += linear_common::verify_preserved(
+                device_weight.p, std::as_bytes(std::span(host_weight.payload)), case_label);
+        }
     }
 
-    if (shape.verify_input_preservation) {
-        std::vector<std::uint16_t> activation_after(activation_bits.size());
-        device_activation.copy_to_host(activation_after.data(), device_activation.bytes);
-        if (activation_after != activation_bits) {
-            std::cerr << label << ": linear modified its activation input\n";
-            ++failures;
-        }
-        std::vector<std::uint8_t> weight_after(host_weight.payload.size());
-        device_weight.copy_to_host(weight_after.data(), device_weight.bytes);
-        if (weight_after != host_weight.payload) {
-            std::cerr << label << ": linear modified its persistent weight\n";
-            ++failures;
-        }
+    if (shape.verify_input_preservation && !shape.verify_each_invocation) {
+        failures += linear_common::verify_preserved(
+            device_activation.p, std::as_bytes(std::span(activation_bits)), label);
+        failures += linear_common::verify_preserved(
+            device_weight.p, std::as_bytes(std::span(host_weight.payload)), label);
     }
     return failures;
 }

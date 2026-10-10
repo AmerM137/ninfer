@@ -31,8 +31,6 @@ struct Q4Q5AttnInputPlan {
     Q4Q5AttnInputScheduleId schedule;
 };
 
-const char* q4_q5_attn_input_schedule_name(Q4Q5AttnInputScheduleId schedule) noexcept;
-
 bool q4_q5_attn_input_admits(const Q4Q5AttnInputProblem& problem) noexcept;
 Q4Q5AttnInputPlan q4_q5_attn_input_resolve_plan(const Q4Q5AttnInputProblem& problem);
 

@@ -83,44 +83,6 @@ bool supported_shape(const Q8AttnInputProblem& problem) noexcept {
 
 } // namespace
 
-const char* q8_attn_input_schedule_name(Q8AttnInputScheduleId schedule) noexcept {
-    switch (schedule) {
-    case Q8AttnInputScheduleId::DecodeR8Direct:
-        return "attn_input_proj.q8.decode.r8.direct.k2048";
-    case Q8AttnInputScheduleId::SplitKMmaDirect:
-        return "attn_input_proj.q8.splitk.mma.r16.direct";
-    case Q8AttnInputScheduleId::SimtR8C4:
-        return "attn_input_proj.q8.simt.r8.c4";
-    case Q8AttnInputScheduleId::MmaR32C64:
-        return "attn_input_proj.q8.mma.r32.c64";
-    case Q8AttnInputScheduleId::MmaR32C128:
-        return "attn_input_proj.q8.mma.r32.c128";
-    case Q8AttnInputScheduleId::MmaR64C64:
-        return "attn_input_proj.q8.mma.r64.c64";
-    case Q8AttnInputScheduleId::MmaR64C96:
-        return "attn_input_proj.q8.mma.r64.c96";
-    case Q8AttnInputScheduleId::MmaR64C128:
-        return "attn_input_proj.q8.mma.r64.c128";
-    case Q8AttnInputScheduleId::MmaR128C64:
-        return "attn_input_proj.q8.mma.r128.c64";
-    case Q8AttnInputScheduleId::MmaR128C80:
-        return "attn_input_proj.q8.mma.r128.c80";
-    case Q8AttnInputScheduleId::DFlash2SmallT:
-        return "attn_input_proj.q8.dflash2.small_t";
-    case Q8AttnInputScheduleId::DFlash2MmaR16C64K128:
-        return "attn_input_proj.q8.dflash2.mma.r16.c64.k128";
-    case Q8AttnInputScheduleId::DFlash2MmaR32C32K128:
-        return "attn_input_proj.q8.dflash2.mma.r32.c32.k128";
-    case Q8AttnInputScheduleId::DFlash2MmaR32C64K128:
-        return "attn_input_proj.q8.dflash2.mma.r32.c64.k128";
-    case Q8AttnInputScheduleId::DFlash2MmaR32C64:
-        return "attn_input_proj.q8.dflash2.mma.r32.c64";
-    case Q8AttnInputScheduleId::DFlash2MmaR64C128:
-        return "attn_input_proj.q8.dflash2.mma.r64.c128";
-    }
-    return "attn_input_proj.q8.unknown";
-}
-
 bool q8_attn_input_admits(const Q8AttnInputProblem& problem) noexcept {
     return supported_shape(problem) && problem.cols > 0;
 }
@@ -143,14 +105,12 @@ Q8AttnInputPlan q8_attn_input_resolve_plan(const Q8AttnInputProblem& problem) {
     return resolve_from(kTargetRoutes);
 }
 
-void q8_attn_input_execute_plan(const Q8AttnInputPlan& plan, const Tensor& x, const Weight& weight,
-                                Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
-                                cudaStream_t stream) {
+void q8_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
+                            Tensor& k, Tensor& v, cudaStream_t stream) {
     const Q8AttnInputProblem problem{x.ne[0], q.ne[0], k.ne[0], weight.n, weight.padded_shape[1],
                                      x.ne[1]};
-    const Q8AttnInputPlan resolved = q8_attn_input_resolve_plan(problem);
-    if (problem.parent_rows != 9216 || problem.kv_rows != 512 ||
-        resolved.schedule != plan.schedule) {
+    const Q8AttnInputPlan plan = q8_attn_input_resolve_plan(problem);
+    if (problem.parent_rows != 9216 || problem.kv_rows != 512) {
         throw std::invalid_argument(
             "Q8 attention input: plan does not match exact four-output problem");
     }
@@ -160,9 +120,6 @@ void q8_attn_input_execute_plan(const Q8AttnInputPlan& plan, const Tensor& x, co
         return;
     case Q8AttnInputScheduleId::SplitKMmaDirect:
         q8_attn_input_splitk_mma_launch(x, weight, q, gate, k, v, stream);
-        return;
-    case Q8AttnInputScheduleId::SimtR8C4:
-        q8_attn_input_simt_r8_c4_launch(x, weight, q, gate, k, v, stream);
         return;
     case Q8AttnInputScheduleId::MmaR32C128:
         q8_attn_input_mma_r32_c128_launch(x, weight, q, gate, k, v, stream);
@@ -186,22 +143,14 @@ void q8_attn_input_execute_plan(const Q8AttnInputPlan& plan, const Tensor& x, co
     throw std::logic_error("Q8 attention input: unknown schedule");
 }
 
-void q8_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
-                            Tensor& k, Tensor& v, cudaStream_t stream) {
+void q8_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& k, Tensor& v,
+                            cudaStream_t stream) {
     const Q8AttnInputProblem problem{x.ne[0], q.ne[0], k.ne[0], weight.n, weight.padded_shape[1],
                                      x.ne[1]};
-    q8_attn_input_execute_plan(q8_attn_input_resolve_plan(problem), x, weight, q, gate, k, v,
-                               stream);
-}
-
-void q8_attn_input_execute_plan(const Q8AttnInputPlan& plan, const Tensor& x, const Weight& weight,
-                                Tensor& q, Tensor& k, Tensor& v, cudaStream_t stream) {
-    const Q8AttnInputProblem problem{x.ne[0], q.ne[0], k.ne[0], weight.n, weight.padded_shape[1],
-                                     x.ne[1]};
-    const Q8AttnInputPlan resolved = q8_attn_input_resolve_plan(problem);
-    const bool companion           = is_companion_shape(problem);
-    const bool dflash2             = is_dflash2_shape(problem);
-    if ((!companion && !dflash2) || resolved.schedule != plan.schedule) {
+    const Q8AttnInputPlan plan = q8_attn_input_resolve_plan(problem);
+    const bool companion       = is_companion_shape(problem);
+    const bool dflash2         = is_dflash2_shape(problem);
+    if (!companion && !dflash2) {
         throw std::invalid_argument(
             "Q8 attention input: plan does not match exact three-output problem");
     }
@@ -236,12 +185,6 @@ void q8_attn_input_execute_plan(const Q8AttnInputPlan& plan, const Tensor& x, co
     case Q8AttnInputScheduleId::SplitKMmaDirect:
         q8_attn_input_splitk_mma_launch(x, weight, q, k, v, stream);
         return;
-    case Q8AttnInputScheduleId::SimtR8C4:
-        q8_attn_input_simt_r8_c4_launch(x, weight, q, k, v, stream);
-        return;
-    case Q8AttnInputScheduleId::MmaR32C128:
-        q8_attn_input_mma_r32_c128_launch(x, weight, q, k, v, stream);
-        return;
     case Q8AttnInputScheduleId::MmaR32C64:
         q8_companion_attn_input_mma_r32_c64_launch(x, weight, q, k, v, stream);
         return;
@@ -260,22 +203,16 @@ void q8_attn_input_execute_plan(const Q8AttnInputPlan& plan, const Tensor& x, co
     case Q8AttnInputScheduleId::MmaR64C128:
         q8_attn_input_mma_r64_c128_launch(x, weight, q, k, v, stream);
         return;
+    case Q8AttnInputScheduleId::MmaR32C128:
     case Q8AttnInputScheduleId::DFlash2SmallT:
     case Q8AttnInputScheduleId::DFlash2MmaR32C64:
     case Q8AttnInputScheduleId::DFlash2MmaR64C128:
     case Q8AttnInputScheduleId::DFlash2MmaR16C64K128:
     case Q8AttnInputScheduleId::DFlash2MmaR32C32K128:
     case Q8AttnInputScheduleId::DFlash2MmaR32C64K128:
-        throw std::logic_error("Q8 attention input: DFlash2 schedule in companion plan");
+        throw std::logic_error("Q8 attention input: schedule does not match companion shape");
     }
     throw std::logic_error("Q8 attention input: unknown schedule");
-}
-
-void q8_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& k, Tensor& v,
-                            cudaStream_t stream) {
-    const Q8AttnInputProblem problem{x.ne[0], q.ne[0], k.ne[0], weight.n, weight.padded_shape[1],
-                                     x.ne[1]};
-    q8_attn_input_execute_plan(q8_attn_input_resolve_plan(problem), x, weight, q, k, v, stream);
 }
 
 } // namespace ninfer::ops::detail

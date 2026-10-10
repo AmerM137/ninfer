@@ -13,7 +13,6 @@
 namespace ninfer::ops {
 
 inline constexpr int kKVCacheFp8HeadDim        = 256;
-inline constexpr int kKVCacheFp8Group          = 256;
 inline constexpr int kKVCacheFp8Groups         = 1;
 inline constexpr float kKVCacheFp8MaxFinite    = 448.0F;
 inline constexpr float kKVCacheFp8ScaleMinimum = 0x1p-24F;

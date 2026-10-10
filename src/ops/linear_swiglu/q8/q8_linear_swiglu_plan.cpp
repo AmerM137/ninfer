@@ -81,50 +81,6 @@ bool supported_shape(const Q8LinearSwiGluProblem& problem) noexcept {
 
 } // namespace
 
-const char* q8_linear_swiglu_schedule_name(Q8LinearSwiGluScheduleId schedule) noexcept {
-    switch (schedule) {
-    case Q8LinearSwiGluScheduleId::DecodePairR16:
-        return "linear_swiglu.q8.decode.pair.r16";
-    case Q8LinearSwiGluScheduleId::SplitKMmaExactT:
-        return "linear_swiglu.q8.splitk.mma.pair.exact_t";
-    case Q8LinearSwiGluScheduleId::MmaR32C64:
-        return "linear_swiglu.q8.mma.pair.r16.c64";
-    case Q8LinearSwiGluScheduleId::MmaR32C80:
-        return "linear_swiglu.q8.mma.pair.r16.c80";
-    case Q8LinearSwiGluScheduleId::MmaR32C96:
-        return "linear_swiglu.q8.mma.pair.r16.c96";
-    case Q8LinearSwiGluScheduleId::MmaR32C128:
-        return "linear_swiglu.q8.mma.pair.r16.c128";
-    case Q8LinearSwiGluScheduleId::MmaR64C64:
-        return "linear_swiglu.q8.mma.pair.r32.c64";
-    case Q8LinearSwiGluScheduleId::MmaR64C96:
-        return "linear_swiglu.q8.mma.pair.r32.c96";
-    case Q8LinearSwiGluScheduleId::MmaR64C128:
-        return "linear_swiglu.q8.mma.pair.r32.c128";
-    case Q8LinearSwiGluScheduleId::MmaR128C64:
-        return "linear_swiglu.q8.mma.pair.r64.c64";
-    case Q8LinearSwiGluScheduleId::MmaR128C80:
-        return "linear_swiglu.q8.mma.pair.r64.c80";
-    case Q8LinearSwiGluScheduleId::DFlash2SmallT:
-        return "linear_swiglu.q8.dflash2.small_t";
-    case Q8LinearSwiGluScheduleId::DFlash2MmaR32C64K128:
-        return "linear_swiglu.q8.dflash2.mma.r32.c64.k128";
-    case Q8LinearSwiGluScheduleId::DFlash2MmaR64C64K128:
-        return "linear_swiglu.q8.dflash2.mma.r64.c64.k128";
-    case Q8LinearSwiGluScheduleId::DFlash2MmaR64C80K128:
-        return "linear_swiglu.q8.dflash2.mma.r64.c80.k128";
-    case Q8LinearSwiGluScheduleId::DFlash2MmaR64C96K128:
-        return "linear_swiglu.q8.dflash2.mma.r64.c96.k128";
-    case Q8LinearSwiGluScheduleId::DFlash2MmaR64C128:
-        return "linear_swiglu.q8.dflash2.mma.pair.r32.c128";
-    }
-    return "linear_swiglu.q8.unknown";
-}
-
-bool q8_linear_swiglu_schedule_uses_mma(Q8LinearSwiGluScheduleId schedule) noexcept {
-    return schedule != Q8LinearSwiGluScheduleId::DecodePairR16;
-}
-
 bool q8_linear_swiglu_admits(const Q8LinearSwiGluProblem& problem) noexcept {
     return supported_shape(problem) && problem.cols > 0;
 }
@@ -146,13 +102,9 @@ Q8LinearSwiGluPlan q8_linear_swiglu_resolve_plan(const Q8LinearSwiGluProblem& pr
     return resolve_from(kCompanionRoutes);
 }
 
-void q8_linear_swiglu_execute_plan(const Q8LinearSwiGluPlan& plan, const Tensor& x, const Weight& w,
-                                   Tensor& out, cudaStream_t stream) {
+void q8_linear_swiglu_dispatch(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
     const Q8LinearSwiGluProblem problem{w.n, out.ne[0], x.ne[0], w.padded_shape[1], x.ne[1]};
-    const Q8LinearSwiGluPlan resolved = q8_linear_swiglu_resolve_plan(problem);
-    if (resolved.schedule != plan.schedule) {
-        throw std::invalid_argument("Q8 LinearSwiGLU: plan does not match exact problem");
-    }
+    const Q8LinearSwiGluPlan plan = q8_linear_swiglu_resolve_plan(problem);
     switch (plan.schedule) {
     case Q8LinearSwiGluScheduleId::DecodePairR16:
         q8_linear_swiglu_decode_pair_r16_launch(x, w, out, stream);
@@ -207,11 +159,6 @@ void q8_linear_swiglu_execute_plan(const Q8LinearSwiGluPlan& plan, const Tensor&
         return;
     }
     throw std::logic_error("Q8 LinearSwiGLU: unknown schedule");
-}
-
-void q8_linear_swiglu_dispatch(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
-    const Q8LinearSwiGluProblem problem{w.n, out.ne[0], x.ne[0], w.padded_shape[1], x.ne[1]};
-    q8_linear_swiglu_execute_plan(q8_linear_swiglu_resolve_plan(problem), x, w, out, stream);
 }
 
 } // namespace ninfer::ops::detail

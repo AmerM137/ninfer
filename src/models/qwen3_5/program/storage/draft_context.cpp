@@ -21,10 +21,4 @@ PagedKVBatchLayerView DFlashPersistentState::full_batch_layer(std::uint32_t laye
     return full->batch_layer_view(layer);
 }
 
-void DFlashPersistentState::save_rewrite_checkpoint(std::int32_t source_slot,
-                                                    std::int32_t destination_slot,
-                                                    cudaStream_t stream) {
-    local.copy_slot_from(local, source_slot, destination_slot, stream);
-}
-
 } // namespace ninfer::models::qwen3_5::detail

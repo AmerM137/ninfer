@@ -792,8 +792,9 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
         break;
     case SpeculativeBackend::Mtp:
         if (options.speculative.draft_tokens == 0 ||
-            options.speculative.draft_tokens > kMaximumMtpDraftTokens) {
-            throw std::invalid_argument("MTP draft window must be in [1,5]");
+            options.speculative.draft_tokens > kMtpDecodeMaximumDrafts) {
+            throw std::invalid_argument("MTP draft window must be in [1," +
+                                        std::to_string(kMtpDecodeMaximumDrafts) + "]");
         }
         break;
     case SpeculativeBackend::DFlash:
@@ -803,8 +804,10 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
             throw std::invalid_argument(
                 "selected masked draft backend is not supported by this target");
         }
-        if (options.speculative.draft_tokens == 0 || options.speculative.draft_tokens > 15) {
-            throw std::invalid_argument("masked draft window must be in [1,15]");
+        if (options.speculative.draft_tokens == 0 ||
+            options.speculative.draft_tokens > kDFlashDecodeMaximumDrafts) {
+            throw std::invalid_argument("masked draft window must be in [1," +
+                                        std::to_string(kDFlashDecodeMaximumDrafts) + "]");
         }
         break;
     }

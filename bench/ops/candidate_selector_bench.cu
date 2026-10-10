@@ -2,8 +2,7 @@
 
 #include "ninfer/ops/candidate_selector.h"
 
-#include "ninfer_bench_common.h"
-#include "ops/candidate_selector/bf16/candidate_selector_path_plan.h"
+#include "op_measurement.cuh"
 
 #include <cuda_runtime.h>
 
@@ -51,17 +50,17 @@ Options parse_options(int argc, char** argv) {
             return argv[++index];
         };
         if (!std::strcmp(argv[index], "--steps")) {
-            options.steps = std::atoi(next("steps"));
+            options.steps = measurement::integer(next("steps"), 0);
         } else if (!std::strcmp(argv[index], "--batch")) {
-            options.batch_size = std::atoi(next("batch"));
+            options.batch_size = measurement::integer(next("batch"), 0);
         } else if (!std::strcmp(argv[index], "--warmup")) {
-            options.warmup = std::atoi(next("warmup"));
+            options.warmup = measurement::integer(next("warmup"), 0);
         } else if (!std::strcmp(argv[index], "--repeat")) {
-            options.repeat = std::atoi(next("repeat"));
+            options.repeat = measurement::integer(next("repeat"));
         } else if (!std::strcmp(argv[index], "--flush-mib")) {
-            const long mib = std::strtol(next("flush MiB"), nullptr, 10);
-            if (mib <= 0) { throw std::invalid_argument("flush MiB must be positive"); }
-            options.flush_bytes = static_cast<std::size_t>(mib) << 20;
+            const auto mib = measurement::integer<std::size_t>(
+                next("flush MiB"), 1, std::numeric_limits<std::size_t>::max() >> 20);
+            options.flush_bytes = mib << 20;
         } else if (!std::strcmp(argv[index], "--help") || !std::strcmp(argv[index], "-h")) {
             std::printf("usage: %s [--steps 1..15] [--batch 1..8] [--warmup N] [--repeat N] "
                         "[--flush-mib N]\n",
@@ -172,7 +171,6 @@ void run(std::int32_t batch_size, Mode mode, const Options& options, Fixture& fi
                     draft, q);
     const auto* configs = static_cast<const ops::SamplingConfig*>(fixture.configs.p);
 
-    const auto route    = ops::detail::candidate_selector_path_route(fixture.kSteps, batch_size);
     const auto capacity = ops::candidate_selector_path_workspace_capacity_bytes(
         fixture.kSteps, fixture.kSteps, batch_size, batch_size);
     WorkspaceArena workspace(std::max<std::size_t>(capacity, 1));
@@ -182,9 +180,9 @@ void run(std::int32_t batch_size, Mode mode, const Options& options, Fixture& fi
                                      configs, draft, q, workspace, s);
     });
     const auto timing = measure_cold_graph(graph, flush, stream, options.warmup, options.repeat);
-    std::printf("%d,%d,%s,%s,%.3f,%.3f,%.3f,%zu,%zu\n", fixture.kSteps, batch_size, mode_name(mode),
-                ops::detail::selector_route_name(route), timing.median_us, timing.min_us,
-                timing.p95_us, graph.nodes(), workspace.peak_used());
+    std::printf("%d,%d,%s,%.3f,%.3f,%.3f,%zu,%zu\n", fixture.kSteps, batch_size, mode_name(mode),
+                timing.median_us, timing.min_us, timing.p95_us, graph.nodes(),
+                workspace.peak_used());
 }
 
 } // namespace
@@ -207,7 +205,7 @@ int main(int argc, char** argv) {
         std::printf("# gpu=%s public=candidate_selector_path geometry=C16_K1..15_R256 "
                     "cache=cold flush_mib=%zu execution=graph\n",
                     properties.name, options.flush_bytes >> 20);
-        std::printf("K,B,mode,route,median_us,min_us,p95_us,graph_nodes,workspace_bytes\n");
+        std::printf("K,B,mode,median_us,min_us,p95_us,graph_nodes,workspace_bytes\n");
         for (int steps = 1; steps <= 15; ++steps) {
             if (options.steps && options.steps != steps) continue;
             Fixture fixture(steps);

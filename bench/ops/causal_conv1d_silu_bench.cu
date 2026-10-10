@@ -7,9 +7,8 @@
 //   ./ninfer_causal_conv1d_silu_bench --snapshot --channels 8192 --tokens 6 --slots 7
 // Printed logical GB/s is informational; NCU determines the applicable resource roofline.
 #include "ninfer/ops/causal_conv1d_silu.h"
-#include "ninfer/ops/scatter.h"
 #include "core/device.h"
-#include "ninfer_bench_common.h"
+#include "op_measurement.cuh"
 
 #include <cstddef>
 #include <cstdint>
@@ -39,13 +38,11 @@ struct Options {
     bool distinct = false;
     bool snapshot = false;
     bool split    = false;
-    bool legacy   = false;
     bool cold     = false;
 };
 
-// The candidate partition for a channel extent. Which partitions are registered is the entry's
-// business, not the benchmark's: this builds the obvious one and lets the entry accept or reject
-// it.
+// The split-output fixture uses two key ranges followed by the remaining value rows; the
+// public Op validates the requested channel geometry.
 constexpr std::int32_t kSplitKeyDim = 2048;
 
 bool split_partition(std::int32_t channels, std::int32_t& key_dim, std::int32_t& value_dim) {
@@ -81,12 +78,6 @@ std::string cache_tag(const Options& options, const char* entry) {
     return options.cold ? std::string(entry) + "-cold" : std::string(entry);
 }
 
-__global__ void copy_u128_kernel(const uint4* src, uint4* dst, std::size_t n4) {
-    const std::size_t start  = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
-    const std::size_t stride = static_cast<std::size_t>(blockDim.x) * gridDim.x;
-    for (std::size_t i = start; i < n4; i += stride) { dst[i] = src[i]; }
-}
-
 DeviceBuffer make_varied_bf16(std::size_t n, std::uint32_t seed) {
     std::vector<std::uint16_t> h(n);
     std::uint32_t state = seed;
@@ -98,28 +89,6 @@ DeviceBuffer make_varied_bf16(std::size_t n, std::uint32_t seed) {
     DeviceBuffer d(n * 2u);
     cudaMemcpy(d.p, h.data(), n * 2u, cudaMemcpyHostToDevice);
     return d;
-}
-
-void copy_bytes_launch(const DeviceBuffer& src, DeviceBuffer& dst, std::size_t copy_bytes,
-                       cudaStream_t stream) {
-    constexpr int kBlock            = 256;
-    constexpr std::size_t kVecBytes = sizeof(uint4);
-    const std::size_t n4            = (copy_bytes + kVecBytes - 1u) / kVecBytes;
-    const int grid                  = static_cast<int>((n4 + kBlock - 1) / kBlock);
-    copy_u128_kernel<<<grid, kBlock, 0, stream>>>(static_cast<const uint4*>(src.p),
-                                                  static_cast<uint4*>(dst.p), n4);
-    CUDA_CHECK(cudaGetLastError());
-}
-
-void run_copy_baseline(const Options& options, double bytes, const char* tag) {
-    const auto copy_bytes   = static_cast<std::size_t>(bytes / 2.0);
-    const auto padded_bytes = (copy_bytes + sizeof(uint4) - 1u) & ~(sizeof(uint4) - 1u);
-    DeviceBuffer src        = make_varied_bf16(padded_bytes / 2u, 0xc001c0deU);
-    DeviceBuffer dst        = make_zeros(padded_bytes);
-
-    const Result r = time_stage(
-        options, [&](cudaStream_t s) { copy_bytes_launch(src, dst, copy_bytes, s); }, bytes);
-    print_result(tag, r);
 }
 
 std::string shape_tag(const char* mode, std::int32_t channels, std::int32_t tokens,
@@ -208,54 +177,6 @@ void run_split(const Options& options) {
     print_result(tag.c_str(), r);
 }
 
-// The stage the split entry replaced: one packed convolution into a [C,T] plane, then three
-// column extractions out of it. Temporary, for the implementation decision only.
-void run_legacy_stage(const Options& options) {
-    std::int32_t key_dim   = 0;
-    std::int32_t value_dim = 0;
-    if (!split_partition(options.channels, key_dim, value_dim)) {
-        std::printf("SKIP: --channels %d leaves no value rows\n", options.channels);
-        return;
-    }
-    const std::size_t n       = static_cast<std::size_t>(options.channels) * options.tokens;
-    const std::size_t state_n = static_cast<std::size_t>(options.channels) * 3u;
-
-    DeviceBuffer x = make_varied_bf16(n, 0x12345678U);
-    DeviceBuffer weight =
-        make_varied_bf16(static_cast<std::size_t>(options.channels) * 4u, 0x87654321U);
-    DeviceBuffer state_in  = make_varied_bf16(state_n, 0x31415926U);
-    DeviceBuffer state_out = make_zeros(state_n * 2u);
-    DeviceBuffer packed    = make_zeros(n * 2u);
-    DeviceBuffer q         = make_zeros(static_cast<std::size_t>(key_dim) * options.tokens * 2u);
-    DeviceBuffer k         = make_zeros(static_cast<std::size_t>(key_dim) * options.tokens * 2u);
-    DeviceBuffer v         = make_zeros(static_cast<std::size_t>(value_dim) * options.tokens * 2u);
-
-    Tensor tx(x.p, DType::BF16, {options.channels, options.tokens});
-    Tensor tw(weight.p, DType::BF16, {options.channels, 4});
-    Tensor tin(state_in.p, DType::BF16, {options.channels, 3});
-    Tensor tout_state(state_out.p, DType::BF16, {options.channels, 3});
-    Tensor tpacked(packed.p, DType::BF16, {options.channels, options.tokens});
-    Tensor tq(q.p, DType::BF16, {key_dim, options.tokens});
-    Tensor tk(k.p, DType::BF16, {key_dim, options.tokens});
-    Tensor tv(v.p, DType::BF16, {value_dim, options.tokens});
-
-    // The convolution moves x in and the packed plane out; the three extractions read that plane
-    // back and write the same bytes again.
-    const double bytes = 8.0 * static_cast<double>(n) + 20.0 * options.channels;
-    const Result r     = time_stage(
-        options,
-        [&](cudaStream_t s) {
-            ops::causal_conv1d_silu(tx, tw, tin, tout_state, tpacked, s);
-            ops::extract_bf16_columns(tpacked, 0, tq, s);
-            ops::extract_bf16_columns(tpacked, key_dim, tk, s);
-            ops::extract_bf16_columns(tpacked, 2 * key_dim, tv, s);
-        },
-        bytes);
-    const std::string tag =
-        shape_tag(cache_tag(options, "legacy-stage").c_str(), options.channels, options.tokens);
-    print_result(tag.c_str(), r);
-}
-
 void run_decode(const Options& options) {
     const std::size_t channels = static_cast<std::size_t>(options.channels);
 
@@ -277,7 +198,6 @@ void run_decode(const Options& options) {
         restore);
     const std::string tag = shape_tag(cache_tag(options, "decode").c_str(), options.channels, 1);
     print_result(tag.c_str(), r);
-    run_copy_baseline(options, bytes, cache_tag(options, "copy same-byte decode baseline").c_str());
 }
 
 void run_snapshot(const Options& options) {
@@ -351,35 +271,13 @@ void run_snapshot(const Options& options) {
 void print_usage(const char* program) {
     std::fprintf(stderr,
                  "usage: %s [--decode] [--prefill] [--distinct] [--snapshot] [--split] "
-                 "[--legacy-stage] [--cache warm|cold] [--channels C] [--tokens T[,T...]] "
+                 "[--cache warm|cold] [--channels C] [--tokens T[,T...]] "
                  "[--batch B] [--valid-columns V0,V1,...] [--slots S] "
                  "[--initial-slot I]\n",
                  program);
 }
 
-bool parse_positive(const char* text, std::int32_t& value) {
-    const long parsed = std::strtol(text, nullptr, 10);
-    if (parsed <= 0 || parsed > INT32_MAX) { return false; }
-    value = static_cast<std::int32_t>(parsed);
-    return true;
-}
-
-bool parse_valid_columns(const char* text, std::vector<std::int32_t>& values) {
-    values.clear();
-    const char* cursor = text;
-    while (*cursor != '\0') {
-        char* end        = nullptr;
-        const long value = std::strtol(cursor, &end, 10);
-        if (end == cursor || value <= 0 || value > INT32_MAX) { return false; }
-        values.push_back(static_cast<std::int32_t>(value));
-        if (*end == '\0') return true;
-        if (*end != ',') return false;
-        cursor = end + 1;
-    }
-    return false;
-}
-
-bool parse_options(int argc, char** argv, Options& options) {
+bool parse_options(int argc, char** argv, Options& options) try {
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--decode")) {
             options.decode = true;
@@ -391,8 +289,6 @@ bool parse_options(int argc, char** argv, Options& options) {
             options.snapshot = true;
         } else if (!std::strcmp(argv[i], "--split")) {
             options.split = true;
-        } else if (!std::strcmp(argv[i], "--legacy-stage")) {
-            options.legacy = true;
         } else if (!std::strcmp(argv[i], "--cache") && i + 1 < argc) {
             const char* value = argv[++i];
             if (!std::strcmp(value, "cold")) {
@@ -403,39 +299,28 @@ bool parse_options(int argc, char** argv, Options& options) {
                 return false;
             }
         } else if (!std::strcmp(argv[i], "--valid-columns") && i + 1 < argc) {
-            if (!parse_valid_columns(argv[++i], options.valid_columns)) { return false; }
+            options.valid_columns = measurement::integers(argv[++i]);
         } else if ((!std::strcmp(argv[i], "--channels") || !std::strcmp(argv[i], "--tokens") ||
                     !std::strcmp(argv[i], "--slots") || !std::strcmp(argv[i], "--initial-slot") ||
                     !std::strcmp(argv[i], "--batch")) &&
                    i + 1 < argc) {
             const char* flag = argv[i++];
             if (!std::strcmp(flag, "--initial-slot")) {
-                const long parsed = std::strtol(argv[i], nullptr, 10);
-                if (parsed < 0 || parsed > INT32_MAX) { return false; }
-                options.initial_slot = static_cast<std::int32_t>(parsed);
+                options.initial_slot = measurement::integer(argv[i], 0);
             } else if (!std::strcmp(flag, "--tokens")) {
-                options.token_list.clear();
-                const char* cursor = argv[i];
-                while (*cursor != 0) {
-                    char* end         = nullptr;
-                    const long parsed = std::strtol(cursor, &end, 10);
-                    if (end == cursor || parsed <= 0 || parsed > INT32_MAX) { return false; }
-                    options.token_list.push_back(static_cast<std::int32_t>(parsed));
-                    cursor = (*end == ',') ? end + 1 : end;
-                }
-                if (options.token_list.empty()) { return false; }
+                options.token_list = measurement::integers(argv[i]);
             } else {
                 std::int32_t* destination = !std::strcmp(flag, "--channels") ? &options.channels
                                             : !std::strcmp(flag, "--batch")  ? &options.batch
                                                                              : &options.slots;
-                if (!parse_positive(argv[i], *destination)) { return false; }
+                *destination              = measurement::integer(argv[i]);
             }
         } else {
             return false;
         }
     }
     if (!options.decode && !options.prefill && !options.distinct && !options.snapshot &&
-        !options.split && !options.legacy) {
+        !options.split) {
         options.decode = options.prefill = true;
     }
     if (options.batch > 8 ||
@@ -454,7 +339,7 @@ bool parse_options(int argc, char** argv, Options& options) {
         }
     }
     return !options.snapshot || options.batch > 1 || options.initial_slot < options.slots;
-}
+} catch (const std::invalid_argument&) { return false; }
 
 } // namespace
 
@@ -480,7 +365,6 @@ int main(int argc, char** argv) {
         if (point.prefill) run_prefill(point, false);
         if (point.distinct) run_prefill(point, true);
         if (point.snapshot) run_snapshot(point);
-        if (point.legacy) run_legacy_stage(point);
         if (point.split) run_split(point);
     }
     return 0;

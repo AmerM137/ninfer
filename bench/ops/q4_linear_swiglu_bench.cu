@@ -4,7 +4,7 @@
 #include "ninfer/ops/linear_swiglu.h"
 
 #include "core/device.h"
-#include "ninfer_bench_common.h"
+#include "op_measurement.cuh"
 #include "quantized_weight.cuh"
 
 #include <cuda_runtime.h>
@@ -53,25 +53,6 @@ struct Result {
     std::size_t workspace_exact_bytes = 0;
 };
 
-std::vector<std::int32_t> parse_tokens(std::string_view raw) {
-    std::vector<std::int32_t> result;
-    std::size_t begin = 0;
-    while (begin < raw.size()) {
-        const std::size_t end = raw.find(',', begin);
-        const std::string token(
-            raw.substr(begin, end == std::string_view::npos ? raw.size() - begin : end - begin));
-        const long value = std::stol(token);
-        if (value <= 0 || value > std::numeric_limits<std::int32_t>::max()) {
-            throw std::invalid_argument("--t-sweep values must be positive int32");
-        }
-        result.push_back(static_cast<std::int32_t>(value));
-        if (end == std::string_view::npos) { break; }
-        begin = end + 1;
-    }
-    if (result.empty()) { throw std::invalid_argument("--t-sweep must not be empty"); }
-    return result;
-}
-
 Options parse_options(int argc, char** argv) {
     Options options;
     for (int index = 1; index < argc; ++index) {
@@ -81,11 +62,11 @@ Options parse_options(int argc, char** argv) {
             return argv[index];
         };
         if (argument == "--t-sweep") {
-            options.tokens = parse_tokens(next("--t-sweep value"));
+            options.tokens = bench::measurement::integers(next("--t-sweep value"));
         } else if (argument == "--warmup") {
-            options.warmup = std::stoi(std::string(next("--warmup value")));
+            options.warmup = bench::measurement::integer(next("--warmup value"), 0);
         } else if (argument == "--repeat") {
-            options.repeat = std::stoi(std::string(next("--repeat value")));
+            options.repeat = bench::measurement::integer(next("--repeat value"));
         } else if (argument == "--execution") {
             const std::string_view mode = next("--execution value");
             if (mode != "eager" && mode != "graph") {

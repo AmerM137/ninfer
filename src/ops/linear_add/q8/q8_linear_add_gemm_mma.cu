@@ -21,18 +21,6 @@ void launch_variant(const Tensor& x, const Weight& w, Tensor& residual_out, cuda
 
 } // namespace
 
-void q8_linear_add_mma_r32_c32_launch(const Tensor& x, const Weight& w, Tensor& residual_out,
-                                      cudaStream_t stream) {
-    using Schedule = Q8A16MmaSchedule<32, 32, 64, 32, 16, 2, 4>;
-    launch_variant<Schedule>(x, w, residual_out, stream);
-}
-
-void q8_linear_add_mma_r32_c48_launch(const Tensor& x, const Weight& w, Tensor& residual_out,
-                                      cudaStream_t stream) {
-    using Schedule = Q8A16MmaSchedule<32, 48, 64, 32, 16, 2, 4>;
-    launch_variant<Schedule>(x, w, residual_out, stream);
-}
-
 void q8_linear_add_mma_r32_c64_launch(const Tensor& x, const Weight& w, Tensor& residual_out,
                                       cudaStream_t stream) {
     using Schedule = Q8A16MmaSchedule<32, 64, 64, 32, 16, 2, 3>;
@@ -51,12 +39,6 @@ void q8_linear_add_mma_r32_c96_launch(const Tensor& x, const Weight& w, Tensor& 
     launch_variant<Schedule>(x, w, residual_out, stream);
 }
 
-void q8_linear_add_mma_r32_c112_launch(const Tensor& x, const Weight& w, Tensor& residual_out,
-                                       cudaStream_t stream) {
-    using Schedule = Q8A16MmaSchedule<32, 112, 64, 32, 16, 2, 2>;
-    launch_variant<Schedule>(x, w, residual_out, stream);
-}
-
 void q8_linear_add_mma_r32_c128_launch(const Tensor& x, const Weight& w, Tensor& residual_out,
                                        cudaStream_t stream) {
     using Schedule = Q8A16MmaSchedule<32, 128, 64, 32, 16, 2, 2>;
@@ -66,12 +48,6 @@ void q8_linear_add_mma_r32_c128_launch(const Tensor& x, const Weight& w, Tensor&
 void q8_linear_add_mma_r48_c64_launch(const Tensor& x, const Weight& w, Tensor& residual_out,
                                       cudaStream_t stream) {
     using Schedule = Q8A16MmaSchedule<48, 64, 64, 48, 16, 2, 3>;
-    launch_variant<Schedule>(x, w, residual_out, stream);
-}
-
-void q8_linear_add_mma_r48_c80_launch(const Tensor& x, const Weight& w, Tensor& residual_out,
-                                      cudaStream_t stream) {
-    using Schedule = Q8A16MmaSchedule<48, 80, 64, 48, 16, 2, 3>;
     launch_variant<Schedule>(x, w, residual_out, stream);
 }
 
@@ -90,30 +66,6 @@ void q8_linear_add_mma_r48_c112_launch(const Tensor& x, const Weight& w, Tensor&
 void q8_linear_add_mma_r48_c128_launch(const Tensor& x, const Weight& w, Tensor& residual_out,
                                        cudaStream_t stream) {
     using Schedule = Q8A16MmaSchedule<48, 128, 64, 48, 16, 2, 2>;
-    launch_variant<Schedule>(x, w, residual_out, stream);
-}
-
-void q8_linear_add_mma_r64_c32_launch(const Tensor& x, const Weight& w, Tensor& residual_out,
-                                      cudaStream_t stream) {
-    using Schedule = Q8A16MmaSchedule<64, 32, 64, 64, 16, 2, 3>;
-    launch_variant<Schedule>(x, w, residual_out, stream);
-}
-
-void q8_linear_add_mma_r64_c48_launch(const Tensor& x, const Weight& w, Tensor& residual_out,
-                                      cudaStream_t stream) {
-    using Schedule = Q8A16MmaSchedule<64, 48, 64, 64, 16, 2, 3>;
-    launch_variant<Schedule>(x, w, residual_out, stream);
-}
-
-void q8_linear_add_mma_r64_c64_launch(const Tensor& x, const Weight& w, Tensor& residual_out,
-                                      cudaStream_t stream) {
-    using Schedule = Q8A16MmaSchedule<64, 64, 64, 64, 16, 2, 2>;
-    launch_variant<Schedule>(x, w, residual_out, stream);
-}
-
-void q8_linear_add_mma_r64_c80_launch(const Tensor& x, const Weight& w, Tensor& residual_out,
-                                      cudaStream_t stream) {
-    using Schedule = Q8A16MmaSchedule<64, 80, 64, 64, 16, 2, 2>;
     launch_variant<Schedule>(x, w, residual_out, stream);
 }
 

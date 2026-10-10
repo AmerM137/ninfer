@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <string>
 #include <string_view>
 
@@ -18,10 +19,13 @@ struct Options {
     std::string execution = "graph", cache = "both", csv_out;
 };
 
-inline int integer(std::string_view text, int minimum = 1) {
-    int value               = 0;
+template <class Integer = int>
+inline Integer integer(std::string_view text, Integer minimum = 1,
+                       Integer maximum = std::numeric_limits<Integer>::max()) {
+    Integer value           = 0;
     const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
-    if (error != std::errc{} || end != text.data() + text.size() || value < minimum)
+    if (error != std::errc{} || end != text.data() + text.size() || value < minimum ||
+        value > maximum)
         throw std::invalid_argument("invalid integer: " + std::string(text));
     return value;
 }
@@ -31,18 +35,23 @@ inline std::string_view take(int argc, char** argv, int& index) {
     return argv[index];
 }
 
-inline std::vector<int> integers(std::string_view text, int minimum = 1) {
+inline std::vector<int> integers(std::string_view text, int minimum = 1,
+                                 int maximum = std::numeric_limits<int>::max()) {
     std::vector<int> values;
     while (!text.empty()) {
         const auto comma = text.find(',');
-        values.push_back(integer(text.substr(0, comma), minimum));
+        values.push_back(integer(text.substr(0, comma), minimum, maximum));
         if (comma == text.npos) return values;
         text.remove_prefix(comma + 1);
     }
     throw std::invalid_argument("empty integer list");
 }
 
-inline std::vector<int> sweep(std::string_view text) {
+struct Sweep {
+    int begin = 0, end = 0, step = 1;
+};
+
+inline Sweep parse_sweep(std::string_view text) {
     const auto a = text.find(':');
     if (a == text.npos) throw std::invalid_argument("sweep expects START:END[:STEP]");
     const auto b    = text.find(':', a + 1);
@@ -50,8 +59,13 @@ inline std::vector<int> sweep(std::string_view text) {
     const int last  = integer(text.substr(a + 1, b == text.npos ? text.npos : b - a - 1));
     const int step  = b == text.npos ? 1 : integer(text.substr(b + 1));
     if (first > last) throw std::invalid_argument("reversed sweep");
+    return {first, last, step};
+}
+
+inline std::vector<int> sweep(std::string_view text) {
+    const auto range = parse_sweep(text);
     std::vector<int> result;
-    for (std::int64_t i = first; i <= last; i += step) result.push_back(int(i));
+    for (std::int64_t i = range.begin; i <= range.end; i += range.step) result.push_back(int(i));
     return result;
 }
 

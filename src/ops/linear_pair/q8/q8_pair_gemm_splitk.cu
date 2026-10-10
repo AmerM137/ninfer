@@ -212,22 +212,6 @@ void q8_pair_splitk_medium_launch(Q8PairScheduleId schedule, const Tensor& x,
             return;
         }
         break;
-    case Q8PairScheduleId::DualSplitKMediumC224:
-        if (x.ne[1] <= 224) {
-            launch_medium<224, 2, 7, 2>(x, first_weight, second_weight, first_out, second_out,
-                                        stream);
-            CUDA_CHECK(cudaGetLastError());
-            return;
-        }
-        break;
-    case Q8PairScheduleId::DualSplitKMediumC256:
-        if (x.ne[1] <= 256) {
-            launch_medium<256, 2, 8, 1>(x, first_weight, second_weight, first_out, second_out,
-                                        stream);
-            CUDA_CHECK(cudaGetLastError());
-            return;
-        }
-        break;
     default:
         break;
     }

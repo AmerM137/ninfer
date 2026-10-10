@@ -121,38 +121,6 @@ void launch_wide_with_narrow_tail(const Tensor& x, const Weight& w, Tensor& resi
 
 } // namespace
 
-const char* q5_linear_add_schedule_name(Q5LinearAddScheduleId schedule) noexcept {
-    switch (schedule) {
-    case Q5LinearAddScheduleId::Split2ExactResidual:
-        return "linear_add.q5.simt.split2.exact.residual";
-    case Q5LinearAddScheduleId::SlicedR16T8W4S2:
-        return "linear_add.q5.sliced.r16.t8.w4.s2.residual";
-    case Q5LinearAddScheduleId::SlicedR16T16W4S2:
-        return "linear_add.q5.sliced.r16.t16.w4.s2.residual";
-    case Q5LinearAddScheduleId::SlicedR16T24W4S2:
-        return "linear_add.q5.sliced.r16.t24.w4.s2.residual";
-    case Q5LinearAddScheduleId::SlicedR32T32W4S2:
-        return "linear_add.q5.sliced.r32.t32.w4.s2.residual";
-    case Q5LinearAddScheduleId::SlicedR32T24W4S2Pairwise:
-        return "linear_add.q5.sliced.r32.t24.w4.s2.pairwise.residual";
-    case Q5LinearAddScheduleId::SlicedR32T32W4S1:
-        return "linear_add.q5.sliced.r32.t32.w4.s1.residual";
-    case Q5LinearAddScheduleId::SlicedR32T32W2S2:
-        return "linear_add.q5.sliced.r32.t32.w2.s2.residual";
-    case Q5LinearAddScheduleId::SlicedR32T64W2S1:
-        return "linear_add.q5.sliced.r32.t64.w2.s1.residual";
-    case Q5LinearAddScheduleId::MmaResidualR32T32K128:
-        return "linear_add.q5.mma.r32.t32.k128.residual";
-    case Q5LinearAddScheduleId::MmaResidualR32T128:
-        return "linear_add.q5.mma.r32.t128.residual";
-    case Q5LinearAddScheduleId::MmaResidualR64T128:
-        return "linear_add.q5.mma.r64.t128.cta_collective_residual";
-    case Q5LinearAddScheduleId::MmaResidualR64T128Tail:
-        return "linear_add.q5.mma.r64.t128.cta_collective_residual.narrow_tail";
-    }
-    return "linear_add.q5.unknown";
-}
-
 bool q5_linear_add_admits(const Q5LinearAddProblem& problem) noexcept {
     return supported_shape(problem) && problem.cols >= 1;
 }

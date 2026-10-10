@@ -3,24 +3,47 @@ set -euo pipefail
 
 repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 server_bin="${repo_dir}/build/apps/ninfer-serve"
-artifact="${repo_dir}/out/qwen3_8_27b.ninfer"
-config="${repo_dir}/eval/configs/qwen3_8_27b_groupwise_reasoning.yaml"
 eval_python="${repo_dir}/eval/.venv/bin/python"
 log_dir="${repo_dir}/eval/server-logs"
 
 usage() {
-    echo "usage: $0 [--plan] [text|multimodal]" >&2
+    echo "usage: $0 nvfp4|groupwise [--plan] [text|multimodal]" >&2
     echo "       with no step argument, text runs followed by multimodal" >&2
 }
+
+case "${1:-}" in
+    nvfp4)
+        artifact="${repo_dir}/out/qwen3_8_27b_nvfp4.ninfer"
+        config="${repo_dir}/eval/configs/qwen3_8_27b_nvfp4_reasoning.yaml"
+        log_identity="qwen3_8_27b_nvfp4"
+        concurrency=2
+        # The measured RTX 5090 profile leaves 11,245,380,608 B after weights.
+        # Its reservation grows as 1,811,051,776 + 32,816/token; 1 GiB headroom
+        # caps context at ~254,769. This covers GPQA's 245,760-token output
+        # budget and the largest measured 2,847-token prompt with 4,321 slack.
+        text_max_context=252928
+        ;;
+    groupwise)
+        artifact="${repo_dir}/out/qwen3_8_27b.ninfer"
+        config="${repo_dir}/eval/configs/qwen3_8_27b_groupwise_reasoning.yaml"
+        log_identity="qwen3_8_27b_groupwise"
+        concurrency=4
+        # This profile left 13.53 GiB free after weights, allowing the full
+        # context and a measured automatic 324,224-token KV pool at C=4.
+        text_max_context=262144
+        ;;
+    *)
+        usage
+        exit 2
+        ;;
+esac
+shift
 
 # Emits tab-separated fields: suite, max-context, has-vision, description.
 step_config() {
     case "$1" in
         text)
-            # The groupwise-int artifact leaves 13.53 GiB free after weights, so
-            # the full 262,144-token context fits (the nvfp4 profile needed
-            # 252,928). Auto sizing resolves a 324,224-token KV pool at C=4.
-            printf 'text_full\t262144\t0\t%s\n' \
+            printf 'text_full\t%s\t0\t%s\n' "${text_max_context}" \
                 "IFBench, AIME 2025, AIME 2026, and GPQA-Diamond"
             ;;
         multimodal)
@@ -106,8 +129,8 @@ run_step() {
     fi
 
     run_stamp="$(date -u +%Y%m%dT%H%M%SZ)"
-    server_log="${log_dir}/qwen3_8_27b_groupwise-${step}-c4-${run_stamp}.server.log"
-    request_log="${log_dir}/qwen3_8_27b_groupwise-${step}-c4-${run_stamp}.requests.jsonl"
+    server_log="${log_dir}/${log_identity}-${step}-c${concurrency}-${run_stamp}.server.log"
+    request_log="${log_dir}/${log_identity}-${step}-c${concurrency}-${run_stamp}.requests.jsonl"
 
     if curl --fail --silent --show-error --max-time 2 http://127.0.0.1:18080/health >/dev/null 2>&1; then
         echo "port 18080 already has a healthy service; stop it before running this script" >&2
@@ -120,8 +143,8 @@ run_step() {
         --model-id qwen3.8-27b \
         --max-context "${max_context}" \
         --kv-capacity auto \
-        --max-concurrency 4 \
-        --max-pending-requests 4 \
+        --max-concurrency "${concurrency}" \
+        --max-pending-requests "${concurrency}" \
         --pending-timeout-ms 86400000 \
         --prefill-chunk 1024 \
         --kv-dtype int8 \

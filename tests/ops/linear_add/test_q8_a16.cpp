@@ -1,4 +1,5 @@
 #include "ops/linear_add/linear_add_test_common.h"
+#include "ops/linear_common.h"
 
 #include "ninfer/ops/linear_add.h"
 #include "ops/op_tester.h"
@@ -7,8 +8,6 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
-#include <exception>
-#include <iostream>
 #include <vector>
 
 namespace {
@@ -69,9 +68,13 @@ int q8_a16_conformance() {
 
     constexpr std::array<std::int32_t, 4> kK4096RouteStarts{2, 49, 129, 641};
     constexpr std::array<std::int32_t, 5> kK4096RouteInteriors{1, 24, 96, 256, 1024};
-    failures += ninfer::test::linear_add::run_shape(
-        "Q8_A16 LinearAdd", WeightFormat::Q8G32F16S,
-        ShapeCase{2048, 4096, 419U, kK4096RouteStarts, kK4096RouteInteriors});
+    failures +=
+        ninfer::test::linear_add::run_shape("Q8_A16 LinearAdd", WeightFormat::Q8G32F16S,
+                                            ShapeCase{.n               = 2048,
+                                                      .k               = 4096,
+                                                      .seed            = 419U,
+                                                      .route_starts    = kK4096RouteStarts,
+                                                      .route_interiors = kK4096RouteInteriors});
 
     constexpr std::array<std::int32_t, 32> kK6144RouteStarts{
         2,    49,   129,  192,  193,  257,  385,  400,  401,  448,  449,
@@ -83,21 +86,35 @@ int q8_a16_conformance() {
         464,  560,  656,  688,  744,  840,  928,  992,  1024, 1072, 1200,
         1312, 1376, 1544, 1736, 1792, 1856, 1920, 1968, 2032, 2048, 4096,
     };
-    failures += ninfer::test::linear_add::run_shape(
-        "Q8_A16 LinearAdd", WeightFormat::Q8G32F16S,
-        ShapeCase{2048, 6144, 421U, kK6144RouteStarts, kK6144RouteInteriors});
+    failures +=
+        ninfer::test::linear_add::run_shape("Q8_A16 LinearAdd", WeightFormat::Q8G32F16S,
+                                            ShapeCase{.n               = 2048,
+                                                      .k               = 6144,
+                                                      .seed            = 421U,
+                                                      .route_starts    = kK6144RouteStarts,
+                                                      .route_interiors = kK6144RouteInteriors});
     constexpr std::array<std::int32_t, 10> large_route_starts{5,  9,  17, 25, 33,
                                                               41, 49, 57, 65, 129};
     constexpr std::array<std::int32_t, 8> large_interiors{1, 4, 8, 96, 128, 512, 1024, 1025};
     constexpr std::array<std::int32_t, 6> graph_tokens{1, 8, 64, 65, 129, 512};
     constexpr std::array<std::int32_t, 3> full_tokens{1, 4, 8};
     for (const auto k : {6144, 17408}) {
-        failures += ninfer::test::linear_add::run_shape(
-            "Q8_A16 LinearAdd", WeightFormat::Q8G32F16S,
-            ShapeCase{5120, k, 423U, large_route_starts, large_interiors, graph_tokens});
-        failures += ninfer::test::linear_add::run_shape(
-            "Q8_A16 LinearAdd full", WeightFormat::Q8G32F16S,
-            ShapeCase{5120, k, 425U, {}, full_tokens, {}, true});
+        failures +=
+            ninfer::test::linear_add::run_shape("Q8_A16 LinearAdd", WeightFormat::Q8G32F16S,
+                                                ShapeCase{.n               = 5120,
+                                                          .k               = k,
+                                                          .seed            = 423U,
+                                                          .route_starts    = large_route_starts,
+                                                          .route_interiors = large_interiors,
+                                                          .graph_tokens    = graph_tokens});
+        failures +=
+            ninfer::test::linear_add::run_shape("Q8_A16 LinearAdd full", WeightFormat::Q8G32F16S,
+                                                ShapeCase{.n               = 5120,
+                                                          .k               = k,
+                                                          .seed            = 425U,
+                                                          .route_starts    = {},
+                                                          .route_interiors = full_tokens,
+                                                          .full_output     = true});
     }
     return failures + cancellation_conformance();
 }
@@ -105,17 +122,5 @@ int q8_a16_conformance() {
 } // namespace
 
 int main() {
-    if (!ninfer::test::linear_add::cuda_available()) {
-        std::cout << "SKIP: no usable CUDA device\n";
-        return 77;
-    }
-
-    try {
-        const int failures = q8_a16_conformance();
-        std::cout << (failures == 0 ? "OK" : "FAIL") << " Q8_A16 LinearAdd\n";
-        return failures == 0 ? 0 : 1;
-    } catch (const std::exception& error) {
-        std::cerr << "Q8_A16 LinearAdd: " << error.what() << '\n';
-        return 1;
-    }
+    return ninfer::test::linear_common::run_test_main("Q8_A16 LinearAdd", q8_a16_conformance);
 }

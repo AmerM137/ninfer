@@ -157,10 +157,6 @@ void ProgramImpl::trim_sequence_kv(SequenceState& state, std::uint32_t main,
     }
 }
 
-PagedKVCacheView ProgramImpl::text_kv_view(const SequenceState& state) const {
-    return decoder->text_kv.execution_view(text_kv_addresses->execution_row(state.kv->text));
-}
-
 PagedKVCacheView ProgramImpl::mtp_kv_view(const SequenceState& state) const {
     return speculative_backend == SpeculativeBackend::Mtp
                ? decoder->mtp_cache()->execution_view(
@@ -171,12 +167,6 @@ PagedKVCacheView ProgramImpl::mtp_kv_view(const SequenceState& state) const {
 void ProgramImpl::set_device_i32(Tensor& tensor, std::int32_t value) {
     CUDA_CHECK(
         cudaMemcpyAsync(tensor.data, &value, sizeof(value), cudaMemcpyHostToDevice, device.stream));
-}
-
-void ProgramImpl::ordered_reset(SequenceState& state) {
-    refresh_state_views(state);
-    state.text_kv_valid = state.mtp_kv_valid = state.dflash_context_frontier = 0;
-    work.reset();
 }
 
 } // namespace ninfer::models::qwen3_5::detail

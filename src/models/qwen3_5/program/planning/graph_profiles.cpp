@@ -52,7 +52,7 @@ std::vector<GraphExecutionProfile> mtp_graph_profiles(std::uint32_t capacity,
 std::vector<GraphExecutionProfile> dflash_graph_profiles(SpeculativeBackend backend,
                                                          std::uint32_t capacity,
                                                          std::uint32_t draft_window) {
-    if (capacity == 0 || draft_window == 0 || draft_window > 15) {
+    if (capacity == 0 || draft_window == 0 || draft_window > kDFlashDecodeMaximumDrafts) {
         throw std::invalid_argument("invalid masked draft graph dimensions");
     }
     if (backend == SpeculativeBackend::DFlash2) {

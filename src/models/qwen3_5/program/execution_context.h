@@ -42,7 +42,6 @@ struct ExecutionCore {
 
 struct PrefillContext {
     ExecutionCore execution;
-    qwen3_5::PagedKVCacheView text_kv;
     qwen3_5::PagedKVCacheView mtp_kv;
     const qwen3_5::PagedKVCache& text_cache;
     const qwen3_5::PagedKVCache* mtp_cache;
@@ -98,7 +97,7 @@ struct DFlashAppendContext {
 struct MtpCausalAttentionEnvelopes {
     ops::CausalAttentionExecutionEnvelope target_verify;
     ops::CausalAttentionExecutionEnvelope batch;
-    std::array<ops::CausalAttentionExecutionEnvelope, kMaximumMtpDraftTokens - 1> ar;
+    std::array<ops::CausalAttentionExecutionEnvelope, kMtpDecodeMaximumDrafts - 1> ar;
 };
 
 struct DFlashEnvelopes {

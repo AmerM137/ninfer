@@ -120,16 +120,4 @@ void q8_pair_decode_r4_launch(const Tensor& x, const Weight& first_weight,
     launch_decode<4>(x, first_weight, second_weight, first_out, second_out, stream);
 }
 
-void q8_pair_decode_r8_launch(const Tensor& x, const Weight& first_weight,
-                              const Weight& second_weight, Tensor& first_out, Tensor& second_out,
-                              cudaStream_t stream) {
-    launch_decode<8>(x, first_weight, second_weight, first_out, second_out, stream);
-}
-
-void q8_pair_decode_r16_launch(const Tensor& x, const Weight& first_weight,
-                               const Weight& second_weight, Tensor& first_out, Tensor& second_out,
-                               cudaStream_t stream) {
-    launch_decode<16>(x, first_weight, second_weight, first_out, second_out, stream);
-}
-
 } // namespace ninfer::ops::detail

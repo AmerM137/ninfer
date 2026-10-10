@@ -316,15 +316,6 @@ StateImageDevicePool::StateImageDevicePool(DeviceSpan backing, const StateImageD
     }
 }
 
-StateImageDeviceSlotView StateImageDevicePool::slot_view(std::int32_t slot) const {
-    StateImageDeviceSlotView view{
-        .linear              = linear_.slot_view(slot),
-        .continuation_hidden = continuation_hidden_slot(slot),
-    };
-    if (dflash_local_) { view.dflash_local = dflash_local_->slot_view(slot); }
-    return view;
-}
-
 Tensor StateImageDevicePool::continuation_hidden_slot(std::int32_t slot) const {
     validate_slot(slot, slot_count(), "StateImage slot is out of range");
     return continuation_hidden_.slice(1, slot, 1).view({host_layout_.spec.hidden});

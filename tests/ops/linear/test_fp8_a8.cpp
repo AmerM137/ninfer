@@ -217,16 +217,5 @@ int run_fp8_a8() {
 } // namespace
 
 int main() {
-    if (!ninfer::test::linear::cuda_available()) {
-        std::cout << "SKIP: no usable CUDA device\n";
-        return 77;
-    }
-    try {
-        const int failures = run_fp8_a8();
-        std::cout << (failures == 0 ? "OK" : "FAIL") << " FP8 A8 Linear\n";
-        return failures == 0 ? 0 : 1;
-    } catch (const std::exception& error) {
-        std::cerr << "FP8 A8 Linear: " << error.what() << '\n';
-        return 1;
-    }
+    return ninfer::test::linear_common::run_test_main("FP8 A8 Linear", [] { return run_fp8_a8(); });
 }

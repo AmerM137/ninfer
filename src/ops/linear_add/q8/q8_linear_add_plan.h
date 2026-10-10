@@ -42,13 +42,9 @@ struct Q8LinearAddProblem {
     std::int32_t cols;
 };
 
-const char* q8_linear_add_schedule_name(Q8LinearAddScheduleId schedule) noexcept;
-bool q8_linear_add_schedule_uses_mma(Q8LinearAddScheduleId schedule) noexcept;
 bool q8_linear_add_admits(const Q8LinearAddProblem& problem) noexcept;
 Q8LinearAddPlan q8_linear_add_resolve_plan(const Q8LinearAddProblem& problem);
 
-void q8_linear_add_execute_plan(const Q8LinearAddPlan& plan, const Tensor& x, const Weight& w,
-                                Tensor& residual_out, cudaStream_t stream);
 void q8_linear_add_dispatch(const Tensor& x, const Weight& w, Tensor& residual_out,
                             cudaStream_t stream);
 

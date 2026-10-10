@@ -1,5 +1,6 @@
 #include "core/weight.h"
 #include "ops/linear_add/linear_add_test_common.h"
+#include "ops/linear_common.h"
 
 #include "ninfer/ops/linear_add.h"
 #include "ops/op_tester.h"
@@ -57,26 +58,17 @@ int bf16_a16_conformance() {
     constexpr std::array<std::int32_t, 10> kRouteInteriors{
         4, 8, 16, 32, 48, 96, 192, 256, 1024, 1536,
     };
-    return ninfer::test::linear_add::run_shape(
-               "BF16_A16 LinearAdd", WeightFormat::BF16,
-               ShapeCase{5120, 6144, 431U, kRouteStarts, kRouteInteriors}) +
+    return ninfer::test::linear_add::run_shape("BF16_A16 LinearAdd", WeightFormat::BF16,
+                                               ShapeCase{.n               = 5120,
+                                                         .k               = 6144,
+                                                         .seed            = 431U,
+                                                         .route_starts    = kRouteStarts,
+                                                         .route_interiors = kRouteInteriors}) +
            bf16_a16_rejections();
 }
 
 } // namespace
 
 int main() {
-    if (!ninfer::test::linear_add::cuda_available()) {
-        std::cout << "SKIP: no usable CUDA device\n";
-        return 77;
-    }
-
-    try {
-        const int failures = bf16_a16_conformance();
-        std::cout << (failures == 0 ? "OK" : "FAIL") << " BF16_A16 LinearAdd\n";
-        return failures == 0 ? 0 : 1;
-    } catch (const std::exception& error) {
-        std::cerr << "BF16_A16 LinearAdd: " << error.what() << '\n';
-        return 1;
-    }
+    return ninfer::test::linear_common::run_test_main("BF16_A16 LinearAdd", bf16_a16_conformance);
 }

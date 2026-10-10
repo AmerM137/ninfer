@@ -51,16 +51,6 @@ int run_nvfp4_a4() {
 } // namespace
 
 int main() {
-    if (!ninfer::test::linear::cuda_available()) {
-        std::cout << "SKIP: no usable CUDA device\n";
-        return 77;
-    }
-    try {
-        const int failures = run_nvfp4_a4();
-        std::cout << (failures == 0 ? "OK" : "FAIL") << " NVFP4_A4 Linear\n";
-        return failures == 0 ? 0 : 1;
-    } catch (const std::exception& error) {
-        std::cerr << "NVFP4_A4 Linear: " << error.what() << '\n';
-        return 1;
-    }
+    return ninfer::test::linear_common::run_test_main("NVFP4_A4 Linear",
+                                                      [] { return run_nvfp4_a4(); });
 }

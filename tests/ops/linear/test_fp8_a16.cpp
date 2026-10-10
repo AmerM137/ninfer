@@ -1,6 +1,5 @@
 #include "core/weight.h"
 #include "ops/linear/linear_test_common.h"
-#include "ops/linear/fp8/fp8_format.h"
 
 #include <array>
 #include <exception>
@@ -94,28 +93,48 @@ int run_fp8_a16() {
                   {5120, 17408, 829U, Comparison::Sampled, true, residual17408_invocations});
 
     auto packed = make_fp8_weight(14336, 5120, 831U);
+    DeviceBuffer device_weight(packed.payload.size());
+    device_weight.copy_from_host(packed.payload.data(), device_weight.bytes);
+    const Weight weight = packed.device_weight(device_weight.p);
+    const std::vector<std::uint16_t> input_bits(5120, 0);
+    auto device_input = test::to_device(input_bits);
+    test::GuardedDeviceBuffer device_output(14336 * sizeof(std::uint16_t));
+    device_output.fill(0xff);
+    Tensor input(device_input.p, DType::BF16, {5120, 1});
+    Tensor output(device_output.data(), DType::BF16, {14336, 1});
+    DeviceArena workspace(256);
+    const auto invoke = [&](const Weight& candidate) {
+        ops::linear(input, candidate, output, ops::LinearPolicy::A16Only, workspace, nullptr);
+    };
     try {
-        (void)ops::detail::validate_fp8_weight(packed.weight, "FP8 validator test");
+        invoke(weight);
+        test::cuda_synchronize();
     } catch (const std::exception& error) {
         std::cerr << "valid FP8 metadata was rejected: " << error.what() << '\n';
         ++failures;
     }
     const auto expect_invalid = [&](const char* label, Weight invalid) {
         try {
-            (void)ops::detail::validate_fp8_weight(invalid, "FP8 validator test");
+            invoke(invalid);
+            test::cuda_synchronize();
             std::cerr << "invalid FP8 " << label << " was accepted\n";
             ++failures;
         } catch (const std::invalid_argument&) {}
     };
-    Weight invalid = packed.weight;
+    Weight invalid = weight;
     invalid.layout = QuantLayout::Contiguous;
     expect_invalid("layout", invalid);
-    invalid             = packed.weight;
+    invalid             = weight;
     invalid.scale_nb[1] = invalid.scale_nb[1] - 2;
     expect_invalid("scale stride", invalid);
-    invalid               = packed.weight;
+    invalid               = weight;
     invalid.payload_bytes = invalid.payload_bytes - 1;
     expect_invalid("payload bound", invalid);
+    failures += device_output.verify_guards("FP8 metadata output");
+    failures += test::linear_common::verify_preserved(
+        device_input.p, std::as_bytes(std::span(input_bits)), "FP8 metadata input");
+    failures += test::linear_common::verify_preserved(
+        device_weight.p, std::as_bytes(std::span(packed.payload)), "FP8 metadata weight");
     for (auto [n, k] : {std::pair{14336, 5120}, std::pair{16384, 5120}, std::pair{34816, 5120},
                         std::pair{248320, 5120}, std::pair{5120, 6144}, std::pair{5120, 17408}}) {
         failures += verify_workspace_envelopes(QType::FP8_E4M3FN_ROW_BF16, n, k);
@@ -126,16 +145,6 @@ int run_fp8_a16() {
 } // namespace
 
 int main() {
-    if (!ninfer::test::linear::cuda_available()) {
-        std::cout << "SKIP: no usable CUDA device\n";
-        return 77;
-    }
-    try {
-        const int failures = run_fp8_a16();
-        std::cout << (failures == 0 ? "OK" : "FAIL") << " FP8 A16 Linear\n";
-        return failures == 0 ? 0 : 1;
-    } catch (const std::exception& error) {
-        std::cerr << "FP8 A16 Linear: " << error.what() << '\n';
-        return 1;
-    }
+    return ninfer::test::linear_common::run_test_main("FP8 A16 Linear",
+                                                      [] { return run_fp8_a16(); });
 }
