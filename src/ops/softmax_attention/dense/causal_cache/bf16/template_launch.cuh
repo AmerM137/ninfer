@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ops/kv_cache/kernels/layout.cuh"
 #include "core/device.h"
 #include "ops/softmax_attention/dense/causal_cache/bf16/grouped_mma.cuh"
 #include "ops/softmax_attention/dense/causal_cache/bf16/tiled_mma.cuh"
@@ -95,13 +96,13 @@ void launch_bf16_kv_tiled_mma(const CausalAttentionOperands& p, Bf16KvReadView c
         CUDA_CHECK(cudaGetLastError());
     };
     if (!cache.table_rows) {
-        launch(PagedKVDirectMetadata{cache.tables});
+        launch(kv::DirectMetadata{cache.tables});
     } else if (cache.valid_columns) {
-        launch(PagedKVBatchMetadata<true>{cache.tables, cache.valid_columns, cache.table_rows,
-                                          cache.table_stride});
+        launch(kv::BatchMetadata<true>{cache.tables, cache.valid_columns, cache.table_rows,
+                                       cache.table_stride});
     } else {
-        launch(PagedKVBatchMetadata<false>{cache.tables, nullptr, cache.table_rows,
-                                           cache.table_stride});
+        launch(
+            kv::BatchMetadata<false>{cache.tables, nullptr, cache.table_rows, cache.table_stride});
     }
 }
 

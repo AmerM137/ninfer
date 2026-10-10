@@ -68,4 +68,10 @@ std::size_t k8v4_kv_workspace_bytes(int heads, int batch, int min_width, int max
                                  envelope.max_visible_keys, multiprocessor_count));
 }
 
+kv::PagedWriteInstance select_k8v4_kv_write(int heads, int width, int batch) {
+    using Instance = kv::PagedWriteInstance;
+    if (batch > 1) return Instance::BatchRows256;
+    return width >= 128 && heads == 2 ? Instance::Page8x256 : Instance::WarpRows256;
+}
+
 } // namespace ninfer::ops::detail

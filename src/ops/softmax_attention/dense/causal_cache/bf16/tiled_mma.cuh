@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ops/kv_cache/kernels/layout.cuh"
 #include "ops/softmax_attention/dense/causal_cache/bf16/tile_io.cuh"
 #include "ops/softmax_attention/common/bf16_softmax.cuh"
 #include "ops/softmax_attention/dense/causal_cache/bf16/epilogue.cuh"
@@ -135,10 +136,9 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     ninfer::ops::cp_commit();
 
     const auto step = [&]<bool FullTile>(int kb) {
-        const int k0                 = kb * Bc;
-        const int next_physical_page = (kb + 1 < n_block_max)
-                                           ? block_table[((kb + 1) * Bc) >> kPagedKVPageShift]
-                                           : physical_page;
+        const int k0 = kb * Bc;
+        const int next_physical_page =
+            (kb + 1 < n_block_max) ? block_table[((kb + 1) * Bc) >> kv::kPageShift] : physical_page;
 
         ninfer::ops::cp_wait<0>(); // K(kb) landed (also publishes q_s / prev PV done)
         __syncthreads();

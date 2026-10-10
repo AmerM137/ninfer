@@ -1,7 +1,8 @@
 #pragma once
 
-#include "ops/kv_cache/fp8_e4m3_row_codec.cuh"
-#include "ops/kv_cache/hadamard_d256.cuh"
+#include "ops/kv_cache/kernels/layout.cuh"
+#include "ops/common/quant/fp8.cuh"
+#include "ops/kv_cache/kernels/hadamard.cuh"
 #include "ops/softmax_attention/common/causal_epilogue.cuh"
 #include "ops/softmax_attention/common/causal_operands.h"
 #include "ops/softmax_attention/common/causal_partition.h"
@@ -76,16 +77,16 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void mxfp8_kv_tiled_mma_kernel(
                               ? __bfloat162float(q[causal_q_index<Geometry>(q_head, d, q0 + row)])
                               : 0.0F;
         }
-        normalized_hadamard_d256_inplace(values, lane);
+        kv::normalized_hadamard_d256_inplace(values, lane);
 #pragma unroll
         for (int r = 0; r < 8; ++r) local_absmax = fmaxf(local_absmax, fabsf(values[r]));
         const float absmax = warp_max(local_absmax, FullMask);
-        const float qs     = absmax > 0.0F ? absmax / kKVCacheFp8MaxFinite : 0.0F;
+        const float qs     = absmax > 0.0F ? absmax / common::kFp8E4M3MaxFinite : 0.0F;
         const float inv    = qs > 0.0F ? 1.0F / qs : 0.0F;
 #pragma unroll
         for (int r = 0; r < 8; ++r) {
             const int d = lane + 32 * r;
-            causal_store_query_code(q_fp8, row, d, kv_cache_fp8_quant_code(values[r], inv));
+            causal_store_query_code(q_fp8, row, d, common::fp8_quant_code(values[r], inv));
         }
         if (lane == 0) q_scale[row] = qs;
     }
@@ -111,19 +112,19 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void mxfp8_kv_tiled_mma_kernel(
     const unsigned v_as        = (lane >> 4) << 4;
     const unsigned v_r         = b_rin << 4;
     auto issue_kv_scales       = [&](int tile_k0, int cooperative_tid, int cooperative_threads) {
-        const int physical_page = block_table[tile_k0 >> kPagedKVPageShift];
+        const int physical_page = block_table[tile_k0 >> kv::kPageShift];
         const int page_offset0  = tile_k0 & (kPagedKVPageSize - 1);
         for (int key_l = cooperative_tid; key_l < Bc; key_l += cooperative_threads) {
             const int key = tile_k0 + key_l;
             if (key <= max_query_abs) {
-                const std::int64_t off = kv_cache_fp8_scale_index<Geometry>(physical_page, kv_head,
-                                                                                  page_offset0 + key_l);
-                k_scale_s[key_l]       = cache_k_scale[off];
+                const std::int64_t off = kv::Fp8RowLayout<Geometry::KVHeads>::scale_offset(
+                    physical_page, kv_head, page_offset0 + key_l);
+                k_scale_s[key_l] = cache_k_scale[off];
                 if constexpr (Values::kScaleItems == 1) {
                     v_scale_s[key_l] = cache_v_scale[off];
                 } else {
                     const auto v_off =
-                        paged_kv_element_offset<Values::kScaleItems, Geometry::KVHeads>(
+                        kv::page_major_offset<Values::kScaleItems, Geometry::KVHeads>(
                             physical_page, kv_head, page_offset0 + key_l, 0);
                     cp_async<16>(v_scale_s + key_l * Values::kScaleItems, cache_v_scale + v_off);
                 }
@@ -138,7 +139,7 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void mxfp8_kv_tiled_mma_kernel(
     };
 
     auto issue_kv_codes = [&](int tile_k0, int cooperative_tid, int cooperative_threads) {
-        const int physical_page = block_table[tile_k0 >> kPagedKVPageShift];
+        const int physical_page = block_table[tile_k0 >> kv::kPageShift];
         const int page_offset0  = tile_k0 & (kPagedKVPageSize - 1);
 #pragma unroll 1
         for (int chunk = cooperative_tid; chunk < Bc * (D / 16); chunk += cooperative_threads) {
@@ -148,8 +149,8 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void mxfp8_kv_tiled_mma_kernel(
             const int key    = tile_k0 + key_l;
             std::uint8_t* kd = &k_fp8[(key_l * DB16 + causal_swizzle(key_l, dc * 8)) * 2];
             if (key <= max_query_abs) {
-                const std::int64_t off = kv_cache_fp8_code_index<Geometry>(physical_page, kv_head,
-                                                                           d, page_offset0 + key_l);
+                const std::int64_t off = kv::Fp8RowLayout<Geometry::KVHeads>::code_offset(
+                    physical_page, kv_head, d, page_offset0 + key_l);
                 cp_async<16, Cache::cg>(kd, &cache_k[off]);
                 if constexpr (Values::kCodeBytes == D)
                     cp_async<16, Cache::cg>(&v_codes[key_l * D + d], &cache_v[off]);
@@ -167,7 +168,7 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void mxfp8_kv_tiled_mma_kernel(
                 const int col = (chunk % (Values::kCodeBytes / 16)) * 16;
                 auto* dst     = v_codes + row * Values::kCodeBytes + col;
                 if (tile_k0 + row <= max_query_abs) {
-                    const auto off = paged_kv_element_offset<Values::kCodeBytes, Geometry::KVHeads>(
+                    const auto off = kv::page_major_offset<Values::kCodeBytes, Geometry::KVHeads>(
                         physical_page, kv_head, page_offset0 + row, col);
                     cp_async<16, Cache::cg>(dst, cache_v + off);
                 } else {

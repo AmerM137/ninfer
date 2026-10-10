@@ -1,5 +1,8 @@
 #pragma once
 
+#include "ops/kv_cache/kernels/hadamard.cuh"
+
+
 #include "core/device.h"
 #include "ops/softmax_attention/common/causal_epilogue.cuh"
 #include "ops/softmax_attention/common/causal_operands.h"
@@ -43,7 +46,7 @@ __launch_bounds__(256) __global__
     const float inverse = denominator > 0.0F ? __frcp_rn(denominator) : 0.0F;
 #pragma unroll
     for (float& value : values) value *= inverse;
-    if constexpr (InverseRotation) normalized_hadamard_d256_inplace(values, lane);
+    if constexpr (InverseRotation) kv::normalized_hadamard_d256_inplace(values, lane);
 #pragma unroll
     for (int i = 0; i < 8; ++i)
         causal_store_output(out + causal_q_index<G>(head, lane + i * 32, token), values[i]);

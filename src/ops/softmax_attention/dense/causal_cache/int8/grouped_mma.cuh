@@ -1,6 +1,8 @@
 #pragma once
+#include "ops/common/quant/integer.cuh"
+#include "ops/kv_cache/kernels/hadamard.cuh"
+#include "ops/kv_cache/kernels/layout.cuh"
 #include "ops/softmax_attention/dense/causal_cache/int8/tile_io.cuh"
-
 #include "ops/softmax_attention/dense/causal_cache/int8/schedule.cuh"
 #include "ops/softmax_attention/common/causal_partition.h"
 #include "ops/softmax_attention/common/causal_epilogue.cuh"
@@ -35,8 +37,8 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     constexpr int D                    = 256;
     constexpr int DB16                 = D / 2;
     constexpr int Threads              = Wc * 32;
-    constexpr int Groups               = kKVCacheInt8Groups;
-    constexpr int GroupKc              = kKVCacheInt8Group / 32;
+    constexpr int Groups               = kv::kInt8Groups;
+    constexpr int GroupKc              = kv::kInt8Group / 32;
     constexpr int QKKs                 = D / 32;
     constexpr int QKNt                 = Bc / 8;
     constexpr int ConsumerWarpsPerTile = Wc / RowTiles;
@@ -138,12 +140,12 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
             const int grp      = pair - token * Groups;
             const int position = pos[token];
             if (position < split_start || position >= split_end) { continue; }
-            const int d0            = grp * kKVCacheInt8Group + lane;
+            const int d0            = grp * kv::kInt8Group + lane;
             const int d1            = d0 + 32;
             const std::int64_t src0 = causal_new_index<Geometry>(kv_head, d0, token);
             const std::int64_t src1 = causal_new_index<Geometry>(kv_head, d1, token);
             float k_h64[2] = {__bfloat162float(input.k[src0]), __bfloat162float(input.k[src1])};
-            hadamard_d64_fragment_inplace(k_h64, lane);
+            kv::hadamard_d64_fragment_inplace(k_h64, lane);
             k_h64_s[token * D + d0] = k_h64[0];
             k_h64_s[token * D + d1] = k_h64[1];
         }
@@ -154,9 +156,9 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
             const int grp      = pair - token * Groups;
             const int position = pos[token];
             if (position < split_start || position >= split_end) { continue; }
-            const int physical_page = block_table[position >> kPagedKVPageShift];
-            const int page_offset   = position & kPagedKVPageMask;
-            const int d0            = grp * kKVCacheInt8Group + lane;
+            const int physical_page = block_table[position >> kv::kPageShift];
+            const int page_offset   = position & kv::kPageMask;
+            const int d0            = grp * kv::kInt8Group + lane;
             const int d1            = d0 + 32;
             const std::int64_t src0 = causal_new_index<Geometry>(kv_head, d0, token);
             const std::int64_t src1 = causal_new_index<Geometry>(kv_head, d1, token);
@@ -166,10 +168,11 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
             for (int half = 0; half < 2; ++half) {
                 const int dh   = lane + half * 32;
                 const float x0 = k_h64_s[token * D + dh];
-                const float x1 = k_h64_s[token * D + kKVCacheInt8Group + dh];
-                const float x2 = k_h64_s[token * D + 2 * kKVCacheInt8Group + dh];
-                const float x3 = k_h64_s[token * D + 3 * kKVCacheInt8Group + dh];
-                k_out[half]    = normalized_hadamard_d256_group_value_from_h64(x0, x1, x2, x3, grp);
+                const float x1 = k_h64_s[token * D + kv::kInt8Group + dh];
+                const float x2 = k_h64_s[token * D + 2 * kv::kInt8Group + dh];
+                const float x3 = k_h64_s[token * D + 3 * kv::kInt8Group + dh];
+                k_out[half] =
+                    kv::normalized_hadamard_d256_group_value_from_h64(x0, x1, x2, x3, grp);
             }
 
             const float kv0    = k_out[0];
@@ -180,22 +183,22 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
             float vamax        = fmaxf(fabsf(vv0), fabsf(vv1));
             kamax              = warp_max(kamax, FullMask);
             vamax              = warp_max(vamax, FullMask);
-            const auto k_quant = kv_cache_int8_quant_params(kamax);
-            const auto v_quant = kv_cache_int8_quant_params(vamax);
-            cache_k_i8[kv_cache_int8_quant_code_index<Geometry>(physical_page, kv_head, d0,
-                                                                page_offset)] =
-                kv_cache_int8_quant_code(kv0, k_quant.inverse_scale);
-            cache_k_i8[kv_cache_int8_quant_code_index<Geometry>(physical_page, kv_head, d1,
-                                                                page_offset)] =
-                kv_cache_int8_quant_code(kv1, k_quant.inverse_scale);
-            cache_v_i8[kv_cache_int8_quant_code_index<Geometry>(physical_page, kv_head, d0,
-                                                                page_offset)] =
-                kv_cache_int8_quant_code(vv0, v_quant.inverse_scale);
-            cache_v_i8[kv_cache_int8_quant_code_index<Geometry>(physical_page, kv_head, d1,
-                                                                page_offset)] =
-                kv_cache_int8_quant_code(vv1, v_quant.inverse_scale);
+            const auto k_quant = common::int8_fp16_scale(kamax);
+            const auto v_quant = common::int8_fp16_scale(vamax);
+            cache_k_i8[kv::Int8G64Layout<Geometry::KVHeads>::code_offset(physical_page, kv_head, d0,
+                                                                         page_offset)] =
+                common::int8_quant_code(kv0, k_quant.inverse_scale);
+            cache_k_i8[kv::Int8G64Layout<Geometry::KVHeads>::code_offset(physical_page, kv_head, d1,
+                                                                         page_offset)] =
+                common::int8_quant_code(kv1, k_quant.inverse_scale);
+            cache_v_i8[kv::Int8G64Layout<Geometry::KVHeads>::code_offset(physical_page, kv_head, d0,
+                                                                         page_offset)] =
+                common::int8_quant_code(vv0, v_quant.inverse_scale);
+            cache_v_i8[kv::Int8G64Layout<Geometry::KVHeads>::code_offset(physical_page, kv_head, d1,
+                                                                         page_offset)] =
+                common::int8_quant_code(vv1, v_quant.inverse_scale);
             if (lane == 0) {
-                const std::int64_t so = kv_cache_int8_quant_scale_index<Geometry>(
+                const std::int64_t so = kv::Int8G64Layout<Geometry::KVHeads>::scale_offset(
                     physical_page, kv_head, grp, page_offset);
                 cache_k_scale[so] = k_quant.scale;
                 cache_v_scale[so] = v_quant.scale;
@@ -220,11 +223,11 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
                               ? __bfloat162float(q[causal_q_index<Geometry>(q_head, d, token)])
                               : 0.0f;
         }
-        normalized_hadamard_d256_inplace(q_values, lane);
+        kv::normalized_hadamard_d256_inplace(q_values, lane);
 
 #pragma unroll
         for (int grp = 0; grp < Groups; ++grp) {
-            const int d0    = grp * kKVCacheInt8Group + lane;
+            const int d0    = grp * kv::kInt8Group + lane;
             const int d1    = d0 + 32;
             const float x0  = q_values[2 * grp];
             const float x1  = q_values[2 * grp + 1];
@@ -232,8 +235,8 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
             amax            = warp_max(amax, FullMask);
             const float qs  = amax > 0.0f ? amax / 127.0f : 0.0f;
             const float inv = qs > 0.0f ? 1.0f / qs : 0.0f;
-            causal_store_query_code(q_i8, row, d0, kv_cache_int8_quant_code(x0, inv));
-            causal_store_query_code(q_i8, row, d1, kv_cache_int8_quant_code(x1, inv));
+            causal_store_query_code(q_i8, row, d0, common::int8_quant_code(x0, inv));
+            causal_store_query_code(q_i8, row, d1, common::int8_quant_code(x1, inv));
             if (lane == 0) { q_scale_tmp[row * Groups + grp] = qs; }
         }
     }
@@ -281,8 +284,8 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
         for (int key_l = tid; key_l < Bc; key_l += Threads) {
             const int key = tile_k0 + key_l;
             if (key >= split_start && key < split_end) {
-                const std::int64_t off = kv_cache_int8_quant_scale_index<Geometry>(
-                    physical_page, kv_head, 0, key & kPagedKVPageMask);
+                const std::int64_t off = kv::Int8G64Layout<Geometry::KVHeads>::scale_offset(
+                    physical_page, kv_head, 0, key & kv::kPageMask);
                 ninfer::ops::cp_async<8>(&k_scale_s[key_l * Groups], &cache_k_scale[off]);
                 ninfer::ops::cp_async<8>(&v_scale_s[key_l * Groups], &cache_v_scale[off]);
             } else {
@@ -297,8 +300,8 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
             const int d     = dc * 16;
             const int key   = tile_k0 + key_l;
             if (key >= split_start && key < split_end) {
-                const std::int64_t off = kv_cache_int8_quant_code_index<Geometry>(
-                    physical_page, kv_head, d, key & kPagedKVPageMask);
+                const std::int64_t off = kv::Int8G64Layout<Geometry::KVHeads>::code_offset(
+                    physical_page, kv_head, d, key & kv::kPageMask);
                 std::int8_t* dst = &k_i8[key_l * D + causal_swizzle(key_l, dc * 8) * 2];
                 ninfer::ops::cp_async<16>(dst, &cache_k_i8[off]);
                 ninfer::ops::cp_async<16>(&v_i8[key_l * D + d], &cache_v_i8[off]);
@@ -311,7 +314,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
         ninfer::ops::cp_commit();
     };
 
-    int physical_page = block_table[first_tile >> kPagedKVPageShift];
+    int physical_page = block_table[first_tile >> kv::kPageShift];
     issue_kv_tile(first_tile, physical_page);
     ninfer::ops::cp_wait<0>();
     __syncthreads();
@@ -493,8 +496,8 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
         const bool has_next = kb + 1 < key_blocks;
         if (has_next) {
             const int next_k0 = k0 + Bc;
-            if ((next_k0 & kPagedKVPageMask) == 0) {
-                physical_page = block_table[next_k0 >> kPagedKVPageShift];
+            if ((next_k0 & kv::kPageMask) == 0) {
+                physical_page = block_table[next_k0 >> kv::kPageShift];
             }
             issue_kv_tile(next_k0, physical_page);
         }

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ops/kv_cache/kernels/layout.cuh"
 #include "core/device.h"
 #include "ops/softmax_attention/dense/causal_cache/int8/grouped_mma.cuh"
 #include "ops/softmax_attention/dense/causal_cache/int8/tiled_mma.cuh"
@@ -59,13 +60,13 @@ void launch_int8_kv_tiled_mma(const CausalAttentionOperands& p, Int8KvReadView c
         CUDA_CHECK(cudaGetLastError());
     };
     if (!cache.table_rows)
-        invoke(PagedKVDirectMetadata{cache.tables});
+        invoke(kv::DirectMetadata{cache.tables});
     else if (cache.valid_columns)
-        invoke(PagedKVBatchMetadata<true>{cache.tables, cache.valid_columns, cache.table_rows,
-                                          cache.table_stride});
+        invoke(kv::BatchMetadata<true>{cache.tables, cache.valid_columns, cache.table_rows,
+                                       cache.table_stride});
     else
-        invoke(PagedKVBatchMetadata<false>{cache.tables, nullptr, cache.table_rows,
-                                           cache.table_stride});
+        invoke(
+            kv::BatchMetadata<false>{cache.tables, nullptr, cache.table_rows, cache.table_stride});
 }
 
 } // namespace ninfer::ops::detail

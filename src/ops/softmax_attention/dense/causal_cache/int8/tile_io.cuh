@@ -1,11 +1,9 @@
 #pragma once
 #include "ops/softmax_attention/common/causal_tile_io.cuh"
-
 #include "ops/common/math.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/common/warp.cuh"
-#include "ops/kernel/paged_kv_address.cuh"
-#include "ops/kv_cache/int8_g64_codec.cuh"
+#include "ops/common/quant/integer.cuh"
 #include "ops/softmax_attention/dense/causal_cache/int8/operands.h"
 
 namespace ninfer::ops::detail {

@@ -1,9 +1,9 @@
 #pragma once
 
 #include "ninfer/types.h"
-#include "ops/kv_cache/fp8_e4m3_row_codec.cuh"
-#include "ops/kv_cache/hadamard_d256.cuh"
-#include "ops/kv_cache/nvfp4_group16_codec.cuh"
+#include "ops/common/quant/fp8.cuh"
+#include "ops/kv_cache/kernels/hadamard.cuh"
+#include "ops/common/quant/nvfp4.cuh"
 #include "ops/softmax_attention/common/causal_tile_io.cuh"
 #include "ops/softmax_attention/qsa/sparse_gqa_arguments.cuh"
 
@@ -76,7 +76,7 @@ __device__ __forceinline__ int4 sparse_gqa_expand(const std::uint8_t* data,
             return result;
         }
     } else if constexpr (format == KvCacheStorage::Nvfp4Group16 && Vector) {
-        return kv_cache_nvfp4_dequant_f16x8(data + d / 2, scales[d / 16]);
+        return common::nvfp4_dequant_f16x8(data + d / 2, scales[d / 16]);
     } else if constexpr ((format == KvCacheStorage::Fp8E4M3Row256 ||
                           format == KvCacheStorage::Int8Group64) &&
                          Vector) {
@@ -89,7 +89,7 @@ __device__ __forceinline__ int4 sparse_gqa_expand(const std::uint8_t* data,
             __half2 value;
             if constexpr (format == KvCacheStorage::Fp8E4M3Row256) {
                 const auto* codes = reinterpret_cast<const std::uint16_t*>(&packed);
-                value             = kv_cache_fp8_dequant_code2_to_half2(codes[i], scale);
+                value             = common::fp8_dequant_code2_to_half2(codes[i], scale);
             } else {
                 // Offset-binary bytes become exact halves 1024 + (code + 128). Subtracting
                 // 1152 recovers signed INT8 without scalar integer-to-float conversions.
@@ -131,7 +131,7 @@ __device__ void sparse_gqa_prepare_query(const SparseGqaArguments& a, std::int64
                 for (int i = 0; i < 8; ++i)
                     values[i] =
                         __bfloat162float(a.query[(q * 24 + head * 12 + h) * 256 + lane + 32 * i]);
-                normalized_hadamard_d256_inplace(values, lane);
+                kv::normalized_hadamard_d256_inplace(values, lane);
             }
 #pragma unroll
             for (int i = 0; i < 8; ++i)

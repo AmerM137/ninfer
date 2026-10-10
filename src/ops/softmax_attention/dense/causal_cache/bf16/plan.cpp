@@ -67,4 +67,8 @@ std::size_t bf16_kv_workspace_bytes(int heads, int batch, int min_width, int max
     return maximum;
 }
 
+kv::PagedWriteInstance select_bf16_kv_write(int heads) {
+    return heads == 4 ? kv::PagedWriteInstance::Copy128 : kv::PagedWriteInstance::Copy96;
+}
+
 } // namespace ninfer::ops::detail

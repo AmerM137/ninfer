@@ -1,4 +1,7 @@
 #pragma once
+#include "ops/common/quant/nvfp4.cuh"
+#include "ops/kv_cache/kernels/hadamard.cuh"
+#include "ops/kv_cache/kernels/layout.cuh"
 #include "ops/softmax_attention/dense/causal_cache/nvfp4/tile_io.cuh"
 #include "ops/common/mbarrier.cuh"
 #include "ops/softmax_attention/dense/causal_cache/nvfp4/schedule.cuh"
@@ -20,26 +23,26 @@ nvfp4_kv_decode_tile(__half* destination, const std::uint8_t* cache,
                      int tile_k0, int max_query_abs, int producer_tid) {
     constexpr int D               = 256;
     constexpr int Bc              = Schedule::kKeyRows;
-    constexpr int GroupsPerTile   = Bc * kKVCacheNvfp4Groups;
+    constexpr int GroupsPerTile   = Bc * kv::kNvfp4Groups;
     constexpr int ProducerThreads = Schedule::kProducerThreads;
-    const int physical_page       = block_table[tile_k0 >> kPagedKVPageShift];
-    const int page_offset0        = tile_k0 & kPagedKVPageMask;
+    const int physical_page       = block_table[tile_k0 >> kv::kPageShift];
+    const int page_offset0        = tile_k0 & kv::kPageMask;
 
 #pragma unroll 1
     for (int task = producer_tid; task < GroupsPerTile; task += ProducerThreads) {
-        const int key_l   = task / kKVCacheNvfp4Groups;
-        const int group   = task - key_l * kKVCacheNvfp4Groups;
-        const int d       = group * kKVCacheNvfp4Group;
+        const int key_l   = task / kv::kNvfp4Groups;
+        const int group   = task - key_l * kv::kNvfp4Groups;
+        const int d       = group * kv::kNvfp4Group;
         const int key     = tile_k0 + key_l;
         __half* target_lo = destination + key_l * D + causal_swizzle(key_l, d);
         __half* target_hi = destination + key_l * D + causal_swizzle(key_l, d + 8);
         if (key <= max_query_abs) {
-            const std::int64_t code_offset = kv_cache_nvfp4_code_index<Geometry>(
+            const std::int64_t code_offset = kv::Nvfp4G16Layout<Geometry::KVHeads>::code_offset(
                 physical_page, kv_head, d, page_offset0 + key_l);
-            const std::int64_t scale_offset = kv_cache_nvfp4_scale_index<Geometry>(
+            const std::int64_t scale_offset = kv::Nvfp4G16Layout<Geometry::KVHeads>::scale_offset(
                 physical_page, kv_head, group, page_offset0 + key_l);
             const auto represented =
-                kv_cache_nvfp4_dequant_f16x16(cache + code_offset, cache_scale[scale_offset]);
+                common::nvfp4_dequant_f16x16(cache + code_offset, cache_scale[scale_offset]);
             store_vec(target_lo, represented.lo);
             store_vec(target_hi, represented.hi);
         } else {
@@ -109,7 +112,7 @@ __global__ __launch_bounds__(Schedule::kThreads, 1) void nvfp4_kv_tiled_mma_kern
                               ? __bfloat162float(q[causal_q_index<Geometry>(q_head, d, q0 + row)])
                               : 0.0F;
         }
-        normalized_hadamard_d256_inplace(values, lane);
+        kv::normalized_hadamard_d256_inplace(values, lane);
 #pragma unroll
         for (int r = 0; r < 8; ++r) {
             const int d                             = lane + 32 * r;

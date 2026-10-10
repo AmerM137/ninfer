@@ -1,4 +1,7 @@
 #pragma once
+#include "ops/kv_cache/kernels/hadamard.cuh"
+
+
 #include "ops/softmax_attention/qsa/sparse_gqa_kernel.cuh"
 
 namespace ninfer::ops::detail::qsa {
@@ -19,7 +22,7 @@ __launch_bounds__(Warps * 32) __global__ void sparse_gqa_simt_kernel(SparseGqaAr
         const int d = kSparseQuantized<Storage> ? lane + 32 * i : lane * 8 + i;
         query[i]    = __bfloat162float(a.query[(q * 24 + head) * 256 + d]);
     }
-    if constexpr (kSparseQuantized<Storage>) normalized_hadamard_d256_inplace(query, lane);
+    if constexpr (kSparseQuantized<Storage>) kv::normalized_hadamard_d256_inplace(query, lane);
     const auto table = a.tables + std::int64_t(a.table_rows[q / a.tokens]) * a.table_stride;
     for (int j = start + warp; j < end; j += Warps) {
         const int ordinal  = j / 4;

@@ -1,7 +1,7 @@
 #pragma once
 
 #include "ops/softmax_attention/common/causal_tile_io.cuh"
-#include "ops/kv_cache/hadamard_d256.cuh"
+#include "ops/kv_cache/kernels/hadamard.cuh"
 
 namespace ninfer::ops::detail {
 
@@ -28,7 +28,7 @@ causal_store_inverse_rotated_row(const float* row, __nv_bfloat16* out, int head,
     float values[8];
 #pragma unroll
     for (int r = 0; r < 8; ++r) values[r] = row[lane + 32 * r];
-    normalized_hadamard_d256_inplace(values, lane);
+    kv::normalized_hadamard_d256_inplace(values, lane);
 #pragma unroll
     for (int r = 0; r < 8; ++r)
         causal_store_output(out + causal_q_index<G>(head, lane + 32 * r, token), values[r]);

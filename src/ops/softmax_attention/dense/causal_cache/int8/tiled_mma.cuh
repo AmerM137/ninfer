@@ -1,6 +1,8 @@
 #pragma once
+#include "ops/common/quant/integer.cuh"
+#include "ops/kv_cache/kernels/hadamard.cuh"
+#include "ops/kv_cache/kernels/layout.cuh"
 #include "ops/softmax_attention/dense/causal_cache/int8/tile_io.cuh"
-
 #include "ops/softmax_attention/dense/causal_cache/int8/schedule.cuh"
 #include "ops/softmax_attention/common/causal_epilogue.cuh"
 #include "ops/softmax_attention/common/causal_softmax.cuh"
@@ -19,7 +21,7 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void int8_kv_tiled_mma_kernel(
     constexpr int Bc            = Schedule::kKeyRows;
     constexpr int DB16          = 128;
     constexpr int Groups        = 4;
-    constexpr int GroupKc       = kKVCacheInt8Group / 32;
+    constexpr int GroupKc       = kv::kInt8Group / 32;
     constexpr int QKNt          = Bc / 8;
     constexpr int PVNtPerWarp   = D / (Schedule::kDConsumers * 8);
     constexpr int PVKs          = Bc / 16;
@@ -80,11 +82,11 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void int8_kv_tiled_mma_kernel(
                 q_values[r] = __bfloat162float(q[causal_q_index<Geometry>(q_head, d, q0 + row)]);
             }
         }
-        normalized_hadamard_d256_inplace(q_values, lane);
+        kv::normalized_hadamard_d256_inplace(q_values, lane);
 
 #pragma unroll
         for (int grp = 0; grp < Groups; ++grp) {
-            const int d0    = grp * kKVCacheInt8Group + lane;
+            const int d0    = grp * kv::kInt8Group + lane;
             const int d1    = d0 + 32;
             const float x0  = q_values[2 * grp];
             const float x1  = q_values[2 * grp + 1];
@@ -92,22 +94,22 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void int8_kv_tiled_mma_kernel(
             absmax          = warp_max(absmax, FullMask);
             const float qs  = absmax > 0.0f ? absmax / 127.0f : 0.0f;
             const float inv = qs > 0.0f ? 1.0f / qs : 0.0f;
-            causal_store_query_code(q_i8, row, d0, kv_cache_int8_quant_code(x0, inv));
-            causal_store_query_code(q_i8, row, d1, kv_cache_int8_quant_code(x1, inv));
+            causal_store_query_code(q_i8, row, d0, common::int8_quant_code(x0, inv));
+            causal_store_query_code(q_i8, row, d1, common::int8_quant_code(x1, inv));
             if (lane == 0) { q_scale[row * Groups + grp] = qs; }
         }
     }
     __syncthreads();
 
     auto issue_kv_tile = [&](int tile_k0) {
-        const int physical_page = block_table[tile_k0 >> kPagedKVPageShift];
+        const int physical_page = block_table[tile_k0 >> kv::kPageShift];
         for (int key_l = tid; key_l < Bc; key_l += Schedule::kThreads) {
             const int key = tile_k0 + key_l;
             __half* kd    = &k_scale_s[key_l * Groups];
             __half* vd    = &v_scale_s[key_l * Groups];
             if (key <= max_query_abs) {
-                const std::int64_t off = kv_cache_int8_quant_scale_index<Geometry>(
-                    physical_page, kv_head, 0, key & kPagedKVPageMask);
+                const std::int64_t off = kv::Int8G64Layout<Geometry::KVHeads>::scale_offset(
+                    physical_page, kv_head, 0, key & kv::kPageMask);
                 ninfer::ops::cp_async<8>(kd, &cache_k_scale[off]);
                 ninfer::ops::cp_async<8>(vd, &cache_v_scale[off]);
             } else {
@@ -124,8 +126,8 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void int8_kv_tiled_mma_kernel(
             std::int8_t* kd = &k_i8[(key_l * DB16 + causal_swizzle(key_l, dc * 8)) * 2];
             std::int8_t* vd = &v_i8[key_l * D + d];
             if (key <= max_query_abs) {
-                const std::int64_t off = kv_cache_int8_quant_code_index<Geometry>(
-                    physical_page, kv_head, d, key & kPagedKVPageMask);
+                const std::int64_t off = kv::Int8G64Layout<Geometry::KVHeads>::code_offset(
+                    physical_page, kv_head, d, key & kv::kPageMask);
                 cp_async<16, Cache::cg>(kd, &cache_k[off]);
                 cp_async<16, Cache::cg>(vd, &cache_v[off]);
             } else {

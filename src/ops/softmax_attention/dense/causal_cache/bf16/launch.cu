@@ -1,7 +1,6 @@
 #include "ops/softmax_attention/dense/causal_cache/bf16/launch.h"
 #include "ops/softmax_attention/dense/causal_cache/bf16/template_launch.cuh"
 #include "ops/softmax_attention/dense/causal_cache/bf16/plan.h"
-#include "ops/kv_cache/append/launch.h"
 
 namespace ninfer::ops::detail {
 namespace {
@@ -90,7 +89,8 @@ void bf16_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor& v,
     const auto plan           = make_bf16_kv_causal_plan(q.ne[1], q.ne[2], q.ne[3], envelope,
                                                          execution.multiprocessor_count);
     if (!plan.grouped()) {
-        kv_cache_append_batch_launch(k, v, positions, valid_columns, table_rows, cache, stream);
+        kv::launch_paged_write(select_bf16_kv_write(k.ne[1]), k, v, positions, valid_columns,
+                               table_rows, cache, stream);
         tiled(make_causal_operands(q, positions, out, scale, envelope.max_visible_keys),
               bf16_kv_cache_view<false>(cache, &valid_columns, &table_rows), plan, stream);
     } else {

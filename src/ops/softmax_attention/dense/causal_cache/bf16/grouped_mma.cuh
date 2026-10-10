@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ops/kv_cache/kernels/layout.cuh"
 #include "ops/softmax_attention/dense/causal_cache/bf16/epilogue.cuh"
 #include "ops/softmax_attention/common/bf16_softmax.cuh"
 #include "ops/softmax_attention/dense/causal_cache/bf16/split_policy.h"
@@ -12,7 +13,7 @@ bf16_kv_load_grouped_tile(__nv_bfloat16* key_tile, __half* value_tile, const __n
                           const __half* values, Input input, int page, int head, int begin, int end,
                           int first_position, int tid) {
     constexpr int D       = G::kHeadDim;
-    const auto cache_base = bf16_kv_cache_index<G>(page, head, 0, begin & kPagedKVPageMask);
+    const auto cache_base = bf16_kv_cache_index<G>(page, head, 0, begin & kv::kPageMask);
     // Small query tiles need enough outstanding loads to hide memory latency.
 #pragma unroll 1
     for (int i = tid; i < S::kKeyRows * (D / 8); i += S::kThreads) {
@@ -110,8 +111,8 @@ __launch_bounds__(S::kLaunchBoundThreads, S::kMinBlocks) __global__
                 const int token = i / (D / 8), d = i % (D / 8) * 8, key = positions[token];
                 if (key >= start && key < stop) {
                     const auto src = causal_new_index<G>(head, d, token);
-                    const auto dst = bf16_kv_cache_index<G>(table[key >> kPagedKVPageShift], head,
-                                                            d, key & kPagedKVPageMask);
+                    const auto dst = bf16_kv_cache_index<G>(table[key >> kv::kPageShift], head, d,
+                                                            key & kv::kPageMask);
                     store_vec(cache_k + dst, load_vec<int4>(input.k + src));
                     store_vec(cache_v + dst,
                               bf16x8_bits_to_f16x8_bits(load_vec<int4>(input.v + src)));
@@ -156,7 +157,7 @@ __launch_bounds__(S::kLaunchBoundThreads, S::kMinBlocks) __global__
                          tokens[1] < live ? positions[tokens[1]] : -1};
     int page_window = -Storage::kPageWindow;
     for (int k0 = start; k0 < end; k0 += N) {
-        const int logical_page = k0 >> kPagedKVPageShift;
+        const int logical_page = k0 >> kv::kPageShift;
         if (logical_page >= page_window + Storage::kPageWindow) {
             page_window = logical_page;
             const int page_count =

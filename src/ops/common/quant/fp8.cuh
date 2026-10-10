@@ -8,6 +8,8 @@
 
 namespace ninfer::ops::common {
 
+inline constexpr float kFp8E4M3MaxFinite = 448.0F;
+
 __device__ __forceinline__ unsigned fp8_e4m3x2_to_bf16x2_bits(unsigned packed) {
 #if __CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 2)
     // PTX 9.2 exposes the native pair widening on the project's sm_120a target.
@@ -52,7 +54,7 @@ struct Fp8Fp16Scale {
 
 __device__ __forceinline__ Fp8Fp16Scale fp8_fp16_scale(float absmax) {
     if (absmax == 0.0F) { return {.scale = __float2half_rn(0.0F), .inverse_scale = 0.0F}; }
-    const float raw_scale         = absmax / 448.0F;
+    const float raw_scale         = absmax / kFp8E4M3MaxFinite;
     const float bounded           = fminf(65504.0F, fmaxf(0x1p-24F, raw_scale));
     const __half scale            = __float2half_rn(bounded);
     const float represented_scale = __half2float(scale);

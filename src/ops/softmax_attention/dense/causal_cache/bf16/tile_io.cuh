@@ -1,10 +1,9 @@
 #pragma once
 #include "ops/softmax_attention/common/causal_tile_io.cuh"
-
 #include "ops/common/math.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/common/warp.cuh"
-#include "ops/kernel/paged_kv_address.cuh"
+#include "ops/kv_cache/kernels/layout.cuh"
 #include "ops/softmax_attention/dense/causal_cache/bf16/schedule.cuh"
 #include "ops/softmax_attention/dense/causal_cache/bf16/operands.h"
 
@@ -12,7 +11,7 @@ namespace ninfer::ops::detail {
 
 template <class G>
 __device__ __forceinline__ std::int64_t bf16_kv_cache_index(int page, int head, int d, int offset) {
-    return paged_kv_element_offset<G::kHeadDim, G::KVHeads>(page, head, offset, d);
+    return kv::page_major_offset<G::kHeadDim, G::KVHeads>(page, head, offset, d);
 }
 
 // Stage one [Bc, D] K or V tile from the per-kv-head contiguous cache into the
@@ -30,8 +29,8 @@ __device__ __forceinline__ void bf16_kv_stage_tile(Element* dst, const Element* 
     const bool full_tile    = (k0 + Bc - 1) <= max_query_abs;
     // Block base pointer computed once (int64); per-element offsets stay 32-bit.
     const Element* cache_block =
-        cache + paged_kv_element_offset<Geometry::kHeadDim, Geometry::KVHeads>(
-                    physical_page, kv_head, k0 & kPagedKVPageMask, 0);
+        cache + kv::page_major_offset<Geometry::kHeadDim, Geometry::KVHeads>(physical_page, kv_head,
+                                                                             k0 & kv::kPageMask, 0);
     if (full_tile) {
 #pragma unroll
         for (int chunk = tid; chunk < Bc * VecPerRow; chunk += Threads) {

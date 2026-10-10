@@ -1,6 +1,6 @@
 #pragma once
 
-#include "ops/kv_cache/hadamard_d256.cuh"
+#include "ops/kv_cache/kernels/hadamard.cuh"
 #include "ops/softmax_attention/common/causal_tile_io.cuh"
 #include "ops/softmax_attention/qsa/sparse_gqa_arguments.cuh"
 
@@ -21,7 +21,7 @@ __device__ __forceinline__ void sparse_gqa_store(const SparseGqaArguments& a, st
 __device__ __forceinline__ void sparse_gqa_inverse_gate(const SparseGqaArguments& a, std::int64_t q,
                                                         int h, float (&values)[8]) {
     const int lane = threadIdx.x % 32;
-    normalized_hadamard_d256_inplace(values, lane);
+    kv::normalized_hadamard_d256_inplace(values, lane);
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
         const auto index = (q * 24 + h) * 256 + lane + 32 * i;

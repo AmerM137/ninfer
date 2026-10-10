@@ -1,10 +1,10 @@
 #pragma once
 
 #include "ninfer/types.h"
-#include "ops/kv_cache/fp8_e4m3_row_codec.cuh"
-#include "ops/kv_cache/hadamard_d256.cuh"
-#include "ops/kv_cache/int8_g64_codec.cuh"
-#include "ops/kv_cache/nvfp4_group16_codec.cuh"
+#include "ops/common/quant/fp8.cuh"
+#include "ops/kv_cache/kernels/hadamard.cuh"
+#include "ops/common/quant/integer.cuh"
+#include "ops/common/quant/nvfp4.cuh"
 #include "ops/softmax_attention/qsa/norm_rope.cuh"
 #include "ops/softmax_attention/qsa/prepare_arguments.cuh"
 
@@ -17,9 +17,9 @@ __device__ __forceinline__ void store_int8(const float (&values)[8], std::uint8_
 #pragma unroll
     for (int group = 0; group < 4; ++group) {
         const float x0 = values[2 * group], x1 = values[2 * group + 1];
-        const auto quant = kv_cache_int8_quant_params(warp_max(fmaxf(fabsf(x0), fabsf(x1))));
-        codes[group * 64 + lane]      = kv_cache_int8_quant_code(x0, quant.inverse_scale);
-        codes[group * 64 + lane + 32] = kv_cache_int8_quant_code(x1, quant.inverse_scale);
+        const auto quant         = common::int8_fp16_scale(warp_max(fmaxf(fabsf(x0), fabsf(x1))));
+        codes[group * 64 + lane] = common::int8_quant_code(x0, quant.inverse_scale);
+        codes[group * 64 + lane + 32] = common::int8_quant_code(x1, quant.inverse_scale);
         if (lane == 0) out_scales[group] = quant.scale;
     }
 }
@@ -29,10 +29,10 @@ __device__ __forceinline__ void store_fp8(const float (&values)[8], std::uint8_t
     float absmax = 0;
 #pragma unroll
     for (float value : values) absmax = fmaxf(absmax, fabsf(value));
-    const auto quant = kv_cache_fp8_quant_params(warp_max(absmax));
+    const auto quant = common::fp8_fp16_scale(warp_max(absmax));
 #pragma unroll
     for (int j = 0; j < 8; ++j)
-        codes[lane + 32 * j] = kv_cache_fp8_quant_code(values[j], quant.inverse_scale);
+        codes[lane + 32 * j] = common::fp8_quant_code(values[j], quant.inverse_scale);
     if (lane == 0) *reinterpret_cast<__half*>(scales) = quant.scale;
 }
 
@@ -42,7 +42,7 @@ __device__ __forceinline__ void store_nvfp4(const float (&values)[8], std::uint8
     for (int j = 0; j < 8; ++j) scratch[lane + 32 * j] = values[j];
     __syncwarp();
     if (lane < 16) {
-        const auto encoded = kv_cache_nvfp4_quantize_group16(scratch + 16 * lane);
+        const auto encoded = common::quantize_nvfp4_group16_f32(scratch + 16 * lane);
         auto* out          = codes + 8 * lane;
         if (reinterpret_cast<std::uintptr_t>(out) % 8 == 0)
             *reinterpret_cast<uint2*>(out) = make_uint2(encoded.codes_lo, encoded.codes_hi);
@@ -96,7 +96,7 @@ __device__ __forceinline__ void prepare_kv(const PrepareArguments& a, int head, 
         for (int j = 0; j < 8; ++j) values[j] = __bfloat162float(raw_key[lane + 32 * j]);
         norm_rotate<256>(values, a.wk, a.epsilon, sc, lane);
         // The transformed FP32 key enters the codec directly, without a BF16 intermediate.
-        normalized_hadamard_d256_inplace(values, lane);
+        kv::normalized_hadamard_d256_inplace(values, lane);
         constexpr auto key_storage =
             Storage == KvCacheStorage::Fp8KeyNvfp4Value ? KvCacheStorage::Fp8E4M3Row256 : Storage;
         constexpr auto value_storage =
@@ -106,7 +106,7 @@ __device__ __forceinline__ void prepare_kv(const PrepareArguments& a, int head, 
 #pragma unroll
         for (int j = 0; j < 8; ++j) values[j] = __bfloat162float(raw_value[lane + 32 * j]);
         if constexpr (value_storage == KvCacheStorage::Nvfp4Group16)
-            normalized_hadamard_d256_inplace(values, lane);
+            kv::normalized_hadamard_d256_inplace(values, lane);
         store_quantized<value_storage>(values, value, a.value_scales.at(p % 64, head, page), lane,
                                        scratch);
     }

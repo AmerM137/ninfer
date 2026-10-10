@@ -7,7 +7,6 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/launcher/speculative_round.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/prepare_ragged_prefix.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/prepare_masked_block.cu"
-  "${CMAKE_CURRENT_LIST_DIR}/launcher/rope.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/sampling.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/target_logprobs.cu"
   "${CMAKE_CURRENT_LIST_DIR}/wrapper/argmax.cpp"
@@ -17,7 +16,6 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/wrapper/speculative_round.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/wrapper/prepare_ragged_prefix.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/wrapper/prepare_masked_block.cpp"
-  "${CMAKE_CURRENT_LIST_DIR}/wrapper/rope.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/wrapper/sampling.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/wrapper/target_logprobs.cpp"
 )

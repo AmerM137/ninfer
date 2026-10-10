@@ -1,7 +1,7 @@
 #include "ninfer/ops/kv_cache_append.h"
-
 #include "core/paged_kv_storage.h"
-#include "ops/kv_cache/append/launch.h"
+#include "ops/common/host/operands.h"
+#include "ops/kv_cache/append/dispatch.h"
 
 #include <cstdint>
 #include <limits>
@@ -88,16 +88,15 @@ std::uint32_t validate_full_cache(const PagedKVLayerView& cache, std::int32_t kv
 
 void require_vector_aligned(const Tensor& tensor, const char* name) {
     require_contiguous_nonnull(tensor, kPrefixAppendOp, name);
-    if ((reinterpret_cast<std::uintptr_t>(tensor.data) & 15u) != 0u) {
+    if (!common::operand::aligned(tensor.data, 16)) {
         throw std::invalid_argument("kv_cache_append_prefix: " + std::string(name) +
                                     " must be 16-byte aligned");
     }
 }
 
-detail::KVCacheAppendPrefixPlan validate_inputs(const Tensor& k, const Tensor& v,
-                                                const Tensor& positions, const Tensor& counts,
-                                                const Tensor& selectors,
-                                                KVCacheAppendPrefixExecutionEnvelope envelope) {
+void validate_inputs(const Tensor& k, const Tensor& v, const Tensor& positions,
+                     const Tensor& counts, const Tensor& selectors,
+                     KVCacheAppendPrefixExecutionEnvelope envelope) {
     if (k.dtype != DType::BF16 || v.dtype != DType::BF16) {
         throw std::invalid_argument("kv_cache_append_prefix: k/v must be BF16");
     }
@@ -122,7 +121,10 @@ detail::KVCacheAppendPrefixPlan validate_inputs(const Tensor& k, const Tensor& v
     require_contiguous_nonnull(positions, kPrefixAppendOp, "positions");
     require_contiguous_nonnull(counts, kPrefixAppendOp, "counts");
     require_contiguous_nonnull(selectors, kPrefixAppendOp, "selectors");
-    return detail::kv_cache_append_prefix_resolve_plan(tokens, envelope);
+    if (envelope.min_count > envelope.max_count ||
+        envelope.max_count > static_cast<std::uint32_t>(tokens)) {
+        throw std::invalid_argument("kv_cache_append_prefix: invalid execution envelope");
+    }
 }
 
 void validate_paged_cache(const PagedKVBatchLayerView& cache,
@@ -198,31 +200,27 @@ void kv_cache_append(const Tensor& k, const Tensor& v, const Tensor& positions,
     if (static_cast<std::uint32_t>(tokens) > capacity) {
         throw std::invalid_argument("kv_cache_append: T exceeds cache capacity");
     }
-    if (cache.storage == KvCacheStorage::Fp8KeyNvfp4Value) {
-        detail::kv_cache_append_k8v4_launch(k, v, positions, cache, stream);
-    } else if (cache.storage == KvCacheStorage::Nvfp4Group16) {
-        detail::kv_cache_append_nvfp4_launch(k, v, positions, cache, stream);
-    } else {
-        detail::kv_cache_append_launch(k, v, positions, cache, stream);
-    }
+    detail::kv_cache_append_dispatch(k, v, positions, cache, stream);
 }
 
 void kv_cache_append_prefix(const Tensor& k, const Tensor& v, const Tensor& positions,
                             const Tensor& counts, const Tensor& table_rows,
                             KVCacheAppendPrefixExecutionEnvelope envelope,
                             PagedKVBatchLayerView cache, cudaStream_t stream) {
-    const auto plan = validate_inputs(k, v, positions, counts, table_rows, envelope);
+    validate_inputs(k, v, positions, counts, table_rows, envelope);
     validate_paged_cache(cache, envelope);
-    detail::kv_cache_append_prefix_launch(k, v, positions, counts, table_rows, cache, plan, stream);
+    detail::kv_cache_append_prefix_dispatch(k, v, positions, counts, table_rows, cache, envelope,
+                                            stream);
 }
 
 void kv_cache_append_prefix(const Tensor& k, const Tensor& v, const Tensor& positions,
                             const Tensor& counts, const Tensor& lanes,
                             KVCacheAppendPrefixExecutionEnvelope envelope,
                             CyclicKVCacheLayerView cache, cudaStream_t stream) {
-    const auto plan = validate_inputs(k, v, positions, counts, lanes, envelope);
+    validate_inputs(k, v, positions, counts, lanes, envelope);
     validate_cyclic_cache(cache, envelope);
-    detail::kv_cache_append_prefix_launch(k, v, positions, counts, lanes, cache, plan, stream);
+    detail::kv_cache_append_prefix_dispatch(k, v, positions, counts, lanes, cache, envelope,
+                                            stream);
 }
 
 } // namespace ninfer::ops

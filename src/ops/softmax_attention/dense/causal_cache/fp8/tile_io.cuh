@@ -1,11 +1,9 @@
 #pragma once
 #include "ops/softmax_attention/common/causal_tile_io.cuh"
-
 #include "ops/common/math.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/common/warp.cuh"
-#include "ops/kernel/paged_kv_address.cuh"
-#include "ops/kv_cache/fp8_e4m3_row_codec.cuh"
+#include "ops/common/quant/fp8.cuh"
 #include "ops/softmax_attention/dense/causal_cache/fp8/operands.h"
 
 namespace ninfer::ops::detail {
@@ -16,7 +14,7 @@ __device__ __forceinline__ int4 fp8_kv_dequant_f16x8(const std::uint8_t* codes, 
     unsigned packed[4];
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
-        const __half2 value2 = kv_cache_fp8_dequant_code2_to_half2(c[i], scale);
+        const __half2 value2 = common::fp8_dequant_code2_to_half2(c[i], scale);
         packed[i]            = *reinterpret_cast<const unsigned*>(&value2);
     }
     return make_int4(static_cast<int>(packed[0]), static_cast<int>(packed[1]),

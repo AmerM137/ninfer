@@ -3,7 +3,6 @@
 #include "ops/softmax_attention/dense/causal_cache/fp8/plan.h"
 #include "ops/softmax_attention/dense/causal_cache/fp8/template_launch.cuh"
 #include "ops/softmax_attention/dense/causal_cache/fp8/tiled_launch.h"
-#include "ops/kv_cache/append/launch.h"
 
 namespace ninfer::ops::detail {
 namespace {
@@ -116,7 +115,8 @@ void fp8_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor& v,
     const auto plan           = make_fp8_kv_causal_plan(q.ne[1], q.ne[2], q.ne[3], envelope,
                                                         execution.multiprocessor_count);
     if (plan.family != Fp8KvFamily::Grouped) {
-        kv_cache_append_batch_launch(k, v, positions, valid, rows, cache, stream);
+        kv::launch_paged_write(select_fp8_kv_write(k.ne[1], k.ne[2], k.ne[3]), k, v, positions,
+                               valid, rows, cache, stream);
         const auto p = make_causal_operands(q, positions, out, scale, envelope.max_visible_keys);
         const auto view =
             make_quantized_causal_cache_view<Fp8KvCacheView<false>>(cache, &valid, &rows);
