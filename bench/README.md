@@ -118,7 +118,7 @@ of at least two. Warmups use the same mixture and compile constraints before mea
 time. Per-request phase rates remain separate from this aggregate throughput.
 
 The benchmark disables context retention because every repetition is an independent root request.
-Schema v16 records `speculative_backend`, `draft_tokens`, and the proposal head independently;
+Reports record `speculative_backend`, `draft_tokens`, and the proposal head independently;
 JSON and CSV identify DFlash2 explicitly. MTP alone reserves its extra lookahead KV margin.
 
 ## Context-cost calibration
@@ -290,16 +290,9 @@ percentages and the DRAM memory floor. Multiple calls are for timing and cannot 
 `--profile`, which always captures one complete public call.
 
 Every ordinary sample is cold-cache: a 256 MiB L2 eviction read completes before the timed
-interval. Reported effective bandwidth uses the encoded weight planes once, one BF16 activation
-read, and one BF16 output write. Reported FLOPs are the mathematical `2*N*K*T`; neither metric
-copies route-private tile, replay, padding, split, schedule, host-launcher, or kernel-instance
-behavior. The fixed RTX 5090 memory reference is `1792 GB/s` DRAM bandwidth. Tensor Core utilization
-is reported only for registered shape/policy/extent combinations with a known MMA profile; the
-activation policy alone does not identify that profile. MXFP8 with FP32 accumulation uses the
-`838 TFLOP/s` dense reference. `READ_%` additionally compares the same one-read model
-bytes with the measured `1674.5 GB/s` pure-read ceiling from `tools/hbm_bandwidth_probe.cu`; it is
-the practical utilization measure for read-dominated points. Physical traffic and instruction
-utilization still require NCU.
+interval. [Linear measurement rules](../docs/maintainer/linear-tuning.md#5-logical-metrics) define
+byte/FLOP accounting, hardware references, timing conditions and suite expansion. Physical traffic
+and instruction utilization require profiler evidence.
 
 ## LinearTopK Op benchmark
 

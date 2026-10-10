@@ -36,44 +36,16 @@ nvcc -O3 -std=c++17 -arch=sm_120a tools/hbm_bandwidth_probe.cu \
 
 ## Artifact workflow
 
-The common converter reads selected local sources and writes a `.ninfer` artifact plus its
-`.conversion.json` report. These examples include the optional weights used by the official
-artifacts. The input paths are placeholders for local checkpoint checkouts:
-
-```bash
-python3 -m tools.convert \
-  --model /path/to/Qwen3.6-27B \
-  --recipe qwen3_6_27b --components text,vision,mtp --proposal \
-  --resource chat_template.jinja=tools/chat_templates/qwen3_6.jinja \
-  --name qwen3.6-27b \
-  --out out/qwen3_6_27b.ninfer
-
-python3 -m tools.convert \
-  --model /path/to/Qwen3.8-27B \
-  --recipe qwen3_8_27b --components text,vision,mtp,dflash2 --proposal \
-  --source dflash2=/path/to/Qwen3.8-27B-DFlash2 \
-  --resource chat_template.jinja=tools/chat_templates/qwen3_8.jinja \
-  --name qwen3.8-27b \
-  --out out/qwen3_8_27b.ninfer
-
-python3 -m tools.convert \
-  --model /path/to/Qwen3.6-35B-A3B-base \
-  --recipe qwen3_6_35b_a3b --components text,vision,mtp,dflash --proposal \
-  --source dflash=/path/to/Qwen3.6-35B-A3B-DFlash \
-  --resource chat_template.jinja=tools/chat_templates/qwen3_6.jinja \
-  --name qwen3.6-35b-a3b \
-  --out out/qwen3_6_35b_a3b.ninfer
-```
-
-Inspect a result:
+The [conversion guide](../docs/weight-conversion.md) owns commands for official/custom recipes,
+mixed sources, optional components, resources and sharding. The converter writes a `.ninfer`
+artifact plus its `.conversion.json` report. Inspect a result with:
 
 ```bash
 python3 -m tools.artifact.inspect out/qwen3_6_27b.ninfer --objects
 ```
 
-Recipes, mixed sources, custom methods, resources and sharding are described in the
-[conversion guide](../docs/weight-conversion.md). Numeric formats, layouts and framing are defined
-by the references linked from the [documentation map](../docs/README.md).
+Numeric formats, layouts and framing are defined by the references in the
+[documentation map](../docs/README.md).
 
 ## Benchmark orchestration
 

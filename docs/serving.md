@@ -1202,7 +1202,8 @@ a following compatible turn can reuse it. Output-limit and context-capacity fini
 `length`/ `max_tokens`; ordinary model or string stops map to `stop`/ `end_turn`.
 
 Function tools are rendered into the model prompt and generated calls are parsed into protocol
-responses. NInfer does not execute tools or enforce tool-argument schemas through constrained decoding.
+responses. NInfer does not execute tools. Tool framing and argument constraints follow the
+[Tool constraints](#tool-constraints) contract.
 
 Prompt-token usage includes chat-template and expanded media tokens. Generated-token usage comes
 from accepted output token IDs, including a stop token whose decoded text may be withheld.

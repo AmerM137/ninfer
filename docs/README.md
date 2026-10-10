@@ -16,15 +16,8 @@ run the CLI or HTTP server.
 
 The executable `--help` output is the exact source for command-line option spelling and defaults.
 
-## Model artifacts
-
-| Model | Weights | Download | Versioned model card source |
-|---|---|---|---|
-| Qwen3.6-27B | `groupwise-int` | [Hugging Face](https://huggingface.co/neroued/Qwen3.6-27B-NInfer) | [model card](../model-cards/Qwen3.6-27B-NInfer/README.md) |
-| Qwen3.6-27B | `nvfp4` | [Hugging Face](https://huggingface.co/neroued/Qwen3.6-27B-nvfp4-NInfer) | [model card](../model-cards/Qwen3.6-27B-nvfp4-NInfer/README.md) |
-| Qwen3.8-27B | `groupwise-int` | [Hugging Face](https://huggingface.co/neroued/Qwen3.8-27B-NInfer) | [model card](../model-cards/Qwen3.8-27B-NInfer/README.md) |
-| Qwen3.8-27B | `nvfp4` | [Hugging Face](https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer) | [model card](../model-cards/Qwen3.8-27B-nvfp4-NInfer/README.md) |
-| Qwen3.6-35B-A3B | `groupwise-int` | [Hugging Face](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer) | [model card](../model-cards/Qwen3.6-35B-A3B-NInfer/README.md) |
+Published artifact downloads are listed in the [project README](../README.md).
+[Versioned model cards](../model-cards/) own each artifact's identity, provenance and evaluation results.
 
 ## Repository-local guides
 
@@ -45,7 +38,6 @@ other references own narrower contracts:
 | Document | Responsibility |
 |---|---|
 | [Engine architecture](maintainer/engine-architecture.md) | model/config/weight ownership, loading-to-execution flow, requests, scheduling, transactions and graphs |
-| [Expert weight cache design](maintainer/expert-weight-cache.md) | planned Qwen3.5-35B-A3B loading modes, complete Host backing for offload, GPU replica storage, whole-layer prefill and CPU/GPU decode |
 | [Build system](maintainer/build-system.md) | CMake targets, explicit source ownership, CUDA compilation boundaries, presets and developer configuration |
 | [Artifact container](maintainer/artifact-container.md) | v3 directory, objects, logical bindings, Uses, resources and file framing/sharding |
 | [Numeric formats](maintainer/tensor-formats.md) | represented values, codes/scales, conversion arithmetic and numerical interpretation |
@@ -58,36 +50,23 @@ other references own narrower contracts:
 | [ReplaySSM GDN](maintainer/replayssm-gdn.md) | raw transition records and faithful commitment of the verified state prefix |
 | [Op development](maintainer/op-development.md) | semantic boundaries, source ownership, numerical qualification and performance evidence |
 | [Operational logging](maintainer/logging.md) | log ownership, presentation, severity and data policy |
-| [Linear benchmark](maintainer/linear-benchmark.md) | pure Linear measurement, metrics and suites |
-| [Linear tuning and reports](maintainer/linear-tuning.md) | tuning ranges, priority points, dispatch tradeoffs and final performance report format |
+| [Linear tuning and measurement](maintainer/linear-tuning.md) | logical metrics, timing, tuning ranges, dispatch tradeoffs and performance reports |
 
 Model cards contain official artifact facts and source provenance. The
 [conversion guide](weight-conversion.md) is the entry point for making an artifact. Exact config
 fields, parameter expansion and native supported domains are maintained by the code linked from
 these references.
 
-## Planned Qwen4Exp support
+## Planned work
 
-Qwen3.8-Flash-Next is a Qwen4Exp checkpoint. Start with the support plan for shared conventions,
-weight decisions and current progress, then read the relevant execution design. The model is not
-yet integrated into the Engine; the converter is implemented and its 20 pure Linear problems
-are supported and qualified. A1 sigmoid-gated RMSNorm and A2 BF16 `[96,2560]` control projection
-and A3/A4 HC expansion, grouped norm, residual combination and block/final Mix are implemented and mathematically
-qualified. Their current contracts live in
-[rmsnorm.h](../include/ninfer/ops/rmsnorm.h),
-[gdn_control.h](../include/ninfer/ops/gdn_control.h), and
-[gated_residual.h](../include/ninfer/ops/gated_residual.h). Proposed storage and remaining Op interfaces
-stay in these design documents until implemented; the support plan tracks remaining layer/model
-integration.
+Qwen3.8-Flash-Next uses the Qwen4Exp architecture. Its converter and many supporting Ops are
+implemented; Engine integration remains pending. The execution design owns the current support
+status and remaining requirements. Concrete Op contracts live in `include/ninfer/ops/`.
 
 | Design | Responsibility |
 |---|---|
-| [Support plan and model weights](maintainer/qwen3_8-flash-next-model.md) | entry point, architecture, quantization, merged matrices, artifact/residency, cross-Op handoffs and remaining work |
-| [Weight conversion](maintainer/qwen3_8-flash-next-converter.md) | source mapping, logical bindings, ModelOpt import, NF4/MTP encoding, artifact writing and the local command |
-| [Main workspace tasks](maintainer/qwen3_8-flash-next-main-tasks.md) | implementation order, shared storage/state/I/O work, secondary-workspace dependencies and the PLE header plan |
-| [Independent Op tasks](maintainer/qwen3_8-flash-next-independent-ops.md) | completed A1/A2/A3 scope, remaining tasks in two batches, fixed PLE interfaces, file ownership and integration boundaries |
-| [HC / Gated Residual](maintainer/qwen3_8-flash-next-hc.md) | grouped normalization, mixing, residual fusion, interfaces and Main/MTP boundary features |
-| [GDN](maintainer/qwen3_8-flash-next-gdn.md) | full layer flow, projection/convolution/control extensions, sigmoid output gating and ReplaySSM integration |
-| [QSA](maintainer/qwen3_8-flash-next-qsa.md) | preparation, indexer, sparse GQA, selection, candidate records and tail state |
-| [Shared KV page extension](maintainer/qwen3_8-flash-next-paged-kv.md) | planned plane row spans, capacity, coverage, COW and offload; current storage remains in the stable Paged KV reference |
-| [PLE](maintainer/qwen3_8-flash-next-ple.md) | NF4 SSD binding, async row reads, prefetch, gated convolution, HC handoff and accepted-prefix state |
+| [Qwen4Exp model and weights](maintainer/qwen4_exp-model.md) | architecture, quantization, merged matrices, source binding and residency budgets |
+| [Qwen4Exp execution and state](maintainer/qwen4_exp-execution.md) | layer flow, cross-Op handoffs, transactions, state lifetime and remaining integration |
+| [Qwen4Exp PLE I/O](maintainer/qwen4_exp-ple-io.md) | exact Host lookup, cold backing, bounded async reads, H2D and cancellation |
+| [Expert weight cache](maintainer/expert-weight-cache.md) | planned Qwen3.5-35B-A3B Host backing, GPU replicas, prefill and CPU/GPU decode |
+| [Linear test maintenance](maintainer/linear-test-reorganization-plan.md) | pending consolidation of test runners and explicit case contracts |

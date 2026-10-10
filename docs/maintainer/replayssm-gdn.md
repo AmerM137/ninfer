@@ -16,7 +16,8 @@ state；它只记录驱动状态转移的 raw inputs。最终接受长度确定�
 bitwise clone 的条件、causal-conv history，以及当前 Qwen3.5 模型实例的空间与计算特征。
 
 Record/Fold 的实现与合同见 [`gdn_replay.h`](../../include/ninfer/ops/gdn_replay.h) 和
-[`replay.cpp`](../../src/ops/linear_attention/gated_delta_net/replay.cpp)。模型配置决定 layer/head
+[`record.cpp`](../../src/ops/linear_attention/gated_delta_net/replay/record.cpp)、
+[`fold.cpp`](../../src/ops/linear_attention/gated_delta_net/replay/fold.cpp)。模型配置决定 layer/head
 数量，Program 按启用的 MTP、DFlash 或 DFlash2 窗口预留 record capacity。
 
 ---

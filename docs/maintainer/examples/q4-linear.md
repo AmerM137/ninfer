@@ -29,7 +29,7 @@
 ## 逻辑带宽与 Tensor Core 利用率
 
 权重包含 `6144 × 5120 / 64 × 34 = 16,711,680` 字节的 code 和 scale。
-沿用 [Linear bench 指标定义](../linear-benchmark.md#5-数学工作量与-route-neutral-指标)：
+沿用 [Linear 指标定义](../linear-tuning.md#5-logical-metrics)：
 
 ```text
 model_bytes = 16,711,680 + 2 × 5120 × T + 2 × 6144 × T

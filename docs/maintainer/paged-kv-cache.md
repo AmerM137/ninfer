@@ -14,7 +14,7 @@ Device/Host replicas、address spaces、reservations、block tables 和 GPU cons
 Growing KV 使用一组启动时固定的 homogeneous pools。每个 pool：
 
 - 存储具有同一 frontier 和 lifetime 的全部 planes；
-- 使用固定的 token page size、plane order 和 page-group count；
+- 使用固定的原 token page size、plane order、各 plane 行跨度和 page-group count；
 - 拥有独立的 physical page-ID namespace 与 free capacity；
 - 为每条 active sequence 提供一个 logical address space；
 - 由 consumer 通过 block table 直接寻址。
@@ -40,6 +40,9 @@ KV 架构区分：
 
 Page boundary 不是 Attention mask boundary，也不是 prefix hit boundary。一个 valid frontier 可以位于 page
 内部任意 offset。
+
+各 plane 的物理行密度由 `KVPlaneGeometry::tokens_per_row` 单独描述：一行可覆盖 1 或 4 个原 token。
+它不改变 allocation、frontier 或 checkpoint 的原 token 域；有效行数按第 4 节从 coverage 推导。
 
 KV Store 可以在任意 token frontier 表示、truncate 或保护 prefix；这不证明模型可以从该位置恢复。
 可复用 frontier 必须同时存在完整 StateImage 与 target-defined backend state，具体规则见
@@ -83,6 +86,8 @@ FP8-E4M3FN-row256，V 固定为 NVFP4-G16。
 `PagedKVStorageLayout` 将选定的 closed profile 解析为 K/V data/scale plane schema；target planner 按
 layer 展开该 schema 并确定 plane ordinal。Common pool implementation 仍只接收已展开的
 `KVPageGeometry`、plane inventory 和 capacity，不解释 storage mode。
+上述 Qwen3.5 K/V data 与 scale planes 均使用 `tokens_per_row=1`；通用存储层同时支持第 4 节的
+四-token 行几何，具体 plane 的数学含义与消费支持由模型和 Op 定义。
 
 ### 3.2 Main capacity
 
@@ -219,23 +224,31 @@ Physical IDs 可以任意排列。Allocator 可以优先返回连续 IDs 改善 
 和 kernel launch topology 不依赖连续性。固定大小 page groups 不产生 variable-size external
 fragmentation，也不需要 Device compaction。
 
-### 4.3 Closed Device plane orders
+### 4.3 Plane 行跨度与 Device order
 
-所有 registered growing pools 使用 \(P=64\)，并选择两种 closed orders 之一。
+Device pool 使用原 token 页跨度 \(P=64\)。每个 `KVPlaneGeometry` 独立给出 dtype、leading extent
+\(X\)、head extent \(H\)、alignment 和 `tokens_per_row` \(s\)，物理行数为 \(R=P/s\)。
+当前接纳以下组合：
 
-Main Text 与 MTP 使用 page-major：
+| \(s\) | 每页行数 \(R\) | Device order |
+|---:|---:|---|
+| 1 | 64 | PageMajor 或 HeadMajor |
+| 4 | 16 | PageMajor |
+
+`kv_plane_rows_per_page()` 为 Device 与 Host 规划提供同一检查：\(s\) 只能为 1 或 4，
+\(P\) 必须为正且能被 \(s\) 整除，\(R\) 必须能表示为正的 Tensor extent；四-token 行要求 PageMajor。
+dtype、\(X\)、\(H\) 和 alignment 仍是各 plane 的存储事实，\(X\)、\(H\) 必须为正。
+行跨度不表示 feature 轴的量化 group size；同一 token 的 K/V code 与 scale 各占一行。
+行跨度参与 geometry 相等性和 Host layout 选择；Device backing 的实际 shape 必须与该 geometry 一致。
+
+两种 closed orders 为：
 
 \[
-[X,P,H,N_{physical}]
+PageMajor:[X,R,H,N_{physical}],\qquad HeadMajor:[X,R,N_{physical},H]
 \]
 
-DFlash Full 使用 head-major page run：
-
-\[
-[X,P,N_{physical},H]
-\]
-
-其中：
+Main Text 与 MTP 的 K/V planes 使用 PageMajor；DFlash Full 使用 HeadMajor。
+对这些现有 K/V profiles，\(s=1\)，其中：
 
 - \(X=D\) 表示 K/V 或 quantized code plane；
 - INT8-G64 scale plane 使用 \(X=D/64\)；
@@ -247,22 +260,25 @@ DFlash Full 使用 head-major page run：
 对 logical position \(p\)：
 
 \[
-b=\lfloor p/P\rfloor,\qquad o=p\bmod P,\qquad g=block\_table[b]
+b=\lfloor p/P\rfloor,\qquad o=p\bmod P,\qquad r=\lfloor o/s\rfloor,\qquad g=block\_table[b]
 \]
+
+\(r\) 定位包含该原位置的物理行；该行是否完整且可读仍由第 4.4 节的 coverage 决定。
 
 Page-major 地址为：
 
 \[
-address=base+d\,nb_0+o\,nb_1+h\,nb_2+g\,nb_3
+address=base+d\,nb_0+r\,nb_1+h\,nb_2+g\,nb_3
 \]
 
 Head-major 地址为：
 
 \[
-address=base+d\,nb_0+o\,nb_1+g\,nb_2+h\,nb_3
+address=base+d\,nb_0+r\,nb_1+g\,nb_2+h\,nb_3
 \]
 
-Code 与 scale planes 使用同一个 \(g\)，但使用各自 Tensor 的 leading coordinate 和 strides。
+所有 grouped planes 使用同一个 \(g\)，但使用各自的行跨度、leading coordinate 和 Tensor strides。
+Feature 轴连续，地址和容量计算使用能覆盖完整 Tensor span 的整数类型。
 Exact persistent codec 由 [`kv_cache_append.h`](../../include/ninfer/ops/kv_cache_append.h) 定义，
 consumer arithmetic 由 [`softmax_attention.h`](../../include/ninfer/ops/softmax_attention.h) 定义；
 allocator 只解释 plane bytes、order 和 page-group identity。
@@ -291,16 +307,38 @@ logical block b covers positions [b*P, (b+1)*P)
 
 RoPE、MRoPE、Vision axes 和 `rope_delta` 是 Attention input metadata，不改变 KV slot ownership。
 
-### 4.5 Page payload
-
-一个 pool 的 logical page-group payload 为：
+对于已提交前沿 \(F\)，逻辑页 \(b\) 内的有效原 token 数为：
 
 \[
-PageBytes=\sum_{plane} PlaneBytesPerToken\cdot P
+c=\operatorname{clamp}(F-bP,0,P)
+\]
+
+跨度为 \(s\) 的 plane 只有行 \([0,\lfloor c/s\rfloor)\) 完整有效；行 \(r\) 对应原位置
+\([bP+rs,bP+(r+1)s)\)。例如 \(c=5,s=4\) 时只有第一行有效，第五个 token 不会提前发布第二行。
+所有 planes 共用同一原 token coverage，不维护独立行前沿。Consumer 还须遵守各自的因果读域，
+不能把物理行存在或 chunk 末端的 coverage 当作每个 query 的可见范围。
+
+尚未形成完整行的模型状态由其 StateImage 合同保存；页组本身不能替代该状态。
+Provisional 写入或复制无效后缀字节均不扩大 committed coverage。
+
+### 4.5 Page payload
+
+各 plane 的完整页 payload 与 page-group payload 为：
+
+\[
+PlanePageBytes=sizeof(dtype)\,X\,H\,(P/s)
+\]
+
+\[
+PageBytes=\sum_{plane} PlanePageBytes
 \]
 
 Startup physical bytes 由各 plane slab 的完整 span 与 alignment 得到。不同 pools 的 `PageBytes` 可以不同，
-但一个 pool 内的所有 page groups 等价。
+但一个 pool 内的所有 page groups 等价。Device slab、Host packed offsets、传输字节和 capacity query
+均使用同一 plane geometry；不能将四-token plane 按 \(P\) 行计费。
+
+Host layout 将每个 plane 的起点按 256 B 对齐，末端按 256 B 对齐形成 `page_stride`。
+该 stride 用于 Host allocation；payload 字节不包含 plane 间和页末 padding。
 
 `P=64` 同时满足当前 32/64-key Attention tiles、128-token aligned prefill chunks、有限 block-table
 metadata 和 bounded tail slack。Prefix hit granularity不参与 page-size 选择。改变 page size、grouping
@@ -328,8 +366,9 @@ LogicalKVPage
 └── transaction pins
 ```
 
-一个 logical page 的 canonical content 由 `content epoch + committed columns` 标识。Speculative 或尚未
-提交的 bytes 不扩展 committed coverage。
+一个 logical page 的 canonical content 由 `content epoch + committed columns` 标识。
+Committed/protected columns 始终计原 token，跨度不同的 planes 由此推导有效行数。
+Speculative 或尚未提交的 bytes 不扩展 committed coverage。
 
 同一 logical page 在所有引用它的 address space 中保持相同页序号。Fork 和 view 按原位置共享
 前缀，COW 与增长创建新 logical page，截断只删除后缀；一个 address space 内也不重复引用同一页。
@@ -379,7 +418,9 @@ Host arena 是有界 variable-size allocator。State 与不同 KV layouts 竞争
 
 ### 5.4 Replica transfer
 
-D2H/H2D transfer 复制完整 page payload，可以把相邻 physical IDs 合并成更少的 transfer runs。
+Device COW 与 D2H/H2D transfer 复制页组的全部 plane payload，按各 plane 的实际行数、bytes 和
+offset 搬运原 words。不同密度的 plane 不单独分配、保留或回收。传输可以把相邻 physical IDs
+合并成更少的 transfer runs。
 Core 按已绑定的 plane geometry 选择 2D copy：短 PageMajor run 可以合并等宽、等间距的 planes，
 HeadMajor 可以选择 page 或 head 作为提交外层。只在减少调用数且 pitch 合法时使用合并路径；
 Host layout 与 payload 不变。Native 从 Core 返回值记录实际搬运字节和调用数。
@@ -642,10 +683,13 @@ PagedKVBatchLayerView
 logical_block = position >> 6
 page_offset   = position & 63
 physical_page = block_table[logical_block]
+plane_row     = page_offset / tokens_per_row
 ```
 
-随后使用 `4.3` 的 closed plane order计算元素地址。Batched consumer先用 `table_rows[b]` 选择 table row，
-再执行同一 translation。
+随后使用 `4.3` 的 closed plane order计算元素地址，并检查该 plane row 在有效完整行范围内。
+Batched consumer先用 `table_rows[b]` 选择 table row，再执行同一 translation。
+K/V views 的现有 codec planes 使用 `tokens_per_row=1`。其他密度的 plane 由对应 Op 的 typed view
+表达；storage geometry 本身不扩展 `PagedKVLayerView` 的数学合同。
 
 Wrapper 验证 Tensor dtype、geometry、closed strides、table shape和execution envelope。Caller 保证：
 
@@ -694,10 +738,11 @@ consumer，且 replay in-flight期间不得改写同一 row。
 
 1. 每个 Device page-group lease 在所属 pool 中至多承载一个 logical page replica。
 2. 同一 pool 只组合共享 frontier、lifetime、page size与allocation语义的planes。
-3. 一个 pool 的 K/V/code/scale planes 对同一 logical block 使用同一个 page-group ID。
+3. 一个 pool 的全部 planes 对同一 logical block 使用同一个 page-group ID，行密度不产生第二份页表。
 4. Device occupancy 按 allocated leases与reservations计数；logical aliases不重复计费。
 5. Logical page identity、content epoch与physical page ID彼此独立。
-6. Valid frontier精确到token；page boundary不改变Attention或checkpoint语义。
+6. Valid frontier精确到原 token；plane 有效完整行数为 floor(coverage/tokens_per_row)。
+   Page boundary不改变Attention或checkpoint语义。
 7. Published checkpoint所需coverage不可被writer覆盖；任一logical page至多一个writer。
 8. Shared full pages immutable；non-aligned writable tail先建立private COW page。
 9. Host/Device replacement在copy与epoch/coverage验证完成后才发布。

@@ -798,4 +798,4 @@ GPU microbenchmark 不代替 Engine 证据。阶段切换减少不等于 CPU ker
 
 其 NVFP4 per-expert divisors、activation Use、512/top-10、不同 H/I、BF16 shared 和 HC
 仍需各自的数学 consumer；不把它们塞进当前 Qwen3.5 精确几何 wrapper。
-参见 [Flash Next 权重方案](qwen3_8-flash-next-model.md)。
+参见 [Qwen4Exp 权重方案](qwen4_exp-model.md)。

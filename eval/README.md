@@ -163,33 +163,17 @@ only by each EvalScope request. The target and ordinary jobs use concurrency two
 at concurrency one so its 245,760-token output budget can accommodate the observed long tail. AIME
 uses 122,880 output tokens per request, while IFBench and both multimodal datasets use 65,536.
 
-The completed formal run recorded these scores (run directories `eval/runs/20260818T132336Z-c16a8902`
-and `eval/runs/20260818T223812Z-da6cdbce`):
-
-| Benchmark | Accuracy | Correct / total |
-|---|---:|---:|
-| IFBench (prompt-level strict) | 77.00% | 231 / 300 |
-| AIME 2025 | 96.67% | 29 / 30 |
-| AIME 2026 | 96.67% | 29 / 30 |
-| GPQA-Diamond | 90.40% | 179 / 198 |
-| ERQA | 66.25% | 265 / 400 |
-| RealWorldQA | 83.53% | 639 / 765 |
+The completed NVFP4 run used `eval/runs/20260818T132336Z-c16a8902` and
+`eval/runs/20260818T223812Z-da6cdbce`. Published scores and correct/total counts are maintained in
+the [NVFP4 model card](../model-cards/Qwen3.8-27B-nvfp4-NInfer/README.md#evaluation).
 
 The Qwen3.8-27B groupwise-int profile runs the same protocol through
 `eval/run_qwen3_8_27b_groupwise_reasoning.sh`. Its 16.96 GiB artifact leaves more GPU memory, so the
 text step uses the full 262,144-token context and both steps run at concurrency four (run
 directories `eval/runs/20260819T031655Z-078bd8e0` and `eval/runs/20260819T141750Z-531a236a`; the
 multimodal step was resumed with `ninfer_eval resume` after a local proxy change interrupted
-RealWorldQA at 618/765 samples):
-
-| Benchmark | Accuracy | Correct / total |
-|---|---:|---:|
-| IFBench (prompt-level strict) | 77.67% | 233 / 300 |
-| AIME 2025 | 96.67% | 29 / 30 |
-| AIME 2026 | 96.67% | 29 / 30 |
-| GPQA-Diamond | 87.37% | 173 / 198 |
-| ERQA | 66.25% | 265 / 400 |
-| RealWorldQA | 82.22% | 629 / 765 |
+RealWorldQA at 618/765 samples). Published scores and counts are maintained in the
+[groupwise-int model card](../model-cards/Qwen3.8-27B-NInfer/README.md#evaluation).
 
 Prepare and inspect Needle-in-a-Haystack without issuing model requests:
 

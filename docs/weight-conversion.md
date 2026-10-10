@@ -101,7 +101,7 @@ indexed proposal are not yet connected for this architecture. CUDA self-quantiza
 the SM120 encoder on first use and requires a CUDA toolkit, C++ compiler and Ninja.
 PLE uses two bounded passes per shard, with no full-table materialization. The complete recipe
 contains about 99.64 GiB of weight/control payload, split by the existing V3 writer.
-See the [model plan](maintainer/qwen3_8-flash-next-model.md) for exact layouts and precision.
+See the [model and weight contract](maintainer/qwen4_exp-model.md) for exact layouts and precision.
 
 ## Change part of a recipe
 
