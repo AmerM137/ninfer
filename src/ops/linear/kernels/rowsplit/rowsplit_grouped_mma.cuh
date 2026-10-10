@@ -1,12 +1,14 @@
 #pragma once
+#include "ops/common/quant/integer.cuh"
+#include "ops/common/numeric/math.h"
+#include "ops/common/cuda/pipeline.cuh"
+#include "ops/common/cuda/mma.cuh"
+#include "ops/common/cuda/memory.cuh"
 
 // Closed Q4/Q5 RowSplit grouped-MMA mechanism. Semantic Ops own the exact job
 // set, route plan, workspace, and fixed instantiations.
 
-#include "ops/common/math.h"
 #include "ops/linear/kernels/rowsplit/rowsplit_mma.cuh"
-#include "ops/linear/kernels/q4/q4_rowsplit_storage.cuh"
-#include "ops/linear/kernels/q5/q5_rowsplit_storage.cuh"
 #include "core/tensor.h"
 
 #include <cuda_bf16.h>
@@ -59,7 +61,7 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void rowsplit_groupe
     __shared__ __align__(16) std::uint8_t Hr[S][BM * HB];
     __shared__ __align__(16) std::uint8_t Sr[S][BM * SB];
 
-    const int tiles0 = div_up(job0.n, BM);
+    const int tiles0 = common::div_up(job0.n, BM);
     int tile         = static_cast<int>(blockIdx.x);
     RowSplitGroupedMmaJob job;
     if constexpr (Jobs == 2) {
@@ -70,8 +72,8 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void rowsplit_groupe
             job = job1;
         }
     } else {
-        const int tiles1 = div_up(job1.n, BM);
-        const int tiles2 = div_up(job2.n, BM);
+        const int tiles1 = common::div_up(job1.n, BM);
+        const int tiles2 = common::div_up(job2.n, BM);
         if (tile < tiles0) {
             job = job0;
         } else if ((tile -= tiles0) < tiles1) {
@@ -124,13 +126,13 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void rowsplit_groupe
             const int kl       = kg8 * 8;
             const int col      = t0 + tl;
             const int kk       = k0 + kl;
-            __nv_bfloat16* dst = &Bs[stage][tl * BK + gemm_swz64(tl, kl)];
+            __nv_bfloat16* dst = &Bs[stage][tl * BK + common::swizzle_xor_64(tl, kl)];
             if constexpr (FullTiles) {
                 gemm_cp_async<16, Cfg>(dst, &x[static_cast<std::int64_t>(col) * k + kk]);
             } else if (col < t && kk + 8 <= k) {
                 gemm_cp_async<16, Cfg>(dst, &x[static_cast<std::int64_t>(col) * k + kk]);
             } else {
-                store_vec(dst, make_int4(0, 0, 0, 0));
+                common::store_vec(dst, make_int4(0, 0, 0, 0));
             }
         }
     };
@@ -150,7 +152,7 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void rowsplit_groupe
                 const std::int64_t gi = static_cast<std::int64_t>(grow) * kg + g;
                 gemm_cp_async<16, Cfg>(dst, &job.codes[gi * 32 + half * 16]);
             } else {
-                store_vec(dst, make_int4(0, 0, 0, 0));
+                common::store_vec(dst, make_int4(0, 0, 0, 0));
             }
         }
         if constexpr (Codec == RowSplitGroupedMmaCodec::Q5) {
@@ -242,49 +244,51 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void rowsplit_groupe
             __nv_bfloat162 w;
             if constexpr (Codec == RowSplitGroupedMmaCodec::Q5) {
                 if constexpr (Cfg::SCALE_PAIR_LOAD) {
-                    w = Q5MmaDecodeAtom::decode_pair(Cr[stage], Hr[stage],
-                                                     &Sr[stage][row * SB + scale_off], row, lane);
+                    w = common::Q5MmaDecodeAtom::decode_pair(
+                        Cr[stage], Hr[stage], &Sr[stage][row * SB + scale_off], row, lane);
                 } else {
-                    w = Q5MmaDecodeAtom::decode_pair(Cr[stage], Hr[stage], &Sr[stage][row * SB],
-                                                     row, lane);
+                    w = common::Q5MmaDecodeAtom::decode_pair(Cr[stage], Hr[stage],
+                                                             &Sr[stage][row * SB], row, lane);
                 }
             } else if constexpr (Codec == RowSplitGroupedMmaCodec::Q4) {
                 if constexpr (Cfg::SCALE_PAIR_LOAD) {
-                    w = Q4MmaDecodeAtom::decode_pair(Cr[stage], &Sr[stage][row * SB + scale_off],
-                                                     row, lane);
+                    w = common::Q4MmaDecodeAtom::decode_pair(
+                        Cr[stage], &Sr[stage][row * SB + scale_off], row, lane);
                 } else {
-                    w = Q4MmaDecodeAtom::decode_pair(Cr[stage], &Sr[stage][row * SB], row, lane);
+                    w = common::Q4MmaDecodeAtom::decode_pair(Cr[stage], &Sr[stage][row * SB], row,
+                                                             lane);
                 }
             } else {
                 if (job.q5) {
                     if constexpr (Cfg::SCALE_PAIR_LOAD) {
-                        w = Q5MmaDecodeAtom::decode_pair(
+                        w = common::Q5MmaDecodeAtom::decode_pair(
                             Cr[stage], Hr[stage], &Sr[stage][row * SB + scale_off], row, lane);
                     } else {
-                        w = Q5MmaDecodeAtom::decode_pair(Cr[stage], Hr[stage], &Sr[stage][row * SB],
-                                                         row, lane);
+                        w = common::Q5MmaDecodeAtom::decode_pair(Cr[stage], Hr[stage],
+                                                                 &Sr[stage][row * SB], row, lane);
                     }
                 } else if constexpr (Cfg::SCALE_PAIR_LOAD) {
-                    w = Q4MmaDecodeAtom::decode_pair(Cr[stage], &Sr[stage][row * SB + scale_off],
-                                                     row, lane);
+                    w = common::Q4MmaDecodeAtom::decode_pair(
+                        Cr[stage], &Sr[stage][row * SB + scale_off], row, lane);
                 } else {
-                    w = Q4MmaDecodeAtom::decode_pair(Cr[stage], &Sr[stage][row * SB], row, lane);
+                    w = common::Q4MmaDecodeAtom::decode_pair(Cr[stage], &Sr[stage][row * SB], row,
+                                                             lane);
                 }
             }
-            const int sc = gemm_swz64(row, 2 * lane);
-            store_vec(&As[row * BK + sc], w);
+            const int sc = common::swizzle_xor_64(row, 2 * lane);
+            common::store_vec(&As[row * BK + sc], w);
         }
     };
 
 #pragma unroll
     for (int s = 0; s < S; ++s) {
         if (s < NKT) { stage_load(s, s); }
-        ninfer::ops::cp_commit();
+        common::cp_commit();
     }
 
     for (int it = 0; it < NKT; ++it) {
         const int stage = it % S;
-        ninfer::ops::cp_wait<S - 1>();
+        common::cp_wait<S - 1>();
         __syncthreads();
         dequant_to_As(stage, it);
         __syncthreads();
@@ -297,28 +301,33 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void rowsplit_groupe
 #pragma unroll
             for (int mi = 0; mi < MT; ++mi) {
                 const int arow = wm * WM + mi * 16 + a_rowoff;
-                ldmatrix_x4(af[mi][0], af[mi][1], af[mi][2], af[mi][3],
-                            smem_addr(&As[arow * BK + gemm_swz64(arow, ks + a_coloff)]));
+                common::ldmatrix_x4(
+                    af[mi][0], af[mi][1], af[mi][2], af[mi][3],
+                    common::smem_addr(
+                        &As[arow * BK + common::swizzle_xor_64(arow, ks + a_coloff)]));
             }
 #pragma unroll
             for (int ni = 0; ni < NT; ++ni) {
                 const int brow = wn * WN + ni * 8 + b_rin;
-                ldmatrix_x2(bf[ni][0], bf[ni][1],
-                            smem_addr(&Bs[stage][brow * BK + gemm_swz64(brow, ks + b_koff)]));
+                common::ldmatrix_x2(
+                    bf[ni][0], bf[ni][1],
+                    common::smem_addr(
+                        &Bs[stage][brow * BK + common::swizzle_xor_64(brow, ks + b_koff)]));
             }
 #pragma unroll
             for (int mi = 0; mi < MT; ++mi) {
 #pragma unroll
                 for (int ni = 0; ni < NT; ++ni) {
-                    mma_bf16(acc[mi][ni][0], acc[mi][ni][1], acc[mi][ni][2], acc[mi][ni][3],
-                             af[mi][0], af[mi][1], af[mi][2], af[mi][3], bf[ni][0], bf[ni][1]);
+                    common::mma_bf16(acc[mi][ni][0], acc[mi][ni][1], acc[mi][ni][2], acc[mi][ni][3],
+                                     af[mi][0], af[mi][1], af[mi][2], af[mi][3], bf[ni][0],
+                                     bf[ni][1]);
                 }
             }
         }
         __syncthreads();
         const int next = it + S;
         if (next < NKT) { stage_load(stage, next); }
-        ninfer::ops::cp_commit();
+        common::cp_commit();
     }
 
 #pragma unroll

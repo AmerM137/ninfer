@@ -1,6 +1,5 @@
 #pragma once
-
-#include "ops/common/mma.cuh"
+#include "ops/common/cuda/pipeline.cuh"
 
 #include <cuda_bf16.h>
 
@@ -49,14 +48,10 @@ struct GemmCfg {
 template <int Bytes, class Cfg>
 __device__ __forceinline__ void gemm_cp_async(void* dst, const void* src) {
     if constexpr (Cfg::CG_LOAD && Bytes == 16) {
-        cp_async<Bytes, Cache::cg>(dst, src);
+        common::cp_async<Bytes, Cache::cg>(dst, src);
     } else {
-        cp_async<Bytes>(dst, src);
+        common::cp_async<Bytes>(dst, src);
     }
-}
-
-__device__ __forceinline__ int gemm_swz64(int row, int col) {
-    return (((col >> 3) ^ (row & 7)) << 3) | (col & 7);
 }
 
 } // namespace ninfer::ops::detail

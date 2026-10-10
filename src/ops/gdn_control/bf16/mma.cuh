@@ -1,5 +1,7 @@
 #pragma once
 // BF16 control dots, optional input norm, and the complete control epilogue.
+#include "ops/common/cuda/memory.cuh"
+#include "ops/common/cuda/mma.cuh"
 #include "ops/common/math.cuh"
 #include "ops/linear/kernels/rowsplit/rowsplit_mma.cuh"
 #include "ops/common/warp.cuh"
@@ -28,7 +30,7 @@ struct MmaGeometry {
 };
 
 __device__ __forceinline__ int swizzle(int row, int col) {
-    return (col & ~63) + gemm_swz64(row, col & 63);
+    return (col & ~63) + common::swizzle_xor_64(row, col & 63);
 }
 
 template <class Geometry, int SplitK, bool FullTokens, int Warps, bool NormalizeInput = false,
@@ -198,7 +200,7 @@ __global__ __launch_bounds__(Warps * 32, 1) void mma_kernel(
             for (int ni = 0; ni < kNFragments; ++ni) {
                 const int xrow = warp * kWarpN + ni * 8 + x_rin;
                 const int xcol = ki * 16 + x_koff;
-                ldmatrix_x2(
+                common::ldmatrix_x2(
                     xf[ni][0], xf[ni][1],
                     smem_addr(
                         &xs[stage * kBlockN * kBlockK + xrow * kBlockK + swizzle(xrow, xcol)]));
@@ -209,19 +211,19 @@ __global__ __launch_bounds__(Warps * 32, 1) void mma_kernel(
                 const int arow         = mi * 16 + a_rowoff;
                 const int acol         = ki * 16 + a_coloff;
                 const int weight_stage = stage * kBlockM * kBlockK;
-                ldmatrix_x4(af[0], af[1], af[2], af[3],
+                common::ldmatrix_x4(af[0], af[1], af[2], af[3],
                             smem_addr(&aws[weight_stage + arow * kBlockK + swizzle(arow, acol)]));
                 if constexpr (Paired) {
-                    ldmatrix_x4(
+                    common::ldmatrix_x4(
                         bf[0], bf[1], bf[2], bf[3],
                         smem_addr(&bws[weight_stage + arow * kBlockK + swizzle(arow, acol)]));
                 }
 #pragma unroll
                 for (int ni = 0; ni < kNFragments; ++ni) {
-                    mma_bf16(a_acc[mi][ni][0], a_acc[mi][ni][1], a_acc[mi][ni][2], a_acc[mi][ni][3],
+                    common::mma_bf16(a_acc[mi][ni][0], a_acc[mi][ni][1], a_acc[mi][ni][2], a_acc[mi][ni][3],
                              af[0], af[1], af[2], af[3], xf[ni][0], xf[ni][1]);
                     if constexpr (Paired) {
-                        mma_bf16(b_acc[mi][ni][0], b_acc[mi][ni][1], b_acc[mi][ni][2],
+                        common::mma_bf16(b_acc[mi][ni][0], b_acc[mi][ni][1], b_acc[mi][ni][2],
                                  b_acc[mi][ni][3], bf[0], bf[1], bf[2], bf[3], xf[ni][0],
                                  xf[ni][1]);
                     }

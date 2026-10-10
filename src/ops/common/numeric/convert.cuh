@@ -29,8 +29,32 @@ struct alignas(Pairs* static_cast<int>(sizeof(__nv_bfloat162))) Bf16PairPack {
 using Bf16x4Pack = Bf16PairPack<2>;
 using Bf16x8Pack = Bf16PairPack<4>;
 
+union alignas(16) Bf16x8Bits {
+    uint4 raw;
+    __nv_bfloat162 pair[4];
+};
+
+static_assert(sizeof(Bf16x8Bits) == 16);
+
 static_assert(sizeof(Bf16x4Pack) == 8);
 static_assert(sizeof(Bf16x8Pack) == 16);
+
+// Exact widening of the two signed bytes in the low 16 bits.
+__device__ __forceinline__ unsigned int8x2_to_bf16x2_bits(unsigned values) {
+    union PairBits {
+        __nv_bfloat162 pair;
+        unsigned bits;
+    };
+
+    PairBits biased;
+    biased.bits          = __byte_perm(values, 0x43004300u, 0x7150) & 0xff7fff7fu;
+    const unsigned signs = (values & 0x80u) | ((values & 0x8000u) << 8);
+    PairBits bias;
+    bias.bits = 0x43004300u | signs;
+    PairBits result;
+    result.pair = __hsub2_rn(biased.pair, bias.pair);
+    return result.bits;
+}
 
 __device__ __forceinline__ std::uint32_t pack_bf16x2(float lo, float hi) {
     std::uint32_t out;

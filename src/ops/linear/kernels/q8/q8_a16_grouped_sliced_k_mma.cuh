@@ -1,4 +1,5 @@
 #pragma once
+#include "ops/common/numeric/convert.cuh"
 #include "ops/common/cuda/pipeline.cuh"
 
 #include "ops/common/cuda/memory.cuh"
@@ -82,7 +83,7 @@ __global__ __launch_bounds__(
         for (int item = lane; item < local_cols * (kTileK / 8); item += 32) {
             const int col = item / (kTileK / 8);
             const int k8  = item - col * (kTileK / 8);
-            auto* dst     = &b_shared[warp][col * kTileK + q8_sliced_k_swizzle_64(col, k8 * 8)];
+            auto* dst     = &b_shared[warp][col * kTileK + common::swizzle_xor_64(col, k8 * 8)];
             if (FullWeights || k0 + k8 * 8 < Hidden)
                 common::cp_async<16, Schedule::kActivationCache>(
                     dst, &x[static_cast<std::int64_t>(token_begin + column_offset + n_base + col) *
@@ -181,10 +182,10 @@ __global__ __launch_bounds__(
                     return static_cast<unsigned>(
                         *reinterpret_cast<const unsigned short*>(&code_shared[code_row][offset]));
                 };
-                const unsigned af0 = q8_bf16_pair_from_s8(load_code_pair(gid, code_col));
-                const unsigned af1 = q8_bf16_pair_from_s8(load_code_pair(gid + 8, code_col));
-                const unsigned af2 = q8_bf16_pair_from_s8(load_code_pair(gid, code_col + 8));
-                const unsigned af3 = q8_bf16_pair_from_s8(load_code_pair(gid + 8, code_col + 8));
+                const unsigned af0 = common::int8x2_to_bf16x2_bits(load_code_pair(gid, code_col));
+                const unsigned af1 = common::int8x2_to_bf16x2_bits(load_code_pair(gid + 8, code_col));
+                const unsigned af2 = common::int8x2_to_bf16x2_bits(load_code_pair(gid, code_col + 8));
+                const unsigned af3 = common::int8x2_to_bf16x2_bits(load_code_pair(gid + 8, code_col + 8));
 #pragma unroll
                 for (int ni = 0; ni < kNt; ++ni) {
                     unsigned bf0, bf1;
@@ -193,7 +194,7 @@ __global__ __launch_bounds__(
                         bf0, bf1,
                         common::smem_addr(
                             &b_shared[warp]
-                                     [br * kTileK + q8_sliced_k_swizzle_64(br, ks * 16 + b_koff)]));
+                                     [br * kTileK + common::swizzle_xor_64(br, ks * 16 + b_koff)]));
                     common::mma_bf16(group_acc[ni][0], group_acc[ni][1], group_acc[ni][2],
                                      group_acc[ni][3], af0, af1, af2, af3, bf0, bf1);
                 }

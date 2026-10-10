@@ -1,3 +1,4 @@
+#include "ops/common/cuda/memory.cuh"
 #include "core/weight.h"
 #include "ops/sparse_moe/prefill/sparse_moe_prefill.h"
 
@@ -57,7 +58,7 @@ __global__ __launch_bounds__(kRouterThreads, 2) void sparse_moe_prefill_router_m
             const int row   = item / (kRouterBK / 8);
             const int k8    = item - row * (kRouterBK / 8);
             const int rr    = row0 + row;
-            auto* dst       = &Ws[stage][row * kRouterBK + gemm_swz64(row, k8 * 8)];
+            auto* dst       = &Ws[stage][row * kRouterBK + common::swizzle_xor_64(row, k8 * 8)];
             const auto* src = weight +
                               static_cast<std::int64_t>(rr < kRouterRows ? rr : 0) * kHidden + k0 +
                               k8 * 8;
@@ -67,7 +68,7 @@ __global__ __launch_bounds__(kRouterThreads, 2) void sparse_moe_prefill_router_m
             const int col = item / (kRouterBK / 8);
             const int k8  = item - col * (kRouterBK / 8);
             const int tt  = token0 + col;
-            auto* dst     = &Xs[stage][col * kRouterBK + gemm_swz64(col, k8 * 8)];
+            auto* dst     = &Xs[stage][col * kRouterBK + common::swizzle_xor_64(col, k8 * 8)];
             const auto* src =
                 x + static_cast<std::int64_t>(tt < tokens ? tt : 0) * kHidden + k0 + k8 * 8;
             cp_async_zfill<16, Cache::cg>(dst, src, tt < tokens ? 16 : 0);
@@ -102,9 +103,9 @@ __global__ __launch_bounds__(kRouterThreads, 2) void sparse_moe_prefill_router_m
             const int brow = warp * 8 + b_rin;
             const int bcol = ki * 16 + b_koff;
             ldmatrix_x4(af[0], af[1], af[2], af[3],
-                        smem_addr(&Ws[stage][arow * kRouterBK + gemm_swz64(arow, acol)]));
+                        smem_addr(&Ws[stage][arow * kRouterBK + common::swizzle_xor_64(arow, acol)]));
             ldmatrix_x2(bf[0], bf[1],
-                        smem_addr(&Xs[stage][brow * kRouterBK + gemm_swz64(brow, bcol)]));
+                        smem_addr(&Xs[stage][brow * kRouterBK + common::swizzle_xor_64(brow, bcol)]));
             mma_bf16(acc[0], acc[1], acc[2], acc[3], af[0], af[1], af[2], af[3], bf[0], bf[1]);
         }
 
@@ -402,7 +403,7 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_q4_gat
                 const int item = tid + i * ExpertThreads;
                 const int col  = item / StageChunks;
                 const int k8   = item - col * StageChunks;
-                auto* dst      = &Bs[stage][col * kExpertBK + gemm_swz64(col, k8 * 8)];
+                auto* dst      = &Bs[stage][col * kExpertBK + common::swizzle_xor_64(col, k8 * 8)];
                 cp_async_zfill<16, Cache::cg>(dst, src_row[i] + k0 + k8 * 8, col < cols ? 16 : 0);
             }
 
@@ -427,7 +428,7 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_q4_gat
                 unsigned decoded[4];
                 Q4MmaDecodeAtom::decode_eight(
                     *reinterpret_cast<const unsigned*>(&Cr[stage][row * 32 + chunk * 4]), decoded);
-                store_vec(&As[row * kExpertBK + gemm_swz64(row, chunk * 8)],
+                store_vec(&As[row * kExpertBK + common::swizzle_xor_64(row, chunk * 8)],
                           make_int4(static_cast<int>(decoded[0]), static_cast<int>(decoded[1]),
                                     static_cast<int>(decoded[2]), static_cast<int>(decoded[3])));
             }
@@ -460,7 +461,7 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_q4_gat
                         const int row = mi * 16 + a_rowoff;
                         const int col = ki * 16 + a_coloff;
                         ldmatrix_x4(af[mi][0], af[mi][1], af[mi][2], af[mi][3],
-                                    smem_addr(&As[row * kExpertBK + gemm_swz64(row, col)]));
+                                    smem_addr(&As[row * kExpertBK + common::swizzle_xor_64(row, col)]));
                     }
 #pragma unroll
                     for (int ni = 0; ni < WarpNT; ++ni) {
@@ -468,7 +469,7 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_q4_gat
                         const int bcol = ki * 16 + b_koff;
                         ldmatrix_x2(
                             bf[ni][0], bf[ni][1],
-                            smem_addr(&Bs[stage][brow * kExpertBK + gemm_swz64(brow, bcol)]));
+                            smem_addr(&Bs[stage][brow * kExpertBK + common::swizzle_xor_64(brow, bcol)]));
 #pragma unroll
                         for (int mi = 0; mi < 4; ++mi) {
                             mma_bf16(partial[mi][ni][0], partial[mi][ni][1], partial[mi][ni][2],
@@ -592,7 +593,7 @@ __global__ __launch_bounds__(kExpertThreads, 1) void sparse_moe_prefill_q8_gate_
                 const int col        = item / (kExpertBK / 8);
                 const int k8         = item - col * (kExpertBK / 8);
                 const int source_col = begin + column_base + col;
-                auto* dst            = &Bs[stage][col * kExpertBK + gemm_swz64(col, k8 * 8)];
+                auto* dst            = &Bs[stage][col * kExpertBK + common::swizzle_xor_64(col, k8 * 8)];
                 const auto* src =
                     input + static_cast<std::int64_t>(col < cols ? source_col : begin) * kHidden +
                     k0 + k8 * 8;
@@ -645,7 +646,7 @@ __global__ __launch_bounds__(kExpertThreads, 1) void sparse_moe_prefill_q8_gate_
                     const int q1 = static_cast<int>(static_cast<std::int8_t>(packed >> 8));
                     const __nv_bfloat162 value = __floats2bfloat162_rn(
                         static_cast<float>(q0) * scale, static_cast<float>(q1) * scale);
-                    store_vec(&As[row * kExpertBK + gemm_swz64(row, col)], value);
+                    store_vec(&As[row * kExpertBK + common::swizzle_xor_64(row, col)], value);
                 }
             }
         };
@@ -679,12 +680,12 @@ __global__ __launch_bounds__(kExpertThreads, 1) void sparse_moe_prefill_q8_gate_
                         const int col = ki * 16 + a_coloff;
                         ldmatrix_x4(af[slot][mi][0], af[slot][mi][1], af[slot][mi][2],
                                     af[slot][mi][3],
-                                    smem_addr(&As[row * kExpertBK + gemm_swz64(row, col)]));
+                                    smem_addr(&As[row * kExpertBK + common::swizzle_xor_64(row, col)]));
                     }
                     const int brow = warp * 8 + b_rin;
                     const int bcol = ki * 16 + b_koff;
                     ldmatrix_x2(bf[slot][0], bf[slot][1],
-                                smem_addr(&Bs[stage][brow * kExpertBK + gemm_swz64(brow, bcol)]));
+                                smem_addr(&Bs[stage][brow * kExpertBK + common::swizzle_xor_64(brow, bcol)]));
                 };
                 load_fragments(0, 0);
 #pragma unroll
@@ -807,7 +808,7 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_qx_dow
                 const int col        = item / (kExpertBK / 8);
                 const int k8         = item - col * (kExpertBK / 8);
                 const int packed_col = begin + column_base + col;
-                auto* dst            = &Bs[stage][col * kExpertBK + gemm_swz64(col, k8 * 8)];
+                auto* dst            = &Bs[stage][col * kExpertBK + common::swizzle_xor_64(col, k8 * 8)];
                 const auto* src =
                     activation +
                     static_cast<std::int64_t>(col < cols ? packed_col : begin) * kIntermediate +
@@ -849,7 +850,7 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_qx_dow
                 Codec::decode_eight(
                     *reinterpret_cast<const unsigned*>(&Cr[stage][row * 32 + chunk * 4]),
                     &Hr[stage][row * Codec::kHighBytes + chunk * HighPerChunk], scale, decoded);
-                store_vec(&As[row * kExpertBK + gemm_swz64(row, chunk * 8)],
+                store_vec(&As[row * kExpertBK + common::swizzle_xor_64(row, chunk * 8)],
                           make_int4(static_cast<int>(decoded[0]), static_cast<int>(decoded[1]),
                                     static_cast<int>(decoded[2]), static_cast<int>(decoded[3])));
             }
@@ -881,12 +882,12 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_qx_dow
                         const int row = mi * 16 + a_rowoff;
                         const int col = ki * 16 + a_coloff;
                         ldmatrix_x4(af[mi][0], af[mi][1], af[mi][2], af[mi][3],
-                                    smem_addr(&As[row * kExpertBK + gemm_swz64(row, col)]));
+                                    smem_addr(&As[row * kExpertBK + common::swizzle_xor_64(row, col)]));
                     }
                     const int brow = warp * 8 + b_rin;
                     const int bcol = ki * 16 + b_koff;
                     ldmatrix_x2(bf[0], bf[1],
-                                smem_addr(&Bs[stage][brow * kExpertBK + gemm_swz64(brow, bcol)]));
+                                smem_addr(&Bs[stage][brow * kExpertBK + common::swizzle_xor_64(brow, bcol)]));
 #pragma unroll
                     for (int mi = 0; mi < 4; ++mi) {
                         mma_bf16(acc[mi][0], acc[mi][1], acc[mi][2], acc[mi][3], af[mi][0],
@@ -977,7 +978,7 @@ __global__ __launch_bounds__(kExpertThreads, 1) void sparse_moe_prefill_q8_down_
                 const int col        = item / (kExpertBK / 8);
                 const int k8         = item - col * (kExpertBK / 8);
                 const int source_col = begin + column_base + col;
-                auto* dst            = &Bs[stage][col * kExpertBK + gemm_swz64(col, k8 * 8)];
+                auto* dst            = &Bs[stage][col * kExpertBK + common::swizzle_xor_64(col, k8 * 8)];
                 const auto* src =
                     input +
                     static_cast<std::int64_t>(col < cols ? source_col : begin) * kIntermediate +
@@ -1033,7 +1034,7 @@ __global__ __launch_bounds__(kExpertThreads, 1) void sparse_moe_prefill_q8_down_
                     const int q1 = static_cast<int>(static_cast<std::int8_t>(packed >> 8));
                     const __nv_bfloat162 value = __floats2bfloat162_rn(
                         static_cast<float>(q0) * scale, static_cast<float>(q1) * scale);
-                    store_vec(&As[row * kExpertBK + gemm_swz64(row, col)], value);
+                    store_vec(&As[row * kExpertBK + common::swizzle_xor_64(row, col)], value);
                 }
             }
         };
@@ -1067,12 +1068,12 @@ __global__ __launch_bounds__(kExpertThreads, 1) void sparse_moe_prefill_q8_down_
                         const int col = ki * 16 + a_coloff;
                         ldmatrix_x4(af[slot][mi][0], af[slot][mi][1], af[slot][mi][2],
                                     af[slot][mi][3],
-                                    smem_addr(&As[row * kExpertBK + gemm_swz64(row, col)]));
+                                    smem_addr(&As[row * kExpertBK + common::swizzle_xor_64(row, col)]));
                     }
                     const int brow = warp * 8 + b_rin;
                     const int bcol = ki * 16 + b_koff;
                     ldmatrix_x2(bf[slot][0], bf[slot][1],
-                                smem_addr(&Bs[stage][brow * kExpertBK + gemm_swz64(brow, bcol)]));
+                                smem_addr(&Bs[stage][brow * kExpertBK + common::swizzle_xor_64(brow, bcol)]));
                 };
                 load_fragments(0, 0);
 #pragma unroll

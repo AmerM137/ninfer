@@ -1,4 +1,5 @@
 #pragma once
+#include "ops/common/numeric/convert.cuh"
 #include "ops/common/cuda/pipeline.cuh"
 
 #include "ops/common/cuda/memory.cuh"
@@ -31,26 +32,6 @@ struct Q8SlicedKIdentityRows {
         return output_row0 + local_row;
     }
 };
-
-__device__ __forceinline__ int q8_sliced_k_swizzle_64(int row, int col) {
-    return (((col >> 3) ^ (row & 7)) << 3) | (col & 7);
-}
-
-union Q8Bf16PairBits {
-    __nv_bfloat162 pair;
-    unsigned bits;
-};
-
-__device__ __forceinline__ unsigned q8_bf16_pair_from_s8(unsigned values) {
-    Q8Bf16PairBits biased;
-    biased.bits          = __byte_perm(values, 0x43004300u, 0x7150) & 0xff7fff7fu;
-    const unsigned signs = (values & 0x80u) | ((values & 0x8000u) << 8);
-    Q8Bf16PairBits bias;
-    bias.bits = 0x43004300u | signs;
-    Q8Bf16PairBits result;
-    result.pair = __hsub2_rn(biased.pair, bias.pair);
-    return result.bits;
-}
 
 // The contraction owns the shared layout; tiled launchers use the same type for opt-in capacity.
 template <class Schedule>
@@ -123,7 +104,7 @@ __device__ __forceinline__ void q8_a16_sliced_k_mma(Q8LinearOperands operands, O
         for (int item = lane; item < items_per_split; item += 32) {
             const int col = item / (kTileK / 8);
             const int k8  = item - col * (kTileK / 8);
-            auto* dst     = &b_shared[warp][col * kTileK + q8_sliced_k_swizzle_64(col, k8 * 8)];
+            auto* dst     = &b_shared[warp][col * kTileK + common::swizzle_xor_64(col, k8 * 8)];
             const int kk  = group_k0 + warp * kTileK + k8 * 8;
             if constexpr (FullWeights) {
                 if constexpr (!Schedule::kExactTokens && !kRuntimeActive) {
@@ -285,10 +266,10 @@ __device__ __forceinline__ void q8_a16_sliced_k_mma(Q8LinearOperands operands, O
                     return static_cast<unsigned>(
                         *reinterpret_cast<const unsigned short*>(&code_shared[code_row][offset]));
                 };
-                const unsigned af0 = q8_bf16_pair_from_s8(load_code_pair(gid, code_col));
-                const unsigned af1 = q8_bf16_pair_from_s8(load_code_pair(gid + 8, code_col));
-                const unsigned af2 = q8_bf16_pair_from_s8(load_code_pair(gid, code_col + 8));
-                const unsigned af3 = q8_bf16_pair_from_s8(load_code_pair(gid + 8, code_col + 8));
+                const unsigned af0 = common::int8x2_to_bf16x2_bits(load_code_pair(gid, code_col));
+                const unsigned af1 = common::int8x2_to_bf16x2_bits(load_code_pair(gid + 8, code_col));
+                const unsigned af2 = common::int8x2_to_bf16x2_bits(load_code_pair(gid, code_col + 8));
+                const unsigned af3 = common::int8x2_to_bf16x2_bits(load_code_pair(gid + 8, code_col + 8));
 #pragma unroll
                 for (int ni = 0; ni < kNt; ++ni) {
                     unsigned bf0, bf1;
@@ -297,7 +278,7 @@ __device__ __forceinline__ void q8_a16_sliced_k_mma(Q8LinearOperands operands, O
                         bf0, bf1,
                         common::smem_addr(
                             &b_shared[k_split]
-                                     [br * kTileK + q8_sliced_k_swizzle_64(br, ks * 16 + b_koff)]));
+                                     [br * kTileK + common::swizzle_xor_64(br, ks * 16 + b_koff)]));
                     common::mma_bf16(group_acc[ni][0], group_acc[ni][1], group_acc[ni][2],
                                      group_acc[ni][3], af0, af1, af2, af3, bf0, bf1);
                 }
