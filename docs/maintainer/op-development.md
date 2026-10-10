@@ -313,11 +313,36 @@ Private launch headers, selectors and kernel templates are not included by model
 headers, product code, permanent tests or public benchmarks. Every kernel assumption has a
 matching admission or launch predicate. An Op never infers it from model identity.
 
-Family kernel libraries own reusable algorithms, format decoding, output mappings and epilogues.
-`src/ops/common/` owns narrow arithmetic, memory, warp and MMA facilities used across families.
-Keep tuning cutoffs with the consuming Op; avoid a shared library that contains model-labelled
-routes or a universal configuration with unrelated optional fields. Sharing a kernel does not
-introduce a model-callable private backend or an intermediate numerical boundary.
+`src/ops/common/` owns the shared implementation foundation:
+
+- `numeric/`: scalar arithmetic, explicit approximation profiles, represented-value conversions
+  and vector types;
+- `cuda/`: memory instructions, reductions and ordering, MMA, asynchronous pipelines and
+  shared-memory storage;
+- `quant/`: packed-format decoding, encoding and explicit scale/rounding profiles;
+- `host/`: operand checks, represented-weight validation and launch resource configuration.
+
+Keep small companion facilities together: vector types with conversions, cache policy and swizzles
+with memory operations, and asynchronous copy with its synchronization. Split a header for a real
+dependency boundary, independent use or substantial implementation size, not for each helper.
+
+These facilities depend only on core, CUDA and other shared facilities, never on an Op family.
+Include the specific facility directly. Do not add a family-local forwarding `math` or `utils`
+header, duplicate a generic primitive, or put selected schedules and tuning cutoffs in this layer.
+Core remains the authority for storage types, layout contracts and codebooks. Device codecs must
+keep format interpretation separate from matrix-tile or paged-cache addressing. Quantization
+profiles with different scale bounds, divisors or rounding boundaries remain explicit.
+
+Family kernel libraries own reusable algorithms, tile assembly, output mappings and epilogues.
+For example, an E4M3 conversion belongs to shared numeric/format support; a GEMM pipeline belongs
+to Linear. Sharing either does not introduce a model-callable private backend or an intermediate
+numerical boundary. The consuming Op chooses its arithmetic profile and tuned implementation.
+
+Elementwise, RMSNorm and Linear consume the categorized foundation. Other families retain their
+existing helpers and call sites until their own reorganization; shared facilities needed by them
+may be supplied in advance. Keep those callers on their existing implementation rather than
+redirecting them through forwarding aliases. Remove an old provider after its remaining consumers
+migrate, and do not add new consumers to the old paths.
 
 Preserve per-shape compilation units and explicit template ownership. File organization must not
 silently change RDC mode, architecture, compiler precision options or device-link ownership.

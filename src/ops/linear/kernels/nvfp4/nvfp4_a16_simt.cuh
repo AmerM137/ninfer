@@ -1,5 +1,10 @@
 #pragma once
 
+#include "ops/common/cuda/memory.cuh"
+#include "ops/common/cuda/reduce.cuh"
+#include "ops/common/numeric/convert.cuh"
+#include "ops/common/quant/nvfp4.cuh"
+
 #include "ops/linear/kernels/nvfp4/nvfp4_a16_gemv.cuh"
 
 #include <cuda_bf16.h>
@@ -36,7 +41,7 @@ load_nvfp4_activation_pack(const __nv_bfloat16* pointer) {
     Nvfp4A16ActivationPack<Values> result;
 #pragma unroll
     for (int chunk = 0; chunk < Values / 8; ++chunk) {
-        const uint4 packed          = load_vec<uint4>(pointer + chunk * 8);
+        const uint4 packed          = common::load_vec<uint4>(pointer + chunk * 8);
         result.words[chunk * 4]     = packed.x;
         result.words[chunk * 4 + 1] = packed.y;
         result.words[chunk * 4 + 2] = packed.z;
@@ -81,7 +86,7 @@ compute_nvfp4_simt_rows(const __nv_bfloat16* __restrict__ x, const std::uint8_t*
                         static_cast<std::int64_t>(min(token, live_tokens - 1)) *
                             Geometry::kInputRows +
                         phase * kValuesPerPhase + local_pack * 8;
-                    destination[task] = load_vec<uint4>(source);
+                    destination[task] = common::load_vec<uint4>(source);
                 }
             }
             __syncthreads();
@@ -128,7 +133,7 @@ compute_nvfp4_simt_rows(const __nv_bfloat16* __restrict__ x, const std::uint8_t*
                 for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
                     const std::uint32_t word  = row_codes[local_row].words[pair / 4];
                     const std::uint8_t packed = static_cast<std::uint8_t>(word >> (8 * (pair & 3)));
-                    const float2 code         = decode_nvfp4_e2m1x2(packed);
+                    const float2 code         = common::decode_nvfp4_e2m1x2(packed);
                     const float coefficient   = coefficients[local_row][group];
                     row_weight[local_row] = make_float2(code.x * coefficient, code.y * coefficient);
                 }
@@ -137,7 +142,7 @@ compute_nvfp4_simt_rows(const __nv_bfloat16* __restrict__ x, const std::uint8_t*
                     const int token = token0 + local_token;
                     if (token < ActiveTokens) {
                         const float2 activation_value =
-                            bf16x2_bits_to_float2(activation[local_token].words[pair]);
+                            common::bf16x2_bits_to_float2(activation[local_token].words[pair]);
                         constexpr int kChainMask = Schedule::kAccumulatorChains - 1;
 #pragma unroll
                         for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
@@ -161,7 +166,7 @@ compute_nvfp4_simt_rows(const __nv_bfloat16* __restrict__ x, const std::uint8_t*
                 for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
                     const std::uint32_t word  = row_codes[local_row].words[pair / 4];
                     const std::uint8_t packed = static_cast<std::uint8_t>(word >> (8 * (pair & 3)));
-                    const float2 code         = decode_nvfp4_e2m1x2(packed);
+                    const float2 code         = common::decode_nvfp4_e2m1x2(packed);
                     const float coefficient   = coefficients[local_row][group];
                     row_weight[local_row] = make_float2(code.x * coefficient, code.y * coefficient);
                 }
@@ -179,12 +184,14 @@ compute_nvfp4_simt_rows(const __nv_bfloat16* __restrict__ x, const std::uint8_t*
                                 shared.activation + local_token * kValuesPerPhase);
                             const int local_pair = warp_in_row * (kValuesPerWarpPhase / 2) +
                                                    lane * Schedule::kPairsPerLane + pair;
-                            activation_value = bf16x2_bits_to_float2(activation_pairs[local_pair]);
+                            activation_value =
+                                common::bf16x2_bits_to_float2(activation_pairs[local_pair]);
                         } else {
                             const auto* activation_pairs = reinterpret_cast<const std::uint32_t*>(
                                 x + static_cast<std::int64_t>(min(token, live_tokens - 1)) *
                                         Geometry::kInputRows);
-                            activation_value = bf16x2_bits_to_float2(activation_pairs[pair_index]);
+                            activation_value =
+                                common::bf16x2_bits_to_float2(activation_pairs[pair_index]);
                         }
                         constexpr int kChainMask = Schedule::kAccumulatorChains - 1;
 #pragma unroll
@@ -256,7 +263,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_
             float sum = 0;
 #pragma unroll
             for (int c = 0; c < Schedule::kAccumulatorChains; ++c) sum += acc[r][t][c];
-            sum = warp_reduce_sum(sum);
+            sum = common::warp_reduce_sum(sum);
             if constexpr (Schedule::kWarpsPerRow == 1)
                 totals[r][t] = sum;
             else if (lane == 0)
@@ -272,7 +279,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_
                 for (int t = 0; t < Schedule::kBlockTokens; ++t) {
                     const float sum =
                         lane < Schedule::kWarpsPerRow ? shared.partials[rg][r][t][lane] : 0.0f;
-                    totals[r][t] = warp_reduce_sum(sum);
+                    totals[r][t] = common::warp_reduce_sum(sum);
                 }
         }
     }

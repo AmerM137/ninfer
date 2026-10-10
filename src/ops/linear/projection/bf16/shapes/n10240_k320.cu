@@ -1,4 +1,5 @@
 #include "ops/linear/projection/bf16/bf16_shapes.h"
+#include "ops/common/cuda/memory.cuh"
 #include "ops/linear/projection/bf16/bf16_launch.cuh"
 
 namespace ninfer::ops::detail {

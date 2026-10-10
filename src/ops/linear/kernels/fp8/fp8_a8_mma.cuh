@@ -1,4 +1,8 @@
 #pragma once
+#include "ops/common/cuda/pipeline.cuh"
+
+#include "ops/common/cuda/memory.cuh"
+#include "ops/linear/common/epilogue.cuh"
 
 // Row-scaled E4M3 weight x materialized row-scaled E4M3 activation Tensor Core GEMM.
 //
@@ -6,14 +10,9 @@
 // contiguous axis the public output-row axis. The epilogue stages BF16 pairs and emits aligned
 // output vectors, while the output policy remains replaceable by a fused semantic Op.
 
-#include "ops/common/math.cuh"
-#include "ops/common/memory.cuh"
-#include "ops/common/mma.cuh"
-#include "ops/linear/common/epilogue.cuh"
-#include "ops/linear/common/vector_output.cuh"
+#include "ops/linear/common/output.cuh"
 #include "ops/linear/kernels/fp8/fp8_schedule.cuh"
 #include "ops/linear/kernels/fp8/fp8_operands.h"
-#include "ops/linear/kernels/fp8/fp8_shared.cuh"
 #include "ops/linear/kernels/fp8/fp8_a8_mma_common.cuh"
 
 #include <cuda_bf16.h>
@@ -40,7 +39,7 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
     constexpr int BK        = Schedule::kBlockK;
     constexpr int S         = Schedule::kStages;
     constexpr int THREADS   = Schedule::kThreads;
-    auto* shared_raw        = fp8_shared_storage<fp8_mma_shared_bytes<Schedule, Epilogue>>();
+    auto* shared_raw        = common::shared_storage<linear_mma_shared_bytes<Schedule, Epilogue>>();
     auto* activation_shared = reinterpret_cast<std::uint8_t*>(shared_raw);
     auto* weight_shared     = activation_shared + S * BM * BK;
 
@@ -72,12 +71,12 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
             auto* destination         = activation_stage + row * BK + physical_byte;
             const int token           = token_begin + row;
             if constexpr (FullTokens) {
-                cp_async<16, Schedule::kActivationCache>(
+                common::cp_async<16, Schedule::kActivationCache>(
                     destination, activation_codes + static_cast<std::int64_t>(token) * K + k_begin +
                                      logical_byte);
             } else {
                 const bool valid = token < tokens;
-                cp_async_zfill<16, Schedule::kActivationCache>(
+                common::cp_async_zfill<16, Schedule::kActivationCache>(
                     destination,
                     activation_codes + static_cast<std::int64_t>(valid ? token : 0) * K + k_begin +
                         logical_byte,
@@ -92,7 +91,7 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
             const int logical_byte    = logical_segment * 16;
             const int physical_byte   = fp8_mma_shared_byte<Schedule>(row, logical_byte);
             const int weight_row      = row_policy.weight_row(row_begin, row, operands.rows);
-            cp_async<16, Schedule::kWeightCache>(
+            common::cp_async<16, Schedule::kWeightCache>(
                 weight_stage + row * BK + physical_byte,
                 weight_codes + static_cast<std::int64_t>(weight_row) * K + k_begin + logical_byte);
         }
@@ -101,7 +100,7 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
 #pragma unroll
     for (int stage = 0; stage < S; ++stage) {
         stage_inputs(stage, stage);
-        cp_commit();
+        common::cp_commit();
     }
 
     float accumulators[Schedule::kMmaTokens][Schedule::kMmaRows][4] = {};
@@ -109,9 +108,9 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
     for (int k_tile = 0; k_tile < TILES_K; ++k_tile) {
         const int stage = k_tile % S;
         if (k_tile + S <= TILES_K) {
-            cp_wait<S - 1>();
+            common::cp_wait<S - 1>();
         } else {
-            cp_wait<0>();
+            common::cp_wait<0>();
         }
         __syncthreads();
 
@@ -122,7 +121,7 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
         const int next_k_tile = k_tile + S;
         if (next_k_tile < TILES_K) {
             stage_inputs(stage, next_k_tile);
-            cp_commit();
+            common::cp_commit();
         }
     }
 

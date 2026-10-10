@@ -1,7 +1,11 @@
 #pragma once
 
+#include "ops/common/cuda/memory.cuh"
+#include "ops/common/cuda/reduce.cuh"
+#include "ops/common/numeric/convert.cuh"
+#include "ops/common/quant/integer.cuh"
+
 #include "core/pdl.cuh"
-#include "ops/common/warp.cuh"
 #include "ops/linear/common/epilogue.cuh"
 #include "ops/linear/kernels/q5/q5_schedule.cuh"
 
@@ -50,22 +54,23 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void q5_a16_dir
             const auto group_index   = group0 + kk / 64;
             std::uint32_t scale_bits = 0;
             if ((lane & 7) == 0 && active)
-                scale_bits = load_vec<std::uint16_t>(scales + group_index * 2);
-            scale_bits = __shfl_sync(kFullWarpMask, scale_bits, lane & ~7);
+                scale_bits = common::load_vec<std::uint16_t>(scales + group_index * 2);
+            scale_bits = __shfl_sync(common::kFullWarpMask, scale_bits, lane & ~7);
             if (active) {
-                const auto word = load_vec<std::uint32_t>(codes + group_index * 32 + (kk % 64) / 2);
+                const auto word =
+                    common::load_vec<std::uint32_t>(codes + group_index * 32 + (kk % 64) / 2);
                 const auto high_byte = high[group_index * 8 + (kk % 64) / 8];
                 float weights[8];
-                Q5SimtDecodeAtom::decode_eight(word, high_byte, scale_bits, weights);
+                common::Q5SimtDecodeAtom::decode_eight(word, high_byte, scale_bits, weights);
 #pragma unroll
                 for (int token = 0; token < T; ++token) {
                     if (FullTokens || token < active_tokens) {
-                        const uint4 values =
-                            load_vec<uint4>(x + std::int64_t(token0 + token) * logical_k + kk);
-                        const float2 x0 = bf16x2_bits_to_float2(values.x);
-                        const float2 x1 = bf16x2_bits_to_float2(values.y);
-                        const float2 x2 = bf16x2_bits_to_float2(values.z);
-                        const float2 x3 = bf16x2_bits_to_float2(values.w);
+                        const uint4 values = common::load_vec<uint4>(
+                            x + std::int64_t(token0 + token) * logical_k + kk);
+                        const float2 x0 = common::bf16x2_bits_to_float2(values.x);
+                        const float2 x1 = common::bf16x2_bits_to_float2(values.y);
+                        const float2 x2 = common::bf16x2_bits_to_float2(values.z);
+                        const float2 x3 = common::bf16x2_bits_to_float2(values.w);
                         acc[token]      = fmaf(weights[0], x0.x, acc[token]);
                         acc[token]      = fmaf(weights[1], x0.y, acc[token]);
                         acc[token]      = fmaf(weights[2], x1.x, acc[token]);
@@ -81,7 +86,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void q5_a16_dir
     }
 #pragma unroll
     for (int token = 0; token < T; ++token) {
-        const float sum = warp_reduce_sum(acc[token]);
+        const float sum = common::warp_reduce_sum(acc[token]);
         if (lane == 0) partial[local_row][part][token] = sum;
     }
     __syncthreads();

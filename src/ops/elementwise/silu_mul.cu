@@ -1,9 +1,9 @@
 #include "ninfer/ops/silu_mul.h"
+#include "ops/common/host/launch.h"
+#include "ops/common/numeric/math.cuh"
+#include "ops/common/numeric/math.h"
 
 #include "core/device.h"
-#include "ops/common/math.cuh"
-#include "ops/common/math.h"
-#include "ops/common/token_slices.h"
 
 #include <cuda_bf16.h>
 
@@ -17,8 +17,8 @@ namespace {
 inline constexpr int kSiluAndMulPairsPerThread = 4;
 
 __device__ __forceinline__ __nv_bfloat162 silu_mul_pair(__nv_bfloat162 g, __nv_bfloat162 u) {
-    const float r0 = silu(__low2float(g)) * __low2float(u);
-    const float r1 = silu(__high2float(g)) * __high2float(u);
+    const float r0 = common::silu(__low2float(g)) * __low2float(u);
+    const float r1 = common::silu(__high2float(g)) * __high2float(u);
     return __floats2bfloat162_rn(r0, r1);
 }
 
@@ -27,7 +27,8 @@ __global__ void silu_mul_scalar_kernel(const __nv_bfloat16* gate, const __nv_bfl
     const std::int64_t start  = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
     const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
     for (std::int64_t i = start; i < n; i += stride) {
-        out[i] = __float2bfloat16(silu(__bfloat162float(gate[i])) * __bfloat162float(up[i]));
+        out[i] =
+            __float2bfloat16(common::silu(__bfloat162float(gate[i])) * __bfloat162float(up[i]));
     }
 }
 
@@ -59,7 +60,7 @@ __global__ void silu_mul_strided_input_kernel(const __nv_bfloat16* gate, const _
             static_cast<std::int64_t>(d2) * unb2 + static_cast<std::int64_t>(d3) * unb3;
         const auto gv = *reinterpret_cast<const __nv_bfloat16*>(gate_bytes + goff);
         const auto uv = *reinterpret_cast<const __nv_bfloat16*>(up_bytes + uoff);
-        out[i]        = __float2bfloat16(silu(__bfloat162float(gv)) * __bfloat162float(uv));
+        out[i]        = __float2bfloat16(common::silu(__bfloat162float(gv)) * __bfloat162float(uv));
     }
 }
 
@@ -117,7 +118,8 @@ __launch_bounds__(256) __global__
     if (tid == 0) {
         if ((n & 1) != 0) {
             const std::int64_t i = n - 1;
-            out[i] = __float2bfloat16(silu(__bfloat162float(gate[i])) * __bfloat162float(up[i]));
+            out[i] =
+                __float2bfloat16(common::silu(__bfloat162float(gate[i])) * __bfloat162float(up[i]));
         }
     }
 }
@@ -147,9 +149,9 @@ void launch_silu_mul(const Tensor& gate, const Tensor& up, Tensor& out, cudaStre
         if (can_use_dim0_split_fast_path(gate, up, out)) {
             const std::int64_t row_pairs          = gate.ne[0] / 2;
             constexpr std::int64_t kPairsPerBlock = kBlock * kSiluAndMulPairsPerThread;
-            const int grid_x =
-                static_cast<int>(std::max<std::int64_t>(1, div_up(row_pairs, kPairsPerBlock)));
-            detail::for_each_token_slice(gate.ne[1], 1, [&](int token_offset, int token_count) {
+            const int grid_x                      = static_cast<int>(
+                std::max<std::int64_t>(1, common::div_up(row_pairs, kPairsPerBlock)));
+            common::for_each_token_slice(gate.ne[1], 1, [&](int token_offset, int token_count) {
                 const Tensor gate_slice = gate.slice(1, token_offset, token_count);
                 const Tensor up_slice   = up.slice(1, token_offset, token_count);
                 Tensor out_slice        = out.slice(1, token_offset, token_count);
@@ -165,7 +167,8 @@ void launch_silu_mul(const Tensor& gate, const Tensor& up, Tensor& out, cudaStre
             });
             return;
         }
-        const int scalar_grid = static_cast<int>(div_up(n, static_cast<std::int64_t>(kBlock)));
+        const int scalar_grid =
+            static_cast<int>(common::div_up(n, static_cast<std::int64_t>(kBlock)));
         silu_mul_strided_input_kernel<<<scalar_grid, kBlock, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(gate.data),
             static_cast<const __nv_bfloat16*>(up.data), static_cast<__nv_bfloat16*>(out.data), n,
@@ -179,7 +182,8 @@ void launch_silu_mul(const Tensor& gate, const Tensor& up, Tensor& out, cudaStre
     const auto up_addr   = reinterpret_cast<std::uintptr_t>(up.data);
     const auto out_addr  = reinterpret_cast<std::uintptr_t>(out.data);
     if (((gate_addr | up_addr | out_addr) & (alignof(__nv_bfloat162) - 1)) != 0) {
-        const int scalar_grid = static_cast<int>(div_up(n, static_cast<std::int64_t>(kBlock)));
+        const int scalar_grid =
+            static_cast<int>(common::div_up(n, static_cast<std::int64_t>(kBlock)));
         silu_mul_scalar_kernel<<<scalar_grid, kBlock, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(gate.data),
             static_cast<const __nv_bfloat16*>(up.data), static_cast<__nv_bfloat16*>(out.data), n);
@@ -189,7 +193,8 @@ void launch_silu_mul(const Tensor& gate, const Tensor& up, Tensor& out, cudaStre
 
     const std::int64_t n2                 = n / 2;
     constexpr std::int64_t kPairsPerBlock = kBlock * kSiluAndMulPairsPerThread;
-    const int grid = static_cast<int>(std::max<std::int64_t>(1, div_up(n2, kPairsPerBlock)));
+    const int grid =
+        static_cast<int>(std::max<std::int64_t>(1, common::div_up(n2, kPairsPerBlock)));
 
     silu_mul_kernel<<<grid, kBlock, 0, stream>>>(static_cast<const __nv_bfloat16*>(gate.data),
                                                  static_cast<const __nv_bfloat16*>(up.data),

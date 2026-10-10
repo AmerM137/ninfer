@@ -1,4 +1,6 @@
 #pragma once
+
+#include "ops/common/cuda/memory.cuh"
 #include "ops/linear/kernels/q8/q8_geometry.h"
 #include "ops/linear/kernels/q8/q8_schedule.cuh"
 

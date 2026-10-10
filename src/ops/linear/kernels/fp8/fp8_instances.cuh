@@ -1,4 +1,6 @@
 #pragma once
+
+#include "ops/common/cuda/memory.cuh"
 #include "ops/linear/kernels/fp8/fp8_schedule.cuh"
 
 namespace ninfer::ops::detail {

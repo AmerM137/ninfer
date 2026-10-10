@@ -1,4 +1,8 @@
 #pragma once
+#include "ops/common/cuda/pipeline.cuh"
+
+#include "ops/common/cuda/memory.cuh"
+#include "ops/common/cuda/mma.cuh"
 
 // Q8G32 RowSplit medium-T split-K MMA core. K-split warps share one 16-row
 // weight tile while N-groups cover disjoint column ranges. Output owns the
@@ -51,7 +55,7 @@ __global__ __launch_bounds__(
     };
 
     static_assert(sizeof(Shared) == Schedule::kSharedBytes);
-    auto& shared = *reinterpret_cast<Shared*>(q8_shared_storage<sizeof(Shared)>());
+    auto& shared = *reinterpret_cast<Shared*>(common::shared_storage<sizeof(Shared)>());
 
     const int tid         = static_cast<int>(threadIdx.x);
     const int warp        = tid >> 5;
@@ -80,14 +84,14 @@ __global__ __launch_bounds__(
             const int k8  = item - col * (kTileK / 8);
             auto* dst     = &b_shared[warp][col * kTileK + q8_sliced_k_swizzle_64(col, k8 * 8)];
             if (FullWeights || k0 + k8 * 8 < Hidden)
-                cp_async<16, Schedule::kActivationCache>(
+                common::cp_async<16, Schedule::kActivationCache>(
                     dst, &x[static_cast<std::int64_t>(token_begin + column_offset + n_base + col) *
                                 Hidden +
                             k0 + k8 * 8]);
             else
-                store_vec(dst, make_uint4(0, 0, 0, 0));
+                common::store_vec(dst, make_uint4(0, 0, 0, 0));
         }
-        cp_commit();
+        common::cp_commit();
     };
 
     const auto stage_codes = [&](int slot, int group_k0) {
@@ -99,13 +103,13 @@ __global__ __launch_bounds__(
             const int swizzled_chunk = chunk ^ (row & 7);
             auto* dst                = &code_shared[row][swizzled_chunk * 16];
             if (FullWeights || (cta_row0 + row < operands.rows && group_k0 + chunk * 16 < padded_k))
-                cp_async<16, Schedule::kWeightCache>(
+                common::cp_async<16, Schedule::kWeightCache>(
                     dst, codes + static_cast<std::int64_t>(cta_row0 + row) * padded_k + group_k0 +
                              chunk * 16);
             else
-                store_vec(dst, make_uint4(0, 0, 0, 0));
+                common::store_vec(dst, make_uint4(0, 0, 0, 0));
         }
-        cp_commit();
+        common::cp_commit();
     };
 
     const int b_rin     = lane & 7;
@@ -122,7 +126,7 @@ __global__ __launch_bounds__(
 
     stage_codes(0, 0);
     stage_x(0, warp_koff);
-    cp_wait<0>();
+    common::cp_wait<0>();
     __syncthreads();
 
     // Bulk tiles keep the K loop compact; the small fixed callers retain their unrolling.
@@ -149,9 +153,9 @@ __global__ __launch_bounds__(
                 const auto* address =
                     scales + (static_cast<std::int64_t>(scale_row) * (padded_k / 32) + k0 / 32) * 2;
                 if constexpr (Schedule::kReadOnlyScales)
-                    lane_scale_pair = load_ldg<unsigned>(address);
+                    lane_scale_pair = common::load_ldg<unsigned>(address);
                 else
-                    lane_scale_pair = load_vec<unsigned>(address);
+                    lane_scale_pair = common::load_vec<unsigned>(address);
             }
         }
         const unsigned top_scale_pair = __shfl_sync(kMask, lane_scale_pair, lane & ~3);
@@ -185,12 +189,13 @@ __global__ __launch_bounds__(
                 for (int ni = 0; ni < kNt; ++ni) {
                     unsigned bf0, bf1;
                     const int br = ni * 8 + b_rin;
-                    ldmatrix_x2(
+                    common::ldmatrix_x2(
                         bf0, bf1,
-                        smem_addr(&b_shared[warp][br * kTileK +
-                                                  q8_sliced_k_swizzle_64(br, ks * 16 + b_koff)]));
-                    mma_bf16(group_acc[ni][0], group_acc[ni][1], group_acc[ni][2], group_acc[ni][3],
-                             af0, af1, af2, af3, bf0, bf1);
+                        common::smem_addr(
+                            &b_shared[warp]
+                                     [br * kTileK + q8_sliced_k_swizzle_64(br, ks * 16 + b_koff)]));
+                    common::mma_bf16(group_acc[ni][0], group_acc[ni][1], group_acc[ni][2],
+                                     group_acc[ni][3], af0, af1, af2, af3, bf0, bf1);
                 }
             }
             const unsigned top_bits = group == 0 ? top_scale_pair & 0xffffu : top_scale_pair >> 16;
@@ -216,7 +221,7 @@ __global__ __launch_bounds__(
                 stage_codes(0, group_k0 + kGroupK);
                 stage_x(0, k0 + kGroupK);
             }
-            cp_wait<0>();
+            common::cp_wait<0>();
             __syncthreads();
         }
     }
@@ -226,8 +231,8 @@ __global__ __launch_bounds__(
     if ((k_split & 1) != 0) {
 #pragma unroll
         for (int ni = 0; ni < kNt; ++ni) {
-            store_vec(partial + ((warp * kNt + ni) * 32 + lane) * 4,
-                      make_float4(acc[ni][0], acc[ni][1], acc[ni][2], acc[ni][3]));
+            common::store_vec(partial + ((warp * kNt + ni) * 32 + lane) * 4,
+                              make_float4(acc[ni][0], acc[ni][1], acc[ni][2], acc[ni][3]));
         }
     }
     __syncthreads();
@@ -236,14 +241,14 @@ __global__ __launch_bounds__(
 #pragma unroll
         for (int ni = 0; ni < kNt; ++ni) {
             const float4 partner =
-                load_vec<float4>(partial + (((warp + 1) * kNt + ni) * 32 + lane) * 4);
+                common::load_vec<float4>(partial + (((warp + 1) * kNt + ni) * 32 + lane) * 4);
             acc[ni][0] += partner.x;
             acc[ni][1] += partner.y;
             acc[ni][2] += partner.z;
             acc[ni][3] += partner.w;
             if (k_split != 0) {
-                store_vec(partial + ((warp * kNt + ni) * 32 + lane) * 4,
-                          make_float4(acc[ni][0], acc[ni][1], acc[ni][2], acc[ni][3]));
+                common::store_vec(partial + ((warp * kNt + ni) * 32 + lane) * 4,
+                                  make_float4(acc[ni][0], acc[ni][1], acc[ni][2], acc[ni][3]));
             }
         }
     }
@@ -256,8 +261,8 @@ __global__ __launch_bounds__(
 #pragma unroll
                 for (int split = 2; split < KSplits; split += 2) {
                     const int partner_warp = n_group * KSplits + split;
-                    const float4 partner =
-                        load_vec<float4>(partial + ((partner_warp * kNt + ni) * 32 + lane) * 4);
+                    const float4 partner   = common::load_vec<float4>(
+                        partial + ((partner_warp * kNt + ni) * 32 + lane) * 4);
                     acc[ni][0] += partner.x;
                     acc[ni][1] += partner.y;
                     acc[ni][2] += partner.z;

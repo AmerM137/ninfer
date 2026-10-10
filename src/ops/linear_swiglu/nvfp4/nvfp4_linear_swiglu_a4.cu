@@ -6,7 +6,7 @@
 #include "ops/common/memory.cuh"
 #include "ops/linear/kernels/nvfp4/nvfp4_schedule.cuh"
 #include "ops/linear/common/epilogue.cuh"
-#include "ops/linear/common/vector_output.cuh"
+#include "ops/linear/common/output.cuh"
 #include "ops/linear/kernels/nvfp4/nvfp4_template_launch.cuh"
 #include "ops/linear_swiglu/token_major_mma_epilogue.cuh"
 #include "ops/linear/kernels/nvfp4/nvfp4_a4_plan.h"

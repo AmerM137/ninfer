@@ -1,5 +1,5 @@
 #include "ops/rmsnorm/operands.h"
-#include "ops/common/operand_checks.h"
+#include "ops/common/host/operands.h"
 #include <array>
 #include <cmath>
 #include <limits>
@@ -50,20 +50,21 @@ Operands validate(const Tensor& x, const Tensor& weight, const Tensor* gate, flo
     std::uintptr_t addresses = 0;
     for (const auto* t : tensors) {
         if (!t) continue;
-        require(t->is_contiguous() && operand::aligned(t->data, 2), op,
+        require(t->is_contiguous() && common::operand::aligned(t->data, 2), op,
                 "operands require contiguous BF16-aligned backing");
         addresses |= reinterpret_cast<std::uintptr_t>(t->data);
     }
-    const auto bytes  = operand::bytes(count, 2, op);
-    const auto input  = operand::range(x.data, bytes, op);
-    const auto gain   = operand::range(weight.data, operand::bytes(x.ne[0], 2, op), op);
-    const auto output = operand::range(out.data, bytes, op);
-    operand::disjoint(output, input, op);
-    operand::disjoint(output, gain, op);
+    const auto bytes = common::operand::bytes(count, 2, op);
+    const auto input = common::operand::range(x.data, bytes, op);
+    const auto gain =
+        common::operand::range(weight.data, common::operand::bytes(x.ne[0], 2, op), op);
+    const auto output = common::operand::range(out.data, bytes, op);
+    common::operand::disjoint(output, input, op);
+    common::operand::disjoint(output, gain, op);
     if (gate)
-        operand::disjoint(output, operand::range(gate->data, bytes, op), op);
+        common::operand::disjoint(output, common::operand::range(gate->data, bytes, op), op);
     else
-        operand::disjoint(input, gain, op);
+        common::operand::disjoint(input, gain, op);
     return {x.ne[0], count / x.ne[0], (addresses & 3u) == 0};
 }
 } // namespace ninfer::ops::detail::rmsnorm

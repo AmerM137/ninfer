@@ -1,4 +1,5 @@
 #include "ops/linear/split/dispatch.h"
+#include "ops/common/cuda/memory.cuh"
 #include "ops/linear/split/bf16/launch.cuh"
 
 namespace ninfer::ops::detail::linear_split {

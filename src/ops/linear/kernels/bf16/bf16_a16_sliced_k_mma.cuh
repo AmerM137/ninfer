@@ -1,4 +1,8 @@
 #pragma once
+#include "ops/common/cuda/pipeline.cuh"
+
+#include "ops/common/cuda/memory.cuh"
+#include "ops/common/cuda/mma.cuh"
 // Warps share an output tile and partition K. FP32 fragments are reduced before the epilogue.
 #include "ops/linear/kernels/bf16/bf16_mma_common.cuh"
 
@@ -57,9 +61,10 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_s
                                    (!bf16_predicated_k<Schedule> || group_k0 + k8 * 8 < kHidden);
                 const auto source =
                     valid ? static_cast<std::int64_t>(row0 + row) * kHidden + group_k0 + k8 * 8 : 0;
-                cp_async_zfill<16, Schedule::kWeightCache>(dst, weight + source, valid ? 16 : 0);
+                common::cp_async_zfill<16, Schedule::kWeightCache>(dst, weight + source,
+                                                                   valid ? 16 : 0);
             } else {
-                cp_async<16, Schedule::kWeightCache>(
+                common::cp_async<16, Schedule::kWeightCache>(
                     dst,
                     &weight[static_cast<std::int64_t>(row0 + row) * kHidden + group_k0 + k8 * 8]);
             }
@@ -73,7 +78,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_s
                                (!bf16_predicated_k<Schedule> || group_k0 + k8 * 8 < kHidden);
             const auto source =
                 valid ? static_cast<std::int64_t>(token0 + token) * kHidden + group_k0 + k8 * 8 : 0;
-            cp_async_zfill<16, Schedule::kActivationCache>(
+            common::cp_async_zfill<16, Schedule::kActivationCache>(
                 &x_shared[token * kBlockK + bf16_mma_shared_col<Schedule>(token, k8 * 8)],
                 x + source, valid ? 16 : 0);
         }
@@ -89,20 +94,21 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_s
                 unsigned a_frag[4];
                 const int a_col = warp_k0 + k_step * 16 + a_col_offset;
                 const int a_row = mi * 16 + a_row_offset;
-                ldmatrix_x4(a_frag[0], a_frag[1], a_frag[2], a_frag[3],
-                            smem_addr(weight_shared + a_row * kBlockK +
-                                      bf16_mma_shared_col<Schedule>(a_row, a_col)));
+                common::ldmatrix_x4(a_frag[0], a_frag[1], a_frag[2], a_frag[3],
+                                    common::smem_addr(weight_shared + a_row * kBlockK +
+                                                      bf16_mma_shared_col<Schedule>(a_row, a_col)));
 #pragma unroll
                 for (int ni = 0; ni < kTokenMmas; ++ni) {
                     unsigned b_frag[2];
                     const int b_row = ni * 8 + b_inner_row;
                     const int b_col = warp_k0 + k_step * 16 + b_k_offset;
-                    ldmatrix_x2(b_frag[0], b_frag[1],
-                                smem_addr(x_shared + b_row * kBlockK +
+                    common::ldmatrix_x2(
+                        b_frag[0], b_frag[1],
+                        common::smem_addr(x_shared + b_row * kBlockK +
                                           bf16_mma_shared_col<Schedule>(b_row, b_col)));
                     auto& c = accum[mi * kTokenMmas + ni];
-                    mma_bf16(c[0], c[1], c[2], c[3], a_frag[0], a_frag[1], a_frag[2], a_frag[3],
-                             b_frag[0], b_frag[1]);
+                    common::mma_bf16(c[0], c[1], c[2], c[3], a_frag[0], a_frag[1], a_frag[2],
+                                     a_frag[3], b_frag[0], b_frag[1]);
                 }
             }
         }
@@ -112,16 +118,16 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_s
     for (int stage = 0; stage < Schedule::kStages; ++stage) {
         if (stage < kGroups) {
             stage_group(stage, stage);
-            cp_commit();
+            common::cp_commit();
         }
     }
 
 #pragma unroll 1
     for (int group = 0; group < kGroups; ++group) {
         if (group + Schedule::kStages <= kGroups) {
-            cp_wait<Schedule::kStages - 1>();
+            common::cp_wait<Schedule::kStages - 1>();
         } else {
-            cp_wait<0>();
+            common::cp_wait<0>();
         }
         __syncthreads();
         const int stage = group % Schedule::kStages;
@@ -131,7 +137,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_s
         const int next = group + Schedule::kStages;
         if (next < kGroups) {
             stage_group(stage, next);
-            cp_commit();
+            common::cp_commit();
         }
     }
 
@@ -140,9 +146,9 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_s
         for (int fragment = 0; fragment < kFragments; ++fragment) {
             const std::int64_t base =
                 (static_cast<std::int64_t>(warp) * kFragments + fragment) * 32 * 4;
-            store_vec(partial + base + static_cast<std::int64_t>(lane) * 4,
-                      make_float4(accum[fragment][0], accum[fragment][1], accum[fragment][2],
-                                  accum[fragment][3]));
+            common::store_vec(partial + base + static_cast<std::int64_t>(lane) * 4,
+                              make_float4(accum[fragment][0], accum[fragment][1],
+                                          accum[fragment][2], accum[fragment][3]));
         }
     }
     __syncthreads();
@@ -154,11 +160,11 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_s
                 (static_cast<std::int64_t>(warp + 1) * kFragments + fragment) * 32 * 4;
             float4 partner = {};
             if constexpr (kKWarps % 2 == 0) {
-                partner =
-                    load_vec<float4>(partial + partner_base + static_cast<std::int64_t>(lane) * 4);
+                partner = common::load_vec<float4>(partial + partner_base +
+                                                   static_cast<std::int64_t>(lane) * 4);
             } else if (warp + 1 < kKWarps) {
-                partner =
-                    load_vec<float4>(partial + partner_base + static_cast<std::int64_t>(lane) * 4);
+                partner = common::load_vec<float4>(partial + partner_base +
+                                                   static_cast<std::int64_t>(lane) * 4);
             }
             accum[fragment][0] += partner.x;
             accum[fragment][1] += partner.y;
@@ -167,9 +173,9 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_s
             if (warp != 0) {
                 const std::int64_t base =
                     (static_cast<std::int64_t>(warp) * kFragments + fragment) * 32 * 4;
-                store_vec(partial + base + static_cast<std::int64_t>(lane) * 4,
-                          make_float4(accum[fragment][0], accum[fragment][1], accum[fragment][2],
-                                      accum[fragment][3]));
+                common::store_vec(partial + base + static_cast<std::int64_t>(lane) * 4,
+                                  make_float4(accum[fragment][0], accum[fragment][1],
+                                              accum[fragment][2], accum[fragment][3]));
             }
         }
     }
@@ -185,7 +191,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_s
                 const std::int64_t base =
                     (static_cast<std::int64_t>(split) * kFragments + fragment) * 32 * 4;
                 const float4 value =
-                    load_vec<float4>(partial + base + static_cast<std::int64_t>(lane) * 4);
+                    common::load_vec<float4>(partial + base + static_cast<std::int64_t>(lane) * 4);
                 sum.x += value.x;
                 sum.y += value.y;
                 sum.z += value.z;

@@ -1,6 +1,7 @@
 #pragma once
+
+#include "ops/common/numeric/math.h"
 #include "core/device.h"
-#include "ops/common/math.h"
 #include "ops/linear/kernels/q5/q5_a16_gemv.cuh"
 #include "ops/linear/kernels/q5/q5_operands.h"
 
@@ -16,7 +17,7 @@ void launch_q5_a16_gemv(const Q5LinearOperands& operands, Output output, Epilogu
         if (operands.k != Schedule::kStaticK || operands.padded_k != Schedule::kStaticK)
             throw std::invalid_argument("Q5 GEMV static geometry requires K == padded K");
     }
-    const dim3 grid(div_up(operands.rows, Schedule::kBlockRows));
+    const dim3 grid(common::div_up(operands.rows, Schedule::kBlockRows));
     const dim3 block(Schedule::kThreads);
     const std::size_t shared_bytes = Schedule::kStageX ? std::size_t(operands.k) * 2 : 0;
     if (shared_bytes + Schedule::kSharedBytes > 48 * 1024)

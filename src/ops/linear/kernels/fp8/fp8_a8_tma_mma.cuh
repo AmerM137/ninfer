@@ -1,12 +1,12 @@
 #pragma once
 
-#include "ops/common/mbarrier.cuh"
-#include "ops/common/math.h"
-#include "ops/common/token_slices.h"
+#include "ops/common/cuda/pipeline.cuh"
+#include "ops/common/host/launch.h"
+#include "ops/common/numeric/math.h"
+
 #include "ops/linear/common/epilogue.cuh"
 #include "ops/linear/kernels/fp8/fp8_a8_mma_common.cuh"
 #include "ops/linear/kernels/fp8/fp8_operands.h"
-#include "ops/linear/kernels/fp8/fp8_shared.cuh"
 
 #include <cuda.h>
 #include <algorithm>
@@ -74,15 +74,6 @@ inline CUtensorMap fp8_tma_map(const std::uint8_t* pointer, int rows, int k, int
     return result;
 }
 
-__device__ __forceinline__ void fp8_tma_load(void* destination, const CUtensorMap* map, int k,
-                                             int row, std::uint64_t* barrier) {
-    asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes "
-                 "[%0], [%1, {%2, %3}], [%4];"
-                 :
-                 : "r"(smem_addr(destination)), "l"(map), "r"(k), "r"(row), "r"(smem_addr(barrier))
-                 : "memory");
-}
-
 template <class Schedule, class Epilogue>
 inline constexpr int fp8_tma_scratch_bytes = [] {
     constexpr int epilogue_bytes = [] {
@@ -122,7 +113,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a8_tma
             tiles_k         = tiles_k * (part + 1) / parts - k_begin;
         }
     }
-    const int row_tiles = operands.rows / BR, token_tiles = div_up(count, BT);
+    const int row_tiles = operands.rows / BR, token_tiles = common::div_up(count, BT);
     int row_tile, token_tile;
     fp8_mma_tile_coordinates<Schedule>(tile, row_tiles, token_tiles, row_tile, token_tile);
     const int row_begin   = row_tile * (BR / (RowPolicy::kPaired ? 2 : 1));
@@ -137,10 +128,10 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a8_tma
     if (threadIdx.x == 0) {
 #pragma unroll
         for (int stage = 0; stage < S; ++stage) {
-            cta_mbarrier_init(full + stage, 1);
-            cta_mbarrier_init(empty + stage, Schedule::kConsumerWarps);
+            common::cta_mbarrier_init(full + stage, 1);
+            common::cta_mbarrier_init(empty + stage, Schedule::kConsumerWarps);
         }
-        cta_mbarrier_fence_init();
+        common::cta_mbarrier_fence_init();
     }
     __syncthreads();
 
@@ -148,24 +139,24 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a8_tma
         if (threadIdx.x == 0) {
             for (int kt = 0; kt < tiles_k; ++kt) {
                 const int stage = kt % S;
-                cta_mbarrier_wait(empty + stage, 1U ^ ((kt / S) & 1U));
-                cta_mbarrier_arrive_expect_tx(full + stage, (BT + BR) * BK);
-                fp8_tma_load(activation + stage * BT * BK, &descriptors.activation,
-                             (k_begin + kt) * BK, token_begin, full + stage);
+                common::cta_mbarrier_wait(empty + stage, 1U ^ ((kt / S) & 1U));
+                common::cta_mbarrier_arrive_expect_tx(full + stage, (BT + BR) * BK);
+                common::tma_load_2d(activation + stage * BT * BK, &descriptors.activation,
+                                    (k_begin + kt) * BK, token_begin, full + stage);
                 if constexpr (RowPolicy::kPaired) {
                     // Each consumer warp owns both gate/up fragments. Load their contiguous
                     // weight spans into that warp's logical shared rows without repacking.
                     constexpr int span = Schedule::kWarpRows / 2;
 #pragma unroll
                     for (int local = 0; local < BR; local += span) {
-                        fp8_tma_load(weight + (stage * BR + local) * BK, &descriptors.weight,
-                                     (k_begin + kt) * BK,
-                                     row_policy.weight_row(row_begin, local, operands.rows),
-                                     full + stage);
+                        common::tma_load_2d(weight + (stage * BR + local) * BK, &descriptors.weight,
+                                            (k_begin + kt) * BK,
+                                            row_policy.weight_row(row_begin, local, operands.rows),
+                                            full + stage);
                     }
                 } else {
-                    fp8_tma_load(weight + stage * BR * BK, &descriptors.weight, (k_begin + kt) * BK,
-                                 row_begin, full + stage);
+                    common::tma_load_2d(weight + stage * BR * BK, &descriptors.weight,
+                                        (k_begin + kt) * BK, row_begin, full + stage);
                 }
             }
         }
@@ -177,12 +168,12 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a8_tma
     float accumulators[Schedule::kMmaTokens][Schedule::kMmaRows][4] = {};
     for (int kt = 0; kt < tiles_k; ++kt) {
         const int stage = kt % S;
-        cta_mbarrier_wait(full + stage, (kt / S) & 1U);
+        common::cta_mbarrier_wait(full + stage, (kt / S) & 1U);
         fp8_mma_compute_stage<Schedule>(activation + stage * BT * BK, weight + stage * BR * BK,
                                         accumulators, warp, lane);
         // Release only after every lane in this consumer warp has finished its shared reads.
         __syncwarp();
-        if (lane == 0) cta_mbarrier_arrive(empty + stage);
+        if (lane == 0) common::cta_mbarrier_arrive(empty + stage);
     }
     if constexpr (SplitK) {
         if (partial >= 0) {
@@ -224,8 +215,8 @@ __global__ void fp8_a8_tma_split_k_reduce(Fp8A8Operands p, const float* partials
     const int tail               = blockIdx.x / Schedule::kReductionBlocks;
     const int chunk              = blockIdx.x % Schedule::kReductionBlocks;
     int row_tile, token_tile;
-    fp8_mma_tile_coordinates<Schedule>(plan.full_tiles + tail, p.rows / BR, div_up(count, BT),
-                                       row_tile, token_tile);
+    fp8_mma_tile_coordinates<Schedule>(plan.full_tiles + tail, p.rows / BR,
+                                       common::div_up(count, BT), row_tile, token_tile);
     const int first = plan.first_part(tail), parts = plan.parts(tail);
     const int row_begin    = row_tile * stored_rows;
     const auto tile_output = linear_output_tile<stored_rows>(output, row_begin);
@@ -290,15 +281,16 @@ void launch_fp8_a8_tma_mma(const Fp8A8Operands& p, Output output, Epilogue epilo
     const Fp8TmaDescriptors descriptors{
         fp8_tma_map(p.x, p.tokens, p.k, Schedule::kBlockTokens, Schedule::kBlockK),
         fp8_tma_map(p.codes, p.rows, p.k, weight_span, Schedule::kBlockK)};
-    for_each_token_slice(p.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
-        const int blocks  = p.rows / Schedule::kBlockRows * div_up(count, Schedule::kBlockTokens);
+    common::for_each_token_slice(p.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
+        const int blocks =
+            p.rows / Schedule::kBlockRows * common::div_up(count, Schedule::kBlockTokens);
         const auto plan   = fp8_tma_split_k_plan<Schedule>(blocks, p.k);
         const auto launch = [&]<bool Full, bool Split>() {
             constexpr auto kernel =
                 fp8_a8_tma_mma_kernel<Schedule, Full, Output, Epilogue, Split, RowPolicy>;
             constexpr int bytes =
                 fp8_tma_scratch_bytes<Schedule, Epilogue> + Schedule::kBarrierBytes;
-            const int dynamic = fp8_prepare_shared<bytes, kernel, true>();
+            const int dynamic = common::prepare_shared<bytes, kernel, true>();
             const int grid    = Split ? plan.full_tiles + plan.split_ctas : blocks;
             kernel<<<grid, Schedule::kThreads, dynamic, stream>>>(
                 descriptors, p, output, epilogue, row_policy, offset, count, plan, partials);

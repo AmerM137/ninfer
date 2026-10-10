@@ -1,8 +1,9 @@
 #pragma once
 
+#include "ops/common/host/launch.h"
+#include "ops/common/numeric/math.h"
+
 #include "core/device.h"
-#include "ops/common/math.h"
-#include "ops/common/token_slices.h"
 #include "ops/linear/common/epilogue.cuh"
 #include "ops/linear/kernels/q6/q6_operands.h"
 #include "ops/linear/kernels/q6/q6_a16_simt.cuh"
@@ -13,15 +14,17 @@ template <class Schedule, class Output, class Epilogue = LinearIdentityEpilogue>
 void launch_q6_a16_simt(const Q6LinearOperands& operands, Output output, Epilogue epilogue,
                         cudaStream_t stream) {
     validate_q6_operands(operands);
-    for_each_token_slice(operands.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
-        const dim3 grid(static_cast<unsigned>(div_up(operands.rows, Schedule::kBlockRows)),
-                        static_cast<unsigned>(div_up(count, Schedule::kBlockTokens)));
-        const auto* x = operands.x + static_cast<std::int64_t>(offset) * operands.k;
-        q6_a16_simt_kernel<Schedule><<<grid, Schedule::kThreads, 0, stream>>>(
-            x, operands.codes, operands.high, operands.scales, output, epilogue, operands.rows,
-            operands.k, count, operands.padded_k, offset);
-        CUDA_CHECK(cudaGetLastError());
-    });
+    common::for_each_token_slice(
+        operands.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
+            const dim3 grid(
+                static_cast<unsigned>(common::div_up(operands.rows, Schedule::kBlockRows)),
+                static_cast<unsigned>(common::div_up(count, Schedule::kBlockTokens)));
+            const auto* x = operands.x + static_cast<std::int64_t>(offset) * operands.k;
+            q6_a16_simt_kernel<Schedule><<<grid, Schedule::kThreads, 0, stream>>>(
+                x, operands.codes, operands.high, operands.scales, output, epilogue, operands.rows,
+                operands.k, count, operands.padded_k, offset);
+            CUDA_CHECK(cudaGetLastError());
+        });
 }
 
 template <class Schedule, class Output, class Epilogue = LinearIdentityEpilogue>

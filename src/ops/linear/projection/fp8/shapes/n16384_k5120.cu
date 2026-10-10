@@ -1,4 +1,5 @@
 #include "ops/linear/projection/fp8/fp8_shapes.h"
+#include "ops/common/cuda/memory.cuh"
 #include "ops/linear/projection/fp8/fp8_launch.cuh"
 
 namespace ninfer::ops::detail {

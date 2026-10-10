@@ -1,10 +1,11 @@
 #pragma once
 
+#include "ops/common/cuda/memory.cuh"
+#include "ops/common/cuda/reduce.cuh"
+#include "ops/common/numeric/convert.cuh"
+
 #include "ops/linear/kernels/bf16/bf16_schedule.cuh"
-#include "ops/common/math.cuh"
 #include "ops/linear/common/epilogue.cuh"
-#include "ops/common/memory.cuh"
-#include "ops/common/warp.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -26,11 +27,11 @@ static_assert(sizeof(Bf16GemvPack<16>) == 32);
 template <int Values>
 __device__ __forceinline__ Bf16GemvPack<Values> load_bf16_pack(const __nv_bfloat16* pointer) {
     if constexpr (Values <= 8) {
-        return load_vec<Bf16GemvPack<Values>>(pointer);
+        return common::load_vec<Bf16GemvPack<Values>>(pointer);
     } else {
         Bf16GemvPack<Values> result;
-        const Bf16GemvPack<8> low  = load_vec<Bf16GemvPack<8>>(pointer);
-        const Bf16GemvPack<8> high = load_vec<Bf16GemvPack<8>>(pointer + 8);
+        const Bf16GemvPack<8> low  = common::load_vec<Bf16GemvPack<8>>(pointer);
+        const Bf16GemvPack<8> high = common::load_vec<Bf16GemvPack<8>>(pointer + 8);
 #pragma unroll
         for (int pair = 0; pair < 4; ++pair) {
             result.words[pair]     = low.words[pair];
@@ -50,13 +51,13 @@ load_bf16_weight_pack(const __nv_bfloat16* pointer) {
         asm volatile("ld.global.cg.v2.u32 {%0, %1}, [%2];\n"
                      : "=r"(bits.x), "=r"(bits.y)
                      : "l"(pointer));
-        return load_vec<Bf16GemvPack<Values>>(&bits);
+        return common::load_vec<Bf16GemvPack<Values>>(&bits);
     } else if constexpr (Values == 8) {
         uint4 bits;
         asm volatile("ld.global.cg.v4.u32 {%0, %1, %2, %3}, [%4];\n"
                      : "=r"(bits.x), "=r"(bits.y), "=r"(bits.z), "=r"(bits.w)
                      : "l"(pointer));
-        return load_vec<Bf16GemvPack<Values>>(&bits);
+        return common::load_vec<Bf16GemvPack<Values>>(&bits);
     } else {
         Bf16GemvPack<Values> result;
         const Bf16GemvPack<8> low  = load_bf16_weight_pack<Cache, 8>(pointer);
@@ -76,8 +77,8 @@ __device__ __forceinline__ void accumulate_bf16_packs(const Bf16GemvPack<Values>
                                                       float (&accumulators)[AccumulatorChains]) {
 #pragma unroll
     for (int pair = 0; pair < Values / 2; ++pair) {
-        const float2 w           = bf16x2_bits_to_float2(weight.words[pair]);
-        const float2 x           = bf16x2_bits_to_float2(activation.words[pair]);
+        const float2 w           = common::bf16x2_bits_to_float2(weight.words[pair]);
+        const float2 x           = common::bf16x2_bits_to_float2(activation.words[pair]);
         constexpr int kChainMask = AccumulatorChains - 1;
         accumulators[(2 * pair) & kChainMask] =
             fmaf(w.x, x.x, accumulators[(2 * pair) & kChainMask]);
@@ -95,7 +96,7 @@ struct Bf16GemvSharedStorage {
 
 template <class Schedule>
 __device__ __forceinline__ std::int32_t bf16_phase_offset(int phase, int warp_in_row, int lane) {
-    constexpr int kValuesPerWarp = kWarpSize * Schedule::kValuesPerLane;
+    constexpr int kValuesPerWarp = common::kWarpSize * Schedule::kValuesPerLane;
     return phase * Schedule::kWarpsPerRow * kValuesPerWarp + warp_in_row * kValuesPerWarp +
            lane * Schedule::kValuesPerLane;
 }
@@ -144,7 +145,8 @@ compute_bf16_gemv_rows(const __nv_bfloat16* activation, const __nv_bfloat16* wei
                        float (&accumulators)[Schedule::kRowsPerWarp][Schedule::kAccumulatorChains],
                        int input_rows) {
     const int K                   = Schedule::kStaticK ? Schedule::kStaticK : input_rows;
-    constexpr int kValuesPerPhase = Schedule::kWarpsPerRow * kWarpSize * Schedule::kValuesPerLane;
+    constexpr int kValuesPerPhase =
+        Schedule::kWarpsPerRow * common::kWarpSize * Schedule::kValuesPerLane;
     const int phases =
         K / kValuesPerPhase + (bf16_predicated_k<Schedule> && K % kValuesPerPhase != 0);
     using Pack = Bf16GemvPack<Schedule::kValuesPerLane>;
@@ -221,8 +223,8 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_g
         activation = reinterpret_cast<const __nv_bfloat16*>(activation_raw);
     }
 
-    const int lane         = static_cast<int>(threadIdx.x) & (kWarpSize - 1);
-    const int warp         = static_cast<int>(threadIdx.x) / kWarpSize;
+    const int lane         = static_cast<int>(threadIdx.x) & (common::kWarpSize - 1);
+    const int warp         = static_cast<int>(threadIdx.x) / common::kWarpSize;
     const int row_group    = warp / Schedule::kWarpsPerRow;
     const int warp_in_row  = warp % Schedule::kWarpsPerRow;
     const int cta_row0     = static_cast<int>(blockIdx.x) * Schedule::kBlockRows;
@@ -240,7 +242,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_g
         for (int chain = 0; chain < Schedule::kAccumulatorChains; ++chain) {
             total += accumulators[local_row][chain];
         }
-        warp_totals[local_row] = warp_reduce_sum(total);
+        warp_totals[local_row] = common::warp_reduce_sum(total);
     }
 
     if constexpr (Schedule::kWarpsPerRow == 1) {
@@ -265,7 +267,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_g
                 const float partial = lane < Schedule::kWarpsPerRow
                                           ? shared.partials[row_group][local_row][lane]
                                           : 0.0F;
-                const float total   = warp_reduce_sum(partial);
+                const float total   = common::warp_reduce_sum(partial);
                 if (lane == 0) {
                     const float values[]{total};
                     linear_finish_row(destination, epilogue, row0 + local_row, 0, values, 1);

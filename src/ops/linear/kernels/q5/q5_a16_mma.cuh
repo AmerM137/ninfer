@@ -1,8 +1,12 @@
 #pragma once
+#include "ops/common/cuda/pipeline.cuh"
+
+#include "ops/common/cuda/memory.cuh"
+#include "ops/common/cuda/mma.cuh"
+#include "ops/common/quant/integer.cuh"
 
 // Row/tokens tiled Q5 x BF16 MMA. Scaled weights are materialized as BF16;
 // accumulation is FP32. N/K/T stay runtime values and the launcher owns bounds.
-#include "ops/common/mma.cuh"
 #include "ops/linear/kernels/q5/q5_schedule.cuh"
 
 namespace ninfer::ops::detail {
@@ -44,11 +48,13 @@ void q5_a16_mma_kernel(
 
     __shared__ __align__(16) __nv_bfloat16 As[BM * BK];
     __shared__ __align__(16) __nv_bfloat16 Bs[BS][BN * BK];
-    __shared__ __align__(16) std::uint8_t Cr[S][BM * GPB * Q5RowSplitStorage::kCodeBytesPerGroup];
-    __shared__ __align__(16) std::uint8_t Hr[S][BM * GPB * Q5RowSplitStorage::kHighBytesPerGroup];
+    __shared__ __align__(16)
+        std::uint8_t Cr[S][BM * GPB * common::Q5RowSplitStorage::kCodeBytesPerGroup];
+    __shared__ __align__(16)
+        std::uint8_t Hr[S][BM * GPB * common::Q5RowSplitStorage::kHighBytesPerGroup];
     __shared__ __align__(16) std::uint8_t Sr[S][BM * GPB * SB];
 
-    const int groups_per_row = padded_k / Q5RowSplitStorage::kGroupK;
+    const int groups_per_row = padded_k / common::Q5RowSplitStorage::kGroupK;
     const int tid            = static_cast<int>(threadIdx.x);
     const int warp           = tid >> 5;
     const int lane           = tid & 31;
@@ -91,21 +97,21 @@ void q5_a16_mma_kernel(
             const int col       = col0 + local_col;
             auto* dst = &Bs[stage][local_col * BK + q5_mma_swizzle_k64(local_col, k8 * 8)];
             if constexpr (kFull) {
-                cp_async<16, Schedule::kActivationCache>(
+                common::cp_async<16, Schedule::kActivationCache>(
                     dst, &x[static_cast<std::int64_t>(col) * k + kk]);
             } else {
                 if (col < cols && kk + 8 <= k) {
-                    cp_async<16, Schedule::kActivationCache>(
+                    common::cp_async<16, Schedule::kActivationCache>(
                         dst, &x[static_cast<std::int64_t>(col) * k + kk]);
                 } else {
-                    store_vec(dst, make_int4(0, 0, 0, 0));
+                    common::store_vec(dst, make_int4(0, 0, 0, 0));
                 }
             }
         }
     };
 
     auto stage_quant = [&](int stage, int k_tile) {
-        const int group0 = (k_tile * BK) / Q5RowSplitStorage::kGroupK;
+        const int group0 = (k_tile * BK) / common::Q5RowSplitStorage::kGroupK;
 #pragma unroll 1
         for (int item = tid; item < BM * GPB * 2; item += Schedule::kThreads) {
             const int row_group = item >> 1;
@@ -113,21 +119,23 @@ void q5_a16_mma_kernel(
             const int local_row = row_group / GPB;
             const int group     = row_group - local_row * GPB;
             const int row       = row0 + local_row;
-            auto* dst = &Cr[stage][row_group * Q5RowSplitStorage::kCodeBytesPerGroup + half * 16];
+            auto* dst =
+                &Cr[stage][row_group * common::Q5RowSplitStorage::kCodeBytesPerGroup + half * 16];
             if constexpr (kFull) {
                 const std::int64_t group_index =
                     static_cast<std::int64_t>(row) * groups_per_row + group0 + group;
-                cp_async<16, Schedule::kWeightCache>(
-                    dst, &codes[group_index * Q5RowSplitStorage::kCodeBytesPerGroup + half * 16]);
+                common::cp_async<16, Schedule::kWeightCache>(
+                    dst, &codes[group_index * common::Q5RowSplitStorage::kCodeBytesPerGroup +
+                                half * 16]);
             } else {
                 if (row < rows && group0 + group < (k + 63) / 64) {
                     const std::int64_t group_index =
                         static_cast<std::int64_t>(row) * groups_per_row + group0 + group;
-                    cp_async<16, Schedule::kWeightCache>(
-                        dst,
-                        &codes[group_index * Q5RowSplitStorage::kCodeBytesPerGroup + half * 16]);
+                    common::cp_async<16, Schedule::kWeightCache>(
+                        dst, &codes[group_index * common::Q5RowSplitStorage::kCodeBytesPerGroup +
+                                    half * 16]);
                 } else {
-                    store_vec(dst, make_int4(0, 0, 0, 0));
+                    common::store_vec(dst, make_int4(0, 0, 0, 0));
                 }
             }
         }
@@ -140,7 +148,8 @@ void q5_a16_mma_kernel(
             const bool valid    = kFull || (row < rows && group0 + group < (k + 63) / 64);
             const std::int64_t index =
                 valid ? std::int64_t(row) * groups_per_row + group0 + group : 0;
-            cp_async_zfill<kHighGroups * 8, kHighGroups == 2 ? Schedule::kWeightCache : Cache::ca>(
+            common::cp_async_zfill<kHighGroups * 8,
+                                   kHighGroups == 2 ? Schedule::kWeightCache : Cache::ca>(
                 &Hr[stage][item * kHighGroups * 8], high + index * 8, valid ? kHighGroups * 8 : 0);
         }
 
@@ -159,18 +168,20 @@ void q5_a16_mma_kernel(
                     const std::int64_t aligned_index =
                         static_cast<std::int64_t>(row) * groups_per_row + aligned_group;
                     if (aligned_group + 1 < groups_per_row) {
-                        cp_async<4>(
-                            dst, &scales[aligned_index * Q5RowSplitStorage::kScaleBytesPerGroup]);
+                        common::cp_async<4>(
+                            dst, &scales[aligned_index *
+                                         common::Q5RowSplitStorage::kScaleBytesPerGroup]);
                     } else {
                         *reinterpret_cast<std::uint16_t*>(dst) =
                             *reinterpret_cast<const std::uint16_t*>(
-                                &scales[group_index * Q5RowSplitStorage::kScaleBytesPerGroup]);
+                                &scales[group_index *
+                                        common::Q5RowSplitStorage::kScaleBytesPerGroup]);
                         *reinterpret_cast<std::uint16_t*>(dst + 2) = 0;
                     }
                 } else {
                     *reinterpret_cast<std::uint16_t*>(dst) =
                         *reinterpret_cast<const std::uint16_t*>(
-                            &scales[group_index * Q5RowSplitStorage::kScaleBytesPerGroup]);
+                            &scales[group_index * common::Q5RowSplitStorage::kScaleBytesPerGroup]);
                 }
             } else {
                 if (row < rows && group0 + group < (k + 63) / 64) {
@@ -181,19 +192,21 @@ void q5_a16_mma_kernel(
                         const std::int64_t aligned_index =
                             static_cast<std::int64_t>(row) * groups_per_row + aligned_group;
                         if (aligned_group + 1 < groups_per_row) {
-                            cp_async<4>(
-                                dst,
-                                &scales[aligned_index * Q5RowSplitStorage::kScaleBytesPerGroup]);
+                            common::cp_async<4>(
+                                dst, &scales[aligned_index *
+                                             common::Q5RowSplitStorage::kScaleBytesPerGroup]);
                         } else {
                             *reinterpret_cast<std::uint16_t*>(dst) =
                                 *reinterpret_cast<const std::uint16_t*>(
-                                    &scales[group_index * Q5RowSplitStorage::kScaleBytesPerGroup]);
+                                    &scales[group_index *
+                                            common::Q5RowSplitStorage::kScaleBytesPerGroup]);
                             *reinterpret_cast<std::uint16_t*>(dst + 2) = 0;
                         }
                     } else {
                         *reinterpret_cast<std::uint16_t*>(dst) =
                             *reinterpret_cast<const std::uint16_t*>(
-                                &scales[group_index * Q5RowSplitStorage::kScaleBytesPerGroup]);
+                                &scales[group_index *
+                                        common::Q5RowSplitStorage::kScaleBytesPerGroup]);
                     }
                 } else {
                     dst[0] = 0;
@@ -213,22 +226,23 @@ void q5_a16_mma_kernel(
     };
 
     auto decode_weight = [&](int stage, int k_tile) {
-        const int scale_group = (k_tile * BK) / Q5RowSplitStorage::kGroupK;
+        const int scale_group = (k_tile * BK) / common::Q5RowSplitStorage::kGroupK;
         for (int local_row = warp; local_row < BM; local_row += Schedule::kWarps) {
             auto* dst = &As[local_row * BK];
 #pragma unroll
             for (int group = 0; group < GPB; ++group) {
                 const int staged_group = local_row * GPB + group;
                 const std::uint8_t* scale_ptr =
-                    &Sr[stage][staged_group * SB + (Schedule::kScaleLoadMode == Q5ScaleLoad::Pair32
-                                                        ? ((scale_group + group) & 1) *
-                                                              Q5RowSplitStorage::kScaleBytesPerGroup
-                                                        : 0)];
-                const __nv_bfloat162 weights = Q5MmaDecodeAtom::decode_pair(
+                    &Sr[stage][staged_group * SB +
+                               (Schedule::kScaleLoadMode == Q5ScaleLoad::Pair32
+                                    ? ((scale_group + group) & 1) *
+                                          common::Q5RowSplitStorage::kScaleBytesPerGroup
+                                    : 0)];
+                const __nv_bfloat162 weights = common::Q5MmaDecodeAtom::decode_pair(
                     Cr[stage], Hr[stage], scale_ptr, staged_group, lane);
-                const int shared_col =
-                    q5_mma_swizzle_k64(local_row, group * Q5RowSplitStorage::kGroupK + 2 * lane);
-                store_vec(&dst[shared_col], weights);
+                const int shared_col = q5_mma_swizzle_k64(
+                    local_row, group * common::Q5RowSplitStorage::kGroupK + 2 * lane);
+                common::store_vec(&dst[shared_col], weights);
             }
         }
     };
@@ -237,24 +251,24 @@ void q5_a16_mma_kernel(
 #pragma unroll
         for (int stage = 0; stage < S; ++stage) {
             if (stage < k_tiles) { stage_inputs(stage, stage); }
-            cp_commit();
+            common::cp_commit();
         }
     } else {
 #pragma unroll
         for (int stage = 0; stage < S; ++stage) {
             if (stage < k_tiles) { stage_quant(stage, stage); }
-            cp_commit();
+            common::cp_commit();
         }
         if (k_tiles > 0) { stage_activation(0, 0); }
-        cp_commit();
+        common::cp_commit();
     }
 
     for (int k_tile = 0; k_tile < k_tiles; ++k_tile) {
         const int stage = k_tile % S;
         if constexpr (BS == S) {
-            cp_wait<S - 1>();
+            common::cp_wait<S - 1>();
         } else {
-            cp_wait<0>();
+            common::cp_wait<0>();
         }
         __syncthreads();
 
@@ -264,7 +278,7 @@ void q5_a16_mma_kernel(
         if constexpr (BS == 1 && BS != S) {
             const int prefetch_quant_tile = k_tile + S;
             if (prefetch_quant_tile < k_tiles) { stage_quant(stage, prefetch_quant_tile); }
-            cp_commit();
+            common::cp_commit();
         }
 
         auto load_fragments = [&](int k_step, unsigned(&a_frag)[MT][4], unsigned(&b_frag)[NT][2]) {
@@ -272,16 +286,18 @@ void q5_a16_mma_kernel(
             for (int mi = 0; mi < MT; ++mi) {
                 const int row = warp_row * WM + mi * 16 + a_row_offset;
                 const int col = k_step + a_col_offset;
-                ldmatrix_x4(a_frag[mi][0], a_frag[mi][1], a_frag[mi][2], a_frag[mi][3],
-                            smem_addr(&As[row * BK + q5_mma_swizzle_k64(row, col)]));
+                common::ldmatrix_x4(
+                    a_frag[mi][0], a_frag[mi][1], a_frag[mi][2], a_frag[mi][3],
+                    common::smem_addr(&As[row * BK + q5_mma_swizzle_k64(row, col)]));
             }
 #pragma unroll
             for (int ni = 0; ni < NT; ++ni) {
                 const int row = warp_col * WN + ni * 8 + b_inner_row;
                 const int col = k_step + b_k_offset;
-                ldmatrix_x2(
+                common::ldmatrix_x2(
                     b_frag[ni][0], b_frag[ni][1],
-                    smem_addr(&Bs[BS == 1 ? 0 : stage][row * BK + q5_mma_swizzle_k64(row, col)]));
+                    common::smem_addr(
+                        &Bs[BS == 1 ? 0 : stage][row * BK + q5_mma_swizzle_k64(row, col)]));
             }
         };
 
@@ -298,10 +314,10 @@ void q5_a16_mma_kernel(
                 for (int mi = 0; mi < MT; ++mi) {
 #pragma unroll
                     for (int ni = 0; ni < NT; ++ni) {
-                        mma_bf16(accum[mi][ni][0], accum[mi][ni][1], accum[mi][ni][2],
-                                 accum[mi][ni][3], a_frag[current][mi][0], a_frag[current][mi][1],
-                                 a_frag[current][mi][2], a_frag[current][mi][3],
-                                 b_frag[current][ni][0], b_frag[current][ni][1]);
+                        common::mma_bf16(
+                            accum[mi][ni][0], accum[mi][ni][1], accum[mi][ni][2], accum[mi][ni][3],
+                            a_frag[current][mi][0], a_frag[current][mi][1], a_frag[current][mi][2],
+                            a_frag[current][mi][3], b_frag[current][ni][0], b_frag[current][ni][1]);
                     }
                 }
             }
@@ -315,9 +331,10 @@ void q5_a16_mma_kernel(
                 for (int mi = 0; mi < MT; ++mi) {
 #pragma unroll
                     for (int ni = 0; ni < NT; ++ni) {
-                        mma_bf16(accum[mi][ni][0], accum[mi][ni][1], accum[mi][ni][2],
-                                 accum[mi][ni][3], a_frag[mi][0], a_frag[mi][1], a_frag[mi][2],
-                                 a_frag[mi][3], b_frag[ni][0], b_frag[ni][1]);
+                        common::mma_bf16(accum[mi][ni][0], accum[mi][ni][1], accum[mi][ni][2],
+                                         accum[mi][ni][3], a_frag[mi][0], a_frag[mi][1],
+                                         a_frag[mi][2], a_frag[mi][3], b_frag[ni][0],
+                                         b_frag[ni][1]);
                     }
                 }
             }
@@ -327,11 +344,11 @@ void q5_a16_mma_kernel(
         if constexpr (BS == S) {
             const int prefetch_tile = k_tile + S;
             if (prefetch_tile < k_tiles) { stage_inputs(stage, prefetch_tile); }
-            cp_commit();
+            common::cp_commit();
         } else {
             const int next_tile = k_tile + 1;
             if (next_tile < k_tiles) { stage_activation(0, next_tile); }
-            cp_commit();
+            common::cp_commit();
         }
     }
 

@@ -1,4 +1,5 @@
 #include "ops/rmsnorm/launch.h"
+#include "ops/common/cuda/reduce.cuh"
 #include "ops/rmsnorm/kernel/warp.cuh"
 #include "ops/rmsnorm/kernel/cta.cuh"
 #include "ops/rmsnorm/kernel/generic.cuh"
@@ -12,7 +13,8 @@ namespace {
 template <Epilogue Kind, int Block>
 void launch_d128(const __nv_bfloat162* x, const __nv_bfloat162* weight, const __nv_bfloat162* gate,
                  __nv_bfloat162* out, std::int64_t rows, float eps, cudaStream_t stream) {
-    const auto blocks = static_cast<unsigned>((rows + Block / kWarpSize - 1) / (Block / kWarpSize));
+    const auto blocks =
+        static_cast<unsigned>((rows + Block / common::kWarpSize - 1) / (Block / common::kWarpSize));
     rmsnorm_d128_bf16x2_kernel<Kind, Block>
         <<<blocks, Block, 0, stream>>>(x, weight, gate, out, rows, eps);
 }

@@ -1,7 +1,11 @@
 #pragma once
+#include "ops/common/cuda/pipeline.cuh"
+
+#include "ops/common/cuda/memory.cuh"
+#include "ops/common/cuda/reduce.cuh"
+#include "ops/common/quant/integer.cuh"
 
 #include "core/pdl.cuh"
-#include "ops/common/warp.cuh"
 #include "ops/linear/common/epilogue.cuh"
 #include "ops/linear/kernels/q5/q5_schedule.cuh"
 
@@ -38,7 +42,7 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
     const int logical_k = Schedule::kStaticK ? Schedule::kStaticK : k;
     if constexpr (Schedule::kStageX) {
         for (int item = int(threadIdx.x); item < logical_k / 8; item += Schedule::kThreads)
-            store_vec(shared_x + item * 8, load_vec<uint4>(x + item * 8));
+            common::store_vec(shared_x + item * 8, common::load_vec<uint4>(x + item * 8));
         __syncthreads();
     }
     const auto* activation    = Schedule::kStageX ? shared_x : x;
@@ -59,30 +63,32 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
         const int active  = kFullTiles ? G : min(G, groups - tile * G);
         const auto group0 = row0 + tile * G;
         for (int item = lane; item < G * 2; item += 32)
-            cp_async_zfill<16, Schedule::kWeightCache>(&shared.codes[warp][slot][item],
-                                                       codes + group0 * 32 + item * 16,
-                                                       item < active * 2 ? 16 : 0);
+            common::cp_async_zfill<16, Schedule::kWeightCache>(&shared.codes[warp][slot][item],
+                                                               codes + group0 * 32 + item * 16,
+                                                               item < active * 2 ? 16 : 0);
         for (int item = lane; item < G / 2; item += 32)
-            cp_async_zfill<16, Schedule::kWeightCache>(&shared.high[warp][slot][item],
-                                                       high + group0 * 8 + item * 16,
-                                                       item < active / 2 ? 16 : 0);
+            common::cp_async_zfill<16, Schedule::kWeightCache>(&shared.high[warp][slot][item],
+                                                               high + group0 * 8 + item * 16,
+                                                               item < active / 2 ? 16 : 0);
         if constexpr (WideScales) {
             for (int item = lane; item < G / 8; item += 32)
-                cp_async_zfill<16>(reinterpret_cast<uint4*>(shared.scales[warp][slot]) + item,
-                                   scales + group0 * 2 + item * 16, item < active / 8 ? 16 : 0);
+                common::cp_async_zfill<16>(
+                    reinterpret_cast<uint4*>(shared.scales[warp][slot]) + item,
+                    scales + group0 * 2 + item * 16, item < active / 8 ? 16 : 0);
         } else {
             for (int item = lane; item < G / 2; item += 32)
-                cp_async_zfill<4>(&shared.scales[warp][slot][item], scales + group0 * 2 + item * 4,
-                                  item < active / 2 ? 4 : 0);
+                common::cp_async_zfill<4>(&shared.scales[warp][slot][item],
+                                          scales + group0 * 2 + item * 4,
+                                          item < active / 2 ? 4 : 0);
         }
-        cp_commit();
+        common::cp_commit();
     };
 #pragma unroll
     for (int prefetch = 0; prefetch < S - 1; ++prefetch) {
         if (prefetch < tiles)
             stage(prefetch, prefetch);
         else
-            cp_commit();
+            common::cp_commit();
     }
     float acc = 0;
 #pragma unroll 1
@@ -90,28 +96,29 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
         if (tile + S - 1 < tiles)
             stage((tile + S - 1) % S, tile + S - 1);
         else
-            cp_commit();
-        cp_wait<S - 1>();
+            common::cp_commit();
+        common::cp_wait<S - 1>();
         __syncwarp();
         const int slot = tile % S;
 #pragma unroll
         for (int group = 0; group < G; ++group) {
             if (kFullTiles || group < groups - tile * G) {
                 float w0, w1;
-                Q5ScalarDecodeAtom::decode_pair(
+                common::Q5ScalarDecodeAtom::decode_pair(
                     reinterpret_cast<const std::uint8_t*>(shared.codes[warp][slot]),
                     reinterpret_cast<const std::uint8_t*>(shared.high[warp][slot]),
                     reinterpret_cast<const std::uint8_t*>(shared.scales[warp][slot]), group, lane,
                     w0, w1);
                 const auto kk      = (group_begin + tile * G + group) * 64 + lane * 2;
-                const float2 value = __bfloat1622float2(load_vec<__nv_bfloat162>(activation + kk));
+                const float2 value =
+                    __bfloat1622float2(common::load_vec<__nv_bfloat162>(activation + kk));
                 acc                = fmaf(w0, value.x, acc);
                 acc                = fmaf(w1, value.y, acc);
             }
         }
         __syncwarp();
     }
-    acc = warp_reduce_sum(acc);
+    acc = common::warp_reduce_sum(acc);
     if constexpr (W > 1) {
         if (lane == 0) shared.partial[local_row][split] = acc;
         __syncthreads();

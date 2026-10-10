@@ -1,6 +1,7 @@
 #pragma once
+
+#include "ops/common/cuda/memory.cuh"
 #include "ops/linear/kernels/nvfp4/nvfp4_layout.h"
-#include "ops/common/memory.cuh"
 #include <cuda.h>
 #include <cuda_bf16.h>
 
@@ -167,7 +168,6 @@ struct Nvfp4A4TmaMmaSchedule {
     static_assert(kScaleWordsPerRow * 4 == kNvfp4ScaleTileGroups);
     static_assert((kBlockK / 16) * 2 == kNvfp4ScaleTileGroups);
 };
-
 
 enum class Nvfp4MmaFragmentPipeline : std::uint8_t {
     Serial,

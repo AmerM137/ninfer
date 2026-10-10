@@ -1,6 +1,11 @@
 #pragma once
+#include "ops/common/cuda/pipeline.cuh"
 
-#include "ops/common/warp.cuh"
+#include "ops/common/cuda/memory.cuh"
+#include "ops/common/cuda/reduce.cuh"
+#include "ops/common/numeric/convert.cuh"
+#include "ops/common/quant/integer.cuh"
+
 #include "ops/linear/kernels/q6/q6_schedule.cuh"
 
 namespace ninfer::ops::detail {
@@ -9,9 +14,9 @@ template <class Schedule>
 __device__ __forceinline__ void q6_simt_copy_code(uint4* shared_dst,
                                                   const std::uint8_t* global_src) {
     if constexpr (Schedule::kCodeCache == Cache::cg) {
-        cp_async<16, Cache::cg>(shared_dst, global_src);
+        common::cp_async<16, Cache::cg>(shared_dst, global_src);
     } else {
-        cp_async<16, Cache::ca>(shared_dst, global_src);
+        common::cp_async<16, Cache::ca>(shared_dst, global_src);
     }
 }
 
@@ -28,12 +33,16 @@ __device__ __forceinline__ void q6_simt_issue_stage(uint4* __restrict__ shared_c
     constexpr int kScalePairs = Schedule::kScalePairsPerStage;
 
     const std::int64_t group0 = static_cast<std::int64_t>(stage) * Schedule::kGroupsPerWarpStage;
-    const std::uint8_t* stage_codes  = code_row + group0 * Q6RowSplitStorage::kCodeBytesPerGroup;
-    const std::uint8_t* stage_high   = high_row + group0 * Q6RowSplitStorage::kHighBytesPerGroup;
-    const std::uint8_t* stage_scales = scale_row + group0 * Q6RowSplitStorage::kScaleBytesPerGroup;
+    const std::uint8_t* stage_codes =
+        code_row + group0 * common::Q6RowSplitStorage::kCodeBytesPerGroup;
+    const std::uint8_t* stage_high =
+        high_row + group0 * common::Q6RowSplitStorage::kHighBytesPerGroup;
+    const std::uint8_t* stage_scales =
+        scale_row + group0 * common::Q6RowSplitStorage::kScaleBytesPerGroup;
 
     const int active_code_vecs = FullStage ? kCodeVecs
-                                           : active_groups * Q6RowSplitStorage::kCodeBytesPerGroup /
+                                           : active_groups *
+                                                 common::Q6RowSplitStorage::kCodeBytesPerGroup /
                                                  static_cast<int>(sizeof(uint4));
     for (int vec = lane; vec < kCodeVecs; vec += 32) {
         if (FullStage || vec < active_code_vecs) {
@@ -45,7 +54,8 @@ __device__ __forceinline__ void q6_simt_issue_stage(uint4* __restrict__ shared_c
     }
 
     const int active_high_vecs = FullStage ? kHighVecs
-                                           : active_groups * Q6RowSplitStorage::kHighBytesPerGroup /
+                                           : active_groups *
+                                                 common::Q6RowSplitStorage::kHighBytesPerGroup /
                                                  static_cast<int>(sizeof(uint4));
     for (int vec = lane; vec < kHighVecs; vec += 32) {
         if (FullStage || vec < active_high_vecs) {
@@ -59,12 +69,13 @@ __device__ __forceinline__ void q6_simt_issue_stage(uint4* __restrict__ shared_c
     const int active_scale_pairs = FullStage ? kScalePairs : active_groups / 2;
     for (int pair = lane; pair < kScalePairs; pair += 32) {
         if (FullStage || pair < active_scale_pairs) {
-            cp_async<4>(&shared_scales[pair], stage_scales + static_cast<std::int64_t>(pair) * 4);
+            common::cp_async<4>(&shared_scales[pair],
+                                stage_scales + static_cast<std::int64_t>(pair) * 4);
         } else {
             shared_scales[pair] = 0u;
         }
     }
-    cp_commit();
+    common::cp_commit();
 }
 
 template <class Schedule, bool FullStage, bool FullCols>
@@ -91,7 +102,7 @@ q6_simt_consume_stage(const __nv_bfloat16* __restrict__ x, std::int32_t k, int c
                 static_cast<std::uint16_t>(scale_pair >> ((group & 1) * 16));
 
             float weights[8];
-            Q6SimtDecodeAtom::decode_eight(packed, high_bits, scale_bits, weights);
+            common::Q6SimtDecodeAtom::decode_eight(packed, high_bits, scale_bits, weights);
 
             const std::int64_t xk = static_cast<std::int64_t>(stage) * Schedule::kStageK +
                                     static_cast<std::int64_t>(phase) * 256 + lane * 8;
@@ -99,11 +110,11 @@ q6_simt_consume_stage(const __nv_bfloat16* __restrict__ x, std::int32_t k, int c
             for (int col = 0; col < kCols; ++col) {
                 if (FullCols || col < active_cols) {
                     const uint4 values =
-                        load_vec<uint4>(x + static_cast<std::int64_t>(col0 + col) * k + xk);
-                    const float2 x0 = bf16x2_bits_to_float2(values.x);
-                    const float2 x1 = bf16x2_bits_to_float2(values.y);
-                    const float2 x2 = bf16x2_bits_to_float2(values.z);
-                    const float2 x3 = bf16x2_bits_to_float2(values.w);
+                        common::load_vec<uint4>(x + static_cast<std::int64_t>(col0 + col) * k + xk);
+                    const float2 x0 = common::bf16x2_bits_to_float2(values.x);
+                    const float2 x1 = common::bf16x2_bits_to_float2(values.y);
+                    const float2 x2 = common::bf16x2_bits_to_float2(values.z);
+                    const float2 x3 = common::bf16x2_bits_to_float2(values.w);
                     acc[col]        = fmaf(weights[0], x0.x, acc[col]);
                     acc[col]        = fmaf(weights[1], x0.y, acc[col]);
                     acc[col]        = fmaf(weights[2], x1.x, acc[col]);
@@ -179,7 +190,7 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
                 stage_scales[warp][prefetch], code_row, high_row, scale_row, prefetch,
                 min(G, groups - prefetch * G), lane);
         } else {
-            cp_commit();
+            common::cp_commit();
         }
     }
 #pragma unroll 1
@@ -191,9 +202,9 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
                 stage_scales[warp][fetch % S], code_row, high_row, scale_row, fetch,
                 min(G, groups - fetch * G), lane);
         } else {
-            cp_commit();
+            common::cp_commit();
         }
-        cp_wait<S - 1>();
+        common::cp_wait<S - 1>();
         __syncwarp();
         q6_simt_consume_stage<Schedule, false, false>(
             warp_x, k, token0, active_tokens, stage, min(G, groups - stage * G),
@@ -202,12 +213,12 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
         __syncwarp();
     }
     if constexpr (W > 1) {
-        cp_wait<0>();
+        common::cp_wait<0>();
         __syncthreads(); // All staged reads and asynchronous writes finish before reuse.
     }
 #pragma unroll
     for (int token = 0; token < T; ++token) {
-        const float sum = warp_reduce_sum(acc[token]);
+        const float sum = common::warp_reduce_sum(acc[token]);
         if constexpr (W == 1) {
             if (lane == 0 && token < active_tokens) {
                 const int global_token = token_begin + token0 + token;

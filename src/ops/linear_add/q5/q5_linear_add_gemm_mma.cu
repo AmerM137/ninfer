@@ -5,6 +5,7 @@
 #include "core/device.h"
 #include "ops/common/bf16_vector.cuh"
 #include "ops/common/math.h"
+#include "ops/common/memory.cuh"
 #include "ops/common/token_slices.h"
 #include "ops/linear/kernels/q5/q5_mma_launch.cuh"
 

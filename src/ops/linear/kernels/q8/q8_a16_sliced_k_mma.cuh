@@ -1,4 +1,8 @@
 #pragma once
+#include "ops/common/cuda/pipeline.cuh"
+
+#include "ops/common/cuda/memory.cuh"
+#include "ops/common/cuda/mma.cuh"
 
 // Q8G32 RowSplit K-split MMA contraction.
 //
@@ -8,11 +12,8 @@
 // the CTA reduces FP32 partials in shared memory. Output owns physical row/token addressing; an
 // optional caller epilogue may instead consume the FP32 tile.
 
-#include "ops/common/mma.cuh"
-#include "ops/common/memory.cuh"
 #include "ops/linear/kernels/q8/q8_schedule.cuh"
 #include "ops/linear/kernels/q8/q8_operands.h"
-#include "ops/linear/kernels/q8/q8_shared.cuh"
 #include "ops/linear/common/epilogue.cuh"
 
 #include <cuda_bf16.h>
@@ -102,7 +103,8 @@ __device__ __forceinline__ void q8_a16_sliced_k_mma(Q8LinearOperands operands, O
     using SharedStorage = Q8SlicedKSharedStorage<Schedule>;
 
     static_assert(sizeof(SharedStorage) == Schedule::kSharedBytes);
-    auto& shared   = *reinterpret_cast<SharedStorage*>(q8_shared_storage<sizeof(SharedStorage)>());
+    auto& shared =
+        *reinterpret_cast<SharedStorage*>(common::shared_storage<sizeof(SharedStorage)>());
     const int tid  = static_cast<int>(threadIdx.x);
     const int warp = tid >> 5;
     const int lane = tid & 31;
@@ -126,20 +128,20 @@ __device__ __forceinline__ void q8_a16_sliced_k_mma(Q8LinearOperands operands, O
             if constexpr (FullWeights) {
                 if constexpr (!Schedule::kExactTokens && !kRuntimeActive) {
                     const int source_col = col < live_columns ? col : 0;
-                    cp_async_zfill<16, Schedule::kActivationCache>(
+                    common::cp_async_zfill<16, Schedule::kActivationCache>(
                         dst,
                         &x[static_cast<std::int64_t>(column_policy(column_offset + source_col)) *
                                kHidden +
                            kk],
                         col < live_columns ? 16 : 0);
                 } else if constexpr (kRuntimeActive || !kPaddedStage || ActiveCols == kTileCols) {
-                    cp_async<16, Schedule::kActivationCache>(
+                    common::cp_async<16, Schedule::kActivationCache>(
                         dst,
                         &x[static_cast<std::int64_t>(column_policy(column_offset + col)) * kHidden +
                            kk]);
                 } else {
                     const int source_col = col < ActiveCols ? col : 0;
-                    cp_async_zfill<16, Schedule::kActivationCache>(
+                    common::cp_async_zfill<16, Schedule::kActivationCache>(
                         dst,
                         &x[static_cast<std::int64_t>(column_policy(column_offset + source_col)) *
                                kHidden +
@@ -149,7 +151,7 @@ __device__ __forceinline__ void q8_a16_sliced_k_mma(Q8LinearOperands operands, O
             } else {
                 const bool valid     = col < live_columns && kk < kHidden;
                 const int source_col = valid ? col : 0;
-                cp_async_zfill<16, Schedule::kActivationCache>(
+                common::cp_async_zfill<16, Schedule::kActivationCache>(
                     dst,
                     &x[static_cast<std::int64_t>(column_policy(column_offset + source_col)) *
                            kHidden +
@@ -171,11 +173,11 @@ __device__ __forceinline__ void q8_a16_sliced_k_mma(Q8LinearOperands operands, O
                 auto* dst                = &code_shared[row][swizzled_chunk * 16];
                 if (FullWeights ||
                     (weight_row < operands.rows && group_k0 + chunk * 16 < padded_k)) {
-                    cp_async<16, Schedule::kWeightCache>(
+                    common::cp_async<16, Schedule::kWeightCache>(
                         dst, codes + static_cast<std::int64_t>(weight_row) * padded_k + group_k0 +
                                  chunk * 16);
                 } else
-                    store_vec(dst, make_uint4(0, 0, 0, 0));
+                    common::store_vec(dst, make_uint4(0, 0, 0, 0));
             }
         }
         if constexpr (Schedule::kScaleAccess == Q8ScaleAccess::Shared) {
@@ -193,15 +195,15 @@ __device__ __forceinline__ void q8_a16_sliced_k_mma(Q8LinearOperands operands, O
                                       static_cast<std::int64_t>(weight_row) * (padded_k / 16) +
                                       group * 2;
                     if constexpr (chunk_bytes == 16)
-                        cp_async<16, Schedule::kWeightCache>(dst, src);
+                        common::cp_async<16, Schedule::kWeightCache>(dst, src);
                     else
-                        cp_async<8, Cache::ca>(dst, src);
+                        common::cp_async<8, Cache::ca>(dst, src);
                 } else {
 #pragma unroll
                     for (int pair = 0; pair < chunk_bytes / 4; ++pair) {
                         unsigned value = 0;
                         if (weight_row < operands.rows && group + pair * 2 < padded_k / 32)
-                            value = load_ldg<unsigned>(
+                            value = common::load_ldg<unsigned>(
                                 scales + static_cast<std::int64_t>(weight_row) * (padded_k / 16) +
                                 group * 2 + pair * 4);
                         *reinterpret_cast<unsigned*>(dst + pair * 4) = value;
@@ -225,8 +227,8 @@ __device__ __forceinline__ void q8_a16_sliced_k_mma(Q8LinearOperands operands, O
 
     stage_codes(0, 0);
     stage_x(0, 0);
-    cp_commit();
-    cp_wait<0>();
+    common::cp_commit();
+    common::cp_wait<0>();
     __syncthreads();
 
     constexpr int kGroupUnroll =
@@ -242,7 +244,7 @@ __device__ __forceinline__ void q8_a16_sliced_k_mma(Q8LinearOperands operands, O
             if (group_index + 1 < kGroups) {
                 stage_codes(slot ^ 1, group_k0 + kGroupK);
                 stage_x(slot ^ 1, group_k0 + kGroupK);
-                cp_commit();
+                common::cp_commit();
             }
         }
 
@@ -255,7 +257,7 @@ __device__ __forceinline__ void q8_a16_sliced_k_mma(Q8LinearOperands operands, O
             } else {
                 const int scale_row = row_policy.weight_row(cta_row0, gid + lid * 8);
                 if (FullWeights || (scale_row < operands.rows && group_k0 + warp_koff < padded_k))
-                    lane_scale_pair = load_ldg<unsigned>(
+                    lane_scale_pair = common::load_ldg<unsigned>(
                         scales + static_cast<std::int64_t>(scale_row) * (padded_k / 16) +
                         (group_k0 + warp_koff) / 16);
             }
@@ -291,12 +293,13 @@ __device__ __forceinline__ void q8_a16_sliced_k_mma(Q8LinearOperands operands, O
                 for (int ni = 0; ni < kNt; ++ni) {
                     unsigned bf0, bf1;
                     const int br = ni * 8 + b_rin;
-                    ldmatrix_x2(
+                    common::ldmatrix_x2(
                         bf0, bf1,
-                        smem_addr(&b_shared[k_split][br * kTileK + q8_sliced_k_swizzle_64(
-                                                                       br, ks * 16 + b_koff)]));
-                    mma_bf16(group_acc[ni][0], group_acc[ni][1], group_acc[ni][2], group_acc[ni][3],
-                             af0, af1, af2, af3, bf0, bf1);
+                        common::smem_addr(
+                            &b_shared[k_split]
+                                     [br * kTileK + q8_sliced_k_swizzle_64(br, ks * 16 + b_koff)]));
+                    common::mma_bf16(group_acc[ni][0], group_acc[ni][1], group_acc[ni][2],
+                                     group_acc[ni][3], af0, af1, af2, af3, bf0, bf1);
                 }
             }
             const unsigned top_bits = group == 0 ? top_scale_pair & 0xffffu : top_scale_pair >> 16;
@@ -321,9 +324,9 @@ __device__ __forceinline__ void q8_a16_sliced_k_mma(Q8LinearOperands operands, O
             if constexpr (Schedule::kStages == 1) {
                 stage_codes(0, group_k0 + kGroupK);
                 stage_x(0, group_k0 + kGroupK);
-                cp_commit();
+                common::cp_commit();
             }
-            cp_wait<0>();
+            common::cp_wait<0>();
             __syncthreads();
         }
     }
@@ -333,8 +336,8 @@ __device__ __forceinline__ void q8_a16_sliced_k_mma(Q8LinearOperands operands, O
     if ((k_split & 1) != 0) {
 #pragma unroll
         for (int ni = 0; ni < kNt; ++ni) {
-            store_vec(partial + ((warp * kNt + ni) * 32 + lane) * 4,
-                      make_float4(acc[ni][0], acc[ni][1], acc[ni][2], acc[ni][3]));
+            common::store_vec(partial + ((warp * kNt + ni) * 32 + lane) * 4,
+                              make_float4(acc[ni][0], acc[ni][1], acc[ni][2], acc[ni][3]));
         }
     }
     __syncthreads();
@@ -343,14 +346,14 @@ __device__ __forceinline__ void q8_a16_sliced_k_mma(Q8LinearOperands operands, O
 #pragma unroll
         for (int ni = 0; ni < kNt; ++ni) {
             const float4 partner =
-                load_vec<float4>(partial + (((warp + 1) * kNt + ni) * 32 + lane) * 4);
+                common::load_vec<float4>(partial + (((warp + 1) * kNt + ni) * 32 + lane) * 4);
             acc[ni][0] += partner.x;
             acc[ni][1] += partner.y;
             acc[ni][2] += partner.z;
             acc[ni][3] += partner.w;
             if (k_split != 0) {
-                store_vec(partial + ((warp * kNt + ni) * 32 + lane) * 4,
-                          make_float4(acc[ni][0], acc[ni][1], acc[ni][2], acc[ni][3]));
+                common::store_vec(partial + ((warp * kNt + ni) * 32 + lane) * 4,
+                                  make_float4(acc[ni][0], acc[ni][1], acc[ni][2], acc[ni][3]));
             }
         }
     }
@@ -364,7 +367,7 @@ __device__ __forceinline__ void q8_a16_sliced_k_mma(Q8LinearOperands operands, O
 #pragma unroll
             for (int split = 2; split < kWarps; split += 2) {
                 const float4 value =
-                    load_vec<float4>(partial + ((split * kNt + ni) * 32 + lane) * 4);
+                    common::load_vec<float4>(partial + ((split * kNt + ni) * 32 + lane) * 4);
                 sum.x += value.x;
                 sum.y += value.y;
                 sum.z += value.z;

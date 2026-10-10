@@ -1,4 +1,9 @@
 #pragma once
+#include "ops/common/cuda/pipeline.cuh"
+
+#include "ops/common/cuda/memory.cuh"
+#include "ops/common/cuda/mma.cuh"
+#include "ops/common/quant/fp8.cuh"
 
 // Small-T row-scaled E4M3 weight x BF16 activation Tensor Core mainloop.
 //
@@ -6,13 +11,9 @@
 // codes are widened exactly to BF16 MMA operands; the represented BF16 row multiplier is applied
 // once to the complete FP32 dot product. The public activation is never quantized.
 
-#include "ops/common/mma.cuh"
-#include "ops/common/memory.cuh"
-#include "ops/linear/kernels/fp8/fp8_a16_codec.cuh"
 #include "ops/linear/kernels/fp8/fp8_schedule.cuh"
 #include "ops/linear/common/epilogue.cuh"
 #include "ops/linear/kernels/fp8/fp8_operands.h"
-#include "ops/linear/kernels/fp8/fp8_shared.cuh"
 
 #include <cuda_bf16.h>
 
@@ -53,7 +54,8 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_sl
     };
 
     static_assert(sizeof(SharedStorage) == Schedule::kSharedBytes);
-    auto& shared = *reinterpret_cast<SharedStorage*>(fp8_shared_storage<Schedule::kSharedBytes>());
+    auto& shared =
+        *reinterpret_cast<SharedStorage*>(common::shared_storage<Schedule::kSharedBytes>());
     auto& code_shared = shared.staging.codes;
     auto& x_shared    = shared.staging.activations;
 
@@ -76,14 +78,14 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_sl
             const int token = item / (kTileK / 8);
             const int k8    = item - token * (kTileK / 8);
             auto* destination =
-                &x_shared[stage][warp][token * kTileK + fp8_a16_shared_col_64(token, k8 * 8)];
+                &x_shared[stage][warp][token * kTileK + common::swizzle_xor_64(token, k8 * 8)];
             if constexpr (!MaskedColumns && (!kPadded || ActiveTokens == kBlockTokens)) {
-                cp_async<16, kActivationCache>(
+                common::cp_async<16, kActivationCache>(
                     destination, x + static_cast<std::int64_t>(token_begin + token) * kHidden +
                                      group_k0 + warp * kTileK + k8 * 8);
             } else {
                 const int source_token = token < live_columns ? token : 0;
-                cp_async_zfill<16, kActivationCache>(
+                common::cp_async_zfill<16, kActivationCache>(
                     destination,
                     x + static_cast<std::int64_t>(token_begin + source_token) * kHidden + group_k0 +
                         warp * kTileK + k8 * 8,
@@ -99,7 +101,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_sl
             const int row = warp * Schedule::kRowsPerLoaderWarp + row_item;
             for (int chunk = lane; chunk < kBlockK / 16; chunk += 32) {
                 const int swizzled_chunk = chunk ^ (row & 7);
-                cp_async<16, kWeightCache>(
+                common::cp_async<16, kWeightCache>(
                     &code_shared[stage][row][swizzled_chunk * 16],
                     weight_codes +
                         static_cast<std::int64_t>(row_policy.weight_row(row0, row, operands.rows)) *
@@ -119,16 +121,16 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_sl
         if (stage < kGroups) {
             stage_codes(stage, stage * kBlockK);
             stage_activation(stage, stage * kBlockK);
-            cp_commit();
+            common::cp_commit();
         }
     }
 #pragma unroll
     for (int group_index = 0; group_index < kGroups; ++group_index) {
         const int stage = group_index % Schedule::kStages;
         if (group_index + Schedule::kStages - 1 < kGroups)
-            cp_wait<Schedule::kStages - 1>();
+            common::cp_wait<Schedule::kStages - 1>();
         else
-            cp_wait<0>();
+            common::cp_wait<0>();
         __syncthreads();
 #pragma unroll
         for (int k_step = 0; k_step < kTileK / 16; ++k_step) {
@@ -139,23 +141,26 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_sl
                 return static_cast<unsigned>(
                     *reinterpret_cast<const std::uint16_t*>(&code_shared[stage][row][offset]));
             };
-            const unsigned a0 = fp8_e4m3x2_to_bf16x2_bits(load_code_pair(gid, code_col));
-            const unsigned a1 = fp8_e4m3x2_to_bf16x2_bits(load_code_pair(gid + 8, code_col));
-            const unsigned a2 = fp8_e4m3x2_to_bf16x2_bits(load_code_pair(gid, code_col + 8));
-            const unsigned a3 = fp8_e4m3x2_to_bf16x2_bits(load_code_pair(gid + 8, code_col + 8));
+            const unsigned a0 = common::fp8_e4m3x2_to_bf16x2_bits(load_code_pair(gid, code_col));
+            const unsigned a1 =
+                common::fp8_e4m3x2_to_bf16x2_bits(load_code_pair(gid + 8, code_col));
+            const unsigned a2 =
+                common::fp8_e4m3x2_to_bf16x2_bits(load_code_pair(gid, code_col + 8));
+            const unsigned a3 =
+                common::fp8_e4m3x2_to_bf16x2_bits(load_code_pair(gid + 8, code_col + 8));
 #pragma unroll
             for (int token_mma = 0; token_mma < kTokenMmas; ++token_mma) {
                 unsigned b0;
                 unsigned b1;
                 const int row = token_mma * 8 + b_row;
-                ldmatrix_x2(
+                common::ldmatrix_x2(
                     b0, b1,
-                    smem_addr(
-                        &x_shared[stage][warp][row * kTileK + fp8_a16_shared_col_64(
+                    common::smem_addr(
+                        &x_shared[stage][warp][row * kTileK + common::swizzle_xor_64(
                                                                   row, k_step * 16 + b_k_offset)]));
-                mma_bf16(accumulators[token_mma][0], accumulators[token_mma][1],
-                         accumulators[token_mma][2], accumulators[token_mma][3], a0, a1, a2, a3, b0,
-                         b1);
+                common::mma_bf16(accumulators[token_mma][0], accumulators[token_mma][1],
+                                 accumulators[token_mma][2], accumulators[token_mma][3], a0, a1, a2,
+                                 a3, b0, b1);
             }
         }
 
@@ -164,7 +169,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_sl
         if (next < kGroups) {
             stage_codes(stage, next * kBlockK);
             stage_activation(stage, next * kBlockK);
-            cp_commit();
+            common::cp_commit();
         }
     }
 
@@ -173,9 +178,9 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_sl
     if ((warp & 1) != 0) {
 #pragma unroll
         for (int token_mma = 0; token_mma < kTokenMmas; ++token_mma) {
-            store_vec(partial + ((warp * kTokenMmas + token_mma) * 32 + lane) * 4,
-                      make_float4(accumulators[token_mma][0], accumulators[token_mma][1],
-                                  accumulators[token_mma][2], accumulators[token_mma][3]));
+            common::store_vec(partial + ((warp * kTokenMmas + token_mma) * 32 + lane) * 4,
+                              make_float4(accumulators[token_mma][0], accumulators[token_mma][1],
+                                          accumulators[token_mma][2], accumulators[token_mma][3]));
         }
     }
     __syncthreads();
@@ -183,16 +188,17 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_sl
     if ((warp & 1) == 0) {
 #pragma unroll
         for (int token_mma = 0; token_mma < kTokenMmas; ++token_mma) {
-            const float4 partner =
-                load_vec<float4>(partial + (((warp + 1) * kTokenMmas + token_mma) * 32 + lane) * 4);
+            const float4 partner = common::load_vec<float4>(
+                partial + (((warp + 1) * kTokenMmas + token_mma) * 32 + lane) * 4);
             accumulators[token_mma][0] += partner.x;
             accumulators[token_mma][1] += partner.y;
             accumulators[token_mma][2] += partner.z;
             accumulators[token_mma][3] += partner.w;
             if (warp != 0) {
-                store_vec(partial + ((warp * kTokenMmas + token_mma) * 32 + lane) * 4,
-                          make_float4(accumulators[token_mma][0], accumulators[token_mma][1],
-                                      accumulators[token_mma][2], accumulators[token_mma][3]));
+                common::store_vec(
+                    partial + ((warp * kTokenMmas + token_mma) * 32 + lane) * 4,
+                    make_float4(accumulators[token_mma][0], accumulators[token_mma][1],
+                                accumulators[token_mma][2], accumulators[token_mma][3]));
             }
         }
     }
@@ -219,8 +225,8 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_sl
                                      accumulators[token_mma][2], accumulators[token_mma][3]);
 #pragma unroll
             for (int split = 2; split < kWarps; split += 2) {
-                const float4 value =
-                    load_vec<float4>(partial + ((split * kTokenMmas + token_mma) * 32 + lane) * 4);
+                const float4 value = common::load_vec<float4>(
+                    partial + ((split * kTokenMmas + token_mma) * 32 + lane) * 4);
                 sum.x += value.x;
                 sum.y += value.y;
                 sum.z += value.z;

@@ -1,4 +1,6 @@
 #pragma once
+
+#include "ops/common/cuda/memory.cuh"
 #include "ops/linear/kernels/q4/q4_schedule.cuh"
 
 namespace ninfer::ops::detail::q4_instances {

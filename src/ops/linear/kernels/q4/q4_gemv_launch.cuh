@@ -1,6 +1,7 @@
 #pragma once
+
+#include "ops/common/numeric/math.h"
 #include "core/device.h"
-#include "ops/common/math.h"
 #include "ops/linear/kernels/q4/q4_a16_gemv.cuh"
 #include "ops/linear/kernels/q4/q4_operands.h"
 
@@ -15,7 +16,7 @@ void launch_q4_a16_gemv(const Q4LinearOperands& operands, Output output, Epilogu
         if (operands.k != Schedule::kStaticGroupsPerRow * 64)
             throw std::invalid_argument("Q4 GEMV static K differs from operands");
     }
-    const dim3 grid(div_up(operands.rows, Schedule::kBlockRows));
+    const dim3 grid(common::div_up(operands.rows, Schedule::kBlockRows));
     const dim3 block(Schedule::kThreads);
     const std::size_t shared_bytes =
         Schedule::kActivationAccess == Q4GemvActivationAccess::CtaSharedFullK

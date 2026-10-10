@@ -1,6 +1,7 @@
 #pragma once
+
+#include "ops/common/cuda/reduce.cuh"
 #include "ops/rmsnorm/kernel/epilogue.cuh"
-#include "ops/common/warp.cuh"
 #include <cuda_bf16.h>
 #include <cstdint>
 
@@ -13,7 +14,7 @@ __launch_bounds__(Block) __global__
                                    const __nv_bfloat162* z, __nv_bfloat162* out,
                                    std::int32_t input_d, std::int64_t rows, float eps) {
     const int d = FixedD ? FixedD : input_d;
-    static_assert(Block % kWarpSize == 0);
+    static_assert(Block % common::kWarpSize == 0);
     const std::int64_t row = static_cast<std::int64_t>(blockIdx.x);
     if (row >= rows) { return; }
 
@@ -43,9 +44,9 @@ __launch_bounds__(Block) __global__
         }
     }
 
-    __shared__ float warp_sums[Block / kWarpSize];
+    __shared__ float warp_sums[Block / common::kWarpSize];
     __shared__ float inv_shared;
-    const float block_sum = block_reduce_sum<Block>(sum, warp_sums);
+    const float block_sum = common::block_reduce_sum<Block>(sum, warp_sums);
     if (threadIdx.x == 0) { inv_shared = rsqrtf(block_sum / static_cast<float>(d) + eps); }
     __syncthreads();
     const float inv = inv_shared;
@@ -96,9 +97,9 @@ __launch_bounds__(512) __global__
     const float2 x1             = __bfloat1622float2(value1);
     const float local_sum       = x0.x * x0.x + x0.y * x0.y + x1.x * x1.x + x1.y * x1.y;
 
-    __shared__ float warp_sums[kBlock / kWarpSize];
+    __shared__ float warp_sums[kBlock / common::kWarpSize];
     __shared__ float inv_shared;
-    const float sum = block_reduce_sum<kBlock>(local_sum, warp_sums);
+    const float sum = common::block_reduce_sum<kBlock>(local_sum, warp_sums);
     if (threadIdx.x == 0) { inv_shared = rsqrtf(sum * (1.0f / 2048.0f) + eps); }
     __syncthreads();
     const float inv = inv_shared;

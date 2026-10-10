@@ -1,6 +1,9 @@
 #pragma once
+#include "ops/common/cuda/pipeline.cuh"
 
-#include "ops/common/mma.cuh"
+#include "ops/common/cuda/memory.cuh"
+#include "ops/common/cuda/mma.cuh"
+
 #include "ops/linear/kernels/q6/q6_schedule.cuh"
 
 namespace ninfer::ops::detail {
@@ -71,7 +74,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void q6_a16_sli
             const bool valid = Full || (row_begin + row < rows && first_group + group < groups);
             const std::int64_t index =
                 valid ? std::int64_t(row_begin + row) * row_groups + first_group + group : 0;
-            cp_async_zfill<16, Schedule::kWeightCache>(
+            common::cp_async_zfill<16, Schedule::kWeightCache>(
                 &shared.staging.codes[slot][row][group][half * 16], codes + index * 32 + half * 16,
                 valid ? 16 : 0);
         }
@@ -81,13 +84,13 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void q6_a16_sli
             const bool valid = Full || (row_begin + row < rows && first_group + group < groups);
             const std::int64_t index =
                 valid ? std::int64_t(row_begin + row) * row_groups + first_group + group : 0;
-            cp_async_zfill<16, Schedule::kWeightCache>(&shared.staging.high[slot][row][group][0],
-                                                       high + index * 16, valid ? 16 : 0);
+            common::cp_async_zfill<16, Schedule::kWeightCache>(
+                &shared.staging.high[slot][row][group][0], high + index * 16, valid ? 16 : 0);
         }
         if constexpr (Full) {
             for (int row = tid; row < R; row += Schedule::kThreads) {
                 const std::int64_t index = std::int64_t(row_begin + row) * row_groups + first_group;
-                cp_async<W * 2>(&shared.staging.scales[slot][row][0], scales + index * 2);
+                common::cp_async<W * 2>(&shared.staging.scales[slot][row][0], scales + index * 2);
             }
         } else {
             // Partial K tiles only guarantee scale-pair alignment of each stored row.
@@ -97,8 +100,8 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void q6_a16_sli
                 const bool valid = row_begin + row < rows && first_group + pair < groups;
                 const std::int64_t index =
                     valid ? std::int64_t(row_begin + row) * row_groups + first_group + pair : 0;
-                cp_async_zfill<4>(&shared.staging.scales[slot][row][pair], scales + index * 2,
-                                  valid ? 4 : 0);
+                common::cp_async_zfill<4>(&shared.staging.scales[slot][row][pair],
+                                          scales + index * 2, valid ? 4 : 0);
             }
         }
         for (int item = lane; item < T * 8; item += 32) {
@@ -107,11 +110,11 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void q6_a16_sli
             const bool valid = Full || (token0 + token < tokens && first_group + warp < groups);
             const std::int64_t index =
                 valid ? std::int64_t(token0 + token) * k + (first_group + warp) * 64 + k8 : 0;
-            cp_async_zfill<16, Schedule::kActivationCache>(
+            common::cp_async_zfill<16, Schedule::kActivationCache>(
                 &shared.staging.x[slot][warp][token][q6_sliced_k_swizzle(token, k8)], x + index,
                 valid ? 16 : 0);
         }
-        cp_commit();
+        common::cp_commit();
     };
 
     float acc[MT][NT][4] = {};
@@ -120,12 +123,12 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void q6_a16_sli
         if (slot < tiles)
             stage_inputs(slot, slot);
         else
-            cp_commit();
+            common::cp_commit();
     }
 #pragma unroll 1
     for (int tile = 0; tile < tiles; ++tile) {
         const int slot = tile % S;
-        cp_wait<S - 1>();
+        common::cp_wait<S - 1>();
         __syncthreads();
         float group_acc[MT][NT][4] = {};
 #pragma unroll
@@ -148,11 +151,13 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void q6_a16_sli
                     const int br = ni * 8 + (lane & 7);
                     const int bk = ks * 16 + (((lane >> 3) & 1) * 8);
                     unsigned b0, b1;
-                    ldmatrix_x2(
+                    common::ldmatrix_x2(
                         b0, b1,
-                        smem_addr(&shared.staging.x[slot][warp][br][q6_sliced_k_swizzle(br, bk)]));
-                    mma_bf16(group_acc[mi][ni][0], group_acc[mi][ni][1], group_acc[mi][ni][2],
-                             group_acc[mi][ni][3], a0, a1, a2, a3, b0, b1);
+                        common::smem_addr(
+                            &shared.staging.x[slot][warp][br][q6_sliced_k_swizzle(br, bk)]));
+                    common::mma_bf16(group_acc[mi][ni][0], group_acc[mi][ni][1],
+                                     group_acc[mi][ni][2], group_acc[mi][ni][3], a0, a1, a2, a3, b0,
+                                     b1);
                 }
             }
         }
@@ -174,16 +179,17 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void q6_a16_sli
         if (tile + S < tiles)
             stage_inputs(slot, tile + S);
         else
-            cp_commit();
+            common::cp_commit();
     }
-    cp_wait<0>();
+    common::cp_wait<0>();
     __syncthreads();
 #pragma unroll
     for (int mi = 0; mi < MT; ++mi) {
 #pragma unroll
         for (int ni = 0; ni < NT; ++ni) {
-            store_vec(shared.partial[warp][mi][ni][lane],
-                      make_float4(acc[mi][ni][0], acc[mi][ni][1], acc[mi][ni][2], acc[mi][ni][3]));
+            common::store_vec(
+                shared.partial[warp][mi][ni][lane],
+                make_float4(acc[mi][ni][0], acc[mi][ni][1], acc[mi][ni][2], acc[mi][ni][3]));
         }
     }
     __syncthreads();
@@ -192,10 +198,11 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void q6_a16_sli
         for (int mi = 0; mi < MT; ++mi) {
 #pragma unroll
             for (int ni = 0; ni < NT; ++ni) {
-                float4 sum = load_vec<float4>(shared.partial[0][mi][ni][lane]);
+                float4 sum = common::load_vec<float4>(shared.partial[0][mi][ni][lane]);
 #pragma unroll
                 for (int part = 1; part < W; ++part) {
-                    const float4 value = load_vec<float4>(shared.partial[part][mi][ni][lane]);
+                    const float4 value =
+                        common::load_vec<float4>(shared.partial[part][mi][ni][lane]);
                     sum.x += value.x;
                     sum.y += value.y;
                     sum.z += value.z;

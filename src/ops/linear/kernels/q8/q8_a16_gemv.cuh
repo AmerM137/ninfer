@@ -1,6 +1,8 @@
 #pragma once
-#include "ops/common/warp.cuh"
-#include "ops/common/math.cuh"
+
+#include "ops/common/cuda/memory.cuh"
+#include "ops/common/cuda/reduce.cuh"
+#include "ops/common/numeric/convert.cuh"
 #include "ops/linear/common/epilogue.cuh"
 #include "ops/linear/kernels/q8/q8_schedule.cuh"
 #include "ops/linear/kernels/q8/q8_operands.h"
@@ -24,15 +26,17 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
         for (int phase = split; phase < (k + 255) / 256; phase += W) {
             unsigned bits = 0;
             if (lane < 8 && (Schedule::kStaticK > 0 || phase * 256 + lane * 32 < k))
-                bits = load_ldg<std::uint16_t>(scale_row + (phase * 8 + lane) * 2);
+                bits = common::load_ldg<std::uint16_t>(scale_row + (phase * 8 + lane) * 2);
             bits              = __shfl_sync(0xffffffffu, bits, lane >> 2);
             const float scale = __half2float(__ushort_as_half(bits));
             const int kk      = phase * 256 + lane * 8;
             if (Schedule::kStaticK > 0 || kk < k) {
-                const uint2 codes  = load_ldg<uint2>(code_row + kk);
-                const uint4 values = load_ldg<uint4>(operands.x + kk);
-                const float2 xv[]{bf16x2_bits_to_float2(values.x), bf16x2_bits_to_float2(values.y),
-                                  bf16x2_bits_to_float2(values.z), bf16x2_bits_to_float2(values.w)};
+                const uint2 codes  = common::load_ldg<uint2>(code_row + kk);
+                const uint4 values = common::load_ldg<uint4>(operands.x + kk);
+                const float2 xv[]{common::bf16x2_bits_to_float2(values.x),
+                                  common::bf16x2_bits_to_float2(values.y),
+                                  common::bf16x2_bits_to_float2(values.z),
+                                  common::bf16x2_bits_to_float2(values.w)};
 #pragma unroll
                 for (int i = 0; i < 8; ++i) {
                     const unsigned word = i < 4 ? codes.x : codes.y;
@@ -43,7 +47,7 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
             }
         }
     }
-    acc = warp_reduce_sum(acc);
+    acc = common::warp_reduce_sum(acc);
     if constexpr (W > 1) {
         __shared__ float partial[R][W];
         if (lane == 0) partial[local_row][split] = acc;

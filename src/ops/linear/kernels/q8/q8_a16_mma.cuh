@@ -1,4 +1,9 @@
 #pragma once
+#include "ops/common/cuda/pipeline.cuh"
+
+#include "ops/common/cuda/memory.cuh"
+#include "ops/common/cuda/mma.cuh"
+#include "ops/linear/common/epilogue.cuh"
 
 // Q8G32 RowSplit x BF16 Tensor Core GEMM.
 //
@@ -8,13 +13,8 @@
 // shared tile; x uses a two-stage cp.async pipeline. Tensor Cores execute
 // m16n8k16 BF16 MMA with FP32 accumulation.
 
-#include "ops/common/mma.cuh"
-#include "ops/common/math.cuh"
-#include "ops/common/memory.cuh"
 #include "ops/linear/kernels/q8/q8_schedule.cuh"
 #include "ops/linear/kernels/q8/q8_operands.h"
-#include "ops/linear/kernels/q8/q8_shared.cuh"
-#include "ops/linear/common/epilogue.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -42,16 +42,6 @@ struct Q8MmaIdentityRows {
         return row0 + local_row;
     }
 };
-template <class Schedule, class Epilogue>
-inline constexpr int q8_mma_shared_bytes = [] {
-    constexpr int extra = [] {
-        if constexpr (requires { Epilogue::template kSharedBytes<Schedule>; })
-            return static_cast<int>(Epilogue::template kSharedBytes<Schedule>);
-        else
-            return 0;
-    }();
-    return Schedule::kSharedBytes > extra ? Schedule::kSharedBytes : extra;
-}();
 
 template <class Cfg, bool Full, bool FullK, class Output, class Epilogue, class RowPolicy>
 __global__ __launch_bounds__(Cfg::kThreads, Cfg::kMinBlocksPerSm) void q8_a16_mma_kernel(
@@ -81,7 +71,7 @@ __global__ __launch_bounds__(Cfg::kThreads, Cfg::kMinBlocksPerSm) void q8_a16_mm
     };
 
     static_assert(sizeof(OperandStorage) == Cfg::kSharedBytes);
-    auto* scratch = q8_shared_storage<q8_mma_shared_bytes<Cfg, Epilogue>>();
+    auto* scratch = common::shared_storage<linear_mma_shared_bytes<Cfg, Epilogue>>();
     auto& shared  = *reinterpret_cast<OperandStorage*>(scratch);
     auto& As      = shared.weights;
     auto& Bs      = shared.activations;
@@ -127,14 +117,14 @@ __global__ __launch_bounds__(Cfg::kThreads, Cfg::kMinBlocksPerSm) void q8_a16_mm
             const int k8 = item - nl * (BK / 8);
             const int kk = k0 + k8 * 8;
             const int nn = n0 + nl;
-            auto* dst    = &Bs[stage][nl * BK + q8_g32_swz64(nl, k8 * 8)];
+            auto* dst    = &Bs[stage][nl * BK + common::swizzle_xor_64(nl, k8 * 8)];
             if constexpr (Full) {
-                cp_async<16, Cfg::kActivationCache>(dst,
-                                                    &x[static_cast<std::int64_t>(nn) * k + kk]);
+                common::cp_async<16, Cfg::kActivationCache>(
+                    dst, &x[static_cast<std::int64_t>(nn) * k + kk]);
             } else {
                 const int valid =
                     nn < n && (FullK || kk < k) ? (FullK ? 16 : min(8, k - kk) * 2) : 0;
-                ninfer::ops::cp_async_zfill<16, Cfg::kPredicatedCache>(
+                ninfer::ops::common::cp_async_zfill<16, Cfg::kPredicatedCache>(
                     dst,
                     &x[static_cast<std::int64_t>(nn < n ? nn : 0) * k + (FullK || kk < k ? kk : 0)],
                     valid);
@@ -154,11 +144,11 @@ __global__ __launch_bounds__(Cfg::kThreads, Cfg::kMinBlocksPerSm) void q8_a16_mm
             auto* dst       = &Cr[row * BK + chunk * 16];
             if constexpr (Full) {
                 const std::int64_t gi = static_cast<std::int64_t>(grow) * kg + g0;
-                cp_async<16, Cfg::kWeightCache>(dst, &codes[gi * 32 + chunk * 16]);
+                common::cp_async<16, Cfg::kWeightCache>(dst, &codes[gi * 32 + chunk * 16]);
             } else {
                 const bool valid_row  = (grow < m);
                 const std::int64_t gi = static_cast<std::int64_t>(valid_row ? grow : 0) * kg + g0;
-                ninfer::ops::cp_async_zfill<16, Cfg::kPredicatedCache>(
+                ninfer::ops::common::cp_async_zfill<16, Cfg::kPredicatedCache>(
                     dst, &codes[gi * 32 + chunk * 16], valid_row ? 16 : 0);
             }
         }
@@ -168,21 +158,22 @@ __global__ __launch_bounds__(Cfg::kThreads, Cfg::kMinBlocksPerSm) void q8_a16_mm
                 auto* dst      = &Sr[row * Cfg::kScaleCacheBytes];
                 if constexpr (Full) {
                     const std::int64_t gi = static_cast<std::int64_t>(grow) * kg + g0;
-                    cp_async<16, Cfg::kWeightCache>(dst, &scales[gi * 2]);
+                    common::cp_async<16, Cfg::kWeightCache>(dst, &scales[gi * 2]);
                 } else if (kg % 8 == 0) {
                     const bool valid_row   = grow < m;
                     const int valid_scales = valid_row && g0 < kg ? min(8, kg - g0) : 0;
                     const std::int64_t gi =
                         static_cast<std::int64_t>(valid_row ? grow : 0) * kg + g0;
-                    cp_async_zfill<16, Cfg::kPredicatedCache>(dst, &scales[gi * 2],
-                                                              valid_scales * 2);
+                    common::cp_async_zfill<16, Cfg::kPredicatedCache>(dst, &scales[gi * 2],
+                                                                      valid_scales * 2);
                 } else {
 #pragma unroll
                     for (int pair = 0; pair < 4; ++pair) {
                         if (grow < m && g0 + pair * 2 < kg)
-                            cp_async<4>(dst + pair * 4,
-                                        scales + (static_cast<std::int64_t>(grow) * kg + g0) * 2 +
-                                            pair * 4);
+                            common::cp_async<4>(
+                                dst + pair * 4,
+                                scales + (static_cast<std::int64_t>(grow) * kg + g0) * 2 +
+                                    pair * 4);
                         else
                             *reinterpret_cast<unsigned*>(dst + pair * 4) = 0;
                     }
@@ -194,8 +185,8 @@ __global__ __launch_bounds__(Cfg::kThreads, Cfg::kMinBlocksPerSm) void q8_a16_mm
     auto dequant_w = [&](int kt) {
         constexpr int GROUPS            = BK / 32;
         constexpr int SCALE_CACHE_TILES = 8 / GROUPS;
-        // q8_g32_swz64 permutes whole eight-element runs, so eight codes are the widest chunk
-        // contiguous in As for every row. BK % 32 keeps gg inside GROUPS and the row stride
+        // common::swizzle_xor_64 permutes whole eight-element runs, so eight codes are the widest
+        // chunk contiguous in As for every row. BK % 32 keeps gg inside GROUPS and the row stride
         // aligned for the vector store; 8 % GROUPS keeps the scale cache a whole number of tiles.
         constexpr int kChunksPerRow = BK / 8;
         static_assert(BK % 32 == 0 && (8 % GROUPS) == 0,
@@ -222,19 +213,19 @@ __global__ __launch_bounds__(Cfg::kThreads, Cfg::kMinBlocksPerSm) void q8_a16_mm
                 decoded.pair[pair] = __floats2bfloat162_rn(static_cast<float>(q0) * scale,
                                                            static_cast<float>(q1) * scale);
             }
-            store_vec(&As[row * BK + q8_g32_swz64(row, col)], decoded.raw);
+            common::store_vec(&As[row * BK + common::swizzle_xor_64(row, col)], decoded.raw);
         }
     };
 
     const int nkt = padded_k / BK;
     stage_x(0, 0);
     stage_w(0);
-    ninfer::ops::cp_commit();
+    ninfer::ops::common::cp_commit();
 
 #pragma unroll Cfg::kKLoopUnroll
     for (int kt = 0; kt < nkt; ++kt) {
         const int stage = kt % Cfg::kStages;
-        ninfer::ops::cp_wait<0>();
+        ninfer::ops::common::cp_wait<0>();
         __syncthreads();
 
         dequant_w(kt);
@@ -246,7 +237,7 @@ __global__ __launch_bounds__(Cfg::kThreads, Cfg::kMinBlocksPerSm) void q8_a16_mm
                 stage_x(next % Cfg::kStages, next);
             }
             stage_w(next);
-            ninfer::ops::cp_commit();
+            ninfer::ops::common::cp_commit();
         }
 
         unsigned af[2][MT][4];
@@ -256,16 +247,18 @@ __global__ __launch_bounds__(Cfg::kThreads, Cfg::kMinBlocksPerSm) void q8_a16_mm
             for (int mi = 0; mi < MT; ++mi) {
                 const int ar = wm * WM + mi * 16 + a_rowoff;
                 const int ac = ks * 16 + a_coloff;
-                ldmatrix_x4(af[slot][mi][0], af[slot][mi][1], af[slot][mi][2], af[slot][mi][3],
-                            smem_addr(&As[ar * BK + q8_g32_swz64(ar, ac)]));
+                common::ldmatrix_x4(
+                    af[slot][mi][0], af[slot][mi][1], af[slot][mi][2], af[slot][mi][3],
+                    common::smem_addr(&As[ar * BK + common::swizzle_xor_64(ar, ac)]));
             }
 #pragma unroll
             for (int ni = 0; ni < NT; ++ni) {
                 const int br = wn * WN + ni * 8 + b_rin;
                 const int bc = ks * 16 + b_koff;
-                ldmatrix_x2(bf[slot][ni][0], bf[slot][ni][1],
-                            smem_addr(&Bs[Cfg::kActivationStages == 1 ? 0 : stage]
-                                         [br * BK + q8_g32_swz64(br, bc)]));
+                common::ldmatrix_x2(
+                    bf[slot][ni][0], bf[slot][ni][1],
+                    common::smem_addr(&Bs[Cfg::kActivationStages == 1 ? 0 : stage]
+                                         [br * BK + common::swizzle_xor_64(br, bc)]));
             }
         };
 
@@ -284,9 +277,9 @@ __global__ __launch_bounds__(Cfg::kThreads, Cfg::kMinBlocksPerSm) void q8_a16_mm
             for (int mi = 0; mi < MT; ++mi) {
 #pragma unroll
                 for (int ni = 0; ni < NT; ++ni) {
-                    mma_bf16(acc[mi][ni][0], acc[mi][ni][1], acc[mi][ni][2], acc[mi][ni][3],
-                             af[slot][mi][0], af[slot][mi][1], af[slot][mi][2], af[slot][mi][3],
-                             bf[slot][ni][0], bf[slot][ni][1]);
+                    common::mma_bf16(acc[mi][ni][0], acc[mi][ni][1], acc[mi][ni][2], acc[mi][ni][3],
+                                     af[slot][mi][0], af[slot][mi][1], af[slot][mi][2],
+                                     af[slot][mi][3], bf[slot][ni][0], bf[slot][ni][1]);
                 }
             }
         }
@@ -295,7 +288,7 @@ __global__ __launch_bounds__(Cfg::kThreads, Cfg::kMinBlocksPerSm) void q8_a16_mm
             if (next < nkt) {
                 __syncthreads();
                 stage_x(0, next);
-                ninfer::ops::cp_commit();
+                ninfer::ops::common::cp_commit();
             }
         }
     }

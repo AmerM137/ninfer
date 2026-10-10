@@ -1,4 +1,7 @@
 #pragma once
+#include "ops/common/cuda/pipeline.cuh"
+
+#include "ops/common/cuda/memory.cuh"
 // BF16 operands remain represented exactly; the complete dot product accumulates in FP32.
 #include "ops/linear/kernels/bf16/bf16_mma_common.cuh"
 
@@ -56,9 +59,10 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_m
                 const bool valid = (!bf16_predicated_rows<Schedule> || m0 + row < M) &&
                                    (!bf16_predicated_k<Schedule> || k0 + kk < split_end);
                 const auto source = valid ? static_cast<std::int64_t>(m0 + row) * K + k0 + kk : 0;
-                cp_async_zfill<16, Schedule::kWeightCache>(dst, weight + source, valid ? 16 : 0);
+                common::cp_async_zfill<16, Schedule::kWeightCache>(dst, weight + source,
+                                                                   valid ? 16 : 0);
             } else {
-                cp_async<16, Schedule::kWeightCache>(
+                common::cp_async<16, Schedule::kWeightCache>(
                     dst, &weight[static_cast<std::int64_t>(m0 + row) * K + k0 + kk]);
             }
         }
@@ -71,13 +75,14 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_m
             auto* dst       = &b_stage[col * BK + bf16_mma_shared_col<Schedule>(col, kk)];
             const int token = n0 + col;
             if constexpr (FullTokens && !bf16_predicated_k<Schedule>) {
-                cp_async<16, Schedule::kActivationCache>(
+                common::cp_async<16, Schedule::kActivationCache>(
                     dst, &x[static_cast<std::int64_t>(token) * K + k0 + kk]);
             } else {
                 const bool valid = (FullTokens || token < tokens) &&
                                    (!bf16_predicated_k<Schedule> || k0 + kk < split_end);
                 const auto source = valid ? static_cast<std::int64_t>(token) * K + k0 + kk : 0;
-                cp_async_zfill<16, Schedule::kActivationCache>(dst, x + source, valid ? 16 : 0);
+                common::cp_async_zfill<16, Schedule::kActivationCache>(dst, x + source,
+                                                                       valid ? 16 : 0);
             }
         }
     };
@@ -87,7 +92,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_m
     for (int stage = 0; stage < S; ++stage) {
         if (stage < kTiles) {
             stage_inputs(stage, stage);
-            cp_commit();
+            common::cp_commit();
         }
     }
 
@@ -95,11 +100,11 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_m
     for (int k_tile = 0; k_tile < kTiles; ++k_tile) {
         const int stage = k_tile % S;
         if (k_tile + S <= kTiles) {
-            cp_wait<S - 1>();
+            common::cp_wait<S - 1>();
         } else {
             // Once the producer stops refilling the ring, fewer than S groups remain. Drain them
             // instead of applying the steady-state wait count to the final consumer stage.
-            cp_wait<0>();
+            common::cp_wait<0>();
         }
         __syncthreads();
 
@@ -110,7 +115,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_m
         const int next = k_tile + S;
         if (next < kTiles) {
             stage_inputs(stage, next);
-            cp_commit();
+            common::cp_commit();
         }
     }
 

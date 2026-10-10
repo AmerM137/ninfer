@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ops/common/cuda/memory.cuh"
+
 #include "ops/linear/kernels/q8/q8_instances.cuh"
 
 namespace ninfer::ops::detail::q8_n12288_k2560 {

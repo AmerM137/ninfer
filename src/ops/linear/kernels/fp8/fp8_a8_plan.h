@@ -53,5 +53,4 @@ inline std::size_t fp8_a8_workspace_capacity_bytes(std::int32_t tokens, std::int
 void launch_fp8_a8_quantize(const Tensor& x, const Weight& weight, Fp8A8Workspace workspace,
                             cudaStream_t stream);
 
-
 } // namespace ninfer::ops::detail

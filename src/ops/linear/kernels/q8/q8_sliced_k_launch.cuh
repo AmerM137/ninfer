@@ -1,6 +1,7 @@
 #pragma once
-#include "ops/common/math.h"
-#include "ops/common/token_slices.h"
+
+#include "ops/common/host/launch.h"
+#include "ops/common/numeric/math.h"
 #include "ops/linear/kernels/q8/q8_a16_sliced_k_mma.cuh"
 
 namespace ninfer::ops::detail {
@@ -22,22 +23,23 @@ void launch_q8_a16_sliced_k_mma(const Q8LinearOperands& operands, Output output,
     static_assert(Schedule::kBlockRows % RowPolicy::kOutputRowsPerCta == 0);
     if (operands.rows % ratio != 0)
         throw std::invalid_argument("Q8 sliced-K row mapping requires complete row pairs");
-    for_each_token_slice(operands.tokens, Schedule::kTokenCapacity, [&](int offset, int count) {
-        const dim3 grid(div_up(operands.rows / ratio, RowPolicy::kOutputRowsPerCta),
-                        div_up(count, Schedule::kTokenCapacity));
-        const auto launch = [&]<bool Full>() {
-            constexpr auto kernel =
-                q8_a16_sliced_k_mma_kernel<Schedule, Full, Output, Epilogue, RowPolicy>;
-            const int shared = q8_prepare_shared<Schedule::kSharedBytes, kernel>();
-            kernel<<<grid, Schedule::kThreads, shared, stream>>>(operands, output, epilogue,
-                                                                 row_policy, offset);
-            CUDA_CHECK(cudaGetLastError());
-        };
-        if (operands.rows % Schedule::kBlockRows == 0 && operands.k == operands.padded_k &&
-            operands.k % Schedule::kBlockK == 0)
-            launch.template operator()<true>();
-        else
-            launch.template operator()<false>();
-    });
+    common::for_each_token_slice(
+        operands.tokens, Schedule::kTokenCapacity, [&](int offset, int count) {
+            const dim3 grid(common::div_up(operands.rows / ratio, RowPolicy::kOutputRowsPerCta),
+                            common::div_up(count, Schedule::kTokenCapacity));
+            const auto launch = [&]<bool Full>() {
+                constexpr auto kernel =
+                    q8_a16_sliced_k_mma_kernel<Schedule, Full, Output, Epilogue, RowPolicy>;
+                const int shared = common::prepare_shared<Schedule::kSharedBytes, kernel>();
+                kernel<<<grid, Schedule::kThreads, shared, stream>>>(operands, output, epilogue,
+                                                                     row_policy, offset);
+                CUDA_CHECK(cudaGetLastError());
+            };
+            if (operands.rows % Schedule::kBlockRows == 0 && operands.k == operands.padded_k &&
+                operands.k % Schedule::kBlockK == 0)
+                launch.template operator()<true>();
+            else
+                launch.template operator()<false>();
+        });
 }
 } // namespace ninfer::ops::detail

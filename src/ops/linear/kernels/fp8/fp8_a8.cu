@@ -1,9 +1,9 @@
 #include "core/weight.h"
+#include "ops/common/cuda/reduce.cuh"
+#include "ops/common/numeric/convert.cuh"
 #include "ops/linear/kernels/fp8/fp8_a8_plan.h"
 
 #include "core/device.h"
-#include "ops/common/math.cuh"
-#include "ops/common/warp.cuh"
 #include "ops/linear/kernels/fp8/fp8_instances.cuh"
 #include "ops/linear/kernels/fp8/fp8_schedule.cuh"
 #include "ops/linear/common/epilogue.cuh"
@@ -43,16 +43,16 @@ __global__ __launch_bounds__(Threads,
 #pragma unroll
     for (int item = 0; item < pairs_per_thread; ++item) {
         const int pair = tid + item * Threads;
-        values[item]   = bf16x2_bits_to_float2(input_pairs[pair]);
+        values[item]   = common::bf16x2_bits_to_float2(input_pairs[pair]);
         maximum        = fmaxf(maximum, fabsf(values[item].x));
         maximum        = fmaxf(maximum, fabsf(values[item].y));
     }
-    maximum = warp_max(maximum);
+    maximum = common::warp_max(maximum);
     if (lane == 0) { warp_maxima[warp] = maximum; }
     __syncthreads();
     if (warp == 0) {
         maximum = lane < warps ? warp_maxima[lane] : 0.0F;
-        maximum = warp_max(maximum);
+        maximum = common::warp_max(maximum);
         if (lane == 0) { token_scale = maximum > 0.0F ? maximum / 448.0F : 0.0F; }
     }
     __syncthreads();

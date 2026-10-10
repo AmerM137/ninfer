@@ -1,7 +1,8 @@
 #pragma once
+#include "ops/common/cuda/pipeline.cuh"
 
-#include "ops/common/memory.cuh"
-#include "ops/linear/kernels/q5/q5_rowsplit_storage.cuh"
+#include "ops/common/cuda/memory.cuh"
+#include "ops/common/quant/integer.cuh"
 
 namespace ninfer::ops::detail {
 
@@ -24,15 +25,15 @@ struct Q5A16SimtSchedule {
     static constexpr int kMinBlocksPerSm     = MinBlocksPerSm;
     static constexpr int kWarps              = BlockRows * WarpsPerRow;
     static constexpr int kThreads            = kWarps * 32;
-    static constexpr int kStageK             = GroupsPerWarpStage * Q5RowSplitStorage::kGroupK;
+    static constexpr int kStageK = GroupsPerWarpStage * common::Q5RowSplitStorage::kGroupK;
     static constexpr int kCodeVecsPerStage   = GroupsPerWarpStage * 2;
     static constexpr int kHighVecsPerStage   = GroupsPerWarpStage / 2;
     static constexpr int kScalePairsPerStage = GroupsPerWarpStage / 2;
     static constexpr int kCodePhases         = (GroupsPerWarpStage + 3) / 4;
-    static constexpr int kStagingBytes =
-        kWarps * Stages * GroupsPerWarpStage *
-        (Q5RowSplitStorage::kCodeBytesPerGroup + Q5RowSplitStorage::kHighBytesPerGroup +
-         Q5RowSplitStorage::kScaleBytesPerGroup);
+    static constexpr int kStagingBytes       = kWarps * Stages * GroupsPerWarpStage *
+                                         (common::Q5RowSplitStorage::kCodeBytesPerGroup +
+                                          common::Q5RowSplitStorage::kHighBytesPerGroup +
+                                          common::Q5RowSplitStorage::kScaleBytesPerGroup);
     static constexpr int kPartialBytes = WarpsPerRow > 1 ? kWarps* BlockTokens * sizeof(float) : 0;
     static constexpr int kSharedBytes =
         ((kStagingBytes > kPartialBytes ? kStagingBytes : kPartialBytes) + 15) / 16 * 16;
@@ -75,24 +76,26 @@ struct Q5A16MmaSchedule {
     static constexpr int kMmaRows        = kWarpRows / 16;
     static constexpr int kMmaTokens      = kWarpTokens / 8;
     static constexpr int kMmaKSteps      = kBlockK / 16;
-    static constexpr int kGroupsPerK     = kBlockK / Q5RowSplitStorage::kGroupK;
+    static constexpr int kGroupsPerK     = kBlockK / common::Q5RowSplitStorage::kGroupK;
     static constexpr int kScaleBytes =
-        kScaleLoadMode == Q5ScaleLoad::Pair32 ? 4 : Q5RowSplitStorage::kScaleBytesPerGroup;
+        kScaleLoadMode == Q5ScaleLoad::Pair32 ? 4 : common::Q5RowSplitStorage::kScaleBytesPerGroup;
 
     static constexpr int kSharedBytes =
         kBlockRows * kBlockK * static_cast<int>(sizeof(__nv_bfloat16)) +
         kActivationStages * kBlockTokens * kBlockK * static_cast<int>(sizeof(__nv_bfloat16)) +
-        kStages * kBlockRows * kGroupsPerK * Q5RowSplitStorage::kCodeBytesPerGroup +
-        kStages * kBlockRows * kGroupsPerK * (kScaleBytes + Q5RowSplitStorage::kHighBytesPerGroup);
+        kStages * kBlockRows * kGroupsPerK * common::Q5RowSplitStorage::kCodeBytesPerGroup +
+        kStages * kBlockRows * kGroupsPerK *
+            (kScaleBytes + common::Q5RowSplitStorage::kHighBytesPerGroup);
 
     static_assert(kBlockRows > 0 && kBlockTokens > 0 && kBlockK > 0);
-    static_assert(kBlockK % Q5RowSplitStorage::kGroupK == 0,
+    static_assert(kBlockK % common::Q5RowSplitStorage::kGroupK == 0,
                   "Q5 MMA K tile must contain complete quant groups");
     static_assert(kBlockRows % kWarpRows == 0 && kBlockTokens % kWarpTokens == 0,
                   "Q5 MMA block tile must divide into warp tiles");
     static_assert(kWarpRows % 16 == 0 && kWarpTokens % 8 == 0,
                   "Q5 MMA warp tile must be composed of m16n8 MMA tiles");
-    static_assert(kStages >= 1 && kStages <= 8, "Q5 MMA cp.async pipeline depth must fit cp_wait");
+    static_assert(kStages >= 1 && kStages <= 8,
+                  "Q5 MMA cp.async pipeline depth must fit common::cp_wait");
     static_assert(kActivationStages == 1 || kActivationStages == kStages,
                   "Q5 MMA activation staging is single-buffered or follows the quant pipeline");
     static_assert(kActivationStages == kStages || kStages < 8,
@@ -138,11 +141,12 @@ struct Q5A16SlicedKMmaSchedule {
     static constexpr int kMmaRows           = BlockRows / 16;
     static constexpr int kMmaTokens         = BlockTokens / 8;
     // Code/scale planes and BF16 activations. Partial results reuse this storage.
-    static constexpr int kStagingBytes = Stages * (BlockRows * KWarps *
-                                                       (Q5RowSplitStorage::kCodeBytesPerGroup +
-                                                        Q5RowSplitStorage::kHighBytesPerGroup +
-                                                        Q5RowSplitStorage::kScaleBytesPerGroup) +
-                                                   KWarps * BlockTokens * 64 * 2);
+    static constexpr int kStagingBytes =
+        Stages * (BlockRows * KWarps *
+                      (common::Q5RowSplitStorage::kCodeBytesPerGroup +
+                       common::Q5RowSplitStorage::kHighBytesPerGroup +
+                       common::Q5RowSplitStorage::kScaleBytesPerGroup) +
+                  KWarps * BlockTokens * 64 * 2);
     static constexpr int kPartialBytes = KWarps * BlockRows * BlockTokens * sizeof(float);
     static constexpr int kSharedBytes =
         ((kStagingBytes > kPartialBytes ? kStagingBytes : kPartialBytes) + 15) / 16 * 16;

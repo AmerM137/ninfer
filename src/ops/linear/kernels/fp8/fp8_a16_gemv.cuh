@@ -1,14 +1,15 @@
 #pragma once
 
+#include "ops/common/cuda/memory.cuh"
+#include "ops/common/cuda/reduce.cuh"
+#include "ops/common/numeric/convert.cuh"
+
 // Reusable row-scaled FP8 T=1 CUDA-core mainloop. Each warp owns contiguous output rows and reads
 // naturally aligned E4M3 code packs. The persistent codes are decoded exactly, multiplied by the
 // represented BF16 activation with FP32 FMA, reduced within the warp, and scaled once by the
 // owning BF16 row multiplier. Output owns the physical row mapping so fused projections reuse the
 // same weight/decode mainloop without materializing a packed parent output.
 
-#include "ops/common/math.cuh"
-#include "ops/common/memory.cuh"
-#include "ops/common/warp.cuh"
 #include "ops/linear/kernels/fp8/fp8_schedule.cuh"
 #include "ops/linear/common/epilogue.cuh"
 #include "ops/linear/kernels/fp8/fp8_operands.h"
@@ -45,11 +46,11 @@ __device__ __forceinline__ Fp8CodePack<Values> load_fp8_codes(const std::uint8_t
     } else if constexpr (Cache == Fp8CodeCache::Default) {
         Fp8CodePack<Values> result;
         if constexpr (Values == 8) {
-            const uint2 v   = load_ldg<uint2>(pointer);
+            const uint2 v   = common::load_ldg<uint2>(pointer);
             result.words[0] = v.x;
             result.words[1] = v.y;
         } else {
-            const uint4 v   = load_ldg<uint4>(pointer);
+            const uint4 v   = common::load_ldg<uint4>(pointer);
             result.words[0] = v.x;
             result.words[1] = v.y;
             result.words[2] = v.z;
@@ -85,7 +86,7 @@ __device__ __forceinline__ void accumulate_rows(const Fp8CodePack<Values> (&code
     constexpr int kChainMask = AccumulatorChains - 1;
 #pragma unroll
     for (int pair = 0; pair < Values / 2; ++pair) {
-        const float2 value = bf16x2_bits_to_float2(activation_pairs[pair]);
+        const float2 value = common::bf16x2_bits_to_float2(activation_pairs[pair]);
 #pragma unroll
         for (int row = 0; row < Rows; ++row) {
             const std::uint32_t word   = codes[row].words[pair >> 1];
@@ -107,15 +108,15 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_ge
     RowPolicy row_policy, int rows, int input_rows) {
     constexpr bool PairRows       = RowPolicy::kPaired;
     const int K                   = Schedule::kStaticK ? Schedule::kStaticK : input_rows;
-    constexpr int kValuesPerPhase = kWarpSize * Schedule::kValuesPerLane;
+    constexpr int kValuesPerPhase = common::kWarpSize * Schedule::kValuesPerLane;
     static_assert(!PairRows || (Schedule::kRowsPerWarp % 2) == 0);
     const int kPhases = K / kValuesPerPhase;
     constexpr int kStoredRowsPerWarp =
         PairRows ? Schedule::kRowsPerWarp / 2 : Schedule::kRowsPerWarp;
     constexpr int kStoredRowsPerCta = Schedule::kWarpsPerCta * kStoredRowsPerWarp;
 
-    const int lane = static_cast<int>(threadIdx.x) & (kWarpSize - 1);
-    const int warp = static_cast<int>(threadIdx.x) / kWarpSize;
+    const int lane = static_cast<int>(threadIdx.x) & (common::kWarpSize - 1);
+    const int warp = static_cast<int>(threadIdx.x) / common::kWarpSize;
     const int row_begin =
         static_cast<int>(blockIdx.x) * kStoredRowsPerCta + warp * kStoredRowsPerWarp;
     const auto* activation_pairs = reinterpret_cast<const std::uint32_t*>(x);
@@ -132,7 +133,8 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_ge
                 weight_codes + static_cast<std::int64_t>(weight_row) * K + value_begin;
             if constexpr (Schedule::kCodeCache == Fp8CodeCache::Default &&
                           Schedule::kValuesPerLane <= 16)
-                row_codes[local_row] = load_vec<Fp8CodePack<Schedule::kValuesPerLane>>(source);
+                row_codes[local_row] =
+                    common::load_vec<Fp8CodePack<Schedule::kValuesPerLane>>(source);
             else
                 row_codes[local_row] =
                     load_fp8_codes<Schedule::kCodeCache, Schedule::kValuesPerLane>(source);
@@ -151,7 +153,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_ge
             for (int chain = 0; chain < Schedule::kAccumulatorChains; ++chain) {
                 total += accumulators[local_row][chain];
             }
-            totals[local_row] = warp_reduce_sum(total);
+            totals[local_row] = common::warp_reduce_sum(total);
         }
         if (lane == 0) {
 #pragma unroll
@@ -174,7 +176,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_ge
             for (int chain = 0; chain < Schedule::kAccumulatorChains; ++chain) {
                 total += accumulators[local_row][chain];
             }
-            total = warp_reduce_sum(total);
+            total = common::warp_reduce_sum(total);
             if (lane == 0) {
                 const int parent_row = row_policy.weight_row(row_begin, local_row, rows);
                 const float values[1]{total * __bfloat162float(__ldg(row_scales + parent_row))};

@@ -1,7 +1,7 @@
 #pragma once
 
 #include "ops/common/math.cuh"
-#include "ops/linear/common/vector_output.cuh"
+#include "ops/linear/common/output.cuh"
 
 namespace ninfer::ops::detail {
 // Matching gate/up fragments belong to the same warp. The persistent weight

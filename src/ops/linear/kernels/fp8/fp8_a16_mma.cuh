@@ -1,4 +1,9 @@
 #pragma once
+#include "ops/common/cuda/pipeline.cuh"
+
+#include "ops/common/cuda/memory.cuh"
+#include "ops/common/cuda/mma.cuh"
+#include "ops/common/quant/fp8.cuh"
 
 // Large-T row-scaled E4M3 weight x BF16 activation Tensor Core GEMM.
 //
@@ -8,13 +13,9 @@
 // remain BF16. Tensor Cores accumulate the complete K reduction in FP32, then the represented BF16
 // row scale is applied once before BF16 output storage.
 
-#include "ops/common/memory.cuh"
-#include "ops/common/mma.cuh"
-#include "ops/linear/kernels/fp8/fp8_a16_codec.cuh"
 #include "ops/linear/common/epilogue.cuh"
 #include "ops/linear/kernels/fp8/fp8_schedule.cuh"
 #include "ops/linear/kernels/fp8/fp8_operands.h"
-#include "ops/linear/kernels/fp8/fp8_shared.cuh"
 
 #include <cuda_bf16.h>
 
@@ -77,13 +78,13 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
             const int token       = token_begin + local_token;
             const int kk          = k8 * 8;
             auto* destination     = &activation_shared[stage * BN * BK + local_token * BK +
-                                                   fp8_a16_shared_col_64(local_token, kk)];
+                                                   common::swizzle_xor_64(local_token, kk)];
             if constexpr (FullTokens) {
-                cp_async<16, Schedule::kActivationCache>(
+                common::cp_async<16, Schedule::kActivationCache>(
                     destination, x + static_cast<std::int64_t>(token) * K + k_begin + kk);
             } else {
                 const bool valid = token < tokens;
-                cp_async_zfill<16, Schedule::kActivationCache>(
+                common::cp_async_zfill<16, Schedule::kActivationCache>(
                     destination,
                     x + static_cast<std::int64_t>(valid ? token : 0) * K + k_begin + kk,
                     valid ? 16 : 0);
@@ -97,7 +98,7 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
         for (int item = tid; item < BM * (BK / 16); item += THREADS) {
             const int local_row = item / (BK / 16);
             const int chunk     = item - local_row * (BK / 16);
-            cp_async<16, Schedule::kWeightCache>(
+            common::cp_async<16, Schedule::kWeightCache>(
                 &code_shared[local_row * BK + chunk * 16],
                 weight_codes +
                     static_cast<std::int64_t>(row_policy.weight_row(row_begin, local_row, M)) * K +
@@ -115,21 +116,22 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
                 const int col         = col32 + half_lane * 2;
                 const unsigned packed = static_cast<unsigned>(
                     *reinterpret_cast<const std::uint16_t*>(&code_shared[row * BK + col]));
-                const unsigned widened = fp8_e4m3x2_to_bf16x2_bits(packed);
-                store_vec(&weight_shared[row * BK + fp8_a16_shared_col_64(row, col)], widened);
+                const unsigned widened = common::fp8_e4m3x2_to_bf16x2_bits(packed);
+                common::store_vec(&weight_shared[row * BK + common::swizzle_xor_64(row, col)],
+                                  widened);
             }
         }
     };
 
     stage_activation(0, 0);
     stage_codes(0);
-    cp_commit();
+    common::cp_commit();
 
     const int kTiles = K / BK;
 #pragma unroll 1
     for (int k_tile = 0; k_tile < kTiles; ++k_tile) {
         const int stage = k_tile % Schedule::kActivationStages;
-        cp_wait<0>();
+        common::cp_wait<0>();
         __syncthreads();
 
         widen_codes();
@@ -139,7 +141,7 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
         if (next < kTiles) {
             if constexpr (Schedule::kActivationStages == 2) { stage_activation(next & 1, next); }
             stage_codes(next);
-            cp_commit();
+            common::cp_commit();
         }
 
         constexpr int kSlots =
@@ -151,17 +153,19 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
             for (int mma_row = 0; mma_row < MT; ++mma_row) {
                 const int row = wm * WM + mma_row * 16 + a_row_offset;
                 const int col = k_step * 16 + a_col_offset;
-                ldmatrix_x4(a_fragments[slot][mma_row][0], a_fragments[slot][mma_row][1],
-                            a_fragments[slot][mma_row][2], a_fragments[slot][mma_row][3],
-                            smem_addr(&weight_shared[row * BK + fp8_a16_shared_col_64(row, col)]));
+                common::ldmatrix_x4(
+                    a_fragments[slot][mma_row][0], a_fragments[slot][mma_row][1],
+                    a_fragments[slot][mma_row][2], a_fragments[slot][mma_row][3],
+                    common::smem_addr(&weight_shared[row * BK + common::swizzle_xor_64(row, col)]));
             }
 #pragma unroll
             for (int mma_token = 0; mma_token < NT; ++mma_token) {
                 const int row = wn * WN + mma_token * 8 + b_inner_row;
                 const int col = k_step * 16 + b_col_offset;
-                ldmatrix_x2(b_fragments[slot][mma_token][0], b_fragments[slot][mma_token][1],
-                            smem_addr(&activation_shared[stage * BN * BK + row * BK +
-                                                         fp8_a16_shared_col_64(row, col)]));
+                common::ldmatrix_x2(
+                    b_fragments[slot][mma_token][0], b_fragments[slot][mma_token][1],
+                    common::smem_addr(&activation_shared[stage * BN * BK + row * BK +
+                                                         common::swizzle_xor_64(row, col)]));
             }
         };
 
@@ -178,7 +182,7 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
             for (int mma_row = 0; mma_row < MT; ++mma_row) {
 #pragma unroll
                 for (int mma_token = 0; mma_token < NT; ++mma_token) {
-                    mma_bf16(
+                    common::mma_bf16(
                         accumulators[mma_row][mma_token][0], accumulators[mma_row][mma_token][1],
                         accumulators[mma_row][mma_token][2], accumulators[mma_row][mma_token][3],
                         a_fragments[slot][mma_row][0], a_fragments[slot][mma_row][1],
@@ -192,7 +196,7 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
             if (next < kTiles) {
                 __syncthreads();
                 stage_activation(0, next);
-                cp_commit();
+                common::cp_commit();
             }
         }
     }

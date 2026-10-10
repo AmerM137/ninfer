@@ -1,0 +1,52 @@
+#pragma once
+
+#include <cuda_runtime.h>
+
+namespace ninfer::ops {
+enum class Cache { ca, cg };
+}
+
+namespace ninfer::ops::common {
+
+template <class V, class T>
+__device__ __forceinline__ V load_vec(const T* ptr) {
+    static_assert(sizeof(V) == 1 || sizeof(V) == 2 || sizeof(V) == 4 || sizeof(V) == 8 ||
+                  sizeof(V) == 16);
+    return *reinterpret_cast<const V*>(ptr);
+}
+
+template <class V, class T>
+__device__ __forceinline__ V load_ldg(const T* ptr) {
+    static_assert(sizeof(V) == 1 || sizeof(V) == 2 || sizeof(V) == 4 || sizeof(V) == 8 ||
+                  sizeof(V) == 16);
+    return __ldg(reinterpret_cast<const V*>(ptr));
+}
+
+template <class T, class V>
+__device__ __forceinline__ void store_vec(T* ptr, V value) {
+    static_assert(sizeof(V) == 1 || sizeof(V) == 2 || sizeof(V) == 4 || sizeof(V) == 8 ||
+                  sizeof(V) == 16);
+    *reinterpret_cast<V*>(ptr) = value;
+}
+
+__device__ __forceinline__ unsigned smem_addr(const void* ptr) {
+    return static_cast<unsigned>(__cvta_generic_to_shared(ptr));
+}
+
+// Permute eight-element vectors within each 64-element row sector.
+__device__ __forceinline__ int swizzle_xor_64(int row, int col) { return col ^ ((row & 7) << 3); }
+
+// Storage and launch must select the same static/dynamic representation.
+template <int Bytes>
+__device__ __forceinline__ unsigned char* shared_storage() {
+    static_assert(Bytes > 0 && Bytes <= 99 * 1024);
+    if constexpr (Bytes > 48 * 1024) {
+        extern __shared__ __align__(16) unsigned char dynamic_storage[];
+        return dynamic_storage;
+    } else {
+        __shared__ __align__(16) unsigned char static_storage[Bytes];
+        return static_storage;
+    }
+}
+
+} // namespace ninfer::ops::common

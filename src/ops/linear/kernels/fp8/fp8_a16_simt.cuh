@@ -1,5 +1,9 @@
 #pragma once
 
+#include "ops/common/cuda/memory.cuh"
+#include "ops/common/cuda/reduce.cuh"
+#include "ops/common/numeric/convert.cuh"
+
 // Reusable row-scaled FP8 CUDA-core mainloop for a compile-time number of BF16 activation
 // columns. A CTA owns one row tile and one compile-time token tile, reusing each decoded weight
 // pair across that token tile before advancing K. Output, epilogue, and row policies let fused
@@ -25,8 +29,8 @@ load_fp8_activation_pack(const __nv_bfloat16* pointer) {
     Fp8ActivationPack<Values> result;
 #pragma unroll
     for (int chunk = 0; chunk < Values / 8; ++chunk) {
-        const uint4 packed =
-            Shared ? load_vec<uint4>(pointer + chunk * 8) : load_ldg<uint4>(pointer + chunk * 8);
+        const uint4 packed          = Shared ? common::load_vec<uint4>(pointer + chunk * 8)
+                                             : common::load_ldg<uint4>(pointer + chunk * 8);
         result.words[chunk * 4]     = packed.x;
         result.words[chunk * 4 + 1] = packed.y;
         result.words[chunk * 4 + 2] = packed.z;
@@ -99,7 +103,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_si
                 const int local_pack  = task - local_token * kPacksPerToken;
                 const int token       = token0 + local_token;
                 if (token < ActiveTokens) {
-                    destination[task] = load_vec<uint4>(
+                    destination[task] = common::load_vec<uint4>(
                         x + static_cast<std::int64_t>(min(token, live_tokens - 1)) * K +
                         phase * kValuesPerPhase + local_pack * 8);
                 }
@@ -152,7 +156,8 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_si
 #pragma unroll
             for (int local_token = 0; local_token < Schedule::kBlockTokens; ++local_token) {
                 if (token0 + local_token >= ActiveTokens) { continue; }
-                const float2 value = bf16x2_bits_to_float2(activation[local_token].words[pair]);
+                const float2 value =
+                    common::bf16x2_bits_to_float2(activation[local_token].words[pair]);
 #pragma unroll
                 for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
                     accumulators[local_row][local_token][(2 * pair) & kChainMask] =
@@ -188,7 +193,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_si
                 for (int chain = 0; chain < Schedule::kAccumulatorChains; ++chain) {
                     total += accumulators[local_row][local_token][chain];
                 }
-                total = warp_reduce_sum(total);
+                total = common::warp_reduce_sum(total);
                 if (lane == 0) { projected[local_token] = total * scale; }
             }
             if (lane == 0) {
@@ -208,7 +213,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_si
                 for (int chain = 0; chain < Schedule::kAccumulatorChains; ++chain) {
                     total += accumulators[local_row][local_token][chain];
                 }
-                totals[local_row] = warp_reduce_sum(total);
+                totals[local_row] = common::warp_reduce_sum(total);
             }
             if (lane == 0) {
 #pragma unroll
@@ -239,7 +244,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_si
                 for (int chain = 0; chain < Schedule::kAccumulatorChains; ++chain) {
                     total += accumulators[local_row][local_token][chain];
                 }
-                total = warp_reduce_sum(total);
+                total = common::warp_reduce_sum(total);
                 if (lane == 0) {
                     destination.store(parent_row, token,
                                       epilogue.apply(parent_row, token, total * scale));

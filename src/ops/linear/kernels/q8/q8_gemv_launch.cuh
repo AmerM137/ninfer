@@ -1,6 +1,7 @@
 #pragma once
+
+#include "ops/common/numeric/math.h"
 #include "core/device.h"
-#include "ops/common/math.h"
 #include "ops/linear/kernels/q8/q8_a16_gemv.cuh"
 
 namespace ninfer::ops::detail {
@@ -17,8 +18,8 @@ void launch_q8_a16_gemv(const Q8LinearOperands& operands, Output output, Epilogu
     }
     const auto launch = [&]<bool FullRows>() {
         q8_a16_gemv_kernel<Schedule, FullRows>
-            <<<div_up(operands.rows, Schedule::kBlockRows), Schedule::kThreads, 0, stream>>>(
-                operands, output, epilogue);
+            <<<common::div_up(operands.rows, Schedule::kBlockRows), Schedule::kThreads, 0,
+               stream>>>(operands, output, epilogue);
         CUDA_CHECK(cudaGetLastError());
     };
     if (operands.rows % Schedule::kBlockRows == 0)

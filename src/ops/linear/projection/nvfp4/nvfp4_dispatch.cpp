@@ -1,6 +1,6 @@
 #include "ops/linear/projection/nvfp4/nvfp4_dispatch.h"
+#include "ops/common/host/operands.h"
 #include "ops/linear/projection/nvfp4/nvfp4_shapes.h"
-#include "ops/linear/kernels/nvfp4/nvfp4_format.h"
 #include <array>
 #include <stdexcept>
 
@@ -31,7 +31,7 @@ std::size_t nvfp4_linear_workspace_capacity_bytes(std::int32_t n, std::int32_t k
 
 void nvfp4_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPolicy policy,
                     WorkspaceArena* workspace, cudaStream_t stream) {
-    validate_nvfp4_weight(weight, "nvfp4 linear");
+    common::validate_nvfp4_weight(weight, "nvfp4 linear");
     if (x.ne[1] <= 0) throw std::invalid_argument("nvfp4 linear: T must be positive");
     const auto& shape = resolve_shape(weight.n, weight.k, policy);
     if (!allows_a4(policy) || !shape.uses_a4(x.ne[1], x.ne[1]))

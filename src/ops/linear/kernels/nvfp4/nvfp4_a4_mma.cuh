@@ -1,13 +1,13 @@
 #pragma once
+#include "ops/common/cuda/pipeline.cuh"
 
-#include "ops/common/mma.cuh"
-#include "ops/common/memory.cuh"
-#include "ops/linear/kernels/nvfp4/nvfp4_codec.cuh"
+#include "ops/common/cuda/memory.cuh"
+#include "ops/common/cuda/mma.cuh"
+#include "ops/linear/common/epilogue.cuh"
+
 #include "ops/linear/kernels/nvfp4/nvfp4_schedule.cuh"
 #include "ops/linear/kernels/nvfp4/nvfp4_operands.h"
-#include "ops/linear/kernels/nvfp4/nvfp4_shared.cuh"
-#include "ops/linear/common/epilogue.cuh"
-#include "ops/linear/common/vector_output.cuh"
+#include "ops/linear/common/output.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -55,7 +55,7 @@ stage_nvfp4_a4_activation(const std::uint8_t* __restrict__ x,
         auto* destination = shared.a_codes[stage] + row * Schedule::kCodeRowBytes + physical_byte;
         const auto* input = x + static_cast<std::int64_t>(source_token) * (k / 2) +
                             k_tile * Schedule::kCodeRowBytes + logical_segment * 16;
-        cp_async_zfill<16, Schedule::kActivationCache>(destination, input, valid ? 16 : 0);
+        common::cp_async_zfill<16, Schedule::kActivationCache>(destination, input, valid ? 16 : 0);
     }
 
     if constexpr (Schedule::kK64PerStage <= 4) {
@@ -69,7 +69,7 @@ stage_nvfp4_a4_activation(const std::uint8_t* __restrict__ x,
             const auto* input = x_scales + (static_cast<std::int64_t>(source_token) * (k / 64) +
                                             k_tile * Schedule::kK64PerStage) *
                                                4;
-            cp_async_zfill<kScaleBytes>(destination, input, valid ? kScaleBytes : 0);
+            common::cp_async_zfill<kScaleBytes>(destination, input, valid ? kScaleBytes : 0);
         }
     } else {
         static_assert((Schedule::kK64PerStage % 4) == 0);
@@ -87,7 +87,7 @@ stage_nvfp4_a4_activation(const std::uint8_t* __restrict__ x,
             const auto* input = x_scales + (static_cast<std::int64_t>(source_token) * (k / 64) +
                                             k_tile * Schedule::kK64PerStage + local_k64) *
                                                4;
-            cp_async_zfill<16>(destination, input, valid ? 16 : 0);
+            common::cp_async_zfill<16>(destination, input, valid ? 16 : 0);
         }
     }
 }
@@ -108,7 +108,7 @@ stage_nvfp4_a4_weight(const std::uint8_t* __restrict__ codes,
         auto* destination = shared.b_codes[stage] + row * Schedule::kCodeRowBytes + physical_byte;
         const auto* input = codes + static_cast<std::int64_t>(weight_row) * (k / 2) +
                             k_tile * Schedule::kCodeRowBytes + logical_segment * 16;
-        cp_async<16, Schedule::kWeightCache>(destination, input);
+        common::cp_async<16, Schedule::kWeightCache>(destination, input);
     }
 
     if constexpr (RowPolicy::kContiguous &&
@@ -135,7 +135,7 @@ stage_nvfp4_a4_weight(const std::uint8_t* __restrict__ codes,
             const auto* input =
                 scales + static_cast<std::int64_t>(persistent_tile * (k / 64) + global_k64) * 512 +
                 row_mod32 * 16 + first_quartile * 4;
-            cp_async<kScaleBytesPerTask>(destination, input);
+            common::cp_async<kScaleBytesPerTask>(destination, input);
         }
     } else {
         constexpr int kScaleTasks = Schedule::kBlockRows * Schedule::kK64PerStage;
@@ -154,7 +154,7 @@ stage_nvfp4_a4_weight(const std::uint8_t* __restrict__ codes,
             const auto* input =
                 scales + static_cast<std::int64_t>(persistent_tile * (k / 64) + global_k64) * 512 +
                 row_mod32 * 16 + row_quartile * 4;
-            cp_async<4>(destination, input);
+            common::cp_async<4>(destination, input);
         }
     }
 }
@@ -169,7 +169,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_m
     constexpr bool PairRows = RowPolicy::kPaired;
     const int k             = Schedule::kStaticK ? Schedule::kStaticK : input_rows;
     const int tokens        = token_offset + count;
-    auto* shared_raw        = nvfp4_shared_storage<nvfp4_mma_shared_bytes<Schedule, Epilogue>>();
+    auto* shared_raw        = common::shared_storage<linear_mma_shared_bytes<Schedule, Epilogue>>();
     auto& shared            = *reinterpret_cast<Nvfp4A4SharedStorage<Schedule>*>(shared_raw);
     const int token_begin   = token_offset + static_cast<int>(blockIdx.y) * Schedule::kBlockTokens;
     constexpr int kRowsPerBlock = PairRows ? Schedule::kBlockRows / 2 : Schedule::kBlockRows;
@@ -184,7 +184,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_m
                                                 tokens);
             stage_nvfp4_a4_weight<Schedule>(weight_codes, weight_scales, shared, stage, stage,
                                             row_begin, row_policy, rows, k);
-            cp_commit();
+            common::cp_commit();
         }
     }
 
@@ -204,7 +204,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_m
 
     for (int k_tile = 0; k_tile < kKTiles; ++k_tile) {
         const int stage = k_tile % Schedule::kStages;
-        cp_wait<kWaitGroups>();
+        common::cp_wait<kWaitGroups>();
         __syncthreads();
 
 #pragma unroll
@@ -221,8 +221,9 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_m
                 const int physical_byte = nvfp4_a4_swizzled_byte<Schedule>(row, logical_byte);
                 const auto* address =
                     shared.a_codes[stage] + row * Schedule::kCodeRowBytes + physical_byte;
-                ldmatrix_x4(a_fragments[mma_m][0], a_fragments[mma_m][1], a_fragments[mma_m][2],
-                            a_fragments[mma_m][3], smem_addr(address));
+                common::ldmatrix_x4(a_fragments[mma_m][0], a_fragments[mma_m][1],
+                                    a_fragments[mma_m][2], a_fragments[mma_m][3],
+                                    common::smem_addr(address));
                 const int scale_row = warp_m * Schedule::kWarpTokens + mma_m * 16 + sfa_row;
                 a_scales[mma_m] =
                     shared.a_scale4[stage][scale_row * Schedule::kK64PerStage + local_k64];
@@ -235,7 +236,8 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_m
                 const int physical_byte = nvfp4_a4_swizzled_byte<Schedule>(row, logical_byte);
                 const auto* address =
                     shared.b_codes[stage] + row * Schedule::kCodeRowBytes + physical_byte;
-                ldmatrix_x2(b_fragments[mma_n][0], b_fragments[mma_n][1], smem_addr(address));
+                common::ldmatrix_x2(b_fragments[mma_n][0], b_fragments[mma_n][1],
+                                    common::smem_addr(address));
                 const int scale_row = warp_n * Schedule::kWarpRows + mma_n * 8 + sfb_row;
                 const std::uint8_t* scale_address;
                 if constexpr (RowPolicy::kContiguous &&
@@ -256,19 +258,19 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_m
                     scale_address = shared.b_scales[stage] +
                                     (scale_row * Schedule::kK64PerStage + local_k64) * 4;
                 }
-                b_scales[mma_n] = load_vec<unsigned>(scale_address);
+                b_scales[mma_n] = common::load_vec<unsigned>(scale_address);
             }
 
 #pragma unroll
             for (int mma_m = 0; mma_m < Schedule::kMmaTokens; ++mma_m) {
 #pragma unroll
                 for (int mma_n = 0; mma_n < Schedule::kMmaRows; ++mma_n) {
-                    mma_nvfp4_e4m3(accumulators[mma_m][mma_n][0], accumulators[mma_m][mma_n][1],
-                                   accumulators[mma_m][mma_n][2], accumulators[mma_m][mma_n][3],
-                                   a_fragments[mma_m][0], a_fragments[mma_m][1],
-                                   a_fragments[mma_m][2], a_fragments[mma_m][3],
-                                   b_fragments[mma_n][0], b_fragments[mma_n][1], a_scales[mma_m],
-                                   b_scales[mma_n]);
+                    common::mma_nvfp4_e4m3(
+                        accumulators[mma_m][mma_n][0], accumulators[mma_m][mma_n][1],
+                        accumulators[mma_m][mma_n][2], accumulators[mma_m][mma_n][3],
+                        a_fragments[mma_m][0], a_fragments[mma_m][1], a_fragments[mma_m][2],
+                        a_fragments[mma_m][3], b_fragments[mma_n][0], b_fragments[mma_n][1],
+                        a_scales[mma_m], b_scales[mma_n]);
                 }
             }
         }
@@ -281,7 +283,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_m
             stage_nvfp4_a4_weight<Schedule>(weight_codes, weight_scales, shared, stage, next_k_tile,
                                             row_begin, row_policy, rows, k);
         }
-        cp_commit();
+        common::cp_commit();
     }
 
     constexpr bool collective = requires {
@@ -335,7 +337,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_m
                       r = (item % (Schedule::kBlockRows / 8)) * 8;
             if (FullTokens || token_begin + t < tokens)
                 linear_store_bf16_vector(output, row_begin + r, token_begin + t,
-                                         load_vec<uint4>(tile + t * stride + r));
+                                         common::load_vec<uint4>(tile + t * stride + r));
         }
     }
 }

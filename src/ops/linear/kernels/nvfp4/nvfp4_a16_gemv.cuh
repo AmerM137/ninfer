@@ -1,13 +1,16 @@
 #pragma once
+#include "ops/common/cuda/pipeline.cuh"
+
+#include "ops/common/cuda/memory.cuh"
+#include "ops/common/cuda/reduce.cuh"
+#include "ops/common/numeric/convert.cuh"
+#include "ops/common/quant/fp8.cuh"
+#include "ops/common/quant/nvfp4.cuh"
 
 #include "ops/linear/kernels/nvfp4/nvfp4_schedule.cuh"
-#include "ops/linear/kernels/nvfp4/nvfp4_codec.cuh"
 #include "ops/linear/kernels/nvfp4/nvfp4_operands.h"
 #include "ops/linear/common/epilogue.cuh"
-#include "ops/linear/common/vector_output.cuh"
-#include "ops/common/math.cuh"
-#include "ops/common/memory.cuh"
-#include "ops/common/warp.cuh"
+#include "ops/linear/common/output.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -29,7 +32,7 @@ static_assert(sizeof(Nvfp4CodePack<32>) == 16);
 template <Nvfp4CodeCache Cache, int Values>
 __device__ __forceinline__ Nvfp4CodePack<Values> load_nvfp4_codes(const std::uint8_t* pointer) {
     if constexpr (Cache == Nvfp4CodeCache::Default) {
-        return load_vec<Nvfp4CodePack<Values>>(pointer);
+        return common::load_vec<Nvfp4CodePack<Values>>(pointer);
     } else if constexpr (Values == 8) {
         Nvfp4CodePack<Values> result;
         asm volatile("ld.global.cg.u32 %0, [%1];\n" : "=r"(result.words[0]) : "l"(pointer));
@@ -72,7 +75,7 @@ stage_nvfp4_scales(const std::uint8_t* __restrict__ scales,
             const std::int64_t source_offset =
                 static_cast<std::int64_t>(m_tile * Geometry::kScaleTilesPerRow + scale_tile) * 512 +
                 static_cast<std::int64_t>(rmod_base + quartet) * 16;
-            const uint4 packed           = load_vec<uint4>(scales + source_offset);
+            const uint4 packed           = common::load_vec<uint4>(scales + source_offset);
             const std::uint32_t words[4] = {packed.x, packed.y, packed.z, packed.w};
 #pragma unroll
             for (int quartile = 0; quartile < 4; ++quartile) {
@@ -136,14 +139,14 @@ __device__ __forceinline__ void load_nvfp4_coefficients(
 #pragma unroll
         for (int group = 0; group < kGroupsPerLane; ++group) {
             const auto scale    = static_cast<std::uint8_t>(word >> (8 * (first_byte + group)));
-            coefficients[group] = decode_nvfp4_e4m3(scale) * inverse_weight_divisor;
+            coefficients[group] = common::decode_e4m3(scale) * inverse_weight_divisor;
         }
     } else {
 #pragma unroll
         for (int group = 0; group < kGroupsPerLane; ++group) {
             const std::uint8_t scale =
                 scales[nvfp4_scale_offset<Geometry>(parent_row, group_begin + group)];
-            coefficients[group] = decode_nvfp4_e4m3(scale) * inverse_weight_divisor;
+            coefficients[group] = common::decode_e4m3(scale) * inverse_weight_divisor;
         }
     }
 }
@@ -183,13 +186,14 @@ compute_nvfp4_rows(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __re
         for (int pair = 0; pair < Schedule::kPairsPerLane; ++pair) {
             const int activation_index =
                 phase * (kValuesPerPhase / 2) + lane * Schedule::kPairsPerLane + pair;
-            const float2 activation = bf16x2_bits_to_float2(activation_pairs[activation_index]);
+            const float2 activation =
+                common::bf16x2_bits_to_float2(activation_pairs[activation_index]);
             const int group         = ((lane * Schedule::kValuesPerLane & 15) + pair * 2) / 16;
 #pragma unroll
             for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
                 const std::uint32_t word  = row_codes[local_row].words[pair / 4];
                 const std::uint8_t packed = static_cast<std::uint8_t>(word >> (8 * (pair & 3)));
-                const float2 code         = decode_nvfp4_e2m1x2(packed);
+                const float2 code         = common::decode_nvfp4_e2m1x2(packed);
                 const float coefficient   = coefficients[local_row][group];
                 constexpr int kChainMask  = Schedule::kAccumulatorChains - 1;
                 accumulators[local_row][(2 * pair) & kChainMask] =
@@ -237,11 +241,11 @@ nvfp4_stage_a16_scales(const std::uint8_t* scales,
             const int local  = item / Geometry::kScaleTilesPerRow,
                       group  = (item % Geometry::kScaleTilesPerRow) * 4;
             const int parent = nvfp4_a16_parent_row<Schedule>(block, local, rows, policy);
-            cp_async<4>(shared.raw_scales + local * Geometry::kGroupsPerRow + group,
-                        scales + nvfp4_scale_offset<Geometry>(parent, group));
+            common::cp_async<4>(shared.raw_scales + local * Geometry::kGroupsPerRow + group,
+                                scales + nvfp4_scale_offset<Geometry>(parent, group));
         }
-        cp_commit();
-        cp_wait<0>();
+        common::cp_commit();
+        common::cp_wait<0>();
         __syncthreads();
     }
 }
@@ -272,7 +276,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_
         float sum = 0;
 #pragma unroll
         for (int c = 0; c < Schedule::kAccumulatorChains; ++c) sum += accumulators[r][c];
-        totals[r] = warp_reduce_sum(sum);
+        totals[r] = common::warp_reduce_sum(sum);
     }
     if (lane == 0) {
 #pragma unroll

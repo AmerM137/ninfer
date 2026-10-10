@@ -1,8 +1,10 @@
 #pragma once
 
+#include "ops/common/host/launch.h"
+#include "ops/common/numeric/math.h"
+#include "ops/linear/common/epilogue.cuh"
+
 #include "core/device.h"
-#include "ops/common/math.h"
-#include "ops/common/token_slices.h"
 #include "ops/linear/kernels/nvfp4/nvfp4_a16_gemv.cuh"
 #include "ops/linear/kernels/nvfp4/nvfp4_a16_simt.cuh"
 #include "ops/linear/kernels/nvfp4/nvfp4_a16_mma.cuh"
@@ -40,7 +42,8 @@ void launch_nvfp4_a16_simt(const Nvfp4A16Operands& p, Output output, Epilogue ep
     }
     static_assert(Schedule::kStaticK > 0 && Schedule::kTokenCapacity > 0);
     const int capacity = Schedule::kTokenCapacity;
-    const int blocks   = p.rows / Schedule::kBlockRows * div_up(capacity, Schedule::kBlockTokens);
+    const int blocks =
+        p.rows / Schedule::kBlockRows * common::div_up(capacity, Schedule::kBlockTokens);
     nvfp4_a16_simt_kernel<Schedule><<<blocks, Schedule::kThreads, 0, stream>>>(
         p.x, p.codes, p.scales, p.alpha, output, epilogue, rows, p.rows, p.tokens);
     CUDA_CHECK(cudaGetLastError());
@@ -52,12 +55,13 @@ void launch_nvfp4_a16_mma(const Nvfp4A16Operands& p, Output output, Epilogue epi
     validate_nvfp4_operands<Schedule>(p);
     if (p.rows % Schedule::kBlockRows || p.k % Schedule::kBlockK)
         throw std::invalid_argument("NVFP4 A16 MMA requires complete row/K tiles");
-    for_each_token_slice(p.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
-        const dim3 grid(p.rows / Schedule::kBlockRows, div_up(count, Schedule::kBlockTokens));
+    common::for_each_token_slice(p.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
+        const dim3 grid(p.rows / Schedule::kBlockRows,
+                        common::div_up(count, Schedule::kBlockTokens));
         const auto launch = [&]<bool Full>() {
             constexpr auto kernel = nvfp4_a16_mma_kernel<Schedule, Full, Output, Epilogue, Rows>;
             const int bytes =
-                nvfp4_prepare_shared<nvfp4_mma_shared_bytes<Schedule, Epilogue>, kernel, true>();
+                common::prepare_shared<linear_mma_shared_bytes<Schedule, Epilogue>, kernel, true>();
             kernel<<<grid, Schedule::kThreads, bytes, stream>>>(p.x, p.codes, p.scales, p.alpha,
                                                                 output, epilogue, rows, p.rows, p.k,
                                                                 offset, count);
@@ -82,9 +86,9 @@ void launch_nvfp4_a16_sliced_k_mma(const Nvfp4A16Operands& p, Output output, Epi
         throw std::invalid_argument(
             "NVFP4 sliced-K requires complete row/K tiles and matching tokens");
     constexpr auto kernel = nvfp4_a16_sliced_k_mma_kernel<Schedule, Output, Epilogue, Rows>;
-    const int bytes       = nvfp4_prepare_shared<Schedule::kSharedBytes, kernel>();
-    for_each_token_slice(p.tokens, capacity, [&](int offset, int count) {
-        const dim3 grid(p.rows / Schedule::kBlockRows, div_up(count, capacity));
+    const int bytes       = common::prepare_shared<Schedule::kSharedBytes, kernel>();
+    common::for_each_token_slice(p.tokens, capacity, [&](int offset, int count) {
+        const dim3 grid(p.rows / Schedule::kBlockRows, common::div_up(count, capacity));
         kernel<<<grid, Schedule::kThreads, bytes, stream>>>(p, output, epilogue, rows, offset);
         CUDA_CHECK(cudaGetLastError());
     });
@@ -100,12 +104,13 @@ void launch_nvfp4_a4_mma(const Nvfp4A4Operands& p, Output output, Epilogue epilo
             "NVFP4 A4 MMA requires complete row/K tiles and enough K stages");
     if (p.scale_layout != Nvfp4ScaleLayout::RowMajor)
         throw std::invalid_argument("NVFP4 A4 MMA requires row-major activation scales");
-    for_each_token_slice(p.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
-        const dim3 grid(p.rows / Schedule::kBlockRows, div_up(count, Schedule::kBlockTokens));
+    common::for_each_token_slice(p.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
+        const dim3 grid(p.rows / Schedule::kBlockRows,
+                        common::div_up(count, Schedule::kBlockTokens));
         const auto launch = [&]<bool Full>() {
             constexpr auto kernel = nvfp4_a4_mma_kernel<Schedule, Full, Epilogue, Output, Rows>;
             const int bytes =
-                nvfp4_prepare_shared<nvfp4_mma_shared_bytes<Schedule, Epilogue>, kernel>();
+                common::prepare_shared<linear_mma_shared_bytes<Schedule, Epilogue>, kernel>();
             kernel<<<grid, Schedule::kThreads, bytes, stream>>>(p.x, p.x_scales, p.codes, p.scales,
                                                                 p.rows, p.k, p.alpha, output,
                                                                 epilogue, rows, offset, count);

@@ -1,6 +1,7 @@
 #pragma once
+
+#include "ops/common/cuda/reduce.cuh"
 #include "ops/rmsnorm/kernel/epilogue.cuh"
-#include "ops/common/warp.cuh"
 #include <cuda_bf16.h>
 #include <cstdint>
 
@@ -14,11 +15,11 @@ __launch_bounds__(Block) __global__
                                     const __nv_bfloat162* z, __nv_bfloat162* out,
                                     std::int32_t input_d, std::int64_t rows, float eps) {
     const int d = FixedD ? FixedD : input_d;
-    static_assert(Block % kWarpSize == 0);
-    constexpr int kWarpsPerBlock   = Block / kWarpSize;
+    static_assert(Block % common::kWarpSize == 0);
+    constexpr int kWarpsPerBlock   = Block / common::kWarpSize;
     constexpr int kMaxPairsPerLane = 4;
-    const int lane                 = static_cast<int>(threadIdx.x) & (kWarpSize - 1);
-    const int warp                 = static_cast<int>(threadIdx.x) / kWarpSize;
+    const int lane                 = static_cast<int>(threadIdx.x) & (common::kWarpSize - 1);
+    const int warp                 = static_cast<int>(threadIdx.x) / common::kWarpSize;
     const std::int64_t row         = static_cast<std::int64_t>(blockIdx.x) * kWarpsPerBlock + warp;
     if (row >= rows) { return; }
 
@@ -31,7 +32,7 @@ __launch_bounds__(Block) __global__
 
 #pragma unroll
     for (int k = 0; k < kMaxPairsPerLane; ++k) {
-        const int pair = lane + k * kWarpSize;
+        const int pair = lane + k * common::kWarpSize;
         if (pair < pairs) {
             values[k] = x[row_base + pair];
             if constexpr (Prefetch) {
@@ -43,13 +44,13 @@ __launch_bounds__(Block) __global__
         }
     }
 
-    sum       = warp_reduce_sum(sum);
+    sum       = common::warp_reduce_sum(sum);
     float inv = lane == 0 ? rsqrtf(sum / static_cast<float>(d) + eps) : 0.0f;
-    inv       = __shfl_sync(kFullWarpMask, inv, 0);
+    inv       = __shfl_sync(common::kFullWarpMask, inv, 0);
 
 #pragma unroll
     for (int k = 0; k < kMaxPairsPerLane; ++k) {
-        const int pair = lane + k * kWarpSize;
+        const int pair = lane + k * common::kWarpSize;
         if (pair < pairs) {
             const float2 xf = __bfloat1622float2(values[k]);
             __nv_bfloat162 w_pair;
@@ -79,25 +80,25 @@ __launch_bounds__(Block) __global__
     void rmsnorm_d128_bf16x2_kernel(const __nv_bfloat162* x, const __nv_bfloat162* weight,
                                     const __nv_bfloat162* z, __nv_bfloat162* out, std::int64_t rows,
                                     float eps) {
-    static_assert(Block % kWarpSize == 0);
-    constexpr int kWarpsPerBlock = Block / kWarpSize;
+    static_assert(Block % common::kWarpSize == 0);
+    constexpr int kWarpsPerBlock = Block / common::kWarpSize;
     constexpr int kPairsPerRow   = 64;
-    const int lane               = static_cast<int>(threadIdx.x) & (kWarpSize - 1);
-    const int warp               = static_cast<int>(threadIdx.x) / kWarpSize;
+    const int lane               = static_cast<int>(threadIdx.x) & (common::kWarpSize - 1);
+    const int warp               = static_cast<int>(threadIdx.x) / common::kWarpSize;
     const std::int64_t row       = static_cast<std::int64_t>(blockIdx.x) * kWarpsPerBlock + warp;
     if (row >= rows) { return; }
 
     const std::int64_t row_base = row * kPairsPerRow;
     const int pair0             = lane;
-    const int pair1             = lane + kWarpSize;
+    const int pair1             = lane + common::kWarpSize;
     const __nv_bfloat162 value0 = x[row_base + pair0];
     const __nv_bfloat162 value1 = x[row_base + pair1];
     const float2 x0             = __bfloat1622float2(value0);
     const float2 x1             = __bfloat1622float2(value1);
     float sum                   = x0.x * x0.x + x0.y * x0.y + x1.x * x1.x + x1.y * x1.y;
-    sum                         = warp_reduce_sum(sum);
+    sum                         = common::warp_reduce_sum(sum);
     float inv                   = lane == 0 ? rsqrtf(sum * (1.0f / 128.0f) + eps) : 0.0f;
-    inv                         = __shfl_sync(kFullWarpMask, inv, 0);
+    inv                         = __shfl_sync(common::kFullWarpMask, inv, 0);
 
     const float2 w0 = __bfloat1622float2(weight[pair0]);
     const float2 w1 = __bfloat1622float2(weight[pair1]);

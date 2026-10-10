@@ -1,5 +1,7 @@
 #pragma once
-#include "ops/linear/kernels/nvfp4/nvfp4_codec.cuh"
+
+#include "ops/common/cuda/memory.cuh"
+#include "ops/common/quant/nvfp4.cuh"
 #include "ops/linear/kernels/nvfp4/nvfp4_layout.h"
 
 namespace ninfer::ops::detail {
@@ -55,12 +57,12 @@ __global__ __launch_bounds__(Threads, 512 / Threads) void nvfp4_a4_quantize_kern
 
     const int token                   = task / kGroupsPerRow;
     const int group                   = task - token * kGroupsPerRow;
-    const Nvfp4QuantizedK16 quantized = quantize_nvfp4_k16(
+    const common::Nvfp4QuantizedK16 quantized = common::quantize_nvfp4_k16(
         input + static_cast<std::int64_t>(token) * Geometry::kInputRows + group * 16,
         input_scale_divisor);
     auto* code_destination =
         codes + static_cast<std::int64_t>(token) * Geometry::kCodeBytesPerRow + group * 8;
-    store_vec(code_destination, make_uint2(quantized.codes_lo, quantized.codes_hi));
+    common::store_vec(code_destination, make_uint2(quantized.codes_lo, quantized.codes_hi));
     if constexpr (Layout != Nvfp4ScaleLayout::RowMajor) {
         scales[nvfp4_tiled_scale_offset<Geometry, Layout>(token, group)] = quantized.scale;
     } else {

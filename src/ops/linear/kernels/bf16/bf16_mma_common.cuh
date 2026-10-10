@@ -1,6 +1,8 @@
 #pragma once
+
+#include "ops/common/cuda/memory.cuh"
+#include "ops/common/cuda/mma.cuh"
 #include "core/device.h"
-#include "ops/common/mma.cuh"
 #include "ops/linear/kernels/bf16/bf16_schedule.cuh"
 #include "ops/linear/common/epilogue.cuh"
 
@@ -16,20 +18,6 @@ int bf16_prepare_shared() {
     }
     return Bytes;
 }
-
-template <class Schedule, class Epilogue>
-inline constexpr int bf16_epilogue_bytes = [] {
-    if constexpr (requires { Epilogue::template kSharedBytes<Schedule>; })
-        return Epilogue::template kSharedBytes<Schedule>;
-    else
-        return 0;
-}();
-
-template <class Schedule, class Epilogue>
-inline constexpr int bf16_mma_shared_bytes =
-    Schedule::kSharedBytes > bf16_epilogue_bytes<Schedule, Epilogue>
-        ? Schedule::kSharedBytes
-        : bf16_epilogue_bytes<Schedule, Epilogue>;
 
 template <class Schedule>
 __device__ __forceinline__ int bf16_mma_shared_col(int row, int col) {
@@ -82,15 +70,17 @@ bf16_mma_compute_stage(const __nv_bfloat16* As, const __nv_bfloat16* Bs,
         for (int mi = 0; mi < MT; ++mi) {
             const int row = wm * WM + mi * 16 + a_row_offset;
             const int col = k_step * 16 + a_col_offset;
-            ldmatrix_x4(a_frag[mi][0], a_frag[mi][1], a_frag[mi][2], a_frag[mi][3],
-                        smem_addr(&As[row * BK + bf16_mma_shared_col<Schedule>(row, col)]));
+            common::ldmatrix_x4(
+                a_frag[mi][0], a_frag[mi][1], a_frag[mi][2], a_frag[mi][3],
+                common::smem_addr(&As[row * BK + bf16_mma_shared_col<Schedule>(row, col)]));
         }
 #pragma unroll
         for (int ni = 0; ni < NT; ++ni) {
             const int row = wn * WN + ni * 8 + b_inner_row;
             const int col = k_step * 16 + b_k_offset;
-            ldmatrix_x2(b_frag[ni][0], b_frag[ni][1],
-                        smem_addr(&Bs[row * BK + bf16_mma_shared_col<Schedule>(row, col)]));
+            common::ldmatrix_x2(
+                b_frag[ni][0], b_frag[ni][1],
+                common::smem_addr(&Bs[row * BK + bf16_mma_shared_col<Schedule>(row, col)]));
         }
     };
 
@@ -108,9 +98,10 @@ bf16_mma_compute_stage(const __nv_bfloat16* As, const __nv_bfloat16* Bs,
             for (int mi = 0; mi < MT; ++mi) {
 #pragma unroll
                 for (int ni = 0; ni < NT; ++ni) {
-                    mma_bf16(accum[mi][ni][0], accum[mi][ni][1], accum[mi][ni][2], accum[mi][ni][3],
-                             a_frag[slot][mi][0], a_frag[slot][mi][1], a_frag[slot][mi][2],
-                             a_frag[slot][mi][3], b_frag[slot][ni][0], b_frag[slot][ni][1]);
+                    common::mma_bf16(accum[mi][ni][0], accum[mi][ni][1], accum[mi][ni][2],
+                                     accum[mi][ni][3], a_frag[slot][mi][0], a_frag[slot][mi][1],
+                                     a_frag[slot][mi][2], a_frag[slot][mi][3], b_frag[slot][ni][0],
+                                     b_frag[slot][ni][1]);
                 }
             }
         }
@@ -124,9 +115,9 @@ bf16_mma_compute_stage(const __nv_bfloat16* As, const __nv_bfloat16* Bs,
             for (int mi = 0; mi < MT; ++mi) {
 #pragma unroll
                 for (int ni = 0; ni < NT; ++ni) {
-                    mma_bf16(accum[mi][ni][0], accum[mi][ni][1], accum[mi][ni][2], accum[mi][ni][3],
-                             a_frag[mi][0], a_frag[mi][1], a_frag[mi][2], a_frag[mi][3],
-                             b_frag[ni][0], b_frag[ni][1]);
+                    common::mma_bf16(accum[mi][ni][0], accum[mi][ni][1], accum[mi][ni][2],
+                                     accum[mi][ni][3], a_frag[mi][0], a_frag[mi][1], a_frag[mi][2],
+                                     a_frag[mi][3], b_frag[ni][0], b_frag[ni][1]);
                 }
             }
         }

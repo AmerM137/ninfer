@@ -1,6 +1,9 @@
 #pragma once
+#include "ops/common/cuda/pipeline.cuh"
 
-#include "ops/common/mma.cuh"
+#include "ops/common/cuda/memory.cuh"
+#include "ops/common/cuda/mma.cuh"
+
 #include "ops/linear/kernels/q5/q5_schedule.cuh"
 
 namespace ninfer::ops::detail {
@@ -88,7 +91,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void q5_a16_sli
                 valid ? std::int64_t(row_policy.weight_row(row_begin, row)) * row_groups +
                             first_group + group
                       : 0;
-            cp_async_zfill<16, Schedule::kWeightCache>(
+            common::cp_async_zfill<16, Schedule::kWeightCache>(
                 &shared.staging.codes[slot][row][group][half * 16], codes + index * 32 + half * 16,
                 valid ? 16 : 0);
         }
@@ -101,14 +104,14 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void q5_a16_sli
                 valid ? std::int64_t(row_policy.weight_row(row_begin, row)) * row_groups +
                             first_group + pair
                       : 0;
-            cp_async_zfill<16, Schedule::kWeightCache>(&shared.staging.high[slot][row][pair][0],
-                                                       high + index * 8, valid ? 16 : 0);
+            common::cp_async_zfill<16, Schedule::kWeightCache>(
+                &shared.staging.high[slot][row][pair][0], high + index * 8, valid ? 16 : 0);
         }
         if constexpr (Full) {
             for (int row = tid; row < R; row += Schedule::kThreads) {
                 const std::int64_t index =
                     std::int64_t(row_policy.weight_row(row_begin, row)) * row_groups + first_group;
-                cp_async<W * 2>(&shared.staging.scales[slot][row][0], scales + index * 2);
+                common::cp_async<W * 2>(&shared.staging.scales[slot][row][0], scales + index * 2);
             }
         } else {
             // Partial K tiles only guarantee scale-pair alignment of each stored row.
@@ -121,8 +124,8 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void q5_a16_sli
                     valid ? std::int64_t(row_policy.weight_row(row_begin, row)) * row_groups +
                                 first_group + pair
                           : 0;
-                cp_async_zfill<4>(&shared.staging.scales[slot][row][pair], scales + index * 2,
-                                  valid ? 4 : 0);
+                common::cp_async_zfill<4>(&shared.staging.scales[slot][row][pair],
+                                          scales + index * 2, valid ? 4 : 0);
             }
         }
         for (int item = lane; item < Schedule::kTokenCapacity * 8; item += 32) {
@@ -133,11 +136,11 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void q5_a16_sli
             const std::int64_t index =
                 valid ? std::int64_t(token0 + token) * logical_k + (first_group + warp) * 64 + k8
                       : 0;
-            cp_async_zfill<16, Schedule::kActivationCache>(
+            common::cp_async_zfill<16, Schedule::kActivationCache>(
                 &shared.staging.x[slot][warp][token][q5_sliced_k_swizzle(token, k8)], x + index,
                 valid ? 16 : 0);
         }
-        cp_commit();
+        common::cp_commit();
     };
 
     float acc[MT][NT][4] = {};
@@ -146,13 +149,13 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void q5_a16_sli
         if (slot < tiles)
             stage_inputs(slot, slot);
         else
-            cp_commit();
+            common::cp_commit();
     }
     constexpr int kUnroll = Schedule::kStaticK ? (Schedule::kStaticK / 64 + W - 1) / W : 1;
 #pragma unroll kUnroll
     for (int tile = 0; tile < tiles; ++tile) {
         const int slot = tile % S;
-        cp_wait<S - 1>();
+        common::cp_wait<S - 1>();
         __syncthreads();
         float group_acc[MT][NT][4] = {};
 #pragma unroll
@@ -175,11 +178,13 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void q5_a16_sli
                     const int br = ni * 8 + (lane & 7);
                     const int bk = ks * 16 + (((lane >> 3) & 1) * 8);
                     unsigned b0, b1;
-                    ldmatrix_x2(
+                    common::ldmatrix_x2(
                         b0, b1,
-                        smem_addr(&shared.staging.x[slot][warp][br][q5_sliced_k_swizzle(br, bk)]));
-                    mma_bf16(group_acc[mi][ni][0], group_acc[mi][ni][1], group_acc[mi][ni][2],
-                             group_acc[mi][ni][3], a0, a1, a2, a3, b0, b1);
+                        common::smem_addr(
+                            &shared.staging.x[slot][warp][br][q5_sliced_k_swizzle(br, bk)]));
+                    common::mma_bf16(group_acc[mi][ni][0], group_acc[mi][ni][1],
+                                     group_acc[mi][ni][2], group_acc[mi][ni][3], a0, a1, a2, a3, b0,
+                                     b1);
                 }
             }
         }
@@ -207,10 +212,10 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void q5_a16_sli
             __syncthreads();
             stage_inputs(slot, tile + S);
         } else if constexpr (S > 1) {
-            cp_commit();
+            common::cp_commit();
         }
     }
-    cp_wait<0>();
+    common::cp_wait<0>();
     __syncthreads();
     constexpr bool kPairwise = Schedule::kReduction == Q5SlicedKReduction::Pairwise;
     if (!kPairwise || (warp & 1) != 0) {
@@ -218,7 +223,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void q5_a16_sli
         for (int mi = 0; mi < MT; ++mi) {
 #pragma unroll
             for (int ni = 0; ni < NT; ++ni) {
-                store_vec(
+                common::store_vec(
                     shared.partial[warp][mi][ni][lane],
                     make_float4(acc[mi][ni][0], acc[mi][ni][1], acc[mi][ni][2], acc[mi][ni][3]));
             }
@@ -233,15 +238,16 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void q5_a16_sli
             for (int mi = 0; mi < MT; ++mi) {
 #pragma unroll
                 for (int ni = 0; ni < NT; ++ni) {
-                    const float4 partner = load_vec<float4>(shared.partial[warp + 1][mi][ni][lane]);
+                    const float4 partner =
+                        common::load_vec<float4>(shared.partial[warp + 1][mi][ni][lane]);
                     acc[mi][ni][0] += partner.x;
                     acc[mi][ni][1] += partner.y;
                     acc[mi][ni][2] += partner.z;
                     acc[mi][ni][3] += partner.w;
                     if (warp != 0)
-                        store_vec(shared.partial[warp][mi][ni][lane],
-                                  make_float4(acc[mi][ni][0], acc[mi][ni][1], acc[mi][ni][2],
-                                              acc[mi][ni][3]));
+                        common::store_vec(shared.partial[warp][mi][ni][lane],
+                                          make_float4(acc[mi][ni][0], acc[mi][ni][1],
+                                                      acc[mi][ni][2], acc[mi][ni][3]));
                 }
             }
         }
@@ -257,10 +263,11 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void q5_a16_sli
                     sum =
                         make_float4(acc[mi][ni][0], acc[mi][ni][1], acc[mi][ni][2], acc[mi][ni][3]);
                 else
-                    sum = load_vec<float4>(shared.partial[0][mi][ni][lane]);
+                    sum = common::load_vec<float4>(shared.partial[0][mi][ni][lane]);
 #pragma unroll
                 for (int part = kPairwise ? 2 : 1; part < W; part += kPairwise ? 2 : 1) {
-                    const float4 value = load_vec<float4>(shared.partial[part][mi][ni][lane]);
+                    const float4 value =
+                        common::load_vec<float4>(shared.partial[part][mi][ni][lane]);
                     sum.x += value.x;
                     sum.y += value.y;
                     sum.z += value.z;

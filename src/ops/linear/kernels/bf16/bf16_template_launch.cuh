@@ -1,7 +1,9 @@
 #pragma once
 
-#include "ops/common/math.h"
-#include "ops/common/token_slices.h"
+#include "ops/common/host/launch.h"
+#include "ops/common/numeric/math.h"
+#include "ops/linear/common/epilogue.cuh"
+
 #include "ops/linear/kernels/bf16/bf16_operands.h"
 #include "ops/linear/kernels/bf16/bf16_a16_gemv.cuh"
 #include "ops/linear/kernels/bf16/bf16_a16_simt.cuh"
@@ -57,8 +59,9 @@ void launch_bf16_a16_simt(const Bf16A16Operands& p, Output output, Epilogue epil
         if (p.tokens != Epilogue::kRowTokens || p.tokens > Schedule::kBlockTokens)
             throw std::invalid_argument("BF16 row epilogue requires the complete token interval");
     }
-    for_each_token_slice(p.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
-        const dim3 grid(p.rows / Schedule::kBlockRows, div_up(count, Schedule::kBlockTokens));
+    common::for_each_token_slice(p.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
+        const dim3 grid(p.rows / Schedule::kBlockRows,
+                        common::div_up(count, Schedule::kBlockTokens));
         bf16_a16_simt_kernel<Schedule><<<grid, Schedule::kThreads, 0, stream>>>(
             p.x, p.weight, output, epilogue, p.k, p.tokens, offset);
         CUDA_CHECK(cudaGetLastError());
@@ -75,18 +78,19 @@ void launch_bf16_mma_partitions(const Bf16A16Operands& p, Output output, Epilogu
     if ((!bf16_predicated_rows<Schedule> && p.rows % Schedule::kBlockRows) ||
         p.k % ((bf16_predicated_k<Schedule> ? 8 : Schedule::kBlockK) * Splits))
         throw std::invalid_argument("BF16 MMA requires compatible row/K tiles in every split");
-    for_each_token_slice(p.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
-        const auto blocks = static_cast<std::int64_t>(bf16_predicated_rows<Schedule>
-                                                          ? div_up(p.rows, Schedule::kBlockRows)
-                                                          : p.rows / Schedule::kBlockRows) *
-                            div_up(count, Schedule::kBlockTokens);
+    common::for_each_token_slice(p.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
+        const auto blocks =
+            static_cast<std::int64_t>(bf16_predicated_rows<Schedule>
+                                          ? common::div_up(p.rows, Schedule::kBlockRows)
+                                          : p.rows / Schedule::kBlockRows) *
+            common::div_up(count, Schedule::kBlockTokens);
         if (blocks > 2147483647LL)
             throw std::invalid_argument("BF16 MMA grid exceeds CUDA grid.x capacity");
         const dim3 grid(static_cast<unsigned>(blocks), 1, Splits);
         const auto launch = [&]<bool Full>() {
             constexpr auto kernel = bf16_a16_mma_kernel<Schedule, Full, Output, Epilogue, Splits>;
             const int bytes =
-                bf16_prepare_shared<bf16_mma_shared_bytes<Schedule, Epilogue>, kernel>();
+                common::prepare_shared<linear_mma_shared_bytes<Schedule, Epilogue>, kernel, true>();
             kernel<<<grid, Schedule::kThreads, bytes, stream>>>(p.x, p.weight, output, epilogue,
                                                                 p.rows, p.k, offset, count);
             CUDA_CHECK(cudaGetLastError());
@@ -112,11 +116,12 @@ void launch_bf16_a16_sliced_k_mma(const Bf16A16Operands& p, Output output, Epilo
         p.k % (bf16_predicated_k<Schedule> ? 8 : Schedule::kBlockK))
         throw std::invalid_argument("BF16 sliced-K requires compatible row/K tiles");
     constexpr auto kernel = bf16_a16_sliced_k_mma_kernel<Schedule, Output, Epilogue>;
-    const int bytes       = bf16_prepare_shared<Schedule::kSharedBytes, kernel>();
-    for_each_token_slice(p.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
-        const dim3 grid(bf16_predicated_rows<Schedule> ? div_up(p.rows, Schedule::kBlockRows)
-                                                       : p.rows / Schedule::kBlockRows,
-                        div_up(count, Schedule::kBlockTokens));
+    const int bytes       = common::prepare_shared<Schedule::kSharedBytes, kernel, true>();
+    common::for_each_token_slice(p.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
+        const dim3 grid(bf16_predicated_rows<Schedule>
+                            ? common::div_up(p.rows, Schedule::kBlockRows)
+                            : p.rows / Schedule::kBlockRows,
+                        common::div_up(count, Schedule::kBlockTokens));
         kernel<<<grid, Schedule::kThreads, bytes, stream>>>(p.x, p.weight, output, epilogue, p.rows,
                                                             p.k, p.tokens, offset);
         CUDA_CHECK(cudaGetLastError());

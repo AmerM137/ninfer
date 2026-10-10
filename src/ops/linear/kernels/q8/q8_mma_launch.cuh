@@ -1,6 +1,8 @@
 #pragma once
-#include "ops/common/math.h"
-#include "ops/common/token_slices.h"
+
+#include "ops/common/host/launch.h"
+#include "ops/common/numeric/math.h"
+#include "ops/linear/common/epilogue.cuh"
 #include "ops/linear/kernels/q8/q8_a16_mma.cuh"
 
 namespace ninfer::ops::detail {
@@ -19,25 +21,27 @@ void launch_q8_a16_mma(const Q8LinearOperands& operands, Output output, Epilogue
     constexpr int row_ratio = Schedule::kBlockRows / RowPolicy::kOutputRowsPerCta;
     if (operands.rows % row_ratio != 0)
         throw std::invalid_argument("Q8 MMA row mapping requires complete row pairs");
-    for_each_token_slice(operands.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
-        const dim3 grid(div_up(operands.rows / row_ratio, RowPolicy::kOutputRowsPerCta),
-                        div_up(count, Schedule::kBlockTokens));
-        const auto launch = [&]<bool Full, bool FullK>() {
-            constexpr auto kernel =
-                q8_a16_mma_kernel<Schedule, Full, FullK, Output, Epilogue, RowPolicy>;
-            const int shared = q8_prepare_shared<q8_mma_shared_bytes<Schedule, Epilogue>, kernel>();
-            kernel<<<grid, Schedule::kThreads, shared, stream>>>(operands, output, epilogue,
-                                                                 row_policy, offset, count);
-            CUDA_CHECK(cudaGetLastError());
-        };
-        if (!Schedule::kPredicated && operands.rows % Schedule::kBlockRows == 0 &&
-            count % Schedule::kBlockTokens == 0 && operands.k == operands.padded_k &&
-            operands.padded_k % 256 == 0)
-            launch.template operator()<true, true>();
-        else if (operands.k == operands.padded_k)
-            launch.template operator()<false, true>();
-        else
-            launch.template operator()<false, false>();
-    });
+    common::for_each_token_slice(
+        operands.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
+            const dim3 grid(common::div_up(operands.rows / row_ratio, RowPolicy::kOutputRowsPerCta),
+                            common::div_up(count, Schedule::kBlockTokens));
+            const auto launch = [&]<bool Full, bool FullK>() {
+                constexpr auto kernel =
+                    q8_a16_mma_kernel<Schedule, Full, FullK, Output, Epilogue, RowPolicy>;
+                const int shared =
+                    common::prepare_shared<linear_mma_shared_bytes<Schedule, Epilogue>, kernel>();
+                kernel<<<grid, Schedule::kThreads, shared, stream>>>(operands, output, epilogue,
+                                                                     row_policy, offset, count);
+                CUDA_CHECK(cudaGetLastError());
+            };
+            if (!Schedule::kPredicated && operands.rows % Schedule::kBlockRows == 0 &&
+                count % Schedule::kBlockTokens == 0 && operands.k == operands.padded_k &&
+                operands.padded_k % 256 == 0)
+                launch.template operator()<true, true>();
+            else if (operands.k == operands.padded_k)
+                launch.template operator()<false, true>();
+            else
+                launch.template operator()<false, false>();
+        });
 }
 } // namespace ninfer::ops::detail

@@ -1,5 +1,8 @@
 #pragma once
 
+#include "ops/common/cuda/reduce.cuh"
+#include "ops/common/numeric/convert.cuh"
+
 // Contiguous BF16 x BF16 SIMT core with exact or runtime column extents.
 //
 // Each row group owns RowsPerWarp output rows. WarpsPerRow warps cover disjoint K slices, and
@@ -27,7 +30,7 @@ bf16_simt_decode_pack(const Bf16GemvPack<Values>& packed) {
     Bf16SimtFloatPack<Values> result;
 #pragma unroll
     for (int pair = 0; pair < Values / 2; ++pair) {
-        const float2 values         = bf16x2_bits_to_float2(packed.words[pair]);
+        const float2 values         = common::bf16x2_bits_to_float2(packed.words[pair]);
         result.values[2 * pair]     = values.x;
         result.values[2 * pair + 1] = values.y;
     }
@@ -41,7 +44,7 @@ __device__ __forceinline__ void bf16_simt_accumulate(const Bf16SimtFloatPack<Val
     constexpr int kChainMask = Chains - 1;
 #pragma unroll
     for (int pair = 0; pair < Values / 2; ++pair) {
-        const float2 x = bf16x2_bits_to_float2(activation.words[pair]);
+        const float2 x = common::bf16x2_bits_to_float2(activation.words[pair]);
         accumulators[(2 * pair) & kChainMask] =
             fmaf(weight.values[2 * pair], x.x, accumulators[(2 * pair) & kChainMask]);
         accumulators[(2 * pair + 1) & kChainMask] =
@@ -98,7 +101,8 @@ __device__ __forceinline__ void bf16_simt_compute_rows(
     float (&accumulators)[Schedule::kRowsPerWarp][ActiveTokens][Schedule::kAccumulatorChains],
     int live_tokens, int input_rows) {
     const int K                   = Schedule::kStaticK ? Schedule::kStaticK : input_rows;
-    constexpr int kValuesPerPhase = Schedule::kWarpsPerRow * kWarpSize * Schedule::kValuesPerLane;
+    constexpr int kValuesPerPhase =
+        Schedule::kWarpsPerRow * common::kWarpSize * Schedule::kValuesPerLane;
     const int kPhases =
         K / kValuesPerPhase + (bf16_predicated_k<Schedule> && K % kValuesPerPhase != 0);
     using Pack       = Bf16GemvPack<Schedule::kValuesPerLane>;
@@ -214,7 +218,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_s
 #pragma unroll
             for (int chain = 0; chain < Schedule::kAccumulatorChains; ++chain)
                 total += accumulators[local_row][token][chain];
-            total = warp_reduce_sum(total);
+            total = common::warp_reduce_sum(total);
             if constexpr (Schedule::kWarpsPerRow == 1) {
                 if constexpr (requires {
                                   epilogue.apply_row(destination, row0, token_begin, values,
@@ -251,7 +255,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_s
                     const float partial = lane < Schedule::kWarpsPerRow
                                               ? shared.partials[row_group][local_row][token][lane]
                                               : 0.0F;
-                    const float total   = warp_reduce_sum(partial);
+                    const float total   = common::warp_reduce_sum(partial);
                     if constexpr (requires {
                                       epilogue.apply_row(destination, row0, token_begin, values,
                                                          live_tokens);

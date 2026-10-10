@@ -1,4 +1,5 @@
 #include "ops/gated_residual/mix/launch.h"
+#include "ops/common/token_slices.h"
 #include "ops/gated_residual/mix/kernel/output.cuh"
 #include "ops/gated_residual/mix/kernel/up_mma_mix.cuh"
 #include "ops/gated_residual/mix/kernel/up_tma_mix.cuh"

@@ -1,10 +1,12 @@
 #pragma once
 
-#include "ops/common/mbarrier.cuh"
+#include "ops/common/cuda/pipeline.cuh"
+#include "ops/common/host/launch.h"
+#include "ops/common/numeric/math.h"
+#include "ops/linear/common/epilogue.cuh"
+
 #include "ops/linear/kernels/bf16/bf16_mma_common.cuh"
 #include "ops/linear/kernels/bf16/bf16_operands.h"
-#include "ops/common/token_slices.h"
-#include "ops/common/math.h"
 #include <cuda.h>
 #include <stdexcept>
 #include <string>
@@ -66,19 +68,9 @@ template <class Schedule>
 __device__ __forceinline__ void bf16_tma_load(void* destination, const CUtensorMap* map,
                                               int k_sector, int row, std::uint64_t* barrier) {
     if constexpr (bf16_predicated_k<Schedule>) {
-        asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes "
-                     "[%0], [%1, {%2, %3}], [%4];"
-                     :
-                     : "r"(smem_addr(destination)), "l"(map), "r"(k_sector * 64), "r"(row),
-                       "r"(smem_addr(barrier))
-                     : "memory");
+        common::tma_load_2d(destination, map, k_sector * 64, row, barrier);
     } else {
-        asm volatile("cp.async.bulk.tensor.3d.shared::cta.global.tile.mbarrier::complete_tx::bytes "
-                     "[%0], [%1, {%2, %3, %4}], [%5];"
-                     :
-                     : "r"(smem_addr(destination)), "l"(map), "r"(0), "r"(k_sector), "r"(row),
-                       "r"(smem_addr(barrier))
-                     : "memory");
+        common::tma_load_3d(destination, map, 0, k_sector, row, barrier);
     }
 }
 
@@ -98,9 +90,9 @@ struct Bf16ContiguousTmaWeightAccess {
 
 template <class Schedule, class Epilogue>
 inline constexpr int bf16_tma_scratch_bytes =
-    ((Schedule::kTensorBytes > bf16_epilogue_bytes<Schedule, Epilogue>
+    ((Schedule::kTensorBytes > linear_epilogue_bytes<Schedule, Epilogue>
           ? Schedule::kTensorBytes
-          : bf16_epilogue_bytes<Schedule, Epilogue>)+127) /
+          : linear_epilogue_bytes<Schedule, Epilogue>)+127) /
     128 * 128;
 
 template <class Schedule, bool FullTokens, class Output, class Epilogue, int Splits = 1,
@@ -128,10 +120,10 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_t
     if (threadIdx.x == 0) {
 #pragma unroll
         for (int stage = 0; stage < S; ++stage) {
-            cta_mbarrier_init(full + stage, 1);
-            cta_mbarrier_init(empty + stage, Schedule::kConsumerWarps);
+            common::cta_mbarrier_init(full + stage, 1);
+            common::cta_mbarrier_init(empty + stage, Schedule::kConsumerWarps);
         }
-        cta_mbarrier_fence_init();
+        common::cta_mbarrier_fence_init();
     }
     __syncthreads();
     const int tiles_k         = split_k / BK + (bf16_predicated_k<Schedule> && split_k % BK != 0);
@@ -143,8 +135,8 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_t
         if (threadIdx.x == 0) {
             for (int kt = 0; kt < tiles_k; ++kt) {
                 const int stage = kt % S;
-                cta_mbarrier_wait(empty + stage, 1U ^ ((kt / S) & 1U));
-                cta_mbarrier_arrive_expect_tx(full + stage, (BR + BT) * BK * 2);
+                common::cta_mbarrier_wait(empty + stage, 1U ^ ((kt / S) & 1U));
+                common::cta_mbarrier_arrive_expect_tx(full + stage, (BR + BT) * BK * 2);
                 const int k_sector = split_begin / 64 + kt * (BK / 64);
                 WeightAccess::template load<Schedule>(a + stage * BR * BK, &descriptors.weight,
                                                       k_sector, row_begin, full + stage);
@@ -159,14 +151,14 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_t
 #pragma unroll Schedule::kConsumerKUnroll
         for (int kt = 0; kt < tiles_k; ++kt) {
             const int stage = kt % S;
-            cta_mbarrier_wait(full + stage, (kt / S) & 1U);
+            common::cta_mbarrier_wait(full + stage, (kt / S) & 1U);
             bf16_mma_compute_stage<Schedule>(a + stage * BR * BK, b + stage * BT * BK, accum, warp,
                                              lane);
             // LDMATRIX reads use the generic proxy; the next TMA write uses the async proxy.
             // Order every lane's reads across that boundary before the elected release arrival.
             asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
             __syncwarp();
-            if (lane == 0) cta_mbarrier_arrive(empty + stage);
+            if (lane == 0) common::cta_mbarrier_arrive(empty + stage);
         }
     }
     bf16_finish_mma_tile<Schedule, FullTokens>(output, epilogue, storage, accum, row_begin,
@@ -185,11 +177,12 @@ void launch_bf16_a16_tma_mma(const Bf16A16Operands& p, Output output, Epilogue e
     }
     // Descriptors are launch-owned values, copied into kernel parameters during Graph capture.
     const auto descriptors = make_bf16_tma_descriptors<Schedule, WeightAccess>(p);
-    for_each_token_slice(p.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
-        const auto blocks = static_cast<std::int64_t>(bf16_predicated_rows<Schedule>
-                                                          ? div_up(p.rows, Schedule::kBlockRows)
-                                                          : p.rows / Schedule::kBlockRows) *
-                            div_up(count, Schedule::kBlockTokens);
+    common::for_each_token_slice(p.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
+        const auto blocks =
+            static_cast<std::int64_t>(bf16_predicated_rows<Schedule>
+                                          ? common::div_up(p.rows, Schedule::kBlockRows)
+                                          : p.rows / Schedule::kBlockRows) *
+            common::div_up(count, Schedule::kBlockTokens);
         if (blocks > 2147483647LL)
             throw std::invalid_argument("BF16 TMA grid exceeds CUDA grid.x capacity");
         const auto launch = [&]<bool Full>() {
@@ -197,7 +190,7 @@ void launch_bf16_a16_tma_mma(const Bf16A16Operands& p, Output output, Epilogue e
                 bf16_a16_tma_mma_kernel<Schedule, Full, Output, Epilogue, Splits, WeightAccess>;
             constexpr int bytes =
                 bf16_tma_scratch_bytes<Schedule, Epilogue> + Schedule::kBarrierBytes;
-            bf16_prepare_shared<bytes, kernel>();
+            common::prepare_shared<bytes, kernel, true>();
             kernel<<<dim3(static_cast<unsigned>(blocks), 1, Splits), Schedule::kThreads, bytes,
                      stream>>>(descriptors, output, epilogue, p.rows, p.k, offset, count);
             CUDA_CHECK(cudaGetLastError());

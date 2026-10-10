@@ -1,4 +1,6 @@
 #pragma once
+
+#include "ops/common/cuda/memory.cuh"
 #include "ops/linear/kernels/nvfp4/nvfp4_schedule.cuh"
 
 namespace ninfer::ops::detail {

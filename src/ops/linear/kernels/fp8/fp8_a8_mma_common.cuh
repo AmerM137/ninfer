@@ -1,9 +1,10 @@
 #pragma once
 
-#include "ops/common/math.cuh"
-#include "ops/common/memory.cuh"
-#include "ops/common/mma.cuh"
-#include "ops/linear/common/vector_output.cuh"
+#include "ops/common/cuda/memory.cuh"
+#include "ops/common/cuda/mma.cuh"
+#include "ops/common/numeric/convert.cuh"
+
+#include "ops/linear/common/output.cuh"
 #include "ops/linear/kernels/fp8/fp8_schedule.cuh"
 
 namespace ninfer::ops::detail {
@@ -75,17 +76,17 @@ fp8_mma_compute_stage(const std::uint8_t* activation_stage, const std::uint8_t* 
             const int row = warp_token * Schedule::kWarpTokens + mma_token * 16 + a_row_offset;
             const int logical_byte  = k_step * 32 + a_column_byte;
             const int physical_byte = fp8_mma_shared_byte<Schedule>(row, logical_byte);
-            ldmatrix_x4(a_fragments[mma_token][0], a_fragments[mma_token][1],
-                        a_fragments[mma_token][2], a_fragments[mma_token][3],
-                        smem_addr(activation_stage + row * BK + physical_byte));
+            common::ldmatrix_x4(a_fragments[mma_token][0], a_fragments[mma_token][1],
+                                a_fragments[mma_token][2], a_fragments[mma_token][3],
+                                common::smem_addr(activation_stage + row * BK + physical_byte));
         }
 #pragma unroll
         for (int mma_row = 0; mma_row < Schedule::kMmaRows; ++mma_row) {
             const int row           = warp_row * Schedule::kWarpRows + mma_row * 8 + b_row_offset;
             const int logical_byte  = k_step * 32 + b_column_byte;
             const int physical_byte = fp8_mma_shared_byte<Schedule>(row, logical_byte);
-            ldmatrix_x2(b_fragments[mma_row][0], b_fragments[mma_row][1],
-                        smem_addr(weight_stage + row * BK + physical_byte));
+            common::ldmatrix_x2(b_fragments[mma_row][0], b_fragments[mma_row][1],
+                                common::smem_addr(weight_stage + row * BK + physical_byte));
         }
     };
 
@@ -103,7 +104,7 @@ fp8_mma_compute_stage(const std::uint8_t* activation_stage, const std::uint8_t* 
             for (int mma_token = 0; mma_token < Schedule::kMmaTokens; ++mma_token) {
 #pragma unroll
                 for (int mma_row = 0; mma_row < Schedule::kMmaRows; ++mma_row) {
-                    mma_fp8_e4m3(
+                    common::mma_fp8_e4m3(
                         accumulators[mma_token][mma_row][0], accumulators[mma_token][mma_row][1],
                         accumulators[mma_token][mma_row][2], accumulators[mma_token][mma_row][3],
                         a_fragments[slot][mma_token][0], a_fragments[slot][mma_token][1],
@@ -122,7 +123,7 @@ fp8_mma_compute_stage(const std::uint8_t* activation_stage, const std::uint8_t* 
             for (int mma_token = 0; mma_token < Schedule::kMmaTokens; ++mma_token) {
 #pragma unroll
                 for (int mma_row = 0; mma_row < Schedule::kMmaRows; ++mma_row) {
-                    mma_fp8_e4m3(
+                    common::mma_fp8_e4m3(
                         accumulators[mma_token][mma_row][0], accumulators[mma_token][mma_row][1],
                         accumulators[mma_token][mma_row][2], accumulators[mma_token][mma_row][3],
                         a_fragments[mma_token][0], a_fragments[mma_token][1],
@@ -179,8 +180,8 @@ fp8_finish_mma_tile(Output output, Epilogue epilogue, RowPolicy row_policy,
             const float2 weight_scale = [&] {
                 if constexpr (requires { RowPolicy::kContiguousPairs; }) {
                     if constexpr (RowPolicy::kContiguousPairs)
-                        return bf16x2_bits_to_float2(
-                            load_ldg<std::uint32_t>(weight_scales + parent_row0));
+                        return common::bf16x2_bits_to_float2(
+                            common::load_ldg<std::uint32_t>(weight_scales + parent_row0));
                 }
                 return make_float2(__bfloat162float(weight_scales[parent_row0]),
                                    __bfloat162float(weight_scales[parent_row1]));
@@ -234,12 +235,12 @@ fp8_finish_mma_tile(Output output, Epilogue epilogue, RowPolicy row_policy,
             const int row_vector  = task - token_local * vectors_per_token;
             const int token       = token_begin + token_local;
             if constexpr (FullTokens) {
-                const uint4 values =
-                    load_vec<uint4>(shared_output + token_local * output_stride + row_vector * 8);
+                const uint4 values = common::load_vec<uint4>(
+                    shared_output + token_local * output_stride + row_vector * 8);
                 linear_store_bf16_vector(output, row_begin + row_vector * 8, token, values);
             } else if (token < tokens) {
-                const uint4 values =
-                    load_vec<uint4>(shared_output + token_local * output_stride + row_vector * 8);
+                const uint4 values = common::load_vec<uint4>(
+                    shared_output + token_local * output_stride + row_vector * 8);
                 linear_store_bf16_vector(output, row_begin + row_vector * 8, token, values);
             }
         }

@@ -1,7 +1,7 @@
 #pragma once
 
-#include "ops/common/memory.cuh"
-#include "ops/linear/kernels/q8/q8_rowsplit_storage.cuh"
+#include "ops/common/cuda/memory.cuh"
+#include "ops/common/quant/integer.cuh"
 
 namespace ninfer::ops::detail {
 
@@ -24,13 +24,13 @@ struct Q8A16SimtSchedule {
     static constexpr int kMinBlocksPerSm     = MinBlocksPerSm;
     static constexpr int kWarps              = BlockRows * WarpsPerRow;
     static constexpr int kThreads            = kWarps * 32;
-    static constexpr int kStageK             = GroupsPerWarpStage * Q8RowSplitStorage::kGroupK;
+    static constexpr int kStageK = GroupsPerWarpStage * common::Q8RowSplitStorage::kGroupK;
     static constexpr int kCodeVecsPerStage   = GroupsPerWarpStage * 2;
     static constexpr int kScalePairsPerStage = GroupsPerWarpStage / 2;
     static constexpr int kCodePhases         = (GroupsPerWarpStage + 7) / 8;
-    static constexpr int kStagingBytes =
-        kWarps * Stages * GroupsPerWarpStage *
-        (Q8RowSplitStorage::kCodeBytesPerGroup + Q8RowSplitStorage::kScaleBytesPerGroup);
+    static constexpr int kStagingBytes       = kWarps * Stages * GroupsPerWarpStage *
+                                         (common::Q8RowSplitStorage::kCodeBytesPerGroup +
+                                          common::Q8RowSplitStorage::kScaleBytesPerGroup);
     static constexpr int kPartialBytes = WarpsPerRow > 1 ? kWarps* BlockTokens * sizeof(float) : 0;
     static constexpr int kSharedBytes =
         ((kStagingBytes > kPartialBytes ? kStagingBytes : kPartialBytes) + 15) / 16 * 16;

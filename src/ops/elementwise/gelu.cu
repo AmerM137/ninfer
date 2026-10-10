@@ -1,9 +1,10 @@
 #include "ninfer/ops/gelu.h"
+#include "ops/common/cuda/memory.cuh"
+#include "ops/common/numeric/convert.cuh"
+#include "ops/common/numeric/math.cuh"
+#include "ops/common/numeric/math.h"
 
 #include "core/device.h"
-#include "ops/common/bf16_vector.cuh"
-#include "ops/common/math.h"
-#include "ops/common/memory.cuh"
 
 #include <cuda_bf16.h>
 
@@ -16,35 +17,26 @@ namespace ninfer::ops {
 namespace {
 
 inline constexpr int kGeluPairsPerThread = 4;
-
-template <bool TanhApprox>
-__device__ __forceinline__ float gelu_one(float value) {
-    constexpr float kInvSqrt2 = 0.70710678118654752440f;
-    constexpr float kSqrt2Pi  = 0.79788456080286535588f;
-    if constexpr (TanhApprox) {
-        return 0.5f * value *
-               (1.0f + tanhf(kSqrt2Pi * (value + 0.044715f * value * value * value)));
-    }
-    return 0.5f * value * (1.0f + erff(value * kInvSqrt2));
-}
+inline constexpr std::int64_t kVectorMaxElements = 32LL * 1024LL * 1024LL;
 
 template <bool TanhApprox>
 __device__ __forceinline__ __nv_bfloat162 gelu_pair(__nv_bfloat162 input) {
-    return __floats2bfloat162_rn(gelu_one<TanhApprox>(__low2float(input)),
-                                 gelu_one<TanhApprox>(__high2float(input)));
+    return __floats2bfloat162_rn(common::gelu<TanhApprox>(__low2float(input)),
+                                 common::gelu<TanhApprox>(__high2float(input)));
 }
 
 template <bool TanhApprox, int Block>
-__launch_bounds__(Block) __global__ void gelu_bf16x8_kernel(Bf16x8Pack* x, std::int64_t packs) {
+__launch_bounds__(Block) __global__
+    void gelu_bf16x8_kernel(common::Bf16x8Pack* x, std::int64_t packs) {
     const std::int64_t start  = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
     const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
     for (std::int64_t i = start; i < packs; i += stride) {
-        Bf16x8Pack value = load_vec<Bf16x8Pack>(x + i);
+        common::Bf16x8Pack value = common::load_vec<common::Bf16x8Pack>(x + i);
 #pragma unroll
         for (int pair = 0; pair < 4; ++pair) {
             value.pair[pair] = gelu_pair<TanhApprox>(value.pair[pair]);
         }
-        store_vec(x + i, value);
+        common::store_vec(x + i, value);
     }
 }
 
@@ -60,7 +52,7 @@ __launch_bounds__(Block) __global__
         if (pair < pairs) { x[pair] = gelu_pair<TanhApprox>(x[pair]); }
     }
     if (blockIdx.x == 0 && threadIdx.x == 0 && has_scalar) {
-        *scalar = __float2bfloat16_rn(gelu_one<TanhApprox>(__bfloat162float(*scalar)));
+        *scalar = __float2bfloat16_rn(common::gelu<TanhApprox>(__bfloat162float(*scalar)));
     }
 }
 
@@ -69,7 +61,7 @@ __global__ void gelu_kernel(__nv_bfloat16* x, std::int64_t n) {
     const std::int64_t start  = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
     for (std::int64_t i = start; i < n; i += stride) {
-        x[i] = __float2bfloat16_rn(gelu_one<TanhApprox>(__bfloat162float(x[i])));
+        x[i] = __float2bfloat16_rn(common::gelu<TanhApprox>(__bfloat162float(x[i])));
     }
 }
 
@@ -78,17 +70,18 @@ void launch_gelu(Tensor& x, GeluMode mode, cudaStream_t stream) {
     constexpr int maxGrid = 16384;
     const std::int64_t n  = x.numel();
     const auto address    = reinterpret_cast<std::uintptr_t>(x.data);
-    if ((address & (alignof(Bf16x8Pack) - 1)) == 0 && (n % 8) == 0 &&
-        n <= kBf16x8CacheSizedMaxElements) {
+    if ((address & (alignof(common::Bf16x8Pack) - 1)) == 0 && (n % 8) == 0 &&
+        n <= kVectorMaxElements) {
         const std::int64_t packs = n / 8;
         const int grid           = static_cast<int>(std::min<std::int64_t>(
-            maxGrid, std::max<std::int64_t>(1, div_up(packs, static_cast<std::int64_t>(block)))));
+            maxGrid,
+            std::max<std::int64_t>(1, common::div_up(packs, static_cast<std::int64_t>(block)))));
         if (mode == GeluMode::Tanh) {
             gelu_bf16x8_kernel<true, block>
-                <<<grid, block, 0, stream>>>(static_cast<Bf16x8Pack*>(x.data), packs);
+                <<<grid, block, 0, stream>>>(static_cast<common::Bf16x8Pack*>(x.data), packs);
         } else {
             gelu_bf16x8_kernel<false, block>
-                <<<grid, block, 0, stream>>>(static_cast<Bf16x8Pack*>(x.data), packs);
+                <<<grid, block, 0, stream>>>(static_cast<common::Bf16x8Pack*>(x.data), packs);
         }
         CUDA_CHECK(cudaGetLastError());
         return;
@@ -97,7 +90,7 @@ void launch_gelu(Tensor& x, GeluMode mode, cudaStream_t stream) {
     if (paired && n >= 2) {
         const std::int64_t pairs = n / 2;
         const int grid           = static_cast<int>(std::min<std::int64_t>(
-            div_up(pairs, static_cast<std::int64_t>(block * kGeluPairsPerThread)),
+            common::div_up(pairs, static_cast<std::int64_t>(block * kGeluPairsPerThread)),
             std::numeric_limits<int>::max()));
         auto* x2                 = static_cast<__nv_bfloat162*>(x.data);
         auto* tail               = static_cast<__nv_bfloat16*>(x.data) + pairs * 2;
@@ -113,7 +106,7 @@ void launch_gelu(Tensor& x, GeluMode mode, cudaStream_t stream) {
     }
 
     const int grid = static_cast<int>(std::min<std::int64_t>(
-        div_up(n, static_cast<std::int64_t>(block)), std::numeric_limits<int>::max()));
+        common::div_up(n, static_cast<std::int64_t>(block)), std::numeric_limits<int>::max()));
     if (mode == GeluMode::Tanh) {
         gelu_kernel<true><<<grid, block, 0, stream>>>(static_cast<__nv_bfloat16*>(x.data), n);
     } else {

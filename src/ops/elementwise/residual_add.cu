@@ -1,9 +1,9 @@
 #include "ninfer/ops/residual_add.h"
+#include "ops/common/cuda/memory.cuh"
+#include "ops/common/numeric/convert.cuh"
+#include "ops/common/numeric/math.h"
 
 #include "core/device.h"
-#include "ops/common/bf16_vector.cuh"
-#include "ops/common/math.h"
-#include "ops/common/memory.cuh"
 
 #include <cuda_bf16.h>
 
@@ -33,17 +33,18 @@ __global__ void residual_add_scalar_kernel(const __nv_bfloat16* y, __nv_bfloat16
 }
 
 __launch_bounds__(256) __global__
-    void residual_add_bf16x8_kernel(const Bf16x8Pack* y, Bf16x8Pack* x, std::int64_t packs) {
+    void residual_add_bf16x8_kernel(const common::Bf16x8Pack* y, common::Bf16x8Pack* x,
+                                    std::int64_t packs) {
     const std::int64_t start  = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
     const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
     for (std::int64_t i = start; i < packs; i += stride) {
-        const Bf16x8Pack yv = load_vec<Bf16x8Pack>(y + i);
-        Bf16x8Pack xv       = load_vec<Bf16x8Pack>(x + i);
+        const common::Bf16x8Pack yv = common::load_vec<common::Bf16x8Pack>(y + i);
+        common::Bf16x8Pack xv       = common::load_vec<common::Bf16x8Pack>(x + i);
 #pragma unroll
         for (int pair = 0; pair < 4; ++pair) {
             xv.pair[pair] = residual_add_pair(yv.pair[pair], xv.pair[pair]);
         }
-        store_vec(x + i, xv);
+        common::store_vec(x + i, xv);
     }
 }
 
@@ -89,18 +90,20 @@ void launch_residual_add(const Tensor& y, Tensor& x, cudaStream_t stream) {
     constexpr int kMaxGrid = 4096;
     const auto y_addr      = reinterpret_cast<std::uintptr_t>(y.data);
     const auto x_addr      = reinterpret_cast<std::uintptr_t>(x.data);
-    if (((y_addr | x_addr) & (alignof(Bf16x8Pack) - 1)) == 0 && (n % 8) == 0) {
+    if (((y_addr | x_addr) & (alignof(common::Bf16x8Pack) - 1)) == 0 && (n % 8) == 0) {
         const std::int64_t packs = n / 8;
         const int grid           = static_cast<int>(std::min<std::int64_t>(
-            kMaxGrid, std::max<std::int64_t>(1, div_up(packs, static_cast<std::int64_t>(kBlock)))));
+            kMaxGrid,
+            std::max<std::int64_t>(1, common::div_up(packs, static_cast<std::int64_t>(kBlock)))));
         residual_add_bf16x8_kernel<<<grid, kBlock, 0, stream>>>(
-            static_cast<const Bf16x8Pack*>(y.data), static_cast<Bf16x8Pack*>(x.data), packs);
+            static_cast<const common::Bf16x8Pack*>(y.data),
+            static_cast<common::Bf16x8Pack*>(x.data), packs);
         CUDA_CHECK(cudaGetLastError());
         return;
     }
     if (((y_addr | x_addr) & (alignof(__nv_bfloat162) - 1)) != 0) {
         const int scalar_grid = static_cast<int>(
-            std::min<std::int64_t>(kMaxGrid, div_up(n, static_cast<std::int64_t>(kBlock))));
+            std::min<std::int64_t>(kMaxGrid, common::div_up(n, static_cast<std::int64_t>(kBlock))));
         residual_add_scalar_kernel<<<scalar_grid, kBlock, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(y.data), static_cast<__nv_bfloat16*>(x.data), n);
         CUDA_CHECK(cudaGetLastError());
@@ -109,8 +112,8 @@ void launch_residual_add(const Tensor& y, Tensor& x, cudaStream_t stream) {
 
     const std::int64_t n2                 = n / 2;
     constexpr std::int64_t kPairsPerBlock = kBlock * kResidualAddPairsPerThread;
-    const int grid                        = static_cast<int>(
-        std::min<std::int64_t>(kMaxGrid, std::max<std::int64_t>(1, div_up(n2, kPairsPerBlock))));
+    const int grid                        = static_cast<int>(std::min<std::int64_t>(
+        kMaxGrid, std::max<std::int64_t>(1, common::div_up(n2, kPairsPerBlock))));
 
     residual_add_bf16x2_kernel<<<grid, kBlock, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(y.data), static_cast<__nv_bfloat16*>(x.data), n);

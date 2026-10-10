@@ -61,5 +61,4 @@ inline std::size_t nvfp4_a4_workspace_capacity_bytes(std::int32_t tokens, std::i
 void launch_nvfp4_a4_quantize(const Tensor& x, const Weight& weight, Nvfp4A4Workspace workspace,
                               Nvfp4ScaleLayout layout, cudaStream_t stream);
 
-
 } // namespace ninfer::ops::detail
