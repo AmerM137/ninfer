@@ -1,8 +1,7 @@
 #pragma once
 
-#include "ops/gated_residual/mix/kernel/math.cuh"
-#include "ops/gated_residual/mix/kernel/shared_layout.cuh"
-#include "ops/gated_residual/mix/operands.h"
+#include "ops/gated_residual/mix/kernel/output.cuh"
+#include "ops/common/cuda/pipeline.cuh"
 #include "ops/linear/kernels/bf16/bf16_mma_common.cuh"
 
 namespace ninfer::ops::detail::hc::mix {
@@ -33,40 +32,40 @@ __launch_bounds__(FoldedUpSchedule<Features, Tokens>::kThreads) __global__
         for (int i = tid; i < Rows * (BK / 8); i += S::kThreads) {
             const int row = i / (BK / 8), k8 = i % (BK / 8);
             const int native_row = (row / Features) * kWidth + d0 + row % Features;
-            cp_async<16, S::kWeightCache>(as + row * BK + bf16_mma_shared_col<S>(row, k8 * 8),
-                                                             static_cast<const __nv_bfloat16*>(o.up) +
-                                                                 std::int64_t(native_row) * kRank + group * BK +
-                                                                 k8 * 8);
+            common::cp_async<16, S::kWeightCache>(
+                as + row * BK + bf16_mma_shared_col<S>(row, k8 * 8),
+                static_cast<const __nv_bfloat16*>(o.up) + std::int64_t(native_row) * kRank +
+                    group * BK + k8 * 8);
         }
         for (int i = tid; i < Tokens * (BK / 8); i += S::kThreads) {
             const int token = i / (BK / 8), k8 = i % (BK / 8);
             const bool valid = token0 + token < o.columns;
             const auto source =
                 valid ? std::int64_t(token0 + token) * kRank + group * BK + k8 * 8 : 0;
-            cp_async_zfill<16, S::kActivationCache>(bs + token * BK +
-                                                                           bf16_mma_shared_col<S>(token, k8 * 8),
-                                                                       activation + source, valid ? 16 : 0);
+            common::cp_async_zfill<16, S::kActivationCache>(
+                bs + token * BK + bf16_mma_shared_col<S>(token, k8 * 8), activation + source,
+                valid ? 16 : 0);
         }
     };
     constexpr int groups = kRank / BK;
 #pragma unroll
     for (int slot = 0; slot < Stages; ++slot) {
         stage_inputs(slot, slot);
-        cp_commit();
+        common::cp_commit();
     }
 #pragma unroll
     for (int group = 0; group < groups; ++group) {
         if (group + Stages <= groups)
-            cp_wait<Stages - 1>();
+            common::cp_wait<Stages - 1>();
         else
-            cp_wait<0>();
+            common::cp_wait<0>();
         __syncthreads();
         const int slot = group % Stages;
         bf16_mma_compute_stage<S>(a + slot * Rows * BK, b + slot * Tokens * BK, accum, warp, lane);
         __syncthreads();
         if (group + Stages < groups) {
             stage_inputs(slot, group + Stages);
-            cp_commit();
+            common::cp_commit();
         }
     }
     auto* contributions = reinterpret_cast<float*>(storage);
@@ -78,7 +77,7 @@ __launch_bounds__(FoldedUpSchedule<Features, Tokens>::kThreads) __global__
         if (token0 + t < o.columns) {
             const auto z            = __bfloat162float(static_cast<const __nv_bfloat16*>(
                 o.normalized)[std::int64_t(token0 + t) * kResidualWidth + s * kWidth + d]);
-            contributions[at(r, t)] = sigmoid_gate(value) * z;
+            contributions[at(r, t)] = common::sigmoid_approx(value) * z;
         }
     };
     const auto& v = accum[0][0];

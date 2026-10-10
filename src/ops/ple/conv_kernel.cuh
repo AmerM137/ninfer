@@ -1,23 +1,13 @@
 #pragma once
 
-#include "ops/ple/validation.h"
-#include "ops/common/math.cuh"
-#include "ops/common/warp.cuh"
+#include "ops/ple/operands.h"
+#include "ops/common/numeric/math.cuh"
+#include "ops/common/numeric/convert.cuh"
+#include "ops/common/cuda/reduce.cuh"
 
 #include <cuda_bf16.h>
 
 namespace ninfer::ops::detail::ple {
-
-template <int Width>
-struct alignas(2 * Width) Bf16Vector {
-    __nv_bfloat16 word[Width];
-
-    __device__ static Bf16Vector load(const __nv_bfloat16* p) {
-        return *reinterpret_cast<const Bf16Vector*>(p);
-    }
-
-    __device__ void store(__nv_bfloat16* p) const { *reinterpret_cast<Bf16Vector*>(p) = *this; }
-};
 
 struct ConvArguments {
     const __nv_bfloat16 *residual, *gated, *kernel, *history, *records, *norm;
@@ -27,31 +17,6 @@ struct ConvArguments {
     int tokens, batch;
     float epsilon;
 };
-
-inline ConvArguments conv_arguments(const Tensor& residual, const Tensor& gated,
-                                    const Tensor& kernel, const PleBatchView& batch,
-                                    const PleConvStateView& before,
-                                    const PleConvRecordWindowView& current, Tensor& updated,
-                                    const Tensor* norm, float epsilon, Tensor* normalized) {
-    return {static_cast<const __nv_bfloat16*>(residual.data),
-            static_cast<const __nv_bfloat16*>(gated.data),
-            static_cast<const __nv_bfloat16*>(kernel.data),
-            static_cast<const __nv_bfloat16*>(before.history.data),
-            static_cast<const __nv_bfloat16*>(current.values.data),
-            norm ? static_cast<const __nv_bfloat16*>(norm->data) : nullptr,
-            static_cast<__nv_bfloat16*>(updated.data),
-            normalized ? static_cast<__nv_bfloat16*>(normalized->data) : nullptr,
-            static_cast<const std::int32_t*>(batch.valid_columns.data),
-            static_cast<const std::int32_t*>(before.slots.data),
-            static_cast<const std::int32_t*>(current.offsets.data),
-            before.history.nb[1] / 2,
-            before.history.nb[2] / 2,
-            current.values.nb[1] / 2,
-            current.values.nb[2] / 2,
-            residual.ne[2],
-            residual.ne[3],
-            epsilon};
-}
 
 struct ConvWindow {
     const __nv_bfloat16 *history, *records;
@@ -70,25 +35,25 @@ __device__ inline ConvWindow window(const ConvArguments& a, int token, int batch
 }
 
 template <int Width>
-__device__ Bf16Vector<Width> conv_value(const ConvArguments& a, const ConvWindow& source,
-                                        std::int64_t column, int token, int channel) {
+__device__ common::Bf16Vector<Width> conv_value(const ConvArguments& a, const ConvWindow& source,
+                                                std::int64_t column, int token, int channel) {
     float conv[Width]{};
 #pragma unroll
     for (int tap = 0; tap < 4; ++tap) {
-        const auto n      = Bf16Vector<Width>::load(source.at(channel, token - 9 + tap * 3));
-        const auto weight = Bf16Vector<Width>::load(a.kernel + tap * kChannels + channel);
+        const auto n = common::Bf16Vector<Width>::load(source.at(channel, token - 9 + tap * 3));
+        const auto weight = common::Bf16Vector<Width>::load(a.kernel + tap * kChannels + channel);
 #pragma unroll
         for (int v = 0; v < Width; ++v)
             conv[v] = fmaf(__bfloat162float(weight.word[v]), __bfloat162float(n.word[v]), conv[v]);
     }
     const auto offset   = column * kChannels + channel;
-    const auto residual = Bf16Vector<Width>::load(a.residual + offset);
-    const auto gated    = Bf16Vector<Width>::load(a.gated + offset);
-    Bf16Vector<Width> out;
+    const auto residual = common::Bf16Vector<Width>::load(a.residual + offset);
+    const auto gated    = common::Bf16Vector<Width>::load(a.gated + offset);
+    common::Bf16Vector<Width> out;
 #pragma unroll
     for (int v = 0; v < Width; ++v)
         out.word[v] = __float2bfloat16_rn(__bfloat162float(residual.word[v]) +
-                                          __bfloat162float(gated.word[v]) + silu(conv[v]));
+                                          __bfloat162float(gated.word[v]) + common::silu(conv[v]));
     return out;
 }
 
@@ -101,7 +66,7 @@ __global__ void conv_add_kernel(const __grid_constant__ ConvArguments a) {
         const int t = column % a.tokens, b = column / a.tokens;
         const int c = (job % tiles * Block + threadIdx.x) * Width;
         if (c >= kChannels) continue;
-        Bf16Vector<Width> result{};
+        common::Bf16Vector<Width> result{};
         if (t < a.valid[b]) result = conv_value<Width>(a, window(a, t, b), column, t, c);
         result.store(a.updated + column * kChannels + c);
     }
@@ -124,13 +89,13 @@ __global__ void conv_add_tiled_kernel(const __grid_constant__ ConvArguments a) {
             source = window(a, first, b);
 #pragma unroll
             for (int j = 0; j < 9; ++j) {
-                const auto n = Bf16Vector<Width>::load(source.at(c, first - 9 + j));
+                const auto n = common::Bf16Vector<Width>::load(source.at(c, first - 9 + j));
 #pragma unroll
                 for (int v = 0; v < Width; ++v) history[j][v] = __bfloat162float(n.word[v]);
             }
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
-                const auto w = Bf16Vector<Width>::load(a.kernel + j * kChannels + c);
+                const auto w = common::Bf16Vector<Width>::load(a.kernel + j * kChannels + c);
 #pragma unroll
                 for (int v = 0; v < Width; ++v) weight[j][v] = __bfloat162float(w.word[v]);
             }
@@ -140,19 +105,20 @@ __global__ void conv_add_tiled_kernel(const __grid_constant__ ConvArguments a) {
             const auto t = std::int64_t(first) + i;
             if (t >= a.tokens) break;
             const auto out = (std::int64_t(b) * a.tokens + t) * kChannels + c;
-            Bf16Vector<Width> y{};
+            common::Bf16Vector<Width> y{};
             if (t < valid) {
-                const auto n = Bf16Vector<Width>::load(source.at(c, t));
-                const auto h = Bf16Vector<Width>::load(a.residual + out);
-                const auto u = Bf16Vector<Width>::load(a.gated + out);
+                const auto n = common::Bf16Vector<Width>::load(source.at(c, t));
+                const auto h = common::Bf16Vector<Width>::load(a.residual + out);
+                const auto u = common::Bf16Vector<Width>::load(a.gated + out);
 #pragma unroll
                 for (int v = 0; v < Width; ++v) {
-                    float sum         = fmaf(weight[0][v], history[i % 9][v], 0.f);
-                    sum               = fmaf(weight[1][v], history[(i + 3) % 9][v], sum);
-                    sum               = fmaf(weight[2][v], history[(i + 6) % 9][v], sum);
-                    sum               = fmaf(weight[3][v], __bfloat162float(n.word[v]), sum);
-                    y.word[v]         = __float2bfloat16_rn(__bfloat162float(h.word[v]) +
-                                                            __bfloat162float(u.word[v]) + silu(sum));
+                    float sum = fmaf(weight[0][v], history[i % 9][v], 0.f);
+                    sum       = fmaf(weight[1][v], history[(i + 3) % 9][v], sum);
+                    sum       = fmaf(weight[2][v], history[(i + 6) % 9][v], sum);
+                    sum       = fmaf(weight[3][v], __bfloat162float(n.word[v]), sum);
+                    y.word[v] =
+                        __float2bfloat16_rn(__bfloat162float(h.word[v]) +
+                                            __bfloat162float(u.word[v]) + common::silu(sum));
                     history[i % 9][v] = __bfloat162float(n.word[v]);
                 }
             }
@@ -178,15 +144,15 @@ __global__ void conv_norm_kernel(const __grid_constant__ ConvArguments a) {
                 const int d = (threadIdx.x + i * Block) * Width;
                 if (d < kFeatures) {
                     const auto offset = column * kChannels + s * kFeatures + d;
-                    if constexpr (WithConv) Bf16Vector<Width>{}.store(a.updated + offset);
-                    Bf16Vector<Width>{}.store(a.normalized + offset);
+                    if constexpr (WithConv) common::Bf16Vector<Width>{}.store(a.updated + offset);
+                    common::Bf16Vector<Width>{}.store(a.normalized + offset);
                 }
             }
             continue;
         }
         ConvWindow source{};
         if constexpr (WithConv) source = window(a, t, b);
-        Bf16Vector<Width> values[items];
+        common::Bf16Vector<Width> values[items];
         float sum = 0;
 #pragma unroll
         for (int i = 0; i < items; ++i) {
@@ -197,7 +163,7 @@ __global__ void conv_norm_kernel(const __grid_constant__ ConvArguments a) {
                     values[i] = conv_value<Width>(a, source, column, t, c);
                     values[i].store(a.updated + column * kChannels + c);
                 } else
-                    values[i] = Bf16Vector<Width>::load(a.updated + column * kChannels + c);
+                    values[i] = common::Bf16Vector<Width>::load(a.updated + column * kChannels + c);
 #pragma unroll
                 for (int v = 0; v < Width; ++v) {
                     const float y = __bfloat162float(values[i].word[v]);
@@ -205,7 +171,7 @@ __global__ void conv_norm_kernel(const __grid_constant__ ConvArguments a) {
                 }
             }
         }
-        sum = block_reduce_sum<Block>(sum, sums);
+        sum = common::block_reduce_sum<Block>(sum, sums);
         if (threadIdx.x == 0) inverse = rsqrtf(sum / kFeatures + a.epsilon);
         __syncthreads();
         const float inv = inverse;
@@ -214,8 +180,8 @@ __global__ void conv_norm_kernel(const __grid_constant__ ConvArguments a) {
             const int d = (threadIdx.x + i * Block) * Width;
             if (d < kFeatures) {
                 const int c       = s * kFeatures + d;
-                const auto weight = Bf16Vector<Width>::load(a.norm + c);
-                Bf16Vector<Width> out;
+                const auto weight = common::Bf16Vector<Width>::load(a.norm + c);
+                common::Bf16Vector<Width> out;
 #pragma unroll
                 for (int v = 0; v < Width; ++v)
                     out.word[v] = __float2bfloat16_rn(__bfloat162float(values[i].word[v]) * inv *
@@ -225,10 +191,6 @@ __global__ void conv_norm_kernel(const __grid_constant__ ConvArguments a) {
         }
         __syncthreads();
     }
-}
-
-inline unsigned conv_grid(std::int64_t count) {
-    return static_cast<unsigned>(count < 65535 ? count : 65535);
 }
 
 } // namespace ninfer::ops::detail::ple

@@ -1,5 +1,5 @@
 #include "ops/gated_residual/operands.h"
-#include "ops/common/operand_checks.h"
+#include "ops/common/host/operands.h"
 
 #include <array>
 #include <cmath>
@@ -12,13 +12,13 @@ void require(bool value, const char* op, const char* reason) {
     if (!value) throw std::invalid_argument(std::string(op) + ": " + reason);
 }
 
-operand::Range check(const Tensor& t, DType dtype, int a, int b, int c, const char* op) {
+common::operand::Range check(const Tensor& t, DType dtype, int a, int b, int c, const char* op) {
     require(t.dtype == dtype, op, "invalid operand dtype");
     require(t.ne[0] == a && t.ne[1] == b && t.ne[2] == c && t.ne[3] == 1, op,
             "invalid operand shape");
-    require(t.is_contiguous() && operand::aligned(t.data, 16), op,
+    require(t.is_contiguous() && common::operand::aligned(t.data, 16), op,
             "operands require contiguous, 16-byte-aligned backing");
-    return operand::range(t.data, t.bytes(), op);
+    return common::operand::range(t.data, t.bytes(), op);
 }
 
 bool same_view(const Tensor& a, const Tensor& b) {
@@ -38,7 +38,7 @@ Operands validate(Form form, const Tensor& input, const Tensor* block, const Ten
     require(execution.multiprocessor_count > 0, op, "physical SM count must be positive");
     if (weight)
         require(epsilon > 0 && std::isfinite(epsilon), op, "epsilon must be positive and finite");
-    std::array<operand::Range, 4> inputs;
+    std::array<common::operand::Range, 4> inputs;
     int count = 1;
     inputs[0] = check(input, DType::BF16, kWidth, expand ? m : kStreams, expand ? 1 : m, op);
     if (block) inputs[count++] = check(*block, DType::BF16, kWidth, m, 1, op);
@@ -47,13 +47,15 @@ Operands validate(Form form, const Tensor& input, const Tensor* block, const Ten
     const bool alias = residual && !expand && same_view(input, *residual);
     if (residual) {
         const auto output = check(*residual, DType::BF16, kWidth, kStreams, m, op);
-        for (int i = alias ? 1 : 0; i < count; ++i) operand::disjoint(output, inputs[i], op);
+        for (int i = alias ? 1 : 0; i < count; ++i)
+            common::operand::disjoint(output, inputs[i], op);
     }
     if (normalized) {
         const auto output = check(*normalized, DType::BF16, kWidth, kStreams, m, op);
-        for (int i = 0; i < count; ++i) operand::disjoint(output, inputs[i], op);
+        for (int i = 0; i < count; ++i) common::operand::disjoint(output, inputs[i], op);
         if (residual)
-            operand::disjoint(output, operand::range(residual->data, residual->bytes(), op), op);
+            common::operand::disjoint(
+                output, common::operand::range(residual->data, residual->bytes(), op), op);
     }
     return {input.data,
             block ? block->data : nullptr,

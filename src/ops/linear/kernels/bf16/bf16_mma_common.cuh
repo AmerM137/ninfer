@@ -8,17 +8,6 @@
 
 namespace ninfer::ops::detail {
 
-template <int Bytes, auto Kernel>
-int bf16_prepare_shared() {
-    static_assert(Bytes <= 99 * 1024);
-    if constexpr (Bytes > 48 * 1024) {
-        static const auto status =
-            cudaFuncSetAttribute(Kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, Bytes);
-        CUDA_CHECK(status);
-    }
-    return Bytes;
-}
-
 template <class Schedule>
 __device__ __forceinline__ int bf16_mma_shared_col(int row, int col) {
     if constexpr (Schedule::kSwizzle == Bf16MmaSwizzle::Plain) {

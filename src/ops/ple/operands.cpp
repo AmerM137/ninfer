@@ -1,4 +1,5 @@
-#include "ops/ple/validation.h"
+#include "ops/ple/operands.h"
+#include "ops/common/host/operands.h"
 
 #include <cmath>
 #include <limits>
@@ -12,28 +13,15 @@ void require(bool condition, const char* label) {
     if (!condition) throw std::invalid_argument(std::string("PLE: invalid ") + label);
 }
 
-bool aligned(const void* p, std::size_t bytes) {
-    return p && reinterpret_cast<std::uintptr_t>(p) % bytes == 0;
-}
-
 void contiguous(const Tensor& t, DType dtype, std::initializer_list<std::int32_t> shape,
                 std::size_t alignment, const char* label) {
     const Tensor expected(nullptr, dtype, shape);
-    require(t.dtype == dtype && t.is_contiguous() && aligned(t.data, alignment), label);
+    require(t.dtype == dtype && t.is_contiguous() && common::operand::aligned(t.data, alignment),
+            label);
     for (int d = 0; d < 4; ++d) require(t.ne[d] == expected.ne[d], label);
 }
 
-struct Range {
-    std::uintptr_t begin, end;
-};
-
-Range range(const Tensor& t, std::uint64_t bytes) {
-    const auto begin = reinterpret_cast<std::uintptr_t>(t.data);
-    require(bytes <= std::numeric_limits<std::uintptr_t>::max() - begin, "address range");
-    return {begin, begin + bytes};
-}
-
-bool overlap(Range a, Range b) { return a.begin < b.end && b.begin < a.end; }
+using common::operand::Range;
 
 // A column is contiguous. The two outer axes can be padded or interleaved. One has
 // at most nine entries (history columns or batch rows), so validation never scans R/S.
@@ -45,7 +33,7 @@ struct Columns {
 Columns columns(const Tensor& t, int count, int outer, const char* label) {
     require(count > 0 && outer > 0 && t.dtype == DType::BF16 && t.ne[0] == kChannels &&
                 t.ne[1] == count && t.ne[2] == outer && t.ne[3] == 1 && t.nb[0] == 2 &&
-                aligned(t.data, 2),
+                common::operand::aligned(t.data, 2),
             label);
     constexpr std::uint64_t width = kChannels * 2;
     std::uint64_t bytes           = width;
@@ -58,7 +46,8 @@ Columns columns(const Tensor& t, int count, int outer, const char* label) {
         bytes += step * n;
     }
     const int small = count <= outer ? 1 : 2, large = 3 - small;
-    Columns result{range(t, bytes), static_cast<std::uint64_t>(t.ne[small]),
+    Columns result{common::operand::range(t.data, bytes, "PLE"),
+                   static_cast<std::uint64_t>(t.ne[small]),
                    t.ne[small] == 1 ? width : static_cast<std::uint64_t>(t.nb[small]),
                    static_cast<std::uint64_t>(t.ne[large]),
                    t.ne[large] == 1 ? width : static_cast<std::uint64_t>(t.nb[large])};
@@ -74,8 +63,8 @@ Columns columns(const Tensor& t, int count, int outer, const char* label) {
     return result;
 }
 
-bool overlap(Range a, const Columns& b) {
-    if (!overlap(a, b.bounds)) return false;
+bool overlaps_columns(Range a, const Columns& b) {
+    if (!common::operand::overlaps(a, b.bounds)) return false;
     constexpr std::uint64_t width = kChannels * 2;
     for (std::uint64_t i = 0; i < b.small_count; ++i) {
         const auto first = b.bounds.begin + i * b.small_stride;
@@ -123,18 +112,22 @@ void validate_conv(const Tensor& residual, const Tensor& gated, const Tensor& ke
     }
     for (const Tensor* output : {&updated, normalized}) {
         if (!output) continue;
-        const auto out = range(*output, output->bytes());
+        const auto out = common::operand::range(output->data, output->bytes(), "PLE");
         for (const Tensor* input : {&residual, &gated, &kernel, &batch.valid_columns, &before.slots,
                                     &current.offsets, norm_weight}) {
             if (!input || (output == &updated && input == &residual && output->data == input->data))
                 continue;
-            require(!overlap(out, range(*input, input->bytes())), "output/input overlap");
+            require(!common::operand::overlaps(
+                        out, common::operand::range(input->data, input->bytes(), "PLE")),
+                    "output/input overlap");
         }
-        require(!overlap(out, history) && !overlap(out, records),
+        require(!overlaps_columns(out, history) && !overlaps_columns(out, records),
                 "output/history or record overlap");
     }
     if (normalized)
-        require(!overlap(range(updated, updated.bytes()), range(*normalized, normalized->bytes())),
+        require(!common::operand::overlaps(
+                    common::operand::range(updated.data, updated.bytes(), "PLE"),
+                    common::operand::range(normalized->data, normalized->bytes(), "PLE")),
                 "output overlap");
 }
 

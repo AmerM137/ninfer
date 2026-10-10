@@ -1,8 +1,6 @@
 #pragma once
 
-#include "ops/gated_residual/mix/kernel/math.cuh"
-#include "ops/gated_residual/mix/kernel/shared_layout.cuh"
-#include "ops/gated_residual/mix/operands.h"
+#include "ops/gated_residual/mix/kernel/output.cuh"
 #include "ops/linear/kernels/bf16/bf16_a16_tma_mma.cuh"
 
 namespace ninfer::ops::detail::hc::mix {
@@ -33,8 +31,8 @@ struct StripedTmaWeightAccess {
         asm volatile("cp.async.bulk.tensor.4d.shared::cta.global.tile.mbarrier::complete_tx::bytes "
                      "[%0], [%1, {%2, %3, %4, %5}], [%6];"
                      :
-                     : "r"(smem_addr(destination)), "l"(map), "r"(0), "r"(k_sector),
-                       "r"(row / kStreams), "r"(0), "r"(smem_addr(barrier))
+                     : "r"(common::smem_addr(destination)), "l"(map), "r"(0), "r"(k_sector),
+                       "r"(row / kStreams), "r"(0), "r"(common::smem_addr(barrier))
                      : "memory");
     }
 };
@@ -63,7 +61,7 @@ struct TmaMixEpilogue {
                 const int s = r / Features, d = feature_begin + r % Features;
                 const float z = __bfloat162float(
                     normalized[std::int64_t(token_begin + t) * kResidualWidth + s * kWidth + d]);
-                partial[at(r, t)] = sigmoid_gate(value) * z;
+                partial[at(r, t)] = common::sigmoid_approx(value) * z;
             }
         };
 #pragma unroll

@@ -1,5 +1,4 @@
-#include "ops/ple/launch.h"
-#include "ops/ple/validation.h"
+#include "ops/ple/operands.h"
 
 #include <cstdint>
 
@@ -36,10 +35,30 @@ __global__ void extract_kernel(const __grid_constant__ ExtractArguments a) {
         *reinterpret_cast<Word*>(after + j * a.after_column) = values[j];
 }
 
-} // namespace
+template <class Word>
+void launch_extract(const ExtractArguments& args, int batch, cudaStream_t stream) {
+    constexpr int threads = sizeof(Word) == 4 ? 128 : 256;
+    extract_kernel<Word><<<dim3(kChannels / 256, batch), threads, 0, stream>>>(args);
+    CUDA_CHECK(cudaGetLastError());
+}
 
-void launch_extract(const PleConvStateView& before, const PleConvRecordReadView& records,
-                    const Tensor& accepted, PleConvStateView after, DeviceExecutionView execution) {
+using ExtractLaunch = void (*)(const ExtractArguments&, int, cudaStream_t);
+
+ExtractLaunch select_extract(const Tensor& before, const Tensor& records, const Tensor& after) {
+    return pair_aligned(before) && pair_aligned(after) && pair_aligned(records)
+               ? launch_extract<std::uint32_t>
+               : launch_extract<std::uint16_t>;
+}
+} // namespace
+} // namespace ninfer::ops::detail::ple
+
+namespace ninfer::ops {
+
+void ple_state_extract(const PleConvStateView& before, const PleConvRecordReadView& records,
+                       const Tensor& accepted, PleConvStateView after,
+                       DeviceExecutionView execution) {
+    using namespace detail::ple;
+    validate_extract(before, records, accepted, after, execution);
     const ExtractArguments a{static_cast<const std::uint16_t*>(before.history.data),
                              static_cast<const std::uint16_t*>(records.values.data),
                              static_cast<std::uint16_t*>(after.history.data),
@@ -52,13 +71,8 @@ void launch_extract(const PleConvStateView& before, const PleConvRecordReadView&
                              records.values.nb[2] / 2,
                              after.history.nb[1] / 2,
                              after.history.nb[2] / 2};
-    if (pair_aligned(before.history) && pair_aligned(after.history) && pair_aligned(records.values))
-        extract_kernel<std::uint32_t>
-            <<<dim3(kChannels / 256, accepted.ne[0]), 128, 0, execution.stream>>>(a);
-    else
-        extract_kernel<std::uint16_t>
-            <<<dim3(kChannels / 256, accepted.ne[0]), 256, 0, execution.stream>>>(a);
-    CUDA_CHECK(cudaGetLastError());
+    select_extract(before.history, records.values, after.history)(a, accepted.ne[0],
+                                                                  execution.stream);
 }
 
-} // namespace ninfer::ops::detail::ple
+} // namespace ninfer::ops

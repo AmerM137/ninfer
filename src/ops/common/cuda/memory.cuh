@@ -29,6 +29,14 @@ __device__ __forceinline__ void store_vec(T* ptr, V value) {
     *reinterpret_cast<V*>(ptr) = value;
 }
 
+__device__ __forceinline__ uint4 streaming_load(const uint4* input) {
+    uint4 value;
+    asm volatile("ld.global.cs.v4.u32 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(value.x), "=r"(value.y), "=r"(value.z), "=r"(value.w)
+                 : "l"(input));
+    return value;
+}
+
 __device__ __forceinline__ unsigned smem_addr(const void* ptr) {
     return static_cast<unsigned>(__cvta_generic_to_shared(ptr));
 }

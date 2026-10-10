@@ -1,16 +1,9 @@
 #pragma once
 #include "ops/gated_residual/kernel/combine.cuh"
-#include "ops/common/warp.cuh"
+#include "ops/common/cuda/reduce.cuh"
+#include "ops/common/cuda/memory.cuh"
 
 namespace ninfer::ops::detail::hc {
-__device__ __forceinline__ uint4 streaming_load(const uint4* input) {
-    uint4 value;
-    asm volatile("ld.global.cs.v4.u32 {%0,%1,%2,%3}, [%4];"
-                 : "=r"(value.x), "=r"(value.y), "=r"(value.z), "=r"(value.w)
-                 : "l"(input));
-    return value;
-}
-
 // A CTA owns every read and write of one (stream,column), including exact in-place updates.
 template <Form Kind, int Block>
 __launch_bounds__(Block) __global__ void norm_kernel(Operands o, std::int64_t first) {
@@ -41,9 +34,9 @@ __launch_bounds__(Block) __global__ void norm_kernel(Operands o, std::int64_t fi
         const auto x = __bfloat1622float2(value);
         sum += x.x * x.x + x.y * x.y;
     }
-    __shared__ float warp_sums[Block / kWarpSize];
+    __shared__ float warp_sums[Block / common::kWarpSize];
     __shared__ float inverse;
-    const float total = block_reduce_sum<Block>(sum, warp_sums);
+    const float total = common::block_reduce_sum<Block>(sum, warp_sums);
     if (threadIdx.x == 0) inverse = rsqrtf(total * (1.0f / kWidth) + o.epsilon);
     __syncthreads();
 #pragma unroll
@@ -61,20 +54,17 @@ __launch_bounds__(Block) __global__ void norm_kernel(Operands o, std::int64_t fi
 // retain less consumed input in cache; they are selected only in the measured domains.
 template <Form Kind, bool StreamingInput>
 __launch_bounds__(320) __global__ void norm_vector_kernel(Operands o, std::int64_t first) {
-    constexpr int kVectors = kWidth / 8, kWarps = kVectors / kWarpSize;
+    constexpr int kVectors = kWidth / 8, kWarps = kVectors / common::kWarpSize;
     const auto row = first + blockIdx.x, m = row / kStreams;
     const int s = int(row % kStreams), d = threadIdx.x;
     const auto* input =
         static_cast<const uint4*>(o.input) + (Kind == Form::ExpandNorm ? m : row) * kVectors + d;
-    Vector value;
-    if constexpr (StreamingInput)
-        value.packed = streaming_load(input);
-    else
-        value.packed = *input;
+    const uint4 input_bits = StreamingInput ? common::streaming_load(input) : *input;
+    auto value             = common::load_vec<common::Bf16x8Pack>(&input_bits);
     if constexpr (Kind == Form::CombineNorm || Kind == Form::AddNorm) {
-        Vector block;
-        block.packed  = static_cast<const uint4*>(o.block)[m * kVectors + d];
-        const float j = Kind == Form::CombineNorm ? o.injection[row] : 1.F;
+        const auto block_bits = static_cast<const uint4*>(o.block)[m * kVectors + d];
+        const auto block      = common::load_vec<common::Bf16x8Pack>(&block_bits);
+        const float j         = Kind == Form::CombineNorm ? o.injection[row] : 1.F;
 #pragma unroll
         for (int i = 0; i < 4; ++i) value.pair[i] = update<Kind>(value.pair[i], block.pair[i], j);
     }
@@ -85,18 +75,19 @@ __launch_bounds__(320) __global__ void norm_vector_kernel(Operands o, std::int64
         sum += x.x * x.x + x.y * x.y;
     }
     __shared__ float sums[kWarps], inverse;
-    sum = warp_reduce_sum(sum);
-    if ((threadIdx.x & (kWarpSize - 1)) == 0) sums[threadIdx.x / kWarpSize] = sum;
+    sum = common::warp_reduce_sum(sum);
+    if ((threadIdx.x & (common::kWarpSize - 1)) == 0) sums[threadIdx.x / common::kWarpSize] = sum;
     __syncthreads();
     // Ten warp totals use a full warp reduction with zero-filled inactive entries.
-    if (threadIdx.x < kWarpSize) {
+    if (threadIdx.x < common::kWarpSize) {
         sum = threadIdx.x < kWarps ? sums[threadIdx.x] : 0.F;
-        sum = warp_reduce_sum(sum);
+        sum = common::warp_reduce_sum(sum);
         if (threadIdx.x == 0) inverse = rsqrtf(sum * (1.F / kWidth) + o.epsilon);
     }
     __syncthreads();
-    Vector weight, normalized;
-    weight.packed = static_cast<const uint4*>(o.weight)[s * kVectors + d];
+    const auto weight_bits = static_cast<const uint4*>(o.weight)[s * kVectors + d];
+    const auto weight      = common::load_vec<common::Bf16x8Pack>(&weight_bits);
+    common::Bf16x8Pack normalized;
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
         const auto x = __bfloat1622float2(value.pair[i]);
@@ -105,8 +96,8 @@ __launch_bounds__(320) __global__ void norm_vector_kernel(Operands o, std::int64
             __floats2bfloat162_rn(x.x * inverse * (1.F + w.x), x.y * inverse * (1.F + w.y));
     }
     if constexpr (Kind != Form::GroupedNorm)
-        static_cast<uint4*>(o.residual)[row * kVectors + d] = value.packed;
-    static_cast<uint4*>(o.normalized)[row * kVectors + d] = normalized.packed;
+        static_cast<uint4*>(o.residual)[row * kVectors + d] = common::load_vec<uint4>(&value);
+    static_cast<uint4*>(o.normalized)[row * kVectors + d] = common::load_vec<uint4>(&normalized);
 }
 
 } // namespace ninfer::ops::detail::hc

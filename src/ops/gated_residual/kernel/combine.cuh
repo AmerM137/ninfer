@@ -1,13 +1,8 @@
 #pragma once
 #include "ops/gated_residual/operands.h"
-#include <cuda_bf16.h>
+#include "ops/common/numeric/convert.cuh"
 
 namespace ninfer::ops::detail::hc {
-union Vector {
-    uint4 packed;
-    __nv_bfloat162 pair[4];
-};
-
 // BF16 conversion of FP32 FMA can double-round at a BF16 midpoint. A warp-level
 // branch skips the entire FP64 correction body when no lane needs it; a simple
 // scalar predicate otherwise issues predicated-off FP64 operations on every value.
@@ -43,13 +38,14 @@ __launch_bounds__(Block) __global__
     constexpr int per_row = kWidth / 8;
     const auto row = i / per_row, m = row / kStreams;
 
-    Vector h, y, result;
-
-    h.packed      = static_cast<const uint4*>(o.input)[i];
-    y.packed      = static_cast<const uint4*>(o.block)[m * per_row + i % per_row];
+    const auto h_bits = static_cast<const uint4*>(o.input)[i];
+    const auto y_bits = static_cast<const uint4*>(o.block)[m * per_row + i % per_row];
+    const auto h      = common::load_vec<common::Bf16x8Pack>(&h_bits);
+    const auto y      = common::load_vec<common::Bf16x8Pack>(&y_bits);
+    common::Bf16x8Pack result;
     const float j = Kind == Form::AddNorm ? 1.0f : o.injection[row];
 #pragma unroll
     for (int p = 0; p < 4; ++p) result.pair[p] = update<Kind>(h.pair[p], y.pair[p], j);
-    static_cast<uint4*>(o.residual)[i] = result.packed;
+    static_cast<uint4*>(o.residual)[i] = common::load_vec<uint4>(&result);
 }
 } // namespace ninfer::ops::detail::hc

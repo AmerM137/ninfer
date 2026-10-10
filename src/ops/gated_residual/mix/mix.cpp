@@ -8,7 +8,7 @@ namespace {
 void execute_mix(mix::Weights weights, const Tensor& normalized, WorkspaceArena& workspace,
                  Tensor& output, Tensor* injection, DeviceExecutionView execution) {
     const auto o = mix::validate(weights, normalized, output, injection, execution);
-    const auto p = mix::plan(weights.kind, o.columns);
+    const auto p = mix::select_plan(weights.kind, o.columns);
     auto scope   = workspace.scope();
     const auto scratch =
         mix::allocate_workspace(workspace, mix::layout(weights.kind, p, o.columns));

@@ -1,5 +1,5 @@
 #include "ops/gated_residual/mix/operands.h"
-#include "ops/common/operand_checks.h"
+#include "ops/common/host/operands.h"
 
 #include <array>
 #include <stdexcept>
@@ -14,7 +14,7 @@ void require(bool condition, const char* reason) {
 }
 
 std::size_t weight_bytes(const Weight& w) {
-    return operand::bytes(std::uint64_t(w.n) * w.k, sizeof(std::uint16_t), kOp);
+    return common::operand::bytes(std::uint64_t(w.n) * w.k, sizeof(std::uint16_t), kOp);
 }
 
 void describe_matrix(const Weight& w, int rows, int columns) {
@@ -28,18 +28,18 @@ void describe_matrix(const Weight& w, int rows, int columns) {
     require(w.payload_bytes >= weight_bytes(w), "BF16 weight backing is too small");
 }
 
-operand::Range tensor(const Tensor& t, DType dtype, int a, int b, int c) {
+common::operand::Range tensor(const Tensor& t, DType dtype, int a, int b, int c) {
     require(t.dtype == dtype && t.ne[0] == a && t.ne[1] == b && t.ne[2] == c && t.ne[3] == 1,
             "invalid tensor shape or dtype");
-    require(t.is_contiguous() && operand::aligned(t.data, 16),
+    require(t.is_contiguous() && common::operand::aligned(t.data, 16),
             "tensors require contiguous, 16-byte-aligned backing");
-    return operand::range(t.data, t.bytes(), kOp);
+    return common::operand::range(t.data, t.bytes(), kOp);
 }
 
-std::array<operand::Range, 3> input_ranges(Weights weights, const Tensor& normalized) {
-    return {operand::range(normalized.data, normalized.bytes(), kOp),
-            operand::range(weights.down.qdata, weight_bytes(weights.down), kOp),
-            operand::range(weights.up.qdata, weight_bytes(weights.up), kOp)};
+std::array<common::operand::Range, 3> input_ranges(Weights weights, const Tensor& normalized) {
+    return {common::operand::range(normalized.data, normalized.bytes(), kOp),
+            common::operand::range(weights.down.qdata, weight_bytes(weights.down), kOp),
+            common::operand::range(weights.up.qdata, weight_bytes(weights.up), kOp)};
 }
 } // namespace
 
@@ -60,18 +60,19 @@ Operands validate(Weights weights, const Tensor& normalized, Tensor& output, Ten
                   DeviceExecutionView execution) {
     describe_weights(weights);
     validate_execution(execution);
-    require(operand::aligned(weights.down.qdata, 16) && operand::aligned(weights.up.qdata, 16),
+    require(common::operand::aligned(weights.down.qdata, 16) &&
+                common::operand::aligned(weights.up.qdata, 16),
             "weights require aligned device backing");
     const int m = normalized.ne[2];
     require(m > 0, "columns must be positive");
     (void)tensor(normalized, DType::BF16, kWidth, kStreams, m);
     const auto out    = tensor(output, DType::BF16, kWidth, m, 1);
     const auto inputs = input_ranges(weights, normalized);
-    for (const auto input : inputs) operand::disjoint(out, input, kOp);
+    for (const auto input : inputs) common::operand::disjoint(out, input, kOp);
     if (injection) {
         const auto j = tensor(*injection, DType::FP32, kStreams, m, 1);
-        for (const auto input : inputs) operand::disjoint(j, input, kOp);
-        operand::disjoint(out, j, kOp);
+        for (const auto input : inputs) common::operand::disjoint(j, input, kOp);
+        common::operand::disjoint(out, j, kOp);
     }
     return {normalized.data,
             weights.down.qdata,
@@ -83,10 +84,12 @@ Operands validate(Weights weights, const Tensor& normalized, Tensor& output, Ten
 
 void validate_scratch(Weights weights, const Tensor& normalized, const Tensor& output,
                       const Tensor* injection, DeviceSpan scratch) {
-    const auto work = operand::range(scratch.data, scratch.bytes, kOp);
-    for (const auto input : input_ranges(weights, normalized)) operand::disjoint(work, input, kOp);
-    operand::disjoint(work, operand::range(output.data, output.bytes(), kOp), kOp);
+    const auto work = common::operand::range(scratch.data, scratch.bytes, kOp);
+    for (const auto input : input_ranges(weights, normalized))
+        common::operand::disjoint(work, input, kOp);
+    common::operand::disjoint(work, common::operand::range(output.data, output.bytes(), kOp), kOp);
     if (injection)
-        operand::disjoint(work, operand::range(injection->data, injection->bytes(), kOp), kOp);
+        common::operand::disjoint(
+            work, common::operand::range(injection->data, injection->bytes(), kOp), kOp);
 }
 } // namespace ninfer::ops::detail::hc::mix

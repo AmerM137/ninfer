@@ -1,4 +1,4 @@
-#include "ops/gated_residual/mix/plan.h"
+#include "ops/gated_residual/mix/select.h"
 #include "ops/gated_residual/mix/workspace.h"
 #include <algorithm>
 #include <array>
@@ -66,7 +66,7 @@ std::span<const Route> routes(Kind kind) {
 }
 } // namespace
 
-Plan plan(Kind kind, std::int32_t columns) {
+Plan select_plan(Kind kind, std::int32_t columns) {
     validate_interval(columns, columns);
     for (const auto& route : routes(kind))
         if (columns >= route.first && columns <= route.last) return route.plan;

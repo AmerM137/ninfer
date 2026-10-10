@@ -1,7 +1,7 @@
 #pragma once
 
 #include "ninfer/ops/gated_residual.h"
-#include "ops/gated_residual/geometry.h"
+#include "ops/gated_residual/operands.h"
 
 namespace ninfer::ops::detail::hc::mix {
 enum class Kind { Block, Final };

@@ -9,6 +9,17 @@
 
 namespace ninfer::ops::common {
 
+template <int Width>
+struct alignas(2 * Width) Bf16Vector {
+    __nv_bfloat16 word[Width];
+
+    __device__ static Bf16Vector load(const __nv_bfloat16* p) {
+        return *reinterpret_cast<const Bf16Vector*>(p);
+    }
+
+    __device__ void store(__nv_bfloat16* p) const { *reinterpret_cast<Bf16Vector*>(p) = *this; }
+};
+
 template <int Pairs>
 struct alignas(Pairs* static_cast<int>(sizeof(__nv_bfloat162))) Bf16PairPack {
     static_assert(Pairs == 1 || Pairs == 2 || Pairs == 4);

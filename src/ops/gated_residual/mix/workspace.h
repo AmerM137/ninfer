@@ -1,7 +1,7 @@
 #pragma once
 
-#include "ops/gated_residual/mix/plan.h"
-#include "ops/common/operand_checks.h"
+#include "ops/gated_residual/mix/select.h"
+#include "ops/common/host/operands.h"
 #include "core/layout.h"
 
 namespace ninfer::ops::detail::hc::mix {
@@ -19,14 +19,15 @@ struct Layout {
 
 inline Layout layout(Kind kind, Plan plan, std::int32_t columns) {
     LayoutBuilder b;
-    const auto u      = b.add(operand::bytes(std::uint64_t(kRank) * columns, 2, "hc_mix"), 256,
-                              "HC low-rank activation");
+    const auto u = b.add(common::operand::bytes(std::uint64_t(kRank) * columns, 2, "hc_mix"), 256,
+                         "HC low-rank activation");
     const auto splits = split_factor(plan.down);
     const auto temporary_bytes =
         splits == 1 ? 0 : std::uint64_t(down_rows(kind)) * columns * splits * 4;
     LayoutRegion temporary;
     if (temporary_bytes)
-        temporary = b.add(operand::bytes(temporary_bytes, 1, "hc_mix"), 256, "HC Down partials");
+        temporary =
+            b.add(common::operand::bytes(temporary_bytes, 1, "hc_mix"), 256, "HC Down partials");
     return {u, temporary, b.finish(1)};
 }
 

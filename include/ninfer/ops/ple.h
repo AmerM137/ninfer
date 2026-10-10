@@ -24,34 +24,25 @@ namespace ninfer::ops {
  *   - history [D,9,S] and records [D,R,B] have contiguous features; column and slot/batch
  *     strides can retain gaps from pool slices. History columns are ordered oldest to newest.
  *
- * For example, a contiguous BF16 projection parent [12800,T*B] supplies key at byte offset 0
- * and value at byte offset 2*10240. Both use token stride 2*12800 and batch stride
- * 2*12800*T. These values illustrate a legal view, not additional stride restrictions.
- *
  * Every view is non-owning. Constness of a Tensor descriptor does not grant write access to
  * its data; each Op below specifies the writable regions. Host-visible shape, dtype, stride,
  * alignment and scalar requirements are checked without reading Device metadata back to Host.
  * The caller guarantees the count/index values and their alias constraints at execution time.
  *
- * Numeric convention for the three computation entries:
+ * Numeric convention:
  *   Norm(x,w,eps)[d] = x[d] * (1+w[d]) / sqrt(sum_i x[i]^2/H + eps).
  * Each stream has its own H-element norm and affine weights. Epsilons are positive and finite;
  * floating-point values used by the active computation are finite. The unit-offset gain is
  * interpreted from the stored weights without an additional public BF16 cast of 1+w.
- * Mathematical oracles evaluate the complete formulas naively in FP64 from represented inputs.
- * BF16 numerical outputs are promoted for comparison with the unrounded ideal results; their
- * storage rounding is covered by the numerical criterion. At a declared BF16 seam, the next
- * formula consumes the actual output words, and is checked using those represented values.
- * Private arithmetic and reduction order remain implementation choices.
  *
  * Workspace / execution:
- * All four entries require no caller-owned global workspace and allocate no hidden Device
- * storage. They submit to execution.stream, with execution.multiprocessor_count positive.
- * They support CUDA Graph capture/replay; Device metadata is consumed at execution time.
- * Multiple ordered kernels are permitted. The caller supplies ready inputs, writable output
- * ranges and storage lifetimes through the last consumer, including graph replay. Ops do not
- * reserve records, advance counters/frontiers, publish state, perform I/O or synchronize Host
- * to inspect Device counts/indices.
+ * The entries require no caller-owned global workspace and allocate no hidden Device storage. They
+ * submit to execution.stream, with execution.multiprocessor_count positive. They support CUDA Graph
+ * capture/replay; Device metadata is consumed at execution time. Multiple ordered kernels are
+ * permitted. The caller supplies ready inputs, writable output ranges and storage lifetimes through
+ * the last consumer, including graph replay. Ops do not reserve records, advance
+ * counters/frontiers, publish state, perform I/O or synchronize Host to inspect Device
+ * counts/indices.
  */
 
 struct PleBatchView {
@@ -86,9 +77,8 @@ struct PleConvRecordReadView {
 };
 
 /**
- * Op: ple_gate
+ * Gated PLE projection.
  *
- * Math:
  * For each active (t,b), 0<=t<n[b], and stream s, with eps=parameters.rms_epsilon:
  *   k_s = Norm(projected.key[:,s,t,b], parameters.norm_key[:,s], eps)
  *   q_s = Norm(residual[:,s,t,b], parameters.norm_query[:,s], eps)
@@ -101,12 +91,10 @@ struct PleConvRecordReadView {
  * U is the represented value of the actual BF16 gated_value output. NormConv must consume
  * exactly those U words, including when U is retained privately rather than reloaded.
  *
- * Logical shapes / supported domain:
  * The shared domain applies. residual and gated_value are BF16 [H,C,T,B]; projected,
  * parameters, batch and records use the views above. For every row,
  *   0<=records.offsets[b] and records.offsets[b]+n[b]<=R.
  *
- * Numeric / effects:
  * Writes gated_value as BF16 ideal_U and, for c=d+H*s, writes BF16 ideal_N to
  * records.values[c,records.offsets[b]+t,b]. There are no public BF16 intermediates for
  * k/q, their products, the dot, or g. For t>=n[b], gated_value is exact BF16 +0; the
@@ -120,9 +108,8 @@ void ple_gate(const PleProjectionView& projected, const Tensor& residual,
               PleConvRecordWindowView records, Tensor& gated_value, DeviceExecutionView execution);
 
 /**
- * Ops: ple_conv_add / ple_conv_add_norm
+ * Dilated causal convolution, SiLU and residual addition, optionally followed by norm.
  *
- * Math / indexing:
  * For each active row b, before.history[:,0..8,before.slots[b]] holds the nine columns
  * immediately preceding local t=0; current.offsets[b] selects the first current N column.
  * Define the represented BF16 input to convolution as
@@ -136,14 +123,12 @@ void ple_gate(const PleProjectionView& projected, const Tensor& residual,
  *   ideal_Z[:,s,t,b] = Norm(Y[:,s,t,b], next_hc_norm_weight[:,s], next_hc_epsilon)
  * and stores BF16 normalized. This norm consumes the actual updated_residual words.
  *
- * Logical shapes / supported domain:
  * Shared domain applies. residual, gated_value and each output are BF16 [H,C,T,B];
  * kernel is BF16 [D,4]; next_hc_norm_weight is BF16 [H,C]. For every row,
  *   0<=current.offsets[b] and current.offsets[b]+n[b]<=R.
  * For n[b]>0, before.slots[b] is in [0,S). Rows with n[b]=0 need no valid slot index.
  * Every required N word must be ready before this call; current is read-only.
  *
- * Numeric / effects:
  * There is no public intermediate rounding between convolution, SiLU and the residual sum.
  * For t>=n[b], every output is exact BF16 +0 and the corresponding residual, gated_value,
  * records and history are not read. History and records are never mutated by these entries.
@@ -166,9 +151,8 @@ void ple_conv_add_norm(const Tensor& residual, const Tensor& gated_value, const 
                        DeviceExecutionView execution);
 
 /**
- * Op: ple_state_extract
+ * Extract the trailing nine columns after an accepted prefix.
  *
- * Math / indexing:
  * For row b, let a=accepted_columns[b], src=before.slots[b], dst=after.slots[b]. For every
  * channel c and j in [0,9), let k=a-9+j and copy the BF16 word
  *   after.history[c,j,dst] = before.history[c,9+k,src]  if k<0,
@@ -177,12 +161,10 @@ void ple_conv_add_norm(const Tensor& residual, const Tensor& gated_value, const 
  * the complete before history to after, including when source and destination are distinct;
  * a>=9 uses only the trailing nine words of the accepted record prefix.
  *
- * Logical shapes / supported domain:
  * Shared view rules apply. before/after may use different pools and positive slot counts.
  * accepted_columns is contiguous Device I32 [B]. For each b, 0<=a<=records.valid_columns[b]<=R.
  * Every source/destination index is valid in its respective pool, including for a=0.
  *
- * Numeric / effects:
  * This is exact BF16 word copying, preserving every bit including zero signs. No numerical
  * evaluation or finite-value requirement is imposed on the copied words. Only the nine columns
  * in the selected destination slots are written; unselected slots, records and metadata remain
