@@ -354,4 +354,21 @@ __device__ __forceinline__ int4 int8_dequant_bf16x8(const std::int8_t* codes8, f
                      static_cast<int>(packed[2]), static_cast<int>(packed[3]));
 }
 
+// Eight code bytes share one represented FP16 scale; expansion multiplies in FP16.
+__device__ __forceinline__ int4 int8_dequant_f16x8(const std::int8_t* codes8, __half scale) {
+    const int2 raw       = load_vec<int2>(codes8);
+    const std::int8_t* c = reinterpret_cast<const std::int8_t*>(&raw);
+    const __half2 s2     = __halves2half2(scale, scale);
+    unsigned packed[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const __half2 code2 =
+            __floats2half2_rn(static_cast<float>(c[2 * i]), static_cast<float>(c[2 * i + 1]));
+        const __half2 value2 = __hmul2(code2, s2);
+        packed[i]            = *reinterpret_cast<const unsigned*>(&value2);
+    }
+    return make_int4(static_cast<int>(packed[0]), static_cast<int>(packed[1]),
+                     static_cast<int>(packed[2]), static_cast<int>(packed[3]));
+}
+
 } // namespace ninfer::ops::common

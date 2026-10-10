@@ -27,37 +27,16 @@ struct ContextAttentionExecutionEnvelope {
 };
 
 /**
- * Shared numerical contract.
+ * Scaled dot-product attention over each entry's visible key set J:
+ *   kvh = floor(h / (Hq/Hkv)); score[j] = scale * dot(q[:,h,i], K[:,kvh,j]);
+ *   out[:,h,i] = BF16(sum_j softmax(score)[j] * V[:,kvh,j]).
  *
- * Every entry computes stable scaled dot-product Softmax Attention. Query head h reads KV head
- * floor(h / (Hq/Hkv)). Public BF16 inputs and persistent cache rows are interpreted after their
- * storage boundary. In the BFloat16 cache profile, K is stored as BF16 and V as
- * FP16_RNE(BF16 input). For a declared visible key set J, the independent mathematical oracle is
- *
- *   score[j]       = scale * dot(FP64(q[:,h,i]), FP64(k[:,kvh,j]))
- *   probability[j] = exp(score[j] - max(score)) / sum_x exp(score[x] - max(score))
- *   ideal[:,h,i]   = sum_j probability[j] * FP64(v[:,kvh,j]).
- *
- * Dot products, stable Softmax, and the value reduction are evaluated naively in FP64. The BF16
- * Op output is promoted to FP64 for comparison; storage rounding belongs to the Op criterion and
- * is not reproduced by the oracle.
- *
- * Quantized cache rows use the exact persistent representation defined by kv_cache_append.
- * INT8 and FP8 K rows represent R*K; NVFP4 and K8V4 additionally store R*V, where R=H256/16
- * is the fixed orthonormal Hadamard transform. The oracle evaluates R*q from the public BF16 q
- * in FP64, uses exact decoded persistent K/V values, and applies R^T to the complete value
- * reduction when V is rotated. This is the same logical formula in the cache's stored basis.
- * It does not quantize or round q, probabilities, partial sums or decoded vectors to copy a
- * kernel's private arithmetic. Newly appended rows cross their specified persistent codec
- * boundary before attention observes them.
- *
- * Kernels may select native BF16/FP16/INT8/FP8 operands, internal reductions, staging precision
- * and decomposition. These are qualified implementation profiles, not extra public tensor
- * boundaries. Every cache route is checked directly against the independent mathematical oracle
- * with its named numerical criterion; route-to-route parity is supplementary evidence only.
- * Those criteria apply to the registered geometries, tested extents, conformance matrix, and
- * target-representative activation range; they are not universal error bounds for arbitrary
- * adversarial BF16 tensors.
+ * Inputs are interpreted in their represented dtype. BFloat16 caches store BF16 K and
+ * FP16_RNE(BF16 input) V. Quantized rows follow kv_cache_append's persistent representation.
+ * INT8/FP8 keys represent R*K, R=H256/16; their logits use R*q and decoded keys. NVFP4/K8V4
+ * additionally store R*V and apply R^T after the complete value reduction. Newly appended rows
+ * cross the persistent codec boundary before attention consumes them. Internal MMA operands,
+ * softmax probabilities and partial sums are not additional public tensor boundaries.
  */
 
 /**
@@ -118,10 +97,10 @@ void packed_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
  *
  * Let Vb be W for dense input or valid_columns[b] otherwise. For live column j<Vb with absolute
  * position p=positions[j,b], query head h attends cache rows [0,p] through table row
- * kv_table_rows[b]. The current k/v row is appended before it is observed, so the formula is the
- * shared oracle above over J=[0,p]. Each masked row has a live prefix [0,Vb); its live positions
- * are sequential and address populated histories. A nonempty row repeats its last live position
- * through the inert tail; an empty row uses zero positions. Other tail values are safe dummies.
+ * kv_table_rows[b]. The current k/v row is appended before it is observed, so the formula above
+ * uses J=[0,p]. Each masked row has a live prefix [0,Vb); its live positions are sequential and
+ * address populated histories. A nonempty row repeats its last live position through the inert
+ * tail; an empty row uses zero positions. Other tail values are safe dummies.
  * Tail columns do not mutate cache and produce exact BF16 zero.
  *
  * Attention consumes the paged cache directly. Caller-owned transient storage is bounded by the
@@ -149,7 +128,7 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
  * Read-only single-sequence causal attention over an already populated cache.
  *
  * q/out are contiguous BF16 [256,24|16,T], positions is contiguous sequential device I32 [T],
- * and cache geometry, visible rows, scale, numerical oracle, envelope, alias, and workspace rules
+ * and cache geometry, visible rows, scale, numerical semantics, envelope, alias, and workspace rules
  * are the same as causal_softmax_attention. The Op accepts no new K/V and leaves every cache byte
  * unchanged; out is completely overwritten.
  */
@@ -201,6 +180,7 @@ void context_softmax_attention(const Tensor& q, const Tensor& query_k, const Ten
 /**
  * Return transient capacity for every T in the inclusive optimized interval at the exact batch
  * size. The execution envelope is fixed; invalid profiles or intervals throw.
+ * An envelope with max_context=0 requires no transient storage.
  */
 [[nodiscard]] std::size_t context_softmax_attention_workspace_capacity_bytes(
     AttentionHeadGeometry geometry, ContextAttentionExecutionEnvelope envelope,

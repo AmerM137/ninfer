@@ -1,6 +1,6 @@
 #pragma once
 
-#include "ops/softmax_attention/dense/causal_cache/bf16/operands.h"
+#include "ops/softmax_attention/kernels/causal/operands.h"
 #include "ninfer/ops/softmax_attention.h"
 
 namespace ninfer::ops::detail {

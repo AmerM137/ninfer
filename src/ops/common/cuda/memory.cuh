@@ -44,6 +44,15 @@ __device__ __forceinline__ unsigned smem_addr(const void* ptr) {
 // Permute eight-element vectors within each 64-element row sector.
 __device__ __forceinline__ int swizzle_xor_64(int row, int col) { return col ^ ((row & 7) << 3); }
 
+// Permute sixteen-element vectors within each 128-element row sector.
+__device__ __forceinline__ int swizzle_xor_128(int row, int col) { return col ^ ((row & 7) << 4); }
+
+// Compose an MMA shared-memory lane base with precomputed column/matrix and row XOR bits.
+__device__ __forceinline__ unsigned swizzle_xor_address(unsigned base, unsigned column,
+                                                        unsigned matrix, unsigned row) {
+    return base + ((column | matrix) ^ row);
+}
+
 // Storage and launch must select the same static/dynamic representation.
 template <int Bytes>
 __device__ __forceinline__ unsigned char* shared_storage() {

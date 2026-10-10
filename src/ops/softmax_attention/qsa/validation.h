@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ninfer/ops/qsa.h"
+#include "ops/common/host/operands.h"
 
 #include <array>
 #include <cstddef>
@@ -18,20 +19,19 @@ struct ViewValidation {
         if (!condition) throw std::invalid_argument(std::string(op) + ": invalid " + label);
     }
 
-    static bool aligned(const void* p, std::size_t bytes) {
-        return p && reinterpret_cast<std::uintptr_t>(p) % bytes == 0;
-    }
-
     void dense(const Tensor& t, DType dtype, std::array<int, 4> shape, int alignment,
                const char* label) const {
-        require(t.dtype == dtype && t.is_contiguous() && aligned(t.data, alignment), label);
+        require(t.dtype == dtype && t.is_contiguous() &&
+                    common::operand::aligned(t.data, alignment),
+                label);
         for (int d = 0; d < 4; ++d) require(t.ne[d] == shape[d] && shape[d] > 0, label);
     }
 
     // Page-major planes have contiguous features and ordered, non-overlapping outer axes.
     void plane(const Tensor& t, DType dtype, std::array<int, 4> shape, const char* label) const {
         const std::int64_t element = dtype_size(dtype);
-        require(t.dtype == dtype && t.nb[0] == element && aligned(t.data, element), label);
+        require(t.dtype == dtype && t.nb[0] == element && common::operand::aligned(t.data, element),
+                label);
         std::uint64_t span = element;
         for (int d = 0; d < 4; ++d) {
             require(t.ne[d] == shape[d] && shape[d] > 0, label);
@@ -66,12 +66,12 @@ struct ViewValidation {
         require(nx <= std::numeric_limits<std::uintptr_t>::max() - x &&
                     ny <= std::numeric_limits<std::uintptr_t>::max() - y,
                 "address range");
-        return x < y + ny && y < x + nx;
+        return common::operand::overlaps({x, x + nx}, {y, y + ny});
     }
 
     void metadata(const Tensor& t, int batch, const char* label) const {
         require(t.dtype == DType::I32 && t.ne[0] == batch && t.ne[1] == 1 && t.ne[2] == 1 &&
-                    t.ne[3] == 1 && t.is_contiguous() && aligned(t.data, 4),
+                    t.ne[3] == 1 && t.is_contiguous() && common::operand::aligned(t.data, 4),
                 label);
     }
 
@@ -82,7 +82,8 @@ struct ViewValidation {
         const std::uint64_t element = dtype_size(dtype), width = features * element;
         require(count > 0 && outer > 0 && t.dtype == dtype && t.ne[0] == features &&
                     t.ne[1] == count && t.ne[2] == outer && t.ne[3] == 1 &&
-                    t.nb[0] == static_cast<std::int64_t>(element) && aligned(t.data, element),
+                    t.nb[0] == static_cast<std::int64_t>(element) &&
+                    common::operand::aligned(t.data, element),
                 label);
         std::uint64_t span = width;
         for (int d = 1; d <= 2; ++d) {

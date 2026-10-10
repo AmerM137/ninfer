@@ -1,6 +1,6 @@
 #include "ops/softmax_attention/dense/causal_cache/bf16/plan.h"
-#include "ops/softmax_attention/dense/causal_cache/bf16/operands.h"
-#include "ops/softmax_attention/common/causal_partition.h"
+#include "ops/softmax_attention/kernels/causal/operands.h"
+#include "ops/softmax_attention/kernels/causal/partition.h"
 #include <algorithm>
 #include <stdexcept>
 
@@ -9,9 +9,9 @@ namespace {
 constexpr int kGroupedPrefillMaxWidth = 256;
 } // namespace
 
-Bf16KvCausalPlan make_bf16_kv_causal_plan(int heads, int width, int batch,
-                                          CausalAttentionExecutionEnvelope envelope,
-                                          int multiprocessor_count) {
+Bf16KvCausalPlan select_bf16_kv_causal_plan(int heads, int width, int batch,
+                                            CausalAttentionExecutionEnvelope envelope,
+                                            int multiprocessor_count) {
     if (multiprocessor_count <= 0 || (heads != 24 && heads != 16) || width < 1 || batch < 1 ||
         batch > 8 || (batch > 1 && width > 16) || envelope.min_visible_keys == 0 ||
         envelope.min_visible_keys > envelope.max_visible_keys ||
@@ -59,7 +59,7 @@ std::size_t bf16_kv_workspace_bytes(int heads, int batch, int min_width, int max
     std::size_t maximum = 0;
     for (int width = min_width; width <= std::min(max_width, kGroupedPrefillMaxWidth); ++width) {
         const auto plan =
-            make_bf16_kv_causal_plan(heads, width, batch, envelope, multiprocessor_count);
+            select_bf16_kv_causal_plan(heads, width, batch, envelope, multiprocessor_count);
         WorkspaceLayoutBuilder layout;
         (void)allocate_causal_partials(layout, heads, width, plan.partition.capacity, batch);
         maximum = std::max(maximum, layout.peak_bytes(1));

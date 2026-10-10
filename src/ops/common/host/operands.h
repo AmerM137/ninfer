@@ -3,6 +3,7 @@
 #include "core/tensor.h"
 #include "core/weight.h"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -15,6 +16,20 @@ namespace ninfer::ops::common::operand {
 struct Range {
     std::uintptr_t begin, end;
 };
+
+inline void shape(const Tensor& tensor, std::array<std::int32_t, 4> expected, const char* op,
+                  const char* name) {
+    for (int d = 0; d < 4; ++d)
+        if (tensor.ne[d] != expected[d])
+            throw std::invalid_argument(std::string(op) + ": invalid shape for " + name);
+}
+
+inline void contiguous_nonnull(const Tensor& tensor, const char* op, const char* name) {
+    if (!tensor.is_contiguous())
+        throw std::invalid_argument(std::string(op) + ": " + name + " must be contiguous");
+    if (!tensor.data)
+        throw std::invalid_argument(std::string(op) + ": " + name + " data must be non-null");
+}
 
 inline std::int64_t numel(const Tensor& tensor, const char* op) {
     bool empty = false;

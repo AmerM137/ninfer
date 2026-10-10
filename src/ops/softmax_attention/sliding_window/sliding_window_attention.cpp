@@ -1,6 +1,7 @@
 #include "ninfer/ops/sliding_window_attention.h"
 
 #include "core/layout.h"
+#include "ops/common/host/operands.h"
 #include "ops/softmax_attention/sliding_window/launch.h"
 
 #include <algorithm>
@@ -30,22 +31,6 @@ void require_profile(AttentionHeadGeometry geometry, std::uint32_t window, const
     }
 }
 
-void require_shape(const Tensor& tensor, std::int32_t n0, std::int32_t n1, std::int32_t n2,
-                   std::int32_t n3, const char* op, const char* name) {
-    if (tensor.ne[0] != n0 || tensor.ne[1] != n1 || tensor.ne[2] != n2 || tensor.ne[3] != n3) {
-        throw std::invalid_argument(std::string(op) + ": invalid shape for " + name);
-    }
-}
-
-void require_contiguous_nonnull(const Tensor& tensor, const char* op, const char* name) {
-    if (!tensor.is_contiguous()) {
-        throw std::invalid_argument(std::string(op) + ": " + name + " must be contiguous");
-    }
-    if (tensor.data == nullptr) {
-        throw std::invalid_argument(std::string(op) + ": " + name + " data must be non-null");
-    }
-}
-
 void validate_context(const CyclicKVCacheLayerView& context, std::uint32_t window, const char* op) {
     if (context.num_kv_heads != kKVHeads || context.head_dim != kHeadDim ||
         context.capacity != window || context.padded_capacity < context.capacity ||
@@ -60,10 +45,12 @@ void validate_context(const CyclicKVCacheLayerView& context, std::uint32_t windo
     if (context.k.dtype != DType::BF16 || context.v.dtype != DType::FP16) {
         throw std::invalid_argument(std::string(op) + ": context K/V must be BF16/FP16");
     }
-    require_shape(context.k, kHeadDim, padded, kKVHeads, context.lane_capacity, op, "context k");
-    require_shape(context.v, kHeadDim, padded, kKVHeads, context.lane_capacity, op, "context v");
-    require_contiguous_nonnull(context.k, op, "context k");
-    require_contiguous_nonnull(context.v, op, "context v");
+    common::operand::shape(context.k, {kHeadDim, padded, kKVHeads, context.lane_capacity}, op,
+                           "context k");
+    common::operand::shape(context.v, {kHeadDim, padded, kKVHeads, context.lane_capacity}, op,
+                           "context v");
+    common::operand::contiguous_nonnull(context.k, op, "context k");
+    common::operand::contiguous_nonnull(context.v, op, "context v");
 }
 
 struct PartialWorkspace {
@@ -101,7 +88,7 @@ std::size_t sliding_window_attention_workspace_capacity_bytes(
     std::size_t capacity = 0;
     for (int tokens = min_tokens; tokens <= max_tokens; ++tokens) {
         const auto plan =
-            detail::sliding_window_attention_resolve_plan(window, tokens, batch_size, envelope);
+            detail::select_sliding_window_attention_plan(window, tokens, batch_size, envelope);
         if (plan.route == detail::SlidingWindowAttentionRoute::Direct) continue;
         WorkspaceLayoutBuilder layout;
         (void)allocate_workspace(layout, tokens, plan.split_capacity, batch_size);
@@ -136,20 +123,20 @@ void sliding_window_attention(const Tensor& q, const Tensor& query_k, const Tens
     if (batch < 1 || batch > 8) {
         throw std::invalid_argument("sliding_window_attention: B must be 1..8");
     }
-    require_shape(q, kHeadDim, kQHeads, tokens, batch, op, "q");
-    require_shape(query_k, kHeadDim, kKVHeads, tokens, batch, op, "query k");
-    require_shape(query_v, kHeadDim, kKVHeads, tokens, batch, op, "query v");
-    require_shape(positions, tokens, batch, 1, 1, op, "positions");
-    require_shape(valid_columns, batch, 1, 1, 1, op, "valid columns");
-    require_shape(lanes, batch, 1, 1, 1, op, "lanes");
-    require_shape(out, kHeadDim, kQHeads, tokens, batch, op, "out");
-    require_contiguous_nonnull(q, op, "q");
-    require_contiguous_nonnull(query_k, op, "query k");
-    require_contiguous_nonnull(query_v, op, "query v");
-    require_contiguous_nonnull(positions, op, "positions");
-    require_contiguous_nonnull(valid_columns, op, "valid columns");
-    require_contiguous_nonnull(lanes, op, "lanes");
-    require_contiguous_nonnull(out, op, "out");
+    common::operand::shape(q, {kHeadDim, kQHeads, tokens, batch}, op, "q");
+    common::operand::shape(query_k, {kHeadDim, kKVHeads, tokens, batch}, op, "query k");
+    common::operand::shape(query_v, {kHeadDim, kKVHeads, tokens, batch}, op, "query v");
+    common::operand::shape(positions, {tokens, batch, 1, 1}, op, "positions");
+    common::operand::shape(valid_columns, {batch, 1, 1, 1}, op, "valid columns");
+    common::operand::shape(lanes, {batch, 1, 1, 1}, op, "lanes");
+    common::operand::shape(out, {kHeadDim, kQHeads, tokens, batch}, op, "out");
+    common::operand::contiguous_nonnull(q, op, "q");
+    common::operand::contiguous_nonnull(query_k, op, "query k");
+    common::operand::contiguous_nonnull(query_v, op, "query v");
+    common::operand::contiguous_nonnull(positions, op, "positions");
+    common::operand::contiguous_nonnull(valid_columns, op, "valid columns");
+    common::operand::contiguous_nonnull(lanes, op, "lanes");
+    common::operand::contiguous_nonnull(out, op, "out");
     validate_context(context, window, op);
     if (envelope.min_context > envelope.max_context ||
         envelope.max_context >
@@ -160,14 +147,13 @@ void sliding_window_attention(const Tensor& q, const Tensor& query_k, const Tens
         throw std::invalid_argument("sliding_window_attention: scale must be 1/sqrt(128)");
     }
 
-    auto scope = workspace.scope();
-    const auto plan =
-        detail::sliding_window_attention_resolve_plan(window, tokens, batch, envelope);
+    auto scope      = workspace.scope();
+    const auto plan = detail::select_sliding_window_attention_plan(window, tokens, batch, envelope);
     PartialWorkspace partial{};
     if (plan.route == detail::SlidingWindowAttentionRoute::SplitKv) {
         partial = allocate_workspace(workspace, tokens, plan.split_capacity, batch);
     }
-    detail::sliding_window_attention_launch(q, query_k, query_v, positions, valid_columns, lanes,
+    detail::launch_sliding_window_attention(q, query_k, query_v, positions, valid_columns, lanes,
                                             scale, context, plan, partial.acc, partial.m, partial.l,
                                             out, stream);
 }

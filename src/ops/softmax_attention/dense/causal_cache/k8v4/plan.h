@@ -2,7 +2,7 @@
 
 #include "ops/kv_cache/kernels/write.h"
 #include "ninfer/ops/softmax_attention.h"
-#include "ops/softmax_attention/common/causal_partition.h"
+#include "ops/softmax_attention/kernels/causal/partition.h"
 
 namespace ninfer::ops::detail {
 
@@ -16,9 +16,9 @@ struct K8V4KvCausalPlan {
     CausalKvPartition partition;
 };
 
-K8V4KvCausalPlan make_k8v4_kv_causal_plan(int heads, int width, int batch,
-                                          CausalAttentionExecutionEnvelope envelope,
-                                          int multiprocessor_count);
+K8V4KvCausalPlan select_k8v4_kv_causal_plan(int heads, int width, int batch,
+                                            CausalAttentionExecutionEnvelope envelope,
+                                            int multiprocessor_count);
 std::size_t k8v4_kv_workspace_bytes(int heads, int batch, int min_width, int max_width,
                                     CausalAttentionExecutionEnvelope envelope,
                                     int multiprocessor_count);

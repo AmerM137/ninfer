@@ -1,8 +1,9 @@
 #include "ops/softmax_attention/dense/causal_cache/fp8/tiled_launch.h"
 #include "ops/softmax_attention/dense/causal_cache/fp8/instances.h"
-#include "ops/softmax_attention/dense/causal_cache/fp8/tile_io.cuh"
-#include "ops/softmax_attention/common/mxfp8_tiled_launch.cuh"
-#include "ops/softmax_attention/common/causal_tiled_merge.cuh"
+#include "ops/softmax_attention/kernels/causal/tile_io.cuh"
+#include "ops/softmax_attention/kernels/causal/operands.h"
+#include "ops/softmax_attention/kernels/causal/mxfp8_tiled_launch.cuh"
+#include "ops/softmax_attention/kernels/causal/tiled_merge.cuh"
 
 namespace ninfer::ops::detail {
 void fp8_kv_tiled_attention(const CausalAttentionOperands& p, Fp8KvReadView cache,

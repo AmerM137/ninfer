@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ops/common/cuda/memory.cuh"
+
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
@@ -80,6 +82,20 @@ __device__ __forceinline__ __half2 fp8_code2_to_half2(std::uint16_t storage) {
 
 __device__ __forceinline__ __half2 fp8_dequant_code2_to_half2(std::uint16_t storage, __half scale) {
     return __hmul2(fp8_code2_to_half2(storage), __halves2half2(scale, scale));
+}
+
+// Eight code bytes share one represented FP16 scale; expansion multiplies in FP16.
+__device__ __forceinline__ int4 fp8_dequant_f16x8(const std::uint8_t* codes, __half scale) {
+    const int2 raw         = load_vec<int2>(codes);
+    const std::uint16_t* c = reinterpret_cast<const std::uint16_t*>(&raw);
+    unsigned packed[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const __half2 value2 = fp8_dequant_code2_to_half2(c[i], scale);
+        packed[i]            = *reinterpret_cast<const unsigned*>(&value2);
+    }
+    return make_int4(static_cast<int>(packed[0]), static_cast<int>(packed[1]),
+                     static_cast<int>(packed[2]), static_cast<int>(packed[3]));
 }
 
 } // namespace ninfer::ops::common

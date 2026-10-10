@@ -1,7 +1,7 @@
 #include "ops/softmax_attention/dense/causal_cache/k8v4/launch.h"
 #include "ops/softmax_attention/dense/causal_cache/k8v4/instances.h"
 #include "ops/softmax_attention/dense/causal_cache/k8v4/plan.h"
-#include "ops/softmax_attention/dense/causal_cache/k8v4/template_launch.cuh"
+#include "ops/softmax_attention/kernels/causal/k8v4/template_launch.cuh"
 #include "ops/softmax_attention/dense/causal_cache/k8v4/tiled_launch.h"
 
 namespace ninfer::ops::detail {
@@ -125,8 +125,8 @@ void k8v4_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                               CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
                               Tensor& out, DeviceExecutionView execution) {
     const cudaStream_t stream = execution.stream;
-    const auto plan           = make_k8v4_kv_causal_plan(q.ne[1], q.ne[2], q.ne[3], envelope,
-                                                         execution.multiprocessor_count);
+    const auto plan           = select_k8v4_kv_causal_plan(q.ne[1], q.ne[2], q.ne[3], envelope,
+                                                           execution.multiprocessor_count);
     if (plan.family != K8V4KvFamily::Grouped) {
         kv::launch_paged_write(select_k8v4_kv_write(k.ne[1], k.ne[2], k.ne[3]), k, v, positions,
                                valid, rows, cache, stream);
@@ -151,7 +151,7 @@ void k8v4_kv_cached_attention(const Tensor& q, const Tensor& positions, float sc
                               Tensor& out, DeviceExecutionView execution) {
     const cudaStream_t stream = execution.stream;
     const auto plan =
-        make_k8v4_kv_causal_plan(q.ne[1], q.ne[2], 1, envelope, execution.multiprocessor_count);
+        select_k8v4_kv_causal_plan(q.ne[1], q.ne[2], 1, envelope, execution.multiprocessor_count);
     const auto view = single_row_paged_kv_batch_view(cache);
     if (plan.family == K8V4KvFamily::Tiled)
         k8v4_kv_tiled_attention(

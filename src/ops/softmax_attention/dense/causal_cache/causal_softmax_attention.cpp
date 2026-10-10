@@ -1,7 +1,7 @@
-// ninfer::ops - causal cached Softmax Attention validation and finite route dispatch.
 #include "ninfer/ops/softmax_attention.h"
 
 #include "core/layout.h"
+#include "ops/common/host/operands.h"
 #include "core/paged_kv_storage.h"
 #include "ops/softmax_attention/dense/causal_cache/bf16/plan.h"
 #include "ops/softmax_attention/dense/causal_cache/bf16/launch.h"
@@ -37,78 +37,6 @@ void require_causal_geometry(AttentionHeadGeometry geometry, const char* op) {
     }
 }
 
-void require_shape(const Tensor& tensor, std::int32_t n0, std::int32_t n1, std::int32_t n2,
-                   std::int32_t n3, const char* op, const char* name) {
-    if (tensor.ne[0] != n0 || tensor.ne[1] != n1 || tensor.ne[2] != n2 || tensor.ne[3] != n3) {
-        throw std::invalid_argument(std::string(op) + ": invalid shape for " + name);
-    }
-}
-
-void require_contiguous_nonnull(const Tensor& tensor, const char* op, const char* name) {
-    if (!tensor.is_contiguous()) {
-        throw std::invalid_argument(std::string(op) + ": " + name + " must be contiguous");
-    }
-    if (tensor.data == nullptr) {
-        throw std::invalid_argument(std::string(op) + ": " + name + " data must be non-null");
-    }
-}
-
-std::uint32_t validate_cache(const PagedKVLayerView& cache, std::int32_t kv_heads, const char* op) {
-    PagedKVStorageLayout layout{};
-    try {
-        layout = paged_kv_storage_layout(cache.storage, kHeadDim);
-    } catch (const std::invalid_argument&) {
-        throw std::invalid_argument(std::string(op) + ": invalid KV cache geometry or storage");
-    }
-    if (cache.num_kv_heads != kv_heads || cache.head_dim != kHeadDim) {
-        throw std::invalid_argument(std::string(op) + ": invalid KV cache geometry or storage");
-    }
-
-    const std::int32_t physical_pages = cache.k_pages.ne[3];
-    const std::int32_t logical_pages  = cache.block_table.ne[0];
-    const std::int64_t capacity       = static_cast<std::int64_t>(logical_pages) * kPagedKVPageSize;
-    if (physical_pages <= 0 || logical_pages <= 0 ||
-        capacity > std::numeric_limits<std::int32_t>::max()) {
-        throw std::invalid_argument(std::string(op) + ": invalid KV cache capacity");
-    }
-
-    if (cache.k_pages.dtype != layout.key.data_dtype ||
-        cache.v_pages.dtype != layout.value.data_dtype) {
-        throw std::invalid_argument(std::string(op) + ": invalid KV cache data dtype");
-    }
-    require_shape(cache.k_pages, layout.key.data_leading_extent, kPagedKVPageSize, kv_heads,
-                  physical_pages, op, "cache k pages");
-    require_shape(cache.v_pages, layout.value.data_leading_extent, kPagedKVPageSize, kv_heads,
-                  physical_pages, op, "cache v pages");
-    require_contiguous_nonnull(cache.k_pages, op, "cache k pages");
-    require_contiguous_nonnull(cache.v_pages, op, "cache v pages");
-    if (cache.block_table.dtype != DType::I32) {
-        throw std::invalid_argument(std::string(op) + ": block table must be I32");
-    }
-    require_shape(cache.block_table, logical_pages, 1, 1, 1, op, "block table");
-    require_contiguous_nonnull(cache.block_table, op, "block table");
-
-    const auto validate_scale = [&](const Tensor& tensor, const PagedKVVectorLayout& vector,
-                                    const char* name) {
-        if (!vector.has_scale()) {
-            if (tensor.data != nullptr) {
-                throw std::invalid_argument(std::string(op) +
-                                            ": unscaled KV cache must not have scales");
-            }
-            return;
-        }
-        if (tensor.dtype != vector.scale_dtype) {
-            throw std::invalid_argument(std::string(op) + ": invalid KV cache scale dtype");
-        }
-        require_shape(tensor, vector.scale_leading_extent, kPagedKVPageSize, kv_heads,
-                      physical_pages, op, name);
-        require_contiguous_nonnull(tensor, op, name);
-    };
-    validate_scale(cache.k_scale_pages, layout.key, "cache k scale pages");
-    validate_scale(cache.v_scale_pages, layout.value, "cache v scale pages");
-    return static_cast<std::uint32_t>(capacity);
-}
-
 std::uint32_t validate_batch_cache(const PagedKVBatchLayerView& cache, std::int32_t kv_heads,
                                    const char* op) {
     PagedKVStorageLayout layout{};
@@ -134,17 +62,21 @@ std::uint32_t validate_batch_cache(const PagedKVBatchLayerView& cache, std::int3
         cache.v_pages.dtype != layout.value.data_dtype) {
         throw std::invalid_argument(std::string(op) + ": invalid KV cache data dtype");
     }
-    require_shape(cache.k_pages, layout.key.data_leading_extent, kPagedKVPageSize, kv_heads,
-                  physical_pages, op, "cache k pages");
-    require_shape(cache.v_pages, layout.value.data_leading_extent, kPagedKVPageSize, kv_heads,
-                  physical_pages, op, "cache v pages");
-    require_contiguous_nonnull(cache.k_pages, op, "cache k pages");
-    require_contiguous_nonnull(cache.v_pages, op, "cache v pages");
+    common::operand::shape(
+        cache.k_pages, {layout.key.data_leading_extent, kPagedKVPageSize, kv_heads, physical_pages},
+        op, "cache k pages");
+    common::operand::shape(
+        cache.v_pages,
+        {layout.value.data_leading_extent, kPagedKVPageSize, kv_heads, physical_pages}, op,
+        "cache v pages");
+    common::operand::contiguous_nonnull(cache.k_pages, op, "cache k pages");
+    common::operand::contiguous_nonnull(cache.v_pages, op, "cache v pages");
     if (cache.block_tables.dtype != DType::I32) {
         throw std::invalid_argument(std::string(op) + ": block tables must be I32");
     }
-    require_shape(cache.block_tables, logical_pages, table_rows, 1, 1, op, "block tables");
-    require_contiguous_nonnull(cache.block_tables, op, "block tables");
+    common::operand::shape(cache.block_tables, {logical_pages, table_rows, 1, 1}, op,
+                           "block tables");
+    common::operand::contiguous_nonnull(cache.block_tables, op, "block tables");
 
     const auto validate_scale = [&](const Tensor& tensor, const PagedKVVectorLayout& vector,
                                     const char* name) {
@@ -158,9 +90,10 @@ std::uint32_t validate_batch_cache(const PagedKVBatchLayerView& cache, std::int3
         if (tensor.dtype != vector.scale_dtype) {
             throw std::invalid_argument(std::string(op) + ": invalid KV cache scale dtype");
         }
-        require_shape(tensor, vector.scale_leading_extent, kPagedKVPageSize, kv_heads,
-                      physical_pages, op, name);
-        require_contiguous_nonnull(tensor, op, name);
+        common::operand::shape(
+            tensor, {vector.scale_leading_extent, kPagedKVPageSize, kv_heads, physical_pages}, op,
+            name);
+        common::operand::contiguous_nonnull(tensor, op, name);
     };
     validate_scale(cache.k_scale_pages, layout.key, "cache k scale pages");
     validate_scale(cache.v_scale_pages, layout.value, "cache v scale pages");
@@ -169,7 +102,11 @@ std::uint32_t validate_batch_cache(const PagedKVBatchLayerView& cache, std::int3
 
 void validate_envelope(CausalAttentionExecutionEnvelope envelope, const PagedKVLayerView& cache,
                        std::int32_t tokens, const char* op) {
-    const std::uint32_t capacity = validate_cache(cache, cache.num_kv_heads, op);
+    common::operand::shape(cache.block_table, {cache.block_table.ne[0], 1, 1, 1}, op,
+                           "block table");
+    common::operand::contiguous_nonnull(cache.block_table, op, "block table");
+    const std::uint32_t capacity =
+        validate_batch_cache(single_row_paged_kv_batch_view(cache), cache.num_kv_heads, op);
     if (envelope.min_visible_keys == 0 || envelope.min_visible_keys > envelope.max_visible_keys ||
         envelope.max_visible_keys > kCausalAttentionMaximumVisibleKeys ||
         envelope.max_visible_keys > capacity) {
@@ -198,12 +135,12 @@ void validate_attention_tensors(const Tensor& q, const Tensor& positions, const 
     const std::int32_t kv_heads = geometry.kv_heads;
     const std::int32_t tokens   = q.ne[2];
     if (tokens <= 0) { throw std::invalid_argument(std::string(op) + ": T must be positive"); }
-    require_shape(q, kHeadDim, q_heads, tokens, 1, op, "q");
-    require_shape(positions, tokens, 1, 1, 1, op, "positions");
-    require_shape(out, kHeadDim, q_heads, tokens, 1, op, "out");
-    require_contiguous_nonnull(q, op, "q");
-    require_contiguous_nonnull(positions, op, "positions");
-    require_contiguous_nonnull(out, op, "out");
+    common::operand::shape(q, {kHeadDim, q_heads, tokens, 1}, op, "q");
+    common::operand::shape(positions, {tokens, 1, 1, 1}, op, "positions");
+    common::operand::shape(out, {kHeadDim, q_heads, tokens, 1}, op, "out");
+    common::operand::contiguous_nonnull(q, op, "q");
+    common::operand::contiguous_nonnull(positions, op, "positions");
+    common::operand::contiguous_nonnull(out, op, "out");
     if (cache.num_kv_heads != kv_heads) {
         throw std::invalid_argument(std::string(op) + ": invalid KV cache head geometry");
     }
@@ -236,16 +173,16 @@ void validate_batched_attention_tensors(const Tensor& q, const Tensor& positions
         (batch > 1 && width > kMaximumVerifyTokens)) {
         throw std::invalid_argument(std::string(op) + ": unsupported B/W domain");
     }
-    require_shape(q, kHeadDim, q_heads, width, batch, op, "q");
-    require_shape(positions, width, batch, 1, 1, op, "positions");
-    if (masked) { require_shape(valid_columns, batch, 1, 1, 1, op, "valid columns"); }
-    require_shape(kv_table_rows, batch, 1, 1, 1, op, "KV table rows");
-    require_shape(out, kHeadDim, q_heads, width, batch, op, "out");
-    require_contiguous_nonnull(q, op, "q");
-    require_contiguous_nonnull(positions, op, "positions");
-    if (masked) { require_contiguous_nonnull(valid_columns, op, "valid columns"); }
-    require_contiguous_nonnull(kv_table_rows, op, "KV table rows");
-    require_contiguous_nonnull(out, op, "out");
+    common::operand::shape(q, {kHeadDim, q_heads, width, batch}, op, "q");
+    common::operand::shape(positions, {width, batch, 1, 1}, op, "positions");
+    if (masked) { common::operand::shape(valid_columns, {batch, 1, 1, 1}, op, "valid columns"); }
+    common::operand::shape(kv_table_rows, {batch, 1, 1, 1}, op, "KV table rows");
+    common::operand::shape(out, {kHeadDim, q_heads, width, batch}, op, "out");
+    common::operand::contiguous_nonnull(q, op, "q");
+    common::operand::contiguous_nonnull(positions, op, "positions");
+    if (masked) { common::operand::contiguous_nonnull(valid_columns, op, "valid columns"); }
+    common::operand::contiguous_nonnull(kv_table_rows, op, "KV table rows");
+    common::operand::contiguous_nonnull(out, op, "out");
     if (cache.num_kv_heads != kv_heads) {
         throw std::invalid_argument(std::string(op) + ": invalid KV cache head geometry");
     }
@@ -318,10 +255,10 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
     const std::int32_t width    = q.ne[2];
     const std::int32_t batch    = q.ne[3];
     const std::int32_t kv_heads = geometry.kv_heads;
-    require_shape(k, kHeadDim, kv_heads, width, batch, op, "k");
-    require_shape(v, kHeadDim, kv_heads, width, batch, op, "v");
-    require_contiguous_nonnull(k, op, "k");
-    require_contiguous_nonnull(v, op, "v");
+    common::operand::shape(k, {kHeadDim, kv_heads, width, batch}, op, "k");
+    common::operand::shape(v, {kHeadDim, kv_heads, width, batch}, op, "v");
+    common::operand::contiguous_nonnull(k, op, "k");
+    common::operand::contiguous_nonnull(v, op, "v");
 
     if (cache.storage == KvCacheStorage::BFloat16) {
         detail::bf16_kv_append_attention(q, k, v, positions, valid_columns, kv_table_rows, scale,

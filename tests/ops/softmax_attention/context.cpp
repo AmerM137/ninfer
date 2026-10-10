@@ -294,7 +294,7 @@ int run_case(int tokens, int context_length, InputProfile profile = InputProfile
                                                           static_cast<std::uint32_t>(envelope_max)};
     const std::size_t workspace_bytes = ops::context_softmax_attention_workspace_capacity_bytes(
         kGeometry, envelope, tokens, tokens, 1);
-    DeviceArena workspace(workspace_bytes);
+    DeviceArena workspace(std::max<std::size_t>(workspace_bytes, 1));
 
     ops::context_softmax_attention(q_tensor, query_k_tensor, query_v_tensor, length_tensor,
                                    valid_tensor, table_row_tensor, kGeometry, kScale, context,

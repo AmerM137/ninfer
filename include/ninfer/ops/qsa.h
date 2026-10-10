@@ -3,7 +3,6 @@
 #include "core/device.h"
 #include "core/paged_kv_cache.h"
 #include "core/tensor.h"
-#include "core/weight.h"
 
 #include <cuda_runtime.h>
 
@@ -103,7 +102,6 @@ struct QsaIndexerExecutionEnvelope {
  * Every live p+1 is <= envelope.max_visible_tokens <=262144, within the table capacity.
  * Envelope zero permits only inert queries. Live scoring operands and their FP32 scores are
  * finite. BF16 values enter FP32 accumulation directly; scores have no BF16 rounding boundary.
- * Mathematical scores and selection boundaries are independently qualified against FP64.
  * Device counts, positions, selectors and readable live pages are caller guarantees.
  *
  * Effects / output:
@@ -166,10 +164,9 @@ struct QsaSparseGqaExecutionEnvelope {
  * covered by its table. Selection is contiguous I32 [512,T,B] and [T,B]; each live c lies in
  * [0,min(512,C)], with distinct ids in [0,C). Id order is unspecified; the set need not be an
  * Indexer's actual TopK. Device metadata and readable selected pages are caller guarantees. Live
- * mathematical operands/results are finite. The independent oracle decodes the actual stored
- * codes/scales and evaluates basis transforms, dot, stable softmax, PV and sigmoid in FP64,
- * comparing promoted BF16 output to the unrounded ideal under one A16 criterion. Cache storage
- * quantization error is separate from this computation error.
+ * mathematical operands/results are finite. Cache storage quantization and the A16 computation
+ * have separate rounding boundaries; decoded KV, transformed Q and probabilities are internal
+ * operands rather than additional public tensors.
  *
  * Effects / execution:
  * All inputs and cache are preserved. There is no append, persistent state or publication.
@@ -244,10 +241,10 @@ void qsa_sparse_gqa(const Tensor& query, const Tensor& output_gate,
  * Numeric / effects:
  * Norm and rotation have no intermediate represented tensor. The pooled mean's BF16 rounding
  * is semantic; raw records preserve input words exactly. Q/IQ/index keys and BFloat16-cache K
- * are BF16 approximations to the complete formula, independently qualified against a
- * high-precision oracle. Quantized K includes the storage encoder's representation error;
- * V uses its profile's exact persistent encoding. Q/IQ for t>=n are exactly BF16 +0; inert columns
- * do not read projections/positions/state or write cache/records. An empty row need not have valid
+ * are BF16 approximations to the complete formula. Quantized K includes the storage encoder's
+ * representation error; V uses its profile's exact persistent encoding. Q/IQ for t>=n are
+ * exactly BF16 +0; inert columns do not read projections/positions/state or write cache/records.
+ * An empty row need not have valid
  * slot/table selectors. before, metadata, page tables and untouched cache/record regions remain
  * unchanged. query may exactly alias projected.query, and index_query may independently exactly
  * alias projected.index_query (same address/shape/strides). Partial overlap and all other

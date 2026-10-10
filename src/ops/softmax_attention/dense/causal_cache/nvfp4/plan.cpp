@@ -1,16 +1,25 @@
 #include "ops/softmax_attention/dense/causal_cache/nvfp4/plan.h"
-#include "ops/softmax_attention/dense/causal_cache/nvfp4/operands.h"
+#include "ops/softmax_attention/kernels/causal/operands.h"
 #include <algorithm>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
 namespace {
+// Complete groups of independent query tiles should fill at least 90% of the SMs.
+// Each dtype chooses whether a shortfall warrants a larger CTA budget.
+inline constexpr bool causal_query_tiles_underfill_sms(int independent_tiles,
+                                                       int multiprocessor_count) {
+    const std::int64_t filled =
+        (multiprocessor_count / independent_tiles) * static_cast<std::int64_t>(independent_tiles);
+    return filled < static_cast<std::int64_t>(multiprocessor_count) * 9 / 10;
+}
+
 constexpr int kGroupedPrefillMaxWidth = 192;
 } // namespace
 
-Nvfp4KvCausalPlan make_nvfp4_kv_causal_plan(int heads, int width, int batch,
-                                            CausalAttentionExecutionEnvelope envelope,
-                                            int multiprocessor_count) {
+Nvfp4KvCausalPlan select_nvfp4_kv_causal_plan(int heads, int width, int batch,
+                                              CausalAttentionExecutionEnvelope envelope,
+                                              int multiprocessor_count) {
     if (multiprocessor_count <= 0 || (heads != 24 && heads != 16) || width < 1 || batch < 1 ||
         batch > 8 || (batch > 1 && width > 16) || envelope.min_visible_keys == 0 ||
         envelope.min_visible_keys > envelope.max_visible_keys ||
@@ -45,7 +54,7 @@ std::size_t nvfp4_kv_workspace_bytes(int heads, int batch, int min_width, int ma
     std::size_t maximum = 0;
     for (int width = min_width; width <= std::min(max_width, kGroupedPrefillMaxWidth); ++width) {
         const auto plan =
-            make_nvfp4_kv_causal_plan(heads, width, batch, envelope, multiprocessor_count);
+            select_nvfp4_kv_causal_plan(heads, width, batch, envelope, multiprocessor_count);
         if (plan.family == Nvfp4KvFamily::Tiled) continue;
         const int splits = plan.partition.capacity;
         WorkspaceLayoutBuilder layout;
