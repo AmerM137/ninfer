@@ -126,7 +126,7 @@ void measure_sparse(const qsa::Options& options, DeviceContext& device, L2FlushB
         qsa::SparseGqaFixture fixture(options, tokens, device.execution_view());
         measurement::Row row;
         row.op              = "qsa_sparse_gqa";
-        row.format          = "bf16";
+        row.format          = qsa::name(options.storage);
         row.policy          = "bf16_output";
         row.tokens          = tokens;
         row.batch           = options.batch;
@@ -153,9 +153,10 @@ void measure_sparse(const qsa::Options& options, DeviceContext& device, L2FlushB
                             options.layout + "," + options.selection + "," +
                             std::to_string(options.selected_blocks) + "," + std::to_string(flops) +
                             "," + std::to_string(flops) + "," +
-                            std::to_string(fixture.selected_tokens * 2048) + "," +
-                            std::to_string(fixture.unique_tokens * 2048) + "," +
-                            std::to_string(fixture.key_data.bytes + fixture.value_data.bytes) +
+                            std::to_string(fixture.selected_tokens * fixture.token_bytes) + "," +
+                            std::to_string(fixture.unique_tokens * fixture.token_bytes) + "," +
+                            std::to_string(fixture.key_data.bytes + fixture.value_data.bytes +
+                                           fixture.key_scales.bytes + fixture.value_scales.bytes) +
                             "," + std::to_string(round));
                 }
     }

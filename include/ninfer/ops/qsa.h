@@ -203,20 +203,27 @@ struct QsaSparseGqaExecutionEnvelope {
  * There is no attention-output BF16 rounding before the gate. Indexer scores do not enter
  * the logits. Logical token j addresses tables[j/64,table_rows[b]], row j%64.
  * Empty J and inert queries produce exact +0, without reading query/gate/cache values.
+ * Quantized keys represent R*K, R=H256/16; logits use R*query and decoded keys. NVFP4 and
+ * K8V4 values represent R*V, so apply R^T to the fully reduced attention before the gate.
  *
  * Domain / numeric:
  * T>0, B=1..8. Query, gate and out are contiguous, 16-byte-aligned BF16 [256,24,T,B].
- * The BFloat16 cache profile has BF16 K and FP16 V [256,64,2,G], no scales. Features are
- * contiguous; naturally aligned positive, non-overlapping page-major outer strides are used.
+ * Cache supports BFloat16 (BF16 K / FP16 V), Fp8E4M3Row256, Int8Group64, Nvfp4Group16 and
+ * Fp8KeyNvfp4Value. Data/scale planes follow paged_kv_storage_layout(storage,256), with
+ * [leading_extent,64,2,G] geometry. Features are contiguous; naturally aligned positive,
+ * non-overlapping page-major outer strides are used. Q and softmax probabilities are not
+ * quantized to low-bit operands: MMA uses BF16/FP16 operands with FP32 accumulation, softmax
+ * and basis transforms. Decoded KV tiles stay on chip; there is no expanded global cache.
  * Tables have contiguous I32 entries and a non-overlapping row stride. Positions are contiguous
  * I32 [T,B]; valid_columns/table_rows are contiguous Device I32 [B]. Each row has 0<=n<=T,
  * with consecutive nonnegative live positions satisfying p+1<=envelope.max_visible_tokens<=262144,
  * covered by its table. Selection is contiguous I32 [512,T,B] and [T,B]; each live c lies in
  * [0,min(512,C)], with distinct ids in [0,C). Id order is unspecified; the set need not be an
  * Indexer's actual TopK. Device metadata and readable selected pages are caller guarantees. Live
- * mathematical operands/results are finite. The independent oracle evaluates dot, stable softmax,
- * PV and sigmoid in FP64 from represented inputs, comparing promoted BF16 output to the unrounded
- * ideal under one BF16 criterion.
+ * mathematical operands/results are finite. The independent oracle decodes the actual stored
+ * codes/scales and evaluates basis transforms, dot, stable softmax, PV and sigmoid in FP64,
+ * comparing promoted BF16 output to the unrounded ideal under one A16 criterion. Cache storage
+ * quantization error is separate from this computation error.
  *
  * Effects / execution:
  * All inputs and cache are preserved. There is no append, persistent state or publication.

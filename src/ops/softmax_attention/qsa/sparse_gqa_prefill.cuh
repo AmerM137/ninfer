@@ -3,10 +3,11 @@
 
 namespace ninfer::ops::detail::qsa {
 
-template <int N, int Queries, bool Vector>
+template <KvCacheStorage Storage, int N, int Queries, bool Vector,
+          SparseGqaLoad Load = SparseGqaLoad::Direct>
 __device__ __forceinline__ void
-sparse_gqa_all_select(SparseGqaArguments a, SparseGqaStorage<N, Queries>& s, std::int64_t first,
-                      int head, std::uint16_t* qs) {
+sparse_gqa_all_select(SparseGqaArguments a, SparseGqaStorage<Storage, N, Queries, Load>& s,
+                      std::int64_t first, int head, std::uint16_t* qs) {
     constexpr int Nt = N / 8, Ks = N / 16;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid / 32;
     const auto total   = std::int64_t(a.tokens) * a.batch;
@@ -18,17 +19,7 @@ sparse_gqa_all_select(SparseGqaArguments a, SparseGqaStorage<N, Queries>& s, std
     const int position = live ? a.positions[q] : -1;
     auto* ks           = s.kv;
     auto* vs           = s.kv + N * 256;
-    for (int i = tid; i < Queries * 16 * 32; i += Queries * 32) {
-        const int row = i / 32, d = i % 32 * 8, local = row / 16, h = row % 16;
-        auto* dst = qs + row * 256 + causal_swizzle(row, d);
-        if (first + local < last && h < 12)
-            cp_async<16>(dst, a.query + ((first + local) * 24 + head * 12 + h) * 256 + d);
-        else
-            store_vec(dst, make_int4(0, 0, 0, 0));
-    }
-    cp_commit();
-    cp_wait<0>();
-    __syncthreads();
+    sparse_gqa_prepare_query<Storage, Queries, Queries>(a, first, last, head, qs);
     unsigned qf[4];
     const int ar     = warp * 16 + (lane & 7) + ((lane >> 3) & 1) * 8;
     float acc[32][4] = {};
@@ -37,14 +28,15 @@ sparse_gqa_all_select(SparseGqaArguments a, SparseGqaStorage<N, Queries>& s, std
     constexpr float scale = kLog2E / 16;
     const SparseGqaWork work{end / 4, end / 4, end, 0, 1};
     if (end) {
-        sparse_gqa_addresses(a, s, work, last - 1, head, 0, end);
-        sparse_gqa_stage<N, Queries, Vector, true>(a, s, 0, end);
+        sparse_gqa_addresses<Storage>(a, s, work, last - 1, head, 0, end);
+        sparse_gqa_stage<Storage, N, Queries, Vector, true>(a, s, 0, end);
         cp_commit();
     }
     for (int start = 0; start < end; start += N) {
         cp_wait<0>();
         __syncthreads();
-        sparse_gqa_stage<N, Queries, Vector, false>(a, s, start, end);
+        sparse_gqa_expand_stage<Storage, true>(s);
+        sparse_gqa_stage<Storage, N, Queries, Vector, false>(a, s, start, end);
         cp_commit();
         float score[Nt][4] = {};
 #pragma unroll
@@ -57,15 +49,15 @@ sparse_gqa_all_select(SparseGqaArguments a, SparseGqaStorage<N, Queries>& s, std
                 const int qd = k * 16 + (lane >> 4) * 8;
                 ldmatrix_x4(qf[0], qf[1], qf[2], qf[3],
                             smem_addr(qs + ar * 256 + causal_swizzle(ar, qd)));
-                mma_bf16(score[n][0], score[n][1], score[n][2], score[n][3], qf[0], qf[1], qf[2],
-                         qf[3], bf[0], bf[1]);
+                sparse_gqa_qk<Storage>(score[n], qf, bf);
             }
         }
         cp_wait<0>();
         __syncthreads();
+        sparse_gqa_expand_stage<Storage, false>(s);
         if (start + N < end) {
-            sparse_gqa_addresses(a, s, work, last - 1, head, start + N, end);
-            sparse_gqa_stage<N, Queries, Vector, true>(a, s, start + N, end);
+            sparse_gqa_addresses<Storage>(a, s, work, last - 1, head, start + N, end);
+            sparse_gqa_stage<Storage, N, Queries, Vector, true>(a, s, start + N, end);
             cp_commit();
         }
         float maximum[2] = {-CUDART_INF_F, -CUDART_INF_F};
@@ -117,30 +109,39 @@ sparse_gqa_all_select(SparseGqaArguments a, SparseGqaStorage<N, Queries>& s, std
 #pragma unroll
         for (int n = 0; n < 32; ++n) {
             const int d = n * 8 + lid * 2;
-            if (live)
-                sparse_gqa_store(a, q, head * 12 + h, d, acc[n][j * 2] * inv,
-                                 acc[n][j * 2 + 1] * inv);
-            else
+            if (live) {
+                if constexpr (kSparseRotatedValue<Storage>)
+                    *reinterpret_cast<float2*>(s.partial + (warp * 16 + h) * 256 + d) =
+                        make_float2(acc[n][j * 2] * inv, acc[n][j * 2 + 1] * inv);
+                else
+                    sparse_gqa_store(a, q, head * 12 + h, d, acc[n][j * 2] * inv,
+                                     acc[n][j * 2 + 1] * inv);
+            } else
                 *reinterpret_cast<unsigned*>(a.out + (q * 24 + head * 12 + h) * 256 + d) = 0;
         }
     }
+    if constexpr (kSparseRotatedValue<Storage>) {
+        __syncthreads();
+        sparse_gqa_inverse_rows<Queries, Queries>(a, first, last, head, s.partial);
+    }
 }
 
-template <int N, int Queries, bool Vector>
+template <KvCacheStorage Storage, int N, int Queries, bool Vector,
+          SparseGqaLoad Load = SparseGqaLoad::Direct>
 __launch_bounds__(Queries * 32) __global__ void sparse_gqa_all_select_kernel(SparseGqaArguments a) {
     extern __shared__ __align__(16) unsigned char smem[];
-    auto& s          = *reinterpret_cast<SparseGqaStorage<N, Queries>*>(smem);
+    auto& s          = *reinterpret_cast<SparseGqaStorage<Storage, N, Queries, Load>*>(smem);
     const auto first = a.begin + std::int64_t(blockIdx.x / 2) * Queries,
                total = std::int64_t(a.tokens) * a.batch;
     const int head   = blockIdx.x % 2;
-    auto* qs = reinterpret_cast<std::uint16_t*>(smem + (sizeof(SparseGqaStorage<N, Queries>) + 15) /
-                                                           16 * 16);
+    auto* qs         = reinterpret_cast<std::uint16_t*>(
+        smem + (sizeof(SparseGqaStorage<Storage, N, Queries, Load>) + 15) / 16 * 16);
     if (sparse_gqa_all_selected<Queries>(a, first)) {
-        sparse_gqa_all_select<N, Queries, Vector>(a, s, first, head, qs);
+        sparse_gqa_all_select<Storage, N, Queries, Vector, Load>(a, s, first, head, qs);
     } else {
 #pragma unroll 1
         for (int i = 0; i < Queries && first + i < total; ++i) {
-            sparse_gqa_mma<N, Queries, Vector>(a, s, first + i, head, 0);
+            sparse_gqa_compute<Storage, N, Queries, Vector, Load>(a, s, first + i, head, 0);
             __syncthreads();
         }
     }

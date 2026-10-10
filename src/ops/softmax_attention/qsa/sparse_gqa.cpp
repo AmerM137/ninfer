@@ -9,7 +9,11 @@ constexpr detail::qsa::ViewValidation v{"qsa_sparse_gqa"};
 void profile(KvCacheStorage storage, int lo, int hi, int batch,
              QsaSparseGqaExecutionEnvelope envelope, DeviceExecutionView execution) {
     v.require(envelope.max_visible_tokens <= 262144, "visible-token capacity");
-    v.require(storage == KvCacheStorage::BFloat16, "cache storage");
+    v.require(storage == KvCacheStorage::BFloat16 || storage == KvCacheStorage::Fp8E4M3Row256 ||
+                  storage == KvCacheStorage::Int8Group64 ||
+                  storage == KvCacheStorage::Nvfp4Group16 ||
+                  storage == KvCacheStorage::Fp8KeyNvfp4Value,
+              "cache storage");
     v.require(lo > 0 && hi >= lo && batch >= 1 && batch <= 8, "T/B interval");
     v.require(execution.multiprocessor_count > 0, "SM count");
 }
@@ -44,9 +48,17 @@ void qsa_sparse_gqa(const Tensor& query, const Tensor& gate, const PagedKVBatchL
     v.dense(gate, DType::BF16, {256, 24, tokens, rows}, 16, "gate");
     v.dense(out, DType::BF16, {256, 24, tokens, rows}, 16, "output");
     v.require(cache.head_dim == 256 && cache.num_kv_heads == 2, "cache geometry");
-    v.plane(cache.k_pages, DType::BF16, {256, 64, 2, pages}, "K pages");
-    v.plane(cache.v_pages, DType::FP16, {256, 64, 2, pages}, "V pages");
-    v.require(!cache.k_scale_pages.data && !cache.v_scale_pages.data, "absent scales");
+    const auto layout = paged_kv_storage_layout(cache.storage, 256);
+    const auto plane  = [&](const Tensor& data, const Tensor& scales, PagedKVVectorLayout format) {
+        v.plane(data, format.data_dtype, {format.data_leading_extent, 64, 2, pages}, "cache data");
+        if (format.has_scale())
+            v.plane(scales, format.scale_dtype, {format.scale_leading_extent, 64, 2, pages},
+                     "cache scales");
+        else
+            v.require(!scales.data, "absent scales");
+    };
+    plane(cache.k_pages, cache.k_scale_pages, layout.key);
+    plane(cache.v_pages, cache.v_scale_pages, layout.value);
     v.plane(cache.block_tables, DType::I32,
             {cache.block_tables.ne[0], cache.block_tables.ne[1], 1, 1}, "block tables");
     v.dense(batch.positions, DType::I32, {tokens, rows, 1, 1}, 4, "positions");
@@ -58,13 +70,16 @@ void qsa_sparse_gqa(const Tensor& query, const Tensor& gate, const PagedKVBatchL
                            &gate,
                            &cache.k_pages,
                            &cache.v_pages,
+                           &cache.k_scale_pages,
+                           &cache.v_scale_pages,
                            &cache.block_tables,
                            &batch.positions,
                            &batch.valid_columns,
                            &batch.table_rows,
                            &selected.block_ids,
                            &selected.block_counts};
-    for (const auto* input : inputs) v.require(!v.overlap(out, *input), "output/input overlap");
+    for (const auto* input : inputs)
+        if (input->data) v.require(!v.overlap(out, *input), "output/input overlap");
     const auto plan =
         detail::qsa::sparse_gqa_plan(tokens, rows, envelope, execution.multiprocessor_count);
     auto scope         = workspace.scope();
@@ -73,7 +88,7 @@ void qsa_sparse_gqa(const Tensor& query, const Tensor& gate, const PagedKVBatchL
         if (!work->data) continue;
         v.require(!v.overlap(*work, out), "workspace/output overlap");
         for (const auto* input : inputs)
-            v.require(!v.overlap(*work, *input), "workspace/input overlap");
+            if (input->data) v.require(!v.overlap(*work, *input), "workspace/input overlap");
     }
     detail::qsa::launch_sparse_gqa(query, gate, cache, batch, selected, plan, scratch, out,
                                    execution);

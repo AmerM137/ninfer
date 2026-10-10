@@ -7,8 +7,8 @@
 namespace ninfer::ops::detail::qsa {
 
 struct SparseGqaPage {
-    const std::uint16_t* data;
-    std::int64_t row, head, page;
+    const std::uint8_t* data;
+    std::int64_t row, head, page; // Byte strides for both data and scale planes.
 };
 
 struct SparseGqaWork {
@@ -18,7 +18,7 @@ struct SparseGqaWork {
 struct SparseGqaArguments {
     const __nv_bfloat16 *query, *gate;
     __nv_bfloat16* out;
-    SparseGqaPage key, value;
+    SparseGqaPage key, value, key_scale, value_scale;
     const int *positions, *valid, *table_rows, *tables, *ids, *counts;
     std::int64_t table_stride;
     float *numerator, *maximum, *sum;

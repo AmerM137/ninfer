@@ -1,6 +1,6 @@
 # Qwen3.8-Flash-Next：QSA 计算、接口与状态
 
-更新日期：2026-10-10。**分段输入投影、五种主 KV 编码的 Prepare、Indexer、BF16 主 KV 的 Sparse GQA 与 tail extraction 已实现；其余主 KV 编码的 Sparse GQA 待实现。**
+更新日期：2026-10-10。**分段输入投影、五种主 KV 编码的 Prepare 与 Sparse GQA、Indexer、tail extraction 已实现；模型调度接入待实现。**
 
 本文拥有 Qwen4Exp Main/MTP 的 QSA 数学、Op 边界、cache 读写与候选状态。
 共同约定见[支持总览 §1.3](qwen3_8-flash-next-model.md#13-统一执行约定)；权重和行序由
@@ -437,7 +437,7 @@ Prepare 的 Q/index-Q 可各自精确 alias 对应 raw 输入；不允许部分�
 
 ## 8. Op 接口
 
-已实现的输入投影、五种主 KV 编码的 Prepare、Indexer、BF16 Sparse GQA 与 tail extraction
+已实现的输入投影、五种主 KV 编码的 Prepare 与 Sparse GQA、Indexer、tail extraction
 合同位于 `include/ninfer/ops/qsa.h`。
 使用既有 Tensor、PagedKVBatchLayerView、KvCacheStorage、WorkspaceArena 和
 DeviceExecutionView；所有声明位于 `ninfer::ops`。
@@ -664,7 +664,14 @@ void qsa_sparse_gqa(
 
 Kernel 按选中块直接读取原 cache，尾部不通过 expanded ID buffer 传递。不读 count
 之后的 IDs，不依赖 IDs 排序，不读未选择的 cache 值来做 masked dense attention。
-当前支持 BFloat16 profile，即 BF16 K / FP16 V。每个 query 至多消费 512*4+3 行。
+支持 BFloat16（BF16 K / FP16 V）、FP8 E4M3 row256、INT8 group64、NVFP4 group16
+和 K8V4，data/scale planes 沿用 `paged_kv_storage_layout`。每个 query 至多消费 512*4+3 行。
+量化 K 存于 `R=H256/16` 的变换域，Q 在片上以 FP32 做同一变换；MMA 使用 BF16/FP16
+操作数，不引入 A8/A4 激活量化。对齐路径将量化 KV 异步搬入 shared memory 后展开，保持 GQA
+组内共享，不建立全局反量化 cache。SIMT 路径直接使用 FP32 算术。
+softmax、QK/PV 累加及 split 归约为 FP32。NVFP4/K8V4 的 V 在完成归约后做 FP32
+逆变换，再乘 sigmoid gate，最终只写一次 BF16。独立 FP64 oracle 从实际 codes/scales
+解码并执行完整数学公式；存储量化误差与 attention 计算误差分开。
 Host envelope 提供所有有效 query 的 `p+1` 上界，用于选择计算与 workspace 配置；
 零上界只允许全 inert。它不保证块集为全选，也不替代 Device positions/counts/IDs。
 同一捕获上界内支持混合上下文直接 replay；固定 T/B、views、storage 和设备事实时，

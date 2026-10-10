@@ -3,8 +3,10 @@
 #include "ninfer/ops/qsa.h"
 #include "ops/op_tester.h"
 #include "ops/softmax_attention/oracle.h"
+#include "sparse_gqa_cache_fixture.h"
 
 #include <bit>
+#include <memory>
 #include <numeric>
 
 namespace ninfer::test::qsa::sparse {
@@ -46,10 +48,13 @@ struct Plane {
 
 struct Fixture {
     int T, B, history, table_width, table_stride, pages;
+    int live_limit = std::numeric_limits<int>::max();
     std::vector<std::uint16_t> qhost, ghost;
     std::vector<int> positions, valid, selectors, tables, ids, counts;
     std::vector<std::vector<int>> visible;
     Plane keys, values;
+    KvCacheStorage storage;
+    std::unique_ptr<EncodedVector> encoded_key, encoded_value;
     GuardedDeviceBuffer q, gate, out, pos, lengths, rows, table, selections, sizes;
     Tensor query, output_gate, output;
     PagedKVBatchLayerView cache;
@@ -57,15 +62,17 @@ struct Fixture {
     ops::QsaBlockSelection selected;
     ops::QsaSparseGqaExecutionEnvelope envelope;
 
-    Fixture(int tokens, int batch_size, int max_history, bool padded)
+    Fixture(int tokens, int batch_size, int max_history, bool padded,
+            KvCacheStorage format = KvCacheStorage::BFloat16, bool padded_scales = false)
         : T(tokens), B(batch_size), history(max_history), table_width((history + 63) / 64),
           table_stride(table_width + (padded ? 3 : 0)), pages(std::min(table_width, 521) * B + 2),
           qhost(std::size_t(T) * B * 6144), ghost(qhost.size()), positions(T * B), valid(B),
           selectors(B), tables(table_stride * (B + 1)), ids(std::size_t(T) * B * 512),
           counts(T * B), visible(T * B), keys(pages, DType::BF16, padded ? 1 : 0),
-          values(pages, DType::FP16, padded ? 3 : 0), q(qhost.size() * 2), gate(ghost.size() * 2),
-          out(qhost.size() * 2), pos(positions.size() * 4), lengths(B * 4), rows(B * 4),
-          table(tables.size() * 4), selections(ids.size() * 4), sizes(counts.size() * 4) {
+          values(pages, DType::FP16, padded ? 3 : 0), storage(format), q(qhost.size() * 2),
+          gate(ghost.size() * 2), out(qhost.size() * 2), pos(positions.size() * 4), lengths(B * 4),
+          rows(B * 4), table(tables.size() * 4), selections(ids.size() * 4),
+          sizes(counts.size() * 4) {
         envelope.max_visible_tokens = history;
         query                       = Tensor(q.data(), DType::BF16, {256, 24, T, B});
         output_gate                 = Tensor(gate.data(), DType::BF16, {256, 24, T, B});
@@ -73,6 +80,18 @@ struct Fixture {
         Tensor bt(table.data(), DType::I32, {table_width, B + 1});
         bt.nb[1] = table_stride * 4;
         cache    = {keys.view, values.view, {}, {}, bt, 256, 2, KvCacheStorage::BFloat16};
+        if (storage != KvCacheStorage::BFloat16) {
+            const auto formats = prepare::cache_encoding(storage);
+            encoded_key =
+                std::make_unique<EncodedVector>(formats.key, pages, padded, padded_scales);
+            encoded_value =
+                std::make_unique<EncodedVector>(formats.value, pages, padded, padded_scales);
+            cache.k_pages       = encoded_key->data.view;
+            cache.v_pages       = encoded_value->data.view;
+            cache.k_scale_pages = encoded_key->scales.view;
+            cache.v_scale_pages = encoded_value->scales.view;
+            cache.storage       = storage;
+        }
         batch    = {Tensor(pos.data(), DType::I32, {T, B}), Tensor(lengths.data(), DType::I32, {B}),
                     Tensor(rows.data(), DType::I32, {B})};
         selected = {Tensor(selections.data(), DType::I32, {512, T, B}),
@@ -105,6 +124,7 @@ struct Fixture {
                     break;
                 }
             }
+            live = std::min(live, live_limit);
             if (phase == 2) live = 0;
             valid[b]     = live;
             selectors[b] = live ? (b + phase) % B + 1 : -1;
@@ -159,7 +179,13 @@ struct Fixture {
         table.copy_from_host(tables.data(), tables.size() * 4);
         selections.copy_from_host(ids.data(), ids.size() * 4);
         sizes.copy_from_host(counts.data(), counts.size() * 4);
+        if (encoded_key) {
+            encoded_key->encode(keys);
+            encoded_value->encode(values);
+        }
         out.fill(0xa5);
+        // Fixture transfers/memset use the default stream; the Op's stream is nonblocking.
+        CUDA_CHECK(cudaStreamSynchronize(nullptr));
     }
 
     void launch(WorkspaceArena& arena, DeviceExecutionView execution) {
@@ -172,26 +198,44 @@ struct Fixture {
         const auto kv = [&](const Plane& plane, int d, int h, int ordinal, int m) {
             const int token    = visible[m][ordinal];
             const int physical = tables[selectors[m / T] * table_stride + token / 64];
-            const auto word    = plane.host[plane.offset(d, h, token % 64, physical)];
+            if (encoded_key)
+                return (&plane == &keys ? encoded_key : encoded_value)
+                    ->decode(d, h, token % 64, physical);
+            const auto word = plane.host[plane.offset(d, h, token % 64, physical)];
             return plane.view.dtype == DType::BF16 ? double(bf16_to_f32(word))
                                                    : double(unhalf(word));
         };
         const auto run = [&](int first, int last) {
             for (int m = first; m < last; ++m) {
                 if (visible[m].empty()) continue;
+                std::array<double, 6144> transformed_query;
+                for (int h = 0; h < 24; ++h) {
+                    std::array<double, 256> row;
+                    for (int d = 0; d < 256; ++d)
+                        row[d] = bf16_to_f32(qhost[(std::size_t(m) * 24 + h) * 256 + d]);
+                    if (encoded_key) prepare::hadamard(row);
+                    std::copy(row.begin(), row.end(), transformed_query.begin() + h * 256);
+                }
                 naive_dense_softmax_attention(
                     {256, 24, 2}, 1, int(visible[m].size()), 1.0 / 16,
-                    [&](int d, int h, int) {
-                        return double(bf16_to_f32(qhost[(std::size_t(m) * 24 + h) * 256 + d]));
-                    },
+                    [&](int d, int h, int) { return transformed_query[h * 256 + d]; },
                     [&](int d, int h, int j) { return kv(keys, d, h, j, m); },
                     [&](int d, int h, int j) { return kv(values, d, h, j, m); },
                     [](int, int) { return true; },
                     [&](int d, int h, int, double x) {
                         const auto i = (std::size_t(m) * 24 + h) * 256 + d;
-                        result[i]    = x / (1.0 + std::exp(-double(bf16_to_f32(ghost[i]))));
+                        result[i]    = x;
                     },
                     T * B == 1 ? 16 : 1);
+                for (int h = 0; h < 24; ++h) {
+                    const auto base = (std::size_t(m) * 24 + h) * 256;
+                    std::array<double, 256> row;
+                    std::copy_n(result.begin() + base, 256, row.begin());
+                    if (encoded_value && encoded_value->format.rotate) prepare::hadamard(row);
+                    for (int d = 0; d < 256; ++d)
+                        result[base + d] =
+                            row[d] / (1.0 + std::exp(-double(bf16_to_f32(ghost[base + d]))));
+                }
             }
         };
         const int workers = std::min(16, T * B);

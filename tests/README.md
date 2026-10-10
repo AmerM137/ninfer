@@ -56,10 +56,12 @@ BF16 operands use a fixed FP32 error bound at the selection boundary. Cases cove
 strided keys/tables, mixed row lengths, per-query causality, all-select/inert queries, concentrated
 winners, workspace reuse, and changing metadata in one Graph. Partial initialization checks the
 read footprint under Compute Sanitizer initcheck.
-`ninfer_qsa_sparse_gqa_test` evaluates represented BF16 K / FP16 V against FP64 selected-set
-attention and sigmoid gate. It covers arbitrary unordered subsets, incomplete tails, strided planes,
-inert/empty outputs, input preservation, Graph replay and update across context envelopes, and a
-case that distinguishes premature BF16 rounding before the gate. Partial initialization checks
+`ninfer_qsa_sparse_gqa_test` checks all five cache profiles against independently decoded
+FP64 selected-set attention, basis transforms and sigmoid gate, under one A16 error criterion.
+`--kv-cache bf16|fp8|int8|nvfp4|k8v4` selects one profile; the default checks all five.
+It covers arbitrary unordered subsets, incomplete tails, strided data/scale planes,
+inert/empty outputs, input preservation, Graph replay and update across context envelopes, and
+cases that distinguish premature BF16 rounding before the gate. Partial initialization checks
 that only live metadata and selected cache rows are read.
 
 `ops/ple/` qualifies ConvAdd/ConvAddNorm against FP64 formulas and the actual BF16 residual

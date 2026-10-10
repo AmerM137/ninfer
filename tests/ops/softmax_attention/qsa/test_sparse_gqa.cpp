@@ -6,14 +6,15 @@ using namespace ninfer::test;
 using namespace ninfer::test::qsa::sparse;
 
 namespace {
+namespace cache_reference = ninfer::test::qsa::prepare;
 // Same A16 attention budget across all shapes and routes, including the fused gate and final
 // BF16 store. Inputs cover near-uniform, unit-RMS and sharper QK distributions.
-constexpr ReductionCriterion kSparseBf16Criterion{2.8e-3, 1.0e-3, 2.7e-3};
+constexpr ReductionCriterion kSparseA16Criterion{2.8e-3, 1.0e-3, 2.7e-3};
 
 int verify(Fixture& f, const std::string& label, bool preserved = true) {
     const auto reference = f.reference();
     const auto got       = from_device_bf16(f.out.data(), f.qhost.size());
-    int failures         = verify_reduction(label, got, reference, kSparseBf16Criterion);
+    int failures         = verify_reduction(label, got, reference, kSparseA16Criterion);
     const auto words     = from_device<std::uint16_t>(f.out.data(), f.qhost.size());
     for (int m = 0; m < f.T * f.B; ++m)
         if (f.visible[m].empty())
@@ -45,6 +46,10 @@ int verify(Fixture& f, const std::string& label, bool preserved = true) {
                                  from_device<int>(f.rows.data(), f.selectors.size()), f.selectors);
         failures += verify_exact("tables preserved",
                                  from_device<int>(f.table.data(), f.tables.size()), f.tables);
+        if (f.encoded_key)
+            for (const auto* plane : {&f.encoded_key->data, &f.encoded_key->scales,
+                                      &f.encoded_value->data, &f.encoded_value->scales})
+                failures += plane->preserved(label);
     }
     for (const auto* buffer :
          {&f.out, &f.q, &f.gate, &f.keys.device, &f.values.device, &f.selections, &f.sizes})
@@ -53,10 +58,12 @@ int verify(Fixture& f, const std::string& label, bool preserved = true) {
 }
 
 int run(DeviceContext& device, int t, int b, int history, bool padded = false, int cap = 512,
-        float magnitude = 1, bool graph = false) {
-    Fixture f(t, b, history, padded);
-    const auto bytes = ops::qsa_sparse_gqa_workspace_capacity_bytes(
-        KvCacheStorage::BFloat16, t, t, b, f.envelope, device.execution_view());
+        float magnitude = 1, bool graph = false, KvCacheStorage storage = KvCacheStorage::BFloat16,
+        int live_limit = std::numeric_limits<int>::max()) {
+    Fixture f(t, b, history, padded, storage);
+    f.live_limit     = live_limit;
+    const auto bytes = ops::qsa_sparse_gqa_workspace_capacity_bytes(storage, t, t, b, f.envelope,
+                                                                    device.execution_view());
     GuardedDeviceBuffer scratch(std::max<std::size_t>(bytes, 256));
     WorkspaceArena arena(DeviceSpan{scratch.data(), std::max<std::size_t>(bytes, 256)});
     DecodeGraphExecutable executable;
@@ -73,7 +80,8 @@ int run(DeviceContext& device, int t, int b, int history, bool padded = false, i
         else
             f.launch(arena, device.execution_view());
         device.synchronize();
-        const auto label = "sparse T=" + std::to_string(t) + " B=" + std::to_string(b) +
+        const auto label = "sparse storage=" + std::to_string(int(storage)) +
+                           " T=" + std::to_string(t) + " B=" + std::to_string(b) +
                            " L=" + std::to_string(history) + " cap=" + std::to_string(cap) +
                            " phase=" + std::to_string(phase);
         failures += verify(f, label);
@@ -84,8 +92,10 @@ int run(DeviceContext& device, int t, int b, int history, bool padded = false, i
     return failures;
 }
 
-int gate_rounding(DeviceContext& device) {
-    Fixture f(1, 1, 1, false);
+int gate_rounding(DeviceContext& device, KvCacheStorage storage = KvCacheStorage::BFloat16,
+                  int tokens = 1, std::uint32_t bound = 1) {
+    Fixture f(tokens, 1, 1, false, storage);
+    f.envelope.max_visible_tokens = bound;
     f.reset();
     std::fill(f.ghost.begin(), f.ghost.end(), f32_to_bf16(1.0f));
     const int page = f.tables[f.selectors[0] * f.table_stride];
@@ -93,23 +103,76 @@ int gate_rounding(DeviceContext& device) {
         for (int d = 0; d < 256; ++d)
             f.values.host[f.values.offset(d, h, 0, page)] = half(1.00390625f);
     f.upload();
-    WorkspaceArena workspace(ops::qsa_sparse_gqa_workspace_capacity_bytes(
-        KvCacheStorage::BFloat16, 1, 1, 1, f.envelope, device.execution_view()));
+    if (f.encoded_value) {
+        auto& v = *f.encoded_value;
+        for (int h = 0; h < 2; ++h) {
+            const auto db = v.data.offset(0, h, page), sb = v.scales.offset(0, h, page);
+            std::fill_n(v.data.host.begin() + db, v.format.data_extent, 0);
+            std::fill_n(v.scales.host.begin() + sb,
+                        v.format.scale_extent * dtype_size(v.format.scale_dtype), 0);
+            if (v.format.encoding == cache_reference::Encoding::Nvfp4) {
+                // R^T of basis values 16 at d=0 and 1/16 at d=16 is 1 +/- 1/256.
+                // The positive half lies exactly on a BF16 midpoint before the gate.
+                v.data.host[db]       = 6;
+                v.data.host[db + 8]   = 6;
+                v.scales.host[sb]     = cache_reference::encode_minifloat(4.0f, false);
+                v.scales.host[sb + 1] = cache_reference::encode_minifloat(0.0625f / 4, false);
+            } else {
+                const auto one = v.format.encoding == cache_reference::Encoding::Int8
+                                     ? 1
+                                     : cache_reference::encode_minifloat(1.0f, false);
+                std::fill_n(v.data.host.begin() + db, 256, one);
+                for (int g = 0; g < v.format.scale_extent; ++g)
+                    cache_reference::write_u16(v.scales.host, sb + 2 * g, half(1.00390625f));
+            }
+        }
+        v.data.upload();
+        v.scales.upload();
+        CUDA_CHECK(cudaStreamSynchronize(nullptr));
+    }
+    WorkspaceArena workspace(std::max<std::size_t>(
+        256, ops::qsa_sparse_gqa_workspace_capacity_bytes(storage, tokens, tokens, 1, f.envelope,
+                                                          device.execution_view())));
     f.launch(workspace, device.execution_view());
     device.synchronize();
-    return verify(f, "gate without intermediate BF16");
+    return verify(f, "gate without intermediate BF16 storage=" + std::to_string(int(storage)) +
+                         " T=" + std::to_string(tokens) + " bound=" + std::to_string(bound));
 }
 
-int read_footprint(DeviceContext& device) {
-    Fixture f(3, 4, 2053, true);
+int read_footprint(DeviceContext& device, KvCacheStorage storage = KvCacheStorage::BFloat16,
+                   bool padded = true) {
+    Fixture f(3, 4, 2053, padded, storage);
     f.reset(0, 1);
-    DeviceBuffer q(f.q.bytes()), gate(f.gate.bytes()), key(f.keys.device.bytes()),
-        value(f.values.device.bytes()), pos(f.pos.bytes()), ids(f.selections.bytes()),
-        counts(f.sizes.bytes()), table(f.table.bytes());
+    DeviceBuffer q(f.q.bytes()), gate(f.gate.bytes()), pos(f.pos.bytes()),
+        ids(f.selections.bytes()), counts(f.sizes.bytes()), table(f.table.bytes());
+    DeviceBuffer payloads[4];
+    const std::uint8_t* host[4]{};
+    std::size_t bytes[4]{}, leading[4]{};
+    Tensor* targets[]{&f.cache.k_pages, &f.cache.v_pages, &f.cache.k_scale_pages,
+                      &f.cache.v_scale_pages};
+    if (f.encoded_key) {
+        const EncodedPlane* planes[]{&f.encoded_key->data, &f.encoded_value->data,
+                                     &f.encoded_key->scales, &f.encoded_value->scales};
+        for (int i = 0; i < 4; ++i) {
+            host[i]    = planes[i]->host.data();
+            bytes[i]   = planes[i]->host.size();
+            leading[i] = planes[i]->leading;
+        }
+    } else {
+        host[0]    = reinterpret_cast<const std::uint8_t*>(f.keys.host.data());
+        host[1]    = reinterpret_cast<const std::uint8_t*>(f.values.host.data());
+        bytes[0]   = f.keys.device.bytes();
+        bytes[1]   = f.values.device.bytes();
+        leading[0] = f.keys.leading * 2;
+        leading[1] = f.values.leading * 2;
+    }
+    for (int i = 0; i < 4; ++i) {
+        if (!bytes[i]) continue;
+        payloads[i]      = DeviceBuffer(bytes[i]);
+        targets[i]->data = static_cast<std::uint8_t*>(payloads[i].p) + leading[i];
+    }
     f.query.data                 = q.p;
     f.output_gate.data           = gate.p;
-    f.cache.k_pages.data         = static_cast<std::uint16_t*>(key.p) + f.keys.leading;
-    f.cache.v_pages.data         = static_cast<std::uint16_t*>(value.p) + f.values.leading;
     f.cache.block_tables.data    = table.p;
     f.batch.positions.data       = pos.p;
     f.selected.block_ids.data    = ids.p;
@@ -133,25 +196,32 @@ int read_footprint(DeviceContext& device) {
                 const int idx      = f.selectors[b] * f.table_stride + token / 64,
                           physical = f.tables[idx];
                 copy(static_cast<int*>(table.p) + idx, f.tables.data() + idx, 4);
-                for (int h = 0; h < 2; ++h) {
-                    const auto ko = f.keys.offset(0, h, token % 64, physical),
-                               vo = f.values.offset(0, h, token % 64, physical);
-                    copy(static_cast<std::uint16_t*>(key.p) + ko, f.keys.host.data() + ko, 512);
-                    copy(static_cast<std::uint16_t*>(value.p) + vo, f.values.host.data() + vo, 512);
-                }
+                for (int h = 0; h < 2; ++h)
+                    for (int i = 0; i < 4; ++i) {
+                        if (!bytes[i]) continue;
+                        const auto& plane = *targets[i];
+                        const auto off    = leading[i] + physical * plane.nb[3] + h * plane.nb[2] +
+                                         token % 64 * plane.nb[1];
+                        copy(static_cast<std::uint8_t*>(payloads[i].p) + off, host[i] + off,
+                             plane.ne[0] * dtype_size(plane.dtype));
+                    }
             }
         }
     WorkspaceArena workspace(ops::qsa_sparse_gqa_workspace_capacity_bytes(
-        KvCacheStorage::BFloat16, 3, 3, 4, f.envelope, device.execution_view()));
+        storage, 3, 3, 4, f.envelope, device.execution_view()));
     f.launch(workspace, device.execution_view());
     device.synchronize();
-    return verify(f, "selected reads only", false);
+    return verify(f,
+                  "selected reads only storage=" + std::to_string(int(storage)) +
+                      " padded=" + std::to_string(padded),
+                  false);
 }
 
-int graph_update(DeviceContext& device, int tokens, int batch) {
-    Fixture f(tokens, batch, 8192, true);
+int graph_update(DeviceContext& device, int tokens, int batch,
+                 KvCacheStorage storage = KvCacheStorage::BFloat16) {
+    Fixture f(tokens, batch, 8192, true, storage);
     const auto bytes = ops::qsa_sparse_gqa_workspace_capacity_bytes(
-        KvCacheStorage::BFloat16, tokens, tokens, batch, {262144}, device.execution_view());
+        storage, tokens, tokens, batch, {262144}, device.execution_view());
     WorkspaceArena workspace(std::max<std::size_t>(bytes, 256));
     DecodeGraphExecutable graph;
     int failures = 0;
@@ -167,8 +237,9 @@ int graph_update(DeviceContext& device, int tokens, int batch) {
             graph.instantiate(definition);
         graph.launch(device.stream);
         device.synchronize();
-        failures += verify(f, "graph update T=" + std::to_string(tokens) +
-                                  " B=" + std::to_string(batch) + " L=" + std::to_string(history));
+        failures += verify(f, "graph update storage=" + std::to_string(int(storage)) +
+                                  " T=" + std::to_string(tokens) + " B=" + std::to_string(batch) +
+                                  " L=" + std::to_string(history));
         if (failures) return failures;
     }
     return failures;
@@ -195,7 +266,7 @@ int validation(DeviceContext& device) {
     padded.output.data     = reinterpret_cast<void*>((logical_end + 15) / 16 * 16);
     const int padded_alias = rejects([&] { padded.launch(workspace, device.execution_view()); });
     int failures           = rejects([&] {
-        (void)ops::qsa_sparse_gqa_workspace_capacity_bytes(KvCacheStorage::Nvfp4Group16, 1, 1, 1,
+        (void)ops::qsa_sparse_gqa_workspace_capacity_bytes(static_cast<KvCacheStorage>(-1), 1, 1, 1,
                                                                      f.envelope, device.execution_view());
     });
     failures += padded_alias;
@@ -223,33 +294,120 @@ int validation(DeviceContext& device) {
                                KvCacheStorage::BFloat16, 1, 512, 1, f.envelope, execution);
     return failures;
 }
+
+int run_bf16(DeviceContext& device) {
+    int failures = 0;
+    failures += gate_rounding(device);
+    failures += graph_update(device, 8, 3);
+    failures += graph_update(device, 33, 8);
+    failures += read_footprint(device);
+    for (int l : {1, 3, 4, 5, 63, 64, 65, 2047, 2048, 2049, 2051, 2052, 2053, 262144})
+        failures += run(device, 1, 1, l);
+    for (int cap : {0, 1, 7, 8, 9, 15, 16, 17, 511})
+        failures += run(device, 3, 1, 32772, true, cap);
+    for (int t : {2, 4, 8, 9, 16, 17, 32, 63, 64, 65, 128, 169, 170, 171})
+        failures += run(device, t, 1, 8195, t % 2, 17);
+    for (int b = 2; b <= 8; ++b) failures += run(device, 9, b, 32771, b % 2, 512, 1, true);
+    for (int t : {255, 256, 257})
+        for (int history : {1024, 8192}) failures += run(device, t, 1, history, false, 512);
+    failures += run(device, 257, 1, 2051, true, 17);
+    failures += run(device, 1024, 1, 2048, false, 512);
+    failures += run(device, 1024, 1, 8192, false, 3);
+    failures += run(device, 2048, 1, 8192, false, 1);
+    failures += run(device, 4096, 1, 8192, false, 0);
+    for (float magnitude : {0.1f, 1.8f})
+        failures += run(device, 8, 1, 32772, false, 512, magnitude);
+    return failures;
+}
+
+int scale_layout(DeviceContext& device, KvCacheStorage storage, int tokens, int history) {
+    // Scale planes have their own strides/alignment, independently of vector-aligned data.
+    Fixture f(tokens, 1, history, false, storage, true);
+    f.live_limit = 4;
+    f.reset();
+    WorkspaceArena arena(std::max<std::size_t>(
+        256, ops::qsa_sparse_gqa_workspace_capacity_bytes(storage, tokens, tokens, 1, f.envelope,
+                                                          device.execution_view())));
+    f.launch(arena, device.execution_view());
+    device.synchronize();
+    return verify(f, "independent scale layout storage=" + std::to_string(int(storage)) +
+                         " T=" + std::to_string(tokens));
+}
+
+int quantized_validation(DeviceContext& device, KvCacheStorage storage) {
+    Fixture invalid(1, 1, 4, false, storage);
+    WorkspaceArena workspace(4 * 1024 * 1024);
+    const auto key_scales       = invalid.cache.k_scale_pages;
+    invalid.cache.k_scale_pages = {};
+    int failures = rejects([&] { invalid.launch(workspace, device.execution_view()); });
+    invalid.cache.k_scale_pages       = key_scales;
+    invalid.cache.k_scale_pages.dtype = DType::BF16;
+    failures += rejects([&] { invalid.launch(workspace, device.execution_view()); });
+    invalid.cache.k_scale_pages       = key_scales;
+    invalid.cache.k_scale_pages.nb[1] = 0;
+    failures += rejects([&] { invalid.launch(workspace, device.execution_view()); });
+    invalid.cache.k_scale_pages = key_scales;
+    invalid.output.data         = invalid.cache.v_scale_pages.data;
+    failures += rejects([&] { invalid.launch(workspace, device.execution_view()); });
+    return failures;
+}
+
+int run_quantized(DeviceContext& device, KvCacheStorage storage) {
+    int failures = quantized_validation(device, storage);
+    failures += read_footprint(device, storage, false) + read_footprint(device, storage, true);
+    failures += scale_layout(device, storage, 1, 2051);
+    failures += scale_layout(device, storage, 192, 8195);
+    failures += scale_layout(device, storage, 256, 65);
+    failures += gate_rounding(device, storage);
+    failures += gate_rounding(device, storage, 256, 1);
+    failures += gate_rounding(device, storage, 256, 8192);
+    failures += graph_update(device, 8, 3, storage);
+    failures += graph_update(device, 33, 8, storage);
+    for (int l : {1, 3, 4, 64, 65, 2048, 2051, 2052, 262144})
+        failures += run(device, 1, 1, l, false, 512, 1, false, storage);
+    for (int t : {63, 64, 65, 169, 170, 171, 255, 256, 257, 339, 340, 341})
+        failures += run(device, t, 1, 8192, false, 17, 1, false, storage);
+    failures += run(device, 257, 1, 2051, true, 17, 1, false, storage);
+    failures += run(device, 9, 8, 32771, true, 512, 1, true, storage);
+    failures += run(device, 1024, 1, 2048, false, 512, 1, false, storage);
+    failures += run(device, 192, 1, 8192, false, 512, 1, false, storage);
+    failures += run(device, 1024, 1, 8192, false, 512, 1, false, storage, 8);
+    for (float magnitude : {0.1f, 1.8f})
+        failures += run(device, 8, 1, 32772, false, 512, magnitude, false, storage);
+    failures += run(device, 3, 2, 2052, true, 0, 1, true, storage);
+    return failures;
+}
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     if (cuda_unavailable()) return 77;
     try {
+        std::vector<KvCacheStorage> formats{
+            KvCacheStorage::BFloat16, KvCacheStorage::Fp8E4M3Row256, KvCacheStorage::Int8Group64,
+            KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value};
+        if (argc != 1) {
+            if (argc != 3 || std::string_view(argv[1]) != "--kv-cache")
+                throw std::invalid_argument(
+                    "usage: ninfer_qsa_sparse_gqa_test [--kv-cache bf16|fp8|int8|nvfp4|k8v4]");
+            const std::string_view name = argv[2];
+            if (name == "bf16")
+                formats = {KvCacheStorage::BFloat16};
+            else if (name == "fp8")
+                formats = {KvCacheStorage::Fp8E4M3Row256};
+            else if (name == "int8")
+                formats = {KvCacheStorage::Int8Group64};
+            else if (name == "nvfp4")
+                formats = {KvCacheStorage::Nvfp4Group16};
+            else if (name == "k8v4")
+                formats = {KvCacheStorage::Fp8KeyNvfp4Value};
+            else
+                throw std::invalid_argument("unsupported test cache format");
+        }
         DeviceContext device;
         int failures = validation(device);
-        failures += gate_rounding(device);
-        failures += graph_update(device, 8, 3);
-        failures += graph_update(device, 33, 8);
-        failures += read_footprint(device);
-        for (int l : {1, 3, 4, 5, 63, 64, 65, 2047, 2048, 2049, 2051, 2052, 2053, 262144})
-            failures += run(device, 1, 1, l);
-        for (int cap : {0, 1, 7, 8, 9, 15, 16, 17, 511})
-            failures += run(device, 3, 1, 32772, true, cap);
-        for (int t : {2, 4, 8, 9, 16, 17, 32, 63, 64, 65, 128, 169, 170, 171})
-            failures += run(device, t, 1, 8195, t % 2, 17);
-        for (int b = 2; b <= 8; ++b) failures += run(device, 9, b, 32771, b % 2, 512, 1, true);
-        for (int t : {255, 256, 257})
-            for (int history : {1024, 8192}) failures += run(device, t, 1, history, false, 512);
-        failures += run(device, 257, 1, 2051, true, 17);
-        failures += run(device, 1024, 1, 2048, false, 512);
-        failures += run(device, 1024, 1, 8192, false, 3);
-        failures += run(device, 2048, 1, 8192, false, 1);
-        failures += run(device, 4096, 1, 8192, false, 0);
-        for (float magnitude : {0.1f, 1.8f})
-            failures += run(device, 8, 1, 32772, false, 512, magnitude);
+        for (auto format : formats)
+            failures += format == KvCacheStorage::BFloat16 ? run_bf16(device)
+                                                           : run_quantized(device, format);
         std::cout << "QSA Sparse GQA: " << (failures ? "FAIL" : "PASS") << '\n';
         return failures ? 1 : 0;
     } catch (const std::exception& e) {

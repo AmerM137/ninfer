@@ -966,8 +966,11 @@ and Graph kernel count. The index plane is always BF16, independent of main KV e
   --rounds 3 --execution graph --cache both --csv-out out/bench/qsa_indexer_mixed.csv
 ```
 
-`--op sparse-gqa` measures the complete public BF16-cache attention and sigmoid gate, including
-any split reduction. `--contexts` and `--valid` have the same meaning as Indexer. Its
+`--op sparse-gqa` measures the complete public attention and sigmoid gate, including any split
+reduction and inverse value-basis transform. `--kv-cache bf16|int8|fp8|nvfp4|k8v4` selects cache
+storage; activations remain BF16/FP16. All profiles start from the same represented BF16 K/V
+source values, initialized through public `kv_cache_append` outside timing. `--contexts` and
+`--valid` have the same meaning as Indexer. Its
 `--context-capacity` defaults to the batch's maximum actual context; an explicit wider value
 measures that capture envelope. `--selection random|shared|contiguous` selects dispersed independent
 sets, a shared shuffled block ranking filtered by each query's causal boundary, or recent adjacent
@@ -975,12 +978,13 @@ blocks. `--selected-blocks` defaults to 512 and permits 0..512; incomplete tails
 Physical pages are shuffled, and `--layout` exercises the same three plane layouts.
 
 CSV records the envelope, workspace, node count, separate useful QK/PV FLOPs, summed per-query
-selected K/V bytes, union K/V bytes across queries, and allocated physical cache bytes. Payload
-rates are not measured DRAM bandwidth; use actual DRAM/L2 traffic to interpret the roofline.
+selected K/V bytes including scales, union K/V bytes across queries, and allocated physical cache
+bytes. Payload rates are not measured DRAM bandwidth; use actual DRAM/L2 traffic to interpret the
+roofline.
 
 ```bash
 ./build/bench/ninfer_qsa_bench --op sparse-gqa --tokens 1,8,128,1024,2048,4096 \
-  --contexts 262144 --execution graph --cache both \
+  --contexts 262144 --kv-cache nvfp4 --execution graph --cache both \
   --csv-out out/bench/qsa_sparse.csv
 ./build/bench/ninfer_qsa_bench --op sparse-gqa --tokens 9 --batch 8 \
   --contexts 64,2048,8192,32768,131072,262144,0,65536 --valid 9,9,9,5,9,9,0,9 \
