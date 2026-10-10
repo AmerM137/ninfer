@@ -5,7 +5,7 @@
 #include "ops/common/memory.cuh"
 #include "ops/common/warp.cuh"
 #include "core/device.h" // CUDA_CHECK
-#include "ops/linear/q4/q4_sliced_k_launch.cuh"
+#include "ops/linear/kernels/q4/q4_sliced_k_launch.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>

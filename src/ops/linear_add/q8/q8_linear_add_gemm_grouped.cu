@@ -2,7 +2,7 @@
 
 #include "core/device.h"
 #include "ops/common/math.h"
-#include "ops/linear/q8/q8_grouped_sliced_k_launch.cuh"
+#include "ops/linear/kernels/q8/q8_grouped_sliced_k_launch.cuh"
 
 namespace ninfer::ops::detail {
 namespace {

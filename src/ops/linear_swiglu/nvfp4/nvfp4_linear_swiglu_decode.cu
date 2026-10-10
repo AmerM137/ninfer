@@ -1,6 +1,6 @@
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.h"
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_epilogue.cuh"
-#include "ops/linear/nvfp4/nvfp4_template_launch.cuh"
+#include "ops/linear/kernels/nvfp4/nvfp4_template_launch.cuh"
 
 namespace ninfer::ops::detail {
 void nvfp4_linear_swiglu_decode_launch(const Tensor& x, const Weight& w, Tensor& y,

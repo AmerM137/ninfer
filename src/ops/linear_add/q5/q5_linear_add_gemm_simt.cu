@@ -2,7 +2,7 @@
 #include "ops/linear_add/q5/q5_linear_add_kernels.h"
 
 #include "core/device.h"
-#include "ops/linear/q5/q5_simt_launch.cuh"
+#include "ops/linear/kernels/q5/q5_simt_launch.cuh"
 
 #include <cuda_bf16.h>
 

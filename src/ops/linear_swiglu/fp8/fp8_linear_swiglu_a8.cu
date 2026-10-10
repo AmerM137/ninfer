@@ -1,6 +1,6 @@
 #include "ops/linear_swiglu/fp8/fp8_linear_swiglu_plan.h"
-#include "ops/linear/fp8/fp8_template_launch.cuh"
-#include "ops/linear/fp8/fp8_instances.cuh"
+#include "ops/linear/kernels/fp8/fp8_template_launch.cuh"
+#include "ops/linear/kernels/fp8/fp8_instances.cuh"
 #include "ops/linear_swiglu/token_major_mma_epilogue.cuh"
 
 namespace ninfer::ops::detail {

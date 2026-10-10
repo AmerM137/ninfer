@@ -77,7 +77,7 @@ T=1 的逻辑带宽为 **1069.4 GB/s，标称带宽利用率 59.68%**；采用 b
 
 ## 曲线解读与验证
 
-[shape 实现](../../../src/ops/linear/q4/shapes/n6144_k5120.cu) 在 GEMV、CTA 内 sliced-K 和普通 MMA
+[shape 实现](../../../src/ops/linear/projection/q4/shapes/n6144_k5120.cu) 在 GEMV、CTA 内 sliced-K 和普通 MMA
 之间选择；具体配置以源码为准。
 
 - T=1→2 从 15.648 升至 21.792 µs（+39.26%），是热区最大的相邻涨幅，

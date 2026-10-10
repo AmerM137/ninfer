@@ -4,7 +4,7 @@
 // every represented value is exactly E2M1(code) * E4M3(scale) for its contiguous G16 group.
 
 #include "ops/kernel/paged_kv_address.cuh"
-#include "ops/linear/nvfp4/nvfp4_codec.cuh"
+#include "ops/linear/kernels/nvfp4/nvfp4_codec.cuh"
 
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>

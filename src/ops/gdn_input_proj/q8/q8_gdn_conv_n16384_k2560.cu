@@ -1,8 +1,8 @@
 #include "ops/gdn_input_proj/q8/kernels.h"
 
 #include "ops/gdn_input_proj/conv_output.cuh"
-#include "ops/linear/q8/q8_gemv_launch.cuh"
-#include "ops/linear/q8/q8_sliced_k_launch.cuh"
+#include "ops/linear/kernels/q8/q8_gemv_launch.cuh"
+#include "ops/linear/kernels/q8/q8_sliced_k_launch.cuh"
 
 #include <array>
 #include <stdexcept>

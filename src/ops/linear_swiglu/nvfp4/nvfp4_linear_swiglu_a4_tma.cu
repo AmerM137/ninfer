@@ -1,5 +1,5 @@
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_a4_tma_launch.h"
-#include "ops/linear/nvfp4/nvfp4_a4_tma.cuh"
+#include "ops/linear/kernels/nvfp4/nvfp4_a4_tma.cuh"
 #include "ops/linear_swiglu/token_major_mma_epilogue.cuh"
 
 namespace ninfer::ops::detail {

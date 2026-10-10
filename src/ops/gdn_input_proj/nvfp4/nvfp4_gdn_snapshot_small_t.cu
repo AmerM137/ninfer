@@ -3,8 +3,8 @@
 #include "ops/gdn_input_proj/nvfp4/kernels.h"
 
 #include "core/device.h"
-#include "ops/linear/nvfp4/nvfp4_schedule.cuh"
-#include "ops/linear/nvfp4/nvfp4_template_launch.cuh"
+#include "ops/linear/kernels/nvfp4/nvfp4_schedule.cuh"
+#include "ops/linear/kernels/nvfp4/nvfp4_template_launch.cuh"
 
 #include <array>
 #include <cstddef>

@@ -5,7 +5,7 @@
 #include "ops/linear_pair/q8/q8_pair_kernels.h"
 #include "core/device.h"
 #include "core/tensor.h"
-#include "ops/linear/q8/q8_simt_launch.cuh"
+#include "ops/linear/kernels/q8/q8_simt_launch.cuh"
 
 #include <cstdint>
 

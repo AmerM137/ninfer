@@ -1,10 +1,10 @@
-#include "ops/linear/q8/q8_gemv_launch.cuh"
+#include "ops/linear/kernels/q8/q8_gemv_launch.cuh"
 #include "core/weight.h"
 #include "ops/linear_add/q8/q8_linear_add_kernels.h"
 
 #include "core/device.h"
 #include "ops/common/math.h"
-#include "ops/linear/q8/q8_simt_launch.cuh"
+#include "ops/linear/kernels/q8/q8_simt_launch.cuh"
 
 #include <cstdint>
 #include <stdexcept>

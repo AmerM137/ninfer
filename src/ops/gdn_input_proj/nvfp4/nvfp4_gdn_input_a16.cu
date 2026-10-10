@@ -1,6 +1,6 @@
 #include "ops/gdn_input_proj/nvfp4/kernels.h"
-#include "ops/linear/nvfp4/nvfp4_template_launch.cuh"
-#include "ops/linear/nvfp4/nvfp4_instances.cuh"
+#include "ops/linear/kernels/nvfp4/nvfp4_template_launch.cuh"
+#include "ops/linear/kernels/nvfp4/nvfp4_instances.cuh"
 #include "ops/linear/common/output.cuh"
 
 namespace ninfer::ops::detail {

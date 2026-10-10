@@ -1,12 +1,12 @@
-#include "ops/linear/q8/q8_geometry.h"
-#include "ops/linear/q8/q8_instances.cuh"
+#include "ops/linear/kernels/q8/q8_geometry.h"
+#include "ops/linear/kernels/q8/q8_instances.cuh"
 #include "core/weight.h"
 #include "ops/linear_pair/q8/q8_pair_kernels.h"
 #include "ops/linear_pair/q8/q8_pair_plan.h"
 
 #include "core/device.h"
-#include "ops/linear/q8/q8_sliced_k_launch.cuh"
-#include "ops/linear/q8/q8_grouped_sliced_k_launch.cuh"
+#include "ops/linear/kernels/q8/q8_sliced_k_launch.cuh"
+#include "ops/linear/kernels/q8/q8_grouped_sliced_k_launch.cuh"
 
 #include <cuda_bf16.h>
 

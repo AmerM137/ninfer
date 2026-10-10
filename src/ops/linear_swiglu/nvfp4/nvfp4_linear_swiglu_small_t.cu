@@ -4,9 +4,9 @@
 #include "core/device.h"
 #include "ops/common/math.cuh"
 #include "ops/common/warp.cuh"
-#include "ops/linear/nvfp4/nvfp4_schedule.cuh"
-#include "ops/linear/nvfp4/nvfp4_template_launch.cuh"
-#include "ops/linear/nvfp4/nvfp4_instances.cuh"
+#include "ops/linear/kernels/nvfp4/nvfp4_schedule.cuh"
+#include "ops/linear/kernels/nvfp4/nvfp4_template_launch.cuh"
+#include "ops/linear/kernels/nvfp4/nvfp4_instances.cuh"
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_epilogue.cuh"
 
 #include <cuda_bf16.h>

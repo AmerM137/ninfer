@@ -1,5 +1,5 @@
 #include "ninfer/ops/rmsnorm.h"
-#include "ops/rmsnorm/launch.h"
+#include "ops/rmsnorm/dispatch.h"
 
 namespace ninfer::ops {
 namespace norm = detail::rmsnorm;
@@ -9,9 +9,7 @@ void execute(const Tensor& x, const Tensor& weight, const Tensor* gate, float ep
              norm::Epilogue kind, Tensor& out, DeviceExecutionView execution, const char* op) {
     const auto operands =
         norm::validate(x, weight, gate, eps, out, kind, execution.multiprocessor_count, op);
-    if (operands.rows)
-        norm::launch(x, weight, gate, eps, kind, out, operands, execution.multiprocessor_count,
-                     execution.stream);
+    if (operands.rows) norm::dispatch(x, weight, gate, eps, kind, out, operands, execution);
 }
 } // namespace
 

@@ -2,7 +2,7 @@
 
 #include "core/weight.h"
 #include "core/tensor.h"
-#include "ops/linear/fp8/fp8_a8_plan.h"
+#include "ops/linear/kernels/fp8/fp8_a8_plan.h"
 
 #include <cuda_runtime.h>
 

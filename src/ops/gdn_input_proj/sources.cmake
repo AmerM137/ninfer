@@ -24,7 +24,6 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/q8/q8_gdn_input_decode.cu"
   "${CMAKE_CURRENT_LIST_DIR}/q8/q8_gdn_input_gemm_mma.cu"
   "${CMAKE_CURRENT_LIST_DIR}/q8/q8_gdn_input_gemm_splitk.cu"
-  "${CMAKE_CURRENT_LIST_DIR}/q8/q8_gdn_input_n16384_k2560.cu"
 )
 
 target_sources(ninfer_nvfp4_non_rdc PRIVATE

@@ -2,8 +2,8 @@
 #include "ops/linear_add/nvfp4/nvfp4_linear_add_plan.h"
 
 #include "core/device.h"
-#include "ops/linear/nvfp4/nvfp4_schedule.cuh"
-#include "ops/linear/nvfp4/nvfp4_template_launch.cuh"
+#include "ops/linear/kernels/nvfp4/nvfp4_schedule.cuh"
+#include "ops/linear/kernels/nvfp4/nvfp4_template_launch.cuh"
 #include "ops/linear_add/nvfp4/nvfp4_linear_add_a4_tma_launch.h"
 #include "ops/linear/common/epilogue.cuh"
 

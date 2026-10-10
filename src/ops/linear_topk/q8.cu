@@ -1,12 +1,12 @@
-#include "ops/linear/q8/q8_geometry.h"
+#include "ops/linear/kernels/q8/q8_geometry.h"
 #include "core/weight.h"
 #include "ops/linear_topk/linear_topk_launch.h"
 
 #include "core/device.h"
 #include "ops/common/memory.cuh"
 #include "ops/common/mma.cuh"
-#include "ops/linear/q8/q8_schedule.cuh"
-#include "ops/linear/q8/q8_sliced_k_launch.cuh"
+#include "ops/linear/kernels/q8/q8_schedule.cuh"
+#include "ops/linear/kernels/q8/q8_sliced_k_launch.cuh"
 #include "ops/linear_topk/grouped_ksplit_topk.cuh"
 
 #include <array>

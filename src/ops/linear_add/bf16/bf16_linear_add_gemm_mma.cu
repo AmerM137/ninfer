@@ -1,5 +1,5 @@
-#include "ops/linear/bf16/bf16_instances.cuh"
-#include "ops/linear/bf16/bf16_template_launch.cuh"
+#include "ops/linear/kernels/bf16/bf16_instances.cuh"
+#include "ops/linear/kernels/bf16/bf16_template_launch.cuh"
 #include "ops/linear_add/bf16/bf16_linear_add_plan.h"
 
 namespace ninfer::ops::detail {

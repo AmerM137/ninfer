@@ -2,8 +2,8 @@
 
 #include "ops/gdn_input_proj/fp8/kernels.h"
 #include "ops/gdn_input_proj/plan.h"
-#include "ops/linear/fp8/fp8_a8_plan.h"
-#include "ops/linear/nvfp4/nvfp4_a4_plan.h"
+#include "ops/linear/kernels/fp8/fp8_a8_plan.h"
+#include "ops/linear/kernels/nvfp4/nvfp4_a4_plan.h"
 
 namespace ninfer::ops::detail::gdn_input {
 

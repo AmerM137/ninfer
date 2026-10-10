@@ -1,10 +1,10 @@
-#include "ops/linear/fp8/fp8_template_launch.cuh"
+#include "ops/linear/kernels/fp8/fp8_template_launch.cuh"
 #include "core/weight.h"
 #include "ops/linear_add/fp8/fp8_linear_add_plan.h"
 
 #include "core/device.h"
-#include "ops/linear/fp8/fp8_schedule.cuh"
-#include "ops/linear/fp8/fp8_a16_gemv.cuh"
+#include "ops/linear/kernels/fp8/fp8_schedule.cuh"
+#include "ops/linear/kernels/fp8/fp8_a16_gemv.cuh"
 #include "ops/linear/common/epilogue.cuh"
 
 #include <cuda_bf16.h>

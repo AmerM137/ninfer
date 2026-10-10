@@ -2,7 +2,7 @@
 #include "core/device.h"
 #include "ops/common/memory.cuh"
 #include "ops/common/mma.cuh"
-#include "ops/linear/q8/q8_sliced_k_launch.cuh"
+#include "ops/linear/kernels/q8/q8_sliced_k_launch.cuh"
 #include "ops/common/warp.cuh"
 #include "ops/common/dflash_rope.cuh"
 #include <cuda_bf16.h>

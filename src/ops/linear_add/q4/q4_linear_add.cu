@@ -1,8 +1,8 @@
 #include "ops/linear_add/q4/q4_linear_add_dispatch.h"
 
-#include "ops/linear/q4/q4_gemv_launch.cuh"
-#include "ops/linear/q4/q4_sliced_k_launch.cuh"
-#include "ops/linear/q4/q4_mma_launch.cuh"
+#include "ops/linear/kernels/q4/q4_gemv_launch.cuh"
+#include "ops/linear/kernels/q4/q4_sliced_k_launch.cuh"
+#include "ops/linear/kernels/q4/q4_mma_launch.cuh"
 
 #include <stdexcept>
 

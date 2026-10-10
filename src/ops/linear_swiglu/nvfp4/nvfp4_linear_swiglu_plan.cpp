@@ -2,8 +2,8 @@
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.h"
 
 #include "core/layout.h"
-#include "ops/linear/nvfp4/nvfp4_layout.h"
-#include "ops/linear/nvfp4/nvfp4_a4_plan.h"
+#include "ops/linear/kernels/nvfp4/nvfp4_layout.h"
+#include "ops/linear/kernels/nvfp4/nvfp4_a4_plan.h"
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_a4_tma_launch.h"
 
 #include <algorithm>

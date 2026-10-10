@@ -1,7 +1,7 @@
 #include "core/weight.h"
 #include "ninfer/ops/linear_topk.h"
 
-#include "ops/linear/fp8/fp8_format.h"
+#include "ops/linear/kernels/fp8/fp8_format.h"
 #include "ops/linear_topk/linear_topk_launch.h"
 #include "ops/linear_topk/linear_topk_workspace.h"
 

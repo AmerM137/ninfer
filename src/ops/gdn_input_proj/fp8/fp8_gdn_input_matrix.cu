@@ -1,13 +1,13 @@
-#include "ops/linear/fp8/fp8_template_launch.cuh"
+#include "ops/linear/kernels/fp8/fp8_template_launch.cuh"
 #include "core/weight.h"
 #include "ops/gdn_input_proj/fp8/kernels.h"
 
 #include "core/device.h"
 #include "ops/linear/common/output.cuh"
-#include "ops/linear/fp8/fp8_schedule.cuh"
-#include "ops/linear/fp8/fp8_a16_simt.cuh"
-#include "ops/linear/fp8/fp8_a16_sliced_k_mma.cuh"
-#include "ops/linear/fp8/fp8_a16_mma.cuh"
+#include "ops/linear/kernels/fp8/fp8_schedule.cuh"
+#include "ops/linear/kernels/fp8/fp8_a16_simt.cuh"
+#include "ops/linear/kernels/fp8/fp8_a16_sliced_k_mma.cuh"
+#include "ops/linear/kernels/fp8/fp8_a16_mma.cuh"
 
 namespace ninfer::ops::detail {
 namespace {

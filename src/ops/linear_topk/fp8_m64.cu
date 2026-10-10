@@ -5,7 +5,7 @@
 #include "ops/common/memory.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/common/score_id_order.cuh"
-#include "ops/linear/fp8/fp8_a16_codec.cuh"
+#include "ops/linear/kernels/fp8/fp8_a16_codec.cuh"
 #include "ops/linear_topk/linear_topk_workspace.h"
 
 #include <cub/warp/warp_merge_sort.cuh>

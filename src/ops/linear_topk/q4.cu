@@ -3,7 +3,7 @@
 
 #include "core/device.h"
 #include "ops/common/score_id_order.cuh"
-#include "ops/linear/q4/q4_sliced_k_launch.cuh"
+#include "ops/linear/kernels/q4/q4_sliced_k_launch.cuh"
 
 #include <cstdint>
 #include <array>

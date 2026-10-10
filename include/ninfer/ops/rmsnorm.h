@@ -3,7 +3,7 @@
 #include "core/tensor.h"
 #include "core/device.h"
 
-#include <cuda_runtime.h> // cudaStream_t
+#include <cuda_runtime.h>
 
 namespace ninfer::ops {
 
@@ -16,11 +16,8 @@ namespace ninfer::ops {
  *
  * `x` and `out` are same-shaped contiguous BF16 tensors, weight is contiguous BF16 [D], and eps
  * is positive and finite. Nonnegative empty shapes perform no device work. Nonempty backing is
- * naturally BF16-aligned. Input, weight, and output must not overlap. The oracle evaluates `ideal`
- * naively in FP64 from the represented inputs. The BF16 output is promoted and compared directly
- * with that result; output storage rounding belongs to the Op's numerical criterion, not the
- * oracle. Kernel reduction, staging, and accumulator precision are implementation choices. There
- * is no workspace or persistent state side effect.
+ * naturally BF16-aligned. Input, weight, and output must not overlap.
+ * Preserves inputs and writes out; no workspace or persistent state.
  */
 void rmsnorm(const Tensor& x, const Tensor& weight, float eps, bool unit_offset, Tensor& out,
              cudaStream_t stream);
@@ -34,13 +31,9 @@ void rmsnorm(const Tensor& x, const Tensor& weight, float eps, bool unit_offset,
  * `x`, `z`, and `out` are same-shaped contiguous BF16 tensors with positive extents,
  * `weight` is contiguous BF16 [D], and eps is positive and finite. This form does not apply a
  * unit offset to weight. The output must not overlap any input; read-only inputs may share
- * backing. Inputs remain unchanged and the output is fully written. The oracle evaluates
- * `ideal` naively in FP64 from the represented inputs. The BF16 output is promoted and compared
- * directly with that result; output storage rounding belongs to the Op's numerical criterion,
- * not the oracle. Kernel reduction, staging,
- * and accumulator precision are implementation choices. There is no workspace or persistent state
- * side effect. `execution` supplies the stream and the selected device's positive physical SM
- * count for launch selection.
+ * backing. Inputs remain unchanged and the output is fully written, without a required BF16
+ * norm intermediate. No workspace or persistent state. execution supplies the stream and
+ * the device's positive physical SM count.
  */
 void silu_gated_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor& z, float eps,
                         Tensor& out, DeviceExecutionView execution);
@@ -52,12 +45,9 @@ void silu_gated_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor& z, 
  *   ideal[d,r]   = x[d,r] * inv_r * weight[d] * sigmoid(z[d,r]).
  *
  * Shapes, direct weight multiplier, effects, non-overlap, zero-workspace and execution rules
- * are the same as silu_gated_rmsnorm. Every positive D and remaining extent is supported within
- * the view's represented range and available storage. In particular, BF16 [128,48,T,B] uses
- * independent 128-element rows and a shared BF16 weight [128]. Norm and gate form one complete
- * mathematical operation: there is no public BF16 norm intermediate. The independent FP64 oracle
- * evaluates the full formula from represented inputs; the BF16 output is compared directly with
- * that result under the suite's numerical criterion, without reproducing private casts.
+ * are the same as silu_gated_rmsnorm. Every positive D and remaining extent is supported
+ * within the view's represented range and available storage. Norm and gate form one computation,
+ * without a required BF16 norm intermediate.
  */
 void sigmoid_gated_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor& z, float eps,
                            Tensor& out, DeviceExecutionView execution);

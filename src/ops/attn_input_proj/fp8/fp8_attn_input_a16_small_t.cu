@@ -1,7 +1,7 @@
 #include "ops/attn_input_proj/fp8/fp8_attn_input_plan.h"
 #include "ops/attn_input_proj/fp8/fp8_attn_input_output.cuh"
-#include "ops/linear/fp8/fp8_template_launch.cuh"
-#include "ops/linear/fp8/fp8_instances.cuh"
+#include "ops/linear/kernels/fp8/fp8_template_launch.cuh"
+#include "ops/linear/kernels/fp8/fp8_instances.cuh"
 
 namespace ninfer::ops::detail {
 void fp8_attn_input_a16_small_mma_launch(const Tensor& x, const Weight& weight, Tensor& q,

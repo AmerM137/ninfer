@@ -7,7 +7,7 @@
 
 #include "ops/common/math.cuh"
 #include "ops/common/rowsplit_mma.cuh"
-#include "ops/linear/q4/q4_rowsplit_storage.cuh"
+#include "ops/linear/kernels/q4/q4_rowsplit_storage.cuh"
 
 #include <cuda_bf16.h>
 

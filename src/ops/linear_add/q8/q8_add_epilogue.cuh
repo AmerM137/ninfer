@@ -1,6 +1,6 @@
 #pragma once
 #include "ops/common/math.cuh"
-#include "ops/linear/q8/q8_a16_mma.cuh"
+#include "ops/linear/kernels/q8/q8_a16_mma.cuh"
 
 namespace ninfer::ops::detail {
 // The projection stays FP32 through the vectorized residual addition.

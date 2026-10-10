@@ -1,204 +1,132 @@
-// ninfer::ops - RMSNorm launcher: finite semantic dispatch over general row geometries.
 #include "ops/rmsnorm/launch.h"
-
 #include "ops/rmsnorm/kernel/warp.cuh"
 #include "ops/rmsnorm/kernel/cta.cuh"
 #include "ops/rmsnorm/kernel/generic.cuh"
 #include "core/device.h"
 
-#include <algorithm>
-#include <cstdint>
-#include <limits>
 #include <stdexcept>
 
 namespace ninfer::ops::detail::rmsnorm {
 namespace {
 
 template <Epilogue Kind, int Block>
-void launch_gated_d128(const __nv_bfloat16* x, const __nv_bfloat16* weight, const __nv_bfloat16* z,
-                       __nv_bfloat16* out, std::int64_t rows, float eps, cudaStream_t stream) {
+void launch_d128(const __nv_bfloat162* x, const __nv_bfloat162* weight, const __nv_bfloat162* gate,
+                 __nv_bfloat162* out, std::int64_t rows, float eps, cudaStream_t stream) {
     const auto blocks = static_cast<unsigned>((rows + Block / kWarpSize - 1) / (Block / kWarpSize));
-    rmsnorm_d128_bf16x2_kernel<Kind, Block><<<blocks, Block, 0, stream>>>(
-        reinterpret_cast<const __nv_bfloat162*>(x), reinterpret_cast<const __nv_bfloat162*>(weight),
-        reinterpret_cast<const __nv_bfloat162*>(z), reinterpret_cast<__nv_bfloat162*>(out), rows,
-        eps);
+    rmsnorm_d128_bf16x2_kernel<Kind, Block>
+        <<<blocks, Block, 0, stream>>>(x, weight, gate, out, rows, eps);
 }
 
-// Above one CTA per SM, another CTA supplies overlap without the gated epilogue's extra
-// prefetch registers. The policy retains the measured crossover on the target device.
-
 template <Epilogue Kind>
-void launch_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor* z, Tensor& out,
-                    std::int32_t d, std::int64_t rows, float eps, bool aligned2,
-                    std::int32_t multiprocessor_count, cudaStream_t stream) {
-    const auto* x_bf16 = static_cast<const __nv_bfloat16*>(x.data);
-    const auto* w_bf16 = static_cast<const __nv_bfloat16*>(weight.data);
-    const auto* z_bf16 = z != nullptr ? static_cast<const __nv_bfloat16*>(z->data) : nullptr;
-    auto* out_bf16     = static_cast<__nv_bfloat16*>(out.data);
-
-    if constexpr (is_gated<Kind>) {
-        if (aligned2 && d == 128) {
-            // D128/H32,H48 sweeps: small CTAs protect the core points; 16 warps cover the next
-            // interval within one CTA wave, then smaller CTAs improve multi-wave overlap. The broad
-            // streaming route retains eight warps for the 512/1024-column anchors.
-            if (rows <= 384 || (rows > 16LL * multiprocessor_count && rows <= 6144)) {
-                launch_gated_d128<Kind, 128>(x_bf16, w_bf16, z_bf16, out_bf16, rows, eps, stream);
-            } else if (rows <= 16LL * multiprocessor_count) {
-                launch_gated_d128<Kind, 512>(x_bf16, w_bf16, z_bf16, out_bf16, rows, eps, stream);
-            } else {
-                launch_gated_d128<Kind, 256>(x_bf16, w_bf16, z_bf16, out_bf16, rows, eps, stream);
-            }
+void launch_instance(const Tensor& x, const Tensor& weight, const Tensor* gate, Tensor& out,
+                     Operands operands, float eps, Instance instance, cudaStream_t stream) {
+    const auto d    = operands.dimension;
+    const auto rows = operands.rows;
+    const auto* x2  = static_cast<const __nv_bfloat162*>(x.data);
+    const auto* w2  = static_cast<const __nv_bfloat162*>(weight.data);
+    const auto* g2  = gate ? static_cast<const __nv_bfloat162*>(gate->data) : nullptr;
+    auto* out2      = static_cast<__nv_bfloat162*>(out.data);
+    switch (instance) {
+    case Instance::D128Block128:
+        if constexpr (is_gated<Kind> || Kind == Epilogue::Plain) {
+            launch_d128<Kind, 128>(x2, w2, g2, out2, rows, eps, stream);
             return;
         }
-    }
-
-    // The hoisted weight and gate cost registers. Measured at 512-thread blocks, only the
-    // SiLU gated epilogue loses a block per SM for them: warp 35 -> 50 and the wide row 38 -> 48,
-    // both three blocks to two. Both gated forms share the general-D prefetch policy and use
-    // the separately tuned fixed-width D128 route above. Only gated epilogues consult the grid,
-    // and the un-prefetched instantiation is compiled only where it is reached.
-    constexpr bool kGateOnGrid = is_gated<Kind>;
-
-    if constexpr (!is_gated<Kind>) {
-        if (aligned2 && d == 5120) {
-            // Fixed width removes the dynamic pair-count predicates. Ten pairs per thread
-            // with hoisted gains wins the hidden-row sweep through prefill.
+        break;
+    case Instance::D128Block256:
+        if constexpr (is_gated<Kind>) {
+            launch_d128<Kind, 256>(x2, w2, g2, out2, rows, eps, stream);
+            return;
+        }
+        break;
+    case Instance::D128Block512:
+        if constexpr (is_gated<Kind>) {
+            launch_d128<Kind, 512>(x2, w2, g2, out2, rows, eps, stream);
+            return;
+        }
+        break;
+    case Instance::D256:
+        if constexpr (Kind == Epilogue::Offset) {
+            rmsnorm_warp_bf16x2_kernel<Kind, 128, true, 256>
+                <<<static_cast<unsigned>((rows + 3) / 4), 128, 0, stream>>>(x2, w2, nullptr, out2,
+                                                                            d, rows, eps);
+            return;
+        }
+        break;
+    case Instance::D2048:
+        if constexpr (Kind == Epilogue::Plain) {
+            rmsnorm_d2048_bf16x2_kernel<Kind>
+                <<<static_cast<unsigned>(rows), 512, 0, stream>>>(x2, w2, g2, out2, rows, eps);
+            return;
+        }
+        break;
+    case Instance::D5120:
+        if constexpr (!is_gated<Kind>) {
             rmsnorm_cta_bf16x2_kernel<Kind, 256, 10, true, 5120>
-                <<<static_cast<unsigned>(rows), 256, 0, stream>>>(
-                    reinterpret_cast<const __nv_bfloat162*>(x_bf16),
-                    reinterpret_cast<const __nv_bfloat162*>(w_bf16), nullptr,
-                    reinterpret_cast<__nv_bfloat162*>(out_bf16), d, rows, eps);
+                <<<static_cast<unsigned>(rows), 256, 0, stream>>>(x2, w2, nullptr, out2, d, rows,
+                                                                  eps);
             return;
         }
-    }
-    if constexpr (Kind == Epilogue::Offset) {
-        if (aligned2 && d == 256) {
-            // One warp per row, four rows per CTA across both query and key projections.
-            constexpr int block = 128;
-            rmsnorm_warp_bf16x2_kernel<Kind, block, true, 256>
-                <<<static_cast<unsigned>((rows + 3) / 4), block, 0, stream>>>(
-                    reinterpret_cast<const __nv_bfloat162*>(x_bf16),
-                    reinterpret_cast<const __nv_bfloat162*>(w_bf16), nullptr,
-                    reinterpret_cast<__nv_bfloat162*>(out_bf16), d, rows, eps);
+        break;
+    case Instance::Warp:
+        if constexpr (is_gated<Kind>) {
+            rmsnorm_warp_bf16x2_kernel<Kind, 512, false>
+                <<<static_cast<unsigned>((rows + 15) / 16), 512, 0, stream>>>(x2, w2, g2, out2, d,
+                                                                              rows, eps);
             return;
         }
-    }
-    if (aligned2 && d == 128 && Kind == Epilogue::Plain) {
-        // Plain per-head D128 is latency-bound for Q32/KV8 rows. Four rows per CTA follows the
-        // measured lower envelope from T=1 through the 1024-token prefill point.
-        constexpr int kBlock         = 128;
-        constexpr int kWarpsPerBlock = kBlock / kWarpSize;
-        const auto blocks = static_cast<unsigned int>((rows + kWarpsPerBlock - 1) / kWarpsPerBlock);
-        rmsnorm_d128_bf16x2_kernel<Kind, kBlock>
-            <<<blocks, kBlock, 0, stream>>>(reinterpret_cast<const __nv_bfloat162*>(x_bf16),
-                                            reinterpret_cast<const __nv_bfloat162*>(w_bf16),
-                                            reinterpret_cast<const __nv_bfloat162*>(z_bf16),
-                                            reinterpret_cast<__nv_bfloat162*>(out_bf16), rows, eps);
-    } else if (aligned2 && d >= 64 && d <= 256 && d % 64 == 0) {
-        constexpr int kBlock         = 512;
-        constexpr int kWarpsPerBlock = kBlock / kWarpSize;
-        const auto blocks = static_cast<unsigned int>((rows + kWarpsPerBlock - 1) / kWarpsPerBlock);
-        if constexpr (kGateOnGrid) {
-            if (blocks > static_cast<unsigned>(multiprocessor_count)) {
-                rmsnorm_warp_bf16x2_kernel<Kind, kBlock, false><<<blocks, kBlock, 0, stream>>>(
-                    reinterpret_cast<const __nv_bfloat162*>(x_bf16),
-                    reinterpret_cast<const __nv_bfloat162*>(w_bf16),
-                    reinterpret_cast<const __nv_bfloat162*>(z_bf16),
-                    reinterpret_cast<__nv_bfloat162*>(out_bf16), d, rows, eps);
-                return;
-            }
-        }
-        rmsnorm_warp_bf16x2_kernel<Kind, kBlock, true><<<blocks, kBlock, 0, stream>>>(
-            reinterpret_cast<const __nv_bfloat162*>(x_bf16),
-            reinterpret_cast<const __nv_bfloat162*>(w_bf16),
-            reinterpret_cast<const __nv_bfloat162*>(z_bf16),
-            reinterpret_cast<__nv_bfloat162*>(out_bf16), d, rows, eps);
-    } else if (aligned2 && d == 2048 && Kind == Epilogue::Plain) {
-        // The 512-thread CTA is faster than 128/256-thread alternatives at every measured column
-        // extent and reaches the same-topology payload floor at the prefill endpoint.
-        rmsnorm_d2048_bf16x2_kernel<Kind><<<static_cast<unsigned int>(rows), 512, 0, stream>>>(
-            reinterpret_cast<const __nv_bfloat162*>(x_bf16),
-            reinterpret_cast<const __nv_bfloat162*>(w_bf16),
-            reinterpret_cast<const __nv_bfloat162*>(z_bf16),
-            reinterpret_cast<__nv_bfloat162*>(out_bf16), rows, eps);
-    } else if (aligned2 && d >= 512 && d <= 3072 && d % 512 == 0) {
-        // 30 -> 34 registers at Block=256, which is 6 blocks per SM either way under the
-        // 1536-thread cap, so this route pays no occupancy for the prefetch and is not gated.
+        break;
+    case Instance::WarpPrefetch:
+        rmsnorm_warp_bf16x2_kernel<Kind, 512, true>
+            <<<static_cast<unsigned>((rows + 15) / 16), 512, 0, stream>>>(x2, w2, g2, out2, d, rows,
+                                                                          eps);
+        return;
+    case Instance::CtaMedium:
         rmsnorm_cta_bf16x2_kernel<Kind, 256, 6, true>
-            <<<static_cast<unsigned int>(rows), 256, 0, stream>>>(
-                reinterpret_cast<const __nv_bfloat162*>(x_bf16),
-                reinterpret_cast<const __nv_bfloat162*>(w_bf16),
-                reinterpret_cast<const __nv_bfloat162*>(z_bf16),
-                reinterpret_cast<__nv_bfloat162*>(out_bf16), d, rows, eps);
-    } else if (aligned2 && d > 3072 && d <= 8192 && d % 1024 == 0) {
-        if constexpr (kGateOnGrid) {
-            if (rows > multiprocessor_count) {
-                rmsnorm_cta_bf16x2_kernel<Kind, 512, 8, false>
-                    <<<static_cast<unsigned int>(rows), 512, 0, stream>>>(
-                        reinterpret_cast<const __nv_bfloat162*>(x_bf16),
-                        reinterpret_cast<const __nv_bfloat162*>(w_bf16),
-                        reinterpret_cast<const __nv_bfloat162*>(z_bf16),
-                        reinterpret_cast<__nv_bfloat162*>(out_bf16), d, rows, eps);
-                return;
-            }
+            <<<static_cast<unsigned>(rows), 256, 0, stream>>>(x2, w2, g2, out2, d, rows, eps);
+        return;
+    case Instance::CtaWide:
+        if constexpr (is_gated<Kind>) {
+            rmsnorm_cta_bf16x2_kernel<Kind, 512, 8, false>
+                <<<static_cast<unsigned>(rows), 512, 0, stream>>>(x2, w2, g2, out2, d, rows, eps);
+            return;
         }
+        break;
+    case Instance::CtaWidePrefetch:
         rmsnorm_cta_bf16x2_kernel<Kind, 512, 8, true>
-            <<<static_cast<unsigned int>(rows), 512, 0, stream>>>(
-                reinterpret_cast<const __nv_bfloat162*>(x_bf16),
-                reinterpret_cast<const __nv_bfloat162*>(w_bf16),
-                reinterpret_cast<const __nv_bfloat162*>(z_bf16),
-                reinterpret_cast<__nv_bfloat162*>(out_bf16), d, rows, eps);
-    } else {
-        rmsnorm_generic_kernel<Kind><<<static_cast<unsigned int>(rows), 256, 0, stream>>>(
-            x_bf16, w_bf16, z_bf16, out_bf16, d, rows, eps);
+            <<<static_cast<unsigned>(rows), 512, 0, stream>>>(x2, w2, g2, out2, d, rows, eps);
+        return;
+    case Instance::Generic:
+        rmsnorm_generic_kernel<Kind><<<static_cast<unsigned>(rows), 256, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data),
+            static_cast<const __nv_bfloat16*>(weight.data),
+            gate ? static_cast<const __nv_bfloat16*>(gate->data) : nullptr,
+            static_cast<__nv_bfloat16*>(out.data), d, rows, eps);
+        return;
     }
+    throw std::logic_error("rmsnorm: instance does not support selected epilogue");
 }
 
 } // namespace
 
-void launch(const Tensor& x, const Tensor& weight, const Tensor* z, float eps, Epilogue epilogue,
-            Tensor& out, Operands operands, std::int32_t multiprocessor_count,
-            cudaStream_t stream) {
-    const auto d        = operands.dimension;
-    const auto rows     = operands.rows;
-    const bool aligned2 = operands.aligned_pairs;
-
-    // CUDA grid limits are launch resources, not a semantic limit on the positive row extent.
-    constexpr std::int64_t kMaxLaunchRows = std::numeric_limits<int>::max();
-    for (std::int64_t first = 0; first < rows;) {
-        const std::int64_t count = std::min(rows - first, kMaxLaunchRows);
-        const std::size_t offset =
-            static_cast<std::size_t>(first) * static_cast<std::size_t>(d) * 2;
-        Tensor x_chunk   = x;
-        Tensor out_chunk = out;
-        Tensor z_chunk;
-        x_chunk.data   = static_cast<std::byte*>(x.data) + offset;
-        out_chunk.data = static_cast<std::byte*>(out.data) + offset;
-        if (z != nullptr) {
-            z_chunk      = *z;
-            z_chunk.data = static_cast<std::byte*>(z->data) + offset;
-        }
-        switch (epilogue) {
-        case Epilogue::SiluGated:
-            launch_rmsnorm<Epilogue::SiluGated>(x_chunk, weight, &z_chunk, out_chunk, d, count, eps,
-                                                aligned2, multiprocessor_count, stream);
-            break;
-        case Epilogue::SigmoidGated:
-            launch_rmsnorm<Epilogue::SigmoidGated>(x_chunk, weight, &z_chunk, out_chunk, d, count,
-                                                   eps, aligned2, multiprocessor_count, stream);
-            break;
-        case Epilogue::Offset:
-            launch_rmsnorm<Epilogue::Offset>(x_chunk, weight, nullptr, out_chunk, d, count, eps,
-                                             aligned2, multiprocessor_count, stream);
-            break;
-        case Epilogue::Plain:
-            launch_rmsnorm<Epilogue::Plain>(x_chunk, weight, nullptr, out_chunk, d, count, eps,
-                                            aligned2, multiprocessor_count, stream);
-            break;
-        }
-        CUDA_CHECK(cudaGetLastError());
-        first += count;
+void launch(const Tensor& x, const Tensor& weight, const Tensor* gate, float eps, Epilogue kind,
+            Tensor& out, Operands operands, Instance instance, cudaStream_t stream) {
+    switch (kind) {
+    case Epilogue::Plain:
+        launch_instance<Epilogue::Plain>(x, weight, gate, out, operands, eps, instance, stream);
+        break;
+    case Epilogue::Offset:
+        launch_instance<Epilogue::Offset>(x, weight, gate, out, operands, eps, instance, stream);
+        break;
+    case Epilogue::SiluGated:
+        launch_instance<Epilogue::SiluGated>(x, weight, gate, out, operands, eps, instance, stream);
+        break;
+    case Epilogue::SigmoidGated:
+        launch_instance<Epilogue::SigmoidGated>(x, weight, gate, out, operands, eps, instance,
+                                                stream);
+        break;
     }
+    CUDA_CHECK(cudaGetLastError());
 }
 
 } // namespace ninfer::ops::detail::rmsnorm

@@ -1,6 +1,6 @@
 #include "ops/linear_add/q5/q5_linear_add_kernels.h"
-#include "ops/linear/q5/q5_instances.cuh"
-#include "ops/linear/q5/q5_sliced_k_launch.cuh"
+#include "ops/linear/kernels/q5/q5_instances.cuh"
+#include "ops/linear/kernels/q5/q5_sliced_k_launch.cuh"
 
 namespace ninfer::ops::detail {
 namespace {

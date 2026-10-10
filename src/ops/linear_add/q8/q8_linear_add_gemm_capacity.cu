@@ -1,7 +1,7 @@
-#include "ops/linear/q8/q8_sliced_k_launch.cuh"
-#include "ops/linear/q8/q8_geometry.h"
+#include "ops/linear/kernels/q8/q8_sliced_k_launch.cuh"
+#include "ops/linear/kernels/q8/q8_geometry.h"
 #include "ops/linear_add/q8/q8_linear_add_kernels.h"
-#include "ops/linear/q8/q8_instances.cuh"
+#include "ops/linear/kernels/q8/q8_instances.cuh"
 
 namespace ninfer::ops::detail {
 namespace {

@@ -3,7 +3,7 @@
 #include "ops/gated_residual/mix/kernel/math.cuh"
 #include "ops/gated_residual/mix/kernel/shared_layout.cuh"
 #include "ops/gated_residual/mix/operands.h"
-#include "ops/linear/bf16/bf16_a16_tma_mma.cuh"
+#include "ops/linear/kernels/bf16/bf16_a16_tma_mma.cuh"
 
 namespace ninfer::ops::detail::hc::mix {
 struct StripedTmaWeightAccess {

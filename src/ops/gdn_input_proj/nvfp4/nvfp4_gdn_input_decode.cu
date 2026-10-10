@@ -3,8 +3,8 @@
 
 #include "core/device.h"
 #include "ops/linear/common/output.cuh"
-#include "ops/linear/nvfp4/nvfp4_schedule.cuh"
-#include "ops/linear/nvfp4/nvfp4_template_launch.cuh"
+#include "ops/linear/kernels/nvfp4/nvfp4_schedule.cuh"
+#include "ops/linear/kernels/nvfp4/nvfp4_template_launch.cuh"
 
 namespace ninfer::ops::detail {
 

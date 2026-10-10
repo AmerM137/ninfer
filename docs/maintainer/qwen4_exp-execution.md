@@ -168,7 +168,7 @@ Verify 保存四类实际记录：卷积前最新 history 列、卷积/SiLU 后�
 ## 4. QSA 三阶段、页组与 tail
 
 Main 用 Q8 Q/gate parent 和 BF16 K/V/index parent，MTP 用一个 BF16 joint parent。
-[qsa_input_proj](../../include/ninfer/ops/qsa.h)直接产生各自连续的 BF16 分段输出，按原
+[linear_split](../../include/ninfer/ops/linear_split.h)直接产生各自连续的 BF16 分段输出，按原
 `T/B` 改 view 后依次进入三个独立 Op；输入投影和 O projection 位于三阶段之外。
 
 | 阶段 | 消费与交接 |

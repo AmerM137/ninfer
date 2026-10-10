@@ -1,16 +1,16 @@
-#include "ops/linear/q5/q5_instances.cuh"
-#include "ops/linear/q4/q4_instances.cuh"
+#include "ops/linear/kernels/q5/q5_instances.cuh"
+#include "ops/linear/kernels/q4/q4_instances.cuh"
 #include "core/weight.h"
 #include "ops/gdn_input_proj/q4_q5/kernels.h"
 
 #include "core/device.h"
 #include "core/pdl.cuh"
 #include "ops/common/math.h"
-#include "ops/linear/q4/q4_sliced_k_launch.cuh"
-#include "ops/linear/q4/q4_simt_launch.cuh"
-#include "ops/linear/q4/q4_gemv_launch.cuh"
-#include "ops/linear/q5/q5_simt_launch.cuh"
-#include "ops/linear/q5/q5_gemv_launch.cuh"
+#include "ops/linear/kernels/q4/q4_sliced_k_launch.cuh"
+#include "ops/linear/kernels/q4/q4_simt_launch.cuh"
+#include "ops/linear/kernels/q4/q4_gemv_launch.cuh"
+#include "ops/linear/kernels/q5/q5_simt_launch.cuh"
+#include "ops/linear/kernels/q5/q5_gemv_launch.cuh"
 
 #include <cuda_bf16.h>
 

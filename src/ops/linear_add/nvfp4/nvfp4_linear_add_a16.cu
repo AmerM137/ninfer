@@ -1,6 +1,6 @@
 #include "ops/linear_add/nvfp4/nvfp4_linear_add_plan.h"
-#include "ops/linear/nvfp4/nvfp4_template_launch.cuh"
-#include "ops/linear/nvfp4/nvfp4_instances.cuh"
+#include "ops/linear/kernels/nvfp4/nvfp4_template_launch.cuh"
+#include "ops/linear/kernels/nvfp4/nvfp4_instances.cuh"
 
 namespace ninfer::ops::detail {
 namespace {

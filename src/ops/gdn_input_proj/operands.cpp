@@ -1,7 +1,7 @@
 #include "ops/gdn_input_proj/operands.h"
 
-#include "ops/linear/fp8/fp8_format.h"
-#include "ops/linear/nvfp4/nvfp4_format.h"
+#include "ops/linear/kernels/fp8/fp8_format.h"
+#include "ops/linear/kernels/nvfp4/nvfp4_format.h"
 
 #include <initializer_list>
 #include <stdexcept>

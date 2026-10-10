@@ -1,7 +1,7 @@
 #include "ops/gdn_input_proj/fp8/kernels.h"
 #include "ops/linear/common/output.cuh"
-#include "ops/linear/fp8/fp8_template_launch.cuh"
-#include "ops/linear/fp8/fp8_instances.cuh"
+#include "ops/linear/kernels/fp8/fp8_template_launch.cuh"
+#include "ops/linear/kernels/fp8/fp8_instances.cuh"
 
 namespace ninfer::ops::detail {
 namespace {

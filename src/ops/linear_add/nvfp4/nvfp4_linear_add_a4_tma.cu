@@ -1,5 +1,5 @@
 #include "ops/linear_add/nvfp4/nvfp4_linear_add_a4_tma_launch.h"
-#include "ops/linear/nvfp4/nvfp4_a4_tma.cuh"
+#include "ops/linear/kernels/nvfp4/nvfp4_a4_tma.cuh"
 
 namespace ninfer::ops::detail {
 namespace {

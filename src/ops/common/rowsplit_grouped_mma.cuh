@@ -5,8 +5,8 @@
 
 #include "ops/common/math.h"
 #include "ops/common/rowsplit_mma.cuh"
-#include "ops/linear/q4/q4_rowsplit_storage.cuh"
-#include "ops/linear/q5/q5_rowsplit_storage.cuh"
+#include "ops/linear/kernels/q4/q4_rowsplit_storage.cuh"
+#include "ops/linear/kernels/q5/q5_rowsplit_storage.cuh"
 #include "core/tensor.h"
 
 #include <cuda_bf16.h>

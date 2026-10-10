@@ -2,8 +2,8 @@
 #include "ops/gated_residual/mix/kernel/output.cuh"
 #include "ops/gated_residual/mix/kernel/up_mma_mix.cuh"
 #include "ops/gated_residual/mix/kernel/up_tma_mix.cuh"
-#include "ops/linear/bf16/bf16_template_launch.cuh"
-#include "ops/linear/bf16/bf16_split_k_launch.cuh"
+#include "ops/linear/kernels/bf16/bf16_template_launch.cuh"
+#include "ops/linear/kernels/bf16/bf16_split_k_launch.cuh"
 
 #include <type_traits>
 

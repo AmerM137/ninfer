@@ -1,7 +1,7 @@
 #include "core/weight.h"
 #include "ops/linear_add/nvfp4/nvfp4_linear_add_plan.h"
 
-#include "ops/linear/nvfp4/nvfp4_layout.h"
+#include "ops/linear/kernels/nvfp4/nvfp4_layout.h"
 
 #include <algorithm>
 #include <cstdint>

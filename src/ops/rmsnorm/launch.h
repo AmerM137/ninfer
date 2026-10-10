@@ -3,6 +3,21 @@
 #include <cuda_runtime.h>
 
 namespace ninfer::ops::detail::rmsnorm {
+enum class Instance {
+    D128Block128,
+    D128Block256,
+    D128Block512,
+    D256,
+    D2048,
+    D5120,
+    Warp,
+    WarpPrefetch,
+    CtaMedium,
+    CtaWide,
+    CtaWidePrefetch,
+    Generic
+};
+
 void launch(const Tensor& x, const Tensor& weight, const Tensor* gate, float eps, Epilogue kind,
-            Tensor& out, Operands operands, std::int32_t multiprocessor_count, cudaStream_t stream);
+            Tensor& out, Operands operands, Instance instance, cudaStream_t stream);
 } // namespace ninfer::ops::detail::rmsnorm

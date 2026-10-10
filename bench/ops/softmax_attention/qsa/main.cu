@@ -4,28 +4,13 @@
 #include "indexer_fixture.cuh"
 #include "sparse_gqa_fixture.cuh"
 #include "ninfer/ops/linear.h"
+#include "ninfer/ops/linear_split.h"
 #include "ninfer/ops/qsa.h"
 
 using namespace ninfer;
 using namespace ninfer::bench;
 
 namespace {
-void launch_split(qsa::Projection projection, qsa::Fixture& f, const Weight& weight,
-                  cudaStream_t stream) {
-    auto& out = f.split;
-    switch (projection) {
-    case qsa::Projection::QueryGate:
-        ops::qsa_input_proj(f.x, weight, out[0], out[1], stream);
-        return;
-    case qsa::Projection::KeyValueIndex:
-        ops::qsa_input_proj(f.x, weight, out[0], out[1], out[2], out[3], stream);
-        return;
-    case qsa::Projection::Joint:
-        ops::qsa_input_proj(f.x, weight, out[0], out[1], out[2], out[3], out[4], out[5], stream);
-        return;
-    }
-}
-
 void measure_tail(const qsa::Options& options, DeviceContext& device, L2FlushBuffer& flush) {
     measurement::Csv csv(options.timing.csv_out, "base_positions,inplace,layout,round");
     for (int capacity : options.capacities) {
@@ -205,15 +190,15 @@ int main(int argc, char** argv) {
                              measurement::selections(options.timing.cache, "cold", "warm")) {
                             for (const auto& entry : entries) {
                                 const bool baseline = entry == "linear";
-                                row.op              = baseline ? "linear" : "qsa_input_proj";
+                                row.op              = baseline ? "linear" : "linear_split";
                                 const auto result   = measurement::measure(
                                     [&](auto stream) {
                                         if (baseline)
                                             ops::linear(fixture.x, weights.weight, fixture.packed,
                                                           stream);
                                         else
-                                            launch_split(projection, fixture, weights.weight,
-                                                           stream);
+                                            ops::linear_split(fixture.x, weights.weight,
+                                                                fixture.split, stream);
                                     },
                                     [](auto) {}, flush, device.stream, options.timing, execution,
                                     cache);

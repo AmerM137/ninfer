@@ -3,7 +3,7 @@
 
 #include "core/device.h"
 #include "ops/gdn_input_proj/conv_output.cuh"
-#include "ops/linear/q8/q8_gemv_launch.cuh"
+#include "ops/linear/kernels/q8/q8_gemv_launch.cuh"
 
 namespace ninfer::ops::detail {
 namespace {

@@ -4,8 +4,8 @@
 #include "core/device.h"
 #include "ops/common/memory.cuh"
 #include "ops/common/mma.cuh"
-#include "ops/linear/fp8/fp8_a16_codec.cuh"
-#include "ops/linear/fp8/fp8_schedule.cuh"
+#include "ops/linear/kernels/fp8/fp8_a16_codec.cuh"
+#include "ops/linear/kernels/fp8/fp8_schedule.cuh"
 #include "ops/linear_topk/grouped_ksplit_topk.cuh"
 
 #include <array>

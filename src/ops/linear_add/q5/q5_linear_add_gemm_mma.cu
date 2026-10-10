@@ -1,4 +1,4 @@
-#include "ops/linear/q5/q5_instances.cuh"
+#include "ops/linear/kernels/q5/q5_instances.cuh"
 #include "core/weight.h"
 #include "ops/linear_add/q5/q5_linear_add_kernels.h"
 
@@ -6,7 +6,7 @@
 #include "ops/common/bf16_vector.cuh"
 #include "ops/common/math.h"
 #include "ops/common/token_slices.h"
-#include "ops/linear/q5/q5_mma_launch.cuh"
+#include "ops/linear/kernels/q5/q5_mma_launch.cuh"
 
 #include <cuda_bf16.h>
 

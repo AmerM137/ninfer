@@ -980,8 +980,8 @@ it is not a mode of Attention input projection. End-to-end target measurement us
 
 ## QSA Op benchmark
 
-`ninfer_qsa_bench --op input-proj` (the default) compares the three public A16 `qsa_input_proj()`
-overloads with the corresponding contiguous-output `linear()` calls.
+`ninfer_qsa_bench --op input-proj` (the default) measures public A16 `linear_split()` on the three
+QSA projection geometries alongside the corresponding contiguous-output `linear()` calls.
 `--projection qg|kv-index|qkgv-index|all` selects Q8 `[12288,2560]`,
 BF16 `[1664,2560]`, or BF16 `[13952,2560]`. `--entry split|linear|both` selects the public entries;
 `both` reuses identical weights, inputs, and total output storage and alternates entry order by round.

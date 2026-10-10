@@ -1,11 +1,11 @@
-#include "ops/linear/q8/q8_geometry.h"
+#include "ops/linear/kernels/q8/q8_geometry.h"
 #include "core/weight.h"
 #include "ops/linear_swiglu/q8/q8_linear_swiglu_kernels.h"
 
 #include "core/device.h"
-#include "ops/linear/q8/q8_schedule.cuh"
+#include "ops/linear/kernels/q8/q8_schedule.cuh"
 #include "ops/linear/common/output.cuh"
-#include "ops/linear/q8/q8_sliced_k_launch.cuh"
+#include "ops/linear/kernels/q8/q8_sliced_k_launch.cuh"
 #include "ops/linear_swiglu/q8/q8_linear_swiglu_output.cuh"
 
 #include <array>

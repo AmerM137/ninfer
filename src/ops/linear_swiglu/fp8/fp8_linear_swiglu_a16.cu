@@ -1,12 +1,12 @@
-#include "ops/linear/fp8/fp8_instances.cuh"
+#include "ops/linear/kernels/fp8/fp8_instances.cuh"
 #include "ops/linear_swiglu/row_major_mma_epilogue.cuh"
-#include "ops/linear/fp8/fp8_template_launch.cuh"
+#include "ops/linear/kernels/fp8/fp8_template_launch.cuh"
 #include "core/weight.h"
 #include "ops/linear_swiglu/fp8/fp8_linear_swiglu_plan.h"
 
 #include "core/device.h"
-#include "ops/linear/fp8/fp8_schedule.cuh"
-#include "ops/linear/fp8/fp8_a16_simt.cuh"
+#include "ops/linear/kernels/fp8/fp8_schedule.cuh"
+#include "ops/linear/kernels/fp8/fp8_a16_simt.cuh"
 #include "ops/linear_swiglu/fp8/fp8_linear_swiglu_output.cuh"
 
 #include <stdexcept>

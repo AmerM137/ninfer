@@ -47,7 +47,10 @@ the speculative workload priorities solely because they share a Linear geometry.
 
 ## 3. Dispatch and interval quality
 
-Reusable templates live in the format directories under [src/ops/linear/](../../src/ops/linear/).
+Reusable templates live under [linear/kernels/](../../src/ops/linear/kernels/). Ordinary projection
+owns [linear/projection/](../../src/ops/linear/projection/); segmented projection owns
+[linear/split/](../../src/ops/linear/split/). Each Op keeps its dispatch, selected schedules and
+shape policies private, even where tuning values currently agree.
 Schedules describe computation organization, operands provide explicit inputs, launchers validate
 constraints and launch kernels, and Output/Epilogue define output mapping and fused computation.
 Each semantic Op selects its own production instances. A template's availability neither registers
