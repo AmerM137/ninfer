@@ -300,6 +300,18 @@ A permanent test should protect one current risk, such as:
 - public benchmark or OpenAI/Anthropic observable behavior;
 - a reproduced supported bug.
 
+Structural refactoring preserves existing cases, seeds, input distributions, oracles and numerical
+criteria. Treat changes to test data or acceptance as explicit verification changes, identifying
+the regression risk they protect and their execution cost.
+
+Test each Op's workspace query against its own execution and interval contract. Shared allocation
+helpers do not promise equal capacities across different Ops.
+
+Stateful integration fixtures establish the prerequisites of the path they test. Isolate unrelated
+cache history when qualifying restoration; share history deliberately when testing retention or
+resource pressure. Enabling prefix reuse does not guarantee a cache hit after arbitrary preceding
+work: availability and selection follow the [context-cache policy](../docs/maintainer/resource-scheduling-and-context-cache.md).
+
 Performance-only assertions belong in benchmarks and profiler review. Source scans,
 implementation-shape assertions, trivial getters/configuration, retired command surfaces, and
 broad additions without a concrete regression risk do not belong in the permanent suite.

@@ -66,7 +66,8 @@ gated delta-rule，产生 48×128 维输出。输出端使用直接 gamma 的 he
 乘 `sigmoid(Z)`，再投影回 2560 维；这里的 sigmoid 与卷积后的 SiLU 分别保留。
 Recurrent state 按 `S[value_dim,key_dim]` 存 FP32。完整层组合见执行文档，计算合同见
 [GDN](../../include/ninfer/ops/gated_delta_net.h)、
-[输入投影](../../include/ninfer/ops/gdn_input_proj.h)、
+[分段投影](../../include/ninfer/ops/linear_split.h)、
+[投影与卷积融合](../../include/ninfer/ops/gdn_input_proj.h)、
 [控制投影](../../include/ninfer/ops/gdn_control.h)和
 [gated RMSNorm](../../include/ninfer/ops/rmsnorm.h)。
 

@@ -269,7 +269,8 @@ global `wrapper/`, `launcher/`, or `kernel/` directories.
 These are responsibilities, not a requirement for five files. Use `select_*` for implementation
 selection, `*_dispatch` for format/geometry routing, and `launch_*` for submitting a selected
 implementation. A single-stage selector can return a typed launcher. A multi-stage selector can
-return a small family-private Plan containing the selected stages and resource facts. Capacity
+return a small family-private Plan containing the selected stages and resource facts. Pass resolved
+choices to allocation and launch instead of repeating the same selection downstream. Capacity
 queries and execution must consume the same selection and allocation rules.
 
 Selection depends on actual operands and execution facts, never target keys, artifact names,
@@ -277,7 +278,7 @@ converter fields, model roles, Program phases or arbitrary registry strings. A l
 specialize full tiles versus tails and obey CUDA grid limits; performance policy belongs in the
 selector. Device-resident per-row lengths stay Device inputs under the Op's capture contract.
 
-### 4.2 Three implementation examples
+### 4.2 Implementation examples
 
 - **Compact Op:** [elementwise](../../src/ops/elementwise/sources.cmake) keeps each small Op's
   entry, selection, launch and private kernels together in one `.cu`. Use an anonymous namespace
@@ -293,19 +294,21 @@ selector. Device-resident per-row lengths stay Device inputs under the Op's capt
   policies and launch bindings. Their contraction templates are shared, while selected schedules
   and cutoffs remain private even when identical. Distinct fused Ops follow the same ownership
   rule. Activation preparation and reduction stages remain private to the Op.
+- **Multi-stage Op:** [Sampling](../../src/ops/sampling/sources.cmake) gives sampling and acceptance
+  their own entries and plans while sharing distribution kernels. [SparseMoE](../../src/ops/sparse_moe/sources.cmake)
+  selects a private decode, small-extent or prefill plan for one complete router/expert/residual
+  computation. Route launchers consume the selected plan and workspace views; individual stages
+  remain private implementation details.
+- **Algorithm subfamily:** GDN controls, fused input convolution, recurrence and replay belong
+  together within [LinearAttention](../../src/ops/linear_attention/sources.cmake). QSA preparation,
+  indexing, sparse attention and tail handling form a [SoftmaxAttention subfamily](../../src/ops/softmax_attention/qsa/sources.cmake).
+  Shared views connect independent Op interfaces. Model call order and persistent-state ownership
+  remain outside these subtrees; pure projections belong to Linear.
 
 New weight geometries extend the corresponding projection catalog and shape policy. A new
 contraction pipeline extends the format's kernel library. A new mathematical fusion first gets an
 explicit semantic boundary and then reuses suitable kernels at their output boundary. Do not make
 different Ops share a tuning table or include a sibling's private shape policy.
-
-An algorithm subfamily may contain independent preparation, compute and record/fold Ops. GDN
-specialized controls, fused input convolution, recurrence and replay belong together within
-LinearAttention; QSA preparation, indexing, sparse attention and tail handling can likewise form
-a subfamily of SoftmaxAttention. Their shared views connect independent interfaces. Model call
-order and persistent-state ownership remain outside that subtree; pure projections belong to
-Linear. These boundaries guide later migrations without requiring a whole-family rewrite to add
-one implementation.
 
 ### 4.3 Shared computation and compilation
 
@@ -334,14 +337,11 @@ keep format interpretation separate from matrix-tile or paged-cache addressing. 
 profiles with different scale bounds, divisors or rounding boundaries remain explicit.
 
 Family kernel libraries own reusable algorithms, tile assembly, output mappings and epilogues.
+When several routes share a computation, place it in that library rather than making one route
+depend on a sibling's private implementation.
 For example, an E4M3 conversion belongs to shared numeric/format support; a GEMM pipeline belongs
 to Linear. Sharing either does not introduce a model-callable private backend or an intermediate
 numerical boundary. The consuming Op chooses its arithmetic profile and tuned implementation.
-
-Families awaiting reorganization retain their existing helpers and call sites until their own
-migration; shared facilities needed by them may be supplied in advance. Keep those callers on
-their existing implementation rather than redirecting them through forwarding aliases. Remove an
-old provider after its remaining consumers migrate, and do not add new consumers to the old paths.
 
 Preserve per-shape compilation units and explicit template ownership. File organization must not
 silently change RDC mode, architecture, compiler precision options or device-link ownership.
@@ -381,10 +381,17 @@ The query returns the minimum high-water capacity sufficient for every legal ext
 interval. An exact-call query uses equal interval endpoints. Invalid profiles and intervals throw;
 zero is reserved for a legal route that requires no caller-owned global scratch.
 
+Account for route transitions and nonmonotone regions when computing the interval maximum. An
+upper-endpoint query suffices only for a region whose allocation is known to be nondecreasing.
+
 Capacity is measured from a 256-byte-aligned Op-local cursor, includes internal alignment gaps, and
 excludes trailing padding. The sizing query and execution share the same route facts and allocation
 recipe. A composed Op reports its complete public scratch requirement rather than exposing private
 child requirements.
+
+Scratch regions may share storage when their device lifetimes do not overlap. Keep the last-reader
+and synchronization requirements beside the layout and affected launch or kernel code; preserve
+them when separating stages or compilation units.
 
 Ending the host workspace scope does not end device use. Kernels that consume a suballocation must
 be submitted on the declared stream before the scope is released, and reuse relies on stream
