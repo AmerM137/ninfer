@@ -1,7 +1,7 @@
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/program/execution_context.h"
 #include "ninfer/ops/indexing.h"
-#include "ninfer/ops/speculative_round.h"
+#include "ninfer/ops/speculative_accept.h"
 
 namespace ninfer::models::qwen3_5::execution {
 
@@ -41,7 +41,7 @@ void target_accept(ExecutionCore& execution, Tensor& continuation_hidden_store,
             dimension(execution.parameters.model.resources().public_token_count), frame.sampling,
             execution.work, execution.device.stream);
     }
-    ops::speculative_select_accepted_hidden(frame.target_hidden, frame.accepted_drafts,
+    ops::gather_bf16_batch_columns(frame.target_hidden, frame.accepted_drafts,
                                             frame.selected_hidden, execution.device.stream);
     ops::scatter(frame.selected_hidden, frame.state_destination_slots, continuation_hidden_store,
                  execution.device.stream);

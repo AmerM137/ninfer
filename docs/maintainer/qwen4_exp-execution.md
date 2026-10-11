@@ -101,7 +101,7 @@ normalized、block output 或 sample hidden 代替或反推。`F=0` 没有有效
 Verify 保留 `[2560,T,B]` sample window 和启用 MTP 时的 `[10240,T,B]` conditioning
 window。`a>0` 使用同一 selector 选择两个窗口的 `a-1` 列；`a=0` 保留旧恢复点，
 不以负 selector gather。可复用
-[accepted-hidden 选择合同](../../include/ninfer/ops/speculative_round.h)分别复制两种宽度，
+[batch column gather 合同](../../include/ninfer/ops/indexing.h)分别复制两种宽度，
 保留原 words，不重跑较短投影或 final Mix 来重建。StateImage 的 Device/Host layout、
 clone、checkpoint 和 restore 必须显式表达这两个不同字段。
 

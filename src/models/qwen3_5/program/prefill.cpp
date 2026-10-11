@@ -7,7 +7,6 @@
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/scalar.h"
 #include "ninfer/ops/indexing.h"
-#include "ninfer/ops/speculative_round.h"
 
 #include <algorithm>
 #include <array>
@@ -375,7 +374,7 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
             CUDA_CHECK(cudaMemcpyAsync(selector_tensor.data, hidden_selectors.data(),
                                        lanes.size() * sizeof(std::int32_t), cudaMemcpyHostToDevice,
                                        device.stream));
-            ops::speculative_select_accepted_hidden(hidden, selector_tensor, selected,
+            ops::gather_bf16_batch_columns(hidden, selector_tensor, selected,
                                                     device.stream);
             ops::scatter(selected, destinations, state_images->continuation_hidden_store(),
                          device.stream);

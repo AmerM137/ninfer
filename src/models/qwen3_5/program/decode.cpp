@@ -5,7 +5,7 @@
 #include "models/qwen3_5/program/planning/graph_profiles.h"
 #include "core/nvtx.h"
 #include "core/device.h"
-#include "ninfer/ops/prepare_ragged_prefix.h"
+#include "ninfer/ops/sequence.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/indexing.h"
 

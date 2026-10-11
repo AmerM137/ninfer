@@ -1,5 +1,4 @@
 #include "ninfer/ops/indexing.h"
-#include "ninfer/ops/speculative_round.h"
 #include "core/device.h"
 #include "core/decode_graph.h"
 #include <algorithm>
@@ -128,7 +127,7 @@ int continuation_case(int width, int batch) {
     DeviceContext context;
     cuda_synchronize();
     const auto launch = [&] {
-        ops::speculative_select_accepted_hidden(h, sel, selected, context.stream);
+        ops::gather_bf16_batch_columns(h, sel, selected, context.stream);
         ops::scatter(selected, indices, dst, context.stream);
     };
     DecodeGraphDefinition definition;

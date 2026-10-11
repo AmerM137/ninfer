@@ -7,7 +7,7 @@
 #include "core/device.h"
 #include "core/tensor.h"
 #include "ninfer/ops/sampling.h"
-#include "ninfer/ops/speculative_round.h"
+#include "ninfer/ops/speculative_accept.h"
 #include "ninfer_bench_common.h"
 
 #include <cuda_runtime.h>

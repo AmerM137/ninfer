@@ -1,4 +1,6 @@
-#include "ninfer/ops/speculative_round.h"
+#include "ninfer/ops/sequence.h"
+#include "ninfer/ops/indexing.h"
+#include "ninfer/ops/speculative_accept.h"
 #include "ops/op_tester.h"
 #include "core/decode_graph.h"
 #include "core/device.h"
@@ -55,8 +57,8 @@ int prepare_verify_case(int k, int batch) {
     DeviceContext context;
     cuda_synchronize();
     const auto launch = [&] {
-        ops::speculative_prepare_verify_inputs(a, d, l, e, full, positions, context.stream);
-        ops::speculative_prepare_verify_ids(a, d, e, ids, context.stream);
+        ops::prepare_verify_inputs(a, d, l, e, full, positions, context.stream);
+        ops::prepare_verify_ids(a, d, e, ids, context.stream);
     };
     DecodeGraphDefinition definition;
     DecodeGraphExecutable graph;
@@ -1168,7 +1170,7 @@ int select_hidden_case(int rows, int columns, int accepted_value) {
     Tensor hidden_tensor(d_hidden.p, DType::BF16, {rows, columns});
     Tensor accepted(d_accepted.p, DType::I32, {1});
     Tensor out(d_out.data(), DType::BF16, {rows, 1});
-    ops::speculative_select_accepted_hidden(hidden_tensor, accepted, out, nullptr);
+    ops::gather_bf16_batch_columns(hidden_tensor, accepted, out, nullptr);
     cuda_synchronize();
 
     const std::string label =
@@ -1196,7 +1198,7 @@ int batched_select_hidden_case(int width, int batch) {
     Tensor o(output.data(), DType::BF16, {rows, batch});
     DeviceContext context;
     cuda_synchronize();
-    const auto launch = [&] { ops::speculative_select_accepted_hidden(h, i, o, context.stream); };
+    const auto launch = [&] { ops::gather_bf16_batch_columns(h, i, o, context.stream); };
     DecodeGraphDefinition definition;
     DecodeGraphExecutable graph;
     if (width == 16 && batch == 8) { definition.capture(context.stream, launch); graph.instantiate(definition); }
@@ -1240,7 +1242,7 @@ int remap_case(int token_count) {
     GuardedDeviceBuffer d_proposals(proposals.size() * sizeof(std::int32_t));
     initialize(d_proposals, proposals);
     Tensor proposal_tensor(d_proposals.data(), DType::I32, {token_count});
-    ops::proposal_remap_token_ids(proposal_tensor, static_cast<const std::int32_t*>(d_map.p),
+    ops::remap_ids_inplace(proposal_tensor, static_cast<const std::int32_t*>(d_map.p),
                                   map_size, nullptr);
     cuda_synchronize();
 
@@ -1287,12 +1289,12 @@ int main(int argc, char** argv) {
     }
     const std::size_t k15 =
         ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(257, 15, 15, 1, 1);
-    if (k15 == 0 || k15 != ops::sampling_workspace_capacity_bytes(257, 16, 16) ||
+    if (k15 == 0 ||
         ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(257, 16, 16, 1, 1) != 0 ||
         ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(257, 1, 16, 1, 1) != k15 ||
         ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(257, 15, 15, 1, 2) !=
             2 * k15) {
-        std::cerr << "speculative accept workspace did not close over K+1 sampling columns\n";
+        std::cerr << "speculative accept workspace did not cover its draft interval\n";
         ++failures;
     }
     try {

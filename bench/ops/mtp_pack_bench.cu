@@ -1,6 +1,6 @@
 // Public benchmark for exact MTP tensor transforms.
 
-#include "ninfer/ops/mtp_pack.h"
+#include "ninfer/ops/indexing.h"
 
 #include "ninfer_bench_common.h"
 
@@ -47,11 +47,11 @@ void run_pack(int hidden, int tokens) {
     const double bytes  = 4.0 * input_elements * sizeof(std::uint16_t);
     const Result result = bench_loop(
         [&](cudaStream_t stream) {
-            ops::mtp_pack_fc_input(embedding_tensor, hidden_tensor, output_tensor, stream);
+            ops::concat_bf16_features(embedding_tensor, hidden_tensor, output_tensor, stream);
         },
         bytes);
     char label[96];
-    std::snprintf(label, sizeof(label), "mtp_pack_fc_input D=%d T=%d", hidden, tokens);
+    std::snprintf(label, sizeof(label), "concat_bf16_features D=%d T=%d", hidden, tokens);
     print_result(label, result);
 }
 
@@ -74,12 +74,12 @@ void run_split(int tokens) {
     const double bytes  = 2.0 * input_elements * sizeof(std::uint16_t);
     const Result result = bench_loop(
         [&](cudaStream_t stream) {
-            ops::mtp_split_attn_in(input_tensor, query_tensor, key_tensor, gate_tensor,
+            ops::split_bf16_features(input_tensor, query_tensor, key_tensor, gate_tensor,
                                    value_tensor, stream);
         },
         bytes);
     char label[96];
-    std::snprintf(label, sizeof(label), "mtp_split_attn_in T=%d", tokens);
+    std::snprintf(label, sizeof(label), "split_bf16_features T=%d", tokens);
     print_result(label, result);
 }
 

@@ -1,4 +1,4 @@
-#include "ninfer/ops/mtp_round.h"
+#include "ninfer/ops/sequence.h"
 #include "ops/op_tester.h"
 
 #include <algorithm>
@@ -91,7 +91,7 @@ int run_case(int k, const std::vector<std::int32_t>& accepted) {
     Tensor t_positions(d_positions.data(), DType::I32, {batch, steps});
     Tensor t_rope_positions(d_rope_positions.data(), DType::I32, {batch, steps});
     Tensor t_valid(d_valid.data(), DType::I32, {batch, steps});
-    ops::mtp_prepare_next_round(t_verify, t_anchors, t_accepted, t_frontiers, t_budgets, t_licensed,
+    ops::prepare_autoregressive_round(t_verify, t_anchors, t_accepted, t_frontiers, t_budgets, t_licensed,
                                 t_rope_deltas, t_alignment, t_extents, t_positions,
                                 t_rope_positions, t_valid, max_context, nullptr);
     cuda_synchronize();

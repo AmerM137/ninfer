@@ -20,7 +20,7 @@
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/sliding_window_attention.h"
 #include "ninfer/ops/softmax_attention.h"
-#include "ninfer/ops/speculative_round.h"
+#include "ninfer/ops/speculative_accept.h"
 #include <algorithm>
 #include <initializer_list>
 #include <limits>

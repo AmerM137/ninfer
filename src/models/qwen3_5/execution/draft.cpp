@@ -20,15 +20,13 @@
 #include "ninfer/ops/linear_add.h"
 #include "ninfer/ops/linear_pair.h"
 #include "ninfer/ops/linear_swiglu.h"
-#include "ninfer/ops/prepare_masked_block.h"
-#include "ninfer/ops/prepare_ragged_prefix.h"
+#include "ninfer/ops/sequence.h"
 #include "ninfer/ops/rmsnorm.h"
 #include "ninfer/ops/rope.h"
 #include "ninfer/ops/scalar.h"
 #include "ninfer/ops/indexing.h"
 #include "ninfer/ops/sliding_window_attention.h"
 #include "ninfer/ops/softmax_attention.h"
-#include "ninfer/ops/speculative_round.h"
 
 #include <cuda_runtime.h>
 
@@ -555,7 +553,7 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& f
                     : dimension(state.execution.parameters.model.resources().public_token_count),
                 state.execution.device.stream);
             if (proposal.token_ids)
-                ops::proposal_remap_token_ids(
+                ops::remap_ids_inplace(
                     flat_drafts, static_cast<const std::int32_t*>(proposal.token_ids->data),
                     dimension(proposal.rows), state.execution.device.stream);
         }
@@ -630,7 +628,7 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
             } else {
                 state.drafts_ready.record(state.execution.device.stream);
             }
-            ops::speculative_prepare_verify_inputs(anchors, drafts, frontiers, extents, verify_ids,
+            ops::prepare_verify_inputs(anchors, drafts, frontiers, extents, verify_ids,
                                                    target_positions, state.execution.device.stream);
         }
 

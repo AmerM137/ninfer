@@ -18,17 +18,14 @@
 #include "ninfer/ops/gdn_input_proj.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/kv_cache_append.h"
-#include "ninfer/ops/speculative_round.h"
 #include "ninfer/ops/linear_add.h"
 #include "ninfer/ops/linear_pair.h"
 #include "ninfer/ops/linear_swiglu.h"
-#include "ninfer/ops/mtp_pack.h"
+#include "ninfer/ops/indexing.h"
 #include "ninfer/ops/position.h"
 #include "ninfer/ops/residual_add.h"
-#include "ninfer/ops/rmsnorm.h"
 #include "ninfer/ops/rope.h"
 #include "ninfer/ops/sparse_moe.h"
-#include "ninfer/ops/indexing.h"
 #include "ninfer/ops/scalar.h"
 #include "ninfer/ops/sigmoid_mul.h"
 #include "ninfer/ops/silu_mul.h"
@@ -309,7 +306,7 @@ void TextContext::mtp_forward_stem(const Tensor& ids, const Tensor& hidden,
     ops::rmsnorm(flat_hidden, mtp_->hidden_norm, config_.rms_norm_eps, true, h, s);
 
     Tensor fc_in = roots.packed_input;
-    ops::mtp_pack_fc_input(e, h, fc_in, s);
+    ops::concat_bf16_features(e, h, fc_in, s);
 
     x = roots.residual;
     project(fc_in, mtp_->input_projection, x, work_, s);
@@ -575,7 +572,7 @@ void TextContext::proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& 
                         : dimension(parameters_.model.resources().public_token_count),
                     ctx_.stream);
         if (proposal_head_ids_ != nullptr) {
-            ops::proposal_remap_token_ids(proposal_tokens, proposal_head_ids_, proposal_head_n_,
+            ops::remap_ids_inplace(proposal_tokens, proposal_head_ids_, proposal_head_n_,
                                           ctx_.stream);
         }
     } else {

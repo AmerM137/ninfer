@@ -1,6 +1,6 @@
+#include "ninfer/ops/indexing.h"
 // Public benchmark for the registered proposal token-id remap.
 
-#include "ninfer/ops/speculative_round.h"
 
 #include "ninfer_bench_common.h"
 
@@ -42,7 +42,7 @@ void run(int tokens) {
     const Result result = bench_loop_prepared(
         [&](cudaStream_t stream) { initial.restore(stream); },
         [&](cudaStream_t stream) {
-            ops::proposal_remap_token_ids(proposal_tensor, static_cast<const std::int32_t*>(map.p),
+            ops::remap_ids_inplace(proposal_tensor, static_cast<const std::int32_t*>(map.p),
                                           kMapSize, stream);
         },
         static_cast<double>(tokens) * 3.0 * sizeof(std::int32_t));

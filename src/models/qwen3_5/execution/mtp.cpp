@@ -3,7 +3,7 @@
 #include "core/layout.h"
 #include "ninfer/ops/linear_split.h"
 #include "ninfer/ops/linear_pair.h"
-#include "ninfer/ops/mtp_pack.h"
+#include "ninfer/ops/indexing.h"
 
 #include <algorithm>
 
@@ -76,7 +76,7 @@ void mtp_projection(const Tensor& hidden, const MtpProjectionParameters& paramet
         gate.view({dimension(config.head_dim), dimension(config.num_attention_heads), columns});
     Tensor v =
         value.view({dimension(config.head_dim), dimension(config.num_key_value_heads), columns});
-    ops::mtp_split_attn_in(packed, q, k, g, v, stream);
+    ops::split_bf16_features(packed, q, k, g, v, stream);
 }
 
 void mtp_kv_projection(const Tensor& hidden, const MtpProjectionParameters& parameters,

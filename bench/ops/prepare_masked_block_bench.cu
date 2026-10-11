@@ -1,6 +1,6 @@
 // Public-Op benchmark for the exact anchor-and-mask block transform.
 
-#include "ninfer/ops/prepare_masked_block.h"
+#include "ninfer/ops/sequence.h"
 
 #include "core/device.h"
 #include "ninfer_bench_common.h"

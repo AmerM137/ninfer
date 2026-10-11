@@ -1,6 +1,6 @@
 #include "core/device.h"
 #include <algorithm>
-#include "ninfer/ops/prepare_masked_block.h"
+#include "ninfer/ops/sequence.h"
 #include "ops/op_tester.h"
 
 #include <array>

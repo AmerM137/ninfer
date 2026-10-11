@@ -1,5 +1,5 @@
 // Measures one public prepare_ragged_prefix call, including values, positions and counts.
-#include "ninfer/ops/prepare_ragged_prefix.h"
+#include "ninfer/ops/sequence.h"
 #include "core/device.h"
 #include "ninfer_bench_common.h"
 

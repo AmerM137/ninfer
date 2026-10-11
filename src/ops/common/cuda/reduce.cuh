@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cuda_runtime.h>
+#include <math_constants.h>
 
 #include <climits>
 #include <cstdint>
@@ -127,6 +128,85 @@ __device__ __forceinline__ float score_from_order_key(std::uint64_t key) {
 __device__ __forceinline__ std::int32_t id_from_order_key(std::uint64_t key) {
     if (key == 0) { return INT_MAX; }
     return static_cast<std::int32_t>(0xffffffffu - static_cast<std::uint32_t>(key));
+}
+
+__device__ inline unsigned long long block_reduce_max_key(unsigned long long key,
+                                                          unsigned long long* warp_keys) {
+    constexpr unsigned int kMask = 0xffffffffu;
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        const unsigned long long other = __shfl_down_sync(kMask, key, offset);
+        if (other > key) { key = other; }
+    }
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    if (lane == 0) { warp_keys[warp] = key; }
+    __syncthreads();
+    key = (warp == 0 && lane < (blockDim.x >> 5)) ? warp_keys[lane] : 0ull;
+    if (warp == 0) {
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            const unsigned long long other = __shfl_down_sync(kMask, key, offset);
+            if (other > key) { key = other; }
+        }
+    }
+    return key;
+}
+
+__device__ __forceinline__ bool score_id_better(float value, std::int32_t index, float best_value,
+                                                std::int32_t best_index) {
+    return value > best_value || (value == best_value && index < best_index);
+}
+
+__device__ __forceinline__ void warp_reduce_argmax(float& value, std::int32_t& index) {
+    constexpr unsigned int kMask = 0xffffffffu;
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        const float other_value        = __shfl_down_sync(kMask, value, offset);
+        const std::int32_t other_index = __shfl_down_sync(kMask, index, offset);
+        if (score_id_better(other_value, other_index, value, index)) {
+            value = other_value;
+            index = other_index;
+        }
+    }
+}
+
+__device__ __forceinline__ void block_reduce_argmax(float& value, std::int32_t& index) {
+    __shared__ float warp_values[16];
+    __shared__ std::int32_t warp_indices[16];
+
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    warp_reduce_argmax(value, index);
+    if (lane == 0) {
+        warp_values[warp]  = value;
+        warp_indices[warp] = index;
+    }
+    __syncthreads();
+
+    value = (lane < (blockDim.x >> 5)) ? warp_values[lane] : -CUDART_INF_F;
+    index = (lane < (blockDim.x >> 5)) ? warp_indices[lane] : INT32_MAX;
+    if (warp == 0) { warp_reduce_argmax(value, index); }
+}
+
+template <int BlockSize>
+__device__ __forceinline__ float block_max_broadcast(float value) {
+    static_assert(BlockSize >= kWarpSize && BlockSize <= 1024);
+    static_assert((BlockSize & (BlockSize - 1)) == 0);
+    constexpr int kWarps = BlockSize / kWarpSize;
+    __shared__ float warp_maxima[kWarps];
+    __shared__ float result;
+
+    const int lane = static_cast<int>(threadIdx.x) & (kWarpSize - 1);
+    const int warp = static_cast<int>(threadIdx.x) / kWarpSize;
+    value          = warp_max(value);
+    if (lane == 0) { warp_maxima[warp] = value; }
+    __syncthreads();
+
+    if (warp == 0) {
+        value = lane < kWarps ? warp_maxima[lane] : -CUDART_INF_F;
+        value = warp_max(value);
+        if (lane == 0) { result = value; }
+    }
+    __syncthreads();
+    return result;
 }
 
 } // namespace ninfer::ops::common
