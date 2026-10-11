@@ -1,5 +1,6 @@
 #include "models/qwen3_5/frontend/frontend.h"
 #include "models/qwen3_5/frontend/resources.h"
+#include "core/cpu/system.h"
 
 #include "models/qwen3_5/frontend/chat_template.h"
 #include "models/qwen3_5/frontend/digest.h"
@@ -2590,6 +2591,22 @@ int test_media_preparation_cancellation() {
     return check(false, "cancelled media preparation completed successfully");
 }
 
+int test_media_auto_threads_respect_affinity() {
+    ninfer::CpuTopology topology;
+    std::exception_ptr error;
+    std::uint32_t threads = 0;
+    std::thread worker([&] {
+        try {
+            const std::array cpu{topology.info().processors.front().cpu};
+            ninfer::bind_current_thread(topology, cpu);
+            fi::MediaPreprocessCache cache(0, 1ULL << 20);
+            threads = cache.stats().preprocess_threads;
+        } catch (...) { error = std::current_exception(); }
+    });
+    worker.join();
+    return check(!error && threads == 1, "automatic media pool ignored the allowed CPU affinity");
+}
+
 } // namespace
 
 int main() {
@@ -2642,6 +2659,7 @@ int main() {
     failures += test_media_cache_runs_independent_misses_in_parallel();
     failures += test_many_images_prepare_in_one_parallel_batch();
     failures += test_media_preparation_cancellation();
+    failures += test_media_auto_threads_respect_affinity();
     failures += test_invalid_media_classification();
     failures += test_disabled_vision();
     return failures == 0 ? 0 : 1;

@@ -4,6 +4,13 @@ add_executable(ninfer_public_api_test "${CMAKE_CURRENT_LIST_DIR}/../test_public_
 target_include_directories(ninfer_public_api_test PRIVATE ${PROJECT_SOURCE_DIR}/include)
 add_test(NAME ninfer_public_api_test COMMAND ninfer_public_api_test)
 
+foreach(part IN ITEMS system task_pool executor)
+  ninfer_add_test(ninfer_cpu_${part}_test
+    SOURCES "${CMAKE_CURRENT_LIST_DIR}/../cpu/test_${part}.cpp"
+    LIBRARIES ninfer_cpu)
+  set_tests_properties(ninfer_cpu_${part}_test PROPERTIES TIMEOUT 30)
+endforeach()
+
 ninfer_add_test(ninfer_device_test       SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_device.cpp"
   LIBRARIES ninfer_core)
 

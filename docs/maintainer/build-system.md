@@ -27,7 +27,10 @@ pytest suites and conversion/evaluation scripts run separately from CMake and CT
 
 CUDA 13.1 and Python 3.11 describe the maintained environment, not configuration version gates.
 CMake also discovers FFmpeg without imposing library version floors. Actual language/API support
-is exercised by compilation and tests. The libcurl 7.85 minimum has a concrete API basis:
+is exercised by compilation and tests. CPU facilities target Linux x86-64 and use hwloc >= 2.5
+for topology discovery without changing the caller's binding. The internal `ninfer_cpu` target
+is ordinary C++, links hwloc/Threads, and can run its tests without CUDA initialization or linkage.
+The libcurl 7.85 minimum has a concrete API basis:
 media acquisition uses `CURLOPT_PROTOCOLS_STR` and `CURLOPT_REDIR_PROTOCOLS_STR`, introduced in
 [that release](https://curl.se/libcurl/c/CURLOPT_PROTOCOLS_STR.html).
 

@@ -1,6 +1,6 @@
 #include "models/qwen3_5/frontend/media_cache.h"
 
-#include "core/host_worker_pool.h"
+#include "core/cpu/task_pool.h"
 
 #include <algorithm>
 #include <chrono>
@@ -11,7 +11,6 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
-#include <thread>
 #include <unordered_map>
 #include <utility>
 
@@ -70,9 +69,12 @@ std::size_t payload_bytes(const PreparedMedia& media) {
 }
 
 std::uint32_t resolve_threads(std::uint32_t requested) {
+    if (requested > 64) {
+        throw std::invalid_argument("media preprocessing threads must be in [1,64]");
+    }
     if (requested != 0) { return requested; }
-    const unsigned detected = std::thread::hardware_concurrency();
-    return std::min<std::uint32_t>(detected == 0 ? 1U : detected, 16U);
+    const CpuTopology topology;
+    return static_cast<std::uint32_t>(std::min<std::size_t>(topology.info().processors.size(), 16));
 }
 
 } // namespace
@@ -179,13 +181,10 @@ struct MediaPreprocessCache::Impl {
               maximum_request_bytes == 0
                   ? 1
                   : std::max<std::size_t>(1, live_capacity_bytes / maximum_request_bytes))),
-          workers(std::make_shared<HostWorkerPool>(threads,
-                                                   std::max<std::size_t>(64, threads * 8ULL))) {
+          workers(TaskPoolOptions{.threads        = threads,
+                                  .queue_capacity = std::max<std::size_t>(64, threads * 8ULL)}) {
         if (live_capacity_bytes == 0) {
             throw std::invalid_argument("media live-byte capacity must be nonzero");
-        }
-        if (threads == 0 || threads > 64) {
-            throw std::invalid_argument("media preprocessing threads must be in [1,64]");
         }
         if (maximum_request_bytes > live_capacity_bytes) {
             throw std::invalid_argument(
@@ -241,7 +240,7 @@ struct MediaPreprocessCache::Impl {
     const std::uint32_t threads;
     std::shared_ptr<State> state;
     std::shared_ptr<MediaPreparationGate> request_gate;
-    std::shared_ptr<HostWorkerPool> workers;
+    TaskPool workers;
 };
 
 MediaPreprocessCache::MediaPreprocessCache(std::size_t capacity_bytes,
@@ -302,7 +301,7 @@ PendingMedia MediaPreprocessCache::begin_prepare(const MediaCacheKey& key,
     try {
         auto state  = impl_->state;
         auto flight = pending.flight;
-        (void)impl_->workers->submit(
+        impl_->workers.enqueue(
             [state = std::move(state), key, control, builder = std::move(builder),
              flight = std::move(flight)]() mutable {
                 PreparedMedia built;
@@ -417,11 +416,11 @@ MediaCacheStats MediaPreprocessCache::stats() const {
         out.evictions           = impl_->state->evictions;
         out.oversize_bypasses   = impl_->state->oversize_bypasses;
     }
-    out.live_bytes                         = impl_->state->account->current();
-    const HostWorkerPool::Snapshot workers = impl_->workers->snapshot();
-    out.preprocess_threads                 = workers.threads;
-    out.queued_tasks                       = workers.queued;
-    out.active_tasks                       = workers.active;
+    out.live_bytes                   = impl_->state->account->current();
+    const TaskPool::Snapshot workers = impl_->workers.snapshot();
+    out.preprocess_threads           = workers.threads;
+    out.queued_tasks                 = workers.queued;
+    out.active_tasks                 = workers.active;
     return out;
 }
 

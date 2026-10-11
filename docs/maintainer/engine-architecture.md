@@ -152,6 +152,28 @@ Reader、binder、原生参数准备、容量查询、warmup 和执行各自检�
 排序及完成后的复用；Tensor 和 span 不携带“已就绪”状态。KV 等有专用布局的传输保留其专用接口。
 这些基础类型允许 CPU 数据参与编排；现有模型执行和 CUDA Ops 仍在 GPU 上运行。
 
+### 2.7 CPU 执行基础
+
+`CpuTopology` 记录发现线程允许使用的 OS CPU、物理核和可见缓存关系，不改变线程绑定。
+线程数量与 affinity 在创建资源前解析；Core 消费明确配置，不自行选择模型计算分工。
+媒体的自动线程数使用允许的 CPU 数量，保持最多 16 个 worker。
+
+`TaskPool` 为独立任务提供固定线程和有界 FIFO。Frontend 媒体准备与 HTTP 使用同一实现的
+独立实例；HTTP 可以等待媒体，二者不共享队列。立即提交被拒绝时不消费任务；阻塞提交在
+等待容量时允许调用方检查取消。任务拥有结果和异常通道，池不额外创建 future。关闭先停止
+新提交，再排空已接受任务并 join；拥有者在销毁前结束所有外部调用。
+
+`CpuExecutor` 拥有固定绑核计算团队，由它产生借用的 `CpuExecutionView`。团队实际 ISA 是
+各 worker 绑核后检测结果的交集。同步 collective 向全队发布同一次工作，返回时全部写入
+对调用者可见；提交线程不参与计算。同一团队不接受嵌套或并发 collective。worker 使用
+nearest-even、屏蔽异常和 gradual underflow，计算保留控制模式，算法的指令数值特性由 Op
+负责。团队只提供 rank、连续范围分工与全队 barrier；scratch 由调用者用现有 HostBuffer、
+MemoryArena 和布局类型管理，进入团队前完成划分。
+
+两种执行器共享启动确认、初始化失败清理和线程回收机制。CPU 团队不调用 CUDA，也不持有
+传输槽、模型状态或权重副本。Engine/Scoring 的控制线程继续拥有各自的工作循环。
+当前 CPU 团队独立可用，尚未接入模型计算或 MoE offload。
+
 ## 3. 请求生命周期
 
 ```mermaid

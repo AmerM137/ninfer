@@ -33,6 +33,15 @@ the same fixture, seed, cache policy, and timing mode.
 and `models/qwen3_5/`. All executables remain under `build/bench/`; the Op registration helper
 lives in `cmake/NinferBenchmarks.cmake`.
 
+`ninfer_cpu_execution_bench` measures synchronous collective dispatch and eight team barriers.
+For example: `./build/bench/ninfer_cpu_execution_bench --workers 8 --samples 500 --idle-us 1000`.
+Workers select physical cores from the allowed topology; `--caller-cpu ID` optionally binds the
+submitter. The benchmark prints actual affinity and ISA facts and P50/P95/max call latency.
+Process CPU/wall cost is averaged over a separate run lasting at least 250 ms at the same cadence,
+including each post-call idle interval; `cpu_calls` is that run's call count. This avoids interpreting
+sub-millisecond OS accounting samples as steady CPU cost. Setup and warmup are excluded.
+These are scheduling costs, not CPU arithmetic throughput or model performance.
+
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DNINFER_BUILD_BENCHMARKS=ON
 cmake --build build -j --target ninfer_bench

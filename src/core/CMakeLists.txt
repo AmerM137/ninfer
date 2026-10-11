@@ -1,3 +1,16 @@
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR
+   NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
+  message(FATAL_ERROR "NInfer CPU execution currently requires Linux x86-64")
+endif()
+
+add_library(ninfer_cpu STATIC
+  cpu/system.cpp
+  cpu/task_pool.cpp
+  cpu/executor.cpp
+)
+ninfer_internal_includes(ninfer_cpu)
+target_link_libraries(ninfer_cpu PRIVATE PkgConfig::HWLOC Threads::Threads)
+
 add_library(ninfer_core STATIC
   arena.cpp
   buffer.cpp
@@ -7,7 +20,6 @@ add_library(ninfer_core STATIC
   transfer.cu
   device.cu
   dtype.cpp
-  host_worker_pool.cpp
   gdn_replay_records.cpp
   cyclic_kv_cache.cpp
   host_context_arena.cpp
@@ -21,4 +33,4 @@ add_library(ninfer_core STATIC
 )
 ninfer_internal_includes(ninfer_core)
 ninfer_cuda_archive(ninfer_core)
-target_link_libraries(ninfer_core PUBLIC CUDA::cudart CUDA::nvtx3 Threads::Threads)
+target_link_libraries(ninfer_core PUBLIC ninfer_cpu CUDA::cudart CUDA::nvtx3 Threads::Threads)

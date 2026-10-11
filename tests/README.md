@@ -16,6 +16,7 @@ ownership contracts are defined in [Engine architecture](../docs/maintainer/engi
 - `ops/` — semantic Op qualification with independent mathematical or state-transition oracles;
   Linear and fused Linear suites are separated by their supported weight/activation paths;
 - `runtime/` — scheduler fairness, cache resource policy, capacity and context-cost calculations;
+- `cpu/` — topology/ISA, bounded task admission, bound collectives, publication and shutdown;
 - `bench/ttft/` — HTTP measurements, campaign orchestration and workload construction;
 - root C++ tests — core storage, public API, serving protocols, logging, benchmark reports and
   causal-scoring evaluation;
@@ -61,6 +62,11 @@ After building, `ctest --preset dev` runs the same CTest suite. See
 [Build system](../docs/maintainer/build-system.md) for local interpreter presets.
 
 The chat-template reference test uses Python Jinja2.
+
+CPU foundation tests link only the C++ `ninfer_cpu` target and need no GPU:
+`ctest --test-dir build -R '^ninfer_cpu_.*_test$' --output-on-failure`.
+The memory test also exercises CPU Tensor/arena computation. Frontend and HTTP transport tests
+cover the task-pool consumers, including restricted media affinity and HTTP queue saturation.
 
 Run a focused target for a localized change:
 
