@@ -180,10 +180,10 @@ __global__ void gate_up_token_kernel(
         // Routed paths need selection's ids. A shared path is independent only when its output lies
         // beyond the partial-score prefix that selection may still read from the lifetime-unioned
         // scratch.
-        const bool must_wait_for_s2 =
+        const bool must_wait_for_selection =
             path < kTopK || activation_begin < tokens * kRouterRows * kRouterPartitions;
         if constexpr (!Adaptive) {
-            if (must_wait_for_s2) { pdl::wait_for_dependencies(); }
+            if (must_wait_for_selection) { pdl::wait_for_dependencies(); }
         }
         float gate = 0.0f;
         float up   = 0.0f;

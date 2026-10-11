@@ -253,8 +253,8 @@ its formula.
 ## 4. Implementation organization
 
 Organize implementations under `src/ops/<family>/` and meaningful algorithm subdirectories.
-Do not add new work to the global `wrapper/`, `launcher/`, or `kernel/` directories. Existing
-families outside the examples below are migrated when their implementation is taken up.
+Entries, selectors, launchers and kernels belong to their semantic family; do not create
+global `wrapper/`, `launcher/`, or `kernel/` directories.
 
 ### 4.1 Responsibilities and selection
 

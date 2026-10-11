@@ -400,34 +400,45 @@ int main() {
         }
     }
 
-    ninfer::Engine engine(dflash_engine_options(artifact, ninfer::ProposalHead::Optimized, 4352));
-    if (const int result = verify_dflash_load(engine); result != 0) { return result; }
-    ninfer::test::speculative_page_boundary(engine);
-    engine.reset_memory_peaks();
-    const ninfer::GenerationResult dflash =
-        engine.generate(engine.prepare_tokens(prompt), greedy_options(24, false));
-    if (dflash.generated_token_ids.size() != 24 ||
-        dflash.finish_reason != ninfer::FinishReason::OutputLimit) {
-        std::cerr << "optimized-head DFlash Graph request did not complete\n";
-        return 1;
+    {
+        ninfer::Engine engine(dflash_engine_options(artifact, ninfer::ProposalHead::Optimized, 4352));
+        if (const int result = verify_dflash_load(engine); result != 0) { return result; }
+        ninfer::test::speculative_page_boundary(engine);
+        engine.reset_memory_peaks();
+        const ninfer::GenerationResult dflash =
+            engine.generate(engine.prepare_tokens(prompt), greedy_options(24, false));
+        if (dflash.generated_token_ids.size() != 24 ||
+            dflash.finish_reason != ninfer::FinishReason::OutputLimit) {
+            std::cerr << "optimized-head DFlash Graph request did not complete\n";
+            return 1;
+        }
+        const ninfer::MemorySummary memory = engine.memory_summary();
+        if (memory.workspace_logical_peak_bytes == 0 ||
+            memory.workspace_logical_peak_bytes > memory.workspace.capacity_bytes) {
+            std::cerr << "DFlash request did not report a valid planned workspace phase\n";
+            return 1;
+        }
+        if (dflash.speculative.backend != ninfer::SpeculativeBackend::DFlash ||
+            dflash.speculative.rounds == 0) {
+            std::cerr << "DFlash fixture did not execute speculative decode\n";
+            return 1;
+        }
+        if (const int result = exercise_partial_terminal(engine, prompt, dflash.generated_token_ids);
+            result != 0) {
+            return result;
+        }
     }
-    const ninfer::MemorySummary memory = engine.memory_summary();
-    if (memory.workspace_logical_peak_bytes == 0 ||
-        memory.workspace_logical_peak_bytes > memory.workspace.capacity_bytes) {
-        std::cerr << "DFlash request did not report a valid planned workspace phase\n";
-        return 1;
+
+    // Restore fixtures need their own optional cache points. The page-boundary fixture above
+    // leaves reused points that may legitimately win retention under the same slot budget.
+    {
+        ninfer::Engine engine(dflash_engine_options(artifact, ninfer::ProposalHead::Optimized, 4352));
+        if (const int result = exercise_boundary_restore(engine); result != 0) { return result; }
     }
-    if (dflash.speculative.backend != ninfer::SpeculativeBackend::DFlash ||
-        dflash.speculative.rounds == 0) {
-        std::cerr << "DFlash fixture did not execute speculative decode\n";
-        return 1;
+    {
+        ninfer::Engine engine(dflash_engine_options(artifact, ninfer::ProposalHead::Optimized, 4352));
+        if (const int result = exercise_long_boundary_restore(engine); result != 0) { return result; }
     }
-    if (const int result = exercise_boundary_restore(engine); result != 0) { return result; }
-    if (const int result = exercise_partial_terminal(engine, prompt, dflash.generated_token_ids);
-        result != 0) {
-        return result;
-    }
-    if (const int result = exercise_long_boundary_restore(engine); result != 0) { return result; }
 
     std::cout << "ok\n";
     return 0;

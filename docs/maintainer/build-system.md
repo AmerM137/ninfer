@@ -88,8 +88,8 @@ manifests which use `target_sources(<owner> PRIVATE ...)`. Included manifests an
 with `CMAKE_CURRENT_LIST_DIR`; `include()` does not change `CMAKE_CURRENT_SOURCE_DIR`.
 
 - Every implementation under `src/` has one target owner and one explicit registration.
-- Ops register implementations through their owning family manifests. `basic_sources.cmake`
-  retains the horizontal implementations awaiting family migration.
+- Ops register implementations through their owning family manifests. Shared weight-input
+  preparation and compile policy are owned by `src/ops/CMakeLists.txt`.
 - Linear separates shared kernel and projection manifests. Format manifests list explicit sources
   and shape filenames with their actual `.cpp`/`.cu` extensions.
 - Models separate loading, frontend, execution and Program source lists while retaining the

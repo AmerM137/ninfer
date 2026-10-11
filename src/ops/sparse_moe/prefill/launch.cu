@@ -86,7 +86,7 @@ void launch_prefill(const Tensor& x, const SparseMoeWeights& weights, Tensor& de
                                  GateUpSchedule::Paths3, stream, route_job_count);
             launch_token_down(weights, output_slice, ids, alpha, shared_scale, adaptive_activations,
                               tokens, DownSchedule::Rows4, stream, route_job_count);
-            // adaptive implies a Q5/Q6 routed down, and prefill_min_tokens admits those only
+            // adaptive implies a Q5/Q6 routed down, and the selected codec profile admits those only
             // with a Q4 routed gate/up, so this path is always the indexed one.
             sparse_moe_prefill_index_kernel<true><<<index_blocks, kExpertThreads, 0, stream>>>(
                 ids, local_rank, packed_index, tile_bases, packed_token, assignments,
