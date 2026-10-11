@@ -39,8 +39,8 @@ __host__ __device__ constexpr int square_index(int row, int col) {
 }
 
 inline std::size_t chunked_workspace_bytes(int value_heads, int tokens) {
-    return Tensor(nullptr, DType::U8,
-                  {static_cast<int>(sizeof(Chunk)), chunk_count(tokens), value_heads})
+    return Tensor::metadata(DType::U8,
+                            {static_cast<int>(sizeof(Chunk)), chunk_count(tokens), value_heads})
         .bytes();
 }
 

@@ -1,5 +1,10 @@
 add_library(ninfer_core STATIC
-  arena.cu
+  arena.cpp
+  buffer.cpp
+  buffer.cu
+  memory.cpp
+  transfer.cpp
+  transfer.cu
   device.cu
   dtype.cpp
   host_worker_pool.cpp

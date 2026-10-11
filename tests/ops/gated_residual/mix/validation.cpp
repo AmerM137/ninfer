@@ -15,10 +15,10 @@ int rejects(const char* label, Call&& call) {
 }
 } // namespace
 
-int validate(Weights& w, std::span<const Column> ref, DeviceExecutionView e) {
-    Fixture f(w, 2, e);
+int validate(Weights& w, std::span<const Column> ref, CudaExecutionView e) {
+    Fixture f(w, 2);
     const auto catalog = input_catalog(w.pattern);
-    f.upload(catalog, e.stream);
+    f.upload(catalog, e.stream());
     int failed = 0;
     std::vector<Tensor*> tensors{&f.z, &f.x};
     if (w.kind == Kind::Block) tensors.push_back(&f.j);
@@ -47,17 +47,18 @@ int validate(Weights& w, std::span<const Column> ref, DeviceExecutionView e) {
         f.z.ne[2] = m;
         failed += rejects("nonpositive M", [&] { f.invoke(e); });
     }
-    f.z.ne[2] = f.columns;
-    failed += rejects("SM count", [&] { f.invoke({e.stream, 0}); });
-    failed += rejects("query SM count", [&] { (void)f.query(1, 2, {e.stream, 0}); });
+    f.z.ne[2]  = f.columns;
+    f.z.device = Device::cpu();
+    failed += rejects("operand device", [&] { f.invoke(e); });
+    f.z.device = e.device();
     for (auto bounds : {std::pair{0, 1}, std::pair{-1, 1}, std::pair{2, 1}})
-        failed += rejects("query interval", [&] { (void)f.query(bounds.first, bounds.second, e); });
+        failed += rejects("query interval", [&] { (void)f.query(bounds.first, bounds.second); });
 
     for (Weight* weight : {&w.down, &w.up}) {
         const auto saved   = *weight;
         const auto invalid = [&] {
             failed += rejects("weight execution", [&] { f.invoke(e); });
-            failed += rejects("weight query", [&] { (void)f.query(1, 2, e); });
+            failed += rejects("weight query", [&] { (void)f.query(1, 2); });
         };
         weight->qtype = QType::FP32;
         invalid();
@@ -80,7 +81,7 @@ int validate(Weights& w, std::span<const Column> ref, DeviceExecutionView e) {
         weight->qdata = nullptr;
         failed += rejects("weight backing", [&] { f.invoke(e); });
         // A capacity query reads host metadata and does not need device backing.
-        if (f.query(1, 2, e) == 0) ++failed;
+        if (f.query(1, 2) == 0) ++failed;
         *weight       = saved;
         weight->qdata = static_cast<const std::byte*>(weight->qdata) + 2;
         failed += rejects("weight alignment", [&] { f.invoke(e); });
@@ -107,7 +108,7 @@ int validate(Weights& w, std::span<const Column> ref, DeviceExecutionView e) {
         f.j = injection;
     }
 
-    WorkspaceArena too_small(DeviceSpan{f.scratch.data(), f.capacity - 1});
+    MemoryArena too_small(f.scratch.span().subspan(0, f.capacity - 1));
     try {
         if (w.kind == Kind::Block)
             ops::hc_mix(f.z, ops::HcMixWeights{w.down, w.up}, too_small, f.x, f.j, e);
@@ -116,7 +117,7 @@ int validate(Weights& w, std::span<const Column> ref, DeviceExecutionView e) {
         std::cerr << "Mix accepted undersized workspace\n";
         ++failed;
     } catch (const std::bad_alloc&) {}
-    WorkspaceArena overlapping(DeviceSpan{const_cast<void*>(w.down.qdata), f.capacity});
+    MemoryArena overlapping(MemorySpan{const_cast<void*>(w.down.qdata), f.capacity, w.down.device});
     failed += rejects("workspace overlap", [&] {
         if (w.kind == Kind::Block)
             ops::hc_mix(f.z, ops::HcMixWeights{w.down, w.up}, overlapping, f.x, f.j, e);
@@ -130,8 +131,8 @@ int validate(Weights& w, std::span<const Column> ref, DeviceExecutionView e) {
           std::pair{512, 513}, std::pair{672, 673}, std::pair{768, 769}, std::pair{1200, 1201},
           std::pair{1360, 1361}, std::pair{1632, 1633}}) {
         std::size_t maximum = 0;
-        for (int m = first; m <= last; ++m) maximum = std::max(maximum, f.query(m, m, e));
-        if (f.query(first, last, e) != maximum) {
+        for (int m = first; m <= last; ++m) maximum = std::max(maximum, f.query(m, m));
+        if (f.query(first, last) != maximum) {
             std::cerr << "Mix interval capacity does not equal its maximum singleton capacity\n";
             ++failed;
         }
@@ -141,19 +142,19 @@ int validate(Weights& w, std::span<const Column> ref, DeviceExecutionView e) {
     // consumes exactly its queried call-local capacity from the aligned starting position.
     constexpr std::size_t prefix_bytes = 768;
     GuardedDeviceBuffer nested_storage(prefix_bytes + f.capacity);
-    // Guard initialization uses the default stream; e.stream is nonblocking.
+    // Guard initialization uses the default stream; e.stream() is nonblocking.
     cuda_synchronize(nullptr);
-    WorkspaceArena nested(DeviceSpan{nested_storage.data(), nested_storage.bytes()});
+    MemoryArena nested(nested_storage.span());
     const auto prefix = nested.alloc_bytes(prefix_bytes, 256);
     std::vector<std::uint16_t> prefix_words(prefix_bytes / 2, 0x4261);
     cuda_check(cudaMemcpyAsync(prefix.data, prefix_words.data(), prefix_bytes,
-                               cudaMemcpyHostToDevice, e.stream),
+                               cudaMemcpyHostToDevice, e.stream()),
                "Mix enclosing allocation");
     if (w.kind == Kind::Block)
         ops::hc_mix(f.z, ops::HcMixWeights{w.down, w.up}, nested, f.x, f.j, e);
     else
         ops::hc_mix(f.z, ops::HcFinalMixWeights{w.down, w.up}, nested, f.x, e);
-    cuda_synchronize(e.stream);
+    cuda_synchronize(e.stream());
     failed +=
         verify(f, ref, "Mix enclosing arena") + nested_storage.verify_guards("Mix nested arena");
     failed +=
@@ -165,12 +166,12 @@ int validate(Weights& w, std::span<const Column> ref, DeviceExecutionView e) {
     }
 
     // Read-only sharing is legal. Qualify the real computation with z bound to a weight row.
-    Fixture shared(w, 1, e);
+    Fixture shared(w, 1);
     // This case skips upload(), which normally completes default-stream initialization.
     cuda_synchronize(nullptr);
     shared.z.data = const_cast<void*>(w.down.qdata);
     shared.invoke(e);
-    cuda_synchronize(e.stream);
+    cuda_synchronize(e.stream());
     const auto expected = reference_column(w, std::span{w.down_values}.first(kTotal));
     const std::array<Column, 1> shared_ref{expected};
     failed += verify(shared, shared_ref, "Mix shared read-only input/weight");

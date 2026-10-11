@@ -1,4 +1,5 @@
 #include "core/weight.h"
+#include "core/buffer.h"
 #include "ninfer/ops/dynamic_grouped_conv.h"
 
 #include "op_measurement.cuh"
@@ -82,29 +83,31 @@ Options parse_args(int argc, char** argv) {
 }
 
 void run_profile(std::int32_t input_rows, const Options& options, bench::L2FlushBuffer& flush,
-                 cudaStream_t stream) {
+                 CudaExecutionView cuda) {
     DeviceBuffer input = make_bf16(static_cast<std::size_t>(input_rows) * kMaximumWidth * 8, 101U);
     DeviceBuffer base  = make_bf16(static_cast<std::size_t>(kHidden) * kTaps * kSides, 103U);
     DeviceBuffer delta =
         make_bf16(static_cast<std::size_t>(kGroups) * kTaps * kMaximumWidth * 8, 105U);
     DeviceBuffer residual = make_bf16(static_cast<std::size_t>(kHidden) * kMaximumWidth * 8, 107U);
     SavedBuffer residual_initial(residual);
-    const auto restore = [&](cudaStream_t s) { residual_initial.restore(s); };
+    const auto restore = [&](CudaExecutionView cuda) { residual_initial.restore(cuda); };
     PackedQuantizedWeight packed =
         make_row_split_weight(QType::Q8_G32_FP16, kHidden, input_rows, input_rows, 501U);
     const std::size_t capacity =
         ops::linear_dynamic_grouped_conv_add_workspace_capacity_bytes(input_rows, 2, 16, 1, 8);
-    WorkspaceArena workspace(std::max<std::size_t>(capacity, 256));
-    Tensor base_kernel(base.p, DType::BF16, {kHidden, kTaps, kSides});
+    ninfer::DeviceBuffer workspace_storage(ninfer::bench::device_context().device(),
+                                           std::max<std::size_t>(capacity, 256));
+    MemoryArena workspace(workspace_storage.span());
+    Tensor base_kernel(base.span(), DType::BF16, {kHidden, kTaps, kSides});
 
     for (int width = 2; width <= 16; ++width) {
         if (options.width && options.width != width) continue;
         for (std::int32_t batch_size = 1; batch_size <= 8; ++batch_size) {
             if (options.batch_size != 0 && batch_size != options.batch_size) { continue; }
             const std::int32_t cols = width * batch_size;
-            Tensor x(input.p, DType::BF16, {input_rows, width, batch_size});
-            Tensor finish_delta(delta.p, DType::BF16, {kGroups, kTaps, width, batch_size});
-            Tensor residual_view(residual.p, DType::BF16, {kHidden, width, batch_size});
+            Tensor x(input.span(), DType::BF16, {input_rows, width, batch_size});
+            Tensor finish_delta(delta.span(), DType::BF16, {kGroups, kTaps, width, batch_size});
+            Tensor residual_view(residual.span(), DType::BF16, {kHidden, width, batch_size});
             const double flops = 2.0 * static_cast<double>(kHidden) * input_rows * cols;
             const double bytes = static_cast<double>(packed.model_weight_bytes()) +
                                  2.0 * static_cast<double>(input_rows) * cols +
@@ -115,18 +118,18 @@ void run_profile(std::int32_t input_rows, const Options& options, bench::L2Flush
                 TimedGraph graph;
                 workspace.reset();
                 workspace.reset_peak();
-                graph.capture(stream, launch);
+                graph.capture(cuda, launch);
                 const ColdTiming timing = measure_cold_graph_prepared(
-                    restore, graph, flush, stream, options.warmup, options.repeat);
+                    restore, graph, flush, cuda, options.warmup, options.repeat);
                 const double tflops    = flops / timing.median_us / 1.0e6;
                 const double bandwidth = bytes / timing.median_us / 1.0e3;
                 std::printf("%d,%d,%d,%d,%.3f,%.3f,%.3f,%.2f,%.1f,%zu,%zu\n", input_rows, width,
                             batch_size, cols, timing.median_us, timing.min_us, timing.p95_us,
                             tflops, bandwidth, graph.nodes(), workspace.peak_used());
             };
-            measure([&](cudaStream_t capture_stream) {
+            measure([&](CudaExecutionView cuda) {
                 ops::linear_dynamic_grouped_conv_add(x, packed.weight, base_kernel, finish_delta,
-                                                     residual_view, workspace, capture_stream);
+                                                     residual_view, workspace, cuda);
             });
         }
     }
@@ -145,11 +148,12 @@ int main(int argc, char** argv) {
         bench::L2FlushBuffer flush(options.flush_bytes);
         cudaStream_t stream = nullptr;
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+        const auto cuda = ninfer::bench::device_context().execution_view(stream);
         std::printf("C,W,B,T,median_us,min_us,p95_us,effective_tflops,effective_gbs,"
                     "graph_nodes,workspace_bytes\n");
         for (const std::int32_t input_rows : std::array<std::int32_t, 2>{4096, 17408}) {
             if (options.input_rows != 0 && input_rows != options.input_rows) { continue; }
-            run_profile(input_rows, options, flush, stream);
+            run_profile(input_rows, options, flush, cuda);
         }
         CUDA_CHECK(cudaStreamDestroy(stream));
         return 0;

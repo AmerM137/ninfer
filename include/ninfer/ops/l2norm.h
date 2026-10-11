@@ -1,7 +1,7 @@
 #pragma once
 
+#include "core/device.h"
 #include "core/tensor.h"
-#include <cuda_runtime.h>
 
 namespace ninfer::ops {
 
@@ -12,6 +12,6 @@ namespace ninfer::ops {
  * same-shaped contiguous BF16 tensors with disjoint storage. Eps is positive and finite.
  * Writes all of out and preserves x. An empty tensor does no work. No workspace or state is used.
  */
-void l2norm(const Tensor& x, float eps, Tensor& out, cudaStream_t stream);
+void l2norm(const Tensor& x, float eps, Tensor& out, CudaExecutionView execution);
 
 } // namespace ninfer::ops

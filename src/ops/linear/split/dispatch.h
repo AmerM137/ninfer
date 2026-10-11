@@ -5,7 +5,7 @@
 #include <array>
 
 namespace ninfer::ops::detail::linear_split {
-using SplitLaunch   = void (*)(const Tensor&, Weights, std::span<const Tensor>, WorkspaceArena*,
+using SplitLaunch   = void (*)(const Tensor&, Weights, std::span<const Tensor>, MemoryArena*,
                              cudaStream_t);
 using SplitCapacity = std::size_t (*)(LinearPolicy, std::int32_t, std::int32_t);
 

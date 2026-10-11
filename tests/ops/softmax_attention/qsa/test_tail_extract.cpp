@@ -1,4 +1,6 @@
 #include "tail_fixture.h"
+#include "cuda_fixture.h"
+#include "core/buffer.h"
 #include "core/decode_graph.h"
 
 #include <limits>
@@ -27,16 +29,19 @@ int run(DeviceContext& device, int batch, int layout, Binding binding, int capac
         raw_out  = raw_out.slice(2, 1, slots - 1);
         rope_out = rope_out.slice(1, 1, slots - 1);
     }
-    DeviceBuffer source(batch * 4), destination(batch * 4), base(batch * 4), valid(batch * 4),
-        accepted(batch * 4);
+    DeviceBuffer source(ninfer::test::cuda_environment().context.device(), batch * 4);
+    DeviceBuffer destination(ninfer::test::cuda_environment().context.device(), batch * 4);
+    DeviceBuffer base(ninfer::test::cuda_environment().context.device(), batch * 4);
+    DeviceBuffer valid(ninfer::test::cuda_environment().context.device(), batch * 4);
+    DeviceBuffer accepted(ninfer::test::cuda_environment().context.device(), batch * 4);
     const ops::QsaTailStateView input{before.view, first.view,
-                                      Tensor(source.p, DType::I32, {batch})};
+                                      Tensor(source.span(), DType::I32, {batch})};
     const ops::QsaTailStateView output{raw_out, rope_out,
-                                       Tensor(destination.p, DType::I32, {batch})};
+                                       Tensor(destination.span(), DType::I32, {batch})};
     const ops::QsaRawRecordReadView read{records.view, positions.view,
-                                         Tensor(base.p, DType::I32, {batch}),
-                                         Tensor(valid.p, DType::I32, {batch})};
-    const Tensor count(accepted.p, DType::I32, {batch});
+                                         Tensor(base.span(), DType::I32, {batch}),
+                                         Tensor(valid.span(), DType::I32, {batch})};
+    const Tensor count(accepted.span(), DType::I32, {batch});
     DecodeGraphDefinition definition;
     DecodeGraphExecutable graph;
     int failures    = 0;
@@ -103,7 +108,7 @@ int run(DeviceContext& device, int batch, int layout, Binding binding, int capac
         accepted.copy_from_host(counts.data(), batch * 4);
         cuda_synchronize();
         if (phase == 0) {
-            definition.capture(device.stream, [&] {
+            definition.capture(device.stream(), [&] {
                 ops::qsa_tail_extract(input, read, count, output, device.execution_view());
             });
             graph.instantiate(definition);
@@ -111,7 +116,7 @@ int run(DeviceContext& device, int batch, int layout, Binding binding, int capac
         if (phase % 2)
             ops::qsa_tail_extract(input, read, count, output, device.execution_view());
         else
-            graph.launch(device.stream);
+            graph.launch(device.stream());
         device.synchronize();
         const auto label = "QSA tail B=" + std::to_string(batch) +
                            " layout=" + std::to_string(layout) +
@@ -151,31 +156,33 @@ int read_footprint(DeviceContext& device) {
             for (int axis = 0; axis < 3; ++axis) first.host[first.index(axis, 0)] = 0;
         before.upload();
         first.upload();
-        DeviceBuffer raw(capacity * 128 * 2), rope(capacity * 3 * 4), out(128 * 3 * 2),
-            out_rope(3 * 4);
+        DeviceBuffer raw(ninfer::test::cuda_environment().context.device(), capacity * 128 * 2);
+        DeviceBuffer rope(ninfer::test::cuda_environment().context.device(), capacity * 3 * 4);
+        DeviceBuffer out(ninfer::test::cuda_environment().context.device(), 128 * 3 * 2);
+        DeviceBuffer out_rope(ninfer::test::cuda_environment().context.device(), 3 * 4);
         const int end = f0 + a, start = end - end % 4;
         for (int p = std::max(f0, start); p < end; ++p)
-            cuda_check(cudaMemcpy(static_cast<std::uint16_t*>(raw.p) + (p - f0) * 128,
+            cuda_check(cudaMemcpy(static_cast<std::uint16_t*>(raw.data()) + (p - f0) * 128,
                                   records.host.data() + records.index(0, p - f0), 256,
                                   cudaMemcpyHostToDevice),
                        "record column upload");
         if (end % 4 && start >= f0)
-            cuda_check(cudaMemcpy(static_cast<std::int32_t*>(rope.p) + (start - f0) * 3,
+            cuda_check(cudaMemcpy(static_cast<std::int32_t*>(rope.data()) + (start - f0) * 3,
                                   positions.host.data() + positions.index(0, start - f0), 12,
                                   cudaMemcpyHostToDevice),
                        "coordinate upload");
         auto zero = to_device_i32({0}), base = to_device_i32({f0}),
              valid = to_device_i32({capacity}), accepted = to_device_i32({a});
         cuda_synchronize();
-        ops::qsa_tail_extract({before.view, first.view, Tensor(zero.p, DType::I32, {1})},
-                              {Tensor(raw.p, DType::BF16, {128, capacity, 1}),
-                               Tensor(rope.p, DType::I32, {3, capacity, 1}),
-                               Tensor(base.p, DType::I32, {1}), Tensor(valid.p, DType::I32, {1})},
-                              Tensor(accepted.p, DType::I32, {1}),
-                              {Tensor(out.p, DType::BF16, {128, 3, 1}),
-                               Tensor(out_rope.p, DType::I32, {3, 1}),
-                               Tensor(zero.p, DType::I32, {1})},
-                              device.execution_view());
+        ops::qsa_tail_extract(
+            {before.view, first.view, Tensor(zero.span(), DType::I32, {1})},
+            {Tensor(raw.span(), DType::BF16, {128, capacity, 1}),
+             Tensor(rope.span(), DType::I32, {3, capacity, 1}),
+             Tensor(base.span(), DType::I32, {1}), Tensor(valid.span(), DType::I32, {1})},
+            Tensor(accepted.span(), DType::I32, {1}),
+            {Tensor(out.span(), DType::BF16, {128, 3, 1}),
+             Tensor(out_rope.span(), DType::I32, {3, 1}), Tensor(zero.span(), DType::I32, {1})},
+            device.execution_view());
         device.synchronize();
         const auto expected = reference(before, first, records, positions, 0, 0, f0, a);
         std::vector<std::uint16_t> words;
@@ -202,8 +209,8 @@ int rejects(const char* label, F&& f) {
 int validation(DeviceContext& device) {
     Plane<std::uint16_t> raw(128, 3, 3, 0), records(128, 5, 2, 0);
     Plane<std::int32_t> rope(3, 3, 1, 0), positions(3, 5, 2, 0);
-    DeviceBuffer metadata(8);
-    const Tensor m(metadata.p, DType::I32, {2});
+    DeviceBuffer metadata(ninfer::test::cuda_environment().context.device(), 8);
+    const Tensor m(metadata.span(), DType::I32, {2});
     const ops::QsaTailStateView state{raw.view, rope.view, m};
     const ops::QsaRawRecordReadView read{records.view, positions.view, m, m};
     int failures             = 0;
@@ -246,8 +253,7 @@ int validation(DeviceContext& device) {
     failures += rejects("empty batch", [&] {
         ops::qsa_tail_extract(state, read, count, state, device.execution_view());
     });
-    failures += rejects("invalid execution",
-                        [&] { ops::qsa_tail_extract(state, read, m, state, {device.stream, 0}); });
+    invalid_state("invalid state device", [](auto& s) { s.slots.device = Device::cpu(); });
     return failures;
 }
 

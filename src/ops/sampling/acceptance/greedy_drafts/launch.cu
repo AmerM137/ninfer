@@ -10,7 +10,7 @@ void launch(const Tensor& target_tokens, const Tensor& logits, const Tensor& dra
             const Tensor& current_extents, Tensor& lengths, Tensor& anchors,
             Tensor& licensed_tokens, Tensor& licensed_counts, Tensor& accepted,
             std::int32_t token_domain, const SamplingConfig* configs, const Plan& plan,
-            DeviceSpan workspace, cudaStream_t stream) {
+            MemorySpan workspace, cudaStream_t stream) {
     const std::int32_t physical_rows = logits.ne[0];
     const std::int32_t cols          = drafts.ne[0] + 1;
     const std::int32_t batch         = drafts.ne[1];

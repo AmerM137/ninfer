@@ -5,7 +5,7 @@
 #include "core/tensor.h"
 #include "ninfer/ops/linear.h"
 
-#include <cuda_runtime.h>
+#include "core/device.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -39,9 +39,9 @@ linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gate_up_rows,
  * Caller workspace covers the complete operation and is scoped to the call.
  */
 void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, LinearPolicy policy,
-                   WorkspaceArena& ws, cudaStream_t stream);
+                   MemoryArena& ws, CudaExecutionView execution);
 
-void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, WorkspaceArena& ws,
-                   cudaStream_t stream);
+void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, MemoryArena& ws,
+                   CudaExecutionView execution);
 
 } // namespace ninfer::ops

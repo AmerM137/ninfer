@@ -31,7 +31,7 @@ int residency() {
 
 template <class Geometry, int Split, int Warps = 8, bool Normalize = false, int Capacity = 0>
 bool launch_mma(const Inputs& in, GdnControlOutputs out, Scratch scratch,
-                DeviceExecutionView execution, const Norm* norm = nullptr) {
+                CudaExecutionView execution, const Norm* norm = nullptr) {
     constexpr int tile   = Geometry::kBlockN;
     constexpr int rows   = (Geometry::kPaired ? Geometry::kHeads : 2 * Geometry::kHeads) / kBlockM;
     constexpr int shared = Geometry::shared_bytes;
@@ -53,7 +53,7 @@ bool launch_mma(const Inputs& in, GdnControlOutputs out, Scratch scratch,
                 config.gridDim          = grid;
                 config.blockDim         = dim3(Warps * 32);
                 config.dynamicSmemBytes = shared;
-                config.stream           = execution.stream;
+                config.stream           = execution.stream();
                 config.attrs            = &cooperative;
                 config.numAttrs         = 1;
                 CUDA_CHECK(cudaLaunchKernelEx(
@@ -68,7 +68,7 @@ bool launch_mma(const Inputs& in, GdnControlOutputs out, Scratch scratch,
                     static_cast<float*>(result.beta.data), columns));
             } else {
                 mma_kernel<Geometry, Split, Full, Warps, Normalize, Capacity>
-                    <<<grid, Warps * 32, shared, execution.stream>>>(
+                    <<<grid, Warps * 32, shared, execution.stream()>>>(
                         static_cast<const __nv_bfloat16*>(x.data), gain,
                         static_cast<__nv_bfloat16*>(normalized.data), eps,
                         static_cast<const __nv_bfloat16*>(in.a),
@@ -90,7 +90,7 @@ bool launch_mma(const Inputs& in, GdnControlOutputs out, Scratch scratch,
     if constexpr (Split == 1)
         submit(in.x, out, norm ? norm->normalized : Tensor{});
     else {
-        const auto tiles = std::int64_t(execution.multiprocessor_count) *
+        const auto tiles = std::int64_t(execution.multiprocessor_count()) *
                            residency<Geometry, Split, Warps, Normalize, Capacity>() /
                            (rows * Split);
         if (tiles < 1) return false;

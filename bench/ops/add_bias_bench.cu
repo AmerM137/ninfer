@@ -1,4 +1,5 @@
 #include "ninfer/ops/add_bias.h"
+#include "core/buffer.h"
 #include "op_measurement.cuh"
 
 #include <cuda_runtime.h>
@@ -20,12 +21,12 @@ void run(int d, int columns) {
     DeviceBuffer x      = make_bf16(n, 101U);
     DeviceBuffer bias   = make_bf16(d, 103U);
     SavedBuffer initial(x);
-    const auto restore = [&](cudaStream_t stream) { initial.restore(stream); };
-    Tensor tx(x.p, DType::BF16, {d, columns});
-    Tensor tb(bias.p, DType::BF16, {d});
+    const auto restore = [&](CudaExecutionView cuda) { initial.restore(cuda); };
+    Tensor tx(x.span(), DType::BF16, {d, columns});
+    Tensor tb(bias.span(), DType::BF16, {d});
 
     const Result result = bench_loop_prepared(
-        restore, [&](cudaStream_t stream) { ops::add_bias(tb, tx, stream); },
+        restore, [&](CudaExecutionView cuda) { ops::add_bias(tb, tx, cuda); },
         static_cast<double>(n) * 4.0);
 
     char tag[80];

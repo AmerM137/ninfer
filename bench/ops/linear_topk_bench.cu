@@ -1,5 +1,6 @@
 // Public cold-cache benchmark for the three registered linear_topk profiles.
 #include "core/weight.h"
+#include "core/buffer.h"
 #include "ninfer/ops/linear_topk.h"
 
 #include "op_measurement.cuh"
@@ -46,40 +47,47 @@ void run(Profile profile, std::int32_t columns, int warmup, int repeat) {
                                        ? make_fp8_weight(rows, kHidden)
                                        : make_row_split_weight(qtype, rows, kHidden, kHidden, 501U);
     DeviceBuffer hidden          = make_bf16(static_cast<std::size_t>(kHidden) * columns, 101U);
-    DeviceBuffer ids(static_cast<std::size_t>(kTopK) * columns * sizeof(std::int32_t));
-    DeviceBuffer scores(static_cast<std::size_t>(kTopK) * columns * sizeof(float));
+    DeviceBuffer ids(ninfer::bench::device_context().device(),
+                     static_cast<std::size_t>(kTopK) * columns * sizeof(std::int32_t));
+    DeviceBuffer scores(ninfer::bench::device_context().device(),
+                        static_cast<std::size_t>(kTopK) * columns * sizeof(float));
     DeviceBuffer id_map(
-        profile == Profile::Q4 ? static_cast<std::size_t>(rows) * sizeof(std::int32_t) : 1);
+        ninfer::bench::device_context().device(),
+        profile == Profile::Q4 ? static_cast<std::size_t>(rows) * sizeof(std::int32_t) : 0);
     if (profile == Profile::Q4) {
         std::vector<std::int32_t> host_ids(static_cast<std::size_t>(rows));
         for (std::int32_t row = 0; row < rows; ++row) { host_ids[row] = row; }
-        id_map.copy_from_host(host_ids.data(), id_map.bytes);
+        id_map.copy_from_host(host_ids.data(), id_map.size());
     }
 
     const std::size_t workspace_bytes =
         ops::linear_topk_workspace_capacity_bytes(qtype, rows, kHidden, columns, columns);
-    WorkspaceArena workspace(workspace_bytes);
-    Tensor hidden_tensor(hidden.p, DType::BF16, {kHidden, columns});
-    Tensor ids_tensor(ids.p, DType::I32, {kTopK, columns});
-    Tensor scores_tensor(scores.p, DType::FP32, {kTopK, columns});
-    Tensor map_tensor(id_map.p, DType::I32, {rows});
+    ninfer::DeviceBuffer workspace_storage(ninfer::bench::device_context().device(),
+                                           workspace_bytes);
+    MemoryArena workspace(workspace_storage.span());
+    Tensor hidden_tensor(hidden.span(), DType::BF16, {kHidden, columns});
+    Tensor ids_tensor(ids.span(), DType::I32, {kTopK, columns});
+    Tensor scores_tensor(scores.span(), DType::FP32, {kTopK, columns});
+    Tensor map_tensor =
+        profile == Profile::Q4 ? Tensor(id_map.span(), DType::I32, {rows}) : Tensor{};
     bench::L2FlushBuffer flush(256ULL << 20);
     cudaStream_t stream = nullptr;
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    const auto cuda = ninfer::bench::device_context().execution_view(stream);
 
-    const auto launch = [&](cudaStream_t launch_stream) {
+    const auto launch = [&](CudaExecutionView cuda) {
         if (profile == Profile::Q4) {
             ops::linear_topk(hidden_tensor, packed.weight, map_tensor, ids_tensor, scores_tensor,
-                             workspace, launch_stream);
+                             workspace, cuda);
         } else {
             ops::linear_topk(hidden_tensor, packed.weight, 248077, ids_tensor, scores_tensor,
-                             workspace, launch_stream);
+                             workspace, cuda);
         }
     };
     TimedGraph graph;
     CUDA_CHECK(cudaDeviceSynchronize());
-    graph.capture(stream, launch);
-    const ColdTiming timing    = measure_cold_graph(graph, flush, stream, warmup, repeat);
+    graph.capture(cuda, launch);
+    const ColdTiming timing    = measure_cold_graph(graph, flush, cuda, warmup, repeat);
     const double weight_bytes  = static_cast<double>(packed.model_weight_bytes());
     const double effective_gbs = weight_bytes / timing.median_us / 1000.0;
     const double useful_tflops = 2.0 * static_cast<double>(profile == Profile::Q4 ? rows : 248077) *

@@ -92,14 +92,15 @@ void split_bf16_features_launch(const Tensor& source, Tensor& first, Tensor& sec
 } // namespace
 
 void concat_bf16_features(const Tensor& first, const Tensor& second, Tensor& out,
-                          cudaStream_t stream) {
+                          CudaExecutionView execution) {
+    const auto stream        = execution.stream();
     constexpr const char* op = "concat_bf16_features";
     common::operand::dtype(first, DType::BF16, op, "first");
-    common::operand::contiguous_nonnull(first, op, "first");
+    common::operand::contiguous_nonnull(first, op, "first", execution.device());
     common::operand::dtype(second, DType::BF16, op, "second");
-    common::operand::contiguous_nonnull(second, op, "second");
+    common::operand::contiguous_nonnull(second, op, "second", execution.device());
     common::operand::dtype(out, DType::BF16, op, "out");
-    common::operand::contiguous_nonnull(out, op, "out");
+    common::operand::contiguous_nonnull(out, op, "out", execution.device());
     const std::int32_t rows   = first.ne[0];
     const std::int32_t tokens = first.ne[1];
     if (rows <= 0) { throw std::invalid_argument("concat_bf16_features: D must be positive"); }
@@ -112,18 +113,19 @@ void concat_bf16_features(const Tensor& first, const Tensor& second, Tensor& out
 }
 
 void split_bf16_features(const Tensor& source, Tensor& first, Tensor& second, Tensor& third,
-                         Tensor& fourth, cudaStream_t stream) {
+                         Tensor& fourth, CudaExecutionView execution) {
+    const auto stream        = execution.stream();
     constexpr const char* op = "split_bf16_features";
     common::operand::dtype(source, DType::BF16, op, "source");
-    common::operand::contiguous_nonnull(source, op, "source");
+    common::operand::contiguous_nonnull(source, op, "source", execution.device());
     common::operand::dtype(first, DType::BF16, op, "first");
-    common::operand::contiguous_nonnull(first, op, "first");
+    common::operand::contiguous_nonnull(first, op, "first", execution.device());
     common::operand::dtype(second, DType::BF16, op, "second");
-    common::operand::contiguous_nonnull(second, op, "second");
+    common::operand::contiguous_nonnull(second, op, "second", execution.device());
     common::operand::dtype(third, DType::BF16, op, "third");
-    common::operand::contiguous_nonnull(third, op, "third");
+    common::operand::contiguous_nonnull(third, op, "third", execution.device());
     common::operand::dtype(fourth, DType::BF16, op, "fourth");
-    common::operand::contiguous_nonnull(fourth, op, "fourth");
+    common::operand::contiguous_nonnull(fourth, op, "fourth", execution.device());
     const std::int32_t tokens = source.ne[1];
     if (tokens <= 0) { throw std::invalid_argument("split_bf16_features: T must be positive"); }
     common::operand::shape(source, {14336, tokens, 1, 1}, op, "source");

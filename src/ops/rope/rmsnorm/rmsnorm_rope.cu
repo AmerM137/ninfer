@@ -31,7 +31,8 @@ constexpr std::int32_t kMaximumBatch  = 8;
 constexpr std::int32_t kMaximumSingle = 2048;
 
 void require_tensor(const Tensor& tensor, DType dtype, const std::array<std::int32_t, 4>& shape,
-                    const char* label) {
+                    const char* label, Device device) {
+    common::operand::device(tensor.device, device, "rmsnorm_rope", label);
     bool shape_matches = true;
     for (std::size_t dim = 0; dim < shape.size(); ++dim) {
         shape_matches = shape_matches && tensor.ne[dim] == shape[dim];
@@ -68,32 +69,37 @@ void require_single_nonoverlap(const Tensor& positions, const Tensor& norm_weigh
 } // namespace
 
 void rmsnorm_rope(const Tensor& positions, const Tensor& q_norm_weight, const Tensor& k_norm_weight,
-                  Tensor& q, Tensor& k, cudaStream_t stream) {
+                  Tensor& q, Tensor& k, CudaExecutionView execution) {
+    const auto stream        = execution.stream();
     const std::int32_t batch = q.ne[3];
     const std::int32_t width = q.ne[2];
     if (width < 2 || width > 16) throw std::invalid_argument("rmsnorm_rope: pair W must be 2..16");
     if (batch < 1 || batch > kMaximumBatch) {
         throw std::invalid_argument("rmsnorm_rope: pair B must be 1..8");
     }
-    require_tensor(q, DType::BF16, {kHeadDim, kQueryHeads, width, batch}, "q");
-    require_tensor(k, DType::BF16, {kHeadDim, kKeyHeads, width, batch}, "k");
-    require_tensor(q_norm_weight, DType::BF16, {kHeadDim, 1, 1, 1}, "q norm weight");
-    require_tensor(k_norm_weight, DType::BF16, {kHeadDim, 1, 1, 1}, "k norm weight");
-    require_tensor(positions, DType::I32, {width, batch, 1, 1}, "positions");
+    require_tensor(q, DType::BF16, {kHeadDim, kQueryHeads, width, batch}, "q", execution.device());
+    require_tensor(k, DType::BF16, {kHeadDim, kKeyHeads, width, batch}, "k", execution.device());
+    require_tensor(q_norm_weight, DType::BF16, {kHeadDim, 1, 1, 1}, "q norm weight",
+                   execution.device());
+    require_tensor(k_norm_weight, DType::BF16, {kHeadDim, 1, 1, 1}, "k norm weight",
+                   execution.device());
+    require_tensor(positions, DType::I32, {width, batch, 1, 1}, "positions", execution.device());
     require_pair_nonoverlap(positions, q_norm_weight, k_norm_weight, q, k);
     launch_fixed<true>(positions, &q_norm_weight, k_norm_weight, &q, k, width * batch, stream);
     CUDA_CHECK(cudaGetLastError());
 }
 
 void rmsnorm_rope(const Tensor& positions, const Tensor& norm_weight, Tensor& x,
-                  cudaStream_t stream) {
+                  CudaExecutionView execution) {
+    const auto stream         = execution.stream();
     const std::int32_t tokens = x.ne[2];
     if (tokens < 1 || tokens > kMaximumSingle) {
         throw std::invalid_argument("rmsnorm_rope: single T must be 1..2048");
     }
-    require_tensor(x, DType::BF16, {kHeadDim, kKeyHeads, tokens, 1}, "x");
-    require_tensor(norm_weight, DType::BF16, {kHeadDim, 1, 1, 1}, "norm weight");
-    require_tensor(positions, DType::I32, {tokens, 1, 1, 1}, "positions");
+    require_tensor(x, DType::BF16, {kHeadDim, kKeyHeads, tokens, 1}, "x", execution.device());
+    require_tensor(norm_weight, DType::BF16, {kHeadDim, 1, 1, 1}, "norm weight",
+                   execution.device());
+    require_tensor(positions, DType::I32, {tokens, 1, 1, 1}, "positions", execution.device());
     require_single_nonoverlap(positions, norm_weight, x);
     launch_fixed<false>(positions, nullptr, norm_weight, nullptr, x, tokens, stream);
     CUDA_CHECK(cudaGetLastError());

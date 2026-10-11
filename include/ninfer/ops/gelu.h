@@ -1,8 +1,8 @@
 #pragma once
 
+#include "core/device.h"
 #include "core/tensor.h"
 
-#include <cuda_runtime.h>
 
 namespace ninfer::ops {
 
@@ -19,6 +19,6 @@ enum class GeluMode {
  *
  * x is a contiguous BF16 tensor. Updates only x; empty tensors perform no device work.
  */
-void gelu(Tensor& x, GeluMode mode, cudaStream_t stream);
+void gelu(Tensor& x, GeluMode mode, CudaExecutionView execution);
 
 } // namespace ninfer::ops

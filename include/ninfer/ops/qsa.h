@@ -75,11 +75,9 @@ struct QsaIndexerExecutionEnvelope {
 /** Capacity over every positive T in [min_tokens,max_tokens], with fixed B and envelope.
  * Includes only Op-local scratch, measured from a 256-byte-aligned workspace cursor.
  */
-[[nodiscard]] std::size_t qsa_indexer_workspace_capacity_bytes(std::int32_t min_tokens,
-                                                               std::int32_t max_tokens,
-                                                               std::int32_t batch_size,
-                                                               QsaIndexerExecutionEnvelope envelope,
-                                                               DeviceExecutionView execution);
+[[nodiscard]] std::size_t
+qsa_indexer_workspace_capacity_bytes(std::int32_t min_tokens, std::int32_t max_tokens,
+                                     std::int32_t batch_size, QsaIndexerExecutionEnvelope envelope);
 
 /**
  * Op: qsa_indexer
@@ -120,7 +118,7 @@ struct QsaIndexerExecutionEnvelope {
  */
 void qsa_indexer(const Tensor& index_query, const QsaIndexCacheView& cache,
                  const QsaBatchView& batch, QsaIndexerExecutionEnvelope envelope,
-                 WorkspaceArena& workspace, QsaBlockSelection& out, DeviceExecutionView execution);
+                 MemoryArena& workspace, QsaBlockSelection& out, CudaExecutionView execution);
 
 struct QsaSparseGqaExecutionEnvelope {
     // Host-known upper bound on p+1 over live queries. Zero permits only inert queries.
@@ -130,10 +128,13 @@ struct QsaSparseGqaExecutionEnvelope {
 
 /** Capacity over every positive T in [min_tokens,max_tokens], with fixed storage, B and envelope.
  * Includes only Op-local scratch, measured from a 256-byte-aligned workspace cursor.
+ * multiprocessor_count is the positive physical SM count used by execution.
  */
-[[nodiscard]] std::size_t qsa_sparse_gqa_workspace_capacity_bytes(
-    KvCacheStorage storage, std::int32_t min_tokens, std::int32_t max_tokens,
-    std::int32_t batch_size, QsaSparseGqaExecutionEnvelope envelope, DeviceExecutionView execution);
+[[nodiscard]] std::size_t
+qsa_sparse_gqa_workspace_capacity_bytes(KvCacheStorage storage, std::int32_t min_tokens,
+                                        std::int32_t max_tokens, std::int32_t batch_size,
+                                        QsaSparseGqaExecutionEnvelope envelope,
+                                        std::int32_t multiprocessor_count);
 
 /**
  * Op: qsa_sparse_gqa
@@ -183,7 +184,7 @@ struct QsaSparseGqaExecutionEnvelope {
 void qsa_sparse_gqa(const Tensor& query, const Tensor& output_gate,
                     const PagedKVBatchLayerView& cache, const QsaBatchView& batch,
                     const QsaBlockSelection& selected, QsaSparseGqaExecutionEnvelope envelope,
-                    WorkspaceArena& workspace, Tensor& out, DeviceExecutionView execution);
+                    MemoryArena& workspace, Tensor& out, CudaExecutionView execution);
 
 /**
  * Op: qsa_prepare
@@ -252,14 +253,14 @@ void qsa_sparse_gqa(const Tensor& query, const Tensor& output_gate,
  * caller guarantees, including across different views of an interleaved allocation.
  *
  * Workspace / execution:
- * Zero global scratch, no sizing query or hidden allocation. execution supplies the stream and
- * positive SM count. CUDA Graph replay reads current Device metadata; callers own operand
+ * Zero global scratch, no sizing query or hidden allocation. Work uses execution.stream().
+ * CUDA Graph replay reads current Device metadata; callers own operand
  * readiness/lifetime, allocation, tail extraction, acceptance, and state publication.
  */
 void qsa_prepare(const QsaProjectionView& projected, const QsaPrepareParameters& parameters,
                  const QsaBatchView& batch, const Tensor& rope_positions,
                  const QsaTailStateView& before, QsaCacheView cache, QsaRawRecordWriteView records,
-                 Tensor& query, Tensor& index_query, DeviceExecutionView execution);
+                 Tensor& query, Tensor& index_query, CudaExecutionView execution);
 
 /**
  * Op: qsa_tail_extract
@@ -302,11 +303,11 @@ void qsa_prepare(const QsaProjectionView& projected, const QsaPrepareParameters&
  *
  * Workspace / execution:
  * No caller-owned global scratch, sizing query, or hidden Device allocation. Work is submitted
- * to execution.stream, with a positive execution.multiprocessor_count. CUDA Graph replay reads
+ * to execution.stream(). CUDA Graph replay reads
  * the current Device metadata. The caller owns operand readiness and storage lifetime.
  */
 void qsa_tail_extract(const QsaTailStateView& before, const QsaRawRecordReadView& records,
                       const Tensor& accepted_columns, QsaTailStateView after,
-                      DeviceExecutionView execution);
+                      CudaExecutionView execution);
 
 } // namespace ninfer::ops

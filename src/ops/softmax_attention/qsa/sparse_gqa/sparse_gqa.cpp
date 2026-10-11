@@ -7,7 +7,7 @@ namespace {
 constexpr detail::qsa::ViewValidation v{"qsa_sparse_gqa"};
 
 void profile(KvCacheStorage storage, int lo, int hi, int batch,
-             QsaSparseGqaExecutionEnvelope envelope, DeviceExecutionView execution) {
+             QsaSparseGqaExecutionEnvelope envelope, std::int32_t multiprocessor_count) {
     v.require(envelope.max_visible_tokens <= 262144, "visible-token capacity");
     v.require(storage == KvCacheStorage::BFloat16 || storage == KvCacheStorage::Fp8E4M3Row256 ||
                   storage == KvCacheStorage::Int8Group64 ||
@@ -15,15 +15,15 @@ void profile(KvCacheStorage storage, int lo, int hi, int batch,
                   storage == KvCacheStorage::Fp8KeyNvfp4Value,
               "cache storage");
     v.require(lo > 0 && hi >= lo && batch >= 1 && batch <= 8, "T/B interval");
-    v.require(execution.multiprocessor_count > 0, "SM count");
+    v.require(multiprocessor_count > 0, "SM count");
 }
 } // namespace
 
 std::size_t qsa_sparse_gqa_workspace_capacity_bytes(KvCacheStorage storage, std::int32_t lo,
                                                     std::int32_t hi, std::int32_t batch,
                                                     QsaSparseGqaExecutionEnvelope envelope,
-                                                    DeviceExecutionView execution) {
-    profile(storage, lo, hi, batch, envelope, execution);
+                                                    std::int32_t multiprocessor_count) {
+    profile(storage, lo, hi, batch, envelope, multiprocessor_count);
     std::size_t maximum = 0;
     // Above this bound every extent uses direct output. Below it, allocation is not monotonic
     // because the split count decreases with query parallelism.
@@ -32,8 +32,7 @@ std::size_t qsa_sparse_gqa_workspace_capacity_bytes(KvCacheStorage storage, std:
         WorkspaceLayoutBuilder layout;
         detail::qsa::allocate_sparse_gqa_workspace(
             layout, t, batch,
-            detail::qsa::select_sparse_gqa_plan(t, batch, envelope,
-                                                execution.multiprocessor_count));
+            detail::qsa::select_sparse_gqa_plan(t, batch, envelope, multiprocessor_count));
         maximum = std::max(maximum, layout.peak_bytes(1));
     }
     return maximum;
@@ -41,10 +40,14 @@ std::size_t qsa_sparse_gqa_workspace_capacity_bytes(KvCacheStorage storage, std:
 
 void qsa_sparse_gqa(const Tensor& query, const Tensor& gate, const PagedKVBatchLayerView& cache,
                     const QsaBatchView& batch, const QsaBlockSelection& selected,
-                    QsaSparseGqaExecutionEnvelope envelope, WorkspaceArena& workspace, Tensor& out,
-                    DeviceExecutionView execution) {
+                    QsaSparseGqaExecutionEnvelope envelope, MemoryArena& workspace, Tensor& out,
+                    CudaExecutionView execution) {
+    if (workspace.device() != execution.device()) {
+        throw std::invalid_argument("QSA workspace belongs to another device");
+    }
+    const detail::qsa::ViewValidation v{"qsa_sparse_gqa", execution.device()};
     const int tokens = query.ne[2], rows = query.ne[3], pages = cache.k_pages.ne[3];
-    profile(cache.storage, tokens, tokens, rows, envelope, execution);
+    profile(cache.storage, tokens, tokens, rows, envelope, execution.multiprocessor_count());
     v.dense(query, DType::BF16, {256, 24, tokens, rows}, 16, "query");
     v.dense(gate, DType::BF16, {256, 24, tokens, rows}, 16, "gate");
     v.dense(out, DType::BF16, {256, 24, tokens, rows}, 16, "output");
@@ -81,8 +84,8 @@ void qsa_sparse_gqa(const Tensor& query, const Tensor& gate, const PagedKVBatchL
                            &selected.block_counts};
     for (const auto* input : inputs)
         if (input->data) v.require(!v.overlap(out, *input), "output/input overlap");
-    const auto plan =
-        detail::qsa::select_sparse_gqa_plan(tokens, rows, envelope, execution.multiprocessor_count);
+    const auto plan    = detail::qsa::select_sparse_gqa_plan(tokens, rows, envelope,
+                                                             execution.multiprocessor_count());
     auto scope         = workspace.scope();
     const auto scratch = detail::qsa::allocate_sparse_gqa_workspace(workspace, tokens, rows, plan);
     for (const auto* work : {&scratch.numerator, &scratch.maximum, &scratch.sum}) {

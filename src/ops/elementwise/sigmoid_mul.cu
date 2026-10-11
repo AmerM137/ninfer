@@ -140,7 +140,8 @@ std::int64_t numel_allow_zero(const Tensor& t) {
 
 } // namespace
 
-void sigmoid_mul(const Tensor& gate, Tensor& x, cudaStream_t stream) {
+void sigmoid_mul(const Tensor& gate, Tensor& x, CudaExecutionView execution) {
+    const auto stream = execution.stream();
     if (gate.dtype != DType::BF16 || x.dtype != DType::BF16) {
         throw std::invalid_argument("sigmoid_mul: gate/x must be BF16");
     }
@@ -150,6 +151,9 @@ void sigmoid_mul(const Tensor& gate, Tensor& x, cudaStream_t stream) {
         }
     }
     if (numel_allow_zero(x) == 0) { return; }
+    if (gate.device != execution.device() || x.device != execution.device()) {
+        throw std::invalid_argument("sigmoid_mul: operands must belong to the execution device");
+    }
     if (!gate.is_contiguous() || !x.is_contiguous()) {
         throw std::invalid_argument("sigmoid_mul: gate/x must be contiguous");
     }

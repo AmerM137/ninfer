@@ -3,7 +3,7 @@
 
 namespace ninfer::models::qwen3_5::detail {
 
-DFlashPersistentState::DFlashPersistentState(DeviceSpan backing,
+DFlashPersistentState::DFlashPersistentState(MemorySpan backing,
                                              const DFlashPersistentLayout& layout,
                                              CyclicKVCache& local_state)
     : local(local_state), prefill_features(layout.prefill_features.bind(backing)),

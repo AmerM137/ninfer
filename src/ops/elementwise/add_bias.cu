@@ -121,7 +121,8 @@ AddBiasLaunch select_add_bias(const Tensor& bias, const Tensor& x) {
 
 } // namespace
 
-void add_bias(const Tensor& bias, Tensor& x, cudaStream_t stream) {
+void add_bias(const Tensor& bias, Tensor& x, CudaExecutionView execution) {
+    const auto stream = execution.stream();
     if (bias.dtype != DType::BF16 || x.dtype != DType::BF16) {
         throw std::invalid_argument("add_bias: bias/x must be BF16");
     }
@@ -131,6 +132,9 @@ void add_bias(const Tensor& bias, Tensor& x, cudaStream_t stream) {
         throw std::invalid_argument("add_bias: bias must have shape [x.ne[0]]");
     }
     if (n == 0) { return; }
+    if (bias.device != execution.device() || x.device != execution.device()) {
+        throw std::invalid_argument("add_bias: operands must belong to the execution device");
+    }
     if (!bias.is_contiguous() || !x.is_contiguous()) {
         throw std::invalid_argument("add_bias: bias/x must be contiguous");
     }

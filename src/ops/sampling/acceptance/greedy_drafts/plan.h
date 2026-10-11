@@ -35,5 +35,5 @@ void launch(const Tensor& target_tokens, const Tensor& logits, const Tensor& dra
             const Tensor& current_extents, Tensor& lengths, Tensor& anchors,
             Tensor& licensed_tokens, Tensor& licensed_counts, Tensor& accepted,
             std::int32_t token_domain, const SamplingConfig* configs, const Plan& plan,
-            DeviceSpan workspace, cudaStream_t stream);
+            MemorySpan workspace, cudaStream_t stream);
 } // namespace ninfer::ops::greedy_drafts_detail

@@ -7,7 +7,7 @@ int main(int argc, char** argv) {
     try {
         const auto options = gdn_replay::parse_options(argc, argv);
         measurement::hardware();
-        DeviceContext device;
+        auto& device = ninfer::bench::device_context();
         L2FlushBuffer flush(options.timing.flush_bytes);
         measurement::Csv csv(options.timing.csv_out);
         for (int t : options.tokens) {
@@ -24,8 +24,9 @@ int main(int argc, char** argv) {
                      measurement::selections(options.timing.execution, "graph", "eager"))
                     for (const auto& cache :
                          measurement::selections(options.timing.cache, "cold", "warm")) {
-                        const auto r = measurement::measure(launch, restore, flush, device.stream,
-                                                               options.timing, execution, cache);
+                        const auto r =
+                            measurement::measure(launch, restore, flush, device.execution_view(),
+                                                 options.timing, execution, cache);
                         csv.write(row, r, execution, cache);
                     }
             };
@@ -37,13 +38,14 @@ int main(int argc, char** argv) {
                 for (int b = 0; b < options.batch; ++b)
                     rows.push_back({slots[b], slots[b], counts[b]});
                 row.commits = gdn_replay::csv_extent(options.commits);
-                run([&](auto s) { f.fold_plan().execute(rows, s); }, [&](auto s) { f.restore(s); });
+                run([&](CudaExecutionView cuda) { f.fold_plan().execute(rows, cuda); },
+                    [&](CudaExecutionView cuda) { f.restore(cuda); });
             } else {
                 auto valid = gdn_replay::extents(options.valid, t, options.batch, false);
                 if (options.valid == "dense") valid.clear();
                 gdn_replay::RecordFixture f(options.profile, t, options.batch, valid);
                 row.valid = gdn_replay::csv_extent(options.valid);
-                run([&](auto s) { f.launch_record(s); }, [](auto) {});
+                run([&](CudaExecutionView cuda) { f.launch_record(cuda); }, [](auto) {});
             }
         }
     } catch (const std::exception& e) {

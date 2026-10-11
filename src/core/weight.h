@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/dtype.h"
+#include "core/memory.h"
 
 #include <cstdint>
 
@@ -28,6 +29,7 @@ enum class QuantLayout : std::uint16_t {
 };
 
 struct Weight {
+    Device device;
     const void* payload            = nullptr;
     std::uint64_t payload_bytes    = 0;
     std::uint64_t high_plane_bytes = 0;

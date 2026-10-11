@@ -1,6 +1,7 @@
 // Cold-cache public Op benchmark for the registered row-scaled FP8 LinearSwiGLU profile.
 
 #include "core/weight.h"
+#include "core/buffer.h"
 #include "ninfer/ops/linear_swiglu.h"
 
 #include "core/device.h"
@@ -98,34 +99,38 @@ int main(int argc, char** argv) {
 
         cudaStream_t stream = nullptr;
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+        const auto cuda = ninfer::bench::device_context().execution_view(stream);
         bench::L2FlushBuffer flush(kFlushBytes);
         DeviceBuffer input = bench::make_bf16(static_cast<std::size_t>(kHidden) * max_t, 101U);
-        DeviceBuffer output(static_cast<std::size_t>(kOutputRows) * max_t * sizeof(std::uint16_t));
+        DeviceBuffer output(ninfer::bench::device_context().device(),
+                            static_cast<std::size_t>(kOutputRows) * max_t * sizeof(std::uint16_t));
         bench::PackedQuantizedWeight packed  = bench::make_fp8_weight(kGateUpRows, kHidden);
         const std::size_t workspace_capacity = ops::linear_swiglu_workspace_capacity_bytes(
             QType::FP8_E4M3FN_ROW_BF16, kGateUpRows, kHidden, options.policy, min_t, max_t);
-        WorkspaceArena workspace(std::max<std::size_t>(workspace_capacity, 256));
+        ninfer::DeviceBuffer workspace_storage(ninfer::bench::device_context().device(),
+                                               std::max<std::size_t>(workspace_capacity, 256));
+        MemoryArena workspace(workspace_storage.span());
 
-        const auto launch = [&](std::int32_t tokens, cudaStream_t launch_stream) {
-            Tensor x(input.p, DType::BF16, {kHidden, tokens});
-            Tensor out(output.p, DType::BF16, {kOutputRows, tokens});
-            ops::linear_swiglu(x, packed.weight, out, options.policy, workspace, launch_stream);
+        const auto launch = [&](std::int32_t tokens, CudaExecutionView cuda) {
+            Tensor x(input.span(), DType::BF16, {kHidden, tokens});
+            Tensor out(output.span(), DType::BF16, {kOutputRows, tokens});
+            ops::linear_swiglu(x, packed.weight, out, options.policy, workspace, cuda);
         };
 
         if (options.profile) {
             const std::int32_t tokens = options.tokens.front();
             for (int iteration = 0; iteration < options.warmup; ++iteration) {
-                bench::flush_l2(flush, stream);
-                launch(tokens, stream);
+                bench::flush_l2(flush, cuda);
+                launch(tokens, cuda);
             }
             CUDA_CHECK(cudaStreamSynchronize(stream));
-            bench::flush_l2(flush, stream);
+            bench::flush_l2(flush, cuda);
             CUDA_CHECK(cudaStreamSynchronize(stream));
             std::printf("PROFILE linear_swiglu weight_type=FP8 policy=%s T=%d\n",
                         policy_name(options.policy), tokens);
             std::fflush(stdout);
             CUDA_CHECK(cudaProfilerStart());
-            launch(tokens, stream);
+            launch(tokens, cuda);
             CUDA_CHECK(cudaStreamSynchronize(stream));
             CUDA_CHECK(cudaProfilerStop());
             CUDA_CHECK(cudaStreamDestroy(stream));
@@ -137,9 +142,9 @@ int main(int argc, char** argv) {
         std::printf("%-4s %6s %11s %11s %11s %10s %10s %8s\n", "pol", "T", "median_us", "min_us",
                     "p95_us", "eff_GB/s", "TFLOP/s", "TC_%");
         for (const std::int32_t tokens : options.tokens) {
-            const auto timing = bench::measure_cold_launch(
-                [&](cudaStream_t launch_stream) { launch(tokens, launch_stream); }, flush, stream,
-                options.warmup, options.repeat);
+            const auto timing =
+                bench::measure_cold_launch([&](CudaExecutionView cuda) { launch(tokens, cuda); },
+                                           flush, cuda, options.warmup, options.repeat);
             const double seconds = timing.median_us * 1.0e-6;
             const double flops   = 2.0 * static_cast<double>(kGateUpRows) * kHidden * tokens;
             const double bytes   = static_cast<double>(packed.model_weight_bytes()) +

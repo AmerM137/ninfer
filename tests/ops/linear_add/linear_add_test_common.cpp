@@ -1,4 +1,5 @@
 #include "ops/linear_add/linear_add_test_common.h"
+#include "cuda_fixture.h"
 
 #include "core/decode_graph.h"
 #include "core/device.h"
@@ -349,7 +350,7 @@ int run_cases(std::string_view label, WeightFormat format, const InvocationCase&
     device_activation.copy_from_host(activation.data(), device_activation.bytes());
     device_weight.copy_from_host(host_payload.data(), host_payload.size());
     const Weight weight = std::visit(
-        [&](const auto& value) { return value.device_weight(device_weight.data()); }, host_weight);
+        [&](const auto& value) { return value.device_weight(device_weight.span()); }, host_weight);
     DeviceContext device;
     const QType qtype         = qtype_for(format);
     int failures              = 0;
@@ -358,15 +359,15 @@ int run_cases(std::string_view label, WeightFormat format, const InvocationCase&
         const auto t = invocation.tokens;
         GuardedDeviceBuffer output(checked_elements(shape.n, t, "output") * sizeof(std::uint16_t));
         output.copy_from_host(residual.data(), output.bytes());
-        Tensor input(device_activation.data(), DType::BF16, {shape.k, t});
-        Tensor residual_out(output.data(), DType::BF16, {shape.n, t});
+        Tensor input(device_activation.span(), DType::BF16, {shape.k, t});
+        Tensor residual_out(output.span(), DType::BF16, {shape.n, t});
         const auto capacity =
             invocation.policy
                 ? ops::linear_add_workspace_capacity_bytes(qtype, shape.n, shape.k,
                                                            *invocation.policy, t, t)
                 : ops::linear_add_workspace_capacity_bytes(qtype, shape.n, shape.k, t, t);
         GuardedDeviceBuffer scratch(std::max<std::size_t>(capacity, 256));
-        WorkspaceArena workspace(DeviceSpan{scratch.data(), scratch.bytes()});
+        MemoryArena workspace(scratch.span());
         const std::string case_label =
             std::string(label) + " [" + std::to_string(shape.n) + "," + std::to_string(shape.k) +
             "] " + std::string(arithmetic_name(invocation.arithmetic)) + " T=" + std::to_string(t);
@@ -377,20 +378,21 @@ int run_cases(std::string_view label, WeightFormat format, const InvocationCase&
         try {
             if (invocation.policy) {
                 ops::linear_add(input, weight, residual_out, *invocation.policy, workspace,
-                                nullptr);
+                                ninfer::test::cuda_environment().default_execution);
             } else {
-                ops::linear_add(input, weight, residual_out, workspace, nullptr);
+                ops::linear_add(input, weight, residual_out, workspace,
+                                ninfer::test::cuda_environment().default_execution);
             }
             cuda_synchronize();
             verify("eager");
             if (invocation.graph != GraphReplay::None) {
                 DecodeGraphDefinition definition;
                 DecodeGraphExecutable graph;
-                definition.capture(device.stream, [&] {
+                definition.capture(device.stream(), [&] {
                     ops::linear_add(input, weight, residual_out,
                                     invocation.graph_policy.value_or(
                                         invocation.policy.value_or(ops::LinearPolicy::A16Only)),
-                                    workspace, device.stream);
+                                    workspace, device.execution_view());
                 });
                 graph.instantiate(definition);
                 std::vector<std::uint16_t> negative_activation;
@@ -405,7 +407,7 @@ int run_cases(std::string_view label, WeightFormat format, const InvocationCase&
                     const bool negative =
                         invocation.graph == GraphReplay::OriginalNegative && replay == 1;
                     if (zero) {
-                        CUDA_CHECK(cudaMemsetAsync(input.data, 0, input.bytes(), device.stream));
+                        CUDA_CHECK(cudaMemsetAsync(input.data, 0, input.bytes(), device.stream()));
                     } else if (invocation.graph != GraphReplay::OriginalTwice) {
                         const auto& values = negative ? negative_activation : activation;
                         const auto input_bytes =
@@ -414,11 +416,11 @@ int run_cases(std::string_view label, WeightFormat format, const InvocationCase&
                                 : device_activation.bytes();
                         CUDA_CHECK(cudaMemcpyAsync(device_activation.data(), values.data(),
                                                    input_bytes, cudaMemcpyHostToDevice,
-                                                   device.stream));
+                                                   device.stream()));
                     }
                     CUDA_CHECK(cudaMemcpyAsync(output.data(), residual.data(), output.bytes(),
-                                               cudaMemcpyHostToDevice, device.stream));
-                    graph.launch(device.stream);
+                                               cudaMemcpyHostToDevice, device.stream()));
+                    graph.launch(device.stream());
                     device.synchronize();
                     const auto stage = "graph replay " + std::to_string(replay);
                     if (zero) {
@@ -434,7 +436,7 @@ int run_cases(std::string_view label, WeightFormat format, const InvocationCase&
             if (invocation.followup_policy) {
                 output.copy_from_host(residual.data(), output.bytes());
                 ops::linear_add(input, weight, residual_out, *invocation.followup_policy, workspace,
-                                nullptr);
+                                ninfer::test::cuda_environment().default_execution);
                 cuda_synchronize();
                 verify("permissive policy");
             }

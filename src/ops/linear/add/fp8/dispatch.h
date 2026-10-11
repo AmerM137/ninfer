@@ -17,6 +17,6 @@ Fp8LinearAddPlan select_fp8_add_n5120_k17408(LinearPolicy policy, std::int32_t t
 std::size_t fp8_linear_add_workspace_capacity_bytes(std::int32_t rows, std::int32_t k,
                                                     LinearPolicy policy, std::int32_t first,
                                                     std::int32_t last);
-void fp8_linear_add_dispatch(const Tensor&, const Weight&, Tensor&, LinearPolicy, WorkspaceArena&,
+void fp8_linear_add_dispatch(const Tensor&, const Weight&, Tensor&, LinearPolicy, MemoryArena&,
                              cudaStream_t);
 } // namespace ninfer::ops::detail

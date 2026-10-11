@@ -47,7 +47,11 @@ void validate_linear_policy(LinearPolicy policy) {
 }
 
 void validate_linear_semantics(const Tensor& x, const Weight& w, const Tensor& out,
-                               LinearPolicy policy) {
+                               LinearPolicy policy, CudaExecutionView execution) {
+    if (x.device != execution.device() || w.device != execution.device() ||
+        out.device != execution.device()) {
+        throw std::invalid_argument("linear: operands must belong to the execution device");
+    }
     if (x.dtype != DType::BF16 || out.dtype != DType::BF16) {
         throw std::invalid_argument("linear: x/out must be BF16");
     }
@@ -75,7 +79,7 @@ void validate_linear_semantics(const Tensor& x, const Weight& w, const Tensor& o
 }
 
 void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
-                     WorkspaceArena* workspace, cudaStream_t stream) {
+                     MemoryArena* workspace, cudaStream_t stream) {
     switch (w.qtype) {
     case QType::Q4_G64_FP16:
         detail::q4_dispatch(x, w, out, policy, stream);
@@ -150,14 +154,17 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
 }
 
 void linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
-            WorkspaceArena& workspace, cudaStream_t stream) {
-    validate_linear_semantics(x, w, out, policy);
-    dispatch_linear(x, w, out, policy, &workspace, stream);
+            MemoryArena& workspace, CudaExecutionView execution) {
+    validate_linear_semantics(x, w, out, policy, execution);
+    if (workspace.device() != execution.device()) {
+        throw std::invalid_argument("linear: workspace belongs to another device");
+    }
+    dispatch_linear(x, w, out, policy, &workspace, execution.stream());
 }
 
-void linear(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
-    validate_linear_semantics(x, w, out, LinearPolicy::A16Only);
-    dispatch_linear(x, w, out, LinearPolicy::A16Only, nullptr, stream);
+void linear(const Tensor& x, const Weight& w, Tensor& out, CudaExecutionView execution) {
+    validate_linear_semantics(x, w, out, LinearPolicy::A16Only, execution);
+    dispatch_linear(x, w, out, LinearPolicy::A16Only, nullptr, execution.stream());
 }
 
 } // namespace ninfer::ops

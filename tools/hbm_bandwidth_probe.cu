@@ -7,8 +7,8 @@
 // read or write and 2N bytes for a copy (N read + N written). This is the
 // rate to compare with the advertised bandwidth; it is not a measured DRAM counter.
 
-#include <cuda_runtime.h>
 #include "../bench/common/fixture_data.cuh"
+#include <cuda_runtime.h>
 
 #include <algorithm>
 #include <cmath>

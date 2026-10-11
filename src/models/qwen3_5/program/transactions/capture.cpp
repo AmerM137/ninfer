@@ -263,8 +263,8 @@ bool ProgramImpl::start_capture(SequenceHandle handle) {
             if (!transfer) { throw std::logic_error("capture lost its reserved Host state space"); }
             operation.state_transfer.emplace(std::move(*transfer));
         }
-        context_source_ready_.record(device.stream);
-        context_source_ready_.wait(device.transfer_stream);
+        context_source_ready_.record(device.stream());
+        context_source_ready_.wait(device.transfer_stream());
         if (operation.state_transfer) {
             enqueue_state_backup(operation);
         } else if (is_masked_draft_backend(speculative_backend)) {

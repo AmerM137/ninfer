@@ -79,15 +79,13 @@ void validate_interval(std::int32_t first, std::int32_t last) {
 }
 
 void validate_projection(const Tensor& x, const Weights& weights, const Tensor& a_log,
-                         const Tensor& dt_bias, GdnControlOutputs out,
-                         DeviceExecutionView execution) {
+                         const Tensor& dt_bias, GdnControlOutputs out) {
     const auto [heads, rows] = weights.geometry;
     matrix(x, DType::BF16, rows, x.ne[1]);
     vector(a_log, DType::FP32, heads);
     vector(dt_bias, DType::FP32, heads);
     matrix(out.g, DType::FP32, heads, x.ne[1]);
     matrix(out.beta, DType::FP32, heads, x.ne[1]);
-    require(execution.multiprocessor_count > 0, "physical SM count must be positive");
 }
 
 void validate_norm(const Tensor& x, const Tensor& weight, float eps, Geometry geometry,
@@ -108,8 +106,8 @@ void validate_control(const Tensor& a, const Tensor& b, const Tensor& a_log, con
     vector(dt_bias, DType::FP32, 48, a.ne[1] != 0);
 }
 
-void validate_disjoint(const Weights* weights, std::span<const Tensor* const> tensors,
-                       DeviceSpan scratch) {
+void validate_storage(const Weights* weights, std::span<const Tensor* const> tensors,
+                      CudaExecutionView execution, MemorySpan scratch) {
     std::array<common::operand::Range, 11> ranges{};
     std::size_t count = 0;
     const auto add    = [&](const void* pointer, std::size_t bytes) {
@@ -117,15 +115,22 @@ void validate_disjoint(const Weights* weights, std::span<const Tensor* const> te
     };
     if (weights) {
         const auto& first = *weights->first;
+        common::operand::device(first.device, execution.device(), kOp, "weight");
         add(first.qdata, common::operand::bytes(std::uint64_t(first.n) * first.k, 2, kOp));
         if (weights->second) {
             const auto& second = *weights->second;
+            common::operand::device(second.device, execution.device(), kOp, "weight");
             add(second.qdata, common::operand::bytes(std::uint64_t(second.n) * second.k, 2, kOp));
         }
     }
-    for (const Tensor* tensor : tensors)
+    for (const Tensor* tensor : tensors) {
+        common::operand::device(tensor->device, execution.device(), kOp, "operand");
         add(tensor->data, common::operand::bytes(tensor->numel(), dtype_size(tensor->dtype), kOp));
-    if (scratch.bytes) add(scratch.data, scratch.bytes);
+    }
+    if (scratch.bytes) {
+        common::operand::device(scratch.device, execution.device(), kOp, "scratch");
+        add(scratch.data, scratch.bytes);
+    }
     common::operand::disjoint(std::span{ranges.data(), count}, kOp);
 }
 

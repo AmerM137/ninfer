@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/buffer.h"
 #include "options.h"
 #include "ninfer/ops/ple.h"
 
@@ -13,9 +14,18 @@ inline constexpr int H = 2560, C = 4, D = H * C;
 struct ConvFixture {
     const Options& options;
     int tokens, capacity;
-    DeviceBuffer residual, gated, kernel, norm, history, records, updated, normalized;
+    DeviceBuffer residual;
+    DeviceBuffer gated;
+    DeviceBuffer kernel;
+    DeviceBuffer norm;
+    DeviceBuffer history;
+    DeviceBuffer records;
+    DeviceBuffer updated;
+    DeviceBuffer normalized;
     std::vector<int> counts;
-    DeviceBuffer valid, slots, offsets;
+    DeviceBuffer valid;
+    DeviceBuffer slots;
+    DeviceBuffer offsets;
     std::unique_ptr<SavedBuffer> saved;
 
     ConvFixture(const Options& o, int t)
@@ -36,24 +46,25 @@ struct ConvFixture {
         if (o.inplace) saved = std::make_unique<SavedBuffer>(residual);
     }
 
-    void restore(cudaStream_t stream) const {
-        if (saved) saved->restore(stream);
+    void restore(CudaExecutionView cuda) const {
+        if (saved) saved->restore(cuda);
     }
 
-    void launch(DeviceExecutionView execution) {
+    void launch(CudaExecutionView execution) {
         const int b = options.batch;
-        Tensor h(residual.p, DType::BF16, {H, C, tokens, b}),
-            u(gated.p, DType::BF16, {H, C, tokens, b});
-        Tensor w(kernel.p, DType::BF16, {D, 4}),
-            y(options.inplace ? residual.p : updated.p, DType::BF16, {H, C, tokens, b});
-        const ops::PleBatchView batch{Tensor(valid.p, DType::I32, {b})};
-        const ops::PleConvStateView before{Tensor(history.p, DType::BF16, {D, 9, b}),
-                                           Tensor(slots.p, DType::I32, {b})};
-        const ops::PleConvRecordWindowView current{Tensor(records.p, DType::BF16, {D, capacity, b}),
-                                                   Tensor(offsets.p, DType::I32, {b})};
+        Tensor h(residual.span(), DType::BF16, {H, C, tokens, b}),
+            u(gated.span(), DType::BF16, {H, C, tokens, b});
+        Tensor w(kernel.span(), DType::BF16, {D, 4}),
+            y(options.inplace ? residual.span() : updated.span(), DType::BF16, {H, C, tokens, b});
+        const ops::PleBatchView batch{Tensor(valid.span(), DType::I32, {b})};
+        const ops::PleConvStateView before{Tensor(history.span(), DType::BF16, {D, 9, b}),
+                                           Tensor(slots.span(), DType::I32, {b})};
+        const ops::PleConvRecordWindowView current{
+            Tensor(records.span(), DType::BF16, {D, capacity, b}),
+            Tensor(offsets.span(), DType::I32, {b})};
         if (options.op == "conv-add-norm") {
-            Tensor weight(norm.p, DType::BF16, {H, C}),
-                z(normalized.p, DType::BF16, {H, C, tokens, b});
+            Tensor weight(norm.span(), DType::BF16, {H, C}),
+                z(normalized.span(), DType::BF16, {H, C, tokens, b});
             ops::ple_conv_add_norm(h, u, w, batch, before, current, weight, 1e-6f, y, z, execution);
         } else
             ops::ple_conv_add(h, u, w, batch, before, current, y, execution);
@@ -63,7 +74,12 @@ struct ConvFixture {
 struct ExtractFixture {
     const Options& options;
     int tokens;
-    DeviceBuffer history, records, after, slots, valid, accepted;
+    DeviceBuffer history;
+    DeviceBuffer records;
+    DeviceBuffer after;
+    DeviceBuffer slots;
+    DeviceBuffer valid;
+    DeviceBuffer accepted;
     std::vector<int> counts, commits;
     std::unique_ptr<SavedBuffer> saved;
 
@@ -84,17 +100,20 @@ struct ExtractFixture {
         if (o.inplace) saved = std::make_unique<SavedBuffer>(history);
     }
 
-    void restore(cudaStream_t stream) const {
-        if (saved) saved->restore(stream);
+    void restore(CudaExecutionView cuda) const {
+        if (saved) saved->restore(cuda);
     }
 
-    void launch(DeviceExecutionView execution) {
+    void launch(CudaExecutionView execution) {
         const int b = options.batch;
-        const Tensor indices(slots.p, DType::I32, {b}), a(accepted.p, DType::I32, {b});
+        const Tensor indices(slots.span(), DType::I32, {b}), a(accepted.span(), DType::I32, {b});
         ops::ple_state_extract(
-            {Tensor(history.p, DType::BF16, {D, 9, b}), indices},
-            {Tensor(records.p, DType::BF16, {D, tokens, b}), Tensor(valid.p, DType::I32, {b})}, a,
-            {Tensor(options.inplace ? history.p : after.p, DType::BF16, {D, 9, b}), indices},
+            {Tensor(history.span(), DType::BF16, {D, 9, b}), indices},
+            {Tensor(records.span(), DType::BF16, {D, tokens, b}),
+             Tensor(valid.span(), DType::I32, {b})},
+            a,
+            {Tensor(options.inplace ? history.span() : after.span(), DType::BF16, {D, 9, b}),
+             indices},
             execution);
     }
 };

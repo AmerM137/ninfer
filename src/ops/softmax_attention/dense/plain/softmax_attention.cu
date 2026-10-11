@@ -29,10 +29,12 @@ std::int32_t select_tile(std::int32_t segment_length) {
 } // namespace
 
 void softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
-                       AttentionHeadGeometry geometry, float scale, WorkspaceArena& workspace,
-                       Tensor& out, cudaStream_t stream) {
-    const std::int32_t tokens =
-        detail::noncausal::validate_qkv(q, k, v, out, geometry, scale, "softmax_attention");
+                       AttentionHeadGeometry geometry, float scale, MemoryArena& workspace,
+                       Tensor& out, CudaExecutionView execution) {
+    const auto stream         = execution.stream();
+    const std::int32_t tokens = detail::noncausal::validate_qkv(
+        q, k, v, out, geometry, scale, "softmax_attention", execution.device());
+    common::operand::device(workspace.device(), execution.device(), "attention", "workspace");
     auto scope            = workspace.scope();
     const int tile        = select_tile(tokens);
     const int query_tiles = (tokens + tile - 1) / tile;

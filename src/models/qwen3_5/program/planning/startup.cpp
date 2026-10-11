@@ -274,7 +274,6 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
 }
 
 WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
-    const DeviceExecutionView device_execution{nullptr, plan.multiprocessor_count};
     const auto& parameters = *plan.parameters;
     const auto& config     = parameters.model.config().text;
 
@@ -331,7 +330,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                          dimension(config.attention->num_attention_heads),
                                          dimension(config.attention->num_key_value_heads)},
                                         plan.kv_storage, envelope, batch_size, min_width, max_width,
-                                        device_execution));
+                                        plan.multiprocessor_count));
                     add_scratch(layout, attention->output, first, last);
                 } else {
                     const auto& gdn = std::get<execution::GdnParameters>(block.mixer);
@@ -394,11 +393,12 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         scratch(layout, execution::mtp_projection_workspace_bytes(parameters.mtp->projection,
                                                                   tokens, tokens));
         (void)workspace::mtp_attention_results(layout, config, tokens);
-        scratch(layout, ops::causal_softmax_attention_workspace_capacity_bytes(
-                            {dimension(config.attention->head_dim),
-                             dimension(config.attention->num_attention_heads),
-                             dimension(config.attention->num_key_value_heads)},
-                            plan.kv_storage, envelope, 1, tokens, tokens, device_execution));
+        scratch(layout,
+                ops::causal_softmax_attention_workspace_capacity_bytes(
+                    {dimension(config.attention->head_dim),
+                     dimension(config.attention->num_attention_heads),
+                     dimension(config.attention->num_key_value_heads)},
+                    plan.kv_storage, envelope, 1, tokens, tokens, plan.multiprocessor_count));
         (void)workspace::mtp_post_attention(layout, config, tokens);
         mtp_post_mixer(layout, tokens, tokens);
     };
@@ -438,7 +438,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                             {dimension(config.attention->head_dim),
                              dimension(config.attention->num_attention_heads),
                              dimension(config.attention->num_key_value_heads)},
-                            plan.kv_storage, text_envelope, 1, 1, 1, device_execution));
+                            plan.kv_storage, text_envelope, 1, 1, 1, plan.multiprocessor_count));
         matrix(layout, DType::BF16, dimension(config.hidden_size), 1);
         matrix(layout, DType::BF16, dimension(config.hidden_size), 1);
         mtp_post_mixer(layout, 1, 1);
@@ -527,12 +527,12 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                 scratch(layout, execution::mtp_projection_workspace_bytes(
                                     parameters.mtp->projection, tokens, tokens));
                 (void)workspace::mtp_attention_results(layout, config, tokens);
-                scratch(layout,
-                        ops::causal_softmax_attention_workspace_capacity_bytes(
-                            {dimension(config.attention->head_dim),
-                             dimension(config.attention->num_attention_heads),
-                             dimension(config.attention->num_key_value_heads)},
-                            plan.kv_storage, text_envelope, batch, width, width, device_execution));
+                scratch(layout, ops::causal_softmax_attention_workspace_capacity_bytes(
+                                    {dimension(config.attention->head_dim),
+                                     dimension(config.attention->num_attention_heads),
+                                     dimension(config.attention->num_key_value_heads)},
+                                    plan.kv_storage, text_envelope, batch, width, width,
+                                    plan.multiprocessor_count));
                 (void)workspace::mtp_post_attention(layout, config, tokens);
                 mtp_post_mixer(layout, tokens, tokens);
             };
@@ -836,7 +836,6 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->features             = inputs.features;
     impl->use_cuda_graph       = inputs.use_cuda_graph;
     impl->causal_scoring       = inputs.causal_scoring;
-    impl->device               = inputs.device;
     impl->multiprocessor_count = inputs.multiprocessor_count;
     impl->context_cache        = inputs.context_cache;
     impl->kv_storage           = inputs.kv_storage;
@@ -916,7 +915,6 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .features             = models::load_options(options),
         .use_cuda_graph       = options.use_cuda_graph,
         .causal_scoring       = options.purpose == EnginePurpose::CausalScoring,
-        .device               = options.device,
         .multiprocessor_count = device.multiprocessor_count(),
         .context_cache        = options.context_cache,
     };

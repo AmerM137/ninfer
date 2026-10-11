@@ -1,4 +1,6 @@
 #include "core/weight.h"
+#include "cuda_fixture.h"
+#include "core/buffer.h"
 #include "ops/linear/linear_test_common.h"
 
 #include <array>
@@ -93,18 +95,21 @@ int run_fp8_a16() {
                   {5120, 17408, 829U, Comparison::Sampled, true, residual17408_invocations});
 
     auto packed = make_fp8_weight(14336, 5120, 831U);
-    DeviceBuffer device_weight(packed.payload.size());
-    device_weight.copy_from_host(packed.payload.data(), device_weight.bytes);
-    const Weight weight = packed.device_weight(device_weight.p);
+    DeviceBuffer device_weight(ninfer::test::cuda_environment().context.device(),
+                               packed.payload.size());
+    device_weight.copy_from_host(packed.payload.data(), device_weight.size());
+    const Weight weight = packed.device_weight(device_weight.span());
     const std::vector<std::uint16_t> input_bits(5120, 0);
     auto device_input = test::to_device(input_bits);
     test::GuardedDeviceBuffer device_output(14336 * sizeof(std::uint16_t));
     device_output.fill(0xff);
-    Tensor input(device_input.p, DType::BF16, {5120, 1});
-    Tensor output(device_output.data(), DType::BF16, {14336, 1});
-    DeviceArena workspace(256);
+    Tensor input(device_input.span(), DType::BF16, {5120, 1});
+    Tensor output(device_output.span(), DType::BF16, {14336, 1});
+    ninfer::DeviceBuffer workspace_storage(ninfer::test::cuda_environment().context.device(), 256);
+    MemoryArena workspace(workspace_storage.span());
     const auto invoke = [&](const Weight& candidate) {
-        ops::linear(input, candidate, output, ops::LinearPolicy::A16Only, workspace, nullptr);
+        ops::linear(input, candidate, output, ops::LinearPolicy::A16Only, workspace,
+                    ninfer::test::cuda_environment().default_execution);
     };
     try {
         invoke(weight);
@@ -132,9 +137,9 @@ int run_fp8_a16() {
     expect_invalid("payload bound", invalid);
     failures += device_output.verify_guards("FP8 metadata output");
     failures += test::linear_common::verify_preserved(
-        device_input.p, std::as_bytes(std::span(input_bits)), "FP8 metadata input");
+        device_input.data(), std::as_bytes(std::span(input_bits)), "FP8 metadata input");
     failures += test::linear_common::verify_preserved(
-        device_weight.p, std::as_bytes(std::span(packed.payload)), "FP8 metadata weight");
+        device_weight.data(), std::as_bytes(std::span(packed.payload)), "FP8 metadata weight");
     for (auto [n, k] : {std::pair{14336, 5120}, std::pair{16384, 5120}, std::pair{34816, 5120},
                         std::pair{248320, 5120}, std::pair{5120, 6144}, std::pair{5120, 17408}}) {
         failures += verify_workspace_envelopes(QType::FP8_E4M3FN_ROW_BF16, n, k);

@@ -1,12 +1,12 @@
 #pragma once
 
+#include "core/device.h"
 #include "core/arena.h"
 #include "core/tensor.h"
 
 #include <cstddef>
 #include <cstdint>
 
-#include <cuda_runtime.h> // cudaStream_t
 
 namespace ninfer::ops {
 
@@ -86,10 +86,11 @@ struct SamplingConfig {
  */
 void sample(const Tensor& logits, Tensor& out, std::int32_t token_domain,
             const SamplingConfig* configs, const Tensor& logical_positions, std::int32_t purpose,
-            WorkspaceArena& workspace, cudaStream_t stream);
+            MemoryArena& workspace, CudaExecutionView execution);
 
 // Adds every id in the contiguous non-empty I32 token_ids vector to the contiguous I32
 // [token_domain] committed count array. IDs must be in [0,token_domain).
-void increment_token_counts(const Tensor& token_ids, Tensor& token_counts, cudaStream_t stream);
+void increment_token_counts(const Tensor& token_ids, Tensor& token_counts,
+                            CudaExecutionView execution);
 
 } // namespace ninfer::ops

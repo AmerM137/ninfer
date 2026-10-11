@@ -1,4 +1,6 @@
 #include "ninfer/ops/gated_delta_net.h"
+#include "cuda_fixture.h"
+#include "core/buffer.h"
 
 #include "gdn_ref.h"
 #include "ops/op_tester.h"
@@ -24,13 +26,6 @@ using namespace ninfer;
 using namespace ninfer::test;
 
 namespace {
-DeviceExecutionView execution(cudaStream_t stream = nullptr) {
-    int device = 0;
-    CUDA_CHECK(cudaGetDevice(&device));
-    cudaDeviceProp props{};
-    CUDA_CHECK(cudaGetDeviceProperties(&props, device));
-    return {stream, props.multiProcessorCount};
-}
 
 constexpr int kStateDim = 128;
 
@@ -392,20 +387,20 @@ int run_case(const Case& test_case, std::uint32_t seed,
     GuardedDeviceBuffer out(in.v.size() * sizeof(std::uint16_t));
     state_a.copy_from_host(in.state.data(), state_a.bytes());
     out.fill(0xff);
-    Tensor q(device.q.p, DType::BF16, {kStateDim, test_case.qk_heads, test_case.tokens});
-    Tensor k(device.k.p, DType::BF16, {kStateDim, test_case.qk_heads, test_case.tokens});
-    Tensor v(device.v.p, DType::BF16, {kStateDim, test_case.value_heads, test_case.tokens});
-    Tensor g(device.g.p, DType::FP32, {test_case.value_heads, test_case.tokens});
-    Tensor beta(device.beta.p, DType::FP32, {test_case.value_heads, test_case.tokens});
-    Tensor output(out.data(), DType::BF16, {kStateDim, test_case.value_heads, test_case.tokens});
+    Tensor q(device.q.span(), DType::BF16, {kStateDim, test_case.qk_heads, test_case.tokens});
+    Tensor k(device.k.span(), DType::BF16, {kStateDim, test_case.qk_heads, test_case.tokens});
+    Tensor v(device.v.span(), DType::BF16, {kStateDim, test_case.value_heads, test_case.tokens});
+    Tensor g(device.g.span(), DType::FP32, {test_case.value_heads, test_case.tokens});
+    Tensor beta(device.beta.span(), DType::FP32, {test_case.value_heads, test_case.tokens});
+    Tensor output(out.span(), DType::BF16, {kStateDim, test_case.value_heads, test_case.tokens});
 
     const int maximum_call     = *std::max_element(partitions.begin(), partitions.end());
     const auto workspace_bytes = ops::gated_delta_net_workspace_capacity_bytes(
         test_case.qk_heads, test_case.value_heads, 1, maximum_call);
     GuardedDeviceBuffer scratch(std::max<std::size_t>(workspace_bytes, 256));
     scratch.fill(0xff);
-    WorkspaceArena workspace(DeviceSpan{scratch.data(), scratch.bytes()});
-    const auto device_execution = execution();
+    MemoryArena workspace(scratch.span());
+    const auto device_execution = cuda_environment().default_execution;
 
     GuardedDeviceBuffer* current = &state_a;
     int failures                 = 0;
@@ -418,9 +413,9 @@ int run_case(const Case& test_case, std::uint32_t seed,
             source_before = from_device<float>(current->data(), in.state.size());
             destination->fill(0xff);
         }
-        Tensor input_state(current->data(), DType::FP32,
+        Tensor input_state(current->span(), DType::FP32,
                            {kStateDim, kStateDim, test_case.value_heads});
-        Tensor output_state(destination->data(), DType::FP32,
+        Tensor output_state(destination->span(), DType::FP32,
                             {kStateDim, kStateDim, test_case.value_heads});
         Tensor qs = q.slice(2, begin, length), ks = k.slice(2, begin, length);
         Tensor vs = v.slice(2, begin, length), gs = g.slice(1, begin, length);
@@ -568,19 +563,19 @@ int batch_update_case(const Case& test_case, const std::vector<int>& source_slot
     DeviceBuffer device_source_slots      = to_device(source_slots);
     DeviceBuffer device_destination_slots = to_device(destination_slots);
 
-    Tensor q(device.q.p, DType::BF16, {kStateDim, test_case.qk_heads, width, batch});
-    Tensor k(device.k.p, DType::BF16, {kStateDim, test_case.qk_heads, width, batch});
-    Tensor v(device.v.p, DType::BF16, {kStateDim, test_case.value_heads, width, batch});
-    Tensor g(device.g.p, DType::FP32, {test_case.value_heads, width, batch});
-    Tensor beta(device.beta.p, DType::FP32, {test_case.value_heads, width, batch});
-    Tensor states_tensor(states.data(), DType::FP32,
+    Tensor q(device.q.span(), DType::BF16, {kStateDim, test_case.qk_heads, width, batch});
+    Tensor k(device.k.span(), DType::BF16, {kStateDim, test_case.qk_heads, width, batch});
+    Tensor v(device.v.span(), DType::BF16, {kStateDim, test_case.value_heads, width, batch});
+    Tensor g(device.g.span(), DType::FP32, {test_case.value_heads, width, batch});
+    Tensor beta(device.beta.span(), DType::FP32, {test_case.value_heads, width, batch});
+    Tensor states_tensor(states.span(), DType::FP32,
                          {kStateDim, kStateDim, test_case.value_heads, slots});
-    Tensor source_slots_tensor(device_source_slots.p, DType::I32, {batch});
-    Tensor destination_slots_tensor(device_destination_slots.p, DType::I32, {batch});
-    Tensor out_tensor(out.data(), DType::BF16, {kStateDim, test_case.value_heads, width, batch});
-    ops::gated_delta_net_batch_update(q, k, v, g, beta, scale, test_case.normalize_qk,
-                                      states_tensor, source_slots_tensor, destination_slots_tensor,
-                                      out_tensor, nullptr);
+    Tensor source_slots_tensor(device_source_slots.span(), DType::I32, {batch});
+    Tensor destination_slots_tensor(device_destination_slots.span(), DType::I32, {batch});
+    Tensor out_tensor(out.span(), DType::BF16, {kStateDim, test_case.value_heads, width, batch});
+    ops::gated_delta_net_batch_update(
+        q, k, v, g, beta, scale, test_case.normalize_qk, states_tensor, source_slots_tensor,
+        destination_slots_tensor, out_tensor, ninfer::test::cuda_environment().default_execution);
     cuda_synchronize();
 
     const std::string label =
@@ -627,26 +622,33 @@ int batch_update_case(const Case& test_case, const std::vector<int>& source_slot
 }
 
 int contract_rejection_cases() {
-    DeviceBuffer q_buffer(kStateDim * 8 * sizeof(std::uint16_t));
-    DeviceBuffer k_buffer(kStateDim * 8 * sizeof(std::uint16_t));
-    DeviceBuffer v_buffer(kStateDim * 8 * sizeof(std::uint16_t));
-    DeviceBuffer g_buffer(8 * sizeof(float));
-    DeviceBuffer beta_buffer(8 * sizeof(float));
-    DeviceBuffer state_buffer(kStateDim * kStateDim * 8 * sizeof(float));
-    DeviceBuffer out_buffer(kStateDim * 8 * sizeof(std::uint16_t));
-    WorkspaceArena workspace(256);
+    DeviceBuffer q_buffer(ninfer::test::cuda_environment().context.device(),
+                          kStateDim * 8 * sizeof(std::uint16_t));
+    DeviceBuffer k_buffer(ninfer::test::cuda_environment().context.device(),
+                          kStateDim * 8 * sizeof(std::uint16_t));
+    DeviceBuffer v_buffer(ninfer::test::cuda_environment().context.device(),
+                          kStateDim * 8 * sizeof(std::uint16_t));
+    DeviceBuffer g_buffer(ninfer::test::cuda_environment().context.device(), 8 * sizeof(float));
+    DeviceBuffer beta_buffer(ninfer::test::cuda_environment().context.device(), 8 * sizeof(float));
+    DeviceBuffer state_buffer(ninfer::test::cuda_environment().context.device(),
+                              kStateDim * kStateDim * 8 * sizeof(float));
+    DeviceBuffer out_buffer(ninfer::test::cuda_environment().context.device(),
+                            kStateDim * 8 * sizeof(std::uint16_t));
+    ninfer::DeviceBuffer workspace_storage(ninfer::test::cuda_environment().context.device(), 256);
+    MemoryArena workspace(workspace_storage.span());
     const float scale = 1.0f / std::sqrt(static_cast<float>(kStateDim));
 
     auto is_rejected = [&](int activation_dim, int state_dim, int qk_heads, int value_heads) {
-        Tensor q(q_buffer.p, DType::BF16, {activation_dim, qk_heads, 1});
-        Tensor k(k_buffer.p, DType::BF16, {activation_dim, qk_heads, 1});
-        Tensor v(v_buffer.p, DType::BF16, {activation_dim, value_heads, 1});
-        Tensor g(g_buffer.p, DType::FP32, {value_heads, 1});
-        Tensor beta(beta_buffer.p, DType::FP32, {value_heads, 1});
-        Tensor state(state_buffer.p, DType::FP32, {state_dim, state_dim, value_heads});
-        Tensor out(out_buffer.p, DType::BF16, {activation_dim, value_heads, 1});
+        Tensor q(q_buffer.span(), DType::BF16, {activation_dim, qk_heads, 1});
+        Tensor k(k_buffer.span(), DType::BF16, {activation_dim, qk_heads, 1});
+        Tensor v(v_buffer.span(), DType::BF16, {activation_dim, value_heads, 1});
+        Tensor g(g_buffer.span(), DType::FP32, {value_heads, 1});
+        Tensor beta(beta_buffer.span(), DType::FP32, {value_heads, 1});
+        Tensor state(state_buffer.span(), DType::FP32, {state_dim, state_dim, value_heads});
+        Tensor out(out_buffer.span(), DType::BF16, {activation_dim, value_heads, 1});
         try {
-            ops::gated_delta_net(q, k, v, g, beta, scale, true, workspace, state, out, execution());
+            ops::gated_delta_net(q, k, v, g, beta, scale, true, workspace, state, out,
+                                 cuda_environment().default_execution);
         } catch (const std::invalid_argument&) { return true; }
         cuda_synchronize();
         return false;

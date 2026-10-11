@@ -1,4 +1,6 @@
 #include "core/weight.h"
+#include "cuda_fixture.h"
+#include "core/buffer.h"
 #include "ninfer/ops/linear_split.h"
 #include "ninfer/ops/weight_input.h"
 
@@ -65,7 +67,7 @@ int verify_output(std::string_view label, const GuardedBf16Tensor& output,
 WeightParent physical_parent(const Weight& weight) {
     const std::array shape{static_cast<std::uint64_t>(weight.n),
                            static_cast<std::uint64_t>(weight.k)};
-    return {weight_geometry(weight.qtype, weight.layout, shape),
+    return {weight_geometry(weight.qtype, weight.layout, shape), weight.device,
             static_cast<const std::byte*>(weight.payload), weight.weight_scale_divisor};
 }
 
@@ -83,13 +85,13 @@ int run_target_projection_case(DevicePackedWeight& parent, DevicePackedWeight* g
     DeviceBuffer input   = to_device(activation_bits);
     GuardedBf16Tensor query(qrows, tokens), gate(qrows, tokens), key(kvrows, tokens),
         value(kvrows, tokens);
-    Tensor x(input.p, DType::BF16, {hidden, tokens}), q = query.tensor(), g = gate.tensor(),
-                                                      k = key.tensor(), v = value.tensor();
+    Tensor x(input.span(), DType::BF16, {hidden, tokens}), q = query.tensor(), g = gate.tensor(),
+                                                           k = key.tensor(), v = value.tensor();
     const auto capacity = dual ? 0
                                : workspace_capacity(QType::FP8_E4M3FN_ROW_BF16, 14336, hidden,
                                                     policy, tokens, tokens);
     GuardedDeviceBuffer scratch(std::max<std::size_t>(capacity, 1));
-    DeviceArena workspace(DeviceSpan{scratch.data(), std::max<std::size_t>(capacity, 1)});
+    MemoryArena workspace(scratch.span().subspan(0, std::max<std::size_t>(capacity, 1)));
     DeviceContext device;
     const auto first    = physical_parent(parent.view());
     const auto second   = gate_value ? physical_parent(gate_value->view()) : first;
@@ -99,13 +101,13 @@ int run_target_projection_case(DevicePackedWeight& parent, DevicePackedWeight* g
     const auto prepared = ops::prepare_projection_weights(std::array<ops::WeightInput, 4>{
         {{q_weight, policy}, {k_weight, policy}, {g_weight, policy}, {v_weight, policy}}});
     const auto launch   = [&] {
-        ops::linear_split(x, prepared, std::array{q, k, g, v}, workspace, device.stream);
+        ops::linear_split(x, prepared, std::array{q, k, g, v}, workspace, device.execution_view());
     };
     DecodeGraphDefinition definition;
     DecodeGraphExecutable graph;
     cuda_synchronize();
     if (replay) {
-        definition.capture(device.stream, launch);
+        definition.capture(device.stream(), launch);
         graph.instantiate(definition);
     }
     int failures = 0;
@@ -113,18 +115,18 @@ int run_target_projection_case(DevicePackedWeight& parent, DevicePackedWeight* g
         if (phase) {
             for (auto& v : activation) v = -v;
             activation_bits = bf16_bits(activation);
-            input.copy_from_host(activation_bits.data(), input.bytes);
+            input.copy_from_host(activation_bits.data(), input.size());
         }
         scratch.fill(phase ? 0xa5 : 0x5a);
         cuda_synchronize();
         for (Tensor* out : {&q, &g, &k, &v})
             CUDA_CHECK(cudaMemsetAsync(out->data, 0xff, std::size_t(out->ne[0]) * tokens * 2,
-                                       device.stream));
+                                       device.stream()));
         if (replay)
-            graph.launch(device.stream);
+            graph.launch(device.stream());
         else
             launch();
-        cuda_synchronize(device.stream);
+        cuda_synchronize(device.stream());
         const bool a8 =
             policy == ops::LinearPolicy::AllowA8 || policy == ops::LinearPolicy::AllowA4;
         const auto criterion     = dual ? kAttnInputProjA16Tolerance
@@ -265,7 +267,7 @@ int run_bf16_target_case(DeviceWeight& parent, std::int32_t tokens, bool replay 
     GuardedBf16Tensor gate(kQRows, tokens);
     GuardedBf16Tensor key(kKvRows, tokens);
     GuardedBf16Tensor value(kKvRows, tokens);
-    Tensor x(device_activation.p, DType::BF16, {kHidden, tokens});
+    Tensor x(device_activation.span(), DType::BF16, {kHidden, tokens});
     Tensor q = query.tensor();
     Tensor g = gate.tensor();
     Tensor k = key.tensor();
@@ -274,27 +276,27 @@ int run_bf16_target_case(DeviceWeight& parent, std::int32_t tokens, bool replay 
     // The fixture poisons outputs on the default stream; order it before the nonblocking stream.
     cuda_synchronize();
     const auto launch = [&] {
-        ops::linear_split(x, parent.view(), std::array{q, k, g, v}, context.stream);
+        ops::linear_split(x, parent.view(), std::array{q, k, g, v}, context.execution_view());
     };
     DecodeGraphDefinition definition;
     DecodeGraphExecutable graph;
     if (replay) {
-        definition.capture(context.stream, launch);
+        definition.capture(context.stream(), launch);
         graph.instantiate(definition);
-        graph.launch(context.stream);
-        cuda_synchronize(context.stream);
+        graph.launch(context.stream());
+        cuda_synchronize(context.stream());
         for (auto& value : activation) value = -value;
         activation_bits = bf16_bits(activation);
-        device_activation.copy_from_host(activation_bits.data(), device_activation.bytes);
-        query.repaint(context.stream);
-        gate.repaint(context.stream);
-        key.repaint(context.stream);
-        value.repaint(context.stream);
-        graph.launch(context.stream);
+        device_activation.copy_from_host(activation_bits.data(), device_activation.size());
+        query.repaint(context.stream());
+        gate.repaint(context.stream());
+        key.repaint(context.stream());
+        value.repaint(context.stream());
+        graph.launch(context.stream());
     } else {
         launch();
     }
-    cuda_synchronize(context.stream);
+    cuda_synchronize(context.stream());
 
     constexpr std::int32_t kKeyBegin   = kQRows;
     constexpr std::int32_t kGateBegin  = kKeyBegin + kKvRows;
@@ -368,14 +370,16 @@ int run_nvfp4_target_case(DevicePackedWeight& parent, std::int32_t tokens,
     GuardedBf16Tensor gate(kQRows, tokens);
     GuardedBf16Tensor key(kKvRows, tokens);
     GuardedBf16Tensor value(kKvRows, tokens);
-    Tensor x(device_activation.p, DType::BF16, {kHidden, tokens});
+    Tensor x(device_activation.span(), DType::BF16, {kHidden, tokens});
     Tensor q = query.tensor();
     Tensor g = gate.tensor();
     Tensor k = key.tensor();
     Tensor v = value.tensor();
     const std::size_t capacity =
         workspace_capacity(QType::NVFP4, 14336, kHidden, policy, tokens, tokens);
-    DeviceArena workspace(std::max<std::size_t>(capacity, 256));
+    ninfer::DeviceBuffer workspace_storage(ninfer::test::cuda_environment().context.device(),
+                                           std::max<std::size_t>(capacity, 256));
+    MemoryArena workspace(workspace_storage.span());
     const auto physical = physical_parent(parent.view());
     const auto qw = rows(physical, 0, 6144), kw = rows(physical, 6144, 1024);
     const auto gw = rows(physical, 7168, 6144), vw = rows(physical, 13312, 1024);
@@ -401,7 +405,8 @@ int run_nvfp4_target_case(DevicePackedWeight& parent, std::int32_t tokens,
         }
     }
     ops::linear_split(x, ops::SingleProjectionWeight{prepared.weight, prepared.policy},
-                      std::array{q, k, g, v}, workspace, nullptr);
+                      std::array{q, k, g, v}, workspace,
+                      ninfer::test::cuda_environment().default_execution);
     cuda_synchronize();
 
     constexpr std::int32_t kKeyBegin   = kQRows;
@@ -495,12 +500,13 @@ int run_q8_target_case(DevicePackedWeight& parent, std::int32_t tokens) {
     GuardedBf16Tensor gate(kQRows, tokens);
     GuardedBf16Tensor key(kKvRows, tokens);
     GuardedBf16Tensor value(kKvRows, tokens);
-    Tensor x(device_activation.p, DType::BF16, {kHidden, tokens});
+    Tensor x(device_activation.span(), DType::BF16, {kHidden, tokens});
     Tensor q = query.tensor();
     Tensor g = gate.tensor();
     Tensor k = key.tensor();
     Tensor v = value.tensor();
-    ops::linear_split(x, parent.view(), std::array{q, k, g, v}, nullptr);
+    ops::linear_split(x, parent.view(), std::array{q, k, g, v},
+                      ninfer::test::cuda_environment().default_execution);
     cuda_synchronize();
 
     const std::string suffix = " Q8 target A16 T=" + std::to_string(tokens);
@@ -536,17 +542,18 @@ int run_q8_qkv_case(DevicePackedWeight& parent, std::int32_t hidden, const char*
     auto activation_bits           = bf16_bits(activation);
     DeviceBuffer device_activation = to_device(activation_bits);
     GuardedBf16Tensor query(kQRows, tokens), key(kKvRows, tokens), value(kKvRows, tokens);
-    Tensor x(device_activation.p, DType::BF16, {hidden, tokens});
+    Tensor x(device_activation.span(), DType::BF16, {hidden, tokens});
     Tensor q = query.tensor(), k = key.tensor(), v = value.tensor();
     std::optional<DeviceContext> context;
     if (graph_replay) context.emplace();
-    const cudaStream_t stream = context ? context->stream : nullptr;
+    const auto cuda   = context ? context->execution_view() : cuda_environment().default_execution;
+    const auto stream = cuda.stream();
     const auto physical       = physical_parent(parent.view());
     const auto qw = rows(physical, 0, 4096), kw = rows(physical, 4096, 1024);
     const auto vw = rows(physical, 5120, 1024);
     const auto prepared =
         ops::prepare_linear_weight(std::array<ops::WeightInput, 3>{{{qw}, {kw}, {vw}}});
-    const auto launch = [&] { ops::linear_split(x, prepared.weight, std::array{q, k, v}, stream); };
+    const auto launch = [&] { ops::linear_split(x, prepared.weight, std::array{q, k, v}, cuda); };
     DecodeGraphDefinition definition;
     DecodeGraphExecutable graph;
     cuda_synchronize();
@@ -559,7 +566,7 @@ int run_q8_qkv_case(DevicePackedWeight& parent, std::int32_t hidden, const char*
         if (phase) {
             for (auto& element : activation) element = -element;
             activation_bits = bf16_bits(activation);
-            device_activation.copy_from_host(activation_bits.data(), device_activation.bytes);
+            device_activation.copy_from_host(activation_bits.data(), device_activation.size());
         }
         cuda_check(
             cudaMemsetAsync(q.data, 0xff, static_cast<std::size_t>(kQRows) * tokens * 2, stream),

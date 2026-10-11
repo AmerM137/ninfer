@@ -1,4 +1,6 @@
 #include "ninfer/ops/rmsnorm.h"
+#include "cuda_fixture.h"
+#include "core/buffer.h"
 #include "ops/norm_test_common.h"
 #include "core/device.h"
 #include "core/decode_graph.h"
@@ -62,20 +64,21 @@ int run_case(const char* label, const Shape& shape, bool unit_offset, std::uint3
     output.fill(0xff);
     void* output_data = static_cast<std::uint8_t*>(output.data()) + leading;
 
-    Tensor input_tensor = tensor_for(device_input.data, shape);
-    Tensor weight_tensor(device_weight.data, DType::BF16, {shape.d});
-    Tensor output_tensor = tensor_for(output_data, shape);
+    Tensor input_tensor = tensor_for(device_input.memory, shape);
+    Tensor weight_tensor(device_weight.memory, DType::BF16, {shape.d});
+    Tensor output_tensor = tensor_for(output.span().subspan(leading), shape);
     if (width) {
-        input_tensor = Tensor(device_input.data, DType::BF16,
-                              {shape.d, shape.rows, width, shape.tokens / width});
-        output_tensor =
-            Tensor(output_data, DType::BF16, {shape.d, shape.rows, width, shape.tokens / width});
+        input_tensor  = Tensor(device_input.memory, DType::BF16,
+                               {shape.d, shape.rows, width, shape.tokens / width});
+        output_tensor = Tensor(output.span().subspan(leading), DType::BF16,
+                               {shape.d, shape.rows, width, shape.tokens / width});
     }
     DeviceContext device;
     DecodeGraphDefinition definition;
     DecodeGraphExecutable graph;
     const auto launch = [&] {
-        ops::rmsnorm(input_tensor, weight_tensor, kEps, unit_offset, output_tensor, device.stream);
+        ops::rmsnorm(input_tensor, weight_tensor, kEps, unit_offset, output_tensor,
+                     device.execution_view());
     };
     int failures = 0;
     for (int phase = 0; phase < (replay ? 2 : 1); ++phase) {
@@ -87,22 +90,22 @@ int run_case(const char* label, const Shape& shape, bool unit_offset, std::uint3
                 device_input.expected[i + offset] = f32_to_bf16(input[i]);
             for (std::size_t i = 0; i < weight.size(); ++i)
                 device_weight.expected[i + offset] = f32_to_bf16(weight[i]);
-            CUDA_CHECK(cudaMemcpy(device_input.storage.p, device_input.expected.data(),
+            CUDA_CHECK(cudaMemcpy(device_input.storage.data(), device_input.expected.data(),
                                   device_input.expected.size() * 2, cudaMemcpyHostToDevice));
-            CUDA_CHECK(cudaMemcpy(device_weight.storage.p, device_weight.expected.data(),
+            CUDA_CHECK(cudaMemcpy(device_weight.storage.data(), device_weight.expected.data(),
                                   device_weight.expected.size() * 2, cudaMemcpyHostToDevice));
         }
         output.fill(0xff);
         cuda_synchronize();
         if (replay && phase == 0) {
-            definition.capture(device.stream, launch);
+            definition.capture(device.stream(), launch);
             graph.instantiate(definition);
         }
         if (replay)
-            graph.launch(device.stream);
+            graph.launch(device.stream());
         else
             launch();
-        cuda_synchronize(device.stream);
+        cuda_synchronize(device.stream());
         const auto reference = rmsnorm_oracle(input, weight, shape, unit_offset);
         failures += verify_reduction(label, from_device_bf16(output_data, count), reference,
                                      rmsnorm_bf16_criterion());
@@ -116,13 +119,16 @@ int run_case(const char* label, const Shape& shape, bool unit_offset, std::uint3
 } // namespace
 
 int validate_contract() {
-    DeviceBuffer input(128 * 4), weight(128 * 2), output(128 * 4);
-    Tensor x(input.p, DType::BF16, {128, 2}), w(weight.p, DType::BF16, {128}),
-        y(output.p, DType::BF16, {128, 2});
+    DeviceBuffer input(ninfer::test::cuda_environment().context.device(), 128 * 4);
+    DeviceBuffer weight(ninfer::test::cuda_environment().context.device(), 128 * 2);
+    DeviceBuffer output(ninfer::test::cuda_environment().context.device(), 128 * 4);
+    Tensor x(input.span(), DType::BF16, {128, 2}), w(weight.span(), DType::BF16, {128}),
+        y(output.span(), DType::BF16, {128, 2});
     int failed        = 0;
     const auto reject = [&](const Tensor& a, const Tensor& b, Tensor out) {
         try {
-            ops::rmsnorm(a, b, 1.0e-6F, false, out, nullptr);
+            ops::rmsnorm(a, b, 1.0e-6F, false, out,
+                         ninfer::test::cuda_environment().default_execution);
         } catch (const std::invalid_argument&) { return 0; }
         std::cerr << "rmsnorm overlap was accepted\n";
         return 1;
@@ -137,9 +143,11 @@ int validate_contract() {
     auto tied = w;
     tied.data = x.data;
     failed += reject(x, tied, y);
-    Tensor empty(nullptr, DType::BF16, {128, 1}), empty_weight(nullptr, DType::BF16, {128});
+    auto empty        = Tensor::metadata(DType::BF16, {128, 1});
+    auto empty_weight = Tensor::metadata(DType::BF16, {128});
     empty.ne[1] = 0;
-    ops::rmsnorm(empty, empty_weight, 1.0e-6F, false, empty, nullptr);
+    ops::rmsnorm(empty, empty_weight, 1.0e-6F, false, empty,
+                 ninfer::test::cuda_environment().default_execution);
     return failed;
 }
 

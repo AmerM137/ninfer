@@ -1,5 +1,6 @@
 // Public KDA timing. Head counts/grouping remain runtime data.
 #include "ninfer/ops/kimi_delta_attention.h"
+#include "core/buffer.h"
 #include "op_measurement.cuh"
 
 #include <algorithm>
@@ -91,8 +92,8 @@ DeviceBuffer bf16(std::size_t count, unsigned seed, float low, float high) {
     std::uniform_real_distribution<float> dist(low, high);
     std::vector<__nv_bfloat16> values(count);
     for (auto& v : values) v = __float2bfloat16(dist(rng));
-    DeviceBuffer out(count * 2);
-    out.copy_from_host(values.data(), out.bytes);
+    DeviceBuffer out(ninfer::bench::device_context().device(), count * 2);
+    out.copy_from_host(values.data(), out.size());
     return out;
 }
 
@@ -101,14 +102,24 @@ DeviceBuffer fp32(std::size_t count, unsigned seed, float low, float high) {
     std::uniform_real_distribution<float> dist(low, high);
     std::vector<float> values(count);
     for (auto& v : values) v = dist(rng);
-    DeviceBuffer out(count * 4);
-    out.copy_from_host(values.data(), out.bytes);
+    DeviceBuffer out(ninfer::bench::device_context().device(), count * 4);
+    out.copy_from_host(values.data(), out.size());
     return out;
 }
 
 struct Fixture {
     int hq, hv, t, b;
-    DeviceBuffer q, k, v, g, beta, alog, bias, initial, final, out, slots;
+    DeviceBuffer q;
+    DeviceBuffer k;
+    DeviceBuffer v;
+    DeviceBuffer g;
+    DeviceBuffer beta;
+    DeviceBuffer alog;
+    DeviceBuffer bias;
+    DeviceBuffer initial;
+    DeviceBuffer final;
+    DeviceBuffer out;
+    DeviceBuffer slots;
 
     Fixture(Profile p, int tokens, int batch)
         : hq(p.qk), hv(p.value), t(tokens), b(batch),
@@ -118,23 +129,26 @@ struct Fixture {
           g(bf16(std::size_t(D) * hv * t * b, 14, -4, 4)),
           beta(bf16(std::size_t(hv) * t * b, 15, -5, 5)), alog(fp32(hv, 16, -0.5F, 0.5F)),
           bias(fp32(std::size_t(D) * hv, 17, -2, 2)),
-          initial(fp32(std::size_t(D) * D * hv * b, 18, -0.02F, 0.02F)), final(initial.bytes),
-          out(v.bytes), slots(std::size_t(b) * sizeof(std::int32_t)) {
+          initial(fp32(std::size_t(D) * D * hv * b, 18, -0.02F, 0.02F)),
+          final(ninfer::bench::device_context().device(), initial.size()),
+          out(ninfer::bench::device_context().device(), v.size()),
+          slots(ninfer::bench::device_context().device(), std::size_t(b) * sizeof(std::int32_t)) {
         std::vector<std::int32_t> selectors(b);
         for (int i = 0; i < b; ++i) selectors[i] = b - 1 - i;
-        slots.copy_from_host(selectors.data(), slots.bytes);
+        slots.copy_from_host(selectors.data(), slots.size());
     }
 
-    void public_call(WorkspaceArena& ws, DeviceExecutionView ex, bool batch_mode) {
-        Tensor qt(q.p, DType::BF16, {D, hq, t, b}), kt(k.p, DType::BF16, {D, hq, t, b});
-        Tensor vt(v.p, DType::BF16, {D, hv, t, b}), gt(g.p, DType::BF16, {D, hv, t, b});
-        Tensor bt(beta.p, DType::BF16, {hv, t, b}), at(alog.p, DType::FP32, {hv}),
-            dt(bias.p, DType::FP32, {D, hv});
-        Tensor si(initial.p, DType::FP32, {D, D, hv, b}), so(final.p, DType::FP32, {D, D, hv, b});
-        Tensor ot(out.p, DType::BF16, {D, hv, t, b}), st(slots.p, DType::I32, {b});
+    void public_call(MemoryArena& ws, CudaExecutionView ex, bool batch_mode) {
+        Tensor qt(q.span(), DType::BF16, {D, hq, t, b}), kt(k.span(), DType::BF16, {D, hq, t, b});
+        Tensor vt(v.span(), DType::BF16, {D, hv, t, b}), gt(g.span(), DType::BF16, {D, hv, t, b});
+        Tensor bt(beta.span(), DType::BF16, {hv, t, b}), at(alog.span(), DType::FP32, {hv}),
+            dt(bias.span(), DType::FP32, {D, hv});
+        Tensor si(initial.span(), DType::FP32, {D, D, hv, b}),
+            so(final.span(), DType::FP32, {D, D, hv, b});
+        Tensor ot(out.span(), DType::BF16, {D, hv, t, b}), st(slots.span(), DType::I32, {b});
         if (batch_mode)
             ops::kimi_delta_attention_batch_update(qt, kt, vt, gt, bt, at, dt, -5, scale, so, st,
-                                                   ot, ex.stream);
+                                                   ot, ex);
         else
             ops::kimi_delta_attention(qt, kt, vt, gt, bt, at, dt, -5, scale, ws, si, so, ot, ex);
     }
@@ -167,26 +181,27 @@ void run(Profile p, int t, int b, const Options& o, DeviceContext& ctx,
          bench::L2FlushBuffer& flush) {
     const auto ws_bytes = ops::kimi_delta_attention_workspace_capacity_bytes(p.qk, p.value, t, t);
     Fixture f(p, t, b);
-    WorkspaceArena ws(std::max<std::size_t>(256, ws_bytes));
+    ninfer::DeviceBuffer ws_storage(ninfer::bench::device_context().device(),
+                                    std::max<std::size_t>(256, ws_bytes));
+    MemoryArena ws(ws_storage.span());
     const auto ex = ctx.execution_view();
-    auto reset    = [&](cudaStream_t s) {
+    auto reset    = [&](CudaExecutionView cuda) {
+        const auto s = cuda.stream();
         if (o.batch_update)
-            CUDA_CHECK(cudaMemcpyAsync(f.final.p, f.initial.p, f.initial.bytes,
+            CUDA_CHECK(cudaMemcpyAsync(f.final.data(), f.initial.data(), f.initial.size(),
                                           cudaMemcpyDeviceToDevice, s));
     };
     auto measure = [&](auto&& body) {
-        reset(ex.stream);
-        body(ex.stream);
+        reset(ex);
+        body(ex);
         ctx.synchronize();
         TimedGraph graph;
-        graph.capture(ex.stream, body);
+        graph.capture(ex, body);
         const auto result =
-            measure_cold_graph_prepared(reset, graph, flush, ex.stream, o.warmup, o.repeat);
+            measure_cold_graph_prepared(reset, graph, flush, ex, o.warmup, o.repeat);
         print(p, t, b, ws_bytes, graph.nodes(), result, o);
     };
-    auto total = [&](cudaStream_t stream) {
-        f.public_call(ws, {stream, ex.multiprocessor_count}, o.batch_update);
-    };
+    auto total = [&](CudaExecutionView cuda) { f.public_call(ws, cuda, o.batch_update); };
     measure(total);
 }
 } // namespace
@@ -208,13 +223,13 @@ int main(int argc, char** argv) {
                 "bytes)\n");
             return 0;
         }
-        DeviceContext ctx;
+        auto& ctx = ninfer::bench::device_context();
         bench::L2FlushBuffer flush(o.flush);
         if (o.csv)
             std::puts("profile,qk_heads,value_heads,tokens,batch,op,workspace_bytes,"
                       "logical_bytes,graph_nodes,cache,median_us,min_us,p95_us,logical_gbps");
         else
-            std::printf("%s; %d SMs; cold-L2 graph; flush outside timer\n", ctx.props.name,
+            std::printf("%s; %d SMs; cold-L2 graph; flush outside timer\n", ctx.properties().name,
                         ctx.multiprocessor_count());
         std::vector<Profile> selected;
         if (o.custom)

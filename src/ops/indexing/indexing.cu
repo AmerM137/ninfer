@@ -129,7 +129,8 @@ void launch_scatter_bf16_batch(const Tensor& source, const Tensor& lanes,
 
 } // namespace
 
-void scatter(const Tensor& src, const Tensor& indices, Tensor& dst, cudaStream_t stream) {
+void scatter(const Tensor& src, const Tensor& indices, Tensor& dst, CudaExecutionView execution) {
+    const auto stream = execution.stream();
     if (src.dtype != DType::BF16 || dst.dtype != DType::BF16 || indices.dtype != DType::I32) {
         throw std::invalid_argument("scatter: src/dst must be BF16 and indices must be I32");
     }
@@ -142,6 +143,10 @@ void scatter(const Tensor& src, const Tensor& indices, Tensor& dst, cudaStream_t
         throw std::invalid_argument("scatter: negative dimension");
     }
     if (src.ne[0] == 0 || src.ne[1] == 0) { return; }
+    if (src.device != execution.device() || indices.device != execution.device() ||
+        dst.device != execution.device()) {
+        throw std::invalid_argument("scatter: operands must belong to the execution device");
+    }
     if (!src.is_contiguous() || !indices.is_contiguous() || !dst.is_contiguous()) {
         throw std::invalid_argument("scatter: tensors must be contiguous");
     }
@@ -153,7 +158,13 @@ void scatter(const Tensor& src, const Tensor& indices, Tensor& dst, cudaStream_t
 }
 
 void scatter_bf16_batch(const Tensor& source, const Tensor& lanes, const Tensor& valid_columns,
-                        Tensor& destination, cudaStream_t stream) {
+                        Tensor& destination, CudaExecutionView execution) {
+    if (source.device != execution.device() || lanes.device != execution.device() ||
+        valid_columns.device != execution.device() || destination.device != execution.device()) {
+        throw std::invalid_argument(
+            "scatter_bf16_batch: operands must belong to the execution device");
+    }
+    const auto stream        = execution.stream();
     const std::int32_t width = source.ne[1];
     const std::int32_t batch = source.ne[2];
     if (source.dtype != DType::BF16 || destination.dtype != DType::BF16 ||
@@ -180,7 +191,12 @@ void scatter_bf16_batch(const Tensor& source, const Tensor& lanes, const Tensor&
 }
 
 void extract_bf16_features(const Tensor& source, std::int32_t feature_offset, Tensor& destination,
-                           cudaStream_t stream) {
+                           CudaExecutionView execution) {
+    if (source.device != execution.device() || destination.device != execution.device()) {
+        throw std::invalid_argument(
+            "extract_bf16_features: operands must belong to the execution device");
+    }
+    const auto stream = execution.stream();
     if (source.dtype != DType::BF16 || destination.dtype != DType::BF16) {
         throw std::invalid_argument("extract_bf16_features: tensors must be BF16");
     }

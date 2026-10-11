@@ -160,7 +160,8 @@ InterpolateLaunch select_interpolate_add(const Tensor& table, const Tensor& x) {
 } // namespace
 
 void embedding_interpolate_add(const Tensor& table, const Tensor& indices, const Tensor& weights,
-                               Tensor& x, cudaStream_t stream) {
+                               Tensor& x, CudaExecutionView execution) {
+    const auto stream = execution.stream();
     if (table.dtype != DType::BF16 || x.dtype != DType::BF16 || indices.dtype != DType::I32 ||
         weights.dtype != DType::FP32) {
         throw std::invalid_argument(
@@ -177,6 +178,11 @@ void embedding_interpolate_add(const Tensor& table, const Tensor& indices, const
         throw std::invalid_argument("embedding_interpolate_add: invalid dimensions");
     }
     if (x.ne[0] == 0 || x.ne[1] == 0) { return; }
+    if (table.device != execution.device() || indices.device != execution.device() ||
+        weights.device != execution.device() || x.device != execution.device()) {
+        throw std::invalid_argument(
+            "embedding_interpolate_add: operands must belong to the execution device");
+    }
     if (!table.is_contiguous() || !indices.is_contiguous() || !weights.is_contiguous() ||
         !x.is_contiguous()) {
         throw std::invalid_argument("embedding_interpolate_add: tensors must be contiguous");

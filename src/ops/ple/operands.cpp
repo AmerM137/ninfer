@@ -14,8 +14,9 @@ void require(bool condition, const char* label) {
 }
 
 void contiguous(const Tensor& t, DType dtype, std::initializer_list<std::int32_t> shape,
-                std::size_t alignment, const char* label) {
-    const Tensor expected(nullptr, dtype, shape);
+                std::size_t alignment, const char* label, Device device) {
+    common::operand::device(t.device, device, "PLE", label);
+    const auto expected = Tensor::metadata(dtype, shape);
     require(t.dtype == dtype && t.is_contiguous() && common::operand::aligned(t.data, alignment),
             label);
     for (int d = 0; d < 4; ++d) require(t.ne[d] == expected.ne[d], label);
@@ -30,7 +31,8 @@ struct Columns {
     std::uint64_t small_count, small_stride, large_count, large_stride;
 };
 
-Columns columns(const Tensor& t, int count, int outer, const char* label) {
+Columns columns(const Tensor& t, int count, int outer, const char* label, Device device) {
+    common::operand::device(t.device, device, "PLE", label);
     require(count > 0 && outer > 0 && t.dtype == DType::BF16 && t.ne[0] == kChannels &&
                 t.ne[1] == count && t.ne[2] == outer && t.ne[3] == 1 && t.nb[0] == 2 &&
                 common::operand::aligned(t.data, 2),
@@ -75,14 +77,11 @@ bool overlaps_columns(Range a, const Columns& b) {
     return false;
 }
 
-void metadata(const Tensor& t, int batch, const char* label) {
-    contiguous(t, DType::I32, {batch}, 4, label);
+void metadata(const Tensor& t, int batch, const char* label, Device device) {
+    contiguous(t, DType::I32, {batch}, 4, label, device);
 }
 
-void execution_domain(int batch, DeviceExecutionView execution) {
-    require(batch >= 1 && batch <= 8, "batch extent");
-    require(execution.multiprocessor_count > 0, "SM count");
-}
+void validate_batch_extent(int batch) { require(batch >= 1 && batch <= 8, "batch extent"); }
 
 } // namespace
 
@@ -90,24 +89,29 @@ void validate_conv(const Tensor& residual, const Tensor& gated, const Tensor& ke
                    const PleBatchView& batch, const PleConvStateView& before,
                    const PleConvRecordWindowView& current, const Tensor& updated,
                    const Tensor* norm_weight, float epsilon, const Tensor* normalized,
-                   DeviceExecutionView execution) {
+                   CudaExecutionView execution) {
     const int tokens = residual.ne[2], rows = residual.ne[3];
-    execution_domain(rows, execution);
+    validate_batch_extent(rows);
     require(tokens > 0, "token extent");
     for (const Tensor* t : {&residual, &gated, &updated})
-        contiguous(*t, DType::BF16, {kFeatures, kStreams, tokens, rows}, 16, "activation");
+        contiguous(*t, DType::BF16, {kFeatures, kStreams, tokens, rows}, 16, "activation",
+                   execution.device());
     if (updated.data == residual.data)
         for (int d = 0; d < 4; ++d)
             require(updated.nb[d] == residual.nb[d], "in-place residual strides");
-    contiguous(kernel, DType::BF16, {kChannels, 4}, 2, "convolution kernel");
-    metadata(batch.valid_columns, rows, "valid columns");
-    metadata(before.slots, rows, "source slots");
-    metadata(current.offsets, rows, "record offsets");
-    const auto history = columns(before.history, kHistory, before.history.ne[2], "history");
-    const auto records = columns(current.values, current.values.ne[1], rows, "records");
+    contiguous(kernel, DType::BF16, {kChannels, 4}, 2, "convolution kernel", execution.device());
+    metadata(batch.valid_columns, rows, "valid columns", execution.device());
+    metadata(before.slots, rows, "source slots", execution.device());
+    metadata(current.offsets, rows, "record offsets", execution.device());
+    const auto history =
+        columns(before.history, kHistory, before.history.ne[2], "history", execution.device());
+    const auto records =
+        columns(current.values, current.values.ne[1], rows, "records", execution.device());
     if (normalized) {
-        contiguous(*normalized, DType::BF16, {kFeatures, kStreams, tokens, rows}, 16, "normalized");
-        contiguous(*norm_weight, DType::BF16, {kFeatures, kStreams}, 2, "norm weight");
+        contiguous(*normalized, DType::BF16, {kFeatures, kStreams, tokens, rows}, 16, "normalized",
+                   execution.device());
+        contiguous(*norm_weight, DType::BF16, {kFeatures, kStreams}, 2, "norm weight",
+                   execution.device());
         require(std::isfinite(epsilon) && epsilon > 0, "norm epsilon");
     }
     for (const Tensor* output : {&updated, normalized}) {
@@ -133,16 +137,18 @@ void validate_conv(const Tensor& residual, const Tensor& gated, const Tensor& ke
 
 void validate_extract(const PleConvStateView& before, const PleConvRecordReadView& records,
                       const Tensor& accepted, const PleConvStateView& after,
-                      DeviceExecutionView execution) {
+                      CudaExecutionView execution) {
     const int batch = accepted.ne[0];
-    execution_domain(batch, execution);
-    metadata(accepted, batch, "accepted columns");
-    metadata(records.valid_columns, batch, "record valid columns");
-    metadata(before.slots, batch, "source slots");
-    metadata(after.slots, batch, "destination slots");
-    (void)columns(before.history, kHistory, before.history.ne[2], "source history");
-    (void)columns(after.history, kHistory, after.history.ne[2], "destination history");
-    (void)columns(records.values, records.values.ne[1], batch, "records");
+    validate_batch_extent(batch);
+    metadata(accepted, batch, "accepted columns", execution.device());
+    metadata(records.valid_columns, batch, "record valid columns", execution.device());
+    metadata(before.slots, batch, "source slots", execution.device());
+    metadata(after.slots, batch, "destination slots", execution.device());
+    (void)columns(before.history, kHistory, before.history.ne[2], "source history",
+                  execution.device());
+    (void)columns(after.history, kHistory, after.history.ne[2], "destination history",
+                  execution.device());
+    (void)columns(records.values, records.values.ne[1], batch, "records", execution.device());
     // Only selected slots are read/written. Their cross-row and in-place relationships
     // are Device-index promises; overlapping pool descriptors alone are not an error.
 }

@@ -14,10 +14,10 @@ int rejects(const char* label, Call&& call) {
 }
 } // namespace
 
-int validate(Form form, DeviceExecutionView e) {
+int validate(Form form, CudaExecutionView e) {
     Fixture f(form, 2, false);
     f.set(Pattern::Random);
-    f.upload(e.stream);
+    f.upload(e.stream());
     int failed = 0;
     std::vector<Tensor*> used{form == Form::ExpandNorm ? &f.tb : &f.th};
     if (form == Form::Combine || form == Form::CombineNorm || form == Form::AddNorm)
@@ -54,7 +54,9 @@ int validate(Form form, DeviceExecutionView e) {
         failed += rejects("nonpositive columns", [&] { f.invoke(e); });
         activation = saved_activation;
     }
-    failed += rejects("SM count", [&] { f.invoke({e.stream, 0}); });
+    activation.device = Device::cpu();
+    failed += rejects("operand device", [&] { f.invoke(e); });
+    activation = saved_activation;
     if (form != Form::Combine) {
         for (float eps : {0.0F, -1.0F, std::numeric_limits<float>::infinity(),
                           std::numeric_limits<float>::quiet_NaN()}) {
@@ -101,7 +103,7 @@ int validate(Form form, DeviceExecutionView e) {
         f.tw.data = f.th.data;
         std::copy_n(f.h.begin(), f.weight.size(), f.weight.begin());
         f.invoke(e);
-        cuda_synchronize(e.stream);
+        cuda_synchronize(e.stream());
         failed += verify(f, "shared read-only input/weight", false);
     }
     return failed;

@@ -1,13 +1,15 @@
 #pragma once
 
+#include "core/buffer.h"
 #include "options.h"
 #include "ninfer/ops/gated_residual.h"
 
 namespace ninfer::bench::hc {
 inline Weight bf16_weight(const DeviceBuffer& buffer, int n, int k) {
     Weight w;
-    w.payload = w.qdata = buffer.p;
-    w.payload_bytes     = buffer.bytes;
+    w.device  = buffer.device();
+    w.payload = w.qdata = buffer.data();
+    w.payload_bytes     = buffer.size();
     w.qtype             = QType::BF16;
     w.layout            = QuantLayout::Contiguous;
     w.ndim              = 2;
@@ -17,7 +19,7 @@ inline Weight bf16_weight(const DeviceBuffer& buffer, int n, int k) {
 }
 
 struct MixFixture {
-    MixFixture(const Options& options, int tokens, DeviceExecutionView execution)
+    MixFixture(const Options& options, int tokens)
         : op(options.op), m(columns(tokens, options.batch)),
           input(make_bf16(std::size_t(kWidth) * kStreams * m, 6201, -1.F, 1.F)),
           down(make_bf16(
@@ -30,22 +32,23 @@ struct MixFixture {
                                        : DeviceBuffer{}),
           wd(bf16_weight(down, kRank + (op == Op::BlockMix ? kStreams : 0), kWidth * kStreams)),
           wu(bf16_weight(up, kWidth * kStreams, kRank)),
-          z(input.p, DType::BF16, {kWidth, kStreams, m}), x(output.p, DType::BF16, {kWidth, m}),
-          j(injection.p, DType::FP32, {kStreams, m}),
-          capacity(op == Op::BlockMix ? ops::hc_mix_workspace_capacity_bytes(
-                                            ops::HcMixWeights{wd, wu}, m, m, execution)
-                                      : ops::hc_mix_workspace_capacity_bytes(
-                                            ops::HcFinalMixWeights{wd, wu}, m, m, execution)),
-          arena(capacity) {}
+          z(input.span(), DType::BF16, {kWidth, kStreams, m}),
+          x(output.span(), DType::BF16, {kWidth, m}),
+          j(injection.size() ? Tensor(injection.span(), DType::FP32, {kStreams, m}) : Tensor{}),
+          capacity(
+              op == Op::BlockMix
+                  ? ops::hc_mix_workspace_capacity_bytes(ops::HcMixWeights{wd, wu}, m, m)
+                  : ops::hc_mix_workspace_capacity_bytes(ops::HcFinalMixWeights{wd, wu}, m, m)),
+          arena_storage(make_buffer(capacity)), arena(arena_storage.span()) {}
 
-    void launch(DeviceExecutionView execution) {
+    void launch(CudaExecutionView execution) {
         if (op == Op::BlockMix)
             ops::hc_mix(z, ops::HcMixWeights{wd, wu}, arena, x, j, execution);
         else
             ops::hc_mix(z, ops::HcFinalMixWeights{wd, wu}, arena, x, execution);
     }
 
-    void restore(cudaStream_t) {}
+    void restore(CudaExecutionView) {}
 
     std::size_t workspace_capacity() const { return capacity; }
 
@@ -53,10 +56,15 @@ struct MixFixture {
 
     Op op;
     int m;
-    DeviceBuffer input, down, up, output, injection;
+    DeviceBuffer input;
+    DeviceBuffer down;
+    DeviceBuffer up;
+    DeviceBuffer output;
+    DeviceBuffer injection;
     Weight wd, wu;
     Tensor z, x, j;
     std::size_t capacity;
-    WorkspaceArena arena;
+    DeviceBuffer arena_storage;
+    MemoryArena arena;
 };
 } // namespace ninfer::bench::hc

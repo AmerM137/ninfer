@@ -66,12 +66,13 @@ std::size_t q4_linear_swiglu_capacity_workspace_bytes(int rows, int k, int first
 }
 
 void q4_linear_swiglu_dispatch(const Tensor& x, const Weight& w, Tensor& out,
-                               WorkspaceArena& workspace, cudaStream_t stream) {
+                               MemoryArena& workspace, CudaExecutionView execution) {
     const auto& plan = select_plan(w.n, w.k, x.ne[1]);
-    if (!plan.materialized) return plan.launch(x, w, out, stream);
+    if (!plan.materialized) return plan.launch(x, w, out, execution.stream());
     auto scope   = workspace.scope();
     auto gate_up = allocate_projection(workspace, x.ne[1]);
-    plan.launch(x, w, gate_up, stream);
-    silu_mul(gate_up.slice(0, 0, out.ne[0]), gate_up.slice(0, out.ne[0], out.ne[0]), out, stream);
+    plan.launch(x, w, gate_up, execution.stream());
+    silu_mul(gate_up.slice(0, 0, out.ne[0]), gate_up.slice(0, out.ne[0], out.ne[0]), out,
+             execution);
 }
 } // namespace ninfer::ops::detail

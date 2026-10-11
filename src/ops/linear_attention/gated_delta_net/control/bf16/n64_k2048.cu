@@ -2,7 +2,7 @@
 
 namespace ninfer::ops::detail::gdn_control {
 void launch_n64_k2048(const Inputs& in, GdnControlOutputs out, Plan plan, Scratch scratch,
-                      DeviceExecutionView e) {
+                      CudaExecutionView e) {
     using Geometry = MmaGeometry<32, 2048, 64>;
     bool launched  = false;
     switch (plan.split_k) {
@@ -28,7 +28,7 @@ void launch_n64_k2048(const Inputs& in, GdnControlOutputs out, Plan plan, Scratc
 }
 
 bool launch_norm_n64_k2048(const Inputs& in, const Norm& norm, GdnControlOutputs out, NormPlan plan,
-                           Scratch scratch, DeviceExecutionView e) {
+                           Scratch scratch, CudaExecutionView e) {
     using Geometry = MmaGeometry<32, 2048, 64>;
     switch (plan.capacity) {
     case 6:

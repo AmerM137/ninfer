@@ -1,4 +1,5 @@
 #include "core/weight.h"
+#include "core/buffer.h"
 #include "ninfer/ops/linear_split.h"
 
 #include "core/device.h"
@@ -206,37 +207,38 @@ const char* policy_name(ops::LinearPolicy policy) {
 
 template <class Launch>
 Measurement measure_public(Launch&& launch, CacheState cache, bench::L2FlushBuffer& flush,
-                           cudaStream_t stream, int warmup, int repeat, bool graph) {
+                           CudaExecutionView cuda, int warmup, int repeat, bool graph) {
     if (graph) {
         bench::TimedGraph captured;
-        captured.capture(stream, launch);
+        captured.capture(cuda, launch);
         return {cache == CacheState::Cold
-                    ? bench::measure_cold_graph(captured, flush, stream, warmup, repeat)
-                    : bench::measure_graph(captured, stream, warmup, repeat),
+                    ? bench::measure_cold_graph(captured, flush, cuda, warmup, repeat)
+                    : bench::measure_graph(captured, cuda, warmup, repeat),
                 captured.nodes()};
     }
-    return {cache == CacheState::Cold
-                ? bench::measure_cold_launch(std::forward<Launch>(launch), flush, stream, warmup,
-                                             repeat)
-                : bench::measure_launch(std::forward<Launch>(launch), stream, warmup, repeat),
-            0};
+    return {
+        cache == CacheState::Cold
+            ? bench::measure_cold_launch(std::forward<Launch>(launch), flush, cuda, warmup, repeat)
+            : bench::measure_launch(std::forward<Launch>(launch), cuda, warmup, repeat),
+        0};
 }
 
 template <class Launch>
 void profile_public(Launch&& launch, const char* format, const char* policy, CacheState cache,
-                    bench::L2FlushBuffer& flush, cudaStream_t stream, int warmup, bool graph) {
+                    bench::L2FlushBuffer& flush, CudaExecutionView cuda, int warmup, bool graph) {
+    const auto stream = cuda.stream();
     bench::TimedGraph captured;
-    if (graph) captured.capture(stream, launch);
+    if (graph) captured.capture(cuda, launch);
     const auto invoke = [&] {
         if (graph)
-            captured.launch(stream);
+            captured.launch(cuda);
         else
-            launch(stream);
+            launch(cuda);
     };
     for (int index = 0; index < warmup; ++index) { invoke(); }
     CUDA_CHECK(cudaStreamSynchronize(stream));
     if (cache == CacheState::Cold) {
-        bench::flush_l2(flush, stream);
+        bench::flush_l2(flush, cuda);
         CUDA_CHECK(cudaStreamSynchronize(stream));
     }
     std::printf("PROFILE entry=linear_split format=%s policy=%s dispatch=public execution=%s "
@@ -287,9 +289,10 @@ std::uint64_t tensor_bytes(std::int32_t rows, std::int32_t tokens) {
     return static_cast<std::uint64_t>(rows) * static_cast<std::uint64_t>(tokens) * 2ULL;
 }
 
-void run_q4q5(const Options& options, bench::L2FlushBuffer& flush, cudaStream_t stream,
+void run_q4q5(const Options& options, bench::L2FlushBuffer& flush, CudaExecutionView cuda,
               std::vector<Result>& results) {
-    WorkspaceArena workspace(256);
+    ninfer::DeviceBuffer workspace_storage(ninfer::bench::device_context().device(), 256);
+    MemoryArena workspace(workspace_storage.span());
     constexpr std::int32_t hidden      = 5120;
     constexpr std::int32_t q_rows      = 6144;
     constexpr std::int32_t kv_rows     = 1024;
@@ -300,24 +303,28 @@ void run_q4q5(const Options& options, bench::L2FlushBuffer& flush, cudaStream_t 
     bench::PackedQuantizedWeight gv =
         bench::make_row_split_weight(QType::Q5_G64_FP16, parent_rows, hidden, hidden, 503U);
     DeviceBuffer input = bench::make_bf16(static_cast<std::size_t>(hidden) * max_tokens, 199U);
-    DeviceBuffer q(static_cast<std::size_t>(q_rows) * max_tokens * 2);
-    DeviceBuffer gate(static_cast<std::size_t>(q_rows) * max_tokens * 2);
-    DeviceBuffer k(static_cast<std::size_t>(kv_rows) * max_tokens * 2);
-    DeviceBuffer v(static_cast<std::size_t>(kv_rows) * max_tokens * 2);
+    DeviceBuffer q(ninfer::bench::device_context().device(),
+                   static_cast<std::size_t>(q_rows) * max_tokens * 2);
+    DeviceBuffer gate(ninfer::bench::device_context().device(),
+                      static_cast<std::size_t>(q_rows) * max_tokens * 2);
+    DeviceBuffer k(ninfer::bench::device_context().device(),
+                   static_cast<std::size_t>(kv_rows) * max_tokens * 2);
+    DeviceBuffer v(ninfer::bench::device_context().device(),
+                   static_cast<std::size_t>(kv_rows) * max_tokens * 2);
     for (const std::int32_t tokens : options.tokens) {
-        Tensor x(input.p, DType::BF16, {hidden, tokens});
-        Tensor tq(q.p, DType::BF16, {q_rows, tokens});
-        Tensor tg(gate.p, DType::BF16, {q_rows, tokens});
-        Tensor tk(k.p, DType::BF16, {kv_rows, tokens});
-        Tensor tv(v.p, DType::BF16, {kv_rows, tokens});
-        const auto launch = [&](cudaStream_t launch_stream) {
+        Tensor x(input.span(), DType::BF16, {hidden, tokens});
+        Tensor tq(q.span(), DType::BF16, {q_rows, tokens});
+        Tensor tg(gate.span(), DType::BF16, {q_rows, tokens});
+        Tensor tk(k.span(), DType::BF16, {kv_rows, tokens});
+        Tensor tv(v.span(), DType::BF16, {kv_rows, tokens});
+        const auto launch = [&](CudaExecutionView cuda) {
             ops::linear_split(x, ops::PairedProjectionWeights{qk.weight, gv.weight},
-                              std::array{tq, tk, tg, tv}, workspace, launch_stream);
+                              std::array{tq, tk, tg, tv}, workspace, cuda);
         };
         const CacheState profile_cache =
             options.cache == CacheMode::Cold ? CacheState::Cold : CacheState::Warm;
         if (options.profile) {
-            profile_public(launch, "q4q5", "a16", profile_cache, flush, stream, options.warmup,
+            profile_public(launch, "q4q5", "a16", profile_cache, flush, cuda, options.warmup,
                            options.graph);
             continue;
         }
@@ -330,8 +337,8 @@ void run_q4q5(const Options& options, bench::L2FlushBuffer& flush, cudaStream_t 
                 (options.cache == CacheMode::Warm && cache != CacheState::Warm))
                 continue;
             append_result(results, "q4q5", "a16", tokens, cache, 0, logical, flops,
-                          measure_public(launch, cache, flush, stream, options.warmup,
-                                         options.repeat, options.graph));
+                          measure_public(launch, cache, flush, cuda, options.warmup, options.repeat,
+                                         options.graph));
         }
     }
 }
@@ -340,40 +347,46 @@ template <class WeightFixture>
 void run_four_output(const Options& options, const char* format, ops::LinearPolicy policy,
                      bool implicit_a16_entry, std::int32_t hidden, std::int32_t q_rows,
                      std::int32_t kv_rows, std::int32_t parent_rows, WeightFixture& fixture,
-                     bench::L2FlushBuffer& flush, cudaStream_t stream,
+                     bench::L2FlushBuffer& flush, CudaExecutionView cuda,
                      std::vector<Result>& results) {
     const std::int32_t min_tokens = *std::min_element(options.tokens.begin(), options.tokens.end());
     const std::int32_t max_tokens = *std::max_element(options.tokens.begin(), options.tokens.end());
     const std::size_t workspace_bytes = ops::linear_split_workspace_capacity_bytes(
         ops::SingleProjectionWeight{fixture.weight, policy},
         std::array{q_rows, kv_rows, q_rows, kv_rows}, min_tokens, max_tokens);
-    WorkspaceArena workspace(std::max<std::size_t>(workspace_bytes, 1));
+    ninfer::DeviceBuffer workspace_storage(ninfer::bench::device_context().device(),
+                                           std::max<std::size_t>(workspace_bytes, 1));
+    MemoryArena workspace(workspace_storage.span());
     DeviceBuffer input = bench::make_bf16(static_cast<std::size_t>(hidden) * max_tokens, 101U);
-    DeviceBuffer q(static_cast<std::size_t>(q_rows) * max_tokens * 2);
-    DeviceBuffer gate(static_cast<std::size_t>(q_rows) * max_tokens * 2);
-    DeviceBuffer k(static_cast<std::size_t>(kv_rows) * max_tokens * 2);
-    DeviceBuffer v(static_cast<std::size_t>(kv_rows) * max_tokens * 2);
+    DeviceBuffer q(ninfer::bench::device_context().device(),
+                   static_cast<std::size_t>(q_rows) * max_tokens * 2);
+    DeviceBuffer gate(ninfer::bench::device_context().device(),
+                      static_cast<std::size_t>(q_rows) * max_tokens * 2);
+    DeviceBuffer k(ninfer::bench::device_context().device(),
+                   static_cast<std::size_t>(kv_rows) * max_tokens * 2);
+    DeviceBuffer v(ninfer::bench::device_context().device(),
+                   static_cast<std::size_t>(kv_rows) * max_tokens * 2);
     for (const std::int32_t tokens : options.tokens) {
-        Tensor x(input.p, DType::BF16, {hidden, tokens});
-        Tensor tq(q.p, DType::BF16, {q_rows, tokens});
-        Tensor tg(gate.p, DType::BF16, {q_rows, tokens});
-        Tensor tk(k.p, DType::BF16, {kv_rows, tokens});
-        Tensor tv(v.p, DType::BF16, {kv_rows, tokens});
+        Tensor x(input.span(), DType::BF16, {hidden, tokens});
+        Tensor tq(q.span(), DType::BF16, {q_rows, tokens});
+        Tensor tg(gate.span(), DType::BF16, {q_rows, tokens});
+        Tensor tk(k.span(), DType::BF16, {kv_rows, tokens});
+        Tensor tv(v.span(), DType::BF16, {kv_rows, tokens});
         const auto exact_workspace = ops::linear_split_workspace_capacity_bytes(
             ops::SingleProjectionWeight{fixture.weight, policy},
             std::array{q_rows, kv_rows, q_rows, kv_rows}, tokens, tokens);
-        const auto launch = [&](cudaStream_t launch_stream) {
+        const auto launch = [&](CudaExecutionView cuda) {
             if (implicit_a16_entry) {
-                ops::linear_split(x, fixture.weight, std::array{tq, tk, tg, tv}, launch_stream);
+                ops::linear_split(x, fixture.weight, std::array{tq, tk, tg, tv}, cuda);
             } else {
                 ops::linear_split(x, ops::SingleProjectionWeight{fixture.weight, policy},
-                                  std::array{tq, tk, tg, tv}, workspace, launch_stream);
+                                  std::array{tq, tk, tg, tv}, workspace, cuda);
             }
         };
         const CacheState profile_cache =
             options.cache == CacheMode::Cold ? CacheState::Cold : CacheState::Warm;
         if (options.profile) {
-            profile_public(launch, format, policy_name(policy), profile_cache, flush, stream,
+            profile_public(launch, format, policy_name(policy), profile_cache, flush, cuda,
                            options.warmup, options.graph);
             continue;
         }
@@ -385,7 +398,7 @@ void run_four_output(const Options& options, const char* format, ops::LinearPoli
                 (options.cache == CacheMode::Warm && cache != CacheState::Warm))
                 continue;
             workspace.reset_peak();
-            const auto measurement = measure_public(launch, cache, flush, stream, options.warmup,
+            const auto measurement = measure_public(launch, cache, flush, cuda, options.warmup,
                                                     options.repeat, options.graph);
             if (workspace.used() != 0 || workspace.peak_used() > exact_workspace)
                 throw std::runtime_error("public projection exceeds its workspace query");
@@ -396,7 +409,7 @@ void run_four_output(const Options& options, const char* format, ops::LinearPoli
 }
 
 void run_q8_qkv(const Options& options, const char* label, std::int32_t hidden,
-                bench::L2FlushBuffer& flush, cudaStream_t stream, std::vector<Result>& results) {
+                bench::L2FlushBuffer& flush, CudaExecutionView cuda, std::vector<Result>& results) {
     constexpr std::int32_t q_rows      = 4096;
     constexpr std::int32_t kv_rows     = 1024;
     constexpr std::int32_t parent_rows = 6144;
@@ -404,21 +417,24 @@ void run_q8_qkv(const Options& options, const char* label, std::int32_t hidden,
     bench::PackedQuantizedWeight weight =
         bench::make_row_split_weight(QType::Q8_G32_FP16, parent_rows, hidden, hidden, 505U);
     DeviceBuffer input = bench::make_bf16(static_cast<std::size_t>(hidden) * max_tokens, 103U);
-    DeviceBuffer q(static_cast<std::size_t>(q_rows) * max_tokens * 2);
-    DeviceBuffer k(static_cast<std::size_t>(kv_rows) * max_tokens * 2);
-    DeviceBuffer v(static_cast<std::size_t>(kv_rows) * max_tokens * 2);
+    DeviceBuffer q(ninfer::bench::device_context().device(),
+                   static_cast<std::size_t>(q_rows) * max_tokens * 2);
+    DeviceBuffer k(ninfer::bench::device_context().device(),
+                   static_cast<std::size_t>(kv_rows) * max_tokens * 2);
+    DeviceBuffer v(ninfer::bench::device_context().device(),
+                   static_cast<std::size_t>(kv_rows) * max_tokens * 2);
     for (const std::int32_t tokens : options.tokens) {
-        Tensor x(input.p, DType::BF16, {hidden, tokens});
-        Tensor tq(q.p, DType::BF16, {q_rows, tokens});
-        Tensor tk(k.p, DType::BF16, {kv_rows, tokens});
-        Tensor tv(v.p, DType::BF16, {kv_rows, tokens});
-        const auto launch = [&](cudaStream_t launch_stream) {
-            ops::linear_split(x, weight.weight, std::array{tq, tk, tv}, launch_stream);
+        Tensor x(input.span(), DType::BF16, {hidden, tokens});
+        Tensor tq(q.span(), DType::BF16, {q_rows, tokens});
+        Tensor tk(k.span(), DType::BF16, {kv_rows, tokens});
+        Tensor tv(v.span(), DType::BF16, {kv_rows, tokens});
+        const auto launch = [&](CudaExecutionView cuda) {
+            ops::linear_split(x, weight.weight, std::array{tq, tk, tv}, cuda);
         };
         const CacheState profile_cache =
             options.cache == CacheMode::Cold ? CacheState::Cold : CacheState::Warm;
         if (options.profile) {
-            profile_public(launch, label, "a16", profile_cache, flush, stream, options.warmup,
+            profile_public(launch, label, "a16", profile_cache, flush, cuda, options.warmup,
                            options.graph);
             continue;
         }
@@ -430,17 +446,17 @@ void run_q8_qkv(const Options& options, const char* label, std::int32_t hidden,
                 (options.cache == CacheMode::Warm && cache != CacheState::Warm))
                 continue;
             append_result(results, label, "a16", tokens, cache, 0, logical, flops,
-                          measure_public(launch, cache, flush, stream, options.warmup,
-                                         options.repeat, options.graph));
+                          measure_public(launch, cache, flush, cuda, options.warmup, options.repeat,
+                                         options.graph));
         }
     }
 }
 
-void run_fp8(const Options& options, bench::L2FlushBuffer& flush, cudaStream_t stream,
+void run_fp8(const Options& options, bench::L2FlushBuffer& flush, CudaExecutionView cuda,
              std::vector<Result>& results) {
     auto weight = bench::make_fp8_weight(14336, 5120);
     run_four_output(options, "fp8", options.fp8_policy, false, 5120, 6144, 1024, 14336, weight,
-                    flush, stream, results);
+                    flush, cuda, results);
 }
 
 void write_csv(const Options& options, const std::vector<Result>& results) {
@@ -485,32 +501,33 @@ int main(int argc, char** argv) {
                     CUDART_VERSION);
         cudaStream_t stream = nullptr;
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+        const auto cuda = ninfer::bench::device_context().execution_view(stream);
         bench::L2FlushBuffer flush(kFlushBytes);
         std::vector<Result> results;
 
-        if (selected(options.format, Format::Q4Q5)) { run_q4q5(options, flush, stream, results); }
+        if (selected(options.format, Format::Q4Q5)) { run_q4q5(options, flush, cuda, results); }
         if (selected(options.format, Format::Q8Qgkv)) {
             auto weight = bench::make_row_split_weight(QType::Q8_G32_FP16, 9216, 2048, 2048, 507U);
             run_four_output(options, "q8-qgkv", ops::LinearPolicy::A16Only, true, 2048, 4096, 512,
-                            9216, weight, flush, stream, results);
+                            9216, weight, flush, cuda, results);
         }
         if (selected(options.format, Format::Q8Qkv)) {
-            run_q8_qkv(options, "q8-qkv", 2048, flush, stream, results);
+            run_q8_qkv(options, "q8-qkv", 2048, flush, cuda, results);
         }
         if (selected(options.format, Format::Q8DFlash2Qkv)) {
-            run_q8_qkv(options, "q8-dflash2-qkv", 5120, flush, stream, results);
+            run_q8_qkv(options, "q8-dflash2-qkv", 5120, flush, cuda, results);
         }
         if (selected(options.format, Format::Bf16)) {
             auto weight = bench::make_direct_bf16_weight(14336, 5120);
             run_four_output(options, "bf16", ops::LinearPolicy::A16Only, false, 5120, 6144, 1024,
-                            14336, weight, flush, stream, results);
+                            14336, weight, flush, cuda, results);
         }
         if (selected(options.format, Format::Nvfp4)) {
             auto weight = bench::make_nvfp4_weight(14336, 5120);
             run_four_output(options, "nvfp4", options.nvfp4_policy, false, 5120, 6144, 1024, 14336,
-                            weight, flush, stream, results);
+                            weight, flush, cuda, results);
         }
-        if (selected(options.format, Format::Fp8)) { run_fp8(options, flush, stream, results); }
+        if (selected(options.format, Format::Fp8)) { run_fp8(options, flush, cuda, results); }
         write_csv(options, results);
         CUDA_CHECK(cudaStreamDestroy(stream));
         return 0;

@@ -96,7 +96,13 @@ void require_bf16_contiguous_aligned(const Tensor& tensor, const char* name) {
 } // namespace
 
 void rmsnorm_pack_tail(const Tensor& input, const Tensor& weight, Tensor& output,
-                       cudaStream_t stream) {
+                       CudaExecutionView execution) {
+    if (input.device != execution.device() || weight.device != execution.device() ||
+        output.device != execution.device()) {
+        throw std::invalid_argument(
+            "rmsnorm_pack_tail: operands must belong to the execution device");
+    }
+    const auto stream = execution.stream();
     require_bf16_contiguous_aligned(input, "input");
     require_bf16_contiguous_aligned(weight, "weight");
     require_bf16_contiguous_aligned(output, "output");

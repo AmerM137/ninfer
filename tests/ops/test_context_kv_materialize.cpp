@@ -1,4 +1,6 @@
 #include "core/weight.h"
+#include "cuda_fixture.h"
+#include "core/buffer.h"
 #include "ninfer/ops/context_kv_materialize.h"
 
 #include "ops/op_tester.h"
@@ -119,10 +121,10 @@ struct Fixture {
             put(target.value_host, 5120);
             target.parent_device = to_device(target.parent_host);
             const auto row_view  = [&](const quantized_weight::PackedWeight& weight, int row) {
-                auto result = weight.device_weight(target.parent_device.p);
+                auto result = weight.device_weight(target.parent_device.span());
                 result.qdata =
-                    static_cast<const std::uint8_t*>(target.parent_device.p) + row * kHidden;
-                result.scales = static_cast<const std::uint8_t*>(target.parent_device.p) +
+                    static_cast<const std::uint8_t*>(target.parent_device.data()) + row * kHidden;
+                result.scales = static_cast<const std::uint8_t*>(target.parent_device.data()) +
                                 parent_codes + row * (kHidden / 32) * 2;
                 result.payload_bytes = target.parent_host.size();
                 return result;
@@ -135,11 +137,11 @@ struct Fixture {
             views[static_cast<std::size_t>(layer)] = {
                 row_view(target.key_host, 4096),
                 row_view(target.value_host, 5120),
-                Tensor(target.norm_device.p, DType::BF16, {kHeadDim}),
+                Tensor(target.norm_device.span(), DType::BF16, {kHeadDim}),
                 CyclicKVCacheLayerView{
-                    .k               = Tensor(target.cache_k.data(), DType::BF16,
+                    .k               = Tensor(target.cache_k.span(), DType::BF16,
                                               {kHeadDim, kPaddedCapacity, kHeads, kLaneCapacity}),
-                    .v               = Tensor(target.cache_v.data(), DType::FP16,
+                    .v               = Tensor(target.cache_v.span(), DType::FP16,
                                               {kHeadDim, kPaddedCapacity, kHeads, kLaneCapacity}),
                     .capacity        = kCapacity,
                     .padded_capacity = kPaddedCapacity,
@@ -320,20 +322,20 @@ int run_case(Fixture& fixture, const std::string& label, int width, int batch,
     const std::size_t workspace_bytes =
         ops::context_kv_materialize_workspace_capacity_bytes(batch, width, width);
     GuardedDeviceBuffer scratch(std::max<std::size_t>(workspace_bytes, 1));
-    WorkspaceArena workspace(DeviceSpan{scratch.data(), scratch.bytes()});
-    Tensor context_tensor(context_device.p, DType::BF16, {kHidden, width, batch});
-    Tensor positions_tensor(positions_device.p, DType::I32, {width, batch});
-    Tensor counts_tensor(counts_device.p, DType::I32, {batch});
-    Tensor slots_tensor(slots_device.p, DType::I32, {batch});
+    MemoryArena workspace(scratch.span());
+    Tensor context_tensor(context_device.span(), DType::BF16, {kHidden, width, batch});
+    Tensor positions_tensor(positions_device.span(), DType::I32, {width, batch});
+    Tensor counts_tensor(counts_device.span(), DType::I32, {batch});
+    Tensor slots_tensor(slots_device.span(), DType::I32, {batch});
     const ops::ContextKVMaterializeExecutionEnvelope envelope{
         narrow ? static_cast<std::uint32_t>(*std::min_element(counts.begin(), counts.end())) : 0U,
         narrow ? static_cast<std::uint32_t>(*std::max_element(counts.begin(), counts.end()))
                : static_cast<std::uint32_t>(width)};
-    const auto launch = [&](cudaStream_t stream) {
+    const auto launch = [&](CudaExecutionView cuda) {
         ops::context_kv_materialize(context_tensor, positions_tensor, counts_tensor, slots_tensor,
-                                    fixture.views, envelope, workspace, stream);
+                                    fixture.views, envelope, workspace, cuda);
     };
-    launch(nullptr);
+    launch(ninfer::test::cuda_environment().default_execution);
     cuda_synchronize();
     int failures = verify_state_effect(label, fixture, positions, counts, state_slots, width);
     failures += verify_exact("counts readonly", from_device<int>(counts_device, batch), counts);
@@ -348,10 +350,12 @@ int run_case(Fixture& fixture, const std::string& label, int width, int batch,
     if (!narrow && (batch == 8 || (batch == 1 && (width == 1 || width == 8 || width >= 16)))) {
         cudaStream_t stream = nullptr;
         cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "graph stream");
+        const auto stream_execution =
+            ninfer::test::cuda_environment().context.execution_view(stream);
         {
             DecodeGraphDefinition definition;
             DecodeGraphExecutable executable;
-            definition.capture(stream, [&] { launch(stream); });
+            definition.capture(stream, [&] { launch(stream_execution); });
             executable.instantiate(definition);
             for (int replay = 0; replay < 3; ++replay) {
                 std::vector<int> next_counts(batch), next_slots(batch), next_positions(columns, -1);

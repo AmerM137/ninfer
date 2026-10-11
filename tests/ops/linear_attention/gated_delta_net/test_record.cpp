@@ -1,4 +1,6 @@
 #include "ninfer/ops/gated_delta_net.h"
+#include "cuda_fixture.h"
+#include "core/buffer.h"
 
 #include "core/device.h"
 #include "ops/linear_attention/gated_delta_net/recurrence/launch.h"
@@ -83,50 +85,60 @@ int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
     DeviceBuffer device_g        = to_device(g);
     DeviceBuffer device_beta     = to_device(beta);
     DeviceBuffer reference_state = to_device(state);
-    DeviceBuffer reference_final(static_cast<std::size_t>(kStateDim) * kStateDim * value_heads *
-                                 batch * sizeof(float));
+    DeviceBuffer reference_final(ninfer::test::cuda_environment().context.device(),
+                                 static_cast<std::size_t>(kStateDim) * kStateDim * value_heads *
+                                     batch * sizeof(float));
     DeviceBuffer record_state   = to_device(state);
     DeviceBuffer device_initial = to_device(initial_slots);
     DeviceBuffer device_valid;
     if (!dense) { device_valid = to_device(valid_columns); }
 
-    DeviceBuffer reference_out(value_elements * sizeof(std::uint16_t));
-    DeviceBuffer record_out(value_elements * sizeof(std::uint16_t));
-    DeviceBuffer key_record(qk_elements * sizeof(std::uint16_t));
-    DeviceBuffer value_record(value_elements * sizeof(std::uint16_t));
-    DeviceBuffer gate_record(gate_elements * 2 * sizeof(std::uint32_t));
+    DeviceBuffer reference_out(ninfer::test::cuda_environment().context.device(),
+                               value_elements * sizeof(std::uint16_t));
+    DeviceBuffer record_out(ninfer::test::cuda_environment().context.device(),
+                            value_elements * sizeof(std::uint16_t));
+    DeviceBuffer key_record(ninfer::test::cuda_environment().context.device(),
+                            qk_elements * sizeof(std::uint16_t));
+    DeviceBuffer value_record(ninfer::test::cuda_environment().context.device(),
+                              value_elements * sizeof(std::uint16_t));
+    DeviceBuffer gate_record(ninfer::test::cuda_environment().context.device(),
+                             gate_elements * 2 * sizeof(std::uint32_t));
     reference_out.fill(0);
     record_out.fill(0xff);
     key_record.fill(0xff);
     value_record.fill(0xff);
     gate_record.fill(0xff);
 
-    Tensor q(device_q.p, DType::BF16, {kStateDim, kQkHeads, width, batch});
-    Tensor k(device_k.p, DType::BF16, {kStateDim, kQkHeads, width, batch});
-    Tensor v(device_v.p, DType::BF16, {kStateDim, value_heads, width, batch});
-    Tensor g_tensor(device_g.p, DType::FP32, {value_heads, width, batch});
-    Tensor beta_tensor(device_beta.p, DType::FP32, {value_heads, width, batch});
-    Tensor reference_states(reference_state.p, DType::FP32,
+    Tensor q(device_q.span(), DType::BF16, {kStateDim, kQkHeads, width, batch});
+    Tensor k(device_k.span(), DType::BF16, {kStateDim, kQkHeads, width, batch});
+    Tensor v(device_v.span(), DType::BF16, {kStateDim, value_heads, width, batch});
+    Tensor g_tensor(device_g.span(), DType::FP32, {value_heads, width, batch});
+    Tensor beta_tensor(device_beta.span(), DType::FP32, {value_heads, width, batch});
+    Tensor reference_states(reference_state.span(), DType::FP32,
                             {kStateDim, kStateDim, value_heads, slots});
-    Tensor record_states(record_state.p, DType::FP32, {kStateDim, kStateDim, value_heads, slots});
-    Tensor reference_final_states(reference_final.p, DType::FP32,
+    Tensor record_states(record_state.span(), DType::FP32,
+                         {kStateDim, kStateDim, value_heads, slots});
+    Tensor reference_final_states(reference_final.span(), DType::FP32,
                                   {kStateDim, kStateDim, value_heads, batch});
     Tensor valid;
-    if (!dense) { valid = Tensor(device_valid.p, DType::I32, {batch}); }
-    Tensor initial(device_initial.p, DType::I32, {batch});
-    Tensor reference_output(reference_out.p, DType::BF16, {kStateDim, value_heads, width, batch});
-    Tensor record_output(record_out.p, DType::BF16, {kStateDim, value_heads, width, batch});
-    Tensor key_record_tensor(key_record.p, DType::BF16, {kStateDim, kQkHeads, width, batch});
-    Tensor value_record_tensor(value_record.p, DType::BF16, {kStateDim, value_heads, width, batch});
-    Tensor gate_record_tensor(gate_record.p, DType::FP32, {2, value_heads, width, batch});
+    if (!dense) { valid = Tensor(device_valid.span(), DType::I32, {batch}); }
+    Tensor initial(device_initial.span(), DType::I32, {batch});
+    Tensor reference_output(reference_out.span(), DType::BF16,
+                            {kStateDim, value_heads, width, batch});
+    Tensor record_output(record_out.span(), DType::BF16, {kStateDim, value_heads, width, batch});
+    Tensor key_record_tensor(key_record.span(), DType::BF16, {kStateDim, kQkHeads, width, batch});
+    Tensor value_record_tensor(value_record.span(), DType::BF16,
+                               {kStateDim, value_heads, width, batch});
+    Tensor gate_record_tensor(gate_record.span(), DType::FP32, {2, value_heads, width, batch});
 
     constexpr float kScale = 1.0F / std::sqrt(128.0F);
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    const auto stream_execution = ninfer::test::cuda_environment().context.execution_view(stream);
     cuda_synchronize();
     // Replay is bitwise equivalent to recurrence, independently of the prefill dispatcher.
     const auto launch_reference = [&] {
-        CUDA_CHECK(cudaMemsetAsync(reference_out.p, 0, reference_out.bytes, stream));
+        CUDA_CHECK(cudaMemsetAsync(reference_out.data(), 0, reference_out.size(), stream));
         for (std::int32_t row = 0; row < batch; ++row) {
             const std::int32_t valid_extent = valid_columns[static_cast<std::size_t>(row)];
             Tensor q_row                    = q.slice(3, row, 1)
@@ -160,7 +172,8 @@ int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
     const auto launch_record = [&] {
         ops::gated_delta_net_replay_record(
             q, k, v, g_tensor, beta_tensor, kScale, record_states, valid, initial,
-            {key_record_tensor, value_record_tensor, gate_record_tensor}, record_output, stream);
+            {key_record_tensor, value_record_tensor, gate_record_tensor}, record_output,
+            stream_execution);
     };
     launch_reference();
     launch_record();
@@ -175,16 +188,16 @@ int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
         CUDA_CHECK(cudaGraphLaunch(executable, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
         for (auto& bits : q_bits) bits ^= 0x8000U;
-        CUDA_CHECK(cudaMemcpyAsync(device_q.p, q_bits.data(), device_q.bytes,
+        CUDA_CHECK(cudaMemcpyAsync(device_q.data(), q_bits.data(), device_q.size(),
                                    cudaMemcpyHostToDevice, stream));
         if (!dense) {
             for (auto& count : valid_columns) count = 1 + count % width;
-            CUDA_CHECK(cudaMemcpyAsync(device_valid.p, valid_columns.data(), device_valid.bytes,
-                                       cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(device_valid.data(), valid_columns.data(),
+                                       device_valid.size(), cudaMemcpyHostToDevice, stream));
         }
-        CUDA_CHECK(cudaMemsetAsync(key_record.p, 0xff, key_record.bytes, stream));
-        CUDA_CHECK(cudaMemsetAsync(value_record.p, 0xff, value_record.bytes, stream));
-        CUDA_CHECK(cudaMemsetAsync(gate_record.p, 0xff, gate_record.bytes, stream));
+        CUDA_CHECK(cudaMemsetAsync(key_record.data(), 0xff, key_record.size(), stream));
+        CUDA_CHECK(cudaMemsetAsync(value_record.data(), 0xff, value_record.size(), stream));
+        CUDA_CHECK(cudaMemsetAsync(gate_record.data(), 0xff, gate_record.size(), stream));
         CUDA_CHECK(cudaGraphLaunch(executable, stream));
         launch_reference();
         CUDA_CHECK(cudaStreamSynchronize(stream));

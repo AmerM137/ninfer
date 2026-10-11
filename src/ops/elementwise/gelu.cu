@@ -117,7 +117,8 @@ void launch_gelu(Tensor& x, GeluMode mode, cudaStream_t stream) {
 
 } // namespace
 
-void gelu(Tensor& x, GeluMode mode, cudaStream_t stream) {
+void gelu(Tensor& x, GeluMode mode, CudaExecutionView execution) {
+    const auto stream = execution.stream();
     if (x.dtype != DType::BF16) { throw std::invalid_argument("gelu: x must be BF16"); }
     std::int64_t n = 1;
     for (int i = 0; i < 4; ++i) {
@@ -127,6 +128,9 @@ void gelu(Tensor& x, GeluMode mode, cudaStream_t stream) {
             throw std::overflow_error("gelu: tensor size overflows int64");
         }
         n *= x.ne[i];
+    }
+    if (x.device != execution.device()) {
+        throw std::invalid_argument("gelu: operand belongs to another device");
     }
     if (!x.is_contiguous()) { throw std::invalid_argument("gelu: x must be contiguous"); }
     if (x.data == nullptr) { throw std::invalid_argument("gelu: x data must be non-null"); }

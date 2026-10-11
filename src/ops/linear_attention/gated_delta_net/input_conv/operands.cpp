@@ -120,11 +120,13 @@ Batch validate_convolution(const Tensor& x, const WeightOperands& weights,
     return batch;
 }
 
-void validate_disjoint(const WeightOperands& weights, std::span<const Tensor* const> tensors,
-                       DeviceSpan scratch, const Tensor* alias_first, const Tensor* alias_second) {
+void validate_storage(const WeightOperands& weights, std::span<const Tensor* const> tensors,
+                      CudaExecutionView execution, MemorySpan scratch, const Tensor* alias_first,
+                      const Tensor* alias_second) {
     for (std::size_t i = 0; i < tensors.size(); ++i) {
         const Tensor& t = *tensors[i];
         if (!t.data) continue;
+        common::operand::device(t.device, execution.device(), "GDN input", "operand");
         for (std::size_t j = i + 1; j < tensors.size(); ++j) {
             if ((tensors[i] == alias_first && tensors[j] == alias_second) ||
                 (tensors[j] == alias_first && tensors[i] == alias_second))
@@ -146,7 +148,11 @@ void validate_disjoint(const WeightOperands& weights, std::span<const Tensor* co
                 throw std::invalid_argument("GDN input: tensor overlaps weight storage");
         }
     }
+    if (scratch.bytes) {
+        common::operand::device(scratch.device, execution.device(), "GDN input", "scratch");
+    }
     for (const Weight* w : {weights.first, weights.second}) {
+        if (w) common::operand::device(w->device, execution.device(), "GDN input", "weight");
         if (w && common::operand::overlaps(
                      common::operand::range(scratch.data, scratch.bytes, "GDN input"),
                      common::operand::range(w->payload, w->payload_bytes, "GDN input")))

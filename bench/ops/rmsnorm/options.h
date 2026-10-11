@@ -67,7 +67,7 @@ inline Options parse(int argc, char** argv) {
     if (have_tokens && have_sweep)
         throw std::invalid_argument("tokens and sweep are mutually exclusive");
     for (int m : o.tokens)
-        (void)Tensor(nullptr, DType::BF16, {o.dimension, o.heads, m, o.batch}).numel();
+        (void)Tensor::metadata(DType::BF16, {o.dimension, o.heads, m, o.batch}).numel();
     return o;
 }
 } // namespace ninfer::bench::rmsnorm

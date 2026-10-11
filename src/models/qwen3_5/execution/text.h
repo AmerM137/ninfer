@@ -58,8 +58,8 @@ struct DFlashFeatureSink {
     std::int32_t active_tokens  = 0;
 
     void begin(const Tensor& value);
-    void capture_layer(int layer, const Tensor& value, cudaStream_t stream);
-    void capture_positions(const Tensor& source, cudaStream_t stream);
+    void capture_layer(int layer, const Tensor& value, CudaExecutionView execution);
+    void capture_positions(const Tensor& source, CudaExecutionView execution);
     void consume_prefill_chunk(std::int32_t tokens, bool rewrite_checkpoint);
 };
 
@@ -67,7 +67,7 @@ class VisionPrefillSession;
 
 class TextContext {
 public:
-    TextContext(DeviceContext& ctx, const execution::Parameters& weights, WorkspaceArena& work,
+    TextContext(DeviceContext& ctx, const execution::Parameters& weights, MemoryArena& work,
                 const qwen3_5::PagedKVCache& batch_text_kv, LinearAttentionStatePool& state,
                 qwen3_5::RoundState& io, Tensor& prefill_hidden, std::uint32_t prefill_chunk,
                 std::uint32_t text_kv_base,
@@ -208,9 +208,10 @@ private:
     prefill_impl(std::span<const int> ids, const TextPrefill* text_prefill,
                  const MultimodalPrefill* multimodal, Tap& tap, bool finalize_at_end);
     DeviceContext& ctx_;
+    CudaExecutionView execution_;
     const Parameters& parameters_;
     const TextConfig& config_;
-    WorkspaceArena& work_;
+    MemoryArena& work_;
     qwen3_5::PagedKVCacheView mtp_kv_;
     const qwen3_5::PagedKVCache& batch_text_kv_;
     const qwen3_5::PagedKVCache* batch_mtp_kv_ = nullptr;

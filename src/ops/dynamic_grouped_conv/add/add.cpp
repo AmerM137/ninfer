@@ -25,13 +25,14 @@ std::size_t linear_dynamic_grouped_conv_add_workspace_capacity_bytes(int input_r
 
 void linear_dynamic_grouped_conv_add(const Tensor& x, const Weight& projection,
                                      const Tensor& base_kernel, const Tensor& finish_delta,
-                                     Tensor& residual, WorkspaceArena& workspace,
-                                     cudaStream_t stream) {
-    dc::validate_add(x, projection, base_kernel, finish_delta, residual, workspace);
+                                     Tensor& residual, MemoryArena& workspace,
+                                     CudaExecutionView execution) {
+    const auto stream = execution.stream();
+    dc::validate_add(x, projection, base_kernel, finish_delta, residual, workspace, execution);
     const auto plan    = dc::add::select_plan(x.ne[1], x.ne[2]);
     auto scope         = workspace.scope();
     const auto storage = workspace.alloc_bytes(plan.workspace_bytes);
-    Tensor projected(storage.data, DType::BF16, {dc::kHidden, x.ne[1], x.ne[2]});
+    Tensor projected(storage, DType::BF16, {dc::kHidden, x.ne[1], x.ne[2]});
     dc::add::launch(plan, x, projection, base_kernel, finish_delta, residual, projected, stream);
 }
 } // namespace ninfer::ops

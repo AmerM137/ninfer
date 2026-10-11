@@ -1,4 +1,5 @@
 #include "core/device.h"
+#include "cuda_fixture.h"
 #include "ninfer/ops/rope.h"
 #include "ops/op_tester.h"
 
@@ -229,7 +230,7 @@ int verify_padding(const std::string& label, const std::vector<std::uint16_t>& s
     return 0;
 }
 
-int run_pair_case(DeviceExecutionView execution, const Geometry& geometry, int q_heads, int k_heads,
+int run_pair_case(CudaExecutionView execution, const Geometry& geometry, int q_heads, int k_heads,
                   int first_position, int q_padding = 0, int k_padding = 0, int lane_width = 0,
                   bool graph = false) {
     constexpr std::uint16_t kPadding = 0x3f81U;
@@ -266,9 +267,9 @@ int run_pair_case(DeviceExecutionView execution, const Geometry& geometry, int q
     k_device.copy_from_host(k_storage.data(), k_device.bytes());
     position_device.copy_from_host(positions.data(), position_device.bytes());
 
-    Tensor position_tensor(position_device.data(), DType::I32, {geometry.tokens, geometry.axes});
-    Tensor q_tensor(q_device.data(), DType::BF16, {geometry.head_dim, q_heads, geometry.tokens});
-    Tensor k_tensor(k_device.data(), DType::BF16, {geometry.head_dim, k_heads, geometry.tokens});
+    Tensor position_tensor(position_device.span(), DType::I32, {geometry.tokens, geometry.axes});
+    Tensor q_tensor(q_device.span(), DType::BF16, {geometry.head_dim, q_heads, geometry.tokens});
+    Tensor k_tensor(k_device.span(), DType::BF16, {geometry.head_dim, k_heads, geometry.tokens});
     q_tensor.nb[2] = static_cast<std::int64_t>(q_stride) * sizeof(std::uint16_t);
     k_tensor.nb[2] = static_cast<std::int64_t>(k_stride) * sizeof(std::uint16_t);
 
@@ -280,9 +281,11 @@ int run_pair_case(DeviceExecutionView execution, const Geometry& geometry, int q
         cudaGraph_t captured;
         cudaGraphExec_t executable;
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+        const auto stream_execution =
+            ninfer::test::cuda_environment().context.execution_view(stream);
         CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
         ops::rope(position_tensor, geometry.rotary_dim, geometry.theta, q_tensor, k_tensor,
-                  execution.on_stream(stream));
+                  stream_execution);
         CUDA_CHECK(cudaStreamEndCapture(stream, &captured));
         CUDA_CHECK(cudaGraphInstantiate(&executable, captured, nullptr, nullptr, 0));
         for (int replay = 0; replay < 2; ++replay) {
@@ -324,7 +327,7 @@ int run_pair_case(DeviceExecutionView execution, const Geometry& geometry, int q
     return failures;
 }
 
-int run_single_case(DeviceExecutionView execution, const Geometry& geometry, int heads,
+int run_single_case(CudaExecutionView execution, const Geometry& geometry, int heads,
                     int first_position, int padding = 0) {
     constexpr std::uint16_t kPadding = 0x3f81U;
     const int dense_per_token        = geometry.head_dim * heads;
@@ -342,8 +345,8 @@ int run_single_case(DeviceExecutionView execution, const Geometry& geometry, int
     device.copy_from_host(storage.data(), device.bytes());
     position_device.copy_from_host(positions.data(), position_device.bytes());
 
-    Tensor position_tensor(position_device.data(), DType::I32, {geometry.tokens, geometry.axes});
-    Tensor tensor(device.data(), DType::BF16, {geometry.head_dim, heads, geometry.tokens});
+    Tensor position_tensor(position_device.span(), DType::I32, {geometry.tokens, geometry.axes});
+    Tensor tensor(device.span(), DType::BF16, {geometry.head_dim, heads, geometry.tokens});
     tensor.nb[2] = static_cast<std::int64_t>(token_stride) * sizeof(std::uint16_t);
     ops::rope(position_tensor, geometry.rotary_dim, geometry.theta, tensor, execution);
     cuda_synchronize();
@@ -365,7 +368,7 @@ int run_single_case(DeviceExecutionView execution, const Geometry& geometry, int
     return failures;
 }
 
-int run_vision_packed_case(DeviceExecutionView execution) {
+int run_vision_packed_case(CudaExecutionView execution) {
     constexpr int kHeadDim = 72;
     constexpr int kHeads   = 16;
     constexpr int kTokens  = 11;
@@ -400,10 +403,10 @@ int run_vision_packed_case(DeviceExecutionView execution) {
     packed_device.copy_from_host(packed.data(), packed_device.bytes());
     position_device.copy_from_host(positions.data(), position_device.bytes());
 
-    auto* packed_data = static_cast<std::uint16_t*>(packed_device.data());
-    Tensor position_tensor(position_device.data(), DType::I32, {kTokens, 2});
-    Tensor q_tensor(packed_data, DType::BF16, {kHeadDim, kHeads, kTokens});
-    Tensor k_tensor(packed_data + kPlane, DType::BF16, {kHeadDim, kHeads, kTokens});
+    Tensor position_tensor(position_device.span(), DType::I32, {kTokens, 2});
+    Tensor q_tensor(packed_device.span(), DType::BF16, {kHeadDim, kHeads, kTokens});
+    Tensor k_tensor(packed_device.span().subspan(kPlane * 2), DType::BF16,
+                    {kHeadDim, kHeads, kTokens});
     q_tensor.nb[2] = static_cast<std::int64_t>(kStride) * sizeof(std::uint16_t);
     k_tensor.nb[2] = static_cast<std::int64_t>(kStride) * sizeof(std::uint16_t);
     ops::rope(position_tensor, kHeadDim, kVisionTheta, q_tensor, k_tensor, execution);
@@ -452,7 +455,7 @@ int main() {
     }
 
     DeviceContext device;
-    const auto execution = device.execution_view().on_stream(nullptr);
+    const auto execution = device.execution_view(nullptr);
     int failures         = 0;
 
     // Text pair form: both registered checkpoint geometries, decode/prefill, and 1-D/MRoPE.
@@ -475,7 +478,7 @@ int main() {
         run_pair_case(execution, {"35b text mrope", 256, 64, 3, 7, kTextTheta}, 16, 2, 2048, 16, 8);
 
     // Exercise both public forms on either side of the large-block residency boundary.
-    const int large_block_capacity = execution.multiprocessor_count * 6;
+    const int large_block_capacity = execution.multiprocessor_count() * 6;
     for (int tokens : {large_block_capacity, large_block_capacity + 1}) {
         failures += run_pair_case(execution,
                                   {"27b text residency boundary", 256, 64, 1, tokens, kTextTheta},

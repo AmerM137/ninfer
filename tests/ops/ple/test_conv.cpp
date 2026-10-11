@@ -16,11 +16,11 @@ int run(DeviceContext& device, int t, int b, int layout, bool inplace, bool norm
     for (int phase = 0; phase < (graph ? 2 : 1); ++phase) {
         f.prepare(phase, true, scale);
         if (graph && !phase) {
-            definition.capture(device.stream, [&] { f.launch(norm, device.execution_view()); });
+            definition.capture(device.stream(), [&] { f.launch(norm, device.execution_view()); });
             executable.instantiate(definition);
         }
         if (graph)
-            executable.launch(device.stream);
+            executable.launch(device.stream());
         else
             f.launch(norm, device.execution_view());
         device.synchronize();
@@ -72,8 +72,9 @@ int split_window(DeviceContext& device, bool norm) {
     auto second_count  = to_device(std::vector<int>{12});
     auto second_offset = to_device(std::vector<int>{5});
     auto zero          = to_device(std::vector<int>{0});
-    const Tensor first(first_count.p, DType::I32, {1}), second(second_count.p, DType::I32, {1});
-    const ops::PleConvStateView middle{intermediate.tensor, Tensor(zero.p, DType::I32, {1})};
+    const Tensor first(first_count.span(), DType::I32, {1}),
+        second(second_count.span(), DType::I32, {1});
+    const ops::PleConvStateView middle{intermediate.tensor, Tensor(zero.span(), DType::I32, {1})};
     cuda_synchronize();
     const auto segment = [&](int start, int count, const Tensor& valid,
                              const ops::PleConvStateView& before, const Tensor& offsets) {
@@ -91,7 +92,7 @@ int split_window(DeviceContext& device, bool norm) {
     segment(0, 5, first, f.state_view(), f.record_view().offsets);
     ops::ple_state_extract(f.state_view(), {f.records.tensor, f.batch_view().valid_columns}, first,
                            middle, device.execution_view());
-    segment(5, 12, second, middle, Tensor(second_offset.p, DType::I32, {1}));
+    segment(5, 12, second, middle, Tensor(second_offset.span(), DType::I32, {1}));
     device.synchronize();
     int failures = f.verify(norm, "PLE split windows at t=5");
     // The outer transaction can still choose a prefix preceding the second call.
@@ -123,10 +124,10 @@ int output_in_history_gap(DeviceContext& device) {
             storage.host[storage.index(c, j)] = f.history.host[f.history.index(c, j, f.source[0])];
     storage.upload();
     auto slot = to_device(std::vector<int>{0});
-    f.y = Tensor(static_cast<std::uint16_t*>(storage.tensor.data) + D, DType::BF16, {H, C, 1, 1});
+    f.y = Tensor(storage.device->span().subspan(std::size_t(D) * 2), DType::BF16, {H, C, 1, 1});
     cuda_synchronize();
     ops::ple_conv_add_norm(f.residual.tensor, f.gated.tensor, f.kernel.tensor, f.batch_view(),
-                           {storage.tensor, Tensor(slot.p, DType::I32, {1})}, f.record_view(),
+                           {storage.tensor, Tensor(slot.span(), DType::I32, {1})}, f.record_view(),
                            f.norm.tensor, epsilon, f.y, f.normalized.tensor,
                            device.execution_view());
     device.synchronize();

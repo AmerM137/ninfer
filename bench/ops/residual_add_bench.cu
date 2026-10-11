@@ -1,4 +1,5 @@
 #include "ninfer/ops/residual_add.h"
+#include "core/buffer.h"
 #include "op_measurement.cuh"
 
 #include <cuda_runtime.h>
@@ -22,12 +23,12 @@ void run(int d, int tokens) {
     DeviceBuffer y      = make_bf16(n, 101U);
     DeviceBuffer x      = make_bf16(n, 103U);
     SavedBuffer initial(x);
-    const auto restore = [&](cudaStream_t stream) { initial.restore(stream); };
-    Tensor ty(y.p, DType::BF16, {d, tokens});
-    Tensor tx(x.p, DType::BF16, {d, tokens});
+    const auto restore = [&](CudaExecutionView cuda) { initial.restore(cuda); };
+    Tensor ty(y.span(), DType::BF16, {d, tokens});
+    Tensor tx(x.span(), DType::BF16, {d, tokens});
 
     const Result result = bench_loop_prepared(
-        restore, [&](cudaStream_t stream) { ops::residual_add(ty, tx, stream); },
+        restore, [&](CudaExecutionView cuda) { ops::residual_add(ty, tx, cuda); },
         static_cast<double>(n) * 6.0);
 
     char tag[96];

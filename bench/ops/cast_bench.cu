@@ -1,4 +1,5 @@
 #include "ninfer/ops/cast.h"
+#include "core/buffer.h"
 #include "core/device.h"
 #include "op_measurement.cuh"
 
@@ -20,19 +21,21 @@ constexpr std::int32_t kD = 1536;
 
 void run(std::int32_t patches, bool profile_once) {
     const std::int64_t count = static_cast<std::int64_t>(kD) * patches;
-    DeviceBuffer source(static_cast<std::size_t>(count) * sizeof(float));
-    DeviceBuffer destination(static_cast<std::size_t>(count) * sizeof(std::uint16_t));
-    CUDA_CHECK(fixture::fill_values(static_cast<float*>(source.p), count, 101U, -2.F, 2.F));
-    CUDA_CHECK(cudaMemset(destination.p, 0, destination.bytes));
-    Tensor source_tensor(source.p, DType::FP32, {kD, patches});
-    Tensor destination_tensor(destination.p, DType::BF16, {kD, patches});
+    DeviceBuffer source(ninfer::bench::device_context().device(),
+                        static_cast<std::size_t>(count) * sizeof(float));
+    DeviceBuffer destination(ninfer::bench::device_context().device(),
+                             static_cast<std::size_t>(count) * sizeof(std::uint16_t));
+    CUDA_CHECK(fixture::fill_values(static_cast<float*>(source.data()), count, 101U, -2.F, 2.F));
+    CUDA_CHECK(cudaMemset(destination.data(), 0, destination.size()));
+    Tensor source_tensor(source.span(), DType::FP32, {kD, patches});
+    Tensor destination_tensor(destination.span(), DType::BF16, {kD, patches});
 
-    const auto launch = [&](cudaStream_t stream) {
-        ops::cast_fp32_to_bf16(source_tensor, destination_tensor, stream);
+    const auto launch = [&](CudaExecutionView cuda) {
+        ops::cast_fp32_to_bf16(source_tensor, destination_tensor, cuda);
     };
 
     if (profile_once) {
-        launch(nullptr);
+        launch(default_execution());
         CUDA_CHECK(cudaDeviceSynchronize());
         std::printf("cast fp32-bf16 profile P=%d\n", patches);
         return;

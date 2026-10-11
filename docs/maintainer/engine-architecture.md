@@ -131,6 +131,27 @@ Reader、binder、原生参数准备、容量查询、warmup 和执行各自检�
 消费者决定。数学公式、权重表示值和实现精度分别解释；不同量化、batch、prefill 或 speculative 路径的
 数值与状态正确性按 [Op 合同](op-development.md)及独立 oracle 验证。
 
+### 2.6 内存位置与执行环境
+
+`Device` 描述 CPU 或具体 CUDA ordinal；`None` 只用于未绑定的描述符和容量规划。
+`Tensor`、权重 parent 及其派生视图记录实际位置，reshape、slice、permute 和 layout binding
+保留该位置。数值格式、逻辑形状与内存位置独立，运行时位置不写入 artifact。
+
+`HostBuffer` 拥有对齐的普通 CPU 内存，`PinnedHostBuffer` 拥有可用于 CUDA 异步传输的锁页内存，
+`DeviceBuffer` 拥有指定 GPU 的分配。`MemorySpan` / `ConstMemorySpan` 借用 backing，记录容量、
+位置及 host pinned 属性。`MemoryArena` 只管理 span 上的分配游标；Program 分别持有 backing
+和 workspace arena，scope 退出只回退游标，不等待设备工作。容量规划使用无 backing 的描述符。
+
+`DeviceContext` 拥有 CUDA streams 和设备属性，并创建只读的 `CudaExecutionView`。Program、
+模型上下文及组合 Op 沿调用链传递该视图；Op 入口检查实际操作数和 workspace 属于执行 GPU，
+私有 launcher 再取出 stream。借用外部 stream 时在其所有者边界核对设备，调用点不得从 Tensor
+位置和裸 stream 拼装执行环境。Engine worker 在执行前绑定设备。
+
+通用字节传输通过 `copy_bytes` / `copy_bytes_async` 表达。CPU copy 同步完成；CUDA async copy
+要求 CPU 端为 pinned memory，CUDA 端属于执行 GPU。调用者持有 backing，负责 stream/event
+排序及完成后的复用；Tensor 和 span 不携带“已就绪”状态。KV 等有专用布局的传输保留其专用接口。
+这些基础类型允许 CPU 数据参与编排；现有模型执行和 CUDA Ops 仍在 GPU 上运行。
+
 ## 3. 请求生命周期
 
 ```mermaid

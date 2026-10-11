@@ -8,6 +8,6 @@ void launch_prepare(const QsaProjectionView& projected, const QsaPrepareParamete
                     const QsaBatchView& batch, const Tensor& rope_positions,
                     const QsaTailStateView& before, QsaCacheView cache,
                     QsaRawRecordWriteView records, Tensor& query, Tensor& index_query,
-                    DeviceExecutionView execution);
+                    CudaExecutionView execution);
 
 } // namespace ninfer::ops::detail::qsa

@@ -9,7 +9,9 @@
 namespace ninfer::ops::detail::dynamic_grouped_conv {
 namespace {
 void require_tensor(const Tensor& tensor, DType dtype, std::int32_t d0, std::int32_t d1,
-                    std::int32_t d2, std::int32_t d3, const char* op, const char* label) {
+                    std::int32_t d2, std::int32_t d3, const char* op, const char* label,
+                    Device device) {
+    common::operand::device(tensor.device, device, op, label);
     if (tensor.dtype != dtype || tensor.ne[0] != d0 || tensor.ne[1] != d1 || tensor.ne[2] != d2 ||
         tensor.ne[3] != d3 || !tensor.is_contiguous() ||
         !common::operand::aligned(tensor.data, 16)) {
@@ -57,7 +59,7 @@ void validate_add_weight(const Weight& weight, std::int32_t input_rows) {
 
 void require_add_nonoverlap(const Tensor& x, const Weight& projection_weight,
                             const Tensor& base_kernel, const Tensor& finish_delta,
-                            const Tensor& residual, const WorkspaceArena& workspace) {
+                            const Tensor& residual, const MemoryArena& workspace) {
     const std::size_t code_bytes =
         static_cast<std::size_t>(kHidden) * static_cast<std::size_t>(x.ne[0]);
     const std::size_t scale_bytes = static_cast<std::size_t>(kHidden) *
@@ -69,7 +71,8 @@ void require_add_nonoverlap(const Tensor& x, const Weight& projection_weight,
         common::operand::range(base_kernel.data, base_kernel.bytes(), "dynamic grouped conv"),
         common::operand::range(finish_delta.data, finish_delta.bytes(), "dynamic grouped conv"),
         common::operand::range(residual.data, residual.bytes(), "dynamic grouped conv"),
-        common::operand::range(workspace.base(), workspace.capacity(), "dynamic grouped conv"),
+        common::operand::range(workspace.storage().data, workspace.capacity(),
+                               "dynamic grouped conv"),
     }};
     common::operand::disjoint(ranges, kAddOp);
 }
@@ -77,7 +80,7 @@ void require_add_nonoverlap(const Tensor& x, const Weight& projection_weight,
 void require_prepare_nonoverlap(const Tensor& residual, const Tensor& norm_weight,
                                 const Tensor& base_kernel, const Weight& kernel_projection_weight,
                                 const Tensor& prepared, const Tensor& finish_delta,
-                                const WorkspaceArena& workspace) {
+                                const MemoryArena& workspace) {
     constexpr std::size_t kWeightBytes =
         static_cast<std::size_t>(kCoefficientRows) * kHidden * sizeof(std::uint16_t);
     const std::array<common::operand::Range, 7> ranges{{
@@ -88,7 +91,8 @@ void require_prepare_nonoverlap(const Tensor& residual, const Tensor& norm_weigh
                                "dynamic grouped conv"),
         common::operand::range(prepared.data, prepared.bytes(), "dynamic grouped conv"),
         common::operand::range(finish_delta.data, finish_delta.bytes(), "dynamic grouped conv"),
-        common::operand::range(workspace.base(), workspace.capacity(), "dynamic grouped conv"),
+        common::operand::range(workspace.storage().data, workspace.capacity(),
+                               "dynamic grouped conv"),
     }};
     common::operand::disjoint(ranges, kPrepareOp);
 }
@@ -109,7 +113,7 @@ void validate_input_rows(int input_rows) {
 void validate_prepare(const Tensor& residual, const Tensor& norm_weight, float eps,
                       const Tensor& base_kernel, const Weight& kernel_projection_weight,
                       const Tensor& prepared, const Tensor& finish_delta,
-                      const WorkspaceArena& workspace) {
+                      const MemoryArena& workspace, CudaExecutionView execution) {
     const std::int32_t batch_size = residual.ne[2];
     const std::int32_t width      = residual.ne[1];
     if (!(eps > 0.0F) || !std::isfinite(eps)) {
@@ -117,30 +121,42 @@ void validate_prepare(const Tensor& residual, const Tensor& norm_weight, float e
             "dynamic grouped conv prepare: eps must be positive and finite");
     }
     validate_interval(width, width, batch_size, batch_size, kPrepareOp);
-    require_tensor(residual, DType::BF16, kHidden, width, batch_size, 1, kPrepareOp, "residual");
-    require_tensor(norm_weight, DType::BF16, kHidden, 1, 1, 1, kPrepareOp, "norm_weight");
-    require_tensor(base_kernel, DType::BF16, kHidden, kTaps, kSides, 1, kPrepareOp, "base_kernel");
-    require_tensor(prepared, DType::BF16, kHidden, width, batch_size, 1, kPrepareOp, "prepared");
+    require_tensor(residual, DType::BF16, kHidden, width, batch_size, 1, kPrepareOp, "residual",
+                   execution.device());
+    require_tensor(norm_weight, DType::BF16, kHidden, 1, 1, 1, kPrepareOp, "norm_weight",
+                   execution.device());
+    require_tensor(base_kernel, DType::BF16, kHidden, kTaps, kSides, 1, kPrepareOp, "base_kernel",
+                   execution.device());
+    require_tensor(prepared, DType::BF16, kHidden, width, batch_size, 1, kPrepareOp, "prepared",
+                   execution.device());
     require_tensor(finish_delta, DType::BF16, kGroups, kTaps, width, batch_size, kPrepareOp,
-                   "finish_delta");
+                   "finish_delta", execution.device());
+    common::operand::device(kernel_projection_weight.device, execution.device(), kPrepareOp,
+                            "weight");
+    common::operand::device(workspace.device(), execution.device(), kPrepareOp, "workspace");
     validate_prepare_weight(kernel_projection_weight);
     require_prepare_nonoverlap(residual, norm_weight, base_kernel, kernel_projection_weight,
                                prepared, finish_delta, workspace);
 }
 
 void validate_add(const Tensor& x, const Weight& projection_weight, const Tensor& base_kernel,
-                  const Tensor& finish_delta, const Tensor& residual,
-                  const WorkspaceArena& workspace) {
+                  const Tensor& finish_delta, const Tensor& residual, const MemoryArena& workspace,
+                  CudaExecutionView execution) {
     const std::int32_t input_rows = x.ne[0];
     const std::int32_t batch_size = x.ne[2];
     const std::int32_t width      = x.ne[1];
     validate_interval(width, width, batch_size, batch_size, kAddOp);
     validate_input_rows(input_rows);
-    require_tensor(x, DType::BF16, input_rows, width, batch_size, 1, kAddOp, "x");
-    require_tensor(base_kernel, DType::BF16, kHidden, kTaps, kSides, 1, kAddOp, "base_kernel");
+    require_tensor(x, DType::BF16, input_rows, width, batch_size, 1, kAddOp, "x",
+                   execution.device());
+    require_tensor(base_kernel, DType::BF16, kHidden, kTaps, kSides, 1, kAddOp, "base_kernel",
+                   execution.device());
     require_tensor(finish_delta, DType::BF16, kGroups, kTaps, width, batch_size, kAddOp,
-                   "finish_delta");
-    require_tensor(residual, DType::BF16, kHidden, width, batch_size, 1, kAddOp, "residual");
+                   "finish_delta", execution.device());
+    require_tensor(residual, DType::BF16, kHidden, width, batch_size, 1, kAddOp, "residual",
+                   execution.device());
+    common::operand::device(projection_weight.device, execution.device(), kAddOp, "weight");
+    common::operand::device(workspace.device(), execution.device(), kAddOp, "workspace");
     validate_add_weight(projection_weight, input_rows);
     require_add_nonoverlap(x, projection_weight, base_kernel, finish_delta, residual, workspace);
 }

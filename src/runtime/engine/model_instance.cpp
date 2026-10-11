@@ -135,8 +135,8 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
     StartupPhaseScope planning(options.startup_observer, StartupPhase::TargetFinalize);
     const auto signature = models::qwen3_5::prefill_signature(*instance->model);
     auto context_cost    = resolve_context_machine_cost(
-        {.hardware_class =
-                context_cost_hardware_class(device.props.name, device.props.major, device.props.minor),
+        {.hardware_class = context_cost_hardware_class(
+             device.properties().name, device.properties().major, device.properties().minor),
             .prefill_signature = signature},
         options.context_cost.preset_path);
     auto planner    = models::qwen3_5::make_sequence_planner(instance->parameters, device, options);

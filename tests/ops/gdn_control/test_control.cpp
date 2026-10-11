@@ -1,4 +1,6 @@
 #include "oracle.h"
+#include "cuda_fixture.h"
+#include "core/buffer.h"
 #include "criteria.h"
 #include "core/decode_graph.h"
 #include <algorithm>
@@ -10,7 +12,7 @@ namespace control = ninfer::test::gdn_control;
 
 namespace {
 
-int run(int columns, bool edges, bool captured, DeviceExecutionView execution) {
+int run(int columns, bool edges, bool captured, CudaExecutionView execution) {
     const auto count = std::size_t(48) * columns;
     std::vector<float> a(count), b(count), a_log(48), dt_bias(48);
     fill_uniform(a, 101, -8.F, 8.F);
@@ -24,13 +26,16 @@ int run(int columns, bool edges, bool captured, DeviceExecutionView execution) {
             b[i] = values[(i / 5) % 5];
         }
     }
-    DeviceBuffer device_a_log(count * 2), device_dt_bias(count * 2), dl(48 * 4), dd(48 * 4);
+    DeviceBuffer device_a_log(ninfer::test::cuda_environment().context.device(), count * 2);
+    DeviceBuffer device_dt_bias(ninfer::test::cuda_environment().context.device(), count * 2);
+    DeviceBuffer dl(ninfer::test::cuda_environment().context.device(), 48 * 4);
+    DeviceBuffer dd(ninfer::test::cuda_environment().context.device(), 48 * 4);
     GuardedDeviceBuffer g(count * 4), beta(count * 4);
-    Tensor a_log_tensor(device_a_log.p, DType::BF16, {48, columns}),
-        tb(device_dt_bias.p, DType::BF16, {48, columns}), tl(dl.p, DType::FP32, {48}),
-        dt_bias_tensor(dd.p, DType::FP32, {48});
-    ops::GdnControlOutputs outputs{Tensor(g.data(), DType::FP32, {48, columns}),
-                                   Tensor(beta.data(), DType::FP32, {48, columns})};
+    Tensor a_log_tensor(device_a_log.span(), DType::BF16, {48, columns}),
+        tb(device_dt_bias.span(), DType::BF16, {48, columns}), tl(dl.span(), DType::FP32, {48}),
+        dt_bias_tensor(dd.span(), DType::FP32, {48});
+    ops::GdnControlOutputs outputs{Tensor(g.span(), DType::FP32, {48, columns}),
+                                   Tensor(beta.span(), DType::FP32, {48, columns})};
     auto upload = [&] {
         round_to_bf16(a);
         round_to_bf16(b);
@@ -43,14 +48,14 @@ int run(int columns, bool edges, bool captured, DeviceExecutionView execution) {
     upload();
     cuda_synchronize();
     const auto launch = [&] {
-        ops::gdn_control(a_log_tensor, tb, tl, dt_bias_tensor, outputs, execution.stream);
+        ops::gdn_control(a_log_tensor, tb, tl, dt_bias_tensor, outputs, execution);
     };
     DecodeGraphDefinition definition;
     DecodeGraphExecutable graph;
     if (captured) {
         launch();
-        cuda_synchronize(execution.stream);
-        definition.capture(execution.stream, launch);
+        cuda_synchronize(execution.stream());
+        definition.capture(execution.stream(), launch);
         graph.instantiate(definition);
     }
     int failed = 0;
@@ -62,13 +67,13 @@ int run(int columns, bool edges, bool captured, DeviceExecutionView execution) {
             for (auto& v : dt_bias) v = -v;
             upload();
         }
-        CUDA_CHECK(cudaMemsetAsync(g.data(), 0xff, count * 4, execution.stream));
-        CUDA_CHECK(cudaMemsetAsync(beta.data(), 0xff, count * 4, execution.stream));
+        CUDA_CHECK(cudaMemsetAsync(g.data(), 0xff, count * 4, execution.stream()));
+        CUDA_CHECK(cudaMemsetAsync(beta.data(), 0xff, count * 4, execution.stream()));
         if (captured)
-            graph.launch(execution.stream);
+            graph.launch(execution.stream());
         else
             launch();
-        cuda_synchronize(execution.stream);
+        cuda_synchronize(execution.stream());
         std::vector<double> rg(count), rb(count);
         for (std::size_t i = 0; i < count; ++i) {
             rg[i] = -std::exp(double(a_log[i % 48])) *
@@ -140,11 +145,13 @@ int main() {
     for (int columns : {1, 7, 128, 4096})
         failed += run(columns, false, columns == 1 || columns == 128, device.execution_view());
     failed += run(17, true, true, device.execution_view());
-    Tensor empty(nullptr, DType::BF16, {48, 1}), vector(nullptr, DType::FP32, {48});
+    auto empty         = Tensor::metadata(DType::BF16, {48, 1});
+    auto vector        = Tensor::metadata(DType::FP32, {48});
     empty.ne[1] = 0;
-    Tensor empty_output(nullptr, DType::FP32, {48, 1});
+    auto empty_output  = Tensor::metadata(DType::FP32, {48, 1});
     empty_output.ne[1] = 0;
-    ops::gdn_control(empty, empty, vector, vector, {empty_output, empty_output}, device.stream);
+    ops::gdn_control(empty, empty, vector, vector, {empty_output, empty_output},
+                     device.execution_view());
     std::cout << (failed ? "FAIL" : "OK") << " GDN control\n";
     return failed ? 1 : 0;
 }

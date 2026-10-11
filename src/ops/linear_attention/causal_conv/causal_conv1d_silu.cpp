@@ -67,15 +67,11 @@ void require_selector_shape(const Tensor& selector, std::int32_t batch, const ch
 }
 
 void require_non_empty_accessible(const Tensor& x, const Tensor& weight, const Tensor& conv_state,
-                                  const Tensor& out) {
-    if (!x.is_contiguous() || !weight.is_contiguous() || !conv_state.is_contiguous() ||
-        !out.is_contiguous()) {
-        throw std::invalid_argument("causal_conv1d: all tensors must be contiguous");
-    }
-    if (x.data == nullptr || weight.data == nullptr || conv_state.data == nullptr ||
-        out.data == nullptr) {
-        throw std::invalid_argument("causal_conv1d: all tensor data pointers must be non-null");
-    }
+                                  const Tensor& out, Device device) {
+    common::operand::contiguous_nonnull(x, "causal_conv1d", "x", device);
+    common::operand::contiguous_nonnull(weight, "causal_conv1d", "weight", device);
+    common::operand::contiguous_nonnull(conv_state, "causal_conv1d", "conv_state", device);
+    common::operand::contiguous_nonnull(out, "causal_conv1d", "out", device);
 }
 
 detail::CausalConvSplitGeometry require_split_geometry(const Tensor& x, const Tensor& out0,
@@ -175,7 +171,8 @@ void require_split_nonoverlap(const Tensor& x, const Tensor& weight, const Tenso
 } // namespace
 
 void causal_conv1d_silu(const Tensor& x, const Tensor& weight, const Tensor& conv_state_in,
-                        Tensor& conv_state_out, Tensor& out, cudaStream_t stream) {
+                        Tensor& conv_state_out, Tensor& out, CudaExecutionView execution) {
+    const auto stream = execution.stream();
     if (x.dtype != DType::BF16 || weight.dtype != DType::BF16 ||
         conv_state_in.dtype != DType::BF16 || conv_state_out.dtype != DType::BF16 ||
         out.dtype != DType::BF16) {
@@ -195,11 +192,9 @@ void causal_conv1d_silu(const Tensor& x, const Tensor& weight, const Tensor& con
     require_out_shape(x, out);
     if (n == 0) { return; }
 
-    require_non_empty_accessible(x, weight, conv_state_in, out);
-    if (!conv_state_out.is_contiguous() || conv_state_out.data == nullptr) {
-        throw std::invalid_argument(
-            "causal_conv1d: conv_state_out must be contiguous and non-null");
-    }
+    require_non_empty_accessible(x, weight, conv_state_in, out, execution.device());
+    common::operand::contiguous_nonnull(conv_state_out, "causal_conv1d", "conv_state_out",
+                                        execution.device());
     require_state_alias_rule(conv_state_in, conv_state_out);
     require_output_nonoverlap(x, weight, conv_state_in, conv_state_out, out);
     const auto plan =
@@ -209,7 +204,8 @@ void causal_conv1d_silu(const Tensor& x, const Tensor& weight, const Tensor& con
 
 void causal_conv1d_silu_split(const Tensor& x, const Tensor& weight, const Tensor& conv_state_in,
                               Tensor& conv_state_out, Tensor& out0, Tensor& out1, Tensor& out2,
-                              cudaStream_t stream) {
+                              CudaExecutionView execution) {
+    const auto stream = execution.stream();
     if (x.dtype != DType::BF16 || weight.dtype != DType::BF16 ||
         conv_state_in.dtype != DType::BF16 || conv_state_out.dtype != DType::BF16) {
         throw std::invalid_argument("causal_conv1d: x/weight/conv_state must be BF16");
@@ -237,7 +233,8 @@ void causal_conv1d_silu_split(const Tensor& x, const Tensor& weight, const Tenso
                                                                {&out1, "out1"},
                                                                {&out2, "out2"}};
     for (const auto& operand : operands) {
-        common::operand::contiguous_nonnull(*operand.first, "causal_conv1d", operand.second);
+        common::operand::contiguous_nonnull(*operand.first, "causal_conv1d", operand.second,
+                                            execution.device());
         require_pair_aligned(*operand.first, operand.second);
     }
     require_state_alias_rule(conv_state_in, conv_state_out);
@@ -249,14 +246,15 @@ void causal_conv1d_silu_split(const Tensor& x, const Tensor& weight, const Tenso
 }
 
 void causal_conv1d_silu(const Tensor& x, const Tensor& weight, Tensor& conv_state, Tensor& out,
-                        cudaStream_t stream) {
-    causal_conv1d_silu(x, weight, conv_state, conv_state, out, stream);
+                        CudaExecutionView execution) {
+    causal_conv1d_silu(x, weight, conv_state, conv_state, out, execution);
 }
 
 void causal_conv1d_silu_snapshot(const Tensor& x, const Tensor& weight, Tensor& conv_states,
                                  const Tensor& valid_columns, const Tensor& initial_state_slots,
                                  const Tensor& snapshot_base_slots, Tensor& out,
-                                 cudaStream_t stream) {
+                                 CudaExecutionView execution) {
+    const auto stream = execution.stream();
     const bool masked = valid_columns.data != nullptr;
     if (x.dtype != DType::BF16 || weight.dtype != DType::BF16 || conv_states.dtype != DType::BF16 ||
         out.dtype != DType::BF16) {
@@ -285,14 +283,15 @@ void causal_conv1d_silu_snapshot(const Tensor& x, const Tensor& weight, Tensor& 
     require_out_shape(x, out);
     if (n == 0) { return; }
 
-    require_non_empty_accessible(x, weight, conv_states, out);
+    require_non_empty_accessible(x, weight, conv_states, out, execution.device());
     if (masked) {
-        common::operand::contiguous_nonnull(valid_columns, "causal_conv1d", "valid_columns");
+        common::operand::contiguous_nonnull(valid_columns, "causal_conv1d", "valid_columns",
+                                            execution.device());
     }
-    common::operand::contiguous_nonnull(initial_state_slots, "causal_conv1d",
-                                        "initial_state_slots");
-    common::operand::contiguous_nonnull(snapshot_base_slots, "causal_conv1d",
-                                        "snapshot_base_slots");
+    common::operand::contiguous_nonnull(initial_state_slots, "causal_conv1d", "initial_state_slots",
+                                        execution.device());
+    common::operand::contiguous_nonnull(snapshot_base_slots, "causal_conv1d", "snapshot_base_slots",
+                                        execution.device());
     detail::launch_causal_conv_snapshot(
         x, weight, conv_states, valid_columns, initial_state_slots, snapshot_base_slots, out,
         detail::select_causal_conv_snapshot_plan(x.ne[1], batch, masked), stream);

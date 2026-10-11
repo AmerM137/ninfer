@@ -18,6 +18,13 @@ struct Range {
     std::uintptr_t begin, end;
 };
 
+inline void device(Device actual, Device expected, const char* op, const char* name) {
+    if (expected.type() == DeviceType::None || actual != expected) {
+        throw std::invalid_argument(std::string(op) + ": " + name +
+                                    " must belong to the execution device");
+    }
+}
+
 inline void dtype(const Tensor& tensor, DType expected, const char* op, const char* name) {
     if (tensor.dtype != expected) throw std::invalid_argument(std::string(op) + ": " + name);
 }
@@ -29,7 +36,9 @@ inline void shape(const Tensor& tensor, std::array<std::int32_t, 4> expected, co
             throw std::invalid_argument(std::string(op) + ": invalid shape for " + name);
 }
 
-inline void contiguous_nonnull(const Tensor& tensor, const char* op, const char* name) {
+inline void contiguous_nonnull(const Tensor& tensor, const char* op, const char* name,
+                               Device expected) {
+    device(tensor.device, expected, op, name);
     if (!tensor.is_contiguous())
         throw std::invalid_argument(std::string(op) + ": " + name + " must be contiguous");
     if (!tensor.data)
@@ -58,8 +67,10 @@ inline bool aligned(const void* pointer, std::size_t alignment) noexcept {
 }
 
 inline void tensor(const Tensor& value, DType dtype, std::initializer_list<std::int32_t> dimensions,
-                   std::size_t alignment, const char* op, const char* name) {
-    const Tensor expected(nullptr, dtype, dimensions);
+                   std::size_t alignment, const char* op, const char* name,
+                   Device expected_device) {
+    device(value.device, expected_device, op, name);
+    const auto expected = Tensor::metadata(dtype, dimensions);
     if (value.dtype != dtype || !value.is_contiguous() || !aligned(value.data, alignment))
         throw std::invalid_argument(std::string(op) + ": invalid " + name);
     for (int axis = 0; axis < 4; ++axis)

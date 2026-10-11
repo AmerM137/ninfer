@@ -12,6 +12,17 @@
 #include <utility>
 
 namespace ninfer {
+
+Device PagedKVBatchLayerView::device() const {
+    const auto location = k_pages.device;
+    if (v_pages.device != location || block_tables.device != location ||
+        (k_scale_pages.data && k_scale_pages.device != location) ||
+        (v_scale_pages.data && v_scale_pages.device != location)) {
+        throw std::invalid_argument("paged KV view spans different devices");
+    }
+    return location;
+}
+
 namespace {
 
 std::int32_t checked_i32(std::uint32_t value, const char* label) {
@@ -208,8 +219,11 @@ void DeviceKVPageReservation::release() noexcept {
     pages_ = 0;
 }
 
-DeviceKVPagePool::DeviceKVPagePool(DeviceSpan backing, const DeviceKVPagePoolLayout& layout)
+DeviceKVPagePool::DeviceKVPagePool(MemorySpan backing, const DeviceKVPagePoolLayout& layout)
     : spec_(layout.spec) {
+    if (backing.device.type() != DeviceType::CUDA) {
+        throw std::invalid_argument("device state requires CUDA backing");
+    }
     validate_geometry(spec_.geometry);
     if (layout.planes.size() != spec_.geometry.planes.size() || layout.planes.empty()) {
         throw std::invalid_argument("Paged KV device layout plane inventory is inconsistent");
@@ -250,10 +264,9 @@ DeviceKVPagePool::DeviceKVPagePool(DeviceSpan backing, const DeviceKVPagePoolLay
 void DeviceKVPagePool::initialize_host_transfer_plan() {
     const HostKVPageLayout host = plan_host_kv_page_layout(geometry());
     host_page_stride_           = host.page_stride;
-    int device                  = 0;
     int maximum_pitch           = 0;
-    CUDA_CHECK(cudaGetDevice(&device));
-    CUDA_CHECK(cudaDeviceGetAttribute(&maximum_pitch, cudaDevAttrMaxPitch, device));
+    CUDA_CHECK(cudaDeviceGetAttribute(&maximum_pitch, cudaDevAttrMaxPitch,
+                                      planes_.front().device.index()));
     const auto pitch_limit = static_cast<std::size_t>(maximum_pitch);
     const bool page_major  = geometry().device_plane_order == PagedKVPlaneOrder::PageMajor;
     std::size_t maximum_short_dimension = 1;
@@ -858,12 +871,15 @@ bool KVExecutionRowLease::release() noexcept {
     return owner->release_row(row, generation);
 }
 
-KVExecutionTablePool::KVExecutionTablePool(DeviceSpan backing, const KVExecutionTableLayout& layout,
+KVExecutionTablePool::KVExecutionTablePool(MemorySpan backing, const KVExecutionTableLayout& layout,
                                            const DeviceKVPagePool& pages)
     : spec_(layout.spec), pages_(&pages), block_tables_(layout.block_tables.bind(backing)),
       host_shadow_(checked_table_bytes(layout.spec)),
       row_in_use_(static_cast<std::size_t>(layout.spec.table_rows), false),
       row_generations_(static_cast<std::size_t>(layout.spec.table_rows), 1) {
+    if (backing.device.type() != DeviceType::CUDA || backing.device != pages.plane(0).device) {
+        throw std::invalid_argument("KV execution tables must share their page pool device");
+    }
     if (block_tables_.dtype != DType::I32 ||
         block_tables_.ne[0] !=
             checked_i32(spec_.logical_page_capacity, "Paged KV logical page capacity") ||

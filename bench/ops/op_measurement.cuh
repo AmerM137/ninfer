@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/buffer.h"
 #include "ninfer_bench_common.h"
 
 #include <charconv>
@@ -123,11 +124,12 @@ public:
     BodyTimedGraph& operator=(const BodyTimedGraph&) = delete;
 
     template <class Launch>
-    void capture(cudaStream_t stream, Launch&& launch) {
+    void capture(CudaExecutionView cuda, Launch&& launch) {
+        const auto stream = cuda.stream();
         CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
         try {
             CUDA_CHECK(cudaEventRecordWithFlags(start_, stream, cudaEventRecordExternal));
-            launch(stream);
+            launch(cuda);
             CUDA_CHECK(cudaEventRecordWithFlags(stop_, stream, cudaEventRecordExternal));
         } catch (...) {
             cudaGraph_t discarded = nullptr;
@@ -149,7 +151,10 @@ public:
         if (!kernels_) throw std::runtime_error("captured Op has no kernels");
     }
 
-    void launch(cudaStream_t stream) const { CUDA_CHECK(cudaGraphLaunch(exec_, stream)); }
+    void launch(CudaExecutionView cuda) const {
+        const auto stream = cuda.stream();
+        CUDA_CHECK(cudaGraphLaunch(exec_, stream));
+    }
 
     double elapsed_us() const {
         float ms = 0;
@@ -171,26 +176,27 @@ struct Result {
 };
 
 template <class Launch, class Restore>
-Result measure(Launch&& launch, Restore&& restore, L2FlushBuffer& flush, cudaStream_t stream,
+Result measure(Launch&& launch, Restore&& restore, L2FlushBuffer& flush, CudaExecutionView cuda,
                const Options& options, const std::string& execution, const std::string& cache) {
+    const auto stream = cuda.stream();
     // Complete fixture uploads and poison fills before using the capture stream.
     CUDA_CHECK(cudaDeviceSynchronize());
-    restore(stream);
-    launch(stream);
+    restore(cuda);
+    launch(cuda);
     CUDA_CHECK(cudaStreamSynchronize(stream));
     BodyTimedGraph graph;
     // Capture also counts the actual Op kernels for an eager row, without timing setup.
-    graph.capture(stream, launch);
+    graph.capture(cuda, launch);
     const bool captured = execution == "graph";
     const auto invoke   = [&] {
         if (captured)
-            graph.launch(stream);
+            graph.launch(cuda);
         else
-            launch(stream);
+            launch(cuda);
     };
     const auto prepare = [&] {
-        restore(stream);
-        if (cache == "cold") flush_l2(flush, stream);
+        restore(cuda);
+        if (cache == "cold") flush_l2(flush, cuda);
     };
     for (int i = 0; i < options.warmup; ++i) {
         prepare();
@@ -270,8 +276,8 @@ private:
 };
 
 inline DeviceBuffer make_i32(const std::vector<int>& values) {
-    DeviceBuffer result(values.size() * sizeof(int));
-    result.copy_from_host(values.data(), result.bytes);
+    DeviceBuffer result(ninfer::bench::device_context().device(), values.size() * sizeof(int));
+    result.copy_from_host(values.data(), result.size());
     return result;
 }
 

@@ -1,4 +1,5 @@
 #include "core/device.h"
+#include "core/buffer.h"
 #include "core/linear_attention_state.h"
 
 #include <cuda_runtime.h>
@@ -94,10 +95,9 @@ int main() {
     int failures = 0;
     ninfer::DeviceContext ctx(0);
     auto state_plan = plan_state(3, 10, 3, 4, 5, 6);
-    ninfer::DeviceArena state_arena(state_plan.bytes);
-    CUDA_CHECK(cudaMemset(state_arena.base(), 0x4a, state_arena.capacity()));
-    ninfer::LinearAttentionStatePool state({state_arena.base(), state_arena.capacity()},
-                                           state_plan.layout);
+    ninfer::DeviceBuffer state_arena(ctx.device(), state_plan.bytes);
+    CUDA_CHECK(cudaMemset(state_arena.data(), 0x4a, state_arena.size()));
+    ninfer::LinearAttentionStatePool state(state_arena.span(), state_plan.layout);
 
     failures += expect_size(state.layer_count(), 3, "state.layer_count");
     failures += expect_size(state.slot_count(), 1, "state.slot_count");
@@ -131,16 +131,15 @@ int main() {
         std::cerr << "state layers alias\n";
     }
 
-    state.zero_slot(0, ctx.stream);
+    state.zero_slot(0, ctx.stream());
     ctx.synchronize();
     failures += expect_device_byte(state.layer_view(0).conv, 0, "zeroed conv");
     failures += expect_device_byte(state.layer_view(1).recurrent, 0, "zeroed recurrent");
 
     auto slotted_plan = plan_state(2, 10, 3, 4, 5, 6, 3);
-    ninfer::DeviceArena slotted_arena(slotted_plan.bytes);
-    CUDA_CHECK(cudaMemset(slotted_arena.base(), 0, slotted_arena.capacity()));
-    ninfer::LinearAttentionStatePool slotted({slotted_arena.base(), slotted_arena.capacity()},
-                                             slotted_plan.layout);
+    ninfer::DeviceBuffer slotted_arena(ctx.device(), slotted_plan.bytes);
+    CUDA_CHECK(cudaMemset(slotted_arena.data(), 0, slotted_arena.size()));
+    ninfer::LinearAttentionStatePool slotted(slotted_arena.span(), slotted_plan.layout);
     failures += expect_size(slotted.slot_count(), 3, "slotted.slot_count");
     failures += check_shape(slotted.layer_view(0).conv, {10, 3, 3, 1}, "slotted.conv");
     failures += check_shape(slotted.layer_view(0).recurrent, {6, 5, 4, 3}, "slotted.recurrent");
@@ -160,14 +159,14 @@ int main() {
     CUDA_CHECK(cudaMemset(conv1_layer1.data, 0x3c, conv1_layer1.bytes()));
     CUDA_CHECK(cudaMemset(recurrent1_layer1.data, 0x2d, recurrent1_layer1.bytes()));
 
-    slotted.copy_slot(1, 2, ctx.stream);
+    slotted.copy_slot(1, 2, ctx.stream());
     ctx.synchronize();
     failures += expect_device_byte(slotted.conv_slot(0, 2), 0x6b, "copied conv slot");
     failures += expect_device_byte(slotted.recurrent_slot(0, 2), 0x4d, "copied recurrent slot");
     failures += expect_device_byte(slotted.conv_slot(1, 2), 0x3c, "copied conv layer1");
     failures += expect_device_byte(slotted.recurrent_slot(1, 2), 0x2d, "copied recurrent layer1");
 
-    slotted.zero_slot(0, ctx.stream);
+    slotted.zero_slot(0, ctx.stream());
     ctx.synchronize();
     failures += expect_device_byte(slotted.conv_slot(0, 0), 0, "zeroed conv slot0");
     failures += expect_device_byte(slotted.recurrent_slot(0, 0), 0, "zeroed recurrent slot0");
@@ -176,15 +175,14 @@ int main() {
     failures += expect_device_byte(slotted.conv_slot(0, 2), 0x6b, "zero kept conv slot2");
     failures += expect_device_byte(slotted.recurrent_slot(0, 2), 0x4d, "zero kept recurrent slot2");
 
-    slotted.zero_all(ctx.stream);
+    slotted.zero_all(ctx.stream());
     ctx.synchronize();
     failures += expect_device_byte(slotted.layer_view(1).conv, 0, "zeroed all conv");
     failures += expect_device_byte(slotted.layer_view(1).recurrent, 0, "zeroed all recurrent");
 
     auto fp32_conv_plan = plan_state(1, 7, 2, 2, 3, 4, 2, ninfer::DType::FP32);
-    ninfer::DeviceArena fp32_conv_arena(fp32_conv_plan.bytes);
-    ninfer::LinearAttentionStatePool fp32_conv({fp32_conv_arena.base(), fp32_conv_arena.capacity()},
-                                               fp32_conv_plan.layout);
+    ninfer::DeviceBuffer fp32_conv_arena(ctx.device(), fp32_conv_plan.bytes);
+    ninfer::LinearAttentionStatePool fp32_conv(fp32_conv_arena.span(), fp32_conv_plan.layout);
     if (fp32_conv.layer_view(0).conv.dtype != ninfer::DType::FP32) {
         ++failures;
         std::cerr << "FP32 conv geometry did not retain its dtype\n";

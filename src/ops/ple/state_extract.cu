@@ -56,7 +56,7 @@ namespace ninfer::ops {
 
 void ple_state_extract(const PleConvStateView& before, const PleConvRecordReadView& records,
                        const Tensor& accepted, PleConvStateView after,
-                       DeviceExecutionView execution) {
+                       CudaExecutionView execution) {
     using namespace detail::ple;
     validate_extract(before, records, accepted, after, execution);
     const ExtractArguments a{static_cast<const std::uint16_t*>(before.history.data),
@@ -72,7 +72,7 @@ void ple_state_extract(const PleConvStateView& before, const PleConvRecordReadVi
                              after.history.nb[1] / 2,
                              after.history.nb[2] / 2};
     select_extract(before.history, records.values, after.history)(a, accepted.ne[0],
-                                                                  execution.stream);
+                                                                  execution.stream());
 }
 
 } // namespace ninfer::ops

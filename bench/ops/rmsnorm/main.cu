@@ -6,7 +6,7 @@ int main(int argc, char** argv) {
     try {
         const auto o = rmsnorm::parse(argc, argv);
         measurement::hardware();
-        DeviceContext device;
+        auto& device = ninfer::bench::device_context();
         L2FlushBuffer flush(o.timing.flush_bytes);
         measurement::Csv csv(o.timing.csv_out);
         for (int columns : o.tokens) {
@@ -15,8 +15,8 @@ int main(int argc, char** argv) {
                  measurement::selections(o.timing.execution, "graph", "eager"))
                 for (const auto& cache : measurement::selections(o.timing.cache, "cold", "warm")) {
                     const auto result = measurement::measure(
-                        [&](auto stream) { f.launch({stream, device.multiprocessor_count()}); },
-                        [](auto) {}, flush, device.stream, o.timing, execution, cache);
+                        [&](CudaExecutionView cuda) { f.launch(cuda); }, [](auto) {}, flush,
+                        device.execution_view(), o.timing, execution, cache);
                     measurement::Row row;
                     row.op          = rmsnorm::name(o.op);
                     row.format      = "bf16";

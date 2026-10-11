@@ -7,7 +7,7 @@
 namespace ninfer::ops::detail::gdn_control {
 
 struct Scratch {
-    DeviceSpan partial;
+    MemorySpan partial;
 };
 
 // Query and execution use the same call-local, aligned allocation recipe.

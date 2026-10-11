@@ -1,4 +1,6 @@
 #include "core/weight.h"
+#include "cuda_fixture.h"
+#include "core/buffer.h"
 #include "ninfer/ops/sparse_moe.h"
 
 #include "ops/op_tester.h"
@@ -94,6 +96,8 @@ public:
 
     void* data() noexcept { return storage_.data(); }
 
+    MemorySpan span() noexcept { return storage_.span(); }
+
     const void* data() const noexcept { return storage_.data(); }
 
     std::vector<double> values() const { return from_device_bf16(data(), words_); }
@@ -115,13 +119,15 @@ public:
           high_row_bytes_(static_cast<std::size_t>(groups_per_row_) *
                           geometry_.high_bytes_per_group),
           scale_row_bytes_(static_cast<std::size_t>(groups_per_row_) * sizeof(std::uint16_t)),
-          codes_(static_cast<std::size_t>(rows) * code_row_bytes_),
-          scales_(static_cast<std::size_t>(rows) * scale_row_bytes_) {
+          codes_(ninfer::test::cuda_environment().context.device(),
+                 static_cast<std::size_t>(rows) * code_row_bytes_),
+          scales_(ninfer::test::cuda_environment().context.device(),
+                  static_cast<std::size_t>(rows) * scale_row_bytes_) {
         codes_.fill(0);
         scales_.fill(0);
         if (high_row_bytes_ != 0) {
-            high_ =
-                std::make_unique<DeviceBuffer>(static_cast<std::size_t>(rows) * high_row_bytes_);
+            high_ = std::make_unique<DeviceBuffer>(codes_.device(), static_cast<std::size_t>(rows) *
+                                                                        high_row_bytes_);
             high_->fill(0);
         }
     }
@@ -147,14 +153,15 @@ public:
 
     Weight weight() const {
         Weight result{};
-        result.payload          = codes_.p;
-        result.payload_bytes    = codes_.bytes + (high_ ? high_->bytes : 0) + scales_.bytes;
-        result.high_plane_bytes = high_ ? high_->bytes : 0;
+        result.device           = codes_.device();
+        result.payload          = codes_.data();
+        result.payload_bytes    = codes_.size() + (high_ ? high_->size() : 0) + scales_.size();
+        result.high_plane_bytes = high_ ? high_->size() : 0;
         result.qtype            = qtype_;
         result.group_size       = static_cast<std::uint32_t>(geometry_.group);
-        result.qdata            = codes_.p;
-        result.qhigh            = high_ ? high_->p : nullptr;
-        result.scales           = scales_.p;
+        result.qdata            = codes_.data();
+        result.qhigh            = high_ ? high_->data() : nullptr;
+        result.scales           = scales_.data();
         result.n                = rows_;
         result.k                = columns_;
         result.group            = geometry_.group;
@@ -211,12 +218,13 @@ private:
     DeviceBuffer scales_;
 };
 
-Weight dense_bf16_weight(void* data, std::int32_t rows, std::int32_t columns) {
+Weight dense_bf16_weight(ConstMemorySpan storage, std::int32_t rows, std::int32_t columns) {
     Weight result{};
-    result.payload         = data;
+    result.device          = storage.device;
+    result.payload         = storage.data;
     result.payload_bytes   = static_cast<std::uint64_t>(rows) * columns * sizeof(std::uint16_t);
     result.qtype           = QType::BF16;
-    result.qdata           = data;
+    result.qdata           = storage.data;
     result.n               = rows;
     result.k               = columns;
     result.layout          = QuantLayout::Contiguous;
@@ -494,7 +502,7 @@ public:
         }
     }
 
-    int run(DeviceExecutionView execution, std::int32_t tokens, int first_pattern,
+    int run(CudaExecutionView execution, std::int32_t tokens, int first_pattern,
             bool graph_replay) {
         const std::string label = std::string(profile_.name) + " T=" + std::to_string(tokens);
         std::vector<float> input(static_cast<std::size_t>(kHidden) * tokens);
@@ -515,32 +523,38 @@ public:
         DeviceBuffer device_input                      = to_device(input_bits);
         DeviceBuffer residual_seed                     = to_device(residual_bits);
         GuardedBf16Output destination_storage(residual.size());
-        cuda_check(cudaMemcpy(destination_storage.data(), residual_seed.p, residual_seed.bytes,
-                              cudaMemcpyDeviceToDevice),
+        cuda_check(cudaMemcpy(destination_storage.data(), residual_seed.data(),
+                              residual_seed.size(), cudaMemcpyDeviceToDevice),
                    "seed SparseMoe destination");
 
         const ops::SparseMoeWeights weights{
-            dense_bf16_weight(device_router_.p, kExperts + 1, kHidden),
+            dense_bf16_weight(device_router_.span(), kExperts + 1, kHidden),
             routed_gate_.weight(),
             routed_down_.weight(),
             shared_gate_.weight(),
             shared_down_device_.weight(),
         };
-        Tensor x(device_input.p, DType::BF16, {kHidden, tokens});
-        Tensor destination(destination_storage.data(), DType::BF16, {kHidden, tokens});
+        Tensor x(device_input.span(), DType::BF16, {kHidden, tokens});
+        Tensor destination(destination_storage.span(), DType::BF16, {kHidden, tokens});
         const std::size_t workspace_bytes = ops::sparse_moe_workspace_capacity_bytes(
             weights.routed_gate_up.qtype, weights.routed_down.qtype, tokens, tokens);
-        WorkspaceArena workspace(workspace_bytes);
+        ninfer::DeviceBuffer workspace_storage(ninfer::test::cuda_environment().context.device(),
+                                               workspace_bytes);
+        MemoryArena workspace(workspace_storage.span());
 
         if (tokens == 1 && profile_.verify_graph_replay) {
-            for (const std::int32_t sm_count : {0, -1}) {
-                bool rejected = false;
+            for (const auto location :
+                 {Device::cpu(), Device::cuda(execution.device().index() + 1)}) {
+                const auto original_device = x.device;
+                x.device                   = location;
+                bool rejected              = false;
                 try {
                     ops::sparse_moe(x, weights, ops::SparseMoeEpilogue::AddResidual, destination,
-                                    workspace, {execution.stream, sm_count});
+                                    workspace, execution);
                 } catch (const std::invalid_argument&) { rejected = true; }
+                x.device = original_device;
                 if (!rejected) {
-                    std::cerr << label << ": accepted a nonpositive physical SM count\n";
+                    std::cerr << label << ": accepted a mismatched operand device\n";
                     return 1;
                 }
             }
@@ -552,13 +566,15 @@ public:
             cudaGraphExec_t exec = nullptr;
             cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking),
                        "create SparseMoe graph stream");
+            const auto stream_execution =
+                ninfer::test::cuda_environment().context.execution_view(stream);
             cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal),
                        "begin SparseMoe graph capture");
-            cuda_check(cudaMemcpyAsync(destination.data, residual_seed.p, destination.bytes(),
+            cuda_check(cudaMemcpyAsync(destination.data, residual_seed.data(), destination.bytes(),
                                        cudaMemcpyDeviceToDevice, stream),
                        "capture SparseMoe residual seed");
             ops::sparse_moe(x, weights, ops::SparseMoeEpilogue::AddResidual, destination, workspace,
-                            execution.on_stream(stream));
+                            stream_execution);
             cuda_check(cudaStreamEndCapture(stream, &graph), "end SparseMoe graph capture");
             cuda_check(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0),
                        "instantiate SparseMoe graph");
@@ -623,7 +639,7 @@ private:
     std::vector<std::vector<double>> references_;
 };
 
-int run_profile(DeviceExecutionView execution, const CodecProfile& profile) {
+int run_profile(CudaExecutionView execution, const CodecProfile& profile) {
     SparseMoeFixture fixture(profile);
     int failures        = 0;
     std::size_t witness = 0;
@@ -669,8 +685,8 @@ int main() {
 
     DeviceContext context;
     // Fixture copies use the default stream; preserve their ordering with the eager call.
-    const DeviceExecutionView execution = context.execution_view().on_stream(nullptr);
-    int failures                        = 0;
+    const CudaExecutionView execution = context.execution_view(nullptr);
+    int failures                      = 0;
     for (const CodecProfile& profile : profiles) { failures += run_profile(execution, profile); }
     std::cout << (failures == 0 ? "OK" : "FAIL") << " sparse_moe correctness\n";
     return failures == 0 ? 0 : 1;

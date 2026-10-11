@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/buffer.h"
 #include "ops/op_tester.h"
 
 #include <array>
@@ -19,7 +20,7 @@ struct Words {
 
     Words(std::initializer_list<std::int32_t> shape, int leading_words = 0,
           std::array<std::int64_t, 4> word_strides = {})
-        : tensor(nullptr, DType::BF16, shape), leading(leading_words) {
+        : tensor(Tensor::metadata(DType::BF16, shape)), leading(leading_words) {
         if (word_strides[0])
             for (int d = 0; d < 4; ++d) tensor.nb[d] = 2 * word_strides[d];
         std::size_t span = 1;
@@ -27,6 +28,7 @@ struct Words {
         host.resize(leading + span, 0x7fa1);
         device      = std::make_unique<GuardedDeviceBuffer>(host.size() * 2);
         tensor.data = static_cast<std::uint16_t*>(device->data()) + leading;
+        tensor.device = device->device();
     }
 
     std::size_t index(int x, int y = 0, int z = 0, int w = 0) const {

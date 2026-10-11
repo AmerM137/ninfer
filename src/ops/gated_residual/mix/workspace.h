@@ -6,9 +6,9 @@
 
 namespace ninfer::ops::detail::hc::mix {
 struct Scratch {
-    DeviceSpan storage;
+    MemorySpan storage;
     void* activation;
-    DeviceSpan partials;
+    MemorySpan partials;
 };
 
 // One contiguous reservation gives execution and sizing identical offsets, including alignment.
@@ -31,9 +31,9 @@ inline Layout layout(Kind kind, Plan plan, std::int32_t columns) {
     return {u, temporary, b.finish(1)};
 }
 
-inline Scratch allocate_workspace(WorkspaceArena& arena, Layout l) {
+inline Scratch allocate_workspace(MemoryArena& arena, Layout l) {
     const auto storage = arena.alloc_bytes(l.bytes, 256);
     return {storage, l.activation.bind(storage).data,
-            l.partials.bytes ? l.partials.bind(storage) : DeviceSpan{}};
+            l.partials.bytes ? l.partials.bind(storage) : MemorySpan{}};
 }
 } // namespace ninfer::ops::detail::hc::mix

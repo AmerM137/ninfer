@@ -1,12 +1,12 @@
 #pragma once
 
+#include "core/device.h"
 #include "ninfer/ops/attention_geometry.h"
 
 #include "core/arena.h"
 #include "core/cyclic_kv_cache.h"
 #include "core/tensor.h"
 
-#include <cuda_runtime.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -53,7 +53,7 @@ void sliding_window_attention(const Tensor& q, const Tensor& query_k, const Tens
                               std::uint32_t window, float scale,
                               const CyclicKVCacheLayerView& context,
                               SlidingWindowAttentionExecutionEnvelope envelope,
-                              WorkspaceArena& workspace, Tensor& out, cudaStream_t stream);
+                              MemoryArena& workspace, Tensor& out, CudaExecutionView execution);
 
 /**
  * Return transient capacity for every T in the inclusive optimized interval at the exact batch

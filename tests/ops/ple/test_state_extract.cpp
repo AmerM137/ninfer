@@ -1,4 +1,6 @@
 #include "fixture.h"
+#include "cuda_fixture.h"
+#include "core/buffer.h"
 #include "ninfer/ops/ple.h"
 #include "core/decode_graph.h"
 
@@ -17,13 +19,16 @@ int run(DeviceContext& device, int batch, int layout, bool inplace, bool sliced)
     destination.fill(223, 1.f, true);
     records.fill(227, 1.f, true);
     std::vector<int> sources(batch), destinations(batch), accepted(batch), valid(batch, capacity);
-    DeviceBuffer ds(batch * 4), dd(batch * 4), da(batch * 4), dv = to_device(valid);
+    DeviceBuffer ds(ninfer::test::cuda_environment().context.device(), batch * 4);
+    DeviceBuffer dd(ninfer::test::cuda_environment().context.device(), batch * 4);
+    DeviceBuffer da(ninfer::test::cuda_environment().context.device(), batch * 4);
+    DeviceBuffer dv = to_device(valid);
     Tensor before = source.tensor, after = inplace ? source.tensor : destination.tensor;
     if (sliced) after = before.slice(2, 2, slots - 2);
-    ops::PleConvStateView input{before, Tensor(ds.p, DType::I32, {batch})};
-    ops::PleConvStateView output{after, Tensor(dd.p, DType::I32, {batch})};
-    ops::PleConvRecordReadView read{records.tensor, Tensor(dv.p, DType::I32, {batch})};
-    Tensor counts(da.p, DType::I32, {batch});
+    ops::PleConvStateView input{before, Tensor(ds.span(), DType::I32, {batch})};
+    ops::PleConvStateView output{after, Tensor(dd.span(), DType::I32, {batch})};
+    ops::PleConvRecordReadView read{records.tensor, Tensor(dv.span(), DType::I32, {batch})};
+    Tensor counts(da.span(), DType::I32, {batch});
     DecodeGraphDefinition definition;
     DecodeGraphExecutable graph;
     int failures = 0;
@@ -55,7 +60,7 @@ int run(DeviceContext& device, int batch, int layout, bool inplace, bool sliced)
             }
         cuda_synchronize();
         if (!extent) {
-            definition.capture(device.stream, [&] {
+            definition.capture(device.stream(), [&] {
                 ops::ple_state_extract(input, read, counts, output, device.execution_view());
             });
             graph.instantiate(definition);
@@ -63,7 +68,7 @@ int run(DeviceContext& device, int batch, int layout, bool inplace, bool sliced)
         if (extent % 2)
             ops::ple_state_extract(input, read, counts, output, device.execution_view());
         else
-            graph.launch(device.stream);
+            graph.launch(device.stream());
         device.synchronize();
         const auto label =
             "PLE extract B=" + std::to_string(batch) + " layout=" + std::to_string(layout) +

@@ -43,6 +43,5 @@ constexpr int split_factor(Down down) {
 }
 
 Plan select_plan(Kind kind, std::int32_t columns);
-std::size_t capacity(Weights weights, std::int32_t first, std::int32_t last,
-                     DeviceExecutionView execution);
+std::size_t capacity(Weights weights, std::int32_t first, std::int32_t last);
 } // namespace ninfer::ops::detail::hc::mix

@@ -12,7 +12,8 @@ using namespace common;
 namespace {
 
 void require_row_pitched_matrix(const Tensor& t, std::int32_t rows, std::int32_t cols,
-                                const char* op, const char* name) {
+                                const char* op, const char* name, Device device) {
+    operand::device(t.device, device, op, name);
     constexpr std::int64_t element = sizeof(std::int32_t);
     if (rows <= 0 || cols <= 0 || t.dtype != DType::I32 || t.ne[0] != rows || t.ne[1] != cols ||
         t.ne[2] != 1 || t.ne[3] != 1 || t.nb[0] != element || t.nb[1] < rows * element ||
@@ -94,7 +95,8 @@ void prepare_autoregressive_round(const Tensor& verify_ids, const Tensor& next_a
                                   const Tensor& rope_deltas, Tensor& alignment_ids,
                                   Tensor& next_extents, Tensor& ar_positions,
                                   Tensor& ar_rope_positions, Tensor& ar_valid_columns,
-                                  std::int32_t max_context, cudaStream_t stream) {
+                                  std::int32_t max_context, CudaExecutionView execution) {
+    const auto stream        = execution.stream();
     constexpr const char* op = "prepare_autoregressive_round";
     const std::int32_t T     = verify_ids.ne[0];
     const std::int32_t batch = verify_ids.ne[1];
@@ -107,19 +109,29 @@ void prepare_autoregressive_round(const Tensor& verify_ids, const Tensor& next_a
     if (max_context <= 0) {
         throw std::invalid_argument("prepare_autoregressive_round: max_context must be positive");
     }
-    common::operand::tensor(verify_ids, DType::I32, {T, batch}, 1, op, "verify_ids");
-    common::operand::tensor(next_anchors, DType::I32, {batch}, 1, op, "next_anchors");
-    common::operand::tensor(accepted, DType::I32, {batch}, 1, op, "accepted");
-    common::operand::tensor(updated_frontiers, DType::I32, {batch}, 1, op, "updated_frontiers");
-    common::operand::tensor(remaining_budgets, DType::I32, {batch}, 1, op, "remaining_budgets");
-    common::operand::tensor(licensed_counts, DType::I32, {batch}, 1, op, "licensed_counts");
-    common::operand::tensor(rope_deltas, DType::I32, {batch}, 1, op, "rope_deltas");
-    common::operand::tensor(alignment_ids, DType::I32, {T, batch}, 1, op, "alignment_ids");
-    common::operand::tensor(next_extents, DType::I32, {batch}, 1, op, "next_extents");
+    common::operand::tensor(verify_ids, DType::I32, {T, batch}, 1, op, "verify_ids",
+                            execution.device());
+    common::operand::tensor(next_anchors, DType::I32, {batch}, 1, op, "next_anchors",
+                            execution.device());
+    common::operand::tensor(accepted, DType::I32, {batch}, 1, op, "accepted", execution.device());
+    common::operand::tensor(updated_frontiers, DType::I32, {batch}, 1, op, "updated_frontiers",
+                            execution.device());
+    common::operand::tensor(remaining_budgets, DType::I32, {batch}, 1, op, "remaining_budgets",
+                            execution.device());
+    common::operand::tensor(licensed_counts, DType::I32, {batch}, 1, op, "licensed_counts",
+                            execution.device());
+    common::operand::tensor(rope_deltas, DType::I32, {batch}, 1, op, "rope_deltas",
+                            execution.device());
+    common::operand::tensor(alignment_ids, DType::I32, {T, batch}, 1, op, "alignment_ids",
+                            execution.device());
+    common::operand::tensor(next_extents, DType::I32, {batch}, 1, op, "next_extents",
+                            execution.device());
     const std::int32_t steps = std::max(T - 2, 1);
-    require_row_pitched_matrix(ar_positions, batch, steps, op, "ar_positions");
-    require_row_pitched_matrix(ar_rope_positions, batch, steps, op, "ar_rope_positions");
-    require_row_pitched_matrix(ar_valid_columns, batch, steps, op, "ar_valid_columns");
+    require_row_pitched_matrix(ar_positions, batch, steps, op, "ar_positions", execution.device());
+    require_row_pitched_matrix(ar_rope_positions, batch, steps, op, "ar_rope_positions",
+                               execution.device());
+    require_row_pitched_matrix(ar_valid_columns, batch, steps, op, "ar_valid_columns",
+                               execution.device());
     if (ar_rope_positions.nb[1] != ar_positions.nb[1] ||
         ar_valid_columns.nb[1] != ar_positions.nb[1]) {
         throw std::invalid_argument(

@@ -28,7 +28,8 @@ void describe_matrix(const Weight& w, int rows, int columns) {
     require(w.payload_bytes >= weight_bytes(w), "BF16 weight backing is too small");
 }
 
-common::operand::Range tensor(const Tensor& t, DType dtype, int a, int b, int c) {
+common::operand::Range tensor(const Tensor& t, DType dtype, int a, int b, int c, Device device) {
+    common::operand::device(t.device, device, kOp, "operand");
     require(t.dtype == dtype && t.ne[0] == a && t.ne[1] == b && t.ne[2] == c && t.ne[3] == 1,
             "invalid tensor shape or dtype");
     require(t.is_contiguous() && common::operand::aligned(t.data, 16),
@@ -48,29 +49,26 @@ void describe_weights(Weights weights) {
     describe_matrix(weights.up, kResidualWidth, kRank);
 }
 
-void validate_execution(DeviceExecutionView execution) {
-    require(execution.multiprocessor_count > 0, "physical SM count must be positive");
-}
-
 void validate_interval(std::int32_t first, std::int32_t last) {
     require(first > 0 && last >= first, "invalid column interval");
 }
 
 Operands validate(Weights weights, const Tensor& normalized, Tensor& output, Tensor* injection,
-                  DeviceExecutionView execution) {
+                  CudaExecutionView execution) {
     describe_weights(weights);
-    validate_execution(execution);
+    common::operand::device(weights.down.device, execution.device(), kOp, "down weight");
+    common::operand::device(weights.up.device, execution.device(), kOp, "up weight");
     require(common::operand::aligned(weights.down.qdata, 16) &&
                 common::operand::aligned(weights.up.qdata, 16),
             "weights require aligned device backing");
     const int m = normalized.ne[2];
     require(m > 0, "columns must be positive");
-    (void)tensor(normalized, DType::BF16, kWidth, kStreams, m);
-    const auto out    = tensor(output, DType::BF16, kWidth, m, 1);
+    (void)tensor(normalized, DType::BF16, kWidth, kStreams, m, execution.device());
+    const auto out    = tensor(output, DType::BF16, kWidth, m, 1, execution.device());
     const auto inputs = input_ranges(weights, normalized);
     for (const auto input : inputs) common::operand::disjoint(out, input, kOp);
     if (injection) {
-        const auto j = tensor(*injection, DType::FP32, kStreams, m, 1);
+        const auto j = tensor(*injection, DType::FP32, kStreams, m, 1, execution.device());
         for (const auto input : inputs) common::operand::disjoint(j, input, kOp);
         common::operand::disjoint(out, j, kOp);
     }
@@ -83,7 +81,8 @@ Operands validate(Weights weights, const Tensor& normalized, Tensor& output, Ten
 }
 
 void validate_scratch(Weights weights, const Tensor& normalized, const Tensor& output,
-                      const Tensor* injection, DeviceSpan scratch) {
+                      const Tensor* injection, MemorySpan scratch) {
+    common::operand::device(scratch.device, normalized.device, kOp, "scratch");
     const auto work = common::operand::range(scratch.data, scratch.bytes, kOp);
     for (const auto input : input_ranges(weights, normalized))
         common::operand::disjoint(work, input, kOp);

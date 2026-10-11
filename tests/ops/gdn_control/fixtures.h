@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/buffer.h"
 #include "ninfer/ops/gdn_control.h"
 #include "ops/op_tester.h"
 
@@ -53,7 +54,8 @@ public:
     int check(std::string_view name) const;
     Profile profile;
     std::vector<float> a, b;
-    DeviceBuffer first, second;
+    DeviceBuffer first;
+    DeviceBuffer second;
     ops::ProjectionWeights prepared;
 private:
     std::vector<std::uint16_t> first_bits_, second_bits_;
@@ -64,7 +66,7 @@ struct Fixture {
     void upload();
     void advance();
     void repaint(cudaStream_t stream);
-    void invoke(WorkspaceArena& arena, DeviceExecutionView execution);
+    void invoke(MemoryArena& arena, CudaExecutionView execution);
     int check(std::string_view name) const;
     Profile profile;
     Case test_case;
@@ -72,11 +74,14 @@ struct Fixture {
     Weights weights;
     std::size_t capacity, prefix;
     std::vector<float> x, norm_gain, a_log, dt_bias;
-    DeviceBuffer device_x, device_norm_weight, device_a_log, device_dt_bias;
+    DeviceBuffer device_x;
+    DeviceBuffer device_norm_weight;
+    DeviceBuffer device_a_log;
+    DeviceBuffer device_dt_bias;
     GuardedDeviceBuffer g, beta, normalized, scratch;
     Tensor input, norm_weight, a_log_tensor, dt_bias_tensor, normalized_tensor;
     ops::GdnControlOutputs outputs;
-    WorkspaceArena arena;
+    MemoryArena arena;
 };
 
 std::size_t workspace_capacity(const ops::ProjectionWeights& weights, bool normalize_input,

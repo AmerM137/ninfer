@@ -88,8 +88,8 @@ void launch_matrix(const Tensor& x, const Weight& weight, std::span<const Tensor
         tma.template operator()<Bf16A16TmaR64T128K64S2>();
 }
 
-void launch_split(const Tensor& x, Weights weights, std::span<const Tensor> outputs,
-                  WorkspaceArena*, cudaStream_t stream) {
+void launch_split(const Tensor& x, Weights weights, std::span<const Tensor> outputs, MemoryArena*,
+                  cudaStream_t stream) {
     if (x.ne[1] == 1)
         launch_decode(x, weights.first, outputs, stream);
     else if (x.ne[1] <= 4)

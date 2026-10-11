@@ -20,7 +20,7 @@ struct Buffer {
     std::unique_ptr<GuardedDeviceBuffer> device;
 
     Buffer(DType dtype, std::initializer_list<int> shape, int layout = 0)
-        : view(nullptr, dtype, shape) {
+        : view(Tensor::metadata(dtype, shape)) {
         if (layout) {
             if (layout == 2 && view.ne[3] == 1) {
                 view.nb[2] = (view.ne[0] + 3) * sizeof(T);
@@ -35,6 +35,7 @@ struct Buffer {
         host.resize(words);
         device    = std::make_unique<GuardedDeviceBuffer>(words * sizeof(T));
         view.data = device->data();
+        view.device = device->device();
     }
 
     std::size_t index(int x, int y = 0, int z = 0, int w = 0) const {
@@ -73,7 +74,7 @@ struct CachePlane {
 
     CachePlane(DType dtype, int features, int pages, bool padded) {
         if (features == 0) return;
-        view               = Tensor(nullptr, dtype, {features, 64, 2, pages});
+        view               = Tensor::metadata(dtype, {features, 64, 2, pages});
         const auto element = dtype_size(dtype);
         if (padded)
             for (int d = 1; d < 4; ++d)
@@ -83,6 +84,7 @@ struct CachePlane {
         host.resize(bytes);
         device    = std::make_unique<GuardedDeviceBuffer>(bytes);
         view.data = device->data();
+        view.device = device->device();
     }
 
     std::size_t index(int d, int p, int h, int page) const {
@@ -239,7 +241,7 @@ struct Fixture {
             x->upload();
     }
 
-    void launch(DeviceExecutionView execution) {
+    void launch(CudaExecutionView execution) {
         ops::qsa_prepare(projected, parameters, batch, rope.view, before, cache, write,
                          query_output, iq_output, execution);
     }

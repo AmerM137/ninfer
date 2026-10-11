@@ -1,4 +1,5 @@
 #include "core/device.h"
+#include "core/buffer.h"
 #include "models/qwen3_5/load.h"
 #include "models/qwen3_5/execution/parameters.h"
 #include "models/qwen3_5/execution/vision.h"
@@ -68,8 +69,8 @@ void test_handoff_lifetime(ninfer::DeviceContext& device,
     plan.max_merged_count = 1;
     const auto workspace_plan =
         qwen::execution::VisionContext::plan_workspace(config, *parameters.vision, 1, 256);
-    ninfer::DeviceBuffer workspace(workspace_plan.capacity_bytes);
-    const ninfer::DeviceSpan backing{workspace.p, workspace.bytes};
+    ninfer::DeviceBuffer workspace(device.device(), workspace_plan.capacity_bytes);
+    const auto backing = workspace.span();
     qwen::detail::VisionHandoffState handoff;
     std::size_t peak_bytes  = 0;
     const auto make_session = [&](const qwen::PreparedPromptData& prompt) {
@@ -80,7 +81,7 @@ void test_handoff_lifetime(ninfer::DeviceContext& device,
         require(chunk.control != nullptr, "Vision replay omitted its item");
         std::vector<std::uint16_t> output(chunk.embeddings.bytes() / sizeof(std::uint16_t));
         CUDA_CHECK(cudaMemcpyAsync(output.data(), chunk.embeddings.data, chunk.embeddings.bytes(),
-                                   cudaMemcpyDeviceToHost, device.stream));
+                                   cudaMemcpyDeviceToHost, device.stream()));
         device.synchronize();
         return output;
     };
@@ -106,8 +107,8 @@ void test_handoff_lifetime(ninfer::DeviceContext& device,
             "retiring an overwritten session released the current Vision handoff");
 
     // Text/decode may replace all general scratch while a Vision item remains live.
-    CUDA_CHECK(
-        cudaMemsetAsync(workspace.p, 0xa5, workspace_plan.general_capacity_bytes, device.stream));
+    CUDA_CHECK(cudaMemsetAsync(workspace.data(), 0xa5, workspace_plan.general_capacity_bytes,
+                               device.stream()));
     require(read(session_a->prepare_chunk(1, 1)) == original,
             "general workspace use changed the live Vision handoff");
     { auto unused_session = make_session(prompt_b); }

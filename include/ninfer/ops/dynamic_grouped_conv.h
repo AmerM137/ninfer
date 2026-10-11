@@ -1,10 +1,10 @@
 #pragma once
 
+#include "core/device.h"
 #include "core/weight.h"
 #include "core/arena.h"
 #include "core/tensor.h"
 
-#include <cuda_runtime.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -53,8 +53,8 @@ namespace ninfer::ops {
 void rmsnorm_dynamic_grouped_conv_prepare(const Tensor& residual, const Tensor& norm_weight,
                                           float eps, const Tensor& base_kernel,
                                           const Weight& kernel_projection_weight, Tensor& prepared,
-                                          Tensor& finish_delta, WorkspaceArena& workspace,
-                                          cudaStream_t stream);
+                                          Tensor& finish_delta, MemoryArena& workspace,
+                                          CudaExecutionView execution);
 
 /**
  * Returns the transient capacity required by linear_dynamic_grouped_conv_add for every width/batch
@@ -91,7 +91,7 @@ void rmsnorm_dynamic_grouped_conv_prepare(const Tensor& residual, const Tensor& 
  */
 void linear_dynamic_grouped_conv_add(const Tensor& x, const Weight& projection_weight,
                                      const Tensor& base_kernel, const Tensor& finish_delta,
-                                     Tensor& residual, WorkspaceArena& workspace,
-                                     cudaStream_t stream);
+                                     Tensor& residual, MemoryArena& workspace,
+                                     CudaExecutionView execution);
 
 } // namespace ninfer::ops

@@ -1,4 +1,5 @@
 #include "ninfer/ops/sigmoid_mul.h"
+#include "core/buffer.h"
 #include "op_measurement.cuh"
 
 #include <cuda_runtime.h>
@@ -23,12 +24,12 @@ void run(int tokens, int heads) {
     DeviceBuffer gate   = make_bf16(n, 101U);
     DeviceBuffer x      = make_bf16(n, 103U);
     SavedBuffer initial(x);
-    const auto restore = [&](cudaStream_t stream) { initial.restore(stream); };
-    Tensor tgate(gate.p, DType::BF16, {256, heads, tokens});
-    Tensor tx(x.p, DType::BF16, {256, heads, tokens});
+    const auto restore = [&](CudaExecutionView cuda) { initial.restore(cuda); };
+    Tensor tgate(gate.span(), DType::BF16, {256, heads, tokens});
+    Tensor tx(x.span(), DType::BF16, {256, heads, tokens});
 
     const Result result = bench_loop_prepared(
-        restore, [&](cudaStream_t stream) { ops::sigmoid_mul(tgate, tx, stream); },
+        restore, [&](CudaExecutionView cuda) { ops::sigmoid_mul(tgate, tx, cuda); },
         static_cast<double>(n) * 6.0);
 
     char tag[128];

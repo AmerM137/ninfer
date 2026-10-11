@@ -1,6 +1,7 @@
 // Cold-cache public Op benchmark for the registered Q4 LinearSwiGLU profile.
 
 #include "core/weight.h"
+#include "core/buffer.h"
 #include "ninfer/ops/linear_swiglu.h"
 
 #include "core/device.h"
@@ -134,30 +135,33 @@ int main(int argc, char** argv) {
 
         cudaStream_t stream = nullptr;
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+        const auto cuda = ninfer::bench::device_context().execution_view(stream);
         bench::L2FlushBuffer flush(kFlushBytes);
         DeviceBuffer input = bench::make_bf16(static_cast<std::size_t>(kHidden) * max_t, 101U);
-        DeviceBuffer output(static_cast<std::size_t>(kOutputRows) * max_t * sizeof(std::uint16_t));
+        DeviceBuffer output(ninfer::bench::device_context().device(),
+                            static_cast<std::size_t>(kOutputRows) * max_t * sizeof(std::uint16_t));
         bench::PackedQuantizedWeight packed =
             bench::make_row_split_weight(QType::Q4_G64_FP16, kGateUpRows, kHidden, kHidden, 501U);
         const std::size_t workspace_capacity = ops::linear_swiglu_workspace_capacity_bytes(
             QType::Q4_G64_FP16, kGateUpRows, kHidden, min_t, max_t);
-        WorkspaceArena workspace(std::max<std::size_t>(workspace_capacity, 256));
+        ninfer::DeviceBuffer workspace_storage(ninfer::bench::device_context().device(),
+                                               std::max<std::size_t>(workspace_capacity, 256));
+        MemoryArena workspace(workspace_storage.span());
 
-        const auto launch = [&](std::int32_t tokens, cudaStream_t launch_stream) {
-            Tensor x(input.p, DType::BF16, {kHidden, tokens});
-            Tensor out(output.p, DType::BF16, {kOutputRows, tokens});
-            ops::linear_swiglu(x, packed.weight, out, workspace, launch_stream);
+        const auto launch = [&](std::int32_t tokens, CudaExecutionView cuda) {
+            Tensor x(input.span(), DType::BF16, {kHidden, tokens});
+            Tensor out(output.span(), DType::BF16, {kOutputRows, tokens});
+            ops::linear_swiglu(x, packed.weight, out, workspace, cuda);
         };
 
         if (options.profile) {
             bench::TimedGraph graph;
             if (options.graph) {
-                graph.capture(stream, [&](cudaStream_t capture_stream) {
-                    launch(options.tokens.front(), capture_stream);
-                });
-                graph.launch(stream);
+                graph.capture(
+                    cuda, [&](CudaExecutionView cuda) { launch(options.tokens.front(), cuda); });
+                graph.launch(cuda);
             } else {
-                launch(options.tokens.front(), stream);
+                launch(options.tokens.front(), cuda);
             }
             CUDA_CHECK(cudaStreamSynchronize(stream));
             std::printf("PROFILE linear_swiglu Q4 T=%d execution=%s graph_nodes=%zu "
@@ -177,16 +181,14 @@ int main(int argc, char** argv) {
         for (const std::int32_t tokens : options.tokens) {
             bench::TimedGraph graph;
             if (options.graph) {
-                graph.capture(stream,
-                              [&](cudaStream_t capture_stream) { launch(tokens, capture_stream); });
+                graph.capture(cuda, [&](CudaExecutionView cuda) { launch(tokens, cuda); });
             }
             const bench::ColdTiming timing =
                 options.graph
-                    ? bench::measure_cold_graph(graph, flush, stream, options.warmup,
-                                                options.repeat)
+                    ? bench::measure_cold_graph(graph, flush, cuda, options.warmup, options.repeat)
                     : bench::measure_cold_launch(
-                          [&](cudaStream_t launch_stream) { launch(tokens, launch_stream); }, flush,
-                          stream, options.warmup, options.repeat);
+                          [&](CudaExecutionView cuda) { launch(tokens, cuda); }, flush, cuda,
+                          options.warmup, options.repeat);
             const double seconds = timing.median_us * 1.0e-6;
             const double flops   = 2.0 * static_cast<double>(kGateUpRows) * kHidden * tokens;
             const double bytes   = static_cast<double>(packed.model_weight_bytes()) +

@@ -1,10 +1,10 @@
 #pragma once
 
+#include "core/device.h"
 #include "core/arena.h"
 #include "core/tensor.h"
 #include "ninfer/ops/projection_weights.h"
 
-#include <cuda_runtime.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -63,12 +63,12 @@ struct GdnConvSnapshotState {
  * Workspace / execution:
  *   Uses scoped storage at the caller arena cursor; earlier allocations may hold operands.
  *   A zero capacity performs no allocation. The query covers the complete computation.
- * Capture/replay uses the supplied stream and consumes device metadata at replay.
+ * Capture/replay uses execution.stream() and consumes device metadata at replay.
  */
 void gdn_input_proj_conv_snapshot(const Tensor& x, const ProjectionWeights& weights,
                                   const Tensor& conv_weight, GdnConvSnapshotState state,
                                   const Tensor& valid_columns, GdnConvOutputs outputs,
-                                  WorkspaceArena& workspace, cudaStream_t stream);
+                                  MemoryArena& workspace, CudaExecutionView execution);
 
 [[nodiscard]] std::size_t
 gdn_input_proj_conv_snapshot_workspace_capacity_bytes(const ProjectionWeights& weights,
@@ -95,8 +95,8 @@ gdn_input_proj_conv_snapshot_workspace_capacity_bytes(const ProjectionWeights& w
 void gdn_input_proj_conv_record(const Tensor& x, const ProjectionWeights& weights,
                                 const Tensor& conv_weight, GdnConvSourceState state,
                                 const Tensor& valid_columns, GdnConvOutputs outputs,
-                                Tensor& conv_record, WorkspaceArena& workspace,
-                                cudaStream_t stream);
+                                Tensor& conv_record, MemoryArena& workspace,
+                                CudaExecutionView execution);
 
 [[nodiscard]] std::size_t
 gdn_input_proj_conv_record_workspace_capacity_bytes(const ProjectionWeights& weights,

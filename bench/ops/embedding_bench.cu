@@ -1,5 +1,6 @@
 // Public embedding benchmark: normal IDs and mask-heavy draft blocks at explicit matrix extents.
 #include "core/weight.h"
+#include "core/buffer.h"
 #include "ninfer/ops/embedding.h"
 
 #include "core/device.h"
@@ -102,10 +103,11 @@ PackedLayout packed_layout(const ProfileSpec& spec) {
     return layout;
 }
 
-Weight make_weight(const ProfileSpec& spec, const PackedLayout& layout, void* payload) {
-    auto* bytes = static_cast<std::uint8_t*>(payload);
+Weight make_weight(const ProfileSpec& spec, const PackedLayout& layout, ConstMemorySpan payload) {
+    const auto* bytes = static_cast<const std::uint8_t*>(payload.data);
     Weight table{};
-    table.payload          = payload;
+    table.device           = payload.device;
+    table.payload          = payload.data;
     table.payload_bytes    = layout.payload_bytes;
     table.high_plane_bytes = layout.high_plane_bytes;
     table.qtype            = spec.qtype;
@@ -118,7 +120,7 @@ Weight make_weight(const ProfileSpec& spec, const PackedLayout& layout, void* pa
     table.padded_shape[0] = kVocab;
     table.padded_shape[1] = layout.padded_d;
     table.ndim            = 2;
-    table.qdata           = payload;
+    table.qdata           = payload.data;
     table.qhigh  = spec.qtype == QType::Q6_G64_FP16 ? bytes + layout.high_plane_offset : nullptr;
     table.scales = bytes + layout.scale_plane_offset;
     table.n      = kVocab;
@@ -177,7 +179,7 @@ __global__ void initialize_scales(std::uint16_t* scales, std::size_t count, bool
 
 void initialize_payload(const ProfileSpec& spec, const PackedLayout& layout,
                         DeviceBuffer& payload) {
-    auto* base      = static_cast<std::uint8_t*>(payload.p);
+    auto* base      = static_cast<std::uint8_t*>(payload.data());
     const int mode  = spec.qtype == QType::Q6_G64_FP16   ? 0
                       : spec.qtype == QType::Q8_G32_FP16 ? 2
                                                          : 3;
@@ -290,9 +292,9 @@ double logical_bytes_per_column(const ProfileSpec& spec, const PackedLayout& lay
 void run_profile(Profile profile, const Options& o, std::ofstream& csv) {
     const auto spec   = profile_spec(profile);
     const auto layout = packed_layout(spec);
-    DeviceBuffer payload(layout.payload_bytes);
+    DeviceBuffer payload(ninfer::bench::device_context().device(), layout.payload_bytes);
     initialize_payload(spec, layout, payload);
-    const auto weight = make_weight(spec, layout, payload.p);
+    const auto weight = make_weight(spec, layout, payload.span());
     const int max_t   = *std::max_element(o.tokens.begin(), o.tokens.end());
     std::vector<int> host_ids(max_t);
     const int mask = spec.d == 2048 ? 248077 : 248070;
@@ -300,51 +302,54 @@ void run_profile(Profile profile, const Options& o, std::ofstream& csv) {
         const int normal = (static_cast<std::int64_t>(i) * 9973 + 12345) % 248077;
         host_ids[i]      = o.pattern == "masked" && i % o.block_width ? mask : normal;
     }
-    DeviceBuffer ids(static_cast<std::size_t>(max_t) * 4),
-        output(static_cast<std::size_t>(max_t) * spec.d * 2);
+    DeviceBuffer ids(ninfer::bench::device_context().device(), static_cast<std::size_t>(max_t) * 4);
+    DeviceBuffer output(ninfer::bench::device_context().device(),
+                        static_cast<std::size_t>(max_t) * spec.d * 2);
     L2FlushBuffer flush(kL2FlushBytes);
-    ids.copy_from_host(host_ids.data(), ids.bytes);
-    DeviceContext device;
+    ids.copy_from_host(host_ids.data(), ids.size());
+    auto& device = ninfer::bench::device_context();
     for (int t : o.tokens) {
-        Tensor input(ids.p, DType::I32, {t}), out(output.p, DType::BF16, {spec.d, t});
-        const auto launch = [&](cudaStream_t stream) {
-            ops::embedding(input, weight, out, stream);
+        Tensor input(ids.span(), DType::I32, {t}), out(output.span(), DType::BF16, {spec.d, t});
+        const auto launch = [&](CudaExecutionView cuda) {
+            ops::embedding(input, weight, out, cuda);
         };
         TimedGraph graph;
         if (o.execution == "graph") {
-            launch(device.stream);
-            CUDA_CHECK(cudaStreamSynchronize(device.stream));
-            graph.capture(device.stream, [&](cudaStream_t stream) {
-                for (int i = 0; i < o.graph_calls; ++i) launch(stream);
+            launch(device.execution_view());
+            CUDA_CHECK(cudaStreamSynchronize(device.stream()));
+            graph.capture(device.execution_view(), [&](CudaExecutionView cuda) {
+                for (int i = 0; i < o.graph_calls; ++i) launch(cuda);
             });
         }
         if (o.profile) {
             for (int i = 0; i < o.warmup; ++i) {
                 if (o.execution == "graph")
-                    graph.launch(device.stream);
+                    graph.launch(device.execution_view());
                 else
-                    launch(device.stream);
+                    launch(device.execution_view());
             }
-            if (o.cache == "cold") flush_l2(flush, device.stream);
-            CUDA_CHECK(cudaStreamSynchronize(device.stream));
+            if (o.cache == "cold") flush_l2(flush, device.execution_view());
+            CUDA_CHECK(cudaStreamSynchronize(device.stream()));
             CUDA_CHECK(cudaProfilerStart());
             if (o.execution == "graph")
-                graph.launch(device.stream);
+                graph.launch(device.execution_view());
             else
-                launch(device.stream);
-            CUDA_CHECK(cudaStreamSynchronize(device.stream));
+                launch(device.execution_view());
+            CUDA_CHECK(cudaStreamSynchronize(device.stream()));
             CUDA_CHECK(cudaProfilerStop());
             return;
         }
         ColdTiming result;
         if (o.execution == "graph")
-            result = o.cache == "cold"
-                         ? measure_cold_graph(graph, flush, device.stream, o.warmup, o.repeat)
-                         : measure_graph(graph, device.stream, o.warmup, o.repeat);
+            result =
+                o.cache == "cold"
+                    ? measure_cold_graph(graph, flush, device.execution_view(), o.warmup, o.repeat)
+                    : measure_graph(graph, device.execution_view(), o.warmup, o.repeat);
         else
             result = o.cache == "cold"
-                         ? measure_cold_launch(launch, flush, device.stream, o.warmup, o.repeat)
-                         : measure_launch(launch, device.stream, o.warmup, o.repeat);
+                         ? measure_cold_launch(launch, flush, device.execution_view(), o.warmup,
+                                               o.repeat)
+                         : measure_launch(launch, device.execution_view(), o.warmup, o.repeat);
         result.median_us /= o.graph_calls;
         result.min_us /= o.graph_calls;
         result.p95_us /= o.graph_calls;

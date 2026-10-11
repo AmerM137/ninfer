@@ -19,12 +19,12 @@ namespace ninfer::ops {
  * and finite. Outputs are fully written, mutually disjoint and disjoint from inputs;
  * read-only inputs may share backing and remain unchanged.
  *
- * All computation entries submit to execution.stream with a positive physical SM count and
+ * All computation entries submit to execution.stream() with a positive physical SM count and
  * support Graph capture/replay with current contents at bound addresses. Norm/combine
  * require no workspace; no entry allocates hidden device storage or owns persistent state.
  */
 void hc_expand_norm(const Tensor& embedding, const Tensor& norm_weight, float epsilon,
-                    Tensor& residual, Tensor& normalized, DeviceExecutionView execution);
+                    Tensor& residual, Tensor& normalized, CudaExecutionView execution);
 
 /**
  * Independent offset RMSNorm for each residual stream:
@@ -36,7 +36,7 @@ void hc_expand_norm(const Tensor& embedding, const Tensor& norm_weight, float ep
  * inputs may share backing and remain unchanged.
  */
 void hc_grouped_rmsnorm(const Tensor& residual, const Tensor& norm_weight, float epsilon,
-                        Tensor& normalized, DeviceExecutionView execution);
+                        Tensor& normalized, CudaExecutionView execution);
 
 /**
  * updated_residual[d,s,m] = residual[d,s,m] + injection[s,m]*block_output[d,m].
@@ -50,7 +50,7 @@ void hc_grouped_rmsnorm(const Tensor& residual, const Tensor& norm_weight, float
  * Preserves all non-aliased inputs.
  */
 void hc_combine(const Tensor& residual, const Tensor& block_output, const Tensor& injection,
-                Tensor& updated_residual, DeviceExecutionView execution);
+                Tensor& updated_residual, CudaExecutionView execution);
 
 /**
  * hc_combine followed by hc_grouped_rmsnorm. Normalization consumes the actual BF16
@@ -63,7 +63,7 @@ void hc_combine(const Tensor& residual, const Tensor& block_output, const Tensor
  */
 void hc_combine_norm(const Tensor& residual, const Tensor& block_output, const Tensor& injection,
                      const Tensor& next_norm_weight, float epsilon, Tensor& updated_residual,
-                     Tensor& normalized, DeviceExecutionView execution);
+                     Tensor& normalized, CudaExecutionView execution);
 
 /**
  * Unit-weight broadcast-add followed by grouped offset RMSNorm. Math, BF16 residual
@@ -72,7 +72,7 @@ void hc_combine_norm(const Tensor& residual, const Tensor& block_output, const T
  */
 void hc_combine_norm(const Tensor& residual, const Tensor& block_output,
                      const Tensor& next_norm_weight, float epsilon, Tensor& updated_residual,
-                     Tensor& normalized, DeviceExecutionView execution);
+                     Tensor& normalized, CudaExecutionView execution);
 
 struct HcMixWeights {
     Weight down_injection; // BF16 Contiguous [324,10240], rows [320,324) are injection.
@@ -102,31 +102,29 @@ struct HcFinalMixWeights {
  * matching capacity query.
  * This Op performs no normalization or residual combination.
  */
-void hc_mix(const Tensor& normalized, const HcMixWeights& weights, WorkspaceArena& workspace,
-            Tensor& block_input, Tensor& injection, DeviceExecutionView execution);
+void hc_mix(const Tensor& normalized, const HcMixWeights& weights, MemoryArena& workspace,
+            Tensor& block_input, Tensor& injection, CudaExecutionView execution);
 
 /**
  * Low-rank mix with down-only [320,10240] weights and no b/injection. Math and effects
  * follow the ordinary form; sample_hidden is BF16 [H,M]. Adds no normalization or
  * residual combination.
  */
-void hc_mix(const Tensor& normalized, const HcFinalMixWeights& weights, WorkspaceArena& workspace,
-            Tensor& sample_hidden, DeviceExecutionView execution);
+void hc_mix(const Tensor& normalized, const HcFinalMixWeights& weights, MemoryArena& workspace,
+            Tensor& sample_hidden, CudaExecutionView execution);
 
 /**
  * Minimum call-local workspace capacity for every M in inclusive [min_tokens,max_tokens],
- * with positive endpoints and the supplied weight metadata/execution facts. Measured from
+ * with positive endpoints and the supplied weight metadata. Measured from
  * a 256-byte-aligned arena cursor, including internal alignment but excluding trailing
  * padding and public tensors. Inspects host metadata only; device backing is not required.
  * Invalid profiles or intervals throw.
  */
 [[nodiscard]] std::size_t hc_mix_workspace_capacity_bytes(const HcMixWeights& weights,
                                                           std::int32_t min_tokens,
-                                                          std::int32_t max_tokens,
-                                                          DeviceExecutionView execution);
+                                                          std::int32_t max_tokens);
 [[nodiscard]] std::size_t hc_mix_workspace_capacity_bytes(const HcFinalMixWeights& weights,
                                                           std::int32_t min_tokens,
-                                                          std::int32_t max_tokens,
-                                                          DeviceExecutionView execution);
+                                                          std::int32_t max_tokens);
 
 } // namespace ninfer::ops

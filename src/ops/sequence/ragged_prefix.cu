@@ -58,7 +58,15 @@ void prepare_ragged_prefix_launch(const Tensor& source, const Tensor& lanes, con
 
 void prepare_ragged_prefix(const Tensor& source, const Tensor& lanes, const Tensor& starts,
                            const Tensor& ends, Tensor& destination, Tensor& positions,
-                           Tensor& counts, cudaStream_t stream) {
+                           Tensor& counts, CudaExecutionView execution) {
+    if (source.device != execution.device() || lanes.device != execution.device() ||
+        starts.device != execution.device() || ends.device != execution.device() ||
+        destination.device != execution.device() || positions.device != execution.device() ||
+        counts.device != execution.device()) {
+        throw std::invalid_argument(
+            "prepare_ragged_prefix: operands must belong to the execution device");
+    }
+    const auto stream        = execution.stream();
     const std::int32_t width = source.ne[1];
     const std::int32_t batch = destination.ne[2];
     const auto vector_shape  = [batch](const Tensor& tensor) {

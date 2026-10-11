@@ -116,25 +116,25 @@ void launch_prepare(const QsaProjectionView& projected, const QsaPrepareParamete
                     const QsaBatchView& batch, const Tensor& rope_positions,
                     const QsaTailStateView& before, QsaCacheView cache,
                     QsaRawRecordWriteView records, Tensor& query, Tensor& index_query,
-                    DeviceExecutionView execution) {
+                    CudaExecutionView execution) {
     const auto args = prepare_arguments(projected, parameters, batch, rope_positions, before, cache,
                                         records, query, index_query);
     const auto plan = select_prepare_plan(args, parameters.rope_theta);
     switch (cache.main.storage) {
     case KvCacheStorage::BFloat16:
-        dispatch<KvCacheStorage::BFloat16>(args, plan, execution.stream);
+        dispatch<KvCacheStorage::BFloat16>(args, plan, execution.stream());
         break;
     case KvCacheStorage::Int8Group64:
-        dispatch<KvCacheStorage::Int8Group64>(args, plan, execution.stream);
+        dispatch<KvCacheStorage::Int8Group64>(args, plan, execution.stream());
         break;
     case KvCacheStorage::Fp8E4M3Row256:
-        dispatch<KvCacheStorage::Fp8E4M3Row256>(args, plan, execution.stream);
+        dispatch<KvCacheStorage::Fp8E4M3Row256>(args, plan, execution.stream());
         break;
     case KvCacheStorage::Nvfp4Group16:
-        dispatch<KvCacheStorage::Nvfp4Group16>(args, plan, execution.stream);
+        dispatch<KvCacheStorage::Nvfp4Group16>(args, plan, execution.stream());
         break;
     case KvCacheStorage::Fp8KeyNvfp4Value:
-        dispatch<KvCacheStorage::Fp8KeyNvfp4Value>(args, plan, execution.stream);
+        dispatch<KvCacheStorage::Fp8KeyNvfp4Value>(args, plan, execution.stream());
         break;
     default:
         throw std::invalid_argument("qsa_prepare: unsupported KV storage");

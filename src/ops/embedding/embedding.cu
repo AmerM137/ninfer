@@ -275,7 +275,12 @@ EmbeddingLaunch select_fp8(const Tensor& out) {
 
 } // namespace
 
-void embedding(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t stream) {
+void embedding(const Tensor& ids, const Weight& table, Tensor& out, CudaExecutionView execution) {
+    if (ids.device != execution.device() || table.device != execution.device() ||
+        out.device != execution.device()) {
+        throw std::invalid_argument("embedding: operands must belong to the execution device");
+    }
+    const auto stream = execution.stream();
     if (ids.dtype != DType::I32) { throw std::invalid_argument("embedding: ids must be I32"); }
     if (out.dtype != DType::BF16) { throw std::invalid_argument("embedding: out must be BF16"); }
 

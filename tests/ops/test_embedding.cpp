@@ -1,4 +1,5 @@
 #include "core/weight.h"
+#include "cuda_fixture.h"
 #include "ninfer/ops/embedding.h"
 #include "ops/op_tester.h"
 #include "core/device.h"
@@ -215,6 +216,7 @@ public:
         result.qtype            = QType::Q6_G64_FP16;
         result.layout           = QuantLayout::RowSplit;
         result.scale_dtype      = DType::FP16;
+        result.device           = payload_.device();
         result.payload          = base;
         result.payload_bytes    = payload_.bytes();
         result.qdata            = base;
@@ -349,6 +351,7 @@ public:
         result.qtype            = QType::Q8_G32_FP16;
         result.layout           = QuantLayout::RowSplit;
         result.scale_dtype      = DType::FP16;
+        result.device           = payload_.device();
         result.payload          = base;
         result.payload_bytes    = payload_.bytes();
         result.qdata            = base;
@@ -463,6 +466,7 @@ public:
         result.qtype            = QType::FP8_E4M3FN_ROW_BF16;
         result.layout           = QuantLayout::RowScale;
         result.scale_dtype      = DType::BF16;
+        result.device           = payload_.device();
         result.payload          = base;
         result.payload_bytes    = payload_.bytes();
         result.qdata            = base;
@@ -559,14 +563,14 @@ int run_quantized_case(const char* label, Table& table, const std::vector<std::i
                        std::int32_t d, bool replay = false, std::size_t output_offset = 0) {
     GuardedDeviceBuffer device_ids(ids.size() * sizeof(std::int32_t));
     GuardedDeviceBuffer output(static_cast<std::size_t>(d) * ids.size() * 2 + output_offset);
-    Tensor input(device_ids.data(), DType::I32, {static_cast<std::int32_t>(ids.size())});
-    Tensor result(static_cast<std::uint8_t*>(output.data()) + output_offset, DType::BF16,
+    Tensor input(device_ids.span(), DType::I32, {static_cast<std::int32_t>(ids.size())});
+    Tensor result(output.span().subspan(output_offset), DType::BF16,
                   {d, static_cast<std::int32_t>(ids.size())});
     Weight weight = table.weight();
     DeviceContext device;
     DecodeGraphDefinition definition;
     DecodeGraphExecutable graph;
-    const auto launch = [&] { ops::embedding(input, weight, result, device.stream); };
+    const auto launch = [&] { ops::embedding(input, weight, result, device.execution_view()); };
     int failures      = 0;
     for (int phase = 0; phase < (replay ? 2 : 1); ++phase) {
         const auto selected = phase == 0 ? ids : dflash2_ids(ids.size(), true);
@@ -574,14 +578,14 @@ int run_quantized_case(const char* label, Table& table, const std::vector<std::i
         output.fill(0x7d);
         cuda_synchronize();
         if (replay && phase == 0) {
-            definition.capture(device.stream, launch);
+            definition.capture(device.stream(), launch);
             graph.instantiate(definition);
         }
         if (replay)
-            graph.launch(device.stream);
+            graph.launch(device.stream());
         else
             launch();
-        cuda_synchronize(device.stream);
+        cuda_synchronize(device.stream());
         failures += verify_quantized(label, output, table.oracle(selected), output_offset);
         failures += output.verify_guards(label) + verify_input(label, device_ids, selected);
         failures += table.verify_unchanged(label);
@@ -648,12 +652,12 @@ int test_fp8() {
     GuardedDeviceBuffer device_ids(sizeof(std::int32_t));
     device_ids.copy_from_host(ids.data(), sizeof(std::int32_t));
     GuardedDeviceBuffer output(static_cast<std::size_t>(kFp8D) * sizeof(std::uint16_t));
-    Tensor input(device_ids.data(), DType::I32, {1});
-    Tensor result(output.data(), DType::BF16, {kFp8D, 1});
+    Tensor input(device_ids.span(), DType::I32, {1});
+    Tensor result(output.span(), DType::BF16, {kFp8D, 1});
     Weight invalid      = table.weight();
     invalid.scale_dtype = DType::FP16;
     try {
-        ops::embedding(input, invalid, result, nullptr);
+        ops::embedding(input, invalid, result, ninfer::test::cuda_environment().default_execution);
         std::cerr << "embedding FP8 accepted malformed row-scale metadata\n";
         ++failures;
     } catch (const std::invalid_argument&) {}
@@ -686,6 +690,7 @@ int test_dense() {
     Weight weight{};
     weight.qtype           = QType::BF16;
     weight.layout          = QuantLayout::Contiguous;
+    weight.device          = device_table.device();
     weight.payload         = device_table.data();
     weight.payload_bytes   = device_table.bytes();
     weight.qdata           = device_table.data();
@@ -697,9 +702,9 @@ int test_dense() {
     weight.n               = kDenseRows;
     weight.k               = kDenseD;
 
-    Tensor input(device_ids.data(), DType::I32, {static_cast<std::int32_t>(ids.size())});
-    Tensor result(output.data(), DType::BF16, {kDenseD, static_cast<std::int32_t>(ids.size())});
-    ops::embedding(input, weight, result, nullptr);
+    Tensor input(device_ids.span(), DType::I32, {static_cast<std::int32_t>(ids.size())});
+    Tensor result(output.span(), DType::BF16, {kDenseD, static_cast<std::int32_t>(ids.size())});
+    ops::embedding(input, weight, result, ninfer::test::cuda_environment().default_execution);
     cuda_synchronize();
 
     int failures = verify_exact("embedding BF16 [2304,1152]",

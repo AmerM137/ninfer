@@ -23,18 +23,18 @@ struct Weights {
 };
 
 struct Fixture {
-    Fixture(Weights& weights, int columns, DeviceExecutionView execution);
+    Fixture(Weights& weights, int columns);
     void upload(std::span<const float> catalog, cudaStream_t stream);
-    void invoke(DeviceExecutionView execution);
+    void invoke(CudaExecutionView execution);
     int check(const std::string& label) const;
-    std::size_t query(int first, int last, DeviceExecutionView execution) const;
+    std::size_t query(int first, int last) const;
 
     Weights& weights;
     int columns;
     std::size_t capacity;
     std::vector<std::uint16_t> input_words;
     GuardedDeviceBuffer input, output, injection, scratch;
-    WorkspaceArena workspace;
+    MemoryArena workspace;
     Tensor z, x, j;
 };
 

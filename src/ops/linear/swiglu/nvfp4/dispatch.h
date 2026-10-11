@@ -21,10 +21,9 @@ void launch_nvfp4_swiglu_decode(const Tensor& x, const Weight& weight, Tensor& o
 void launch_nvfp4_swiglu_small_t(const Tensor& x, const Weight& weight, Tensor& out,
                                  cudaStream_t stream);
 void launch_nvfp4_swiglu_a4(const Tensor& x, const Weight& weight, Tensor& out,
-                            WorkspaceArena& workspace, cudaStream_t stream);
+                            MemoryArena& workspace, cudaStream_t stream);
 
 void nvfp4_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor& out,
-                                  LinearPolicy policy, WorkspaceArena& workspace,
-                                  cudaStream_t stream);
+                                  LinearPolicy policy, MemoryArena& workspace, cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

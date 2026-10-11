@@ -2,6 +2,7 @@
 // Cache encoding, launch geometry, and route selection remain private to the public wrappers.
 
 #include "ninfer/ops/softmax_attention.h"
+#include "core/buffer.h"
 #include "ninfer/ops/kv_cache_append.h"
 
 #include "core/device.h"
@@ -299,22 +300,22 @@ PagedKVLayerView make_full_view(DeviceBuffer& k, DeviceBuffer& v, DeviceBuffer& 
     const std::int32_t pages          = padded / kPagedKVPageSize;
     return {
         .k_pages =
-            Tensor(k.p, layout.key.data_dtype,
+            Tensor(k.span(), layout.key.data_dtype,
                    {layout.key.data_leading_extent, kPagedKVPageSize, geometry.kv_heads, pages}),
         .v_pages =
-            Tensor(v.p, layout.value.data_dtype,
+            Tensor(v.span(), layout.value.data_dtype,
                    {layout.value.data_leading_extent, kPagedKVPageSize, geometry.kv_heads, pages}),
         .k_scale_pages = layout.key.has_scale()
-                             ? Tensor(k_scale.p, layout.key.scale_dtype,
+                             ? Tensor(k_scale.span(), layout.key.scale_dtype,
                                       {layout.key.scale_leading_extent, kPagedKVPageSize,
                                        geometry.kv_heads, pages})
                              : Tensor(),
         .v_scale_pages = layout.value.has_scale()
-                             ? Tensor(v_scale.p, layout.value.scale_dtype,
+                             ? Tensor(v_scale.span(), layout.value.scale_dtype,
                                       {layout.value.scale_leading_extent, kPagedKVPageSize,
                                        geometry.kv_heads, pages})
                              : Tensor(),
-        .block_table   = Tensor(block_table.p, DType::I32, {pages}),
+        .block_table   = Tensor(block_table.span(), DType::I32, {pages}),
         .head_dim      = kFullHeadDim,
         .num_kv_heads  = geometry.kv_heads,
         .storage       = storage,
@@ -332,7 +333,8 @@ public:
                               101U)),
           v_(bench::make_bf16(static_cast<std::size_t>(kFullHeadDim) * geometry.kv_heads * tokens,
                               103U)),
-          positions_(static_cast<std::size_t>(tokens) * sizeof(std::int32_t)),
+          positions_(ninfer::bench::device_context().device(),
+                     static_cast<std::size_t>(tokens) * sizeof(std::int32_t)),
           cache_k_(bench::make_zeros(full_data_bytes(geometry, storage_layout_.key, padded_))),
           cache_v_(bench::make_zeros(full_data_bytes(geometry, storage_layout_.value, padded_))),
           cache_k_scale_(
@@ -343,10 +345,11 @@ public:
               bench::make_zeros(storage_layout_.value.has_scale()
                                     ? full_scale_bytes(geometry, storage_layout_.value, padded_)
                                     : std::size_t{1})),
-          block_table_(static_cast<std::size_t>(padded_ / kPagedKVPageSize) * sizeof(std::int32_t)),
-          k_tensor_(k_.p, DType::BF16, {kFullHeadDim, geometry.kv_heads, tokens}),
-          v_tensor_(v_.p, DType::BF16, {kFullHeadDim, geometry.kv_heads, tokens}),
-          positions_tensor_(positions_.p, DType::I32, {tokens}),
+          block_table_(ninfer::bench::device_context().device(),
+                       static_cast<std::size_t>(padded_ / kPagedKVPageSize) * sizeof(std::int32_t)),
+          k_tensor_(k_.span(), DType::BF16, {kFullHeadDim, geometry.kv_heads, tokens}),
+          v_tensor_(v_.span(), DType::BF16, {kFullHeadDim, geometry.kv_heads, tokens}),
+          positions_tensor_(positions_.span(), DType::I32, {tokens}),
           cache_view_(make_full_view(cache_k_, cache_v_, cache_k_scale_, cache_v_scale_,
                                      block_table_, geometry, storage, padded_)) {
         std::vector<std::int32_t> host_positions(static_cast<std::size_t>(tokens));
@@ -357,14 +360,14 @@ public:
         for (std::int32_t page = 0; page < static_cast<std::int32_t>(host_table.size()); ++page) {
             host_table[static_cast<std::size_t>(page)] = page;
         }
-        CUDA_CHECK(cudaMemcpy(positions_.p, host_positions.data(), positions_.bytes,
+        CUDA_CHECK(cudaMemcpy(positions_.data(), host_positions.data(), positions_.size(),
                               cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(block_table_.p, host_table.data(), block_table_.bytes,
+        CUDA_CHECK(cudaMemcpy(block_table_.data(), host_table.data(), block_table_.size(),
                               cudaMemcpyHostToDevice));
     }
 
-    void launch(cudaStream_t stream) {
-        ops::kv_cache_append(k_tensor_, v_tensor_, positions_tensor_, cache_view_, stream);
+    void launch(CudaExecutionView cuda) {
+        ops::kv_cache_append(k_tensor_, v_tensor_, positions_tensor_, cache_view_, cuda);
     }
 
 private:
@@ -391,14 +394,14 @@ private:
 PagedKVBatchLayerView make_prefix_paged_view(DeviceBuffer& k, DeviceBuffer& v,
                                              DeviceBuffer& block_tables) {
     return {
-        .k_pages = Tensor(k.p, DType::BF16,
+        .k_pages = Tensor(k.span(), DType::BF16,
                           {kPrefixHeadDim, kPagedKVPageSize,
                            kPagedPrefixCapacity / kPagedKVPageSize, kPrefixKvHeads}),
-        .v_pages = Tensor(v.p, DType::FP16,
+        .v_pages = Tensor(v.span(), DType::FP16,
                           {kPrefixHeadDim, kPagedKVPageSize,
                            kPagedPrefixCapacity / kPagedKVPageSize, kPrefixKvHeads}),
         .block_tables =
-            Tensor(block_tables.p, DType::I32, {kPagedPrefixCapacity / kPagedKVPageSize, 1}),
+            Tensor(block_tables.span(), DType::I32, {kPagedPrefixCapacity / kPagedKVPageSize, 1}),
         .head_dim     = kPrefixHeadDim,
         .num_kv_heads = kPrefixKvHeads,
         .storage      = KvCacheStorage::BFloat16,
@@ -408,9 +411,9 @@ PagedKVBatchLayerView make_prefix_paged_view(DeviceBuffer& k, DeviceBuffer& v,
 CyclicKVCacheLayerView make_prefix_cyclic_view(DeviceBuffer& k, DeviceBuffer& v,
                                                std::int32_t capacity, std::int32_t batch) {
     return {
-        .k        = Tensor(k.p, DType::BF16, {kPrefixHeadDim, capacity, kPrefixKvHeads, batch}),
-        .v        = Tensor(v.p, DType::FP16, {kPrefixHeadDim, capacity, kPrefixKvHeads, batch}),
-        .capacity = static_cast<std::uint32_t>(capacity),
+        .k = Tensor(k.span(), DType::BF16, {kPrefixHeadDim, capacity, kPrefixKvHeads, batch}),
+        .v = Tensor(v.span(), DType::FP16, {kPrefixHeadDim, capacity, kPrefixKvHeads, batch}),
+        .capacity        = static_cast<std::uint32_t>(capacity),
         .padded_capacity = static_cast<std::uint32_t>(capacity),
         .num_kv_heads    = kPrefixKvHeads,
         .head_dim        = kPrefixHeadDim,
@@ -427,23 +430,27 @@ public:
               static_cast<std::size_t>(kPrefixHeadDim) * kPrefixKvHeads * tokens * batch, 105U)),
           v_(bench::make_bf16(
               static_cast<std::size_t>(kPrefixHeadDim) * kPrefixKvHeads * tokens * batch, 107U)),
-          positions_(static_cast<std::size_t>(tokens) * batch * sizeof(std::int32_t)),
-          commit_count_(static_cast<std::size_t>(batch) * sizeof(std::int32_t)),
-          selector_(static_cast<std::size_t>(batch) * sizeof(std::int32_t)),
+          positions_(ninfer::bench::device_context().device(),
+                     static_cast<std::size_t>(tokens) * batch * sizeof(std::int32_t)),
+          commit_count_(ninfer::bench::device_context().device(),
+                        static_cast<std::size_t>(batch) * sizeof(std::int32_t)),
+          selector_(ninfer::bench::device_context().device(),
+                    static_cast<std::size_t>(batch) * sizeof(std::int32_t)),
           cache_k_(bench::make_zeros(static_cast<std::size_t>(kPrefixHeadDim) * kPrefixKvHeads * 2 *
                                      (cyclic ? static_cast<std::size_t>(cyclic_capacity) * batch
                                              : static_cast<std::size_t>(kPagedPrefixCapacity)))),
           cache_v_(bench::make_zeros(static_cast<std::size_t>(kPrefixHeadDim) * kPrefixKvHeads * 2 *
                                      (cyclic ? static_cast<std::size_t>(cyclic_capacity) * batch
                                              : static_cast<std::size_t>(kPagedPrefixCapacity)))),
-          block_table_(cyclic ? sizeof(std::int32_t)
+          block_table_(ninfer::bench::device_context().device(),
+                       cyclic ? sizeof(std::int32_t)
                               : static_cast<std::size_t>(kPagedPrefixCapacity / kPagedKVPageSize) *
                                     sizeof(std::int32_t)),
-          k_tensor_(k_.p, DType::BF16, {kPrefixHeadDim, kPrefixKvHeads, tokens, batch}),
-          v_tensor_(v_.p, DType::BF16, {kPrefixHeadDim, kPrefixKvHeads, tokens, batch}),
-          positions_tensor_(positions_.p, DType::I32, {tokens, batch}),
-          count_tensor_(commit_count_.p, DType::I32, {batch}),
-          selector_tensor_(selector_.p, DType::I32, {batch}),
+          k_tensor_(k_.span(), DType::BF16, {kPrefixHeadDim, kPrefixKvHeads, tokens, batch}),
+          v_tensor_(v_.span(), DType::BF16, {kPrefixHeadDim, kPrefixKvHeads, tokens, batch}),
+          positions_tensor_(positions_.span(), DType::I32, {tokens, batch}),
+          count_tensor_(commit_count_.span(), DType::I32, {batch}),
+          selector_tensor_(selector_.span(), DType::I32, {batch}),
           paged_view_(cyclic ? PagedKVBatchLayerView{}
                              : make_prefix_paged_view(cache_k_, cache_v_, block_table_)),
           cyclic_view_(cyclic ? make_prefix_cyclic_view(cache_k_, cache_v_, cyclic_capacity, batch)
@@ -464,7 +471,7 @@ public:
                 host_positions[static_cast<std::size_t>(b * tokens + token)] = start + token;
             }
         }
-        CUDA_CHECK(cudaMemcpy(positions_.p, host_positions.data(), positions_.bytes,
+        CUDA_CHECK(cudaMemcpy(positions_.data(), host_positions.data(), positions_.size(),
                               cudaMemcpyHostToDevice));
         if (!cyclic) {
             std::vector<std::int32_t> host_table(kPagedPrefixCapacity / kPagedKVPageSize);
@@ -472,27 +479,27 @@ public:
                  ++page) {
                 host_table[static_cast<std::size_t>(page)] = page;
             }
-            CUDA_CHECK(cudaMemcpy(block_table_.p, host_table.data(), block_table_.bytes,
+            CUDA_CHECK(cudaMemcpy(block_table_.data(), host_table.data(), block_table_.size(),
                                   cudaMemcpyHostToDevice));
         }
         const std::vector<std::int32_t> host_counts(static_cast<std::size_t>(batch), committed);
-        CUDA_CHECK(cudaMemcpy(commit_count_.p, host_counts.data(), commit_count_.bytes,
+        CUDA_CHECK(cudaMemcpy(commit_count_.data(), host_counts.data(), commit_count_.size(),
                               cudaMemcpyHostToDevice));
         std::vector<std::int32_t> host_selectors(static_cast<std::size_t>(batch));
         for (std::int32_t b = 0; b < batch; ++b) {
             host_selectors[static_cast<std::size_t>(b)] = cyclic ? b : 0;
         }
-        CUDA_CHECK(cudaMemcpy(selector_.p, host_selectors.data(), selector_.bytes,
+        CUDA_CHECK(cudaMemcpy(selector_.data(), host_selectors.data(), selector_.size(),
                               cudaMemcpyHostToDevice));
     }
 
-    void launch(cudaStream_t stream) {
+    void launch(CudaExecutionView cuda) {
         if (cyclic_) {
             ops::kv_cache_append_prefix(k_tensor_, v_tensor_, positions_tensor_, count_tensor_,
-                                        selector_tensor_, envelope_, cyclic_view_, stream);
+                                        selector_tensor_, envelope_, cyclic_view_, cuda);
         } else {
             ops::kv_cache_append_prefix(k_tensor_, v_tensor_, positions_tensor_, count_tensor_,
-                                        selector_tensor_, envelope_, paged_view_, stream);
+                                        selector_tensor_, envelope_, paged_view_, cuda);
         }
     }
 
@@ -574,16 +581,16 @@ double prefix_useful_bytes(std::int32_t committed, std::int32_t batch) {
 template <class Case>
 bench::ColdTiming measure(Case& data, Execution execution, CacheState cache,
                           bench::TimedGraph* graph, bench::L2FlushBuffer& flush,
-                          cudaStream_t stream, int warmup, int repeat) {
+                          CudaExecutionView cuda, int warmup, int repeat) {
     if (execution == Execution::Eager) {
-        const auto launch = [&](cudaStream_t launch_stream) { data.launch(launch_stream); };
+        const auto launch = [&](CudaExecutionView cuda) { data.launch(cuda); };
         return cache == CacheState::Cold
-                   ? bench::measure_cold_launch(launch, flush, stream, warmup, repeat)
-                   : bench::measure_launch(launch, stream, warmup, repeat);
+                   ? bench::measure_cold_launch(launch, flush, cuda, warmup, repeat)
+                   : bench::measure_launch(launch, cuda, warmup, repeat);
     }
     return cache == CacheState::Cold
-               ? bench::measure_cold_graph(*graph, flush, stream, warmup, repeat)
-               : bench::measure_graph(*graph, stream, warmup, repeat);
+               ? bench::measure_cold_graph(*graph, flush, cuda, warmup, repeat)
+               : bench::measure_graph(*graph, cuda, warmup, repeat);
 }
 
 void report(const Result& result) {
@@ -629,22 +636,23 @@ void write_csv(const Options& options, const std::vector<Result>& results) {
 
 template <class Case>
 void profile_case(Case& data, const char* label, const Options& options,
-                  bench::L2FlushBuffer& flush, cudaStream_t stream) {
+                  bench::L2FlushBuffer& flush, CudaExecutionView cuda) {
+    const auto stream         = cuda.stream();
     const Execution execution = options.execution;
     const CacheState cache = options.cache == CacheMode::Cold ? CacheState::Cold : CacheState::Warm;
     const bool empty       = options.mode == Mode::Prefix && options.max_count == 0;
     bench::TimedGraph graph;
     if (execution == Execution::Graph && !empty) {
-        data.launch(stream);
+        data.launch(cuda);
         CUDA_CHECK(cudaStreamSynchronize(stream));
-        graph.capture(stream, [&](cudaStream_t launch_stream) { data.launch(launch_stream); });
-        for (int index = 0; index < options.warmup; ++index) { graph.launch(stream); }
+        graph.capture(cuda, [&](CudaExecutionView cuda) { data.launch(cuda); });
+        for (int index = 0; index < options.warmup; ++index) { graph.launch(cuda); }
     } else {
-        for (int index = 0; index < options.warmup; ++index) { data.launch(stream); }
+        for (int index = 0; index < options.warmup; ++index) { data.launch(cuda); }
     }
     CUDA_CHECK(cudaStreamSynchronize(stream));
     if (cache == CacheState::Cold) {
-        bench::flush_l2(flush, stream);
+        bench::flush_l2(flush, cuda);
         CUDA_CHECK(cudaStreamSynchronize(stream));
     }
     std::printf("PROFILE %s dispatch=public execution=%s cache=%s\n", label,
@@ -652,9 +660,9 @@ void profile_case(Case& data, const char* label, const Options& options,
     std::fflush(stdout);
     CUDA_CHECK(cudaProfilerStart());
     if (execution == Execution::Graph && !empty)
-        graph.launch(stream);
+        graph.launch(cuda);
     else
-        data.launch(stream);
+        data.launch(cuda);
     CUDA_CHECK(cudaStreamSynchronize(stream));
     CUDA_CHECK(cudaProfilerStop());
 }
@@ -681,18 +689,19 @@ void collect_case(Case& data, Mode mode, const char* geometry, KvCacheStorage st
                   std::int32_t tokens, std::int32_t committed, double logical_cache_bytes,
                   double key_vector_bytes, double value_vector_bytes, double physical_cache_bytes,
                   double useful_bytes, const Options& options, bench::L2FlushBuffer& flush,
-                  cudaStream_t stream, std::vector<Result>& results) {
+                  CudaExecutionView cuda, std::vector<Result>& results) {
+    const auto stream = cuda.stream();
     const bool empty = mode == Mode::Prefix && options.max_count == 0;
     bench::TimedGraph graph;
     if (empty) {
-        data.launch(stream);
+        data.launch(cuda);
         CUDA_CHECK(cudaStreamSynchronize(stream));
     }
     if (options.execution != Execution::Eager && !empty) {
-        data.launch(stream);
+        data.launch(cuda);
         CUDA_CHECK(cudaStreamSynchronize(stream));
-        graph.capture(stream, [&](cudaStream_t launch_stream) {
-            for (int call = 0; call < options.graph_calls; ++call) data.launch(launch_stream);
+        graph.capture(cuda, [&](CudaExecutionView cuda) {
+            for (int call = 0; call < options.graph_calls; ++call) data.launch(cuda);
         });
     }
     for (const Execution execution : {Execution::Eager, Execution::Graph}) {
@@ -726,7 +735,7 @@ void collect_case(Case& data, Mode mode, const char* geometry, KvCacheStorage st
                           physical_cache_bytes,
                           useful_bytes,
                           empty ? bench::ColdTiming{}
-                                : measure(data, execution, cache, &graph, flush, stream,
+                                : measure(data, execution, cache, &graph, flush, cuda,
                                           options.warmup, options.repeat)};
             result.timing.median_us /= options.graph_calls;
             result.timing.min_us /= options.graph_calls;
@@ -749,6 +758,7 @@ int main(int argc, char** argv) {
         const Options options = parse_options(argc, argv);
         cudaStream_t stream   = nullptr;
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+        const auto cuda = ninfer::bench::device_context().execution_view(stream);
         bench::L2FlushBuffer flush(kFlushBytes);
         const std::vector<FullGeometry> geometries = selected_geometries(options.full_geometry);
         const std::vector<KvCacheStorage> storages = selected_storages(options.kv);
@@ -760,7 +770,7 @@ int main(int argc, char** argv) {
                 FullCase data(geometry, storage, options.tokens.front(), options.context);
                 const std::string label = std::string("mode=full geometry=") + geometry.name +
                                           " kv=" + storage_name(storage);
-                profile_case(data, label.c_str(), options, flush, stream);
+                profile_case(data, label.c_str(), options, flush, cuda);
             } else {
                 const bool cyclic = options.layout == LayoutChoice::Cyclic;
                 if (options.counts.front() > options.tokens.front()) {
@@ -780,7 +790,7 @@ int main(int argc, char** argv) {
                     (cyclic ? "cyclic capacity=" + std::to_string(options.cyclic_capacity) +
                                   " B=" + std::to_string(options.batch)
                             : "paged");
-                profile_case(data, label.c_str(), options, flush, stream);
+                profile_case(data, label.c_str(), options, flush, cuda);
             }
             CUDA_CHECK(cudaStreamDestroy(stream));
             return 0;
@@ -801,7 +811,7 @@ int main(int argc, char** argv) {
                                      tokens, tokens, full_logical_cache_bytes(geometry, tokens),
                                      key_vector_bytes, value_vector_bytes, physical_cache_bytes,
                                      full_useful_bytes(geometry, storage, tokens), options, flush,
-                                     stream, results);
+                                     cuda, results);
                     }
                 }
             }
@@ -834,7 +844,7 @@ int main(int argc, char** argv) {
                                      cyclic ? options.cyclic_capacity : 0, tokens, committed,
                                      cache_bytes, kPrefixVectorBytes, kPrefixVectorBytes,
                                      cache_bytes, prefix_useful_bytes(committed, options.batch),
-                                     options, flush, stream, results);
+                                     options, flush, cuda, results);
                     }
                 }
             }

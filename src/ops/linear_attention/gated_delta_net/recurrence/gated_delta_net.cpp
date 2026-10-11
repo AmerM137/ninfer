@@ -32,7 +32,7 @@ RecurrenceGeometry require_geometry(const Tensor& q, const Tensor& v) {
 
 RecurrenceGeometry validate_recurrent(const Tensor& q, const Tensor& k, const Tensor& v,
                                       const Tensor& g, const Tensor& beta, float scale,
-                                      const Tensor& ssm_state, const Tensor& out) {
+                                      const Tensor& ssm_state, const Tensor& out, Device device) {
     common::operand::dtype(q, DType::BF16, "gated_delta_net", "q must be BF16");
     common::operand::dtype(k, DType::BF16, "gated_delta_net", "k must be BF16");
     common::operand::dtype(v, DType::BF16, "gated_delta_net", "v must be BF16");
@@ -63,23 +63,22 @@ RecurrenceGeometry validate_recurrent(const Tensor& q, const Tensor& k, const Te
                             geometry.value_heads, 1},
                            "gated_delta_net", "ssm_state");
 
-    common::operand::contiguous_nonnull(q, "gated_delta_net", "q");
-    common::operand::contiguous_nonnull(k, "gated_delta_net", "k");
-    common::operand::contiguous_nonnull(v, "gated_delta_net", "v");
-    common::operand::contiguous_nonnull(g, "gated_delta_net", "g");
-    common::operand::contiguous_nonnull(beta, "gated_delta_net", "beta");
-    common::operand::contiguous_nonnull(ssm_state, "gated_delta_net", "ssm_state");
-    common::operand::contiguous_nonnull(out, "gated_delta_net", "out");
+    common::operand::contiguous_nonnull(q, "gated_delta_net", "q", device);
+    common::operand::contiguous_nonnull(k, "gated_delta_net", "k", device);
+    common::operand::contiguous_nonnull(v, "gated_delta_net", "v", device);
+    common::operand::contiguous_nonnull(g, "gated_delta_net", "g", device);
+    common::operand::contiguous_nonnull(beta, "gated_delta_net", "beta", device);
+    common::operand::contiguous_nonnull(ssm_state, "gated_delta_net", "ssm_state", device);
+    common::operand::contiguous_nonnull(out, "gated_delta_net", "out", device);
 
     detail::gated_delta_net::require_scale(scale, "gated_delta_net");
     return geometry;
 }
 
-RecurrenceGeometry
-validate_recurrent_batch_update(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
-                                const Tensor& beta, float scale, const Tensor& ssm_states,
-                                const Tensor& source_state_slots,
-                                const Tensor& destination_state_slots, const Tensor& out) {
+RecurrenceGeometry validate_recurrent_batch_update(
+    const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g, const Tensor& beta,
+    float scale, const Tensor& ssm_states, const Tensor& source_state_slots,
+    const Tensor& destination_state_slots, const Tensor& out, Device device) {
     constexpr std::int32_t kMaximumBatch = 8;
     common::operand::dtype(q, DType::BF16, "gated_delta_net", "q must be BF16");
     common::operand::dtype(k, DType::BF16, "gated_delta_net", "k must be BF16");
@@ -124,17 +123,17 @@ validate_recurrent_batch_update(const Tensor& q, const Tensor& k, const Tensor& 
     common::operand::shape(destination_state_slots, {batch, 1, 1, 1}, "gated_delta_net",
                            "destination_state_slots");
 
-    common::operand::contiguous_nonnull(q, "gated_delta_net", "q");
-    common::operand::contiguous_nonnull(k, "gated_delta_net", "k");
-    common::operand::contiguous_nonnull(v, "gated_delta_net", "v");
-    common::operand::contiguous_nonnull(g, "gated_delta_net", "g");
-    common::operand::contiguous_nonnull(beta, "gated_delta_net", "beta");
-    common::operand::contiguous_nonnull(ssm_states, "gated_delta_net", "ssm_states");
-    common::operand::contiguous_nonnull(source_state_slots, "gated_delta_net",
-                                        "source_state_slots");
+    common::operand::contiguous_nonnull(q, "gated_delta_net", "q", device);
+    common::operand::contiguous_nonnull(k, "gated_delta_net", "k", device);
+    common::operand::contiguous_nonnull(v, "gated_delta_net", "v", device);
+    common::operand::contiguous_nonnull(g, "gated_delta_net", "g", device);
+    common::operand::contiguous_nonnull(beta, "gated_delta_net", "beta", device);
+    common::operand::contiguous_nonnull(ssm_states, "gated_delta_net", "ssm_states", device);
+    common::operand::contiguous_nonnull(source_state_slots, "gated_delta_net", "source_state_slots",
+                                        device);
     common::operand::contiguous_nonnull(destination_state_slots, "gated_delta_net",
-                                        "destination_state_slots");
-    common::operand::contiguous_nonnull(out, "gated_delta_net", "out");
+                                        "destination_state_slots", device);
+    common::operand::contiguous_nonnull(out, "gated_delta_net", "out", device);
 
     detail::gated_delta_net::require_scale(scale, "gated_delta_net");
     return geometry;
@@ -142,18 +141,18 @@ validate_recurrent_batch_update(const Tensor& q, const Tensor& k, const Tensor& 
 
 void validate_recurrence(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
                          const Tensor& beta, float scale, const Tensor& ssm_state_in,
-                         const Tensor& ssm_state_out, const Tensor& out) {
+                         const Tensor& ssm_state_out, const Tensor& out, Device device) {
     // ssm_state_out carries the running-state contract validated by validate_recurrent;
     // ssm_state_in is an equally-shaped read view (may alias ssm_state_out for in-place).
     const RecurrenceGeometry geometry =
-        validate_recurrent(q, k, v, g, beta, scale, ssm_state_out, out);
+        validate_recurrent(q, k, v, g, beta, scale, ssm_state_out, out, device);
     common::operand::dtype(ssm_state_in, DType::FP32, "gated_delta_net",
                            "ssm_state_in must be FP32");
     common::operand::shape(ssm_state_in,
                            {detail::gated_delta_net::kStateDim, detail::gated_delta_net::kStateDim,
                             geometry.value_heads, 1},
                            "gated_delta_net", "ssm_state_in");
-    common::operand::contiguous_nonnull(ssm_state_in, "gated_delta_net", "ssm_state_in");
+    common::operand::contiguous_nonnull(ssm_state_in, "gated_delta_net", "ssm_state_in", device);
 }
 
 } // namespace
@@ -171,8 +170,8 @@ std::size_t gated_delta_net_workspace_capacity_bytes(std::int32_t qk_heads,
 }
 
 void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
-                     const Tensor& beta, float scale, bool normalize_qk, WorkspaceArena& ws,
-                     Tensor& ssm_state, Tensor& out, DeviceExecutionView execution) {
+                     const Tensor& beta, float scale, bool normalize_qk, MemoryArena& ws,
+                     Tensor& ssm_state, Tensor& out, CudaExecutionView execution) {
     gated_delta_net(q, k, v, g, beta, scale, normalize_qk, ws, ssm_state, ssm_state, out,
                     execution);
 }
@@ -182,9 +181,10 @@ void gated_delta_net_batch_update(const Tensor& q, const Tensor& k, const Tensor
                                   bool normalize_qk, Tensor& ssm_states,
                                   const Tensor& source_state_slots,
                                   const Tensor& destination_state_slots, Tensor& out,
-                                  cudaStream_t stream) {
+                                  CudaExecutionView execution) {
+    const auto stream = execution.stream();
     validate_recurrent_batch_update(q, k, v, g, beta, scale, ssm_states, source_state_slots,
-                                    destination_state_slots, out);
+                                    destination_state_slots, out, execution.device());
 
     detail::gated_delta_net::launch_recurrent_batch_update(q, k, v, g, beta, scale, normalize_qk,
                                                            ssm_states, source_state_slots,
@@ -192,20 +192,21 @@ void gated_delta_net_batch_update(const Tensor& q, const Tensor& k, const Tensor
 }
 
 void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
-                     const Tensor& beta, float scale, bool normalize_qk, WorkspaceArena& ws,
+                     const Tensor& beta, float scale, bool normalize_qk, MemoryArena& ws,
                      const Tensor& ssm_state_in, Tensor& ssm_state_out, Tensor& out,
-                     DeviceExecutionView execution) {
-    validate_recurrence(q, k, v, g, beta, scale, ssm_state_in, ssm_state_out, out);
-    if (execution.multiprocessor_count <= 0) {
-        throw std::invalid_argument("gated_delta_net: invalid SM count");
+                     CudaExecutionView execution) {
+    if (ws.device() != execution.device()) {
+        throw std::invalid_argument("gated_delta_net: workspace belongs to another device");
     }
+    validate_recurrence(q, k, v, g, beta, scale, ssm_state_in, ssm_state_out, out,
+                        execution.device());
     namespace chunked = detail::gated_delta_net::chunked;
     const auto plan   = detail::gated_delta_net::select_recurrence_plan(
-        q.ne[1], v.ne[1], q.ne[2], execution.multiprocessor_count);
+        q.ne[1], v.ne[1], q.ne[2], execution.multiprocessor_count());
     if (plan.route == detail::gated_delta_net::RecurrenceRoute::Recurrent) {
         detail::gated_delta_net::launch_recurrent_inout(q, k, v, g, beta, scale, normalize_qk,
                                                         ssm_state_in, ssm_state_out, out,
-                                                        execution.stream);
+                                                        execution.stream());
         return;
     }
     auto scope         = ws.scope();
@@ -226,8 +227,8 @@ void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Te
         v.ne[1],
         q.ne[2],
         scale};
-    chunked::launch_prepare(args, qk, control, normalize_qk, execution.stream);
-    chunked::launch_recurrence(args, qk, control, plan.value_tile, execution.stream);
+    chunked::launch_prepare(args, qk, control, normalize_qk, execution.stream());
+    chunked::launch_recurrence(args, qk, control, plan.value_tile, execution.stream());
 }
 
 } // namespace ninfer::ops

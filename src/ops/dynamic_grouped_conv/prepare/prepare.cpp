@@ -36,14 +36,15 @@ std::size_t rmsnorm_dynamic_grouped_conv_prepare_workspace_capacity_bytes(int mi
 void rmsnorm_dynamic_grouped_conv_prepare(const Tensor& residual, const Tensor& norm_weight,
                                           float epsilon, const Tensor& base_kernel,
                                           const Weight& projection, Tensor& prepared,
-                                          Tensor& finish_delta, WorkspaceArena& workspace,
-                                          cudaStream_t stream) {
+                                          Tensor& finish_delta, MemoryArena& workspace,
+                                          CudaExecutionView execution) {
+    const auto stream = execution.stream();
     dc::validate_prepare(residual, norm_weight, epsilon, base_kernel, projection, prepared,
-                         finish_delta, workspace);
+                         finish_delta, workspace, execution);
     const auto plan = dc::prepare::select_plan(residual.ne[1], residual.ne[2]);
     auto scope      = workspace.scope();
     auto* partials  = static_cast<float*>(workspace.alloc_bytes(plan.workspace_bytes).data);
-    rmsnorm(residual, norm_weight, epsilon, false, prepared, stream);
+    rmsnorm(residual, norm_weight, epsilon, false, prepared, execution);
     dc::prepare::launch(plan, base_kernel, projection, partials, prepared, finish_delta, stream);
 }
 } // namespace ninfer::ops

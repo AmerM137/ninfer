@@ -1,8 +1,8 @@
 #pragma once
 
+#include "core/device.h"
 #include "core/tensor.h"
 
-#include <cuda_runtime.h>
 
 namespace ninfer::ops {
 
@@ -16,6 +16,6 @@ namespace ninfer::ops {
  * overlap one another). Writes all of out and preserves both inputs.
  * Empty tensors perform no device work.
  */
-void silu_mul(const Tensor& gate, const Tensor& up, Tensor& out, cudaStream_t stream);
+void silu_mul(const Tensor& gate, const Tensor& up, Tensor& out, CudaExecutionView execution);
 
 } // namespace ninfer::ops

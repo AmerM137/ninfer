@@ -1,4 +1,5 @@
 #include "core/device.h"
+#include "cuda_fixture.h"
 #include "ninfer/ops/position.h"
 #include "ops/op_tester.h"
 
@@ -19,8 +20,9 @@ int fill_case(std::int32_t count, std::int32_t start) {
 
     GuardedDeviceBuffer output(static_cast<std::size_t>(count) * sizeof(std::int32_t));
     output.fill(0xcd);
-    Tensor output_tensor(output.data(), DType::I32, {count});
-    ops::fill_i32_positions(output_tensor, start, nullptr);
+    Tensor output_tensor(output.span(), DType::I32, {count});
+    ops::fill_i32_positions(output_tensor, start,
+                            ninfer::test::cuda_environment().default_execution);
     cuda_synchronize();
 
     const std::string label =
@@ -47,11 +49,12 @@ int offset_case(std::int32_t count, std::int32_t delta_value, bool in_place) {
     device_delta.copy_from_host(delta.data(), sizeof(std::int32_t));
     device_output.fill(0xcd);
 
-    Tensor source_tensor(device_source.data(), DType::I32, {count});
-    Tensor delta_tensor(device_delta.data(), DType::I32, {1});
-    Tensor output_tensor(device_output.data(), DType::I32, {count});
+    Tensor source_tensor(device_source.span(), DType::I32, {count});
+    Tensor delta_tensor(device_delta.span(), DType::I32, {1});
+    Tensor output_tensor(device_output.span(), DType::I32, {count});
     Tensor& destination = in_place ? source_tensor : output_tensor;
-    ops::offset_i32_positions(source_tensor, delta_tensor, destination, nullptr);
+    ops::offset_i32_positions(source_tensor, delta_tensor, destination,
+                              ninfer::test::cuda_environment().default_execution);
     cuda_synchronize();
 
     const std::string label = "offset_i32_positions T=" + std::to_string(count) +
@@ -87,16 +90,19 @@ int lane_offset_case(int width, int batch, int axes, bool in_place) {
     input.copy_from_host(source.data(), input.bytes());
     offsets.copy_from_host(delta.data(), offsets.bytes());
     output.fill(0xcd);
-    auto* destination = in_place ? input.data() : output.data();
+    const auto destination = in_place ? input.span() : output.span();
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    const auto stream_execution = ninfer::test::cuda_environment().context.execution_view(stream);
     cuda_synchronize();
     const auto launch = [&] {
         for (int b = 0; b < batch; ++b) {
-            Tensor src(static_cast<std::int32_t*>(input.data()) + b * lane_size, DType::I32, {lane_size});
-            Tensor dst(static_cast<std::int32_t*>(destination) + b * lane_size, DType::I32, {lane_size});
-            Tensor d(static_cast<std::int32_t*>(offsets.data()) + b, DType::I32, {1});
-            ops::offset_i32_positions(src, d, dst, stream);
+            Tensor src(input.span().subspan(std::size_t(b) * lane_size * 4), DType::I32,
+                       {lane_size});
+            Tensor dst(destination.subspan(std::size_t(b) * lane_size * 4), DType::I32,
+                       {lane_size});
+            Tensor d(offsets.span().subspan(std::size_t(b) * 4), DType::I32, {1});
+            ops::offset_i32_positions(src, d, dst, stream_execution);
         }
     };
     launch();
@@ -122,7 +128,8 @@ int lane_offset_case(int width, int batch, int axes, bool in_place) {
     for (int b = 0; b < batch; ++b)
         for (int i = 0; i < lane_size; ++i)
             expected[b * lane_size + i] = source[b * lane_size + i] + delta[b];
-    int failures = verify_exact("lane offsets", from_device<std::int32_t>(destination, expected.size()), expected);
+    int failures = verify_exact(
+        "lane offsets", from_device<std::int32_t>(destination.data, expected.size()), expected);
     if (!in_place)
         failures += verify_exact("lane source unchanged", from_device<std::int32_t>(input.data(), source.size()), source);
     failures += verify_exact("lane delta unchanged", from_device<std::int32_t>(offsets.data(), delta.size()), delta);

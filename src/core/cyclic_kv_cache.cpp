@@ -7,6 +7,14 @@
 #include <stdexcept>
 
 namespace ninfer {
+
+Device CyclicKVCacheLayerView::device() const {
+    if (k.device != v.device) {
+        throw std::invalid_argument("cyclic KV view spans different devices");
+    }
+    return k.device;
+}
+
 namespace {
 
 constexpr std::size_t kArenaAlign = 256;
@@ -59,7 +67,7 @@ std::size_t CyclicKVCacheLayout::payload_bytes() const noexcept {
     return total;
 }
 
-CyclicKVCache::CyclicKVCache(DeviceSpan backing, const CyclicKVCacheLayout& layout)
+CyclicKVCache::CyclicKVCache(MemorySpan backing, const CyclicKVCacheLayout& layout)
     : capacity_(layout.capacity), padded_capacity_(layout.padded_capacity),
       num_kv_heads_(layout.num_kv_heads), head_dim_(layout.head_dim),
       lane_capacity_(layout.lane_capacity) {
@@ -101,6 +109,10 @@ CyclicKVCacheLayerView CyclicKVCache::layer_view(std::uint32_t layer) const {
 
 void CyclicKVCache::copy_slot_from(const CyclicKVCache& source, std::int32_t source_slot,
                                    std::int32_t destination_slot, cudaStream_t stream) {
+    if (k_.front().device.type() != DeviceType::CUDA ||
+        k_.front().device != source.k_.front().device) {
+        throw std::invalid_argument("cyclic KV transfer requires backing on the same CUDA device");
+    }
     if (source.layer_count() != layer_count() || source.capacity_ != capacity_ ||
         source.padded_capacity_ != padded_capacity_ || source.num_kv_heads_ != num_kv_heads_ ||
         source.head_dim_ != head_dim_) {

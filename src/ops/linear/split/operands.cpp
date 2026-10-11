@@ -110,7 +110,10 @@ void validate_segments(std::span<const std::int32_t> rows, const SplitShape& sha
 }
 
 void validate_operands(const Tensor& x, Weights weights, std::span<const Tensor> outputs,
-                       const SplitShape& shape) {
+                       const SplitShape& shape, CudaExecutionView execution) {
+    require(x.device == execution.device() && weights.first.device == execution.device() &&
+                (!weights.second || weights.second->device == execution.device()),
+            "input and weights must belong to the execution device");
     validate_interval(x.ne[1], x.ne[1]);
     matrix(x, shape.input_rows, x.ne[1]);
     validate_weight(weights.first);
@@ -118,6 +121,7 @@ void validate_operands(const Tensor& x, Weights weights, std::span<const Tensor>
     require(outputs.size() == shape.segments.size(), "invalid output segment count");
     const auto input = operand::range(x.data, x.bytes(), kOp);
     for (std::size_t i = 0; i < outputs.size(); ++i) {
+        require(outputs[i].device == execution.device(), "output belongs to another device");
         matrix(outputs[i], shape.segments[i], x.ne[1]);
         const auto out = operand::range(outputs[i].data, outputs[i].bytes(), kOp);
         operand::disjoint(out, input, kOp);
@@ -128,7 +132,7 @@ void validate_operands(const Tensor& x, Weights weights, std::span<const Tensor>
 }
 
 void validate_scratch(const Tensor& x, Weights weights, std::span<const Tensor> outputs,
-                      DeviceSpan scratch) {
+                      MemorySpan scratch) {
     const auto range = operand::range(scratch.data, scratch.bytes, kOp);
     operand::disjoint(range, operand::range(x.data, x.bytes(), kOp), kOp);
     disjoint_weights(range, weights);

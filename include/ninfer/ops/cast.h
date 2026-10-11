@@ -1,7 +1,7 @@
 #pragma once
 
+#include "core/device.h"
 #include "core/tensor.h"
-#include <cuda_runtime.h>
 
 namespace ninfer::ops {
 
@@ -12,6 +12,6 @@ namespace ninfer::ops {
  * storage. They do not overlap. Converts every element independently with round-to-nearest-even,
  * writes all of destination and preserves source. No workspace or other state is used.
  */
-void cast_fp32_to_bf16(const Tensor& source, Tensor& destination, cudaStream_t stream);
+void cast_fp32_to_bf16(const Tensor& source, Tensor& destination, CudaExecutionView execution);
 
 } // namespace ninfer::ops

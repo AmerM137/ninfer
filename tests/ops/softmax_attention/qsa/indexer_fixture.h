@@ -48,18 +48,18 @@ struct Fixture {
           tables(table_stride * (B + 2)), q(q_host.size() * 2), keys(k_host.size() * 2),
           pos(positions.size() * 4), lengths(B * 4), rows(B * 4), table(tables.size() * 4),
           ids(std::size_t(512) * T * B * 4), counts(std::size_t(T) * B * 4) {
-        query = Tensor(q.data(), DType::BF16, {128, 4, T, B});
-        Tensor kv(keys.data(), DType::BF16, {128, 16, 1, pages});
+        query = Tensor(q.span(), DType::BF16, {128, 4, T, B});
+        Tensor kv(keys.span(), DType::BF16, {128, 16, 1, pages});
         kv.nb[1] = key_row_stride * 2;
         kv.nb[2] = 16 * kv.nb[1];
         kv.nb[3] = key_page_stride * 2;
-        Tensor bt(table.data(), DType::I32, {table_width, B + 2});
+        Tensor bt(table.span(), DType::I32, {table_width, B + 2});
         bt.nb[1] = table_stride * 4;
         cache    = {kv, bt};
-        batch    = {Tensor(pos.data(), DType::I32, {T, B}), Tensor(lengths.data(), DType::I32, {B}),
-                    Tensor(rows.data(), DType::I32, {B})};
-        selected = {Tensor(ids.data(), DType::I32, {512, T, B}),
-                    Tensor(counts.data(), DType::I32, {T, B})};
+        batch    = {Tensor(pos.span(), DType::I32, {T, B}), Tensor(lengths.span(), DType::I32, {B}),
+                    Tensor(rows.span(), DType::I32, {B})};
+        selected = {Tensor(ids.span(), DType::I32, {512, T, B}),
+                    Tensor(counts.span(), DType::I32, {T, B})};
     }
 
     void reset(int phase, bool all_empty = false) {
@@ -135,7 +135,7 @@ struct Fixture {
         cuda_synchronize();
     }
 
-    void launch(WorkspaceArena& workspace, DeviceExecutionView execution) {
+    void launch(MemoryArena& workspace, CudaExecutionView execution) {
         ops::qsa_indexer(query, cache, batch, envelope, workspace, selected, execution);
     }
 };

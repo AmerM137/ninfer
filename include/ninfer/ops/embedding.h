@@ -1,8 +1,8 @@
 #pragma once
 
+#include "core/device.h"
 #include "core/tensor.h"
 #include "core/weight.h"
-#include <cuda_runtime.h>
 
 namespace ninfer::ops {
 
@@ -18,7 +18,7 @@ namespace ninfer::ops {
  * Writes all of out, which must not overlap ids or any table plane. Inputs are preserved;
  * an empty token extent does no work. No workspace or other state is used.
  */
-void embedding(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t stream);
+void embedding(const Tensor& ids, const Weight& table, Tensor& out, CudaExecutionView execution);
 
 /**
  * x[d,p] += sum_{c=0..3} table[d,indices[c,p]] * weights[c,p].
@@ -30,6 +30,6 @@ void embedding(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t
  * other state is used.
  */
 void embedding_interpolate_add(const Tensor& table, const Tensor& indices, const Tensor& weights,
-                               Tensor& x, cudaStream_t stream);
+                               Tensor& x, CudaExecutionView execution);
 
 } // namespace ninfer::ops

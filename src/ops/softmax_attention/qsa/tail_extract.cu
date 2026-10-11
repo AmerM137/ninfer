@@ -70,7 +70,7 @@ bool pair_aligned(const Tensor& t) {
 
 void launch_tail_extract(const QsaTailStateView& before, const QsaRawRecordReadView& records,
                          const Tensor& accepted, QsaTailStateView after,
-                         DeviceExecutionView execution) {
+                         CudaExecutionView execution) {
     const TailArguments args{columns<const std::uint16_t>(before.raw_keys),
                              columns<const std::uint16_t>(records.raw_keys),
                              columns<std::uint16_t>(after.raw_keys),
@@ -83,21 +83,19 @@ void launch_tail_extract(const QsaTailStateView& before, const QsaRawRecordReadV
                              static_cast<const std::int32_t*>(accepted.data)};
     if (pair_aligned(before.raw_keys) && pair_aligned(records.raw_keys) &&
         pair_aligned(after.raw_keys))
-        tail_extract_kernel<std::uint32_t><<<accepted.ne[0], 64, 0, execution.stream>>>(args);
+        tail_extract_kernel<std::uint32_t><<<accepted.ne[0], 64, 0, execution.stream()>>>(args);
     else
-        tail_extract_kernel<std::uint16_t><<<accepted.ne[0], 128, 0, execution.stream>>>(args);
+        tail_extract_kernel<std::uint16_t><<<accepted.ne[0], 128, 0, execution.stream()>>>(args);
     CUDA_CHECK(cudaGetLastError());
 }
 
 } // namespace
 
 void qsa_tail_extract(const QsaTailStateView& before, const QsaRawRecordReadView& records,
-                      const Tensor& accepted, QsaTailStateView after,
-                      DeviceExecutionView execution) {
-    const detail::qsa::ViewValidation v{"qsa_tail_extract"};
+                      const Tensor& accepted, QsaTailStateView after, CudaExecutionView execution) {
+    const detail::qsa::ViewValidation v{"qsa_tail_extract", execution.device()};
     const int batch = accepted.ne[0], capacity = records.raw_keys.ne[1];
     v.require(batch >= 1 && batch <= 8, "batch extent");
-    v.require(execution.multiprocessor_count > 0, "SM count");
     v.metadata(accepted, batch, "accepted columns");
     v.metadata(records.base_positions, batch, "record base positions");
     v.metadata(records.valid_columns, batch, "record valid columns");

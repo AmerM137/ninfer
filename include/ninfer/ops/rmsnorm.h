@@ -3,7 +3,6 @@
 #include "core/tensor.h"
 #include "core/device.h"
 
-#include <cuda_runtime.h>
 
 namespace ninfer::ops {
 
@@ -20,7 +19,7 @@ namespace ninfer::ops {
  * Preserves inputs and writes out; no workspace or persistent state.
  */
 void rmsnorm(const Tensor& x, const Tensor& weight, float eps, bool unit_offset, Tensor& out,
-             cudaStream_t stream);
+             CudaExecutionView execution);
 
 /**
  * Applies RMS normalization over ne[0] and an elementwise SiLU gate. For each logical row r:
@@ -36,7 +35,7 @@ void rmsnorm(const Tensor& x, const Tensor& weight, float eps, bool unit_offset,
  * the device's positive physical SM count.
  */
 void silu_gated_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor& z, float eps,
-                        Tensor& out, DeviceExecutionView execution);
+                        Tensor& out, CudaExecutionView execution);
 
 /**
  * Applies RMS normalization over ne[0] and an elementwise sigmoid gate. For each logical row r:
@@ -50,6 +49,6 @@ void silu_gated_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor& z, 
  * without a required BF16 norm intermediate.
  */
 void sigmoid_gated_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor& z, float eps,
-                           Tensor& out, DeviceExecutionView execution);
+                           Tensor& out, CudaExecutionView execution);
 
 } // namespace ninfer::ops

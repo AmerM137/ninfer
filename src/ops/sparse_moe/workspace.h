@@ -93,12 +93,10 @@ PrefillWorkspace allocate_prefill_workspace(Arena& arena, std::int32_t capacity_
     out.local_rank   = arena.alloc(DType::I32, {assignments}, 256);
     out.shared_scale = arena.alloc(DType::FP32, {capacity_tokens}, 256);
     out.tile_counts  = arena.alloc(DType::I32, {256, route_tiles}, 256);
-    // Both maps alias the dead prefix of tile_counts, whose last reader is the scan. The
-    // layout builder allocates nothing, so the offset is only formed when there is a pointer.
-    auto* const counts = static_cast<std::int32_t*>(out.tile_counts.data);
-    out.packed_index   = Tensor(counts, DType::I32, {assignments});
-    out.packed_token =
-        Tensor(counts != nullptr ? counts + assignments : nullptr, DType::I32, {assignments});
+    // Both maps alias the dead prefix of tile_counts, whose last reader is the scan.
+    const auto counts  = out.tile_counts.view({256 * route_tiles});
+    out.packed_index   = counts.slice(0, 0, assignments);
+    out.packed_token   = counts.slice(0, assignments, assignments);
     out.tile_bases     = arena.alloc(DType::I32, {256, route_tiles}, 256);
     out.expert_offsets = arena.alloc(DType::I32, {257}, 256);
     // A route job is one nonempty expert column tile. The bound is for the
@@ -110,13 +108,15 @@ PrefillWorkspace allocate_prefill_workspace(Arena& arena, std::int32_t capacity_
     // [1] is how many experts the route touched, which picks the gate/up pipeline depth.
     out.route_job_count = arena.alloc(DType::I32, {2}, 256);
 
-    out.score_storage     = arena.alloc(DType::FP32, {kRouterScoreRows, capacity_tokens}, 256);
-    out.shared_activation = Tensor(out.score_storage.data, DType::BF16, {512, capacity_tokens});
+    const auto scores = arena.alloc_bytes(std::size_t(kRouterScoreRows) * capacity_tokens * 4, 256);
+    out.score_storage = Tensor(scores, DType::FP32, {kRouterScoreRows, capacity_tokens});
+    out.shared_activation = Tensor(scores, DType::BF16, {512, capacity_tokens});
 
     out.grouped_io = arena.alloc(DType::BF16, {2048, assignments}, 256);
 
-    out.routed_storage = arena.alloc(DType::BF16, {512, assignments}, 256);
-    out.routed_sum     = Tensor(out.routed_storage.data, DType::FP32, {2048, capacity_tokens});
+    const auto routed  = arena.alloc_bytes(std::size_t(512) * assignments * 2, 256);
+    out.routed_storage = Tensor(routed, DType::BF16, {512, assignments});
+    out.routed_sum     = Tensor(routed, DType::FP32, {2048, capacity_tokens});
     return out;
 }
 

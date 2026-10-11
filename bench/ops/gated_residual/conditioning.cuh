@@ -23,9 +23,9 @@ static __global__ void condition_kernel(unsigned long long nanoseconds) {
 }
 } // namespace detail
 
-inline void condition(DeviceExecutionView execution, int microseconds) {
+inline void condition(CudaExecutionView execution, int microseconds) {
     if (!microseconds) return;
-    detail::condition_kernel<<<2 * execution.multiprocessor_count, 256, 0, execution.stream>>>(
+    detail::condition_kernel<<<2 * execution.multiprocessor_count(), 256, 0, execution.stream()>>>(
         static_cast<unsigned long long>(microseconds) * 1000);
     CUDA_CHECK(cudaGetLastError());
 }

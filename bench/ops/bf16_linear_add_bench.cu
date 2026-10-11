@@ -1,6 +1,7 @@
 // Cold-cache public-Op benchmark for BF16 LinearAdd [5120,6144].
 
 #include "core/weight.h"
+#include "core/buffer.h"
 #include "ninfer/ops/linear_add.h"
 
 #include "core/device.h"
@@ -174,32 +175,34 @@ int main(int argc, char** argv) {
         const std::int32_t max_tokens = options.tokens.back();
         cudaStream_t stream           = nullptr;
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+        const auto cuda = ninfer::bench::device_context().execution_view(stream);
 
         bench::L2FlushBuffer flush(options.flush_bytes);
         DeviceBuffer input = bench::make_bf16(static_cast<std::size_t>(kHidden) * max_tokens, 101U);
         DeviceBuffer residual =
             bench::make_bf16(static_cast<std::size_t>(kRows) * max_tokens, 103U);
         bench::SavedBuffer residual_initial(residual);
-        const auto restore             = [&](cudaStream_t s) { residual_initial.restore(s); };
+        const auto restore = [&](CudaExecutionView cuda) { residual_initial.restore(cuda); };
         bench::DirectBf16Weight weight = bench::make_direct_bf16_weight(kRows, kHidden, 0x61U);
-        WorkspaceArena workspace(1);
+        ninfer::DeviceBuffer workspace_storage(ninfer::bench::device_context().device(), 1);
+        MemoryArena workspace(workspace_storage.span());
 
         if (options.profile) {
             const std::int32_t tokens = options.tokens.front();
-            Tensor x(input.p, DType::BF16, {kHidden, tokens});
-            Tensor out(residual.p, DType::BF16, {kRows, tokens});
+            Tensor x(input.span(), DType::BF16, {kHidden, tokens});
+            Tensor out(residual.span(), DType::BF16, {kRows, tokens});
             for (int index = 0; index < options.warmup; ++index) {
-                restore(stream);
-                bench::flush_l2(flush, stream);
-                ops::linear_add(x, weight.weight, out, workspace, stream);
+                restore(cuda);
+                bench::flush_l2(flush, cuda);
+                ops::linear_add(x, weight.weight, out, workspace, cuda);
             }
             CUDA_CHECK(cudaStreamSynchronize(stream));
-            restore(stream);
-            bench::flush_l2(flush, stream);
+            restore(cuda);
+            bench::flush_l2(flush, cuda);
             CUDA_CHECK(cudaStreamSynchronize(stream));
             std::printf("PROFILE op=linear_add T=%d\n", tokens);
             CUDA_CHECK(cudaProfilerStart());
-            ops::linear_add(x, weight.weight, out, workspace, stream);
+            ops::linear_add(x, weight.weight, out, workspace, cuda);
             CUDA_CHECK(cudaStreamSynchronize(stream));
             CUDA_CHECK(cudaProfilerStop());
             CUDA_CHECK(cudaStreamDestroy(stream));
@@ -208,14 +211,14 @@ int main(int argc, char** argv) {
 
         std::vector<Result> results;
         for (const std::int32_t tokens : options.tokens) {
-            Tensor x(input.p, DType::BF16, {kHidden, tokens});
-            Tensor out(residual.p, DType::BF16, {kRows, tokens});
-            const auto launch = [&](cudaStream_t launch_stream) {
-                ops::linear_add(x, weight.weight, out, workspace, launch_stream);
+            Tensor x(input.span(), DType::BF16, {kHidden, tokens});
+            Tensor out(residual.span(), DType::BF16, {kRows, tokens});
+            const auto launch = [&](CudaExecutionView cuda) {
+                ops::linear_add(x, weight.weight, out, workspace, cuda);
             };
             Result result =
                 make_result(tokens,
-                            bench::measure_cold_launch_prepared(restore, launch, flush, stream,
+                            bench::measure_cold_launch_prepared(restore, launch, flush, cuda,
                                                                 options.warmup, options.repeat),
                             weight.model_weight_bytes());
             print_result(result);

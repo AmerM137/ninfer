@@ -38,7 +38,8 @@ void require_causal_geometry(AttentionHeadGeometry geometry, const char* op) {
 }
 
 std::uint32_t validate_batch_cache(const PagedKVBatchLayerView& cache, std::int32_t kv_heads,
-                                   const char* op) {
+                                   const char* op, Device device) {
+    common::operand::device(cache.device(), device, op, "cache");
     PagedKVStorageLayout layout{};
     try {
         layout = paged_kv_storage_layout(cache.storage, kHeadDim);
@@ -69,14 +70,14 @@ std::uint32_t validate_batch_cache(const PagedKVBatchLayerView& cache, std::int3
         cache.v_pages,
         {layout.value.data_leading_extent, kPagedKVPageSize, kv_heads, physical_pages}, op,
         "cache v pages");
-    common::operand::contiguous_nonnull(cache.k_pages, op, "cache k pages");
-    common::operand::contiguous_nonnull(cache.v_pages, op, "cache v pages");
+    common::operand::contiguous_nonnull(cache.k_pages, op, "cache k pages", device);
+    common::operand::contiguous_nonnull(cache.v_pages, op, "cache v pages", device);
     if (cache.block_tables.dtype != DType::I32) {
         throw std::invalid_argument(std::string(op) + ": block tables must be I32");
     }
     common::operand::shape(cache.block_tables, {logical_pages, table_rows, 1, 1}, op,
                            "block tables");
-    common::operand::contiguous_nonnull(cache.block_tables, op, "block tables");
+    common::operand::contiguous_nonnull(cache.block_tables, op, "block tables", device);
 
     const auto validate_scale = [&](const Tensor& tensor, const PagedKVVectorLayout& vector,
                                     const char* name) {
@@ -93,7 +94,7 @@ std::uint32_t validate_batch_cache(const PagedKVBatchLayerView& cache, std::int3
         common::operand::shape(
             tensor, {vector.scale_leading_extent, kPagedKVPageSize, kv_heads, physical_pages}, op,
             name);
-        common::operand::contiguous_nonnull(tensor, op, name);
+        common::operand::contiguous_nonnull(tensor, op, name, device);
     };
     validate_scale(cache.k_scale_pages, layout.key, "cache k scale pages");
     validate_scale(cache.v_scale_pages, layout.value, "cache v scale pages");
@@ -101,12 +102,12 @@ std::uint32_t validate_batch_cache(const PagedKVBatchLayerView& cache, std::int3
 }
 
 void validate_envelope(CausalAttentionExecutionEnvelope envelope, const PagedKVLayerView& cache,
-                       std::int32_t tokens, const char* op) {
+                       std::int32_t tokens, const char* op, Device device) {
     common::operand::shape(cache.block_table, {cache.block_table.ne[0], 1, 1, 1}, op,
                            "block table");
-    common::operand::contiguous_nonnull(cache.block_table, op, "block table");
+    common::operand::contiguous_nonnull(cache.block_table, op, "block table", device);
     const std::uint32_t capacity =
-        validate_batch_cache(single_row_paged_kv_batch_view(cache), cache.num_kv_heads, op);
+        validate_batch_cache(single_row_paged_kv_batch_view(cache), cache.num_kv_heads, op, device);
     if (envelope.min_visible_keys == 0 || envelope.min_visible_keys > envelope.max_visible_keys ||
         envelope.max_visible_keys > kCausalAttentionMaximumVisibleKeys ||
         envelope.max_visible_keys > capacity) {
@@ -120,7 +121,7 @@ void validate_envelope(CausalAttentionExecutionEnvelope envelope, const PagedKVL
 void validate_attention_tensors(const Tensor& q, const Tensor& positions, const Tensor& out,
                                 AttentionHeadGeometry geometry, const PagedKVLayerView& cache,
                                 CausalAttentionExecutionEnvelope envelope, float scale,
-                                const char* op) {
+                                const char* op, Device device) {
     require_causal_geometry(geometry, op);
     if (q.dtype != DType::BF16 || out.dtype != DType::BF16) {
         throw std::invalid_argument(std::string(op) + ": q/out must be BF16");
@@ -138,13 +139,13 @@ void validate_attention_tensors(const Tensor& q, const Tensor& positions, const 
     common::operand::shape(q, {kHeadDim, q_heads, tokens, 1}, op, "q");
     common::operand::shape(positions, {tokens, 1, 1, 1}, op, "positions");
     common::operand::shape(out, {kHeadDim, q_heads, tokens, 1}, op, "out");
-    common::operand::contiguous_nonnull(q, op, "q");
-    common::operand::contiguous_nonnull(positions, op, "positions");
-    common::operand::contiguous_nonnull(out, op, "out");
+    common::operand::contiguous_nonnull(q, op, "q", device);
+    common::operand::contiguous_nonnull(positions, op, "positions", device);
+    common::operand::contiguous_nonnull(out, op, "out", device);
     if (cache.num_kv_heads != kv_heads) {
         throw std::invalid_argument(std::string(op) + ": invalid KV cache head geometry");
     }
-    validate_envelope(envelope, cache, tokens, op);
+    validate_envelope(envelope, cache, tokens, op, device);
 }
 
 void validate_batched_attention_tensors(const Tensor& q, const Tensor& positions,
@@ -152,7 +153,7 @@ void validate_batched_attention_tensors(const Tensor& q, const Tensor& positions
                                         const Tensor& out, const PagedKVBatchLayerView& cache,
                                         AttentionHeadGeometry geometry,
                                         CausalAttentionExecutionEnvelope envelope, float scale,
-                                        const char* op) {
+                                        const char* op, Device device) {
     require_causal_geometry(geometry, op);
     if (q.dtype != DType::BF16 || out.dtype != DType::BF16) {
         throw std::invalid_argument(std::string(op) + ": q/out must be BF16");
@@ -178,15 +179,15 @@ void validate_batched_attention_tensors(const Tensor& q, const Tensor& positions
     if (masked) { common::operand::shape(valid_columns, {batch, 1, 1, 1}, op, "valid columns"); }
     common::operand::shape(kv_table_rows, {batch, 1, 1, 1}, op, "KV table rows");
     common::operand::shape(out, {kHeadDim, q_heads, width, batch}, op, "out");
-    common::operand::contiguous_nonnull(q, op, "q");
-    common::operand::contiguous_nonnull(positions, op, "positions");
-    if (masked) { common::operand::contiguous_nonnull(valid_columns, op, "valid columns"); }
-    common::operand::contiguous_nonnull(kv_table_rows, op, "KV table rows");
-    common::operand::contiguous_nonnull(out, op, "out");
+    common::operand::contiguous_nonnull(q, op, "q", device);
+    common::operand::contiguous_nonnull(positions, op, "positions", device);
+    if (masked) { common::operand::contiguous_nonnull(valid_columns, op, "valid columns", device); }
+    common::operand::contiguous_nonnull(kv_table_rows, op, "KV table rows", device);
+    common::operand::contiguous_nonnull(out, op, "out", device);
     if (cache.num_kv_heads != kv_heads) {
         throw std::invalid_argument(std::string(op) + ": invalid KV cache head geometry");
     }
-    const std::uint32_t capacity = validate_batch_cache(cache, kv_heads, op);
+    const std::uint32_t capacity = validate_batch_cache(cache, kv_heads, op, device);
     if (cache.block_tables.ne[1] < batch || envelope.min_visible_keys == 0 ||
         envelope.min_visible_keys > envelope.max_visible_keys ||
         envelope.max_visible_keys > kCausalAttentionMaximumVisibleKeys ||
@@ -201,14 +202,14 @@ void validate_batched_attention_tensors(const Tensor& q, const Tensor& positions
 std::size_t causal_softmax_attention_workspace_capacity_bytes(
     AttentionHeadGeometry geometry, KvCacheStorage cache_storage,
     CausalAttentionExecutionEnvelope envelope, std::int32_t batch_size, std::int32_t min_width,
-    std::int32_t max_width, DeviceExecutionView execution) {
+    std::int32_t max_width, std::int32_t multiprocessor_count) {
     require_causal_geometry(geometry, "causal_softmax_attention workspace");
     const std::int32_t q_heads = geometry.query_heads;
     bool supported_dtype       = true;
     try {
         (void)paged_kv_storage_layout(cache_storage, kHeadDim);
     } catch (const std::invalid_argument&) { supported_dtype = false; }
-    if (execution.multiprocessor_count <= 0 || !supported_dtype || batch_size <= 0 ||
+    if (multiprocessor_count <= 0 || !supported_dtype || batch_size <= 0 ||
         batch_size > kMaximumBatchSize || min_width <= 0 || max_width < min_width ||
         (batch_size > 1 && max_width > kMaximumVerifyTokens) || envelope.min_visible_keys == 0 ||
         envelope.min_visible_keys > envelope.max_visible_keys ||
@@ -219,36 +220,37 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
 
     if (cache_storage == KvCacheStorage::BFloat16)
         return detail::bf16_kv_workspace_bytes(q_heads, batch_size, min_width, max_width, envelope,
-                                               execution.multiprocessor_count);
+                                               multiprocessor_count);
 
     if (cache_storage == KvCacheStorage::Fp8E4M3Row256)
         return detail::fp8_kv_workspace_bytes(q_heads, batch_size, min_width, max_width, envelope,
-                                              execution.multiprocessor_count);
+                                              multiprocessor_count);
 
     if (cache_storage == KvCacheStorage::Int8Group64)
         return detail::int8_kv_workspace_bytes(q_heads, batch_size, min_width, max_width, envelope,
-                                               execution.multiprocessor_count);
+                                               multiprocessor_count);
 
     if (cache_storage == KvCacheStorage::Nvfp4Group16)
         return detail::nvfp4_kv_workspace_bytes(q_heads, batch_size, min_width, max_width, envelope,
-                                                execution.multiprocessor_count);
+                                                multiprocessor_count);
 
     return detail::k8v4_kv_workspace_bytes(q_heads, batch_size, min_width, max_width, envelope,
-                                           execution.multiprocessor_count);
+                                           multiprocessor_count);
 }
 
 void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                               const Tensor& positions, const Tensor& valid_columns,
                               const Tensor& kv_table_rows, AttentionHeadGeometry geometry,
                               float scale, PagedKVBatchLayerView cache,
-                              CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
-                              Tensor& out, DeviceExecutionView execution) {
-    constexpr const char* op = "causal_softmax_attention";
-    if (execution.multiprocessor_count <= 0) {
-        throw std::invalid_argument(std::string(op) + ": SM count must be positive");
+                              CausalAttentionExecutionEnvelope envelope, MemoryArena& workspace,
+                              Tensor& out, CudaExecutionView execution) {
+    if (workspace.device() != execution.device()) {
+        throw std::invalid_argument(
+            "causal_softmax_attention: workspace belongs to another device");
     }
+    constexpr const char* op = "causal_softmax_attention";
     validate_batched_attention_tensors(q, positions, valid_columns, kv_table_rows, out, cache,
-                                       geometry, envelope, scale, op);
+                                       geometry, envelope, scale, op, execution.device());
     if (k.dtype != DType::BF16 || v.dtype != DType::BF16) {
         throw std::invalid_argument("causal_softmax_attention: k/v must be BF16");
     }
@@ -257,8 +259,8 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
     const std::int32_t kv_heads = geometry.kv_heads;
     common::operand::shape(k, {kHeadDim, kv_heads, width, batch}, op, "k");
     common::operand::shape(v, {kHeadDim, kv_heads, width, batch}, op, "v");
-    common::operand::contiguous_nonnull(k, op, "k");
-    common::operand::contiguous_nonnull(v, op, "v");
+    common::operand::contiguous_nonnull(k, op, "k", execution.device());
+    common::operand::contiguous_nonnull(v, op, "v", execution.device());
 
     if (cache.storage == KvCacheStorage::BFloat16) {
         detail::bf16_kv_append_attention(q, k, v, positions, valid_columns, kv_table_rows, scale,
@@ -292,13 +294,15 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
                                      AttentionHeadGeometry geometry, float scale,
                                      const PagedKVLayerView& cache,
                                      CausalAttentionExecutionEnvelope envelope,
-                                     WorkspaceArena& workspace, Tensor& out,
-                                     DeviceExecutionView execution) {
-    constexpr const char* op = "causal_softmax_attention_cached";
-    if (execution.multiprocessor_count <= 0) {
-        throw std::invalid_argument(std::string(op) + ": SM count must be positive");
+                                     MemoryArena& workspace, Tensor& out,
+                                     CudaExecutionView execution) {
+    if (workspace.device() != execution.device()) {
+        throw std::invalid_argument(
+            "causal_softmax_attention_cached: workspace belongs to another device");
     }
-    validate_attention_tensors(q, positions, out, geometry, cache, envelope, scale, op);
+    constexpr const char* op = "causal_softmax_attention_cached";
+    validate_attention_tensors(q, positions, out, geometry, cache, envelope, scale, op,
+                               execution.device());
 
     if (cache.storage == KvCacheStorage::BFloat16) {
         detail::bf16_kv_cached_attention(q, positions, scale, cache, envelope, workspace, out,

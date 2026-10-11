@@ -1,4 +1,5 @@
 #include "core/arena.h"
+#include "cuda_fixture.h"
 #include "core/paged_kv_cache.h"
 #include "ninfer/ops/kv_cache_append.h"
 #include "ninfer/ops/softmax_attention.h"
@@ -1042,22 +1043,22 @@ public:
     PagedKVLayerView view() {
         PagedKVLayerView result;
         result.k_pages = Tensor(
-            k_.data(), layout_.key.code_dtype,
+            k_.span(), layout_.key.code_dtype,
             {layout_.key.code_extent, kPagedKVPageSize, geometry_.kv_heads, physical_pages_});
         result.v_pages = Tensor(
-            v_.data(), layout_.value.code_dtype,
+            v_.span(), layout_.value.code_dtype,
             {layout_.value.code_extent, kPagedKVPageSize, geometry_.kv_heads, physical_pages_});
-        result.block_table  = Tensor(block_table_.data(), DType::I32, {logical_pages_});
+        result.block_table  = Tensor(block_table_.span(), DType::I32, {logical_pages_});
         result.num_kv_heads = geometry_.kv_heads;
         result.head_dim     = kHeadDim;
         result.storage      = storage_;
         if (layout_.key.scale_extent != 0) {
             result.k_scale_pages = Tensor(
-                k_scale_.data(), layout_.key.scale_dtype,
+                k_scale_.span(), layout_.key.scale_dtype,
                 {layout_.key.scale_extent, kPagedKVPageSize, geometry_.kv_heads, physical_pages_});
         }
         if (layout_.value.scale_extent != 0) {
-            result.v_scale_pages = Tensor(v_scale_.data(), layout_.value.scale_dtype,
+            result.v_scale_pages = Tensor(v_scale_.span(), layout_.value.scale_dtype,
                                           {layout_.value.scale_extent, kPagedKVPageSize,
                                            geometry_.kv_heads, physical_pages_});
         }
@@ -1237,23 +1238,23 @@ public:
     PagedKVBatchLayerView view() {
         PagedKVBatchLayerView result;
         result.k_pages = Tensor(
-            k_.data(), layout_.key.code_dtype,
+            k_.span(), layout_.key.code_dtype,
             {layout_.key.code_extent, kPagedKVPageSize, geometry_.kv_heads, physical_pages_});
         result.v_pages = Tensor(
-            v_.data(), layout_.value.code_dtype,
+            v_.span(), layout_.value.code_dtype,
             {layout_.value.code_extent, kPagedKVPageSize, geometry_.kv_heads, physical_pages_});
-        result.block_tables = Tensor(block_tables_.data(), DType::I32,
+        result.block_tables = Tensor(block_tables_.span(), DType::I32,
                                      {logical_pages_, static_cast<std::int32_t>(rows_)});
         result.num_kv_heads = geometry_.kv_heads;
         result.head_dim     = kHeadDim;
         result.storage      = storage_;
         if (layout_.key.scale_extent != 0) {
             result.k_scale_pages = Tensor(
-                k_scale_.data(), layout_.key.scale_dtype,
+                k_scale_.span(), layout_.key.scale_dtype,
                 {layout_.key.scale_extent, kPagedKVPageSize, geometry_.kv_heads, physical_pages_});
         }
         if (layout_.value.scale_extent != 0) {
-            result.v_scale_pages = Tensor(v_scale_.data(), layout_.value.scale_dtype,
+            result.v_scale_pages = Tensor(v_scale_.span(), layout_.value.scale_dtype,
                                           {layout_.value.scale_extent, kPagedKVPageSize,
                                            geometry_.kv_heads, physical_pages_});
         }
@@ -1284,12 +1285,10 @@ public:
                 .v_pages       = batch.v_pages,
                 .k_scale_pages = batch.k_scale_pages,
                 .v_scale_pages = batch.v_scale_pages,
-                .block_table =
-                    Tensor(static_cast<std::int32_t*>(block_tables_.data()) + row * logical_pages_,
-                           DType::I32, {logical_pages_}),
-                .head_dim     = kHeadDim,
-                .num_kv_heads = geometry_.kv_heads,
-                .storage      = storage_};
+                .block_table   = batch.block_tables.slice(1, row, 1).view({logical_pages_}),
+                .head_dim      = kHeadDim,
+                .num_kv_heads  = geometry_.kv_heads,
+                .storage       = storage_};
     }
 
     int verify_untouched(const std::string& label, const Bytes& before,
@@ -1709,14 +1708,14 @@ std::string case_label(const char* entry, const Geometry& geometry, KvCacheStora
 template <class Launch>
 void launch_attention_case(Launch&& launch, bool graph_replay) {
     if (!graph_replay) {
-        launch(nullptr);
+        launch(cuda_environment().default_execution);
         cuda_synchronize();
         return;
     }
 
     // Prime route-local CUDA function attributes before stream capture. The append route writes
     // the same represented values to the same positions, so this does not change its oracle.
-    launch(nullptr);
+    launch(cuda_environment().default_execution);
     cuda_synchronize();
 
     cudaStream_t stream        = nullptr;
@@ -1724,9 +1723,10 @@ void launch_attention_case(Launch&& launch, bool graph_replay) {
     cudaGraphExec_t executable = nullptr;
     cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking),
                "create causal-attention graph stream");
+    const auto stream_execution = ninfer::test::cuda_environment().context.execution_view(stream);
     cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal),
                "begin causal-attention capture");
-    launch(stream);
+    launch(stream_execution);
     cuda_check(cudaStreamEndCapture(stream, &graph), "end causal-attention capture");
     cuda_check(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0),
                "instantiate causal-attention graph");
@@ -1762,7 +1762,7 @@ std::vector<T> select_query_columns(const std::vector<T>& values, std::size_t st
     return result;
 }
 
-int run_a1_case(DeviceExecutionView execution, const Geometry& geometry, KvCacheStorage storage,
+int run_a1_case(CudaExecutionView execution, const Geometry& geometry, KvCacheStorage storage,
                 const AttentionCase& test_case, MappingPattern mapping,
                 std::span<const int> oracle_queries         = {},
                 std::span<const std::uint32_t> graph_limits = {}) {
@@ -1816,22 +1816,23 @@ int run_a1_case(DeviceExecutionView execution, const Geometry& geometry, KvCache
     std::vector<std::uint16_t> output_canary(q_bits.size(), kOutputCanary);
     dout.copy_from_host(output_canary.data(), output_canary.size() * sizeof(std::uint16_t));
 
-    Tensor tq(dq.data(), DType::BF16, {kHeadDim, geometry.q_heads, test_case.tokens});
-    Tensor tk(dk.data(), DType::BF16, {kHeadDim, geometry.kv_heads, test_case.tokens});
-    Tensor tv(dv.data(), DType::BF16, {kHeadDim, geometry.kv_heads, test_case.tokens});
-    Tensor tp(dp.data(), DType::I32, {test_case.tokens});
-    Tensor ttable_row(dtable_row.data(), DType::I32, {1});
-    Tensor tout(dout.data(), DType::BF16, {kHeadDim, geometry.q_heads, test_case.tokens});
+    Tensor tq(dq.span(), DType::BF16, {kHeadDim, geometry.q_heads, test_case.tokens});
+    Tensor tk(dk.span(), DType::BF16, {kHeadDim, geometry.kv_heads, test_case.tokens});
+    Tensor tv(dv.span(), DType::BF16, {kHeadDim, geometry.kv_heads, test_case.tokens});
+    Tensor tp(dp.span(), DType::I32, {test_case.tokens});
+    Tensor ttable_row(dtable_row.span(), DType::I32, {1});
+    Tensor tout(dout.span(), DType::BF16, {kHeadDim, geometry.q_heads, test_case.tokens});
     const std::size_t workspace_bytes = ops::causal_softmax_attention_workspace_capacity_bytes(
-        op_geometry(geometry), storage, envelope, 1, test_case.tokens, test_case.tokens, execution);
+        op_geometry(geometry), storage, envelope, 1, test_case.tokens, test_case.tokens,
+        execution.multiprocessor_count());
     GuardedDeviceBuffer workspace_buffer(std::max<std::size_t>(workspace_bytes, 256));
-    WorkspaceArena workspace(DeviceSpan{workspace_buffer.data(), workspace_buffer.bytes()});
+    MemoryArena workspace(workspace_buffer.span());
 
     int graph_failures = 0;
-    const auto launch  = [&](cudaStream_t stream) {
+    const auto launch  = [&](CudaExecutionView cuda) {
         ops::causal_softmax_attention(tq, tk, tv, tp, Tensor{}, ttable_row, op_geometry(geometry),
                                        kAttentionScale, cache.batch_view(), envelope, workspace,
-                                       tout, execution.on_stream(stream));
+                                       tout, cuda);
     };
     if (graph_limits.empty()) {
         launch_attention_case(launch, test_case.graph_replay);
@@ -1839,17 +1840,17 @@ int run_a1_case(DeviceExecutionView execution, const Geometry& geometry, KvCache
         DecodeGraphExecutable executable;
         for (const auto limit : graph_limits) {
             envelope.max_visible_keys = limit;
-            launch(execution.stream);
+            launch(execution);
             cuda_synchronize();
             DecodeGraphDefinition definition;
-            definition.capture(execution.stream, [&] { launch(execution.stream); });
+            definition.capture(execution.stream(), [&] { launch(execution); });
             if (executable.ready())
                 executable.update(definition);
             else
                 executable.instantiate(definition);
             dout.copy_from_host(output_canary.data(), output_canary.size() * sizeof(std::uint16_t));
             cuda_synchronize();
-            executable.launch(execution.stream);
+            executable.launch(execution.stream());
             cuda_synchronize();
             const auto actual = copy_from_guarded<std::uint16_t>(dout, q_bits.size());
             graph_failures +=
@@ -1872,7 +1873,8 @@ int run_a1_case(DeviceExecutionView execution, const Geometry& geometry, KvCache
     failures += verify_cache(label, cache.snapshot(), expected);
     if (storage == KvCacheStorage::Nvfp4Group16 || storage == KvCacheStorage::Fp8KeyNvfp4Value) {
         DeviceCache standalone(initial, mapping, max_context);
-        ops::kv_cache_append(tk, tv, tp, standalone.view(), nullptr);
+        ops::kv_cache_append(tk, tv, tp, standalone.view(),
+                             ninfer::test::cuda_environment().default_execution);
         cuda_synchronize();
         failures += verify_cache(label + " fused/standalone byte parity", cache.snapshot(),
                                  standalone.snapshot());
@@ -1893,7 +1895,7 @@ int run_a1_case(DeviceExecutionView execution, const Geometry& geometry, KvCache
     return failures;
 }
 
-int run_a3_case(DeviceExecutionView execution, const Geometry& geometry, KvCacheStorage storage,
+int run_a3_case(CudaExecutionView execution, const Geometry& geometry, KvCacheStorage storage,
                 const AttentionCase& test_case, MappingPattern mapping,
                 std::span<const int> oracle_queries = {}) {
     const std::int32_t total       = test_case.base + test_case.tokens;
@@ -1928,19 +1930,19 @@ int run_a3_case(DeviceExecutionView execution, const Geometry& geometry, KvCache
     std::vector<std::uint16_t> output_canary(q_bits.size(), kOutputCanary);
     dout.copy_from_host(output_canary.data(), output_canary.size() * sizeof(std::uint16_t));
 
-    Tensor tq(dq.data(), DType::BF16, {kHeadDim, geometry.q_heads, test_case.tokens});
-    Tensor tp(dp.data(), DType::I32, {test_case.tokens});
-    Tensor tout(dout.data(), DType::BF16, {kHeadDim, geometry.q_heads, test_case.tokens});
+    Tensor tq(dq.span(), DType::BF16, {kHeadDim, geometry.q_heads, test_case.tokens});
+    Tensor tp(dp.span(), DType::I32, {test_case.tokens});
+    Tensor tout(dout.span(), DType::BF16, {kHeadDim, geometry.q_heads, test_case.tokens});
     const std::size_t workspace_bytes = ops::causal_softmax_attention_workspace_capacity_bytes(
-        op_geometry(geometry), storage, envelope, 1, test_case.tokens, test_case.tokens, execution);
+        op_geometry(geometry), storage, envelope, 1, test_case.tokens, test_case.tokens,
+        execution.multiprocessor_count());
     GuardedDeviceBuffer workspace_buffer(std::max<std::size_t>(workspace_bytes, 256));
-    WorkspaceArena workspace(DeviceSpan{workspace_buffer.data(), workspace_buffer.bytes()});
+    MemoryArena workspace(workspace_buffer.span());
 
     launch_attention_case(
-        [&](cudaStream_t stream) {
+        [&](CudaExecutionView cuda) {
             ops::causal_softmax_attention_cached(tq, tp, op_geometry(geometry), kAttentionScale,
-                                                 cache.view(), envelope, workspace, tout,
-                                                 execution.on_stream(stream));
+                                                 cache.view(), envelope, workspace, tout, cuda);
         },
         test_case.graph_replay);
 
@@ -2017,7 +2019,7 @@ int verify_invalid_columns_zero(const std::string& label, std::span<const std::u
     return failures;
 }
 
-int run_batch_case(DeviceExecutionView execution, const Geometry& geometry, KvCacheStorage storage,
+int run_batch_case(CudaExecutionView execution, const Geometry& geometry, KvCacheStorage storage,
                    const BatchAttentionCase& test_case, int envelope_max = 0,
                    std::span<const std::uint32_t> graph_limits = {}) {
     const int batch = test_case.contexts.size(), width = test_case.width;
@@ -2056,16 +2058,17 @@ int run_batch_case(DeviceExecutionView execution, const Geometry& geometry, KvCa
         control.emplace(initial, test_case.mapping, envelope.max_visible_keys);
     GuardedDeviceBuffer dq(q.size() * 2), dk(k.size() * 2), dv(v.size() * 2), dp(columns * 4),
         dvalid(batch * 4), dlanes(batch * 4), dout(q.size() * 2);
-    Tensor tq(dq.data(), DType::BF16, {kHeadDim, geometry.q_heads, width, batch});
-    Tensor tk(dk.data(), DType::BF16, {kHeadDim, geometry.kv_heads, width, batch}),
-        tv(dv.data(), DType::BF16, {kHeadDim, geometry.kv_heads, width, batch});
-    Tensor tp(dp.data(), DType::I32, {width, batch}), tvalid(dvalid.data(), DType::I32, {batch}),
-        tlanes(dlanes.data(), DType::I32, {batch});
-    Tensor tout(dout.data(), DType::BF16, {kHeadDim, geometry.q_heads, width, batch});
+    Tensor tq(dq.span(), DType::BF16, {kHeadDim, geometry.q_heads, width, batch});
+    Tensor tk(dk.span(), DType::BF16, {kHeadDim, geometry.kv_heads, width, batch}),
+        tv(dv.span(), DType::BF16, {kHeadDim, geometry.kv_heads, width, batch});
+    Tensor tp(dp.span(), DType::I32, {width, batch}), tvalid(dvalid.span(), DType::I32, {batch}),
+        tlanes(dlanes.span(), DType::I32, {batch});
+    Tensor tout(dout.span(), DType::BF16, {kHeadDim, geometry.q_heads, width, batch});
     const auto capacity = ops::causal_softmax_attention_workspace_capacity_bytes(
-        op_geometry(geometry), storage, envelope, batch, width, width, execution);
+        op_geometry(geometry), storage, envelope, batch, width, width,
+        execution.multiprocessor_count());
     GuardedDeviceBuffer scratch(std::max<std::size_t>(capacity, 256));
-    WorkspaceArena workspace(DeviceSpan{scratch.data(), scratch.bytes()});
+    MemoryArena workspace(scratch.span());
     const bool masked = test_case.graph_replay ||
                         std::any_of(test_case.valid_columns.begin(), test_case.valid_columns.end(),
                                     [&](int count) { return count != width; });
@@ -2124,8 +2127,8 @@ int run_batch_case(DeviceExecutionView execution, const Geometry& geometry, KvCa
         if (test_case.graph_replay && (phase == 0 || !graph_limits.empty())) {
             launch();
             cuda_synchronize(
-                execution.stream); // Warm lazy CUDA attributes; repeated append is idempotent.
-            definition.capture(execution.stream, launch);
+                execution.stream()); // Warm lazy CUDA attributes; repeated append is idempotent.
+            definition.capture(execution.stream(), launch);
             if (graph.ready())
                 graph.update(definition);
             else
@@ -2135,10 +2138,10 @@ int run_batch_case(DeviceExecutionView execution, const Geometry& geometry, KvCa
             cuda_synchronize();
         }
         if (test_case.graph_replay)
-            graph.launch(execution.stream);
+            graph.launch(execution.stream());
         else
             launch();
-        cuda_synchronize(execution.stream);
+        cuda_synchronize(execution.stream());
         const std::string label = std::string("causal batch ") + geometry.name + " " +
                                   cache_name(storage) + " W=" + std::to_string(width) +
                                   " B=" + std::to_string(batch) + " phase=" + std::to_string(phase);
@@ -2151,17 +2154,12 @@ int run_batch_case(DeviceExecutionView execution, const Geometry& geometry, KvCa
         if (control) {
             for (int b = 0; b < batch; ++b)
                 if (valid[b]) {
-                    Tensor ck(static_cast<std::uint16_t*>(dk.data()) +
-                                  b * width * kv_column_elements,
-                              DType::BF16, {kHeadDim, geometry.kv_heads, valid[b]});
-                    Tensor cv(static_cast<std::uint16_t*>(dv.data()) +
-                                  b * width * kv_column_elements,
-                              DType::BF16, {kHeadDim, geometry.kv_heads, valid[b]});
-                    Tensor cp(static_cast<int*>(dp.data()) + b * width, DType::I32, {valid[b]});
-                    ops::kv_cache_append(ck, cv, cp, control->single_view(lanes[b]),
-                                         execution.stream);
+                    Tensor ck = tk.slice(3, b, 1).slice(2, 0, valid[b]);
+                    Tensor cv = tv.slice(3, b, 1).slice(2, 0, valid[b]);
+                    Tensor cp = tp.slice(1, b, 1).slice(0, 0, valid[b]);
+                    ops::kv_cache_append(ck, cv, cp, control->single_view(lanes[b]), execution);
                 }
-            cuda_synchronize(execution.stream);
+            cuda_synchronize(execution.stream());
             const auto actual = cache.snapshot_bytes(), standalone = control->snapshot_bytes();
             for (int plane = 0; plane < 4; ++plane)
                 failures += verify_exact(
@@ -2237,7 +2235,7 @@ int report_quantization_quality(KvCacheStorage storage, std::uint32_t seed) {
     return 0;
 }
 
-int run_quantized_batch_cases(DeviceExecutionView execution, KvCacheStorage storage,
+int run_quantized_batch_cases(CudaExecutionView execution, KvCacheStorage storage,
                               std::uint32_t seed) {
     int failures = 0;
     failures += run_batch_case(execution, kGeometries[0], storage,
@@ -2268,7 +2266,7 @@ int run_quantized_batch_cases(DeviceExecutionView execution, KvCacheStorage stor
     return failures;
 }
 
-int run_verify_width_cases(DeviceExecutionView execution, KvCacheStorage storage) {
+int run_verify_width_cases(CudaExecutionView execution, KvCacheStorage storage) {
     constexpr int order[]{7, 0, 4, 2, 6, 1, 5, 3};
     int failures   = 0;
     const auto run = [&](int width, int batch, int base, bool graph) {
@@ -2310,7 +2308,7 @@ int run_verify_width_cases(DeviceExecutionView execution, KvCacheStorage storage
     return failures;
 }
 
-int run_batch_cases(DeviceExecutionView execution, KvCacheStorage storage) {
+int run_batch_cases(CudaExecutionView execution, KvCacheStorage storage) {
     int failures = 0;
     failures += run_batch_case(execution, kGeometries[0], storage,
                                {16, {0}, {0}, {0}, MappingPattern::Fragmented, 1501u});
@@ -2346,7 +2344,7 @@ int run_batch_cases(DeviceExecutionView execution, KvCacheStorage storage) {
     return failures;
 }
 
-int run_geometry(DeviceExecutionView execution, const Geometry& geometry, KvCacheStorage storage) {
+int run_geometry(CudaExecutionView execution, const Geometry& geometry, KvCacheStorage storage) {
     int failures = 0;
     for (const MappingPattern mapping :
          {MappingPattern::Identity, MappingPattern::Offset, MappingPattern::Fragmented}) {
@@ -2388,7 +2386,7 @@ int run_geometry(DeviceExecutionView execution, const Geometry& geometry, KvCach
 
 // A fixed-width call keeps update-compatible execution across short and
 // long envelopes. Verify each replay against the independent oracle.
-int run_graph_envelope_cases(DeviceExecutionView execution, KvCacheStorage storage) {
+int run_graph_envelope_cases(CudaExecutionView execution, KvCacheStorage storage) {
     int failures = 0;
     constexpr std::array<std::uint32_t, 5> short_limits{64, 128, 2048, 64, 2048};
     constexpr std::array<std::uint32_t, 4> long_limits{32769, 65536, 131072, 32769};
@@ -2413,7 +2411,7 @@ int run_graph_envelope_cases(DeviceExecutionView execution, KvCacheStorage stora
     return failures;
 }
 
-int run_quantized_causal_cases(DeviceExecutionView execution, KvCacheStorage storage) {
+int run_quantized_causal_cases(CudaExecutionView execution, KvCacheStorage storage) {
     int failures = 0;
     for (const Geometry& geometry : kGeometries) {
         // Grouped/parallel and decode/prefill width boundaries remain independent
@@ -2504,7 +2502,7 @@ int run_quantized_causal_cases(DeviceExecutionView execution, KvCacheStorage sto
     return failures;
 }
 
-int run_nvfp4_cases(DeviceExecutionView execution) {
+int run_nvfp4_cases(CudaExecutionView execution) {
     int failures = 0;
     for (const Geometry& geometry : kGeometries) {
         failures += run_a1_case(execution, geometry, KvCacheStorage::Nvfp4Group16, {1, 0, 1, 701u},
@@ -2549,7 +2547,7 @@ int run_nvfp4_cases(DeviceExecutionView execution) {
     return failures;
 }
 
-int run_k8v4_cases(DeviceExecutionView execution) {
+int run_k8v4_cases(CudaExecutionView execution) {
     int failures = 0;
     for (const Geometry& geometry : kGeometries) {
         failures += run_a1_case(execution, geometry, KvCacheStorage::Fp8KeyNvfp4Value,
@@ -2584,16 +2582,17 @@ int run_k8v4_cases(DeviceExecutionView execution) {
     return failures;
 }
 
-int verify_workspace_capacity_contract(DeviceExecutionView execution, KvCacheStorage storage) {
+int verify_workspace_capacity_contract(CudaExecutionView execution, KvCacheStorage storage) {
     int failures = 0;
     constexpr ops::CausalAttentionExecutionEnvelope envelope{1, 1025};
     constexpr ops::AttentionHeadGeometry geometry{kHeadDim, 16, 2};
     const std::size_t interval = ops::causal_softmax_attention_workspace_capacity_bytes(
-        geometry, storage, envelope, 1, 1, 17, execution);
+        geometry, storage, envelope, 1, 1, 17, execution.multiprocessor_count());
     std::size_t witness = 0;
     for (std::int32_t tokens = 1; tokens <= 17; ++tokens) {
         witness = std::max(witness, ops::causal_softmax_attention_workspace_capacity_bytes(
-                                        geometry, storage, envelope, 1, tokens, tokens, execution));
+                                        geometry, storage, envelope, 1, tokens, tokens,
+                                        execution.multiprocessor_count()));
     }
     if (interval != witness) {
         std::cerr << "causal_softmax_attention interval capacity has no exact route witness\n";
@@ -2609,9 +2608,10 @@ int verify_workspace_capacity_contract(DeviceExecutionView execution, KvCacheSto
             for (int width = 17; width <= 1025; ++width)
                 largest = std::max(largest, ops::causal_softmax_attention_workspace_capacity_bytes(
                                                 op_geometry(item), storage, prefill_envelope, 1,
-                                                width, width, execution));
+                                                width, width, execution.multiprocessor_count()));
             const auto capacity = ops::causal_softmax_attention_workspace_capacity_bytes(
-                op_geometry(item), storage, prefill_envelope, 1, 17, 1025, execution);
+                op_geometry(item), storage, prefill_envelope, 1, 17, 1025,
+                execution.multiprocessor_count());
             if (capacity != largest) {
                 std::cerr << "causal_softmax_attention prefill interval capacity mismatch\n";
                 ++failures;
@@ -2622,7 +2622,6 @@ int verify_workspace_capacity_contract(DeviceExecutionView execution, KvCacheSto
     // Device capacity is a planning input. Host-only queries cover batched decode
     // and single-request prefill on several SM counts without launching synthetic devices.
     for (const int sm_count : {96, 160, 170, 192}) {
-        const DeviceExecutionView capacity_execution{nullptr, sm_count};
         constexpr ops::AttentionHeadGeometry capacity_geometry{kHeadDim, 24, 4};
         constexpr ops::CausalAttentionExecutionEnvelope capacity_envelope{1, 131072};
         for (const int batch : {1, 3}) {
@@ -2631,10 +2630,9 @@ int verify_workspace_capacity_contract(DeviceExecutionView execution, KvCacheSto
             for (int width = 1; width <= max_width; ++width)
                 largest = std::max(largest, ops::causal_softmax_attention_workspace_capacity_bytes(
                                                 capacity_geometry, storage, capacity_envelope,
-                                                batch, width, width, capacity_execution));
+                                                batch, width, width, sm_count));
             const auto capacity = ops::causal_softmax_attention_workspace_capacity_bytes(
-                capacity_geometry, storage, capacity_envelope, batch, 1, max_width,
-                capacity_execution);
+                capacity_geometry, storage, capacity_envelope, batch, 1, max_width, sm_count);
             if (capacity != largest) {
                 std::cerr << "causal_softmax_attention capacity interval mismatch for SM="
                           << sm_count << " B=" << batch << '\n';
@@ -2645,7 +2643,7 @@ int verify_workspace_capacity_contract(DeviceExecutionView execution, KvCacheSto
     for (const int sm_count : {0, -1}) {
         try {
             (void)ops::causal_softmax_attention_workspace_capacity_bytes(
-                geometry, storage, envelope, 1, 1, 17, {nullptr, sm_count});
+                geometry, storage, envelope, 1, 1, 17, sm_count);
             std::cerr << "causal_softmax_attention accepted a nonpositive SM count\n";
             ++failures;
         } catch (const std::invalid_argument&) {}
@@ -2654,7 +2652,7 @@ int verify_workspace_capacity_contract(DeviceExecutionView execution, KvCacheSto
     try {
         (void)ops::causal_softmax_attention_workspace_capacity_bytes(
             {kHeadDim, 16, 2}, storage, {1, ops::kCausalAttentionMaximumVisibleKeys}, 1, 1, 1,
-            execution);
+            execution.multiprocessor_count());
     } catch (const std::invalid_argument&) {
         std::cerr << "causal_softmax_attention rejected its maximum visible-key envelope\n";
         ++failures;
@@ -2662,14 +2660,14 @@ int verify_workspace_capacity_contract(DeviceExecutionView execution, KvCacheSto
     try {
         (void)ops::causal_softmax_attention_workspace_capacity_bytes(
             {kHeadDim, 16, 2}, storage, {1, ops::kCausalAttentionMaximumVisibleKeys + 1}, 1, 1, 1,
-            execution);
+            execution.multiprocessor_count());
         std::cerr << "causal_softmax_attention accepted an envelope outside the launcher domain\n";
         ++failures;
     } catch (const std::invalid_argument&) {}
     return failures;
 }
 
-int run_numerical_profile_cases(DeviceExecutionView execution, KvCacheStorage storage) {
+int run_numerical_profile_cases(CudaExecutionView execution, KvCacheStorage storage) {
     int failures = 0;
     const std::array<int, 4> queries{0, 63, 128, 1023};
     for (const auto& geometry : kGeometries) {
@@ -2688,7 +2686,7 @@ int run_numerical_profile_cases(DeviceExecutionView execution, KvCacheStorage st
     return failures;
 }
 
-int run_small_prefill_cases(DeviceExecutionView execution, KvCacheStorage storage) {
+int run_small_prefill_cases(CudaExecutionView execution, KvCacheStorage storage) {
     int failures = 0;
     const std::array<int, 4> append_queries{0, 7, 16, 33};
     const std::array<int, 4> cached_queries{0, 63, 64, 128};
@@ -2714,7 +2712,7 @@ int run_small_prefill_cases(DeviceExecutionView execution, KvCacheStorage storag
     return failures;
 }
 
-int run_storage_cases(DeviceExecutionView execution, KvCacheStorage storage) {
+int run_storage_cases(CudaExecutionView execution, KvCacheStorage storage) {
     int failures = verify_workspace_capacity_contract(execution, storage);
     if (storage == KvCacheStorage::Nvfp4Group16) {
         failures += run_nvfp4_cases(execution);

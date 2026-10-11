@@ -1,4 +1,6 @@
 #include "sparse_gqa_fixture.h"
+#include "cuda_fixture.h"
+#include "core/buffer.h"
 #include "core/decode_graph.h"
 
 using namespace ninfer;
@@ -62,21 +64,21 @@ int run(DeviceContext& device, int t, int b, int history, bool padded = false, i
         int live_limit = std::numeric_limits<int>::max()) {
     Fixture f(t, b, history, padded, storage);
     f.live_limit     = live_limit;
-    const auto bytes = ops::qsa_sparse_gqa_workspace_capacity_bytes(storage, t, t, b, f.envelope,
-                                                                    device.execution_view());
+    const auto bytes = ops::qsa_sparse_gqa_workspace_capacity_bytes(
+        storage, t, t, b, f.envelope, device.execution_view().multiprocessor_count());
     GuardedDeviceBuffer scratch(std::max<std::size_t>(bytes, 256));
-    WorkspaceArena arena(DeviceSpan{scratch.data(), std::max<std::size_t>(bytes, 256)});
+    MemoryArena arena(scratch.span().subspan(0, std::max<std::size_t>(bytes, 256)));
     DecodeGraphExecutable executable;
     int failures = 0;
     for (int phase = 0; phase < (graph ? 3 : 1); ++phase) {
         f.reset(phase, cap, magnitude);
         if (graph && phase == 0) {
             DecodeGraphDefinition definition;
-            definition.capture(device.stream, [&] { f.launch(arena, device.execution_view()); });
+            definition.capture(device.stream(), [&] { f.launch(arena, device.execution_view()); });
             executable.instantiate(definition);
         }
         if (graph)
-            executable.launch(device.stream);
+            executable.launch(device.stream());
         else
             f.launch(arena, device.execution_view());
         device.synchronize();
@@ -130,9 +132,12 @@ int gate_rounding(DeviceContext& device, KvCacheStorage storage = KvCacheStorage
         v.scales.upload();
         CUDA_CHECK(cudaStreamSynchronize(nullptr));
     }
-    WorkspaceArena workspace(std::max<std::size_t>(
-        256, ops::qsa_sparse_gqa_workspace_capacity_bytes(storage, tokens, tokens, 1, f.envelope,
-                                                          device.execution_view())));
+    ninfer::DeviceBuffer workspace_storage(
+        ninfer::test::cuda_environment().context.device(),
+        std::max<std::size_t>(256, ops::qsa_sparse_gqa_workspace_capacity_bytes(
+                                       storage, tokens, tokens, 1, f.envelope,
+                                       device.execution_view().multiprocessor_count())));
+    MemoryArena workspace(workspace_storage.span());
     f.launch(workspace, device.execution_view());
     device.synchronize();
     return verify(f, "gate without intermediate BF16 storage=" + std::to_string(int(storage)) +
@@ -143,8 +148,12 @@ int read_footprint(DeviceContext& device, KvCacheStorage storage = KvCacheStorag
                    bool padded = true) {
     Fixture f(3, 4, 2053, padded, storage);
     f.reset(0, 1);
-    DeviceBuffer q(f.q.bytes()), gate(f.gate.bytes()), pos(f.pos.bytes()),
-        ids(f.selections.bytes()), counts(f.sizes.bytes()), table(f.table.bytes());
+    DeviceBuffer q(ninfer::test::cuda_environment().context.device(), f.q.bytes());
+    DeviceBuffer gate(ninfer::test::cuda_environment().context.device(), f.gate.bytes());
+    DeviceBuffer pos(ninfer::test::cuda_environment().context.device(), f.pos.bytes());
+    DeviceBuffer ids(ninfer::test::cuda_environment().context.device(), f.selections.bytes());
+    DeviceBuffer counts(ninfer::test::cuda_environment().context.device(), f.sizes.bytes());
+    DeviceBuffer table(ninfer::test::cuda_environment().context.device(), f.table.bytes());
     DeviceBuffer payloads[4];
     const std::uint8_t* host[4]{};
     std::size_t bytes[4]{}, leading[4]{};
@@ -168,47 +177,50 @@ int read_footprint(DeviceContext& device, KvCacheStorage storage = KvCacheStorag
     }
     for (int i = 0; i < 4; ++i) {
         if (!bytes[i]) continue;
-        payloads[i]      = DeviceBuffer(bytes[i]);
-        targets[i]->data = static_cast<std::uint8_t*>(payloads[i].p) + leading[i];
+        payloads[i] = DeviceBuffer(ninfer::test::cuda_environment().context.device(), bytes[i]);
+        targets[i]->data = static_cast<std::uint8_t*>(payloads[i].data()) + leading[i];
     }
-    f.query.data                 = q.p;
-    f.output_gate.data           = gate.p;
-    f.cache.block_tables.data    = table.p;
-    f.batch.positions.data       = pos.p;
-    f.selected.block_ids.data    = ids.p;
-    f.selected.block_counts.data = counts.p;
+    f.query.data                 = q.data();
+    f.output_gate.data           = gate.data();
+    f.cache.block_tables.data    = table.data();
+    f.batch.positions.data       = pos.data();
+    f.selected.block_ids.data    = ids.data();
+    f.selected.block_counts.data = counts.data();
     const auto copy              = [&](void* dst, const void* src, std::size_t n) {
-        CUDA_CHECK(cudaMemcpyAsync(dst, src, n, cudaMemcpyHostToDevice, device.stream));
+        CUDA_CHECK(cudaMemcpyAsync(dst, src, n, cudaMemcpyHostToDevice, device.stream()));
     };
     for (int b = 0; b < f.B; ++b)
         for (int t = 0; t < f.valid[b]; ++t) {
             const int m = b * f.T + t;
-            copy(static_cast<int*>(pos.p) + m, f.positions.data() + m, 4);
-            copy(static_cast<int*>(counts.p) + m, f.counts.data() + m, 4);
+            copy(static_cast<int*>(pos.data()) + m, f.positions.data() + m, 4);
+            copy(static_cast<int*>(counts.data()) + m, f.counts.data() + m, 4);
             if (f.counts[m])
-                copy(static_cast<int*>(ids.p) + std::size_t(m) * 512,
+                copy(static_cast<int*>(ids.data()) + std::size_t(m) * 512,
                      f.ids.data() + std::size_t(m) * 512, f.counts[m] * 4);
             if (f.visible[m].empty()) continue;
             const auto off = std::size_t(m) * 6144;
-            copy(static_cast<std::uint16_t*>(q.p) + off, f.qhost.data() + off, 12288);
-            copy(static_cast<std::uint16_t*>(gate.p) + off, f.ghost.data() + off, 12288);
+            copy(static_cast<std::uint16_t*>(q.data()) + off, f.qhost.data() + off, 12288);
+            copy(static_cast<std::uint16_t*>(gate.data()) + off, f.ghost.data() + off, 12288);
             for (int token : f.visible[m]) {
                 const int idx      = f.selectors[b] * f.table_stride + token / 64,
                           physical = f.tables[idx];
-                copy(static_cast<int*>(table.p) + idx, f.tables.data() + idx, 4);
+                copy(static_cast<int*>(table.data()) + idx, f.tables.data() + idx, 4);
                 for (int h = 0; h < 2; ++h)
                     for (int i = 0; i < 4; ++i) {
                         if (!bytes[i]) continue;
                         const auto& plane = *targets[i];
                         const auto off    = leading[i] + physical * plane.nb[3] + h * plane.nb[2] +
                                          token % 64 * plane.nb[1];
-                        copy(static_cast<std::uint8_t*>(payloads[i].p) + off, host[i] + off,
+                        copy(static_cast<std::uint8_t*>(payloads[i].data()) + off, host[i] + off,
                              plane.ne[0] * dtype_size(plane.dtype));
                     }
             }
         }
-    WorkspaceArena workspace(ops::qsa_sparse_gqa_workspace_capacity_bytes(
-        storage, 3, 3, 4, f.envelope, device.execution_view()));
+    ninfer::DeviceBuffer workspace_storage(
+        ninfer::test::cuda_environment().context.device(),
+        ops::qsa_sparse_gqa_workspace_capacity_bytes(
+            storage, 3, 3, 4, f.envelope, device.execution_view().multiprocessor_count()));
+    MemoryArena workspace(workspace_storage.span());
     f.launch(workspace, device.execution_view());
     device.synchronize();
     return verify(f,
@@ -221,8 +233,10 @@ int graph_update(DeviceContext& device, int tokens, int batch,
                  KvCacheStorage storage = KvCacheStorage::BFloat16) {
     Fixture f(tokens, batch, 8192, true, storage);
     const auto bytes = ops::qsa_sparse_gqa_workspace_capacity_bytes(
-        storage, tokens, tokens, batch, {262144}, device.execution_view());
-    WorkspaceArena workspace(std::max<std::size_t>(bytes, 256));
+        storage, tokens, tokens, batch, {262144}, device.execution_view().multiprocessor_count());
+    ninfer::DeviceBuffer workspace_storage(ninfer::test::cuda_environment().context.device(),
+                                           std::max<std::size_t>(bytes, 256));
+    MemoryArena workspace(workspace_storage.span());
     DecodeGraphExecutable graph;
     int failures = 0;
     for (int history : {64, 2051, 8192, 64, 0}) {
@@ -230,12 +244,12 @@ int graph_update(DeviceContext& device, int tokens, int batch,
         f.envelope.max_visible_tokens = history;
         f.reset(history ? 0 : 2);
         DecodeGraphDefinition definition;
-        definition.capture(device.stream, [&] { f.launch(workspace, device.execution_view()); });
+        definition.capture(device.stream(), [&] { f.launch(workspace, device.execution_view()); });
         if (graph.ready())
             graph.update(definition);
         else
             graph.instantiate(definition);
-        graph.launch(device.stream);
+        graph.launch(device.stream());
         device.synchronize();
         failures += verify(f, "graph update storage=" + std::to_string(int(storage)) +
                                   " T=" + std::to_string(tokens) + " B=" + std::to_string(batch) +
@@ -257,7 +271,9 @@ int rejects(F&& call) {
 int validation(DeviceContext& device) {
     Fixture f(1, 1, 4, false);
     f.reset();
-    WorkspaceArena workspace(4 * 1024 * 1024);
+    ninfer::DeviceBuffer workspace_storage(ninfer::test::cuda_environment().context.device(),
+                                           4 * 1024 * 1024);
+    MemoryArena workspace(workspace_storage.span());
     Fixture padded(1, 1, 8192, true);
     // This aligned output intersects real rows in the padded plane's tail, beyond the
     // logical element-byte count. Checking Tensor::bytes() would miss the overlap.
@@ -266,13 +282,15 @@ int validation(DeviceContext& device) {
     padded.output.data     = reinterpret_cast<void*>((logical_end + 15) / 16 * 16);
     const int padded_alias = rejects([&] { padded.launch(workspace, device.execution_view()); });
     int failures           = rejects([&] {
-        (void)ops::qsa_sparse_gqa_workspace_capacity_bytes(static_cast<KvCacheStorage>(-1), 1, 1, 1,
-                                                                     f.envelope, device.execution_view());
+        (void)ops::qsa_sparse_gqa_workspace_capacity_bytes(
+            static_cast<KvCacheStorage>(-1), 1, 1, 1, f.envelope,
+            device.execution_view().multiprocessor_count());
     });
     failures += padded_alias;
     failures += rejects([&] {
-        (void)ops::qsa_sparse_gqa_workspace_capacity_bytes(KvCacheStorage::BFloat16, 2, 1, 1,
-                                                           f.envelope, device.execution_view());
+        (void)ops::qsa_sparse_gqa_workspace_capacity_bytes(
+            KvCacheStorage::BFloat16, 2, 1, 1, f.envelope,
+            device.execution_view().multiprocessor_count());
     });
     const auto out = f.output;
     f.output.data  = f.query.data;
@@ -289,9 +307,11 @@ int validation(DeviceContext& device) {
     std::size_t maximum  = 0;
     for (int t = 1; t <= 512; ++t)
         maximum = std::max(maximum, ops::qsa_sparse_gqa_workspace_capacity_bytes(
-                                        KvCacheStorage::BFloat16, t, t, 1, f.envelope, execution));
+                                        KvCacheStorage::BFloat16, t, t, 1, f.envelope,
+                                        execution.multiprocessor_count()));
     failures += maximum != ops::qsa_sparse_gqa_workspace_capacity_bytes(
-                               KvCacheStorage::BFloat16, 1, 512, 1, f.envelope, execution);
+                               KvCacheStorage::BFloat16, 1, 512, 1, f.envelope,
+                               execution.multiprocessor_count());
     return failures;
 }
 
@@ -325,9 +345,12 @@ int scale_layout(DeviceContext& device, KvCacheStorage storage, int tokens, int 
     Fixture f(tokens, 1, history, false, storage, true);
     f.live_limit = 4;
     f.reset();
-    WorkspaceArena arena(std::max<std::size_t>(
-        256, ops::qsa_sparse_gqa_workspace_capacity_bytes(storage, tokens, tokens, 1, f.envelope,
-                                                          device.execution_view())));
+    ninfer::DeviceBuffer arena_storage(
+        ninfer::test::cuda_environment().context.device(),
+        std::max<std::size_t>(256, ops::qsa_sparse_gqa_workspace_capacity_bytes(
+                                       storage, tokens, tokens, 1, f.envelope,
+                                       device.execution_view().multiprocessor_count())));
+    MemoryArena arena(arena_storage.span());
     f.launch(arena, device.execution_view());
     device.synchronize();
     return verify(f, "independent scale layout storage=" + std::to_string(int(storage)) +
@@ -336,7 +359,9 @@ int scale_layout(DeviceContext& device, KvCacheStorage storage, int tokens, int 
 
 int quantized_validation(DeviceContext& device, KvCacheStorage storage) {
     Fixture invalid(1, 1, 4, false, storage);
-    WorkspaceArena workspace(4 * 1024 * 1024);
+    ninfer::DeviceBuffer workspace_storage(ninfer::test::cuda_environment().context.device(),
+                                           4 * 1024 * 1024);
+    MemoryArena workspace(workspace_storage.span());
     const auto key_scales       = invalid.cache.k_scale_pages;
     invalid.cache.k_scale_pages = {};
     int failures = rejects([&] { invalid.launch(workspace, device.execution_view()); });

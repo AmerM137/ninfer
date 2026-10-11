@@ -1,4 +1,6 @@
 #include "core/weight.h"
+#include "cuda_fixture.h"
+#include "core/buffer.h"
 #include "ops/linear/linear_test_common.h"
 
 #include "core/arena.h"
@@ -66,6 +68,10 @@ public:
     void* data() { return storage_.data(); }
 
     const void* data() const { return storage_.data(); }
+
+    MemorySpan span() { return storage_.span(); }
+
+    ConstMemorySpan span() const { return storage_.span(); }
 
     void poison() { storage_.fill(kOutputPoisonByte); }
 
@@ -225,7 +231,8 @@ quantized_weight::PackedWeight make_bf16_weight(std::int32_t n, std::int32_t k,
     quantized_weight::PackedWeight result;
     result.payload.resize(host.bits.size() * sizeof(std::uint16_t));
     std::memcpy(result.payload.data(), host.bits.data(), result.payload.size());
-    result.weight           = host.device_weight(result.payload.data());
+    result.weight =
+        host.device_weight({result.payload.data(), result.payload.size(), Device::cpu()});
     result.code_plane_bytes = result.payload.size();
     return result;
 }
@@ -312,11 +319,13 @@ int run_shape(std::string_view label, ActivationCompute activation_compute,
         }
     }
 
-    DeviceBuffer device_activation(activation_bits.size() * sizeof(std::uint16_t));
-    device_activation.copy_from_host(activation_bits.data(), device_activation.bytes);
-    DeviceBuffer device_weight(host_weight.payload.size());
-    device_weight.copy_from_host(host_weight.payload.data(), device_weight.bytes);
-    const Weight weight = host_weight.device_weight(device_weight.p);
+    DeviceBuffer device_activation(ninfer::test::cuda_environment().context.device(),
+                                   activation_bits.size() * sizeof(std::uint16_t));
+    device_activation.copy_from_host(activation_bits.data(), device_activation.size());
+    DeviceBuffer device_weight(ninfer::test::cuda_environment().context.device(),
+                               host_weight.payload.size());
+    device_weight.copy_from_host(host_weight.payload.data(), device_weight.size());
+    const Weight weight = host_weight.device_weight(device_weight.span());
 
     std::vector<double> full_reference;
     if (shape.comparison == Comparison::Full) {
@@ -334,21 +343,25 @@ int run_shape(std::string_view label, ActivationCompute activation_compute,
                                        std::to_string(shape.k) +
                                        "] T=" + std::to_string(invocation.t);
         GuardedOutput output(checked_elements(shape.n, invocation.t, "guarded output"));
-        Tensor input(device_activation.p, DType::BF16, {shape.k, invocation.t});
-        Tensor destination(output.data(), DType::BF16, {shape.n, invocation.t});
+        Tensor input(device_activation.span(), DType::BF16, {shape.k, invocation.t});
+        Tensor destination(output.span(), DType::BF16, {shape.n, invocation.t});
         const std::size_t capacity = ops::linear_workspace_capacity_bytes(
             weight.qtype, shape.n, shape.k, invocation.policy, invocation.t, invocation.t);
-        DeviceArena workspace(std::max<std::size_t>(capacity, 256));
+        ninfer::DeviceBuffer workspace_storage(ninfer::test::cuda_environment().context.device(),
+                                               std::max<std::size_t>(capacity, 256));
+        MemoryArena workspace(workspace_storage.span());
         std::unique_ptr<DeviceContext> graph_context;
         DecodeGraphDefinition graph_definition;
         DecodeGraphExecutable graph;
         if (invocation.graph_replay) graph_context = std::make_unique<DeviceContext>();
-        const cudaStream_t stream = graph_context ? graph_context->stream : nullptr;
+        const auto cuda =
+            graph_context ? graph_context->execution_view() : cuda_environment().default_execution;
+        const auto stream         = cuda.stream();
         const auto launch         = [&] {
             if (invocation.call_form == CallForm::A16Convenience) {
-                ops::linear(input, weight, destination, stream);
+                ops::linear(input, weight, destination, cuda);
             } else {
-                ops::linear(input, weight, destination, invocation.policy, workspace, stream);
+                ops::linear(input, weight, destination, invocation.policy, workspace, cuda);
             }
         };
         try {
@@ -362,7 +375,7 @@ int run_shape(std::string_view label, ActivationCompute activation_compute,
                     // BF16 negation is exact. Evaluate the same FP64 oracle using -X below.
                     auto negative = activation_bits;
                     for (auto& bits : negative) bits ^= 0x8000;
-                    device_activation.copy_from_host(negative.data(), device_activation.bytes);
+                    device_activation.copy_from_host(negative.data(), device_activation.size());
                 }
                 output.poison();
                 cuda_check(cudaDeviceSynchronize(), "finish poisoning before replay");
@@ -413,7 +426,7 @@ int run_shape(std::string_view label, ActivationCompute activation_compute,
                 }
                 if (replay == 1) {
                     std::vector<std::uint16_t> after(activation_bits.size());
-                    device_activation.copy_to_host(after.data(), device_activation.bytes);
+                    device_activation.copy_to_host(after.data(), device_activation.size());
                     for (std::size_t i = 0; i < after.size(); ++i) {
                         if (after[i] != (activation_bits[i] ^ 0x8000)) {
                             std::cerr << case_label << ": modified graph activation input\n";
@@ -422,7 +435,7 @@ int run_shape(std::string_view label, ActivationCompute activation_compute,
                         }
                     }
                     device_activation.copy_from_host(activation_bits.data(),
-                                                     device_activation.bytes);
+                                                     device_activation.size());
                 }
             }
         } catch (const std::exception& error) {
@@ -431,17 +444,17 @@ int run_shape(std::string_view label, ActivationCompute activation_compute,
         }
         if (shape.verify_each_invocation) {
             failures += linear_common::verify_preserved(
-                device_activation.p, std::as_bytes(std::span(activation_bits)), case_label);
+                device_activation.data(), std::as_bytes(std::span(activation_bits)), case_label);
             failures += linear_common::verify_preserved(
-                device_weight.p, std::as_bytes(std::span(host_weight.payload)), case_label);
+                device_weight.data(), std::as_bytes(std::span(host_weight.payload)), case_label);
         }
     }
 
     if (shape.verify_input_preservation && !shape.verify_each_invocation) {
         failures += linear_common::verify_preserved(
-            device_activation.p, std::as_bytes(std::span(activation_bits)), label);
+            device_activation.data(), std::as_bytes(std::span(activation_bits)), label);
         failures += linear_common::verify_preserved(
-            device_weight.p, std::as_bytes(std::span(host_weight.payload)), label);
+            device_weight.data(), std::as_bytes(std::span(host_weight.payload)), label);
     }
     return failures;
 }

@@ -26,7 +26,9 @@ void require_profile(AttentionHeadGeometry geometry, const char* op) {
     }
 }
 
-std::uint32_t validate_context(const PagedKVBatchLayerView& context, const char* op) {
+std::uint32_t validate_context(const PagedKVBatchLayerView& context, const char* op,
+                               Device device) {
+    common::operand::device(context.device(), device, op, "cache");
     if (context.storage != KvCacheStorage::BFloat16 || context.num_kv_heads != kKVHeads ||
         context.head_dim != kHeadDim) {
         throw std::invalid_argument(std::string(op) + ": invalid context geometry or dtype");
@@ -43,15 +45,15 @@ std::uint32_t validate_context(const PagedKVBatchLayerView& context, const char*
                            op, "context k pages");
     common::operand::shape(context.v_pages, {kHeadDim, kPagedKVPageSize, physical_pages, kKVHeads},
                            op, "context v pages");
-    common::operand::contiguous_nonnull(context.k_pages, op, "context k pages");
-    common::operand::contiguous_nonnull(context.v_pages, op, "context v pages");
+    common::operand::contiguous_nonnull(context.k_pages, op, "context k pages", device);
+    common::operand::contiguous_nonnull(context.v_pages, op, "context v pages", device);
     common::operand::shape(context.block_tables,
                            {context.block_tables.ne[0], context.block_tables.ne[1], 1, 1}, op,
                            "context block tables");
     if (context.block_tables.dtype != DType::I32) {
         throw std::invalid_argument(std::string(op) + ": context block tables must be I32");
     }
-    common::operand::contiguous_nonnull(context.block_tables, op, "context block tables");
+    common::operand::contiguous_nonnull(context.block_tables, op, "context block tables", device);
     if (context.k_scale_pages.data != nullptr || context.v_scale_pages.data != nullptr) {
         throw std::invalid_argument(std::string(op) + ": BF16 context must not have scales");
     }
@@ -112,8 +114,13 @@ void context_softmax_attention(const Tensor& q, const Tensor& query_k, const Ten
                                const Tensor& context_lengths, const Tensor& valid_columns,
                                const Tensor& table_rows, AttentionHeadGeometry geometry,
                                float scale, const PagedKVBatchLayerView& context,
-                               ContextAttentionExecutionEnvelope envelope,
-                               WorkspaceArena& workspace, Tensor& out, cudaStream_t stream) {
+                               ContextAttentionExecutionEnvelope envelope, MemoryArena& workspace,
+                               Tensor& out, CudaExecutionView execution) {
+    if (workspace.device() != execution.device()) {
+        throw std::invalid_argument(
+            "context_softmax_attention: workspace belongs to another device");
+    }
+    const auto stream        = execution.stream();
     constexpr const char* op = "context_softmax_attention";
     require_profile(geometry, op);
     if (q.dtype != DType::BF16 || query_k.dtype != DType::BF16 || query_v.dtype != DType::BF16 ||
@@ -140,14 +147,14 @@ void context_softmax_attention(const Tensor& q, const Tensor& query_k, const Ten
     common::operand::shape(valid_columns, {batch, 1, 1, 1}, op, "valid columns");
     common::operand::shape(table_rows, {batch, 1, 1, 1}, op, "table rows");
     common::operand::shape(out, {kHeadDim, kQHeads, tokens, batch}, op, "out");
-    common::operand::contiguous_nonnull(q, op, "q");
-    common::operand::contiguous_nonnull(query_k, op, "query k");
-    common::operand::contiguous_nonnull(query_v, op, "query v");
-    common::operand::contiguous_nonnull(context_lengths, op, "context lengths");
-    common::operand::contiguous_nonnull(valid_columns, op, "valid columns");
-    common::operand::contiguous_nonnull(table_rows, op, "table rows");
-    common::operand::contiguous_nonnull(out, op, "out");
-    const std::uint32_t logical_capacity = validate_context(context, op);
+    common::operand::contiguous_nonnull(q, op, "q", execution.device());
+    common::operand::contiguous_nonnull(query_k, op, "query k", execution.device());
+    common::operand::contiguous_nonnull(query_v, op, "query v", execution.device());
+    common::operand::contiguous_nonnull(context_lengths, op, "context lengths", execution.device());
+    common::operand::contiguous_nonnull(valid_columns, op, "valid columns", execution.device());
+    common::operand::contiguous_nonnull(table_rows, op, "table rows", execution.device());
+    common::operand::contiguous_nonnull(out, op, "out", execution.device());
+    const std::uint32_t logical_capacity = validate_context(context, op, execution.device());
     if (envelope.min_context > envelope.max_context || envelope.max_context > logical_capacity) {
         throw std::invalid_argument("context_softmax_attention: invalid execution envelope");
     }

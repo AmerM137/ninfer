@@ -217,7 +217,7 @@ int run(const Options& options) {
 
     std::cout << "format,ninfer_qwen3_5_mtp_round_bench_v2\n";
     std::cout << "artifact," << options.artifact.string() << '\n';
-    std::cout << "device," << device.props.name << '\n';
+    std::cout << "device," << device.properties().name << '\n';
     std::cout << "draft_tokens," << options.draft_tokens << '\n';
     std::cout << "proposal_head,"
               << (options.proposal == ninfer::ProposalHead::Optimized ? "optimized" : "full")

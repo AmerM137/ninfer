@@ -9,7 +9,7 @@ int main(int argc, char** argv) {
     try {
         const auto options = hc::parse(argc, argv);
         measurement::hardware();
-        DeviceContext device;
+        auto& device = ninfer::bench::device_context();
         L2FlushBuffer flush(options.timing.flush_bytes);
         measurement::Csv csv(options.timing.csv_out, "alias,condition_us");
         for (int tokens : options.tokens) {
@@ -19,15 +19,12 @@ int main(int argc, char** argv) {
                     for (const auto& cache :
                          measurement::selections(options.timing.cache, "cold", "warm")) {
                         const auto result = measurement::measure(
-                            [&](auto stream) {
-                                f.launch(device.execution_view().on_stream(stream));
+                            [&](CudaExecutionView cuda) { f.launch(cuda); },
+                            [&](CudaExecutionView cuda) {
+                                hc::condition(cuda, options.condition_us);
+                                f.restore(cuda);
                             },
-                            [&](auto stream) {
-                                hc::condition(device.execution_view().on_stream(stream),
-                                              options.condition_us);
-                                f.restore(stream);
-                            },
-                            flush, device.stream, options.timing, execution, cache);
+                            flush, device.execution_view(), options.timing, execution, cache);
                         measurement::Row row;
                         row.op              = hc::name(options.op);
                         row.format          = "bf16";
@@ -43,7 +40,7 @@ int main(int argc, char** argv) {
                     }
             };
             if (hc::mixes(options.op)) {
-                hc::MixFixture f(options, tokens, device.execution_view());
+                hc::MixFixture f(options, tokens);
                 measure(f);
             } else {
                 hc::Fixture f(options, tokens);

@@ -4,7 +4,6 @@
 #include "core/device.h"
 #include "core/tensor.h"
 
-#include <cuda_runtime.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -47,8 +46,8 @@ namespace ninfer::ops {
  * This overload reads and writes the same `ssm_state`, publishing the state after all T tokens.
  */
 void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
-                     const Tensor& beta, float scale, bool normalize_qk, WorkspaceArena& ws,
-                     Tensor& ssm_state, Tensor& out, DeviceExecutionView execution);
+                     const Tensor& beta, float scale, bool normalize_qk, MemoryArena& ws,
+                     Tensor& ssm_state, Tensor& out, CudaExecutionView execution);
 
 /**
  * Distinct-state form of the same recurrence. `ssm_state_out` receives the final state;
@@ -56,9 +55,9 @@ void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Te
  * arguments may overlap either state.
  */
 void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
-                     const Tensor& beta, float scale, bool normalize_qk, WorkspaceArena& ws,
+                     const Tensor& beta, float scale, bool normalize_qk, MemoryArena& ws,
                      const Tensor& ssm_state_in, Tensor& ssm_state_out, Tensor& out,
-                     DeviceExecutionView execution);
+                     CudaExecutionView execution);
 
 /**
  * One-token update for B independent state-pool slots. q/k are contiguous BF16 [128,Hqk,1,B],
@@ -73,7 +72,7 @@ void gated_delta_net_batch_update(const Tensor& q, const Tensor& k, const Tensor
                                   bool normalize_qk, Tensor& ssm_states,
                                   const Tensor& source_state_slots,
                                   const Tensor& destination_state_slots, Tensor& out,
-                                  cudaStream_t stream);
+                                  CudaExecutionView execution);
 
 struct GdnRecurrenceRecords {
     Tensor key;   // BF16 [128,Hq,T,B], raw represented key words.
@@ -101,6 +100,6 @@ void gated_delta_net_replay_record(const Tensor& q, const Tensor& k, const Tenso
                                    const Tensor& g, const Tensor& beta, float scale,
                                    const Tensor& ssm_states, const Tensor& valid_columns,
                                    const Tensor& initial_state_slots, GdnRecurrenceRecords records,
-                                   Tensor& out, cudaStream_t stream);
+                                   Tensor& out, CudaExecutionView execution);
 
 } // namespace ninfer::ops

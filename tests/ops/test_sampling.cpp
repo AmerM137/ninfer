@@ -6,6 +6,8 @@
 // input.  The test never reproduces the device RNG algorithm or uses another
 // production path as a golden.
 #include "ninfer/ops/sampling.h"
+#include "cuda_fixture.h"
+#include "core/buffer.h"
 #include "ops/op_tester.h"
 
 #include <algorithm>
@@ -179,15 +181,17 @@ RunResult run_batch(const std::vector<float>& logits, int physical_rows, int tok
     DeviceBuffer device_configs                             = to_device(configs);
     DeviceBuffer device_positions                           = to_device(logical_positions);
 
-    Tensor logits_tensor(device_logits.p, DType::BF16, {physical_rows, batch});
-    Tensor out_tensor(device_out.data(), DType::I32, {batch});
-    Tensor positions_tensor(device_positions.p, DType::I32, {batch});
+    Tensor logits_tensor(device_logits.span(), DType::BF16, {physical_rows, batch});
+    Tensor out_tensor(device_out.span(), DType::I32, {batch});
+    Tensor positions_tensor(device_positions.span(), DType::I32, {batch});
     const std::size_t workspace_bytes =
         ops::sampling_workspace_capacity_bytes(token_domain, batch, batch);
-    WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
+    ninfer::DeviceBuffer workspace_storage(ninfer::test::cuda_environment().context.device(),
+                                           std::max<std::size_t>(256, workspace_bytes));
+    MemoryArena workspace(workspace_storage.span());
     ops::sample(logits_tensor, out_tensor, token_domain,
-                static_cast<const ops::SamplingConfig*>(device_configs.p), positions_tensor,
-                purpose, workspace, nullptr);
+                static_cast<const ops::SamplingConfig*>(device_configs.data()), positions_tensor,
+                purpose, workspace, ninfer::test::cuda_environment().default_execution);
     cuda_synchronize();
 
     RunResult result;
@@ -256,19 +260,21 @@ RunResult run_repeated(const std::vector<float>& column, int token_domain, int t
     for (int i = 0; i < total; ++i) { positions[static_cast<std::size_t>(i)] = position + i; }
     DeviceBuffer device_positions = to_device(positions);
 
-    Tensor logits_tensor(device_logits.p, DType::BF16, {physical_rows, batch});
+    Tensor logits_tensor(device_logits.span(), DType::BF16, {physical_rows, batch});
     const std::size_t workspace_bytes =
         ops::sampling_workspace_capacity_bytes(token_domain, batch, batch);
-    WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
+    ninfer::DeviceBuffer workspace_storage(ninfer::test::cuda_environment().context.device(),
+                                           std::max<std::size_t>(256, workspace_bytes));
+    MemoryArena workspace(workspace_storage.span());
 
     for (int produced = 0; produced < total; produced += batch) {
-        auto* out = static_cast<std::int32_t*>(collected.data()) + produced;
-        auto* pos = static_cast<std::int32_t*>(device_positions.p) + produced;
-        Tensor out_tensor(out, DType::I32, {batch});
-        Tensor positions_tensor(pos, DType::I32, {batch});
+        Tensor out_tensor(collected.span().subspan(std::size_t(produced) * 4), DType::I32, {batch});
+        Tensor positions_tensor(device_positions.span().subspan(std::size_t(produced) * 4),
+                                DType::I32, {batch});
         ops::sample(logits_tensor, out_tensor, token_domain,
-                    static_cast<const ops::SamplingConfig*>(device_configs.p), positions_tensor,
-                    purpose, workspace, nullptr);
+                    static_cast<const ops::SamplingConfig*>(device_configs.data()),
+                    positions_tensor, purpose, workspace,
+                    ninfer::test::cuda_environment().default_execution);
     }
     cuda_synchronize();
 
@@ -606,7 +612,7 @@ int grammar_mask_contract() {
         for (int token : {domain - 1, domain - 2}) mask[token / 32] |= 1u << (token % 32);
         auto device_mask = to_device(mask);
         ops::SamplingConfig config;
-        config.mask       = {static_cast<const std::uint32_t*>(device_mask.p),
+        config.mask       = {static_cast<const std::uint32_t*>(device_mask.data()),
                              static_cast<int>(mask.size())};
         const auto greedy = run_homogeneous_batch(repeat_column(column, 8), domain + 3, domain, 8,
                                                   config, 0, ops::kSamplePurposeDecode);
@@ -630,9 +636,10 @@ int increment_counts_contract() {
     DeviceBuffer device_ids = to_device(ids);
     GuardedDeviceBuffer device_counts(initial.size() * sizeof(std::int32_t));
     device_counts.copy_from_host(initial.data(), initial.size() * sizeof(std::int32_t));
-    Tensor token_ids(device_ids.p, DType::I32, {static_cast<std::int32_t>(ids.size())});
-    Tensor counts(device_counts.data(), DType::I32, {static_cast<std::int32_t>(initial.size())});
-    ops::increment_token_counts(token_ids, counts, nullptr);
+    Tensor token_ids(device_ids.span(), DType::I32, {static_cast<std::int32_t>(ids.size())});
+    Tensor counts(device_counts.span(), DType::I32, {static_cast<std::int32_t>(initial.size())});
+    ops::increment_token_counts(token_ids, counts,
+                                ninfer::test::cuda_environment().default_execution);
     cuda_synchronize();
 
     int failures =

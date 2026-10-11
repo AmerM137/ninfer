@@ -75,7 +75,7 @@ void execute_conv(const Tensor& residual, const Tensor& gated, const Tensor& ker
                   const PleBatchView& batch, const PleConvStateView& before,
                   const PleConvRecordWindowView& current, Tensor& updated,
                   const Tensor* norm_weight, float epsilon, Tensor* normalized,
-                  DeviceExecutionView execution) {
+                  CudaExecutionView execution) {
     validate_conv(residual, gated, kernel, batch, before, current, updated, norm_weight, epsilon,
                   normalized, execution);
     const auto args   = conv_arguments(residual, gated, kernel, batch, before, current, updated,
@@ -83,7 +83,7 @@ void execute_conv(const Tensor& residual, const Tensor& gated, const Tensor& ker
     const bool paired = pair_aligned(kernel) && pair_aligned(before.history) &&
                         pair_aligned(current.values) &&
                         (!norm_weight || pair_aligned(*norm_weight));
-    select_conv(args, paired, execution.multiprocessor_count)(args, execution.stream);
+    select_conv(args, paired, execution.multiprocessor_count())(args, execution.stream());
 }
 } // namespace
 } // namespace ninfer::ops::detail::ple
@@ -93,7 +93,7 @@ namespace ninfer::ops {
 void ple_conv_add(const Tensor& residual, const Tensor& gated_value, const Tensor& kernel,
                   const PleBatchView& batch, const PleConvStateView& before,
                   const PleConvRecordWindowView& current, Tensor& updated_residual,
-                  DeviceExecutionView execution) {
+                  CudaExecutionView execution) {
     detail::ple::execute_conv(residual, gated_value, kernel, batch, before, current,
                               updated_residual, nullptr, 0, nullptr, execution);
 }
@@ -102,7 +102,7 @@ void ple_conv_add_norm(const Tensor& residual, const Tensor& gated_value, const 
                        const PleBatchView& batch, const PleConvStateView& before,
                        const PleConvRecordWindowView& current, const Tensor& next_hc_norm_weight,
                        float next_hc_epsilon, Tensor& updated_residual, Tensor& normalized,
-                       DeviceExecutionView execution) {
+                       CudaExecutionView execution) {
     detail::ple::execute_conv(residual, gated_value, kernel, batch, before, current,
                               updated_residual, &next_hc_norm_weight, next_hc_epsilon, &normalized,
                               execution);

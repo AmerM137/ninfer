@@ -30,7 +30,12 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
                                       Tensor& lengths, Tensor& anchors, Tensor& licensed_tokens,
                                       Tensor& licensed_counts, Tensor& accepted,
                                       std::int32_t token_domain, const SamplingConfig* configs,
-                                      WorkspaceArena& workspace, cudaStream_t stream) {
+                                      MemoryArena& workspace, CudaExecutionView execution) {
+    if (workspace.device() != execution.device()) {
+        throw std::invalid_argument(
+            "speculative_accept_greedy_drafts: workspace belongs to another device");
+    }
+    const auto stream        = execution.stream();
     constexpr const char* op = "speculative_accept_greedy_drafts";
     const std::int32_t k     = drafts.ne[0];
     const std::int32_t batch = drafts.ne[1];
@@ -40,9 +45,10 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
     if (batch < 1) {
         throw std::invalid_argument("speculative_accept_greedy_drafts: B must be >=1");
     }
-    common::operand::tensor(target_tokens, DType::I32, {k + 1, batch}, 1, op, "target_tokens");
+    common::operand::tensor(target_tokens, DType::I32, {k + 1, batch}, 1, op, "target_tokens",
+                            execution.device());
     common::operand::dtype(logits, DType::BF16, op, "logits");
-    common::operand::contiguous_nonnull(logits, op, "logits");
+    common::operand::contiguous_nonnull(logits, op, "logits", execution.device());
     if (logits.ne[0] <= 0 || logits.ne[1] != k + 1 || logits.ne[2] != batch || logits.ne[3] != 1) {
         throw std::invalid_argument(
             "speculative_accept_greedy_drafts: logits must be [physical_rows,K+1,B]");
@@ -51,20 +57,23 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
         throw std::invalid_argument(
             "speculative_accept_greedy_drafts: token_domain must be in [1, logits.ne[0]]");
     }
-    common::operand::tensor(drafts, DType::I32, {k, batch}, 1, op, "drafts");
-    common::operand::tensor(current_extents, DType::I32, {batch}, 1, op, "current_extents");
-    common::operand::tensor(lengths, DType::I32, {batch}, 1, op, "lengths");
-    common::operand::tensor(anchors, DType::I32, {batch}, 1, op, "anchors");
-    common::operand::tensor(licensed_tokens, DType::I32, {k + 1, batch}, 1, op, "licensed_tokens");
-    common::operand::tensor(licensed_counts, DType::I32, {batch}, 1, op, "licensed_counts");
-    common::operand::tensor(accepted, DType::I32, {batch}, 1, op, "accepted");
+    common::operand::tensor(drafts, DType::I32, {k, batch}, 1, op, "drafts", execution.device());
+    common::operand::tensor(current_extents, DType::I32, {batch}, 1, op, "current_extents",
+                            execution.device());
+    common::operand::tensor(lengths, DType::I32, {batch}, 1, op, "lengths", execution.device());
+    common::operand::tensor(anchors, DType::I32, {batch}, 1, op, "anchors", execution.device());
+    common::operand::tensor(licensed_tokens, DType::I32, {k + 1, batch}, 1, op, "licensed_tokens",
+                            execution.device());
+    common::operand::tensor(licensed_counts, DType::I32, {batch}, 1, op, "licensed_counts",
+                            execution.device());
+    common::operand::tensor(accepted, DType::I32, {batch}, 1, op, "accepted", execution.device());
     if (configs == nullptr) {
         throw std::invalid_argument("speculative_accept_greedy_drafts: configs must be non-null");
     }
     auto scratch_scope       = workspace.scope();
     const auto plan          = greedy_drafts_detail::select_plan(token_domain, k + 1);
     const std::size_t bytes  = plan.workspace.bytes * static_cast<std::size_t>(batch);
-    const DeviceSpan scratch = bytes == 0 ? DeviceSpan{} : workspace.alloc_bytes(bytes);
+    const MemorySpan scratch = bytes == 0 ? MemorySpan{} : workspace.alloc_bytes(bytes);
     greedy_drafts_detail::launch(target_tokens, logits, drafts, current_extents, lengths, anchors,
                                  licensed_tokens, licensed_counts, accepted, token_domain, configs,
                                  plan, scratch, stream);

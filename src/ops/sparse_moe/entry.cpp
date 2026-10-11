@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <type_traits>
+#include <stdexcept>
 
 namespace ninfer::ops {
 
@@ -26,35 +27,36 @@ std::size_t sparse_moe_workspace_capacity_bytes(QType gate_up, QType down, std::
 }
 
 void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilogue epilogue,
-                Tensor& destination, WorkspaceArena& workspace, DeviceExecutionView execution) {
+                Tensor& destination, MemoryArena& workspace, CudaExecutionView execution) {
     sparse_moe(x, weights, epilogue, destination, SparseMoeHints{}, workspace, execution);
 }
 
 void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilogue epilogue,
-                Tensor& destination, const SparseMoeHints& hints, WorkspaceArena& workspace,
-                DeviceExecutionView execution) {
+                Tensor& destination, const SparseMoeHints& hints, MemoryArena& workspace,
+                CudaExecutionView execution) {
     using namespace moe_detail;
     constexpr const char* op = "sparse_moe";
-    if (execution.multiprocessor_count <= 0)
+    if (execution.multiprocessor_count() <= 0)
         throw std::invalid_argument("sparse_moe: physical SM count must be positive");
     if (epilogue != SparseMoeEpilogue::AddResidual)
         throw std::invalid_argument("sparse_moe: unsupported epilogue");
-    const auto tokens = require_tensor(x, "x");
-    if (require_tensor(destination, "destination") != tokens)
+    const auto tokens = require_tensor(x, "x", execution.device());
+    if (require_tensor(destination, "destination", execution.device()) != tokens)
         throw std::invalid_argument("sparse_moe: x and destination token counts must match");
 
     std::vector<common::operand::Range> ranges;
     ranges.reserve(16);
     ranges.push_back(common::operand::range(x, op));
     ranges.push_back(common::operand::range(destination, op));
-    validate_weights(weights, ranges);
+    validate_weights(weights, ranges, execution.device());
+    common::operand::device(workspace.device(), execution.device(), op, "workspace");
     const auto plan =
         select_plan(tokens, weights.routed_gate_up.qtype, weights.routed_down.qtype, hints);
     const auto required = workspace_bytes(plan);
-    if (!workspace.base() || workspace.capacity() < required ||
+    if (!workspace.storage().data || workspace.capacity() < required ||
         workspace.used() > workspace.capacity() - required)
         throw std::invalid_argument("sparse_moe: insufficient workspace capacity");
-    ranges.push_back(common::operand::range(workspace.base(), workspace.capacity(), op));
+    ranges.push_back(common::operand::range(workspace.storage().data, workspace.capacity(), op));
     common::operand::disjoint(ranges, op);
 
     auto scope = workspace.scope();
@@ -64,11 +66,11 @@ void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilo
             if constexpr (std::is_same_v<Selected, DecodePlan>) {
                 nvtx::ScopedRange range(nvtx::Name::SparseMoeDecode, nvtx::Category::Moe, tokens);
                 const auto scratch = allocate_decode_workspace(workspace);
-                launch_decode(x, weights, destination, selected, scratch, execution.stream);
+                launch_decode(x, weights, destination, selected, scratch, execution.stream());
             } else if constexpr (std::is_same_v<Selected, SmallPlan>) {
                 nvtx::ScopedRange range(nvtx::Name::SparseMoeSmallT, nvtx::Category::Moe, tokens);
                 const auto scratch = allocate_small_workspace(workspace, tokens);
-                launch_small(x, weights, destination, selected, scratch, execution.stream);
+                launch_small(x, weights, destination, selected, scratch, execution.stream());
             } else {
                 nvtx::ScopedRange range(nvtx::Name::SparseMoePrefill, nvtx::Category::Moe, tokens);
                 const auto scratch = allocate_prefill_workspace(workspace, selected.slice_tokens);

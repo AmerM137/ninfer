@@ -1,4 +1,6 @@
 #include "core/weight.h"
+#include "cuda_fixture.h"
+#include "core/buffer.h"
 #include "ninfer/ops/dynamic_grouped_conv.h"
 #include "core/decode_graph.h"
 
@@ -234,15 +236,19 @@ int run() {
     direct_bf16_weight::DeviceWeight projection_weight(make_projection_weight());
     Reference reference =
         compute_reference(residual_host, norm_host, base_host, projection_weight.host);
-    DeviceBuffer residual_device = to_device(residual_host), norm_device = to_device(norm_host),
-                 base_device = to_device(base_host);
+    DeviceBuffer residual_device = to_device(residual_host);
+    DeviceBuffer norm_device     = to_device(norm_host);
+    DeviceBuffer base_device     = to_device(base_host);
     const auto capacity =
         ops::rmsnorm_dynamic_grouped_conv_prepare_workspace_capacity_bytes(2, 16, 1, 8);
-    WorkspaceArena workspace(capacity);
+    ninfer::DeviceBuffer workspace_storage(ninfer::test::cuda_environment().context.device(),
+                                           capacity);
+    MemoryArena workspace(workspace_storage.span());
     cudaStream_t stream = nullptr;
     cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "create stream");
-    Tensor norm(norm_device.p, DType::BF16, {kHidden});
-    Tensor base(base_device.p, DType::BF16, {kHidden, kTaps, kSides});
+    const auto stream_execution = ninfer::test::cuda_environment().context.execution_view(stream);
+    Tensor norm(norm_device.span(), DType::BF16, {kHidden});
+    Tensor base(base_device.span(), DType::BF16, {kHidden, kTaps, kSides});
     const Weight weight = projection_weight.view();
     int failures        = 0;
     for (int width = 2; width <= 16; ++width) {
@@ -251,9 +257,9 @@ int run() {
             const std::size_t pe = static_cast<std::size_t>(kHidden) * width * batch;
             const std::size_t fe = static_cast<std::size_t>(kGroups) * 2 * width * batch;
             GuardedDeviceBuffer pd(pe * sizeof(std::uint16_t)), fd(fe * sizeof(std::uint16_t));
-            Tensor residual(residual_device.p, DType::BF16, {kHidden, width, batch});
-            Tensor prepared(pd.data(), DType::BF16, {kHidden, width, batch});
-            Tensor finish(fd.data(), DType::BF16, {kGroups, kTaps, width, batch});
+            Tensor residual(residual_device.span(), DType::BF16, {kHidden, width, batch});
+            Tensor prepared(pd.span(), DType::BF16, {kHidden, width, batch});
+            Tensor finish(fd.span(), DType::BF16, {kGroups, kTaps, width, batch});
             const bool graph_case = (width == 3 && batch == 3) || (width == 7 && batch == 7) ||
                                     (width == 14 && batch == 7) || (width == 16 && batch == 8);
             for (int replay = 0; replay < (graph_case ? 2 : 1); ++replay) {
@@ -265,7 +271,8 @@ int run() {
                 workspace.reset_peak();
                 const auto launch = [&] {
                     ops::rmsnorm_dynamic_grouped_conv_prepare(residual, norm, kEps, base, weight,
-                                                              prepared, finish, workspace, stream);
+                                                              prepared, finish, workspace,
+                                                              stream_execution);
                 };
                 if (replay) {
                     DecodeGraphDefinition definition;

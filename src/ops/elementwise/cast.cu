@@ -83,7 +83,12 @@ CastLaunch select_cast(const Tensor& source, const Tensor& destination) {
 
 } // namespace
 
-void cast_fp32_to_bf16(const Tensor& source, Tensor& destination, cudaStream_t stream) {
+void cast_fp32_to_bf16(const Tensor& source, Tensor& destination, CudaExecutionView execution) {
+    if (source.device != execution.device() || destination.device != execution.device()) {
+        throw std::invalid_argument(
+            "cast_fp32_to_bf16: operands must belong to the execution device");
+    }
+    const auto stream = execution.stream();
     if (source.dtype != DType::FP32 || destination.dtype != DType::BF16) {
         throw std::invalid_argument("cast_fp32_to_bf16: source must be FP32 and destination BF16");
     }

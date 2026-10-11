@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ninfer/ops/softmax_attention.h"
+#include "ops/common/host/operands.h"
 
 #include <cmath>
 #include <stdexcept>
@@ -22,8 +23,9 @@ inline void require_profile(AttentionHeadGeometry geometry, float scale, const c
     }
 }
 
-inline void require_qkv(const Tensor& tensor, std::int32_t tokens, const char* op,
-                        const char* name) {
+inline void require_qkv(const Tensor& tensor, std::int32_t tokens, const char* op, const char* name,
+                        Device device) {
+    common::operand::device(tensor.device, device, op, name);
     if (tensor.dtype != DType::BF16 || tensor.ne[0] != kHeadDim || tensor.ne[1] != kHeads ||
         tensor.ne[2] != tokens || tensor.ne[3] != 1) {
         throw std::invalid_argument(std::string(op) + ": invalid " + name + " shape");
@@ -40,14 +42,14 @@ inline void require_qkv(const Tensor& tensor, std::int32_t tokens, const char* o
 
 inline std::int32_t validate_qkv(const Tensor& q, const Tensor& k, const Tensor& v,
                                  const Tensor& out, AttentionHeadGeometry geometry, float scale,
-                                 const char* op) {
+                                 const char* op, Device device) {
     require_profile(geometry, scale, op);
     const std::int32_t tokens = q.ne[2];
     if (tokens <= 0) { throw std::invalid_argument(std::string(op) + ": T must be positive"); }
-    require_qkv(q, tokens, op, "q");
-    require_qkv(k, tokens, op, "k");
-    require_qkv(v, tokens, op, "v");
-    require_qkv(out, tokens, op, "out");
+    require_qkv(q, tokens, op, "q", device);
+    require_qkv(k, tokens, op, "k", device);
+    require_qkv(v, tokens, op, "v", device);
+    require_qkv(out, tokens, op, "out", device);
     if (!out.is_contiguous()) {
         throw std::invalid_argument(std::string(op) + ": out must be contiguous");
     }

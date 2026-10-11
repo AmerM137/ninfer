@@ -5,6 +5,7 @@
 //   ./ninfer_sampling_select_bench --dflash2 --drafts 15 --batch 8 --mode stochastic --extent 15
 //   ./ninfer_sampling_select_bench --matrix
 #include "core/device.h"
+#include "core/buffer.h"
 #include "core/tensor.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/speculative_accept.h"
@@ -179,14 +180,16 @@ DeviceBuffer make_logits(int cols) {
             host[static_cast<std::size_t>(col) * kPhysicalRows + row] = f32_to_bf16(value);
         }
     }
-    DeviceBuffer device(host.size() * sizeof(std::uint16_t));
-    CUDA_CHECK(cudaMemcpy(device.p, host.data(), device.bytes, cudaMemcpyHostToDevice));
+    DeviceBuffer device(ninfer::bench::device_context().device(),
+                        host.size() * sizeof(std::uint16_t));
+    CUDA_CHECK(cudaMemcpy(device.data(), host.data(), device.size(), cudaMemcpyHostToDevice));
     return device;
 }
 
 DeviceBuffer make_i32(const std::vector<std::int32_t>& host) {
-    DeviceBuffer device(host.size() * sizeof(std::int32_t));
-    CUDA_CHECK(cudaMemcpy(device.p, host.data(), device.bytes, cudaMemcpyHostToDevice));
+    DeviceBuffer device(ninfer::bench::device_context().device(),
+                        host.size() * sizeof(std::int32_t));
+    CUDA_CHECK(cudaMemcpy(device.data(), host.data(), device.size(), cudaMemcpyHostToDevice));
     return device;
 }
 
@@ -197,11 +200,12 @@ DeviceBuffer make_config(DeviceBuffer& counts, Mode mode, bool counts_active, in
     config.top_p            = 0.95f;
     config.presence_penalty = mode == Mode::Stochastic && counts_active ? 1.0f : 0.0f;
     config.seed             = 20260716ull;
-    config.token_counts =
-        mode == Mode::Stochastic && counts_active ? static_cast<std::int32_t*>(counts.p) : nullptr;
+    config.token_counts     = mode == Mode::Stochastic && counts_active
+                                  ? static_cast<std::int32_t*>(counts.data())
+                                  : nullptr;
 
-    DeviceBuffer device(sizeof(ops::SamplingConfig));
-    CUDA_CHECK(cudaMemcpy(device.p, &config, sizeof(config), cudaMemcpyHostToDevice));
+    DeviceBuffer device(ninfer::bench::device_context().device(), sizeof(ops::SamplingConfig));
+    CUDA_CHECK(cudaMemcpy(device.data(), &config, sizeof(config), cudaMemcpyHostToDevice));
     return device;
 }
 
@@ -216,7 +220,7 @@ DeviceBuffer make_batch_configs(DeviceBuffer& counts, int batch, Mode mode, bool
         config.presence_penalty     = mode == Mode::Stochastic && counts_active ? 1.0f : 0.0f;
         config.seed                 = 20260716ull + static_cast<unsigned long long>(row);
         config.token_counts         = mode == Mode::Stochastic && counts_active
-                                          ? static_cast<std::int32_t*>(counts.p) +
+                                          ? static_cast<std::int32_t*>(counts.data()) +
                                         static_cast<std::size_t>(row) * kTokenDomain
                                           : nullptr;
         if (mixed) {
@@ -224,11 +228,12 @@ DeviceBuffer make_batch_configs(DeviceBuffer& counts, int batch, Mode mode, bool
             config.presence_penalty  = row % 3 == 0 ? 0.0f : 1.0f;
             config.frequency_penalty = row % 3 == 1 ? 0.125f : 0.0f;
             config.token_counts =
-                counts_active ? static_cast<int*>(counts.p) + row * kTokenDomain : nullptr;
+                counts_active ? static_cast<int*>(counts.data()) + row * kTokenDomain : nullptr;
         }
     }
-    DeviceBuffer device(configs.size() * sizeof(ops::SamplingConfig));
-    CUDA_CHECK(cudaMemcpy(device.p, configs.data(), device.bytes, cudaMemcpyHostToDevice));
+    DeviceBuffer device(ninfer::bench::device_context().device(),
+                        configs.size() * sizeof(ops::SamplingConfig));
+    CUDA_CHECK(cudaMemcpy(device.data(), configs.data(), device.size(), cudaMemcpyHostToDevice));
     return device;
 }
 
@@ -240,24 +245,28 @@ double stochastic_payload_bytes(int cols, bool counts_active) {
 
 void run_sample(DeviceBuffer& logits, DeviceBuffer& counts, int batch, Mode mode,
                 bool counts_active, int top_k) {
-    CUDA_CHECK(cudaMemset(counts.p, 0, counts.bytes));
+    CUDA_CHECK(cudaMemset(counts.data(), 0, counts.size()));
     DeviceBuffer configs = make_batch_configs(counts, batch, mode, counts_active, top_k);
-    DeviceBuffer out(static_cast<std::size_t>(batch) * sizeof(std::int32_t));
+    DeviceBuffer out(ninfer::bench::device_context().device(),
+                     static_cast<std::size_t>(batch) * sizeof(std::int32_t));
     std::vector<std::int32_t> positions(static_cast<std::size_t>(batch));
     for (int row = 0; row < batch; ++row) { positions[static_cast<std::size_t>(row)] = 4096 + row; }
     DeviceBuffer device_positions = make_i32(positions);
-    Tensor tlogits(logits.p, DType::BF16, {kPhysicalRows, batch});
-    Tensor tout(out.p, DType::I32, {batch});
-    Tensor tpositions(device_positions.p, DType::I32, {batch});
-    WorkspaceArena workspace(ops::sampling_workspace_capacity_bytes(kTokenDomain, batch, batch));
-    const auto* config_ptr = static_cast<const ops::SamplingConfig*>(configs.p);
+    Tensor tlogits(logits.span(), DType::BF16, {kPhysicalRows, batch});
+    Tensor tout(out.span(), DType::I32, {batch});
+    Tensor tpositions(device_positions.span(), DType::I32, {batch});
+    ninfer::DeviceBuffer workspace_storage(
+        ninfer::bench::device_context().device(),
+        ops::sampling_workspace_capacity_bytes(kTokenDomain, batch, batch));
+    MemoryArena workspace(workspace_storage.span());
+    const auto* config_ptr = static_cast<const ops::SamplingConfig*>(configs.data());
 
     const double bytes  = mode == Mode::Greedy ? static_cast<double>(kTokenDomain) * 2.0 * batch
                                                : stochastic_payload_bytes(batch, counts_active);
     const Result result = bench_loop(
-        [&](cudaStream_t stream) {
+        [&](CudaExecutionView cuda) {
             ops::sample(tlogits, tout, kTokenDomain, config_ptr, tpositions,
-                        ops::kSamplePurposeDecode, workspace, stream);
+                        ops::kSamplePurposeDecode, workspace, cuda);
         },
         bytes);
     const std::string label = std::string("G2 B=") + std::to_string(batch) + " " +
@@ -269,7 +278,7 @@ void run_sample(DeviceBuffer& logits, DeviceBuffer& counts, int batch, Mode mode
 
 void run_mtp(DeviceBuffer& logits, DeviceBuffer& counts, int k, Mode mode, bool counts_active,
              int top_k) {
-    CUDA_CHECK(cudaMemset(counts.p, 0, counts.bytes));
+    CUDA_CHECK(cudaMemset(counts.data(), 0, counts.size()));
     DeviceBuffer config = make_config(counts, mode, counts_active, top_k);
     std::vector<std::int32_t> target_host(static_cast<std::size_t>(k + 1));
     std::vector<std::int32_t> draft_host(static_cast<std::size_t>(k));
@@ -283,31 +292,34 @@ void run_mtp(DeviceBuffer& logits, DeviceBuffer& counts, int k, Mode mode, bool 
     DeviceBuffer drafts  = make_i32(draft_host);
     DeviceBuffer length  = make_i32({128});
     DeviceBuffer token   = make_i32({-1});
-    DeviceBuffer sampled(static_cast<std::size_t>(k + 1) * sizeof(std::int32_t));
-    DeviceBuffer num(sizeof(std::int32_t));
-    DeviceBuffer accepted(sizeof(std::int32_t));
+    DeviceBuffer sampled(ninfer::bench::device_context().device(),
+                         static_cast<std::size_t>(k + 1) * sizeof(std::int32_t));
+    DeviceBuffer num(ninfer::bench::device_context().device(), sizeof(std::int32_t));
+    DeviceBuffer accepted(ninfer::bench::device_context().device(), sizeof(std::int32_t));
     DeviceBuffer extent = make_i32({k});
 
-    Tensor ttargets(targets.p, DType::I32, {k + 1});
-    Tensor tlogits(logits.p, DType::BF16, {kPhysicalRows, k + 1});
-    Tensor tdrafts(drafts.p, DType::I32, {k});
-    Tensor textent(extent.p, DType::I32, {1});
-    Tensor tlength(length.p, DType::I32, {1});
-    Tensor ttoken(token.p, DType::I32, {1});
-    Tensor tsampled(sampled.p, DType::I32, {k + 1});
-    Tensor tnum(num.p, DType::I32, {1});
-    Tensor taccepted(accepted.p, DType::I32, {1});
-    WorkspaceArena workspace(
+    Tensor ttargets(targets.span(), DType::I32, {k + 1});
+    Tensor tlogits(logits.span(), DType::BF16, {kPhysicalRows, k + 1});
+    Tensor tdrafts(drafts.span(), DType::I32, {k});
+    Tensor textent(extent.span(), DType::I32, {1});
+    Tensor tlength(length.span(), DType::I32, {1});
+    Tensor ttoken(token.span(), DType::I32, {1});
+    Tensor tsampled(sampled.span(), DType::I32, {k + 1});
+    Tensor tnum(num.span(), DType::I32, {1});
+    Tensor taccepted(accepted.span(), DType::I32, {1});
+    ninfer::DeviceBuffer workspace_storage(
+        ninfer::bench::device_context().device(),
         ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(kTokenDomain, k, k, 1, 1));
-    const auto* config_ptr = static_cast<const ops::SamplingConfig*>(config.p);
+    MemoryArena workspace(workspace_storage.span());
+    const auto* config_ptr = static_cast<const ops::SamplingConfig*>(config.data());
 
     const double bytes  = mode == Mode::Greedy ? static_cast<double>((k + 1) * 4 + k * 4)
                                                : stochastic_payload_bytes(k + 1, counts_active);
     const Result result = bench_loop(
-        [&](cudaStream_t stream) {
+        [&](CudaExecutionView cuda) {
             ops::speculative_accept_greedy_drafts(ttargets, tlogits, tdrafts, textent, tlength,
                                                   ttoken, tsampled, tnum, taccepted, kTokenDomain,
-                                                  config_ptr, workspace, stream);
+                                                  config_ptr, workspace, cuda);
         },
         bytes);
     const std::string label = std::string("G3 K=") + std::to_string(k) + " " +
@@ -323,7 +335,7 @@ void run_dflash2(DeviceBuffer& logits, DeviceBuffer& counts, const Options& opti
     const Mode mode          = options.mode;
     const bool counts_active = options.counts_active;
     const int top_k          = options.top_k;
-    CUDA_CHECK(cudaMemset(counts.p, 0, counts.bytes));
+    CUDA_CHECK(cudaMemset(counts.data(), 0, counts.size()));
     DeviceBuffer configs =
         make_batch_configs(counts, batch, mode, counts_active, top_k, options.mixed);
 
@@ -362,28 +374,33 @@ void run_dflash2(DeviceBuffer& logits, DeviceBuffer& counts, const Options& opti
     DeviceBuffer targets    = make_i32(target_host);
     DeviceBuffer drafts     = make_i32(draft_host);
     DeviceBuffer candidates = make_i32(candidate_host);
-    DeviceBuffer proposal_q(q_host.size() * sizeof(float));
-    CUDA_CHECK(cudaMemcpy(proposal_q.p, q_host.data(), proposal_q.bytes, cudaMemcpyHostToDevice));
+    DeviceBuffer proposal_q(ninfer::bench::device_context().device(),
+                            q_host.size() * sizeof(float));
+    CUDA_CHECK(
+        cudaMemcpy(proposal_q.data(), q_host.data(), proposal_q.size(), cudaMemcpyHostToDevice));
     DeviceBuffer extents =
         make_i32(std::vector<std::int32_t>(static_cast<std::size_t>(batch), extent));
     DeviceBuffer lengths =
         make_i32(std::vector<std::int32_t>(static_cast<std::size_t>(batch), 4096));
     DeviceBuffer anchors = make_i32(std::vector<std::int32_t>(static_cast<std::size_t>(batch), -1));
-    DeviceBuffer licensed(static_cast<std::size_t>(kDFlash2Columns) * batch * sizeof(std::int32_t));
-    DeviceBuffer licensed_counts(static_cast<std::size_t>(batch) * sizeof(std::int32_t));
-    DeviceBuffer accepted(static_cast<std::size_t>(batch) * sizeof(std::int32_t));
+    DeviceBuffer licensed(ninfer::bench::device_context().device(),
+                          static_cast<std::size_t>(kDFlash2Columns) * batch * sizeof(std::int32_t));
+    DeviceBuffer licensed_counts(ninfer::bench::device_context().device(),
+                                 static_cast<std::size_t>(batch) * sizeof(std::int32_t));
+    DeviceBuffer accepted(ninfer::bench::device_context().device(),
+                          static_cast<std::size_t>(batch) * sizeof(std::int32_t));
 
-    Tensor ttargets(targets.p, DType::I32, {kDFlash2Columns, batch});
-    Tensor tlogits(logits.p, DType::BF16, {kPhysicalRows, kDFlash2Columns, batch});
-    Tensor tdrafts(drafts.p, DType::I32, {kDFlash2Drafts, batch});
-    Tensor tcandidates(candidates.p, DType::I32, {kDFlash2Candidates, kDFlash2Drafts, batch});
-    Tensor tq(proposal_q.p, DType::FP32, {kDFlash2Candidates, kDFlash2Drafts, batch});
-    Tensor textents(extents.p, DType::I32, {batch});
-    Tensor tlengths(lengths.p, DType::I32, {batch});
-    Tensor tanchors(anchors.p, DType::I32, {batch});
-    Tensor tlicensed(licensed.p, DType::I32, {kDFlash2Columns, batch});
-    Tensor tlicensed_counts(licensed_counts.p, DType::I32, {batch});
-    Tensor taccepted(accepted.p, DType::I32, {batch});
+    Tensor ttargets(targets.span(), DType::I32, {kDFlash2Columns, batch});
+    Tensor tlogits(logits.span(), DType::BF16, {kPhysicalRows, kDFlash2Columns, batch});
+    Tensor tdrafts(drafts.span(), DType::I32, {kDFlash2Drafts, batch});
+    Tensor tcandidates(candidates.span(), DType::I32, {kDFlash2Candidates, kDFlash2Drafts, batch});
+    Tensor tq(proposal_q.span(), DType::FP32, {kDFlash2Candidates, kDFlash2Drafts, batch});
+    Tensor textents(extents.span(), DType::I32, {batch});
+    Tensor tlengths(lengths.span(), DType::I32, {batch});
+    Tensor tanchors(anchors.span(), DType::I32, {batch});
+    Tensor tlicensed(licensed.span(), DType::I32, {kDFlash2Columns, batch});
+    Tensor tlicensed_counts(licensed_counts.span(), DType::I32, {batch});
+    Tensor taccepted(accepted.span(), DType::I32, {batch});
     const ops::SpeculativeAcceptExecutionEnvelope envelope{
         .all_rows_greedy_without_penalties =
             mode == Mode::Greedy && !options.force_general && !options.mixed,
@@ -391,25 +408,28 @@ void run_dflash2(DeviceBuffer& logits, DeviceBuffer& counts, const Options& opti
     const std::size_t workspace_bytes =
         ops::speculative_accept_sparse_drafts_workspace_capacity_bytes(
             kTokenDomain, envelope, kDFlash2Drafts, kDFlash2Drafts, batch, batch);
-    WorkspaceArena workspace(std::max<std::size_t>(workspace_bytes, 256));
-    const auto* config_ptr = static_cast<const ops::SamplingConfig*>(configs.p);
-    const auto launch      = [&](cudaStream_t stream) {
+    ninfer::DeviceBuffer workspace_storage(ninfer::bench::device_context().device(),
+                                           std::max<std::size_t>(workspace_bytes, 256));
+    MemoryArena workspace(workspace_storage.span());
+    const auto* config_ptr = static_cast<const ops::SamplingConfig*>(configs.data());
+    const auto launch      = [&](CudaExecutionView cuda) {
         ops::speculative_accept_sparse_drafts(
             ttargets, tlogits, tdrafts, tcandidates, tq, textents, tlengths, tanchors, tlicensed,
-            tlicensed_counts, taccepted, kTokenDomain, config_ptr, envelope, workspace, stream);
+            tlicensed_counts, taccepted, kTokenDomain, config_ptr, envelope, workspace, cuda);
     };
 
     cudaStream_t stream = nullptr;
     CUDA_CHECK(cudaStreamCreate(&stream));
-    launch(stream);
+    const auto cuda = ninfer::bench::device_context().execution_view(stream);
+    launch(cuda);
     CUDA_CHECK(cudaStreamSynchronize(stream));
     TimedGraph graph;
-    graph.capture(stream, [&](cudaStream_t s) {
-        for (int i = 0; i < options.graph_calls; ++i) launch(s);
+    graph.capture(cuda, [&](CudaExecutionView cuda) {
+        for (int i = 0; i < options.graph_calls; ++i) launch(cuda);
     });
     bench::L2FlushBuffer flush(kFlushBytes);
     const ColdTiming timing =
-        measure_cold_graph(graph, flush, stream, options.warmup, options.repeat);
+        measure_cold_graph(graph, flush, cuda, options.warmup, options.repeat);
     CUDA_CHECK(cudaStreamDestroy(stream));
 
     const bool general = !envelope.all_rows_greedy_without_penalties;
@@ -451,9 +471,10 @@ int main(int argc, char** argv) {
         DeviceBuffer logits = make_logits(max_cols);
         const int count_rows =
             options.matrix ? 8 : (options.dflash2 || options.sample ? options.batch : 1);
-        DeviceBuffer counts(static_cast<std::size_t>(kTokenDomain) * count_rows *
-                            sizeof(std::int32_t));
-        CUDA_CHECK(cudaMemset(counts.p, 0, counts.bytes));
+        DeviceBuffer counts(bench::device_context().device(),
+                            static_cast<std::size_t>(kTokenDomain) * count_rows *
+                                sizeof(std::int32_t));
+        CUDA_CHECK(cudaMemset(counts.data(), 0, counts.size()));
 
         std::printf("payload: physical_rows=%d token_domain=%d logits=%.3f MiB/row "
                     "counts=%.3f MiB/row\n",

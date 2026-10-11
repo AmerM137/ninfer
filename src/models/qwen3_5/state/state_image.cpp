@@ -97,12 +97,12 @@ StateImageHostLayout plan_host_state_image(const StateImageSpec& spec) {
     LayoutBuilder builder;
     StateImageHostLayout host;
     host.spec = spec;
-    const Tensor conv_slot(nullptr, spec.linear.conv_dtype,
-                           {spec.linear.conv_channels, spec.linear.conv_width});
-    const Tensor recurrent_slot(
-        nullptr, DType::FP32,
-        {spec.linear.key_head_dim, spec.linear.value_head_dim, spec.linear.value_heads});
-    const Tensor hidden_slot(nullptr, DType::BF16, {spec.hidden});
+    const auto conv_slot = Tensor::metadata(spec.linear.conv_dtype,
+                                            {spec.linear.conv_channels, spec.linear.conv_width});
+    const auto recurrent_slot =
+        Tensor::metadata(DType::FP32, {spec.linear.key_head_dim, spec.linear.value_head_dim,
+                                       spec.linear.value_heads});
+    const auto hidden_slot       = Tensor::metadata(DType::BF16, {spec.hidden});
     host.linear_conv_layer_bytes = conv_slot.bytes();
     host.linear_conv = builder.add(checked_mul(host.linear_conv_layer_bytes, spec.linear.layers,
                                                "StateImage host convolution bytes overflow"),
@@ -115,8 +115,8 @@ StateImageHostLayout plan_host_state_image(const StateImageSpec& spec) {
     host.continuation_hidden = builder.add(hidden_slot.bytes(), kStateImageAlignment,
                                            "StateImage host continuation hidden");
     if (spec.dflash_local) {
-        const Tensor local_slot(
-            nullptr, DType::BF16,
+        const auto local_slot = Tensor::metadata(
+            DType::BF16,
             {spec.dflash_local->head_dim,
              static_cast<std::int32_t>(padded_dflash_capacity(spec.dflash_local->capacity)),
              spec.dflash_local->kv_heads});
@@ -285,9 +285,12 @@ std::byte* HostStatePool::slot_data(std::uint32_t index) const noexcept {
     return slots_[index].storage.data();
 }
 
-StateImageDevicePool::StateImageDevicePool(DeviceSpan backing, const StateImageDeviceLayout& layout)
+StateImageDevicePool::StateImageDevicePool(MemorySpan backing, const StateImageDeviceLayout& layout)
     : linear_(backing, layout.linear),
       continuation_hidden_(layout.continuation_hidden.bind(backing)), host_layout_(layout.host) {
+    if (backing.device.type() != DeviceType::CUDA) {
+        throw std::invalid_argument("device state images require CUDA backing");
+    }
     if (continuation_hidden_.dtype != DType::BF16 || !continuation_hidden_.is_contiguous() ||
         continuation_hidden_.ne[0] != host_layout_.spec.hidden ||
         continuation_hidden_.ne[1] != linear_.slot_count()) {

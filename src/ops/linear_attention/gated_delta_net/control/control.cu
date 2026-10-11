@@ -22,12 +22,13 @@ __global__ void control_kernel(const __nv_bfloat16* a, const __nv_bfloat16* b, c
 
 namespace ninfer::ops {
 void gdn_control(const Tensor& a, const Tensor& b, const Tensor& a_log, const Tensor& dt_bias,
-                 GdnControlOutputs out, cudaStream_t stream) {
+                 GdnControlOutputs out, CudaExecutionView execution) {
+    const auto stream = execution.stream();
     namespace control = detail::gdn_control;
     control::validate_control(a, b, a_log, dt_bias, out);
     if (a.ne[1] == 0) return;
     const std::array<const Tensor*, 6> tensors{&a, &b, &a_log, &dt_bias, &out.g, &out.beta};
-    control::validate_disjoint(nullptr, tensors);
+    control::validate_storage(nullptr, tensors, execution);
     const auto elements   = out.g.numel();
     const unsigned blocks = static_cast<unsigned>((elements + 255) / 256);
     control::control_kernel<<<blocks, 256, 0, stream>>>(

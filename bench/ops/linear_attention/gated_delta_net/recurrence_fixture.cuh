@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/buffer.h"
 #include "recurrence_options.h"
 #include "ninfer_bench_common.h"
 #include "ops/linear_attention/gated_delta_net/operands.h"
@@ -20,8 +21,8 @@ DeviceBuffer make_varied_bf16(std::size_t elements, std::uint32_t seed) {
         const float u = static_cast<float>((state >> 8) & 0x00ffffffU) * (1.0F / 16777216.0F);
         value         = f32_to_bf16(2.0F * u - 1.0F);
     }
-    DeviceBuffer device(elements * sizeof(std::uint16_t));
-    device.copy_from_host(host.data(), device.bytes);
+    DeviceBuffer device(ninfer::bench::device_context().device(), elements * sizeof(std::uint16_t));
+    device.copy_from_host(host.data(), device.size());
     return device;
 }
 
@@ -49,8 +50,9 @@ DeviceBuffer make_normalized_bf16(std::size_t rows, std::uint32_t seed) {
         }
     }
 
-    DeviceBuffer device(host.size() * sizeof(std::uint16_t));
-    device.copy_from_host(host.data(), device.bytes);
+    DeviceBuffer device(ninfer::bench::device_context().device(),
+                        host.size() * sizeof(std::uint16_t));
+    device.copy_from_host(host.data(), device.size());
     return device;
 }
 
@@ -84,34 +86,35 @@ struct Operands {
                          problem.value_heads * problem.tokens * problem.batch *
                          sizeof(std::uint16_t))) {}
 
-    Tensor query() const {
+    Tensor query() {
         return Tensor(
-            q.p, DType::BF16,
+            q.span(), DType::BF16,
             {gated_delta_net_detail::kStateDim, problem.qk_heads, problem.tokens, problem.batch});
     }
 
-    Tensor key() const {
+    Tensor key() {
         return Tensor(
-            k.p, DType::BF16,
+            k.span(), DType::BF16,
             {gated_delta_net_detail::kStateDim, problem.qk_heads, problem.tokens, problem.batch});
     }
 
-    Tensor value() const {
-        return Tensor(v.p, DType::BF16,
+    Tensor value() {
+        return Tensor(v.span(), DType::BF16,
                       {gated_delta_net_detail::kStateDim, problem.value_heads, problem.tokens,
                        problem.batch});
     }
 
-    Tensor gate() const {
-        return Tensor(g.p, DType::FP32, {problem.value_heads, problem.tokens, problem.batch});
+    Tensor gate() {
+        return Tensor(g.span(), DType::FP32, {problem.value_heads, problem.tokens, problem.batch});
     }
 
-    Tensor beta_tensor() const {
-        return Tensor(beta.p, DType::FP32, {problem.value_heads, problem.tokens, problem.batch});
+    Tensor beta_tensor() {
+        return Tensor(beta.span(), DType::FP32,
+                      {problem.value_heads, problem.tokens, problem.batch});
     }
 
-    Tensor output() const {
-        return Tensor(out.p, DType::BF16,
+    Tensor output() {
+        return Tensor(out.span(), DType::BF16,
                       {gated_delta_net_detail::kStateDim, problem.value_heads, problem.tokens,
                        problem.batch});
     }

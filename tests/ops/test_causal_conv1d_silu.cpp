@@ -1,4 +1,5 @@
 #include "ninfer/ops/causal_conv1d_silu.h"
+#include "cuda_fixture.h"
 #include "ops/op_tester.h"
 
 #include <cuda_runtime.h>
@@ -186,13 +187,14 @@ int packed_rejection_case(std::int32_t T) {
     GuardedDeviceBuffer state_out(static_cast<std::size_t>(C) * 3 * sizeof(std::uint16_t));
     GuardedDeviceBuffer out(n * sizeof(std::uint16_t));
 
-    const Tensor tx(x.data(), DType::BF16, {C, T});
-    const Tensor tw(weight.data(), DType::BF16, {C, 4});
-    const Tensor tsi(state_in.data(), DType::BF16, {C, 3});
+    const Tensor tx(x.span(), DType::BF16, {C, T});
+    const Tensor tw(weight.span(), DType::BF16, {C, 4});
+    const Tensor tsi(state_in.span(), DType::BF16, {C, 3});
 
     auto is_rejected = [&](const Tensor& state_in_arg, Tensor state_out_arg, Tensor out_arg) {
         try {
-            ops::causal_conv1d_silu(tx, tw, state_in_arg, state_out_arg, out_arg, nullptr);
+            ops::causal_conv1d_silu(tx, tw, state_in_arg, state_out_arg, out_arg,
+                                    ninfer::test::cuda_environment().default_execution);
         } catch (const std::invalid_argument&) { return true; }
         cuda_synchronize();
         return false;
@@ -205,15 +207,22 @@ int packed_rejection_case(std::int32_t T) {
             ++failures;
         }
     };
-    Tensor tso(state_out.data(), DType::BF16, {C, 3});
-    Tensor tout(out.data(), DType::BF16, {C, T});
-    Tensor out_over_x(x.data(), DType::BF16, {C, T});
-    Tensor shifted_state_out(static_cast<std::uint16_t*>(state_in.data()) + 2, DType::BF16, {C, 3});
+    Tensor tso(state_out.span(), DType::BF16, {C, 3});
+    Tensor tout(out.span(), DType::BF16, {C, T});
+    Tensor out_over_x(x.span(), DType::BF16, {C, T});
+    Tensor shifted_state_out(static_cast<std::uint16_t*>(state_in.data()) + 2, state_in.device(),
+                             DType::BF16, {C, 3});
 
     expect_rejected(is_rejected(tsi, shifted_state_out, tout),
                     "a state pair that overlaps without being the same storage");
     expect_rejected(is_rejected(tsi, tso, out_over_x), "an out that overlaps x");
     expect_rejected(is_rejected(tsi, tout, tout), "an out that overlaps conv_state_out");
+    auto host_state_out   = tso;
+    host_state_out.device = Device::cpu();
+    expect_rejected(is_rejected(tsi, host_state_out, tout), "a state output on another device");
+    auto host_state_in   = tsi;
+    host_state_in.device = Device::cpu();
+    expect_rejected(is_rejected(host_state_in, tso, tout), "a state input on another device");
     return failures;
 }
 
@@ -232,40 +241,43 @@ int split_rejection_case(std::int32_t T) {
     GuardedDeviceBuffer k(static_cast<std::size_t>(KD) * T * sizeof(std::uint16_t));
     GuardedDeviceBuffer v(static_cast<std::size_t>(VD) * T * sizeof(std::uint16_t));
 
-    const Tensor tx(x.data(), DType::BF16, {C, T});
-    const Tensor tw(weight.data(), DType::BF16, {C, 4});
-    const Tensor tsi(state_in.data(), DType::BF16, {C, 3});
-    Tensor tq(q.data(), DType::BF16, {KD, T});
-    Tensor tk(k.data(), DType::BF16, {KD, T});
-    Tensor tv(v.data(), DType::BF16, {VD, T});
+    const Tensor tx(x.span(), DType::BF16, {C, T});
+    const Tensor tw(weight.span(), DType::BF16, {C, 4});
+    const Tensor tsi(state_in.span(), DType::BF16, {C, 3});
+    Tensor tq(q.span(), DType::BF16, {KD, T});
+    Tensor tk(k.span(), DType::BF16, {KD, T});
+    Tensor tv(v.span(), DType::BF16, {VD, T});
 
-    const Tensor bad_null(nullptr, DType::BF16, {C, T});
-    const Tensor bad_dtype(weight.data(), DType::FP32, {C, 4});
-    Tensor bad_rank(q.data(), DType::BF16, {KD, T, 2});
-    Tensor bad_profile(q.data(), DType::BF16, {KD + 1, T});
-    Tensor other_profile(v.data(), DType::BF16, {6144, T});
-    Tensor bad_dest_dtype(q.data(), DType::FP32, {KD, T});
-    Tensor null_dest(nullptr, DType::BF16, {KD, T});
-    Tensor short_dest(q.data(), DType::BF16, {KD, T - 1});
-    Tensor over_x(x.data(), DType::BF16, {KD, T});
-    Tensor over_state(state_in.data(), DType::BF16, {KD, T});
-    Tensor misaligned(static_cast<std::uint16_t*>(q.data()) + 1, DType::BF16, {KD, T});
+    auto bad_null = tx;
+    bad_null.data = nullptr;
+    const Tensor bad_dtype(weight.data(), weight.device(), DType::FP32, {C, 4});
+    Tensor bad_rank(q.data(), q.device(), DType::BF16, {KD, T, 2});
+    Tensor bad_profile(q.data(), q.device(), DType::BF16, {KD + 1, T});
+    Tensor other_profile(v.data(), v.device(), DType::BF16, {6144, T});
+    Tensor bad_dest_dtype(q.data(), q.device(), DType::FP32, {KD, T});
+    auto null_dest = tq;
+    null_dest.data = nullptr;
+    Tensor short_dest(q.span(), DType::BF16, {KD, T - 1});
+    Tensor over_x(x.span(), DType::BF16, {KD, T});
+    Tensor over_state(state_in.data(), state_in.device(), DType::BF16, {KD, T});
+    Tensor misaligned(static_cast<std::uint16_t*>(q.data()) + 1, q.device(), DType::BF16, {KD, T});
 
     auto is_rejected = [&](const Tensor& x_in, const Tensor& weight_in, const Tensor& state_in_arg,
                            Tensor state_out_arg, Tensor q_in, Tensor k_in, Tensor v_in) {
         try {
             ops::causal_conv1d_silu_split(x_in, weight_in, state_in_arg, state_out_arg, q_in, k_in,
-                                          v_in, nullptr);
+                                          v_in, ninfer::test::cuda_environment().default_execution);
         } catch (const std::invalid_argument&) { return true; }
         cuda_synchronize();
         return false;
     };
-    Tensor tso(state_out.data(), DType::BF16, {C, 3});
+    Tensor tso(state_out.span(), DType::BF16, {C, 3});
     // A state pair that shares all but one element: the contract allows disjoint or exactly the
     // same storage, and this is neither.
-    Tensor shifted_state_out(static_cast<std::uint16_t*>(state_in.data()) + 2, DType::BF16, {C, 3});
+    Tensor shifted_state_out(static_cast<std::uint16_t*>(state_in.data()) + 2, state_in.device(),
+                             DType::BF16, {C, 3});
 
-    int failures = 0;
+    int failures         = 0;
     auto expect_rejected = [&](bool rejected, const char* what) {
         if (!rejected) {
             std::cout << "FAIL causal_conv1d_silu_split T=" << T << " accepted " << what << "\n";
@@ -328,9 +340,7 @@ int split_case(std::int32_t C, std::int32_t q_dim, std::int32_t k_dim, std::int3
     k.fill(kOutputPoison);
     v.fill(kOutputPoison);
 
-    auto at = [&](GuardedDeviceBuffer& buffer) {
-        return static_cast<void*>(static_cast<char*>(buffer.data()) + pad);
-    };
+    auto at               = [&](GuardedDeviceBuffer& buffer) { return buffer.span().subspan(pad); };
     auto pad_is_untouched = [&](GuardedDeviceBuffer& buffer, const char* label) {
         if (pad == 0) { return 0; }
         std::vector<std::uint8_t> head(pad);
@@ -344,20 +354,21 @@ int split_case(std::int32_t C, std::int32_t q_dim, std::int32_t k_dim, std::int3
         return 0;
     };
 
-    Tensor tx(x.data(), DType::BF16, {C, T});
-    Tensor tw(weight.data(), DType::BF16, {C, 4});
-    Tensor ts_in(state_in.data(), DType::BF16, {C, 3});
-    Tensor ts_out((alias_state ? state_in : state_out).data(), DType::BF16, {C, 3});
+    Tensor tx(x.span(), DType::BF16, {C, T});
+    Tensor tw(weight.span(), DType::BF16, {C, 4});
+    Tensor ts_in(state_in.span(), DType::BF16, {C, 3});
+    Tensor ts_out((alias_state ? state_in : state_out).span(), DType::BF16, {C, 3});
     Tensor tq(at(q), DType::BF16, {q_dim, T});
     Tensor tk(at(k), DType::BF16, {k_dim, T});
     Tensor tv(at(v), DType::BF16, {value_dim, T});
 
-    ops::causal_conv1d_silu_split(tx, tw, ts_in, ts_out, tq, tk, tv, nullptr);
+    ops::causal_conv1d_silu_split(tx, tw, ts_in, ts_out, tq, tk, tv,
+                                  ninfer::test::cuda_environment().default_execution);
     cuda_synchronize();
 
-    const std::string tag     = "causal_conv1d_silu_split C=" + std::to_string(C) +
-                                " T=" + std::to_string(T) + (alias_state ? " alias" : "") +
-                                (offset_pairs ? " offset" : "");
+    const std::string tag = "causal_conv1d_silu_split C=" + std::to_string(C) +
+                            " T=" + std::to_string(T) + (alias_state ? " alias" : "") +
+                            (offset_pairs ? " offset" : "");
     const std::size_t q_count = static_cast<std::size_t>(q_dim) * static_cast<std::size_t>(T);
     const std::size_t k_count = static_cast<std::size_t>(k_dim) * static_cast<std::size_t>(T);
     const std::size_t v_count = static_cast<std::size_t>(value_dim) * static_cast<std::size_t>(T);
@@ -366,11 +377,11 @@ int split_case(std::int32_t C, std::int32_t q_dim, std::int32_t k_dim, std::int3
     failures += pad_is_untouched(q, "out0");
     failures += pad_is_untouched(k, "out1");
     failures += pad_is_untouched(v, "out2");
-    failures += verify_output(tag + " q", from_device_bf16(at(q), q_count),
+    failures += verify_output(tag + " q", from_device_bf16(at(q).data, q_count),
                               oracle_slice(oracle.output, C, T, 0, q_dim));
-    failures += verify_output(tag + " k", from_device_bf16(at(k), k_count),
+    failures += verify_output(tag + " k", from_device_bf16(at(k).data, k_count),
                               oracle_slice(oracle.output, C, T, q_dim, k_dim));
-    failures += verify_output(tag + " v", from_device_bf16(at(v), v_count),
+    failures += verify_output(tag + " v", from_device_bf16(at(v).data, v_count),
                               oracle_slice(oracle.output, C, T, q_dim + k_dim, value_dim));
     failures +=
         verify_bits(tag + " final state", (alias_state ? state_in : state_out).data(), final_bits);
@@ -413,18 +424,21 @@ int ordinary_case(std::int32_t C, std::int32_t T, StateCall call, std::uint32_t 
     state_in.copy_from_host(state_bits.data(), state_in.bytes());
     output.fill(kOutputPoison);
 
-    Tensor tx(x.data(), DType::BF16, {C, T});
-    Tensor tw(weight.data(), DType::BF16, {C, 4});
-    Tensor ts_in(state_in.data(), DType::BF16, {C, 3});
-    Tensor ts_out(state_out == nullptr ? state_in.data() : state_out->data(), DType::BF16, {C, 3});
-    Tensor tout(output.data(), DType::BF16, {C, T});
+    Tensor tx(x.span(), DType::BF16, {C, T});
+    Tensor tw(weight.span(), DType::BF16, {C, 4});
+    Tensor ts_in(state_in.span(), DType::BF16, {C, 3});
+    Tensor ts_out(state_out == nullptr ? state_in.span() : state_out->span(), DType::BF16, {C, 3});
+    Tensor tout(output.span(), DType::BF16, {C, T});
 
     if (call == StateCall::InPlaceEntry) {
-        ops::causal_conv1d_silu(tx, tw, ts_in, tout, nullptr);
+        ops::causal_conv1d_silu(tx, tw, ts_in, tout,
+                                ninfer::test::cuda_environment().default_execution);
     } else if (call == StateCall::DistinctEntry) {
-        ops::causal_conv1d_silu(tx, tw, ts_in, ts_out, tout, nullptr);
+        ops::causal_conv1d_silu(tx, tw, ts_in, ts_out, tout,
+                                ninfer::test::cuda_environment().default_execution);
     } else {
-        ops::causal_conv1d_silu(tx, tw, ts_in, ts_in, tout, nullptr);
+        ops::causal_conv1d_silu(tx, tw, ts_in, ts_in, tout,
+                                ninfer::test::cuda_environment().default_execution);
     }
     cuda_synchronize();
 
@@ -489,12 +503,14 @@ int continuation_slot_case(std::int32_t C, std::int32_t T, std::int32_t slots,
     auto* selected_device =
         static_cast<std::uint8_t*>(state.data()) +
         static_cast<std::size_t>(read_slot) * slot_elements * sizeof(std::uint16_t);
-    Tensor tx(x.data(), DType::BF16, {C, T});
-    Tensor tw(weight.data(), DType::BF16, {C, 4});
-    Tensor ts_in(selected_device, DType::BF16, {C, 3});
-    Tensor ts_out(state.data(), DType::BF16, {C, 3});
-    Tensor tout(output.data(), DType::BF16, {C, T});
-    ops::causal_conv1d_silu(tx, tw, ts_in, ts_out, tout, nullptr);
+    Tensor tx(x.span(), DType::BF16, {C, T});
+    Tensor tw(weight.span(), DType::BF16, {C, 4});
+    Tensor ts_in(state.span().subspan(std::size_t(read_slot) * slot_elements * 2), DType::BF16,
+                 {C, 3});
+    Tensor ts_out(state.span(), DType::BF16, {C, 3});
+    Tensor tout(output.span(), DType::BF16, {C, T});
+    ops::causal_conv1d_silu(tx, tw, ts_in, ts_out, tout,
+                            ninfer::test::cuda_environment().default_execution);
     cuda_synchronize();
 
     const std::string tag = "causal_conv1d_silu continuation C=" + std::to_string(C) +
@@ -554,14 +570,14 @@ int snapshot_case(std::int32_t C, std::int32_t T, std::int32_t slots, std::int32
     snapshot_base.copy_from_host(&snapshot_base_slot_host, sizeof(snapshot_base_slot_host));
     output.fill(kOutputPoison);
 
-    Tensor tx(x.data(), DType::BF16, {C, T});
-    Tensor tw(weight.data(), DType::BF16, {C, 4});
-    Tensor tstate(state.data(), DType::BF16, {C, 3, slots});
-    Tensor tslot(slot.data(), DType::I32, {1});
-    Tensor tsnapshot_base(snapshot_base.data(), DType::I32, {1});
-    Tensor tout(output.data(), DType::BF16, {C, T});
+    Tensor tx(x.span(), DType::BF16, {C, T});
+    Tensor tw(weight.span(), DType::BF16, {C, 4});
+    Tensor tstate(state.span(), DType::BF16, {C, 3, slots});
+    Tensor tslot(slot.span(), DType::I32, {1});
+    Tensor tsnapshot_base(snapshot_base.span(), DType::I32, {1});
+    Tensor tout(output.span(), DType::BF16, {C, T});
     ops::causal_conv1d_silu_snapshot(tx, tw, tstate, Tensor{}, tslot, tsnapshot_base, tout,
-                                     nullptr);
+                                     ninfer::test::cuda_environment().default_execution);
     cuda_synchronize();
 
     const std::string tag = "causal_conv1d_silu snapshot C=" + std::to_string(C) +
@@ -652,15 +668,16 @@ int batched_snapshot_case(std::int32_t C, std::int32_t width,
     bases.copy_from_host(snapshot_bases.data(), bases.bytes());
     output.fill(kOutputPoison);
 
-    Tensor tx(x.data(), DType::BF16, {C, width, batch});
-    Tensor tw(weight.data(), DType::BF16, {C, 4});
-    Tensor tstate(state.data(), DType::BF16, {C, 3, slots});
+    Tensor tx(x.span(), DType::BF16, {C, width, batch});
+    Tensor tw(weight.span(), DType::BF16, {C, 4});
+    Tensor tstate(state.span(), DType::BF16, {C, 3, slots});
     Tensor tvalid;
-    if (masked) { tvalid = Tensor(valid->data(), DType::I32, {batch}); }
-    Tensor tinitial(initial.data(), DType::I32, {batch});
-    Tensor tbases(bases.data(), DType::I32, {batch});
-    Tensor tout(output.data(), DType::BF16, {C, width, batch});
-    ops::causal_conv1d_silu_snapshot(tx, tw, tstate, tvalid, tinitial, tbases, tout, nullptr);
+    if (masked) { tvalid = Tensor(valid->span(), DType::I32, {batch}); }
+    Tensor tinitial(initial.span(), DType::I32, {batch});
+    Tensor tbases(bases.span(), DType::I32, {batch});
+    Tensor tout(output.span(), DType::BF16, {C, width, batch});
+    ops::causal_conv1d_silu_snapshot(tx, tw, tstate, tvalid, tinitial, tbases, tout,
+                                     ninfer::test::cuda_environment().default_execution);
     cuda_synchronize();
 
     const std::string tag = "causal_conv1d_silu batched snapshot C=" + std::to_string(C) +

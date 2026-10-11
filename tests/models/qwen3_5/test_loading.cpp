@@ -237,7 +237,7 @@ void native_uses() {
     const std::array<std::uint64_t, 2> shape{128, 64};
     const auto geometry = weight_geometry(QType::NVFP4, QuantLayout::BlockScaleK16M128x4, shape);
     std::vector<std::byte> bytes(geometry.bytes);
-    const WeightParent parent{geometry, bytes.data(), 8.0F};
+    const WeightParent parent{geometry, Device::cpu(), bytes.data(), 8.0F};
     const WeightView gate{{64, 64}, {{&parent, 0, 4096}}};
     const WeightView up{{64, 64}, {{&parent, 4096, 8192}}};
     const auto joined = ops::prepare_linear_swiglu_weight({gate, ops::LinearPolicy::AllowA4, 2.0F},

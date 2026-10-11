@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/buffer.h"
 #include "core/arena.h"
 #include "core/layout.h"
 #include "core/paged_kv_storage.h"
@@ -41,6 +42,8 @@ struct PagedKVBatchLayerView {
     std::int32_t head_dim     = 0;
     std::int32_t num_kv_heads = 0;
     KvCacheStorage storage    = KvCacheStorage::BFloat16;
+
+    [[nodiscard]] Device device() const;
 };
 
 /** Rebinds one checked single-sequence table row as a one-row batched view. */
@@ -197,7 +200,7 @@ private:
 
 class DeviceKVPagePool {
 public:
-    DeviceKVPagePool(DeviceSpan backing, const DeviceKVPagePoolLayout& layout);
+    DeviceKVPagePool(MemorySpan backing, const DeviceKVPagePoolLayout& layout);
 
     DeviceKVPagePool(const DeviceKVPagePool&)            = delete;
     DeviceKVPagePool& operator=(const DeviceKVPagePool&) = delete;
@@ -379,7 +382,7 @@ private:
 
 class KVExecutionTablePool {
 public:
-    KVExecutionTablePool(DeviceSpan backing, const KVExecutionTableLayout& layout,
+    KVExecutionTablePool(MemorySpan backing, const KVExecutionTableLayout& layout,
                          const DeviceKVPagePool& pages);
 
     KVExecutionTablePool(const KVExecutionTablePool&)            = delete;

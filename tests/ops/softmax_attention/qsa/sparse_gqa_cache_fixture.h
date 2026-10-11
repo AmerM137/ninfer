@@ -16,8 +16,7 @@ struct EncodedPlane {
         : leading(padded ? dtype_size(dtype) : 0), element(dtype_size(dtype)),
           row(features * element + (padded ? element : 0)), head(64 * row + leading),
           page(2 * head + leading), host(leading + page * pages, 0xcd), device(host.size()),
-          view(static_cast<std::uint8_t*>(device.data()) + leading, dtype,
-               {features, 64, 2, pages}) {
+          view(device.span().subspan(leading), dtype, {features, 64, 2, pages}) {
         view.nb[1] = row;
         view.nb[2] = head;
         view.nb[3] = page;

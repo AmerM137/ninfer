@@ -1,4 +1,5 @@
 #include "core/weight.h"
+#include "cuda_fixture.h"
 #include "ops/linear_pair/linear_pair_test_common.h"
 
 #include "ninfer/ops/linear_pair.h"
@@ -224,15 +225,15 @@ int run_q8_a16_shape(std::string_view label, const ShapeCase& shape) {
                                             fixture.second_storage.payload.size());
     }
 
-    void* const second_payload =
-        fixture.shared_payload ? first_device_weight.data() : second_device_weight.data();
-    const auto parent = [](const quantized_weight::PackedWeight& source, const void* payload) {
+    const auto second_payload =
+        fixture.shared_payload ? first_device_weight.span() : second_device_weight.span();
+    const auto parent = [](const quantized_weight::PackedWeight& source, ConstMemorySpan payload) {
         const std::array shape{static_cast<std::uint64_t>(source.weight.n),
                                static_cast<std::uint64_t>(source.weight.k)};
         return WeightParent{weight_geometry(source.weight.qtype, source.weight.layout, shape),
-                            static_cast<const std::byte*>(payload)};
+                            payload.device, static_cast<const std::byte*>(payload.data)};
     };
-    const auto first_parent  = parent(fixture.first_storage, first_device_weight.data());
+    const auto first_parent  = parent(fixture.first_storage, first_device_weight.span());
     const auto second_parent = parent(second_storage, second_payload);
     const auto region        = [](const WeightParent& storage, std::uint64_t row) {
         const auto k = storage.geometry.shape[1];
@@ -252,14 +253,15 @@ int run_q8_a16_shape(std::string_view label, const ShapeCase& shape) {
         first_output.fill(0xff);
         second_output.fill(0xff);
 
-        Tensor input(device_activation.data(), DType::BF16, {shape.k, t});
-        Tensor first(first_output.data(), DType::BF16, {kOutputRows, t});
-        Tensor second(second_output.data(), DType::BF16, {kOutputRows, t});
+        Tensor input(device_activation.span(), DType::BF16, {shape.k, t});
+        Tensor first(first_output.span(), DType::BF16, {kOutputRows, t});
+        Tensor second(second_output.span(), DType::BF16, {kOutputRows, t});
 
         const std::string case_label =
             std::string(label) + " [1024," + std::to_string(shape.k) + "] T=" + std::to_string(t);
         try {
-            ops::linear_pair(input, first_weight, second_weight, first, second, nullptr);
+            ops::linear_pair(input, first_weight, second_weight, first, second,
+                             ninfer::test::cuda_environment().default_execution);
             test::cuda_check(cudaDeviceSynchronize(), "synchronize linear_pair");
         } catch (const std::exception& error) {
             std::cerr << case_label << ": unexpected exception: " << error.what() << '\n';

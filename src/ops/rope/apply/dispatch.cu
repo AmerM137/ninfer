@@ -87,21 +87,21 @@ Selection select_rope(const RopeArguments& a, int multiprocessors) {
     return generic;
 }
 
-void apply(const RopeArguments& arguments, DeviceExecutionView execution) {
-    const auto selected = select_rope(arguments, execution.multiprocessor_count);
-    selected.launch(arguments, selected.threads, execution.stream);
+void apply(const RopeArguments& arguments, CudaExecutionView execution) {
+    const auto selected = select_rope(arguments, execution.multiprocessor_count());
+    selected.launch(arguments, selected.threads, execution.stream());
     CUDA_CHECK(cudaGetLastError());
 }
 
 } // namespace
 
 void rope_dispatch(const Tensor& positions, int rotary_dim, float theta, Tensor& q, Tensor& k,
-                   DeviceExecutionView execution) {
+                   CudaExecutionView execution) {
     apply({positions, q, &k, rotary_dim, theta}, execution);
 }
 
 void rope_dispatch(const Tensor& positions, int rotary_dim, float theta, Tensor& x,
-                   DeviceExecutionView execution) {
+                   CudaExecutionView execution) {
     apply({positions, x, nullptr, rotary_dim, theta}, execution);
 }
 

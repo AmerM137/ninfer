@@ -1,5 +1,8 @@
 #pragma once
 
+#include <optional>
+
+#include "core/buffer.h"
 #include "state_fixture.cuh"
 #include "ninfer/ops/qsa.h"
 
@@ -10,17 +13,25 @@
 namespace ninfer::bench::qsa {
 
 struct IndexerFixture {
-    DeviceBuffer query_data, key_data, positions, valid, table_rows, tables, ids, counts;
+    DeviceBuffer query_data;
+    DeviceBuffer key_data;
+    DeviceBuffer positions;
+    DeviceBuffer valid;
+    DeviceBuffer table_rows;
+    DeviceBuffer tables;
+    DeviceBuffer ids;
+    DeviceBuffer counts;
     std::vector<int> contexts, lengths;
     Tensor query;
     ops::QsaIndexCacheView cache;
     ops::QsaBatchView batch;
     ops::QsaBlockSelection selected;
     ops::QsaIndexerExecutionEnvelope envelope;
-    std::unique_ptr<WorkspaceArena> workspace;
+    DeviceBuffer workspace_storage;
+    std::optional<MemoryArena> workspace;
     std::size_t workspace_bytes;
 
-    IndexerFixture(const Options& o, int tokens, DeviceExecutionView execution)
+    IndexerFixture(const Options& o, int tokens, CudaExecutionView execution)
         : contexts(broadcast(o.contexts, o.batch)),
           lengths(o.valid == "dense" ? std::vector<int>(o.batch, tokens)
                                      : broadcast(measurement::integers(o.valid, 0), o.batch)),
@@ -58,23 +69,23 @@ struct IndexerFixture {
         tables     = measurement::make_i32(table);
         ids        = make_zeros(std::size_t(512) * tokens * B * 4);
         counts     = make_zeros(std::size_t(tokens) * B * 4);
-        query      = Tensor(query_data.p, DType::BF16, {128, 4, tokens, B});
-        Tensor keys(static_cast<std::uint16_t*>(key_data.p) + leading, DType::BF16,
-                    {128, 16, 1, pages});
+        query      = Tensor(query_data.span(), DType::BF16, {128, 4, tokens, B});
+        Tensor keys(key_data.span().subspan(leading * 2), DType::BF16, {128, 16, 1, pages});
         keys.nb[1] = row_stride * 2;
         keys.nb[2] = 16 * keys.nb[1];
         keys.nb[3] = page_stride * 2;
-        cache      = {keys, Tensor(tables.p, DType::I32, {logical, B})};
-        batch    = {Tensor(positions.p, DType::I32, {tokens, B}), Tensor(valid.p, DType::I32, {B}),
-                    Tensor(table_rows.p, DType::I32, {B})};
-        selected = {Tensor(ids.p, DType::I32, {512, tokens, B}),
-                    Tensor(counts.p, DType::I32, {tokens, B})};
-        workspace_bytes =
-            ops::qsa_indexer_workspace_capacity_bytes(tokens, tokens, B, envelope, execution);
-        workspace = std::make_unique<WorkspaceArena>(std::max<std::size_t>(256, workspace_bytes));
+        cache           = {keys, Tensor(tables.span(), DType::I32, {logical, B})};
+        batch           = {Tensor(positions.span(), DType::I32, {tokens, B}),
+                           Tensor(valid.span(), DType::I32, {B}), Tensor(table_rows.span(), DType::I32, {B})};
+        selected        = {Tensor(ids.span(), DType::I32, {512, tokens, B}),
+                           Tensor(counts.span(), DType::I32, {tokens, B})};
+        workspace_bytes = ops::qsa_indexer_workspace_capacity_bytes(tokens, tokens, B, envelope);
+        workspace_storage =
+            DeviceBuffer(execution.device(), std::max<std::size_t>(256, workspace_bytes));
+        workspace.emplace(workspace_storage.span());
     }
 
-    void launch(DeviceExecutionView execution) {
+    void launch(CudaExecutionView execution) {
         ops::qsa_indexer(query, cache, batch, envelope, *workspace, selected, execution);
     }
 };

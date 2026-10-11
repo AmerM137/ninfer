@@ -27,7 +27,13 @@ void increment_token_counts_launch(const Tensor& token_ids, Tensor& token_counts
 
 } // namespace
 
-void increment_token_counts(const Tensor& token_ids, Tensor& token_counts, cudaStream_t stream) {
+void increment_token_counts(const Tensor& token_ids, Tensor& token_counts,
+                            CudaExecutionView execution) {
+    if (token_ids.device != execution.device() || token_counts.device != execution.device()) {
+        throw std::invalid_argument(
+            "increment_token_counts: operands must belong to the execution device");
+    }
+    const auto stream = execution.stream();
     if (token_ids.dtype != DType::I32 || token_ids.ne[0] <= 0 || token_ids.ne[1] != 1 ||
         token_ids.ne[2] != 1 || token_ids.ne[3] != 1 || !token_ids.is_contiguous() ||
         token_ids.data == nullptr) {

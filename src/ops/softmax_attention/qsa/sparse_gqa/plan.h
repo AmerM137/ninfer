@@ -77,6 +77,6 @@ SparseGqaWorkspace allocate_sparse_gqa_workspace(Allocator& allocator, int token
 void launch_sparse_gqa(const Tensor& query, const Tensor& gate, const PagedKVBatchLayerView& cache,
                        const QsaBatchView& batch, const QsaBlockSelection& selected,
                        SparseGqaPlan plan, const SparseGqaWorkspace& scratch, Tensor& out,
-                       DeviceExecutionView execution);
+                       CudaExecutionView execution);
 
 } // namespace ninfer::ops::detail::qsa

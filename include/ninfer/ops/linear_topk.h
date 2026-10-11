@@ -1,10 +1,10 @@
 #pragma once
 
+#include "core/device.h"
 #include "core/weight.h"
 #include "core/arena.h"
 #include "core/tensor.h"
 
-#include <cuda_runtime.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -32,8 +32,8 @@ namespace ninfer::ops {
  * workspace must not overlap. Workspace is scoped to the call; no persistent state or allocation.
  */
 void linear_topk(const Tensor& hidden, const Weight& head, std::int32_t valid_rows,
-                 Tensor& candidate_ids, Tensor& candidate_scores, WorkspaceArena& workspace,
-                 cudaStream_t stream);
+                 Tensor& candidate_ids, Tensor& candidate_scores, MemoryArena& workspace,
+                 CudaExecutionView execution);
 
 /**
  * Mapped-head form: use every row of a registered Q4_G64_FP16 head and map its local row
@@ -41,7 +41,7 @@ void linear_topk(const Tensor& hidden, const Weight& head, std::int32_t valid_ro
  * Global ids determine both output ids and tie-breaking; all other requirements are as above.
  */
 void linear_topk(const Tensor& hidden, const Weight& head, const Tensor& row_to_global_ids,
-                 Tensor& candidate_ids, Tensor& candidate_scores, WorkspaceArena& workspace,
-                 cudaStream_t stream);
+                 Tensor& candidate_ids, Tensor& candidate_scores, MemoryArena& workspace,
+                 CudaExecutionView execution);
 
 } // namespace ninfer::ops

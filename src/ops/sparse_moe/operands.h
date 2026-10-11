@@ -11,7 +11,8 @@ constexpr std::int32_t kRoutedGateRows = kExperts * kExpertRows;
 constexpr std::int32_t kRoutedDownRows = kExperts * kHidden;
 constexpr std::int32_t kSharedGateRows = 2 * kIntermediate;
 
-inline std::int32_t require_tensor(const Tensor& tensor, const char* name) {
+inline std::int32_t require_tensor(const Tensor& tensor, const char* name, Device device) {
+    common::operand::device(tensor.device, device, "sparse_moe", name);
     if (tensor.dtype != DType::BF16 || tensor.ne[0] != kHidden || tensor.ne[1] < 1 ||
         tensor.ne[2] != 1 || tensor.ne[3] != 1 || !tensor.is_contiguous() ||
         tensor.data == nullptr || !common::operand::aligned(tensor.data, 16)) {
@@ -93,7 +94,12 @@ inline void require_quantized(const Weight& weight, std::int32_t n, std::int32_t
 }
 
 inline void validate_weights(const SparseMoeWeights& weights,
-                             std::vector<common::operand::Range>& ranges) {
+                             std::vector<common::operand::Range>& ranges, Device device) {
+    for (const Weight* weight :
+         {&weights.router_shared_gate, &weights.routed_gate_up, &weights.routed_down,
+          &weights.shared_gate_up, &weights.shared_down}) {
+        common::operand::device(weight->device, device, "sparse_moe", "weight");
+    }
     require_router(weights.router_shared_gate, ranges);
     if (weights.routed_gate_up.qtype != QType::Q4_G64_FP16 &&
         weights.routed_gate_up.qtype != QType::Q8_G32_FP16) {

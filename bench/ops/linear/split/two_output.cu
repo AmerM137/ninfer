@@ -64,7 +64,7 @@ int main(int argc, char** argv) {
                              : options.policy == "allow-a8" ? ops::LinearPolicy::AllowA8
                                                             : ops::LinearPolicy::AllowA4;
         measurement::hardware();
-        DeviceContext device;
+        auto& device = ninfer::bench::device_context();
         PackedQuantizedWeight first, second;
         ops::ProjectionWeights weights;
         if (options.format == "q4q5") {
@@ -90,18 +90,23 @@ int main(int argc, char** argv) {
             auto output0        = make_zeros(std::size_t(rows[0]) * t * 2);
             auto output1        = make_zeros(std::size_t(rows[1]) * t * 2);
             const auto capacity = ops::linear_split_workspace_capacity_bytes(weights, rows, t, t);
-            WorkspaceArena arena(256 + capacity);
+            ninfer::DeviceBuffer arena_storage(ninfer::bench::device_context().device(),
+                                               256 + capacity);
+            MemoryArena arena(arena_storage.span());
             (void)arena.alloc_bytes(256);
-            Tensor x(input.p, DType::BF16, {options.k, t});
-            const std::array outputs{Tensor(output0.p, DType::BF16, {rows[0], t}),
-                                     Tensor(output1.p, DType::BF16, {rows[1], t})};
+            Tensor x(input.span(), DType::BF16, {options.k, t});
+            const std::array outputs{Tensor(output0.span(), DType::BF16, {rows[0], t}),
+                                     Tensor(output1.span(), DType::BF16, {rows[1], t})};
             for (const auto& execution :
                  measurement::selections(options.timing.execution, "graph", "eager"))
                 for (const auto& cache :
                      measurement::selections(options.timing.cache, "cold", "warm")) {
                     const auto result = measurement::measure(
-                        [&](auto s) { ops::linear_split(x, weights, outputs, arena, s); },
-                        [](auto) {}, flush, device.stream, options.timing, execution, cache);
+                        [&](CudaExecutionView cuda) {
+                            ops::linear_split(x, weights, outputs, arena, cuda);
+                        },
+                        [](auto) {}, flush, device.execution_view(), options.timing, execution,
+                        cache);
                     measurement::Row row;
                     row.op              = "linear_split";
                     row.format          = options.format;

@@ -5,6 +5,7 @@
 //   ncu ... ./ninfer_rope_bench --text --geometry dflash --tokens 1024 --profile
 //   ./ninfer_rope_bench --vision --patches 8,256,4096,49152,65536
 #include "core/device.h"
+#include "core/buffer.h"
 #include "ninfer/ops/rope.h"
 #include "op_measurement.cuh"
 
@@ -34,8 +35,9 @@ constexpr int kVisionHeads     = 16;
 constexpr float kVisionTheta   = 10'000.0F;
 
 DeviceBuffer copy_positions(const std::vector<std::int32_t>& host) {
-    DeviceBuffer device(host.size() * sizeof(std::int32_t));
-    cudaMemcpy(device.p, host.data(), device.bytes, cudaMemcpyHostToDevice);
+    DeviceBuffer device(ninfer::bench::device_context().device(),
+                        host.size() * sizeof(std::int32_t));
+    cudaMemcpy(device.data(), host.data(), device.size(), cudaMemcpyHostToDevice);
     return device;
 }
 
@@ -94,22 +96,19 @@ DeviceBuffer make_vision_positions(int patches) {
 }
 
 template <int Heads>
-void run_text_single(DeviceExecutionView execution, int tokens, int axes, const char* geometry,
-                     const char* role) {
+void run_text_single(int tokens, int axes, const char* geometry, const char* role) {
     const std::size_t elements = static_cast<std::size_t>(kTextHeadDim) * Heads * tokens;
     DeviceBuffer positions     = make_text_positions(tokens, axes);
     DeviceBuffer x             = make_bf16(elements, 101U);
     SavedBuffer initial_x(x);
-    const auto restore = [&](cudaStream_t stream) { initial_x.restore(stream); };
-    Tensor tpos(positions.p, DType::I32, {tokens, axes});
-    Tensor tx(x.p, DType::BF16, {kTextHeadDim, Heads, tokens});
+    const auto restore = [&](CudaExecutionView cuda) { initial_x.restore(cuda); };
+    Tensor tpos(positions.span(), DType::I32, {tokens, axes});
+    Tensor tx(x.span(), DType::BF16, {kTextHeadDim, Heads, tokens});
     const double bytes =
         2.0 * static_cast<double>(Heads * kTextRotaryDim) * tokens * sizeof(__nv_bfloat16);
     const Result result = bench_loop_prepared(
         restore,
-        [&](cudaStream_t stream) {
-            ops::rope(tpos, kTextRotaryDim, kTextTheta, tx, execution.on_stream(stream));
-        },
+        [&](CudaExecutionView cuda) { ops::rope(tpos, kTextRotaryDim, kTextTheta, tx, cuda); },
         bytes);
     const std::string label = std::string("rope text ") + geometry + " " + role +
                               " axes=" + std::to_string(axes) + " T=" + std::to_string(tokens);
@@ -117,7 +116,7 @@ void run_text_single(DeviceExecutionView execution, int tokens, int axes, const 
 }
 
 template <int QHeads, int KHeads>
-void run_text(DeviceExecutionView execution, int tokens, int axes, const char* geometry) {
+void run_text(int tokens, int axes, const char* geometry) {
     const std::size_t q_elements = static_cast<std::size_t>(kTextHeadDim) * QHeads * tokens;
     const std::size_t k_elements = static_cast<std::size_t>(kTextHeadDim) * KHeads * tokens;
     DeviceBuffer positions       = make_text_positions(tokens, axes);
@@ -125,27 +124,25 @@ void run_text(DeviceExecutionView execution, int tokens, int axes, const char* g
     DeviceBuffer k               = make_bf16(k_elements, 105U);
     SavedBuffer initial_q(q);
     SavedBuffer initial_k(k);
-    const auto restore = [&](cudaStream_t stream) {
-        initial_q.restore(stream);
-        initial_k.restore(stream);
+    const auto restore = [&](CudaExecutionView cuda) {
+        initial_q.restore(cuda);
+        initial_k.restore(cuda);
     };
-    Tensor tpos(positions.p, DType::I32, {tokens, axes});
-    Tensor tq(q.p, DType::BF16, {kTextHeadDim, QHeads, tokens});
-    Tensor tk(k.p, DType::BF16, {kTextHeadDim, KHeads, tokens});
+    Tensor tpos(positions.span(), DType::I32, {tokens, axes});
+    Tensor tq(q.span(), DType::BF16, {kTextHeadDim, QHeads, tokens});
+    Tensor tk(k.span(), DType::BF16, {kTextHeadDim, KHeads, tokens});
     const double bytes = 2.0 * static_cast<double>((QHeads + KHeads) * kTextRotaryDim) * tokens *
                          sizeof(__nv_bfloat16);
     const Result result = bench_loop_prepared(
         restore,
-        [&](cudaStream_t stream) {
-            ops::rope(tpos, kTextRotaryDim, kTextTheta, tq, tk, execution.on_stream(stream));
-        },
+        [&](CudaExecutionView cuda) { ops::rope(tpos, kTextRotaryDim, kTextTheta, tq, tk, cuda); },
         bytes);
     const std::string label = std::string("rope text ") + geometry +
                               " axes=" + std::to_string(axes) + " T=" + std::to_string(tokens);
     print_result(label.c_str(), result);
 }
 
-void run_dflash(DeviceExecutionView execution, int tokens, bool profile) {
+void run_dflash(int tokens, bool profile) {
     const std::size_t q_elements =
         static_cast<std::size_t>(kDflashHeadDim) * kDflashQHeads * tokens;
     const std::size_t k_elements =
@@ -155,24 +152,24 @@ void run_dflash(DeviceExecutionView execution, int tokens, bool profile) {
     DeviceBuffer k         = make_bf16(k_elements, 109U);
     SavedBuffer initial_q(q);
     SavedBuffer initial_k(k);
-    const auto restore = [&](cudaStream_t stream) {
-        initial_q.restore(stream);
-        initial_k.restore(stream);
+    const auto restore = [&](CudaExecutionView cuda) {
+        initial_q.restore(cuda);
+        initial_k.restore(cuda);
     };
-    Tensor tpos(positions.p, DType::I32, {tokens});
-    Tensor tq(q.p, DType::BF16, {kDflashHeadDim, kDflashQHeads, tokens});
-    Tensor tk(k.p, DType::BF16, {kDflashHeadDim, kDflashKHeads, tokens});
+    Tensor tpos(positions.span(), DType::I32, {tokens});
+    Tensor tq(q.span(), DType::BF16, {kDflashHeadDim, kDflashQHeads, tokens});
+    Tensor tk(k.span(), DType::BF16, {kDflashHeadDim, kDflashKHeads, tokens});
     const double bytes = 2.0 *
                          static_cast<double>((kDflashQHeads + kDflashKHeads) * kDflashRotaryDim) *
                          tokens * sizeof(__nv_bfloat16);
-    const auto launch = [&](cudaStream_t stream) {
-        ops::rope(tpos, kDflashRotaryDim, kTextTheta, tq, tk, execution.on_stream(stream));
+    const auto launch = [&](CudaExecutionView cuda) {
+        ops::rope(tpos, kDflashRotaryDim, kTextTheta, tq, tk, cuda);
     };
     if (profile) {
-        for (int warmup = 0; warmup < 20; ++warmup) { launch(nullptr); }
+        for (int warmup = 0; warmup < 20; ++warmup) { launch(default_execution()); }
         CUDA_CHECK(cudaDeviceSynchronize());
-        restore(nullptr);
-        launch(nullptr);
+        restore(default_execution());
+        launch(default_execution());
         CUDA_CHECK(cudaDeviceSynchronize());
         std::printf("profile rope dflash T=%d\n", tokens);
         return;
@@ -182,44 +179,42 @@ void run_dflash(DeviceExecutionView execution, int tokens, bool profile) {
     print_result(label.c_str(), result);
 }
 
-void run_dflash_single_k(DeviceExecutionView execution, int tokens) {
+void run_dflash_single_k(int tokens) {
     const std::size_t elements = static_cast<std::size_t>(kDflashHeadDim) * kDflashKHeads * tokens;
     DeviceBuffer positions     = make_text_positions(tokens, 1);
     DeviceBuffer x             = make_bf16(elements, 111U);
     SavedBuffer initial_x(x);
-    const auto restore = [&](cudaStream_t stream) { initial_x.restore(stream); };
-    Tensor tpos(positions.p, DType::I32, {tokens});
-    Tensor tx(x.p, DType::BF16, {kDflashHeadDim, kDflashKHeads, tokens});
+    const auto restore = [&](CudaExecutionView cuda) { initial_x.restore(cuda); };
+    Tensor tpos(positions.span(), DType::I32, {tokens});
+    Tensor tx(x.span(), DType::BF16, {kDflashHeadDim, kDflashKHeads, tokens});
     const double bytes = 2.0 * static_cast<double>(kDflashKHeads * kDflashRotaryDim) * tokens *
                          sizeof(__nv_bfloat16);
     const Result result = bench_loop_prepared(
         restore,
-        [&](cudaStream_t stream) {
-            ops::rope(tpos, kDflashRotaryDim, kTextTheta, tx, execution.on_stream(stream));
-        },
+        [&](CudaExecutionView cuda) { ops::rope(tpos, kDflashRotaryDim, kTextTheta, tx, cuda); },
         bytes);
     const std::string label = "rope text dflash single-k axes=1 T=" + std::to_string(tokens);
     print_result(label.c_str(), result);
 }
 
-void run_vision(DeviceExecutionView execution, int patches) {
+void run_vision(int patches) {
     constexpr int hidden   = kVisionHeadDim * kVisionHeads;
     constexpr int qkv      = hidden * 3;
     DeviceBuffer positions = make_vision_positions(patches);
     DeviceBuffer packed    = make_bf16(static_cast<std::size_t>(qkv) * patches, 113U);
     SavedBuffer initial_packed(packed);
-    const auto restore = [&](cudaStream_t stream) { initial_packed.restore(stream); };
-    Tensor tq(packed.p, DType::BF16, {kVisionHeadDim, kVisionHeads, patches});
+    const auto restore = [&](CudaExecutionView cuda) { initial_packed.restore(cuda); };
+    Tensor tq(packed.span(), DType::BF16, {kVisionHeadDim, kVisionHeads, patches});
     tq.nb[2]  = qkv * 2;
     Tensor tk = tq;
-    tk.data   = static_cast<unsigned char*>(packed.p) + hidden * 2;
-    Tensor tpos(positions.p, DType::I32, {patches, 2});
+    tk.data   = static_cast<unsigned char*>(packed.data()) + hidden * 2;
+    Tensor tpos(positions.span(), DType::I32, {patches, 2});
     const double bytes = 2.0 * static_cast<double>(2 * kVisionHeads * kVisionHeadDim) * patches *
                          sizeof(__nv_bfloat16);
     const Result result = bench_loop_prepared(
         restore,
-        [&](cudaStream_t stream) {
-            ops::rope(tpos, kVisionHeadDim, kVisionTheta, tq, tk, execution.on_stream(stream));
+        [&](CudaExecutionView cuda) {
+            ops::rope(tpos, kVisionHeadDim, kVisionTheta, tq, tk, cuda);
         },
         bytes);
     const std::string label = "rope vision P=" + std::to_string(patches);
@@ -306,43 +301,31 @@ int main(int argc, char** argv) {
     }
     try {
         const Options options = parse_options(argc, argv);
-        DeviceContext device;
-        const auto execution = device.execution_view();
         if (options.text) {
             if (options.geometryDflash && options.axes1 && options.pair) {
-                for (int tokens : options.tokens) {
-                    run_dflash(execution, tokens, options.profile);
-                }
+                for (int tokens : options.tokens) { run_dflash(tokens, options.profile); }
             }
             if (options.geometryDflash && options.axes1 && options.single_k) {
-                for (int tokens : options.tokens) { run_dflash_single_k(execution, tokens); }
+                for (int tokens : options.tokens) { run_dflash_single_k(tokens); }
             }
             for (int axes : {1, 3}) {
                 if ((axes == 1 && !options.axes1) || (axes == 3 && !options.axes3)) { continue; }
                 for (int tokens : options.tokens) {
                     if (options.geometry27) {
-                        if (options.pair) { run_text<24, 4>(execution, tokens, axes, "27b"); }
-                        if (options.single_q) {
-                            run_text_single<24>(execution, tokens, axes, "27b", "q");
-                        }
-                        if (options.single_k) {
-                            run_text_single<4>(execution, tokens, axes, "27b", "k");
-                        }
+                        if (options.pair) { run_text<24, 4>(tokens, axes, "27b"); }
+                        if (options.single_q) { run_text_single<24>(tokens, axes, "27b", "q"); }
+                        if (options.single_k) { run_text_single<4>(tokens, axes, "27b", "k"); }
                     }
                     if (options.geometry35) {
-                        if (options.pair) { run_text<16, 2>(execution, tokens, axes, "35b"); }
-                        if (options.single_q) {
-                            run_text_single<16>(execution, tokens, axes, "35b", "q");
-                        }
-                        if (options.single_k) {
-                            run_text_single<2>(execution, tokens, axes, "35b", "k");
-                        }
+                        if (options.pair) { run_text<16, 2>(tokens, axes, "35b"); }
+                        if (options.single_q) { run_text_single<16>(tokens, axes, "35b", "q"); }
+                        if (options.single_k) { run_text_single<2>(tokens, axes, "35b", "k"); }
                     }
                 }
             }
         }
         if (options.vision) {
-            for (int patches : options.patches) run_vision(execution, patches);
+            for (int patches : options.patches) run_vision(patches);
         }
     } catch (const std::exception& error) {
         std::fprintf(stderr, "error: %s\n", error.what());

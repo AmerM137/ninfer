@@ -18,6 +18,7 @@ namespace ninfer {
  * carries no mutable frontier: callers supply the live absolute interval to the consuming Op.
  */
 struct CyclicKVCacheLayerView {
+    [[nodiscard]] Device device() const;
     Tensor k;
     Tensor v;
     std::uint32_t capacity        = 0;
@@ -45,7 +46,7 @@ plan_cyclic_kv_cache(LayoutBuilder& builder, std::uint32_t layers, std::uint32_t
 
 class CyclicKVCache {
 public:
-    CyclicKVCache(DeviceSpan backing, const CyclicKVCacheLayout& layout);
+    CyclicKVCache(MemorySpan backing, const CyclicKVCacheLayout& layout);
 
     CyclicKVCache(const CyclicKVCache&)            = delete;
     CyclicKVCache& operator=(const CyclicKVCache&) = delete;

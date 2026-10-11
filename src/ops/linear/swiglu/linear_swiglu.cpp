@@ -59,8 +59,13 @@ std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gat
 }
 
 void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, LinearPolicy policy,
-                   WorkspaceArena& ws, cudaStream_t stream) {
+                   MemoryArena& ws, CudaExecutionView execution) {
     validate_policy(policy);
+    if (x.device != execution.device() || out.device != execution.device() ||
+        gate_up_weight.device != execution.device() || ws.device() != execution.device()) {
+        throw std::invalid_argument(
+            "linear_swiglu: operands and workspace must belong to execution");
+    }
     if (x.dtype != DType::BF16 || out.dtype != DType::BF16) {
         throw std::invalid_argument("linear_swiglu: x/out must be BF16");
     }
@@ -89,13 +94,14 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
 
     if (fp8_weight) {
         (void)common::validate_fp8_weight(gate_up_weight, "fp8 linear_swiglu");
-        detail::fp8_linear_swiglu_dispatch(x, gate_up_weight, out, policy, ws, stream);
+        detail::fp8_linear_swiglu_dispatch(x, gate_up_weight, out, policy, ws, execution.stream());
         return;
     }
 
     if (nvfp4_weight) {
         (void)common::validate_nvfp4_weight(gate_up_weight, "nvfp4 linear_swiglu");
-        detail::nvfp4_linear_swiglu_dispatch(x, gate_up_weight, out, policy, ws, stream);
+        detail::nvfp4_linear_swiglu_dispatch(x, gate_up_weight, out, policy, ws,
+                                             execution.stream());
         return;
     }
 
@@ -105,16 +111,16 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
     }
 
     if (q8_weight) {
-        detail::select_q8_linear_swiglu(gate_up_weight.n, gate_up_weight.k, t)(x, gate_up_weight,
-                                                                               out, stream);
+        detail::select_q8_linear_swiglu(gate_up_weight.n, gate_up_weight.k,
+                                        t)(x, gate_up_weight, out, execution.stream());
     } else {
-        detail::q4_linear_swiglu_dispatch(x, gate_up_weight, out, ws, stream);
+        detail::q4_linear_swiglu_dispatch(x, gate_up_weight, out, ws, execution);
     }
 }
 
-void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, WorkspaceArena& ws,
-                   cudaStream_t stream) {
-    linear_swiglu(x, gate_up_weight, out, LinearPolicy::A16Only, ws, stream);
+void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, MemoryArena& ws,
+                   CudaExecutionView execution) {
+    linear_swiglu(x, gate_up_weight, out, LinearPolicy::A16Only, ws, execution);
 }
 
 } // namespace ninfer::ops

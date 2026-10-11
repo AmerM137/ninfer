@@ -1,4 +1,6 @@
 #include "ninfer/ops/linear_split.h"
+#include "cuda_fixture.h"
+#include "core/buffer.h"
 #include "core/decode_graph.h"
 #include "core/device.h"
 #include "ops/input_projection_test_common.h"
@@ -31,8 +33,9 @@ struct Profile {
     std::vector<int> tokens;
 };
 
-void launch(const Tensor& x, const Weight& weight, std::vector<Tensor>& out, cudaStream_t stream) {
-    ops::linear_split(x, weight, out, stream);
+void launch(const Tensor& x, const Weight& weight, std::vector<Tensor>& out,
+            CudaExecutionView cuda) {
+    ops::linear_split(x, weight, out, cuda);
 }
 
 struct Outputs {
@@ -59,7 +62,7 @@ struct Outputs {
                     std::make_unique<GuardedDeviceBuffer>(std::size_t(s.rows) * tokens * 2));
                 data = backing.back()->data();
             }
-            views.emplace_back(data, DType::BF16,
+            views.emplace_back(data, backing.back()->device(), DType::BF16,
                                std::initializer_list<std::int32_t>{s.rows, tokens});
         }
     }
@@ -137,8 +140,8 @@ int verify_segment(const std::string& label, const Segment& segment, int row_beg
 
 int run_case(DeviceContext& device, const Profile& profile, DevicePackedWeight& parent, int tokens,
              bool graph, bool shared = false) {
-    DeviceBuffer data(std::size_t(kInputRows) * tokens * 2);
-    Tensor x(data.p, DType::BF16, {kInputRows, tokens});
+    DeviceBuffer data(device.device(), std::size_t(kInputRows) * tokens * 2);
+    Tensor x(data.span(), DType::BF16, {kInputRows, tokens});
     Outputs out(profile, tokens, shared);
     DecodeGraphDefinition definition;
     DecodeGraphExecutable executable;
@@ -151,14 +154,15 @@ int run_case(DeviceContext& device, const Profile& profile, DevicePackedWeight& 
         // Upload/poison operations must finish before the nonblocking capture stream reads them.
         cuda_synchronize();
         if (graph && phase == 0) {
-            definition.capture(device.stream,
-                               [&] { launch(x, parent.view(), out.views, device.stream); });
+            definition.capture(device.stream(), [&] {
+                launch(x, parent.view(), out.views, device.execution_view());
+            });
             executable.instantiate(definition);
         }
         if (graph)
-            executable.launch(device.stream);
+            executable.launch(device.stream());
         else
-            launch(x, parent.view(), out.views, device.stream);
+            launch(x, parent.view(), out.views, device.execution_view());
         device.synchronize();
         const auto label = std::string(profile.name) + " M=" + std::to_string(tokens) +
                            " graph=" + std::to_string(graph) + " phase=" + std::to_string(phase) +
@@ -186,49 +190,56 @@ int rejects(const char* label, F&& call) {
 }
 
 int validation(DeviceContext& device, const Profile& profile, const Weight& weight) {
-    DeviceBuffer data(kInputRows * 2 * 2);
-    Tensor x(data.p, DType::BF16, {kInputRows, 2});
+    DeviceBuffer data(ninfer::test::cuda_environment().context.device(), kInputRows * 2 * 2);
+    Tensor x(data.span(), DType::BF16, {kInputRows, 2});
     Outputs outputs(profile, 2, false);
     int failures = 0;
     auto out     = outputs.views;
     out[0].ne[0] -= 1;
-    failures += rejects("wrong output shape", [&] { launch(x, weight, out, device.stream); });
+    failures +=
+        rejects("wrong output shape", [&] { launch(x, weight, out, device.execution_view()); });
     out         = outputs.views;
     out[1].data = static_cast<std::byte*>(out[0].data) + 16;
-    failures +=
-        rejects("overlapping output segments", [&] { launch(x, weight, out, device.stream); });
+    failures += rejects("overlapping output segments",
+                        [&] { launch(x, weight, out, device.execution_view()); });
     out         = outputs.views;
     out[0].data = x.data;
-    failures += rejects("output overlaps x", [&] { launch(x, weight, out, device.stream); });
+    failures +=
+        rejects("output overlaps x", [&] { launch(x, weight, out, device.execution_view()); });
     out         = outputs.views;
     out[0].data = const_cast<void*>(weight.qdata);
-    failures += rejects("output overlaps weight", [&] { launch(x, weight, out, device.stream); });
+    failures +=
+        rejects("output overlaps weight", [&] { launch(x, weight, out, device.execution_view()); });
     out          = outputs.views;
     out[0].dtype = DType::FP16;
-    failures += rejects("wrong output dtype", [&] { launch(x, weight, out, device.stream); });
+    failures +=
+        rejects("wrong output dtype", [&] { launch(x, weight, out, device.execution_view()); });
     out          = outputs.views;
     auto invalid = weight;
     invalid.padded_shape[1] += 128;
-    failures +=
-        rejects("unsupported padded weight", [&] { launch(x, invalid, out, device.stream); });
+    failures += rejects("unsupported padded weight",
+                        [&] { launch(x, invalid, out, device.execution_view()); });
     invalid       = weight;
     invalid.qtype = profile.q8 ? QType::BF16 : QType::Q8_G32_FP16;
-    failures += rejects("wrong weight type", [&] { launch(x, invalid, out, device.stream); });
+    failures +=
+        rejects("wrong weight type", [&] { launch(x, invalid, out, device.execution_view()); });
     if (profile.q8) {
         out[0].data = const_cast<void*>(weight.scales);
-        failures +=
-            rejects("output overlaps scales", [&] { launch(x, weight, out, device.stream); });
+        failures += rejects("output overlaps scales",
+                            [&] { launch(x, weight, out, device.execution_view()); });
         out           = outputs.views;
         invalid       = weight;
         invalid.group = 64;
-        failures += rejects("wrong Q8 group", [&] { launch(x, invalid, out, device.stream); });
+        failures +=
+            rejects("wrong Q8 group", [&] { launch(x, invalid, out, device.execution_view()); });
     }
     auto strided = x;
     strided.nb[1] += 16;
-    failures += rejects("strided input", [&] { launch(strided, weight, out, device.stream); });
+    failures +=
+        rejects("strided input", [&] { launch(strided, weight, out, device.execution_view()); });
     auto empty  = x;
     empty.ne[1] = 0;
-    failures += rejects("zero M", [&] { launch(empty, weight, out, device.stream); });
+    failures += rejects("zero M", [&] { launch(empty, weight, out, device.execution_view()); });
     return failures;
 }
 

@@ -328,7 +328,7 @@ int run(const Options& options) {
 
     std::cout << "format,ninfer_qwen3_5_dflash_round_bench_v3\n";
     std::cout << "artifact," << options.artifact.string() << '\n';
-    std::cout << "device," << device.props.name << '\n';
+    std::cout << "device," << device.properties().name << '\n';
     std::cout << "context_tokens," << options.context_tokens << '\n';
     std::cout << "draft_tokens," << options.draft_tokens << '\n';
     std::cout << "batch_size," << options.batch_size << '\n';

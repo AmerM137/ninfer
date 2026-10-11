@@ -67,14 +67,15 @@ void test_state_store(ninfer::DeviceContext& device) {
     };
     ninfer::LayoutBuilder builder;
     const q36::StateImageDeviceLayout layout = q36::plan_state_image_device_pool(builder, spec);
-    ninfer::DeviceArena arena(builder.finish(256));
-    q36::StateImageDevicePool physical({arena.base(), arena.capacity()}, layout);
+    ninfer::DeviceBuffer arena_storage(device.device(), builder.finish(256));
+    ninfer::MemoryArena arena(arena_storage.span());
+    q36::StateImageDevicePool physical(arena.storage(), layout);
     ninfer::HostContextArena host_backing(layout.host.image_bytes * 2, layout.host.image_bytes);
     q36::HostStatePool host(host_backing, layout.host);
     store::StateImageStore images(
         physical, &host, static_cast<std::uint32_t>(physical.slot_count()) + host.capacity());
 
-    const auto source = images.reserve_reset(device.stream);
+    const auto source = images.reserve_reset(device.stream());
     expect(source.has_value(), "state source allocation");
     const std::int32_t original_slot = images.physical_slot(*source);
     images.freeze(*source);
@@ -112,12 +113,12 @@ void test_state_store(ninfer::DeviceContext& device) {
            "checkpoint and active state ownership close after release");
     expect(!images.valid(*source), "released state generation becomes stale");
 
-    const auto reused = images.reserve_reset(device.stream);
+    const auto reused = images.reserve_reset(device.stream());
     expect(reused.has_value() && *reused != *source, "state descriptor reuse advances generation");
     expect(images.release(*reused), "reused state image releases");
 
     for (const bool cancel_last_reader : {false, true}) {
-        const auto shared       = images.reserve_reset(device.stream);
+        const auto shared       = images.reserve_reset(device.stream());
         const auto first_reader = images.reserve_destination();
         const auto last_reader  = images.reserve_destination();
         expect(shared && first_reader && last_reader, "shared State reader fixture allocates");
@@ -125,7 +126,7 @@ void test_state_store(ninfer::DeviceContext& device) {
         const std::array<std::uint16_t, 8> content{1, 3, 5, 7, 9, 11, 13, 15};
         const auto hidden = physical.continuation_hidden_slot(source_slot);
         CUDA_CHECK(cudaMemcpyAsync(hidden.data, content.data(), sizeof(content),
-                                   cudaMemcpyHostToDevice, device.stream));
+                                   cudaMemcpyHostToDevice, device.stream()));
         images.freeze(*shared);
         images.retain_checkpoint_reference(*shared); // Cache checkpoint.
         images.retain_checkpoint_reference(*shared); // Paused request snapshot.
@@ -138,17 +139,17 @@ void test_state_store(ninfer::DeviceContext& device) {
         expect(!images.can_release_after_checkpoint_references(*shared, 0) &&
                    images.device_occupied() == 3,
                "retired content owner does not advertise pinned State capacity as free");
-        physical.copy_slot(source_slot, images.physical_slot(*first_reader), device.stream);
+        physical.copy_slot(source_slot, images.physical_slot(*first_reader), device.stream());
         device.synchronize();
         images.commit_fork(*shared, *first_reader);
         expect(images.valid(*shared) && images.source_pins(*shared) == 1,
                "one completed reader does not release the remaining reader's State");
-        physical.copy_slot(source_slot, images.physical_slot(*last_reader), device.stream);
+        physical.copy_slot(source_slot, images.physical_slot(*last_reader), device.stream());
         std::array<std::uint16_t, 8> observed{};
         const auto last_hidden =
             physical.continuation_hidden_slot(images.physical_slot(*last_reader));
         CUDA_CHECK(cudaMemcpyAsync(observed.data(), last_hidden.data, sizeof(observed),
-                                   cudaMemcpyDeviceToHost, device.stream));
+                                   cudaMemcpyDeviceToHost, device.stream()));
         device.synchronize();
         expect(observed == content, "remaining State reader retains the exact source content");
         if (cancel_last_reader) {
@@ -158,7 +159,7 @@ void test_state_store(ninfer::DeviceContext& device) {
         }
         expect(!images.valid(*shared) && images.device_occupied() == 2,
                "last reader retirement releases the orphaned State automatically");
-        const auto replacement = images.reserve_reset(device.stream);
+        const auto replacement = images.reserve_reset(device.stream());
         expect(replacement && *replacement != *shared &&
                    images.physical_slot(*replacement) == source_slot,
                "retired State storage is reusable under a new generation");
@@ -168,7 +169,7 @@ void test_state_store(ninfer::DeviceContext& device) {
     }
 
     {
-        const auto shared = images.reserve_reset(device.stream);
+        const auto shared = images.reserve_reset(device.stream());
         const auto reader = images.reserve_destination();
         images.freeze(*shared);
         images.retain_checkpoint_reference(*shared);
@@ -186,14 +187,14 @@ void test_state_store(ninfer::DeviceContext& device) {
     }
 
     for (const bool cancel_transfer : {false, true}) {
-        const auto shared = images.reserve_reset(device.stream);
+        const auto shared = images.reserve_reset(device.stream());
         device.synchronize();
         images.freeze(*shared);
         images.retain_checkpoint_reference(*shared);
-        auto transfer = images.begin_device_to_host(*shared, device.transfer_stream);
+        auto transfer = images.begin_device_to_host(*shared, device.transfer_stream());
         expect(transfer && images.release_checkpoint_owner(*shared) && images.valid(*shared),
                "submitted State transfer retains a retired checkpoint source");
-        CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+        CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream()));
         if (cancel_transfer) {
             images.abort_transfer(std::move(*transfer));
         } else {
@@ -204,7 +205,7 @@ void test_state_store(ninfer::DeviceContext& device) {
                "last transfer lease retirement frees both State replicas and reservations");
     }
 
-    const auto host_source = images.reserve_reset(device.stream);
+    const auto host_source = images.reserve_reset(device.stream());
     expect(host_source.has_value(), "Host state source allocation");
     device.synchronize();
     images.freeze(*host_source);
@@ -218,11 +219,11 @@ void test_state_store(ninfer::DeviceContext& device) {
     expect(host_backing.occupied_bytes() == 0 && images.source_pins(*host_source) == 0 &&
                images.residency(*host_source) == store::StateReplicaResidency::DeviceOnly,
            "cancelled State transfer releases its actual Host extent and retains source state");
-    auto d2h = images.begin_device_to_host(*host_source, device.transfer_stream);
+    auto d2h = images.begin_device_to_host(*host_source, device.transfer_stream());
     expect(d2h.has_value() &&
                images.residency(*host_source) == store::StateReplicaResidency::DeviceOnly,
            "incomplete State D2H does not publish a Host replica");
-    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream()));
     images.publish_transfer(std::move(*d2h), true);
     expect(images.residency(*host_source) == store::StateReplicaResidency::Both &&
                host_backing.live_bytes() == layout.host.image_bytes &&
@@ -239,11 +240,11 @@ void test_state_store(ninfer::DeviceContext& device) {
     const auto fork_one = images.reserve_logical_destination();
     const auto fork_two = images.reserve_logical_destination();
     expect(fork_one && fork_two, "concurrent Host State forks reserve logical destinations");
-    auto h2d_one = images.begin_host_fork(*host_source, *fork_one, device.transfer_stream);
-    auto h2d_two = images.begin_host_fork(*host_source, *fork_two, device.transfer_stream);
+    auto h2d_one = images.begin_host_fork(*host_source, *fork_one, device.transfer_stream());
+    auto h2d_two = images.begin_host_fork(*host_source, *fork_two, device.transfer_stream());
     expect(h2d_one && h2d_two && images.source_pins(*host_source) == 2,
            "immutable Host State source supports multiple fork pins");
-    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream()));
     images.publish_transfer(std::move(*h2d_one), true);
     images.publish_transfer(std::move(*h2d_two), true);
     expect(images.source_pins(*host_source) == 0 &&
@@ -270,8 +271,9 @@ void test_kv_store(ninfer::DeviceContext& device) {
         ninfer::plan_device_kv_page_pool(builder, page_spec);
     const ninfer::KVExecutionTableLayout table_layout =
         ninfer::plan_kv_execution_tables(builder, {.logical_page_capacity = 4, .table_rows = 2});
-    ninfer::DeviceArena arena(builder.finish(256));
-    const ninfer::DeviceSpan backing{arena.base(), arena.capacity()};
+    ninfer::DeviceBuffer arena_storage(device.device(), builder.finish(256));
+    ninfer::MemoryArena arena(arena_storage.span());
+    const auto backing = arena.storage();
     ninfer::DeviceKVPagePool physical_pages(backing, page_layout);
     ninfer::KVExecutionTablePool physical_tables(backing, table_layout, physical_pages);
     const ninfer::HostKVPageLayout host_layout =
@@ -283,9 +285,9 @@ void test_kv_store(ninfer::DeviceContext& device) {
     store::HostKVExtentStore extents(host_arena, 8);
     store::KVAddressSpaceStore addresses(pages, physical_tables, 4, 4);
 
-    const auto address = addresses.create_active(3, 0, device.stream);
+    const auto address = addresses.create_active(3, 0, device.stream());
     expect(address.has_value(), "active KV address allocation");
-    addresses.ensure_mapped_to_tokens(*address, 65, device.stream);
+    addresses.ensure_mapped_to_tokens(*address, 65, device.stream());
     device.synchronize();
     expect(addresses.mapped_pages(*address) == 2 && addresses.committed_frontier(*address) == 0,
            "physical KV append does not publish canonical coverage before commit");
@@ -299,7 +301,7 @@ void test_kv_store(ninfer::DeviceContext& device) {
     expect(pages.active_address_references(addresses.logical_page(*address, 0)) == 1 &&
                pages.active_address_references(addresses.logical_page(*address, 1)) == 1,
            "active KV membership is counted on each logical page");
-    addresses.ensure_mapped_to_tokens(*address, 129, device.stream);
+    addresses.ensure_mapped_to_tokens(*address, 129, device.stream());
     device.synchronize();
     expect(read_block_table(physical_tables, 0, 3) == std::vector<std::int32_t>({0, 1, 2}),
            "incremental KV materialization preserves the existing mapping prefix");
@@ -350,10 +352,10 @@ void test_kv_store(ninfer::DeviceContext& device) {
     expect(host_backup.has_value(), "Host KV extent reservation");
     const std::vector<ninfer::DeviceKVPageHandle> sources = extents.device_sources(*host_backup);
     physical_pages.copy_to_host(sources, extents.writable_view(*host_backup),
-                                device.transfer_stream);
+                                device.transfer_stream());
     expect(!pages.host_resident(logical_pages[0]) && !pages.host_resident(logical_pages[1]),
            "incomplete KV D2H does not publish Host replicas");
-    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream()));
     auto host_extent = extents.publish(std::move(*host_backup));
     expect(pages.host_resident(logical_pages[0]) && pages.host_resident(logical_pages[1]) &&
                host_backing.reserved_bytes() == 0 &&
@@ -378,8 +380,8 @@ void test_kv_store(ninfer::DeviceContext& device) {
     const std::vector<ninfer::DeviceKVPageHandle> second_sources =
         extents.device_sources(*second_host_backup);
     physical_pages.copy_to_host(second_sources, extents.writable_view(*second_host_backup),
-                                device.transfer_stream);
-    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+                                device.transfer_stream());
+    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream()));
     const auto second_host_extent = extents.publish(std::move(*second_host_backup));
     expect(pages.drop_device_replica(logical_pages[0]) &&
                pages.drop_device_replica(logical_pages[1]) && !extents.release(second_host_extent),
@@ -395,8 +397,8 @@ void test_kv_store(ninfer::DeviceContext& device) {
         pages.reserve_device_replica(logical_pages[0], *restore_reservation),
         pages.reserve_device_replica(logical_pages[1], *restore_reservation)};
     physical_pages.copy_from_host(extents.view(second_host_extent), restore_destinations,
-                                  device.transfer_stream);
-    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+                                  device.transfer_stream());
+    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream()));
     pages.publish_device_replica(logical_pages[0]);
     pages.publish_device_replica(logical_pages[1]);
     expect(extents.release(second_host_extent) && host_arena.occupied_bytes() == 0,
@@ -405,7 +407,7 @@ void test_kv_store(ninfer::DeviceContext& device) {
     expect(addresses.bound_row(*address) == -1 && addresses.reserved_growth_pages(*address) == 0 &&
                physical_pages.reserved_pages() == 1,
            "prepared KV activation preserves the catalogued mapping until publication");
-    addresses.commit_activation(std::move(activation), device.stream);
+    addresses.commit_activation(std::move(activation), device.stream());
     expect(pages.active_address_references(logical_pages[0]) == 1 &&
                pages.active_address_references(logical_pages[1]) == 1,
            "KV reactivation republishes logical-page active references");
@@ -423,8 +425,8 @@ void test_kv_store(ninfer::DeviceContext& device) {
     expect(final_host_backup.has_value(), "final Host KV backup reservation");
     const auto final_sources = extents.device_sources(*final_host_backup);
     physical_pages.copy_to_host(final_sources, extents.writable_view(*final_host_backup),
-                                device.transfer_stream);
-    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+                                device.transfer_stream());
+    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream()));
     (void)extents.publish(std::move(*final_host_backup));
     expect(addresses.release(*address), "catalogued KV address releases");
     expect(extents.release_unreferenced() == host_layout.page_stride &&
@@ -434,13 +436,13 @@ void test_kv_store(ninfer::DeviceContext& device) {
                physical_pages.allocated_pages() == 0 && physical_pages.reserved_pages() == 0,
            "KV release invalidates generations and closes physical ownership");
 
-    const auto occupied_prefix = addresses.create_active(1, 0, device.stream);
+    const auto occupied_prefix = addresses.create_active(1, 0, device.stream());
     expect(occupied_prefix.has_value(), "growth rollback retained prefix allocation");
-    addresses.ensure_mapped_to_tokens(*occupied_prefix, 1, device.stream);
+    addresses.ensure_mapped_to_tokens(*occupied_prefix, 1, device.stream());
     addresses.settle_growth(*occupied_prefix, 1);
     addresses.deactivate(*occupied_prefix);
     const auto occupied_page = addresses.logical_page(*occupied_prefix, 0);
-    addresses.activate(*occupied_prefix, 0, 0, device.stream);
+    addresses.activate(*occupied_prefix, 0, 0, device.stream());
     expect(addresses.active(*occupied_prefix) && addresses.mapped_pages(*occupied_prefix) == 1 &&
                addresses.logical_page(*occupied_prefix, 0) == occupied_page &&
                addresses.reserved_growth_pages(*occupied_prefix) == 0 &&
@@ -448,8 +450,8 @@ void test_kv_store(ninfer::DeviceContext& device) {
                pages.writer_references(occupied_page) == 1 && physical_pages.reserved_pages() == 0,
            "zero-growth reactivation retains its existing page and restores the writer");
     addresses.deactivate(*occupied_prefix);
-    const auto first_empty  = addresses.create_active(0, 0, device.stream);
-    const auto second_empty = addresses.create_active(0, 1, device.stream);
+    const auto first_empty  = addresses.create_active(0, 0, device.stream());
+    const auto second_empty = addresses.create_active(0, 1, device.stream());
     expect(first_empty && second_empty && addresses.active(*first_empty) &&
                addresses.active(*second_empty) && addresses.bound_row(*first_empty) == 0 &&
                addresses.bound_row(*second_empty) == 1 &&
@@ -459,7 +461,7 @@ void test_kv_store(ninfer::DeviceContext& device) {
                addresses.reserved_growth_pages(*second_empty) == 0 &&
                physical_pages.allocated_pages() == 1 && physical_pages.reserved_pages() == 0,
            "zero-growth active addresses own rows without reserving physical pages");
-    addresses.ensure_mapped_to_tokens(*first_empty, 0, device.stream);
+    addresses.ensure_mapped_to_tokens(*first_empty, 0, device.stream());
     addresses.reserve_growth(*first_empty, 4);
     bool growth_rejected = false;
     try {
@@ -497,11 +499,11 @@ void test_kv_store(ninfer::DeviceContext& device) {
            "zero-growth and failed reservation fixtures close all ownership");
 
     // Verify crosses a page boundary, but the terminal commit consumes only its first column.
-    const auto terminal = addresses.create_active(3, 0, device.stream);
+    const auto terminal = addresses.create_active(3, 0, device.stream());
     expect(terminal.has_value(), "terminal boundary KV address allocation");
-    addresses.ensure_mapped_to_tokens(*terminal, 63, device.stream);
+    addresses.ensure_mapped_to_tokens(*terminal, 63, device.stream());
     addresses.commit_frontier(*terminal, 63);
-    addresses.ensure_mapped_to_tokens(*terminal, 71, device.stream);
+    addresses.ensure_mapped_to_tokens(*terminal, 71, device.stream());
     device.synchronize();
     const auto terminal_mapping   = read_block_table(physical_tables, 0, 2);
     const auto unchanged_terminal = [&] {
@@ -512,13 +514,13 @@ void test_kv_store(ninfer::DeviceContext& device) {
                physical_pages.available_pages() == 5 &&
                read_block_table(physical_tables, 0, 2) == terminal_mapping;
     };
-    addresses.ensure_mapped_to_tokens(*terminal, 71, device.stream);
-    addresses.ensure_mapped_to_tokens(*terminal, 64, device.stream);
+    addresses.ensure_mapped_to_tokens(*terminal, 71, device.stream());
+    addresses.ensure_mapped_to_tokens(*terminal, 64, device.stream());
     device.synchronize();
     expect(unchanged_terminal(), "covered KV requests preserve speculative mappings and ownership");
     bool exceeded = false;
     try {
-        addresses.ensure_mapped_to_tokens(*terminal, 193, device.stream);
+        addresses.ensure_mapped_to_tokens(*terminal, 193, device.stream());
     } catch (const std::invalid_argument&) { exceeded = true; }
     expect(exceeded && unchanged_terminal(),
            "KV coverage beyond reserved growth fails without mutation");
@@ -537,7 +539,7 @@ void test_kv_store(ninfer::DeviceContext& device) {
     expect(addresses.growth_pages_for_tokens(*terminal, 65) == 1 &&
                addresses.reserved_growth_pages(*terminal) == 1,
            "unit growth demand is independent of an already acquired reservation");
-    addresses.ensure_mapped_to_tokens(*terminal, 65, device.stream);
+    addresses.ensure_mapped_to_tokens(*terminal, 65, device.stream());
     addresses.settle_growth(*terminal, 65);
     expect(addresses.mapped_pages(*terminal) == 2 &&
                addresses.committed_frontier(*terminal) == 65 &&
@@ -549,9 +551,9 @@ void test_kv_store(ninfer::DeviceContext& device) {
                physical_pages.reserved_pages() == 0 && physical_pages.available_pages() == 8,
            "terminal settlement releases both mappings and unused growth");
 
-    const auto alternating = addresses.create_active(4, 0, device.stream);
+    const auto alternating = addresses.create_active(4, 0, device.stream());
     expect(alternating.has_value(), "alternating Host release address allocation");
-    addresses.ensure_mapped_to_tokens(*alternating, 193, device.stream);
+    addresses.ensure_mapped_to_tokens(*alternating, 193, device.stream());
     addresses.commit_frontier(*alternating, 193);
     addresses.deactivate(*alternating);
     const std::array alternating_pages{
@@ -561,8 +563,8 @@ void test_kv_store(ninfer::DeviceContext& device) {
     expect(alternating_backup.has_value(), "alternating Host extent reservation");
     const auto alternating_sources = extents.device_sources(*alternating_backup);
     physical_pages.copy_to_host(alternating_sources, extents.writable_view(*alternating_backup),
-                                device.transfer_stream);
-    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+                                device.transfer_stream());
+    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream()));
     const auto alternating_extent = extents.publish(std::move(*alternating_backup));
     const std::array alternating_release{alternating_pages[0], alternating_pages[2]};
     expect(extents.release_page_replicas(pages, alternating_release),
@@ -582,9 +584,9 @@ void test_kv_store(ninfer::DeviceContext& device) {
                pages.occupied() == 0,
            "alternating Host extent partitions close without leaked descriptors");
 
-    const auto shared = addresses.create_active(3, 0, device.stream);
+    const auto shared = addresses.create_active(3, 0, device.stream());
     expect(shared.has_value(), "shared-prefix source address allocation");
-    addresses.ensure_mapped_to_tokens(*shared, 65, device.stream);
+    addresses.ensure_mapped_to_tokens(*shared, 65, device.stream());
     addresses.commit_frontier(*shared, 65);
     addresses.set_checkpoint_requirement(*shared, 65);
     device.synchronize();
@@ -600,9 +602,9 @@ void test_kv_store(ninfer::DeviceContext& device) {
            "prefix fork remains unpublished while its tail copy is pending");
     physical_pages.copy_page(addresses.prefix_fork_tail_source(first_fork),
                              addresses.prefix_fork_tail_destination(first_fork),
-                             device.transfer_stream);
-    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
-    addresses.commit_prefix_fork(std::move(first_fork), device.stream);
+                             device.transfer_stream());
+    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream()));
+    addresses.commit_prefix_fork(std::move(first_fork), device.stream());
     device.synchronize();
     const auto branch_one_mapping = read_block_table(physical_tables, 1, 2);
     const auto branch_one_tail    = addresses.logical_page(*branch_one, 1);
@@ -613,7 +615,7 @@ void test_kv_store(ninfer::DeviceContext& device) {
                pages.address_references(shared_tail) == 1 &&
                addresses.reserved_growth_pages(*branch_one) == 0,
            "zero-growth fork shares full pages and publishes its reserved private partial tail");
-    addresses.ensure_mapped_to_tokens(*branch_one, 66, device.stream);
+    addresses.ensure_mapped_to_tokens(*branch_one, 66, device.stream());
     addresses.commit_frontier(*branch_one, 66);
     expect(pages.committed_columns(shared_tail) == 1 &&
                pages.committed_columns(branch_one_tail) == 2,
@@ -630,9 +632,9 @@ void test_kv_store(ninfer::DeviceContext& device) {
     auto second_fork = addresses.prepare_prefix_fork(*shared, *branch_two, 65, 1, 1);
     physical_pages.copy_page(addresses.prefix_fork_tail_source(second_fork),
                              addresses.prefix_fork_tail_destination(second_fork),
-                             device.transfer_stream);
-    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
-    addresses.commit_prefix_fork(std::move(second_fork), device.stream);
+                             device.transfer_stream());
+    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream()));
+    addresses.commit_prefix_fork(std::move(second_fork), device.stream());
     device.synchronize();
     const auto branch_two_mapping = read_block_table(physical_tables, 1, 2);
     const auto branch_two_tail    = addresses.logical_page(*branch_two, 1);
@@ -660,9 +662,9 @@ void test_kv_store(ninfer::DeviceContext& device) {
                physical_pages.allocated_pages() == 0 && physical_pages.reserved_pages() == 0,
            "shared full-page occupancy survives until its final address reference releases");
 
-    const auto mixed_source = addresses.create_active(4, 0, device.stream);
+    const auto mixed_source = addresses.create_active(4, 0, device.stream());
     expect(mixed_source.has_value(), "mixed prefix retained source allocation");
-    addresses.ensure_mapped_to_tokens(*mixed_source, 65, device.stream);
+    addresses.ensure_mapped_to_tokens(*mixed_source, 65, device.stream());
     addresses.commit_frontier(*mixed_source, 65);
     addresses.set_checkpoint_requirement(*mixed_source, 65);
     addresses.deactivate(*mixed_source);
@@ -673,10 +675,10 @@ void test_kv_store(ninfer::DeviceContext& device) {
     auto mixed_fork = addresses.prepare_prefix_fork(*mixed_source, *mixed_active, 65, 2, 0);
     physical_pages.copy_page(addresses.prefix_fork_tail_source(mixed_fork),
                              addresses.prefix_fork_tail_destination(mixed_fork),
-                             device.transfer_stream);
-    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
-    addresses.commit_prefix_fork(std::move(mixed_fork), device.stream);
-    addresses.ensure_mapped_to_tokens(*mixed_active, 130, device.stream);
+                             device.transfer_stream());
+    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream()));
+    addresses.commit_prefix_fork(std::move(mixed_fork), device.stream());
+    addresses.ensure_mapped_to_tokens(*mixed_active, 130, device.stream());
     addresses.commit_frontier(*mixed_active, 130);
     addresses.set_checkpoint_requirement(*mixed_active, 130);
     const auto mixed_mutable_full = addresses.logical_page(*mixed_active, 1);
@@ -702,8 +704,8 @@ void test_kv_store(ninfer::DeviceContext& device) {
     auto partial = addresses.prepare_active_prefix_view(*mixed_active, *partial_view, 130);
     physical_pages.copy_page(addresses.active_prefix_view_tail_source(partial),
                              addresses.active_prefix_view_tail_destination(partial),
-                             device.transfer_stream);
-    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+                             device.transfer_stream());
+    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream()));
     addresses.commit_active_prefix_view(std::move(partial));
     const auto partial_tail = addresses.logical_page(*partial_view, 2);
     expect(addresses.active(*mixed_active) && !addresses.active(*partial_view) &&
@@ -716,7 +718,7 @@ void test_kv_store(ninfer::DeviceContext& device) {
                pages.writer_references(partial_tail) == 0,
            "mixed prefix view freezes full pages and isolates its tail while keeping the writer");
 
-    addresses.ensure_mapped_to_tokens(*mixed_active, 192, device.stream);
+    addresses.ensure_mapped_to_tokens(*mixed_active, 192, device.stream());
     addresses.commit_frontier(*mixed_active, 192);
     addresses.set_checkpoint_requirement(*mixed_active, 192);
     const auto aligned_view = addresses.create_inactive();
@@ -740,7 +742,7 @@ void test_kv_store(ninfer::DeviceContext& device) {
                read_block_table(physical_tables, 0, 3) == aligned_mapping &&
                physical_pages.allocated_pages() == allocated_before_aligned_view,
            "aligned prefix view preserves every logical and physical page without allocation");
-    addresses.ensure_mapped_to_tokens(*mixed_active, 193, device.stream);
+    addresses.ensure_mapped_to_tokens(*mixed_active, 193, device.stream());
     addresses.settle_growth(*mixed_active, 192);
     expect(addresses.mapped_pages(*mixed_active) == 3 &&
                addresses.reserved_growth_pages(*mixed_active) == 0 &&
@@ -748,7 +750,7 @@ void test_kv_store(ninfer::DeviceContext& device) {
                physical_pages.allocated_pages() == allocated_before_aligned_view,
            "settlement releases a private speculative suffix ending at a shared full page");
     addresses.reserve_growth(*mixed_active, 1);
-    addresses.ensure_mapped_to_tokens(*mixed_active, 193, device.stream);
+    addresses.ensure_mapped_to_tokens(*mixed_active, 193, device.stream());
     addresses.commit_frontier(*mixed_active, 193);
     device.synchronize();
     const auto appended_page = addresses.logical_page(*mixed_active, 3);
@@ -769,16 +771,16 @@ void test_kv_store(ninfer::DeviceContext& device) {
                pages.occupied() == 0 && physical_pages.allocated_pages() == 0,
            "mixed prefix view ownership closes without leaked logical or physical pages");
 
-    const auto filler = addresses.create_active(4, 0, device.stream);
+    const auto filler = addresses.create_active(4, 0, device.stream());
     expect(filler.has_value(), "full-capacity retained-fork filler allocation");
-    addresses.ensure_mapped_to_tokens(*filler, 193, device.stream);
+    addresses.ensure_mapped_to_tokens(*filler, 193, device.stream());
     addresses.commit_frontier(*filler, 193);
     addresses.set_checkpoint_requirement(*filler, 193);
     addresses.deactivate(*filler);
 
-    const auto retained = addresses.create_active(4, 0, device.stream);
+    const auto retained = addresses.create_active(4, 0, device.stream());
     expect(retained.has_value(), "full-capacity retained source allocation");
-    addresses.ensure_mapped_to_tokens(*retained, 65, device.stream);
+    addresses.ensure_mapped_to_tokens(*retained, 65, device.stream());
     addresses.commit_frontier(*retained, 65);
     addresses.set_checkpoint_requirement(*retained, 65);
     addresses.deactivate(*retained);
@@ -813,9 +815,9 @@ void test_kv_store(ninfer::DeviceContext& device) {
            "retained fork reserves tail and growth while the source remains resident");
     physical_pages.copy_page(addresses.prefix_fork_tail_source(retained_fork),
                              addresses.prefix_fork_tail_destination(retained_fork),
-                             device.transfer_stream);
-    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
-    addresses.commit_prefix_fork(std::move(retained_fork), device.stream);
+                             device.transfer_stream());
+    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream()));
+    addresses.commit_prefix_fork(std::move(retained_fork), device.stream());
     expect(pages.device_resident(retained_tail) && pages.source_pins(retained_tail) == 0 &&
                addresses.logical_page(*retained_destination, 0) == retained_full &&
                addresses.logical_page(*retained_destination, 1) != retained_tail &&
@@ -842,8 +844,9 @@ void test_cancel_alias_during_prefix_fork(ninfer::DeviceContext& device) {
                      .planes = {{.dtype = ninfer::DType::BF16, .leading_extent = 8, .head_extent = 2}}}});
     const ninfer::KVExecutionTableLayout table_layout =
         ninfer::plan_kv_execution_tables(builder, {.logical_page_capacity = 3, .table_rows = 2});
-    ninfer::DeviceArena arena(builder.finish(256));
-    const ninfer::DeviceSpan backing{arena.base(), arena.capacity()};
+    ninfer::DeviceBuffer arena_storage(device.device(), builder.finish(256));
+    ninfer::MemoryArena arena(arena_storage.span());
+    const auto backing = arena.storage();
     ninfer::DeviceKVPagePool physical_pages(backing, page_layout);
     ninfer::KVExecutionTablePool physical_tables(backing, table_layout, physical_pages);
     store::LogicalKVPageStore pages(physical_pages, physical_pages.capacity_pages());
@@ -860,15 +863,17 @@ void test_cancel_alias_during_prefix_fork(ninfer::DeviceContext& device) {
     };
 
     for (const bool cancel_fork : {false, true}) {
-        const auto source = addresses.create_active(2, 0, device.stream);
+        const auto source = addresses.create_active(2, 0, device.stream());
         expect(source.has_value(), "pinned prefix source allocation");
-        addresses.ensure_mapped_to_tokens(*source, page_tokens + 1, device.stream);
+        addresses.ensure_mapped_to_tokens(*source, page_tokens + 1, device.stream());
         addresses.settle_growth(*source, page_tokens + 1);
         addresses.set_checkpoint_requirement(*source, page_tokens + 1);
         device.synchronize();
         const auto source_mapping = read_block_table(physical_tables, 0, 2);
-        CUDA_CHECK(cudaMemsetAsync(page_data(source_mapping[0]), 0x35, plane.nb[3], device.stream));
-        CUDA_CHECK(cudaMemsetAsync(page_data(source_mapping[1]), 0xa6, plane.nb[3], device.stream));
+        CUDA_CHECK(
+            cudaMemsetAsync(page_data(source_mapping[0]), 0x35, plane.nb[3], device.stream()));
+        CUDA_CHECK(
+            cudaMemsetAsync(page_data(source_mapping[1]), 0xa6, plane.nb[3], device.stream()));
         device.synchronize();
         addresses.deactivate(*source);
         const auto full = addresses.logical_page(*source, 0);
@@ -878,7 +883,7 @@ void test_cancel_alias_during_prefix_fork(ninfer::DeviceContext& device) {
         const auto destination = addresses.create_inactive();
         expect(alias && destination, "pinned prefix branch allocation");
         auto alias_fork = addresses.prepare_prefix_fork(*source, *alias, page_tokens, 0, 0);
-        addresses.commit_prefix_fork(std::move(alias_fork), device.stream);
+        addresses.commit_prefix_fork(std::move(alias_fork), device.stream());
         device.synchronize();
         expect(pages.address_references(full) == 2 && pages.active_address_references(full) == 1,
                "active branch shares the retained full page");
@@ -886,7 +891,7 @@ void test_cancel_alias_during_prefix_fork(ninfer::DeviceContext& device) {
         auto pending = addresses.prepare_prefix_fork(*source, *destination, page_tokens + 1, 1, 1);
         physical_pages.copy_page(addresses.prefix_fork_tail_source(pending),
                                  addresses.prefix_fork_tail_destination(pending),
-                                 device.transfer_stream);
+                                 device.transfer_stream());
         expect(pages.source_pins(full) == 1 && pages.source_pins(tail) == 1 &&
                    !addresses.can_release(*source),
                "pending fork pins its source and protects the final tail reference");
@@ -904,13 +909,13 @@ void test_cancel_alias_during_prefix_fork(ninfer::DeviceContext& device) {
                    pages.source_pins(tail) == 1 && pages.device_resident(full) &&
                    pages.device_resident(tail) && !addresses.can_release(*source),
                "alias cancellation preserves both pinned source pages and their final ownership");
-        CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+        CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream()));
         if (cancel_fork) {
             addresses.abort_prefix_fork(pending);
             expect(addresses.release(*destination),
                    "cancelled fork releases its empty destination");
         } else {
-            addresses.commit_prefix_fork(std::move(pending), device.stream);
+            addresses.commit_prefix_fork(std::move(pending), device.stream());
             device.synchronize();
             const auto destination_mapping = read_block_table(physical_tables, 1, 2);
             expect(destination_mapping[0] == source_mapping[0] &&
@@ -953,16 +958,17 @@ void test_shared_kv_directory(ninfer::DeviceContext& device) {
                      .planes = {{.dtype = ninfer::DType::BF16, .leading_extent = 8, .head_extent = 2}}}});
     const ninfer::KVExecutionTableLayout table_layout =
         ninfer::plan_kv_execution_tables(builder, {.logical_page_capacity = 68, .table_rows = 1});
-    ninfer::DeviceArena arena(builder.finish(256));
-    const ninfer::DeviceSpan backing{arena.base(), arena.capacity()};
+    ninfer::DeviceBuffer arena_storage(device.device(), builder.finish(256));
+    ninfer::MemoryArena arena(arena_storage.span());
+    const auto backing = arena.storage();
     ninfer::DeviceKVPagePool physical_pages(backing, page_layout);
     ninfer::KVExecutionTablePool physical_tables(backing, table_layout, physical_pages);
     store::LogicalKVPageStore pages(physical_pages, physical_pages.capacity_pages());
     store::KVAddressSpaceStore addresses(pages, physical_tables, 3, 68);
 
-    const auto source = addresses.create_active(full_pages + 1, 0, device.stream);
+    const auto source = addresses.create_active(full_pages + 1, 0, device.stream());
     expect(source.has_value(), "long shared-directory source allocation");
-    addresses.ensure_mapped_to_tokens(*source, frontier, device.stream);
+    addresses.ensure_mapped_to_tokens(*source, frontier, device.stream());
     addresses.settle_growth(*source, frontier);
     addresses.set_checkpoint_requirement(*source, frontier);
     device.synchronize();
@@ -977,9 +983,10 @@ void test_shared_kv_directory(ninfer::DeviceContext& device) {
     expect(branch.has_value(), "long shared-directory fork destination allocation");
     auto fork = addresses.prepare_prefix_fork(*source, *branch, frontier, 1, 0);
     physical_pages.copy_page(addresses.prefix_fork_tail_source(fork),
-                             addresses.prefix_fork_tail_destination(fork), device.transfer_stream);
-    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
-    addresses.commit_prefix_fork(std::move(fork), device.stream);
+                             addresses.prefix_fork_tail_destination(fork),
+                             device.transfer_stream());
+    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream()));
+    addresses.commit_prefix_fork(std::move(fork), device.stream());
     device.synchronize();
     const auto branch_mapping    = read_block_table(physical_tables, 0, full_pages + 1);
     bool fork_identity_preserved = true;
@@ -1009,7 +1016,7 @@ void test_shared_kv_directory(ninfer::DeviceContext& device) {
            "every inherited page remains reachable from the surviving long directory");
 
     const std::uint32_t next_frontier = (full_pages + 1) * page_tokens + 1;
-    addresses.ensure_mapped_to_tokens(*branch, next_frontier, device.stream);
+    addresses.ensure_mapped_to_tokens(*branch, next_frontier, device.stream());
     addresses.settle_growth(*branch, next_frontier);
     device.synchronize();
     const auto grown_branch_mapping = read_block_table(physical_tables, 0, full_pages + 2);
@@ -1020,8 +1027,8 @@ void test_shared_kv_directory(ninfer::DeviceContext& device) {
     auto view = addresses.prepare_active_prefix_view(*branch, *view_destination, next_frontier);
     physical_pages.copy_page(addresses.active_prefix_view_tail_source(view),
                              addresses.active_prefix_view_tail_destination(view),
-                             device.transfer_stream);
-    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+                             device.transfer_stream());
+    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream()));
     addresses.commit_active_prefix_view(std::move(view));
     const auto view_tail         = addresses.logical_page(*view_destination, full_pages + 1);
     bool view_identity_preserved = true;
@@ -1042,12 +1049,12 @@ void test_shared_kv_directory(ninfer::DeviceContext& device) {
     expect(addresses.release_after_deactivate(*branch) && !pages.valid(appended_tail) &&
                pages.valid(branch_tail) && physical_pages.allocated_pages() == full_pages + 2,
            "long prefix view retains its directory after the intermediate branch is released");
-    addresses.activate(*view_destination, 0, 0, device.stream);
+    addresses.activate(*view_destination, 0, 0, device.stream());
     device.synchronize();
     const auto view_mapping = read_block_table(physical_tables, 0, full_pages + 2);
     expect(view_mapping.back() != grown_branch_mapping.back(),
            "activated prefix view uses its independent tail page");
-    addresses.ensure_mapped_to_tokens(*view_destination, next_frontier + 1, device.stream);
+    addresses.ensure_mapped_to_tokens(*view_destination, next_frontier + 1, device.stream());
     addresses.settle_growth(*view_destination, next_frontier + 1);
     device.synchronize();
     std::vector<std::int32_t> expected_mapping(source_mapping.begin(),
@@ -1136,16 +1143,17 @@ void test_mixed_row_frontiers(ninfer::DeviceContext& context) {
         ninfer::plan_device_kv_page_pool(builder, {.page_group_count = 4, .geometry = geometry});
     const auto table_layout =
         ninfer::plan_kv_execution_tables(builder, {.logical_page_capacity = 2, .table_rows = 1});
-    ninfer::DeviceArena arena(builder.finish(256));
-    ninfer::DeviceKVPagePool pool({arena.base(), arena.capacity()}, layout);
-    ninfer::KVExecutionTablePool tables({arena.base(), arena.capacity()}, table_layout, pool);
+    ninfer::DeviceBuffer arena_storage(context.device(), builder.finish(256));
+    ninfer::MemoryArena arena(arena_storage.span());
+    ninfer::DeviceKVPagePool pool(arena.storage(), layout);
+    ninfer::KVExecutionTablePool tables(arena.storage(), table_layout, pool);
     store::LogicalKVPageStore pages(pool, 4);
     store::KVAddressSpaceStore addresses(pages, tables, 2, 2);
-    const auto address = addresses.create_active(2, 0, context.stream).value();
-    addresses.ensure_mapped_to_tokens(address, 65, context.stream);
+    const auto address = addresses.create_active(2, 0, context.stream()).value();
+    addresses.ensure_mapped_to_tokens(address, 65, context.stream());
     const std::array initial_pages{addresses.physical_page(address, 0),
                                    addresses.physical_page(address, 1)};
-    pool.zero_pages(initial_pages, context.stream);
+    pool.zero_pages(initial_pages, context.stream());
     context.synchronize();
     const auto mapping = read_block_table(tables, 0, 2);
     const auto first   = addresses.logical_page(address, 0);
@@ -1174,7 +1182,7 @@ void test_mixed_row_frontiers(ninfer::DeviceContext& context) {
     const auto& index = pool.plane(1);
     auto* candidate   = static_cast<std::byte*>(index.data) +
                       static_cast<std::int64_t>(mapping[0]) * index.nb[3] + index.nb[1];
-    CUDA_CHECK(cudaMemsetAsync(candidate, 0x55, 128 * sizeof(std::uint16_t), context.stream));
+    CUDA_CHECK(cudaMemsetAsync(candidate, 0x55, 128 * sizeof(std::uint16_t), context.stream()));
     context.synchronize();
     check(6, 6, 0, 1);
     addresses.commit_frontier(address, 7);
@@ -1187,7 +1195,7 @@ void test_mixed_row_frontiers(ninfer::DeviceContext& context) {
            "candidate index row was not present for the partial-prefix check");
 
     // A replacement token 7 completes the same row without touching the protected prefix.
-    CUDA_CHECK(cudaMemsetAsync(candidate, 0x66, sizeof(observed), context.stream));
+    CUDA_CHECK(cudaMemsetAsync(candidate, 0x66, sizeof(observed), context.stream()));
     context.synchronize();
     addresses.commit_frontier(address, 8);
     check(8, 8, 0, 2);
@@ -1208,7 +1216,7 @@ void test_mixed_row_frontiers(ninfer::DeviceContext& context) {
     addresses.commit_frontier(address, 64);
     expect(pages.committed_columns(first) == 64 && pages.committed_columns(first) / 4 == 16,
            "frontier 64 must complete the last compressed row of the first page");
-    addresses.ensure_mapped_to_tokens(address, 65, context.stream);
+    addresses.ensure_mapped_to_tokens(address, 65, context.stream());
     const auto new_second = addresses.logical_page(address, 1);
     addresses.commit_frontier(address, 65);
     expect(pages.committed_columns(first) == 64 && pages.committed_columns(new_second) == 1 &&
@@ -1240,18 +1248,19 @@ void test_history_prefix_view(ninfer::DeviceContext& context, ninfer::PagedKVPla
         ninfer::plan_device_kv_page_pool(builder, {.page_group_count = 8, .geometry = geometry});
     const auto table_layout =
         ninfer::plan_kv_execution_tables(builder, {.logical_page_capacity = 6, .table_rows = 1});
-    ninfer::DeviceArena arena(builder.finish(256));
-    ninfer::DeviceKVPagePool pool({arena.base(), arena.capacity()}, page_layout);
-    ninfer::KVExecutionTablePool tables({arena.base(), arena.capacity()}, table_layout, pool);
+    ninfer::DeviceBuffer arena_storage(context.device(), builder.finish(256));
+    ninfer::MemoryArena arena(arena_storage.span());
+    ninfer::DeviceKVPagePool pool(arena.storage(), page_layout);
+    ninfer::KVExecutionTablePool tables(arena.storage(), table_layout, pool);
     store::LogicalKVPageStore pages(pool, 12);
     store::KVAddressSpaceStore addresses(pages, tables, 4, 6);
-    const auto source      = addresses.create_active(5, 0, context.stream).value();
+    const auto source      = addresses.create_active(5, 0, context.stream()).value();
     const auto destination = addresses.create_inactive().value();
-    addresses.ensure_mapped_to_tokens(source, endpoint, context.stream);
+    addresses.ensure_mapped_to_tokens(source, endpoint, context.stream());
     addresses.commit_frontier(source, endpoint);
     addresses.set_checkpoint_requirement(source, rewrite);
     addresses.deactivate(source);
-    addresses.activate(source, 1, 0, context.stream);
+    addresses.activate(source, 1, 0, context.stream());
     bool protected_truncate_rejected = false;
     try {
         addresses.destructive_truncate(source, rewrite - 1U);
@@ -1259,7 +1268,7 @@ void test_history_prefix_view(ninfer::DeviceContext& context, ninfer::PagedKVPla
     expect(protected_truncate_rejected,
            "activation lost the internal rewrite checkpoint protection");
 
-    const auto original_bytes = fill_device_pool(pool, context.stream);
+    const auto original_bytes = fill_device_pool(pool, context.stream());
     context.synchronize();
     const auto original_mapping = read_block_table(tables, 0, 4);
     const auto allocated = pool.allocated_pages(), reserved = pool.reserved_pages();
@@ -1288,7 +1297,7 @@ void test_history_prefix_view(ninfer::DeviceContext& context, ninfer::PagedKVPla
     auto view = addresses.prepare_active_prefix_view(source, destination, rewrite);
     expect(view.needs_tail_copy(), "partial prefix export omitted its tail copy");
     pool.copy_page(addresses.active_prefix_view_tail_source(view),
-                   addresses.active_prefix_view_tail_destination(view), context.stream);
+                   addresses.active_prefix_view_tail_destination(view), context.stream());
     context.synchronize();
     addresses.commit_active_prefix_view(std::move(view));
     expect(
@@ -1315,7 +1324,7 @@ void test_history_prefix_view(ninfer::DeviceContext& context, ninfer::PagedKVPla
         addresses.physical_page(source, 0),      addresses.physical_page(source, 1),
         addresses.physical_page(source, 2),      addresses.physical_page(source, 3),
         addresses.physical_page(destination, 0), addresses.physical_page(destination, 1)};
-    pool.copy_to_host(observation, host_view, context.stream);
+    pool.copy_to_host(observation, host_view, context.stream());
     context.synchronize();
     const auto expected_source =
         expected_host_records(pool, original_mapping, host_layout, original_bytes);
@@ -1340,16 +1349,16 @@ void test_history_prefix_view(ninfer::DeviceContext& context, ninfer::PagedKVPla
                 order == ninfer::PagedKVPlaneOrder::PageMajor
                     ? static_cast<std::size_t>(physical_tail) * plane.nb[3] + head * plane.nb[2]
                     : head * plane.nb[3] + static_cast<std::size_t>(physical_tail) * plane.nb[2];
-            const auto error = cudaMemsetAsync(static_cast<std::byte*>(plane.data) + offset +
-                                                   first_row * plane.nb[1],
-                                               0, (rows - first_row) * plane.nb[1], context.stream);
+            const auto error = cudaMemsetAsync(
+                static_cast<std::byte*>(plane.data) + offset + first_row * plane.nb[1], 0,
+                (rows - first_row) * plane.nb[1], context.stream());
             if (error != cudaSuccess) { throw std::runtime_error("source suffix rewrite failed"); }
         }
     }
     addresses.commit_frontier(source, page_size + 21U);
     const std::array exported{addresses.physical_page(destination, 0),
                               addresses.physical_page(destination, 1)};
-    pool.copy_to_host(exported, host_view.subview(0, 2), context.stream);
+    pool.copy_to_host(exported, host_view.subview(0, 2), context.stream());
     context.synchronize();
     expect(std::memcmp(host_view.data(), expected_view.data(), expected_view.size()) == 0,
            "source rewrite changed the old exported prefix contents");

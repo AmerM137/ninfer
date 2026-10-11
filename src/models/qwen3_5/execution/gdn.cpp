@@ -24,14 +24,14 @@ std::size_t gdn_record_workspace_bytes(const GdnParameters& parameters, std::int
 }
 
 void gdn_projection(const Tensor& hidden, const GdnParameters& parameters, Tensor& qkv, Tensor& z,
-                    WorkspaceArena& workspace, cudaStream_t stream) {
+                    MemoryArena& workspace, CudaExecutionView execution) {
     std::array outputs{qkv, z};
-    ops::linear_split(hidden, parameters.projection, outputs, workspace, stream);
+    ops::linear_split(hidden, parameters.projection, outputs, workspace, execution);
 }
 
 void gdn_norm_control(const Tensor& residual, const Tensor& norm, float epsilon,
                       const GdnParameters& parameters, Tensor& hidden, Tensor& g, Tensor& beta,
-                      WorkspaceArena& workspace, DeviceExecutionView execution) {
+                      MemoryArena& workspace, CudaExecutionView execution) {
     ops::gdn_norm_control_proj(residual, norm, epsilon, parameters.control, parameters.a_log,
                                parameters.dt_bias, {hidden, {g, beta}}, workspace, execution);
 }
@@ -40,20 +40,20 @@ void gdn_projection_snapshot(const Tensor& hidden, const GdnParameters& paramete
                              Tensor& conv_states, const Tensor& valid_columns,
                              const Tensor& initial_slots, const Tensor& destination_slots,
                              Tensor& query, Tensor& key, Tensor& value, Tensor& z,
-                             WorkspaceArena& workspace, cudaStream_t stream) {
+                             MemoryArena& workspace, CudaExecutionView execution) {
     ops::gdn_input_proj_conv_snapshot(hidden, parameters.projection, parameters.convolution,
                                       {conv_states, initial_slots, destination_slots},
-                                      valid_columns, {query, key, value, z}, workspace, stream);
+                                      valid_columns, {query, key, value, z}, workspace, execution);
 }
 
 void gdn_projection_record(const Tensor& hidden, const GdnParameters& parameters,
                            const Tensor& conv_states, const Tensor& valid_columns,
                            const Tensor& initial_slots, Tensor& conv_record, Tensor& query,
-                           Tensor& key, Tensor& value, Tensor& z, WorkspaceArena& workspace,
-                           cudaStream_t stream) {
+                           Tensor& key, Tensor& value, Tensor& z, MemoryArena& workspace,
+                           CudaExecutionView execution) {
     ops::gdn_input_proj_conv_record(hidden, parameters.projection, parameters.convolution,
                                     {conv_states, initial_slots}, valid_columns,
-                                    {query, key, value, z}, conv_record, workspace, stream);
+                                    {query, key, value, z}, conv_record, workspace, execution);
 }
 
 } // namespace ninfer::models::qwen3_5::execution

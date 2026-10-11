@@ -1,6 +1,7 @@
 // Cold-cache public-Op benchmark for Q8 LinearAdd.
 
 #include "core/weight.h"
+#include "core/buffer.h"
 #include "ninfer/ops/linear_add.h"
 
 #include "core/device.h"
@@ -123,38 +124,41 @@ int main(int argc, char** argv) {
 
         cudaStream_t stream = nullptr;
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+        const auto cuda = ninfer::bench::device_context().execution_view(stream);
         ninfer::bench::L2FlushBuffer flush(kFlushBytes);
         ninfer::DeviceBuffer input =
             bench::make_bf16(static_cast<std::size_t>(options.hidden) * max_t, 101U);
         ninfer::DeviceBuffer residual =
             bench::make_bf16(static_cast<std::size_t>(kRows) * max_t, 103U);
         bench::SavedBuffer residual_initial(residual);
-        const auto restore                  = [&](cudaStream_t s) { residual_initial.restore(s); };
+        const auto restore = [&](CudaExecutionView cuda) { residual_initial.restore(cuda); };
         bench::PackedQuantizedWeight packed = bench::make_row_split_weight(
             QType::Q8_G32_FP16, kRows, options.hidden, options.hidden, 501U);
         const std::size_t workspace_capacity = ops::linear_add_workspace_capacity_bytes(
             QType::Q8_G32_FP16, kRows, options.hidden, min_t, max_t);
-        WorkspaceArena workspace(std::max<std::size_t>(workspace_capacity, 256));
+        ninfer::DeviceBuffer workspace_storage(ninfer::bench::device_context().device(),
+                                               std::max<std::size_t>(workspace_capacity, 256));
+        MemoryArena workspace(workspace_storage.span());
         std::vector<Result> results;
 
         for (const std::int32_t t : options.t_sweep) {
-            Tensor x(input.p, DType::BF16, {options.hidden, t});
-            Tensor out(residual.p, DType::BF16, {kRows, t});
+            Tensor x(input.span(), DType::BF16, {options.hidden, t});
+            Tensor out(residual.span(), DType::BF16, {kRows, t});
 
             if (options.profile) {
-                ops::linear_add(x, packed.weight, out, workspace, stream);
+                ops::linear_add(x, packed.weight, out, workspace, cuda);
                 CUDA_CHECK(cudaStreamSynchronize(stream));
                 std::printf("profile op=linear_add T=%d\n", t);
                 continue;
             }
 
-            const auto launch = [&](cudaStream_t launch_stream) {
-                ops::linear_add(x, packed.weight, out, workspace, launch_stream);
+            const auto launch = [&](CudaExecutionView cuda) {
+                ops::linear_add(x, packed.weight, out, workspace, cuda);
             };
             append(results, t, options.hidden,
-                   bench::measure_cold_launch_prepared(restore, launch, flush, stream,
-                                                       options.warmup, options.repeat),
-                   packed.storage.bytes);
+                   bench::measure_cold_launch_prepared(restore, launch, flush, cuda, options.warmup,
+                                                       options.repeat),
+                   packed.storage.size());
         }
 
         CUDA_CHECK(cudaStreamSynchronize(stream));

@@ -35,7 +35,7 @@ struct Plane {
     Plane(int pages, DType dtype, int padding)
         : leading(padding ? 1 : 0), row(256 + padding), head(64 * row + padding),
           page(2 * head + padding), host(leading + page * pages), device(host.size() * 2),
-          view(static_cast<std::uint16_t*>(device.data()) + leading, dtype, {256, 64, 2, pages}) {
+          view(device.span().subspan(leading * 2), dtype, {256, 64, 2, pages}) {
         view.nb[1] = row * 2;
         view.nb[2] = head * 2;
         view.nb[3] = page * 2;
@@ -74,10 +74,10 @@ struct Fixture {
           rows(B * 4), table(tables.size() * 4), selections(ids.size() * 4),
           sizes(counts.size() * 4) {
         envelope.max_visible_tokens = history;
-        query                       = Tensor(q.data(), DType::BF16, {256, 24, T, B});
-        output_gate                 = Tensor(gate.data(), DType::BF16, {256, 24, T, B});
-        output                      = Tensor(out.data(), DType::BF16, {256, 24, T, B});
-        Tensor bt(table.data(), DType::I32, {table_width, B + 1});
+        query                       = Tensor(q.span(), DType::BF16, {256, 24, T, B});
+        output_gate                 = Tensor(gate.span(), DType::BF16, {256, 24, T, B});
+        output                      = Tensor(out.span(), DType::BF16, {256, 24, T, B});
+        Tensor bt(table.span(), DType::I32, {table_width, B + 1});
         bt.nb[1] = table_stride * 4;
         cache    = {keys.view, values.view, {}, {}, bt, 256, 2, KvCacheStorage::BFloat16};
         if (storage != KvCacheStorage::BFloat16) {
@@ -92,10 +92,10 @@ struct Fixture {
             cache.v_scale_pages = encoded_value->scales.view;
             cache.storage       = storage;
         }
-        batch    = {Tensor(pos.data(), DType::I32, {T, B}), Tensor(lengths.data(), DType::I32, {B}),
-                    Tensor(rows.data(), DType::I32, {B})};
-        selected = {Tensor(selections.data(), DType::I32, {512, T, B}),
-                    Tensor(sizes.data(), DType::I32, {T, B})};
+        batch    = {Tensor(pos.span(), DType::I32, {T, B}), Tensor(lengths.span(), DType::I32, {B}),
+                    Tensor(rows.span(), DType::I32, {B})};
+        selected = {Tensor(selections.span(), DType::I32, {512, T, B}),
+                    Tensor(sizes.span(), DType::I32, {T, B})};
     }
 
     void reset(int phase = 0, int cap = 512, float magnitude = 1.0F) {
@@ -188,7 +188,7 @@ struct Fixture {
         CUDA_CHECK(cudaStreamSynchronize(nullptr));
     }
 
-    void launch(WorkspaceArena& arena, DeviceExecutionView execution) {
+    void launch(MemoryArena& arena, CudaExecutionView execution) {
         ops::qsa_sparse_gqa(query, output_gate, cache, batch, selected, envelope, arena, output,
                             execution);
     }

@@ -8,10 +8,8 @@
 namespace ninfer::ops {
 namespace {
 
-constexpr detail::qsa::ViewValidation v{"qsa_prepare"};
-
 bool identical(const Tensor& a, const Tensor& b) {
-    if (a.data != b.data || a.dtype != b.dtype) return false;
+    if (a.data != b.data || a.device != b.device || a.dtype != b.dtype) return false;
     for (int d = 0; d < 4; ++d)
         if (a.ne[d] != b.ne[d] || a.nb[d] != b.nb[d]) return false;
     return true;
@@ -22,10 +20,10 @@ bool identical(const Tensor& a, const Tensor& b) {
 void qsa_prepare(const QsaProjectionView& p, const QsaPrepareParameters& parameters,
                  const QsaBatchView& batch, const Tensor& rope_positions,
                  const QsaTailStateView& before, QsaCacheView cache, QsaRawRecordWriteView records,
-                 Tensor& query, Tensor& index_query, DeviceExecutionView execution) {
+                 Tensor& query, Tensor& index_query, CudaExecutionView execution) {
+    const detail::qsa::ViewValidation v{"qsa_prepare", execution.device()};
     const int tokens = p.query.ne[2], rows = p.query.ne[3], axes = rope_positions.ne[1];
     v.require(tokens > 0 && rows >= 1 && rows <= 8 && (axes == 1 || axes == 3), "T/B/A");
-    v.require(execution.multiprocessor_count > 0, "SM count");
     v.require(parameters.rms_epsilon > 0 && std::isfinite(parameters.rms_epsilon) &&
                   parameters.rope_theta > 0 && std::isfinite(parameters.rope_theta),
               "epsilon/theta");

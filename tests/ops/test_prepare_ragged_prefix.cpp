@@ -25,19 +25,20 @@ int run_case(int rows, int width, int batch, bool padded, int mode, bool replay)
     GuardedDeviceBuffer input(source.size() * 2), dl(batch * 4), ds(batch * 4), de(batch * 4),
         destination(static_cast<std::size_t>(rows) * width * batch * 2),
         positions(width * batch * 4), counts(batch * 4);
-    Tensor x(input.data(), DType::BF16, {rows, width, 8});
+    Tensor x(input.span(), DType::BF16, {rows, width, 8});
     x.nb[1] = column_stride * 2;
     x.nb[2] = lane_stride * 2;
     x.nb[3] = lane_stride * 8 * 2;
-    Tensor l(dl.data(), DType::I32, {batch}), s(ds.data(), DType::I32, {batch}),
-        e(de.data(), DType::I32, {batch}),
-        out(destination.data(), DType::BF16, {rows, width, batch}),
-        pos(positions.data(), DType::I32, {width, batch}), n(counts.data(), DType::I32, {batch});
+    Tensor l(dl.span(), DType::I32, {batch}), s(ds.span(), DType::I32, {batch}),
+        e(de.span(), DType::I32, {batch}),
+        out(destination.span(), DType::BF16, {rows, width, batch}),
+        pos(positions.span(), DType::I32, {width, batch}), n(counts.span(), DType::I32, {batch});
     DeviceContext device;
     DecodeGraphDefinition definition;
     DecodeGraphExecutable graph;
     const auto launch = [&] {
-        ops::prepare_ragged_prefix(x, l, s, mode == 0 ? s : e, out, pos, n, device.stream);
+        ops::prepare_ragged_prefix(x, l, s, mode == 0 ? s : e, out, pos, n,
+                                   device.execution_view());
     };
     std::vector<int> lanes(batch), starts(batch), ends(batch), expected_counts(batch),
         expected_positions(width * batch);
@@ -78,14 +79,14 @@ int run_case(int rows, int width, int batch, bool padded, int mode, bool replay)
         counts.fill(0xa7);
         cuda_synchronize();
         if (replay && phase == 0) {
-            definition.capture(device.stream, launch);
+            definition.capture(device.stream(), launch);
             graph.instantiate(definition);
         }
         if (replay)
-            graph.launch(device.stream);
+            graph.launch(device.stream());
         else
             launch();
-        cuda_synchronize(device.stream);
+        cuda_synchronize(device.stream());
         const std::string label = "prepare_ragged_prefix D=" + std::to_string(rows) +
                                   " Wc=" + std::to_string(width) + " B=" + std::to_string(batch) +
                                   " mode=" + std::to_string(mode) +

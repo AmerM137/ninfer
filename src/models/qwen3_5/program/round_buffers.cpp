@@ -86,7 +86,7 @@ RoundStateLayout begin_round_state_layout(LayoutBuilder& builder, const RoundSta
     return layout;
 }
 
-OrdinaryDecodeState::OrdinaryDecodeState(DeviceSpan backing,
+OrdinaryDecodeState::OrdinaryDecodeState(MemorySpan backing,
                                          const OrdinaryDecodeStateLayout& layout,
                                          std::uint32_t batch_capacity) {
     if (batch_capacity == 0 || batch_capacity > kMaximumConcurrency) {
@@ -99,7 +99,7 @@ OrdinaryDecodeState::OrdinaryDecodeState(DeviceSpan backing,
     egress                    = layout.egress.bind(backing);
     const auto count          = static_cast<std::int32_t>(batch_capacity);
     const auto ingress_tensor = [&](std::size_t offset, DType dtype) {
-        return Tensor(static_cast<unsigned char*>(ingress.data) + offset, dtype, {count});
+        return Tensor(ingress.subspan(offset), dtype, {count});
     };
     tokens          = ingress_tensor(offsetof(OrdinaryDecodeIngress, tokens), DType::I32);
     cache_positions = ingress_tensor(offsetof(OrdinaryDecodeIngress, cache_positions), DType::I32);
@@ -113,9 +113,8 @@ OrdinaryDecodeState::OrdinaryDecodeState(DeviceSpan backing,
     sampling = reinterpret_cast<const ops::SamplingConfig*>(
         static_cast<const unsigned char*>(ingress.data) +
         offsetof(OrdinaryDecodeIngress, sampling));
-    sampled_tokens = Tensor(static_cast<unsigned char*>(egress.data) +
-                                offsetof(OrdinaryDecodeEgress, sampled_tokens),
-                            DType::I32, {count});
+    sampled_tokens =
+        Tensor(egress.subspan(offsetof(OrdinaryDecodeEgress, sampled_tokens)), DType::I32, {count});
     logits         = layout.logits.bind(backing);
     hidden         = layout.hidden.bind(backing);
 }
@@ -225,25 +224,25 @@ void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layou
     layout.complete = true;
 }
 
-MtpPrefillState::MtpPrefillState(DeviceSpan backing, const MtpPrefillStateLayout& layout)
+MtpPrefillState::MtpPrefillState(MemorySpan backing, const MtpPrefillStateLayout& layout)
     : position(layout.position.bind(backing)), ar_hidden(layout.ar_hidden.bind(backing)),
       draft_tokens(layout.draft_tokens.bind(backing)),
       target_input_ids(layout.target_input_ids.bind(backing)),
       target_positions(layout.target_positions.bind(backing)) {}
 
-DFlashPrefillState::DFlashPrefillState(DeviceSpan backing, const DFlashPrefillStateLayout& layout)
+DFlashPrefillState::DFlashPrefillState(MemorySpan backing, const DFlashPrefillStateLayout& layout)
     : ingress(layout.ingress.bind(backing)),
       local_append_count(layout.local_append_count.bind(backing)) {
     static_assert(std::is_standard_layout_v<DFlashPrefillIngress>);
     const auto scalar = [&](std::size_t offset) {
-        return Tensor(static_cast<unsigned char*>(ingress.data) + offset, DType::I32, {1});
+        return Tensor(ingress.subspan(offset), DType::I32, {1});
     };
     append_count           = scalar(offsetof(DFlashPrefillIngress, append_count));
     state_destination_slot = scalar(offsetof(DFlashPrefillIngress, state_destination_slot));
     full_kv_table_row      = scalar(offsetof(DFlashPrefillIngress, full_kv_table_row));
 }
 
-MtpDecodeState::MtpDecodeState(DeviceSpan backing, const MtpDecodeStateLayout& layout,
+MtpDecodeState::MtpDecodeState(MemorySpan backing, const MtpDecodeStateLayout& layout,
                                std::uint32_t batch_capacity, std::uint32_t draft_window) {
     if (batch_capacity == 0 || batch_capacity > kMaximumConcurrency || draft_window == 0 ||
         draft_window > kMtpDecodeMaximumDrafts) {
@@ -259,11 +258,11 @@ MtpDecodeState::MtpDecodeState(DeviceSpan backing, const MtpDecodeStateLayout& l
     egress                    = layout.egress.bind(backing);
     const auto ingress_tensor = [&](std::size_t offset, DType dtype,
                                     std::initializer_list<std::int32_t> shape) {
-        return Tensor(static_cast<unsigned char*>(ingress.data) + offset, dtype, shape);
+        return Tensor(ingress.subspan(offset), dtype, shape);
     };
     const auto egress_tensor = [&](std::size_t offset, DType dtype,
                                    std::initializer_list<std::int32_t> shape) {
-        return Tensor(static_cast<unsigned char*>(egress.data) + offset, dtype, shape);
+        return Tensor(egress.subspan(offset), dtype, shape);
     };
     anchors = ingress_tensor(offsetof(MtpDecodeIngress, anchors), DType::I32, {batch});
     base_frontiers =
@@ -318,7 +317,7 @@ MtpDecodeState::MtpDecodeState(DeviceSpan backing, const MtpDecodeStateLayout& l
     }
 }
 
-DFlashDecodeState::DFlashDecodeState(DeviceSpan backing, const DFlashDecodeStateLayout& layout,
+DFlashDecodeState::DFlashDecodeState(MemorySpan backing, const DFlashDecodeStateLayout& layout,
                                      std::uint32_t batch_capacity, std::uint32_t draft_window) {
     if (batch_capacity == 0 || batch_capacity > kMaximumConcurrency || draft_window == 0 ||
         draft_window > kDFlashDecodeMaximumDrafts) {
@@ -334,11 +333,11 @@ DFlashDecodeState::DFlashDecodeState(DeviceSpan backing, const DFlashDecodeState
     egress                    = layout.egress.bind(backing);
     const auto ingress_tensor = [&](std::size_t offset, DType dtype,
                                     std::initializer_list<std::int32_t> shape) {
-        return Tensor(static_cast<unsigned char*>(ingress.data) + offset, dtype, shape);
+        return Tensor(ingress.subspan(offset), dtype, shape);
     };
     const auto egress_tensor = [&](std::size_t offset, DType dtype,
                                    std::initializer_list<std::int32_t> shape) {
-        return Tensor(static_cast<unsigned char*>(egress.data) + offset, dtype, shape);
+        return Tensor(egress.subspan(offset), dtype, shape);
     };
     anchors = ingress_tensor(offsetof(DFlashDecodeIngress, anchors), DType::I32, {batch});
     execution_frontiers =
@@ -385,7 +384,7 @@ DFlashDecodeState::DFlashDecodeState(DeviceSpan backing, const DFlashDecodeState
     target_continuation_hidden = layout.target_continuation_hidden.bind(backing);
 }
 
-RoundState::RoundState(DeviceSpan backing, const RoundStateLayout& layout) {
+RoundState::RoundState(MemorySpan backing, const RoundStateLayout& layout) {
     if (!layout.complete) { throw std::invalid_argument("RoundState layout is incomplete"); }
     if (layout.ordinary) {
         ordinary.emplace(backing, *layout.ordinary, layout.spec.batch_capacity);

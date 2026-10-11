@@ -32,6 +32,6 @@ void launch(const Tensor& target_tokens, const Tensor& logits, const Tensor& dra
             const Tensor& candidate_ids, const Tensor& proposal_q, const Tensor& current_extents,
             Tensor& round_lengths, Tensor& round_anchors, Tensor& licensed_tokens,
             Tensor& licensed_counts, Tensor& accepted_drafts, std::int32_t token_domain,
-            const SamplingConfig* configs, const Plan& plan, DeviceSpan workspace,
+            const SamplingConfig* configs, const Plan& plan, MemorySpan workspace,
             cudaStream_t stream);
 } // namespace ninfer::ops::sparse_drafts_detail

@@ -1,4 +1,6 @@
 #include "core/weight.h"
+#include "cuda_fixture.h"
+#include "core/buffer.h"
 #include "ninfer/ops/linear.h"
 
 #include "ops/direct_bf16_weight.h"
@@ -191,19 +193,24 @@ int run_new_bf16_geometry(const Geometry& shape) {
     if (text) failures += verify_workspace_envelopes(QType::BF16, shape.n, shape.k);
     if (raw) {
         DeviceWeight weight(make_patterned(shape.n, shape.k, 503U));
-        DeviceBuffer input(static_cast<std::size_t>(shape.k) * 8 * 2);
-        DeviceBuffer output(static_cast<std::size_t>(shape.n) * 8 * 2);
-        DeviceArena scratch(256);
+        DeviceBuffer input(ninfer::test::cuda_environment().context.device(),
+                           static_cast<std::size_t>(shape.k) * 8 * 2);
+        DeviceBuffer output(ninfer::test::cuda_environment().context.device(),
+                            static_cast<std::size_t>(shape.n) * 8 * 2);
+        ninfer::DeviceBuffer scratch_storage(ninfer::test::cuda_environment().context.device(),
+                                             256);
+        MemoryArena scratch(scratch_storage.span());
         for (int t : {1, 3, 5, 7}) {
-            Tensor x(input.p, DType::BF16, {shape.k, t});
-            Tensor y(output.p, DType::BF16, {shape.n, t});
+            Tensor x(input.span(), DType::BF16, {shape.k, t});
+            Tensor y(output.span(), DType::BF16, {shape.n, t});
             for (bool convenience : {false, true}) {
                 try {
                     if (convenience)
-                        ops::linear(x, weight.view(), y, nullptr);
+                        ops::linear(x, weight.view(), y,
+                                    ninfer::test::cuda_environment().default_execution);
                     else
                         ops::linear(x, weight.view(), y, ops::LinearPolicy::A16Only, scratch,
-                                    nullptr);
+                                    ninfer::test::cuda_environment().default_execution);
                     std::cerr << "BF16: accepted an invalid raw-patch extent\n";
                     ++failures;
                 } catch (const std::invalid_argument&) {}

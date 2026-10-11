@@ -14,6 +14,7 @@ namespace ninfer::ops::detail::qsa {
 
 struct ViewValidation {
     const char* op;
+    Device device;
 
     void require(bool condition, const char* label) const {
         if (!condition) throw std::invalid_argument(std::string(op) + ": invalid " + label);
@@ -21,6 +22,7 @@ struct ViewValidation {
 
     void dense(const Tensor& t, DType dtype, std::array<int, 4> shape, int alignment,
                const char* label) const {
+        require(device.type() == DeviceType::CUDA && t.device == device, "operand device");
         require(t.dtype == dtype && t.is_contiguous() &&
                     common::operand::aligned(t.data, alignment),
                 label);
@@ -29,6 +31,7 @@ struct ViewValidation {
 
     // Page-major planes have contiguous features and ordered, non-overlapping outer axes.
     void plane(const Tensor& t, DType dtype, std::array<int, 4> shape, const char* label) const {
+        require(device.type() == DeviceType::CUDA && t.device == device, "operand device");
         const std::int64_t element = dtype_size(dtype);
         require(t.dtype == dtype && t.nb[0] == element && common::operand::aligned(t.data, element),
                 label);
@@ -70,6 +73,7 @@ struct ViewValidation {
     }
 
     void metadata(const Tensor& t, int batch, const char* label) const {
+        require(device.type() == DeviceType::CUDA && t.device == device, "operand device");
         require(t.dtype == DType::I32 && t.ne[0] == batch && t.ne[1] == 1 && t.ne[2] == 1 &&
                     t.ne[3] == 1 && t.is_contiguous() && common::operand::aligned(t.data, 4),
                 label);
@@ -79,6 +83,7 @@ struct ViewValidation {
     // axis is at most eight for QSA state/records, keeping the overlap check bounded.
     void columns(const Tensor& t, DType dtype, int features, int count, int outer,
                  const char* label) const {
+        require(device.type() == DeviceType::CUDA && t.device == device, "operand device");
         const std::uint64_t element = dtype_size(dtype), width = features * element;
         require(count > 0 && outer > 0 && t.dtype == dtype && t.ne[0] == features &&
                     t.ne[1] == count && t.ne[2] == outer && t.ne[3] == 1 &&

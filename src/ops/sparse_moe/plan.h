@@ -72,7 +72,7 @@ void launch_small(const Tensor& x, const SparseMoeWeights& weights, Tensor& dest
 
 void launch_prefill(const Tensor& x, const SparseMoeWeights& weights, Tensor& destination,
                     const PrefillPlan& plan, const PrefillWorkspace& workspace,
-                    DeviceExecutionView execution);
+                    CudaExecutionView execution);
 
 void launch_decode_gate_up(const Tensor& x, const SparseMoeWeights& weights,
                            const DecodeWorkspace& workspace, cudaStream_t stream);

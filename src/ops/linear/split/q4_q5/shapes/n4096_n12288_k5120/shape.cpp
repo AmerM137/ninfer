@@ -2,7 +2,7 @@
 
 namespace ninfer::ops::detail::linear_split::q4_q5_n4096_n12288_k5120 {
 namespace {
-void launch(const Tensor& x, Weights weights, std::span<const Tensor> outputs, WorkspaceArena*,
+void launch(const Tensor& x, Weights weights, std::span<const Tensor> outputs, MemoryArena*,
             cudaStream_t stream) {
     if (x.ne[1] <= 12)
         launch_small(x, weights.first, *weights.second, outputs, stream);

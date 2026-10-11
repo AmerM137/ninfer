@@ -137,7 +137,8 @@ std::int64_t numel_allow_zero(const Tensor& t) {
 
 } // namespace
 
-void residual_add(const Tensor& y, Tensor& x, cudaStream_t stream) {
+void residual_add(const Tensor& y, Tensor& x, CudaExecutionView execution) {
+    const auto stream = execution.stream();
     if (y.dtype != DType::BF16 || x.dtype != DType::BF16) {
         throw std::invalid_argument("residual_add: y/x must be BF16");
     }
@@ -147,6 +148,9 @@ void residual_add(const Tensor& y, Tensor& x, cudaStream_t stream) {
         }
     }
     if (numel_allow_zero(x) == 0) { return; }
+    if (y.device != execution.device() || x.device != execution.device()) {
+        throw std::invalid_argument("residual_add: operands must belong to the execution device");
+    }
     if (!y.is_contiguous() || !x.is_contiguous()) {
         throw std::invalid_argument("residual_add: y/x must be contiguous");
     }

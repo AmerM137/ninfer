@@ -7,7 +7,7 @@ int main(int argc, char** argv) {
     try {
         const auto options = gdn_input::parse_options(argc, argv);
         measurement::hardware();
-        DeviceContext device;
+        auto& device = ninfer::bench::device_context();
         gdn_input::Weights weights(options);
         L2FlushBuffer flush(options.timing.flush_bytes);
         measurement::Csv csv(options.timing.csv_out);
@@ -18,8 +18,9 @@ int main(int argc, char** argv) {
                 for (const auto& cache :
                      measurement::selections(options.timing.cache, "cold", "warm")) {
                     const auto result = measurement::measure(
-                        [&](auto s) { fixture.launch(s); }, [&](auto s) { fixture.restore(s); },
-                        flush, device.stream, options.timing, execution, cache);
+                        [&](CudaExecutionView cuda) { fixture.launch(cuda); },
+                        [&](CudaExecutionView cuda) { fixture.restore(cuda); }, flush,
+                        device.execution_view(), options.timing, execution, cache);
                     measurement::Row row;
                     row.op            = options.op;
                     row.format        = options.format;

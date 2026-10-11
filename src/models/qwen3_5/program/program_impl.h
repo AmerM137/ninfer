@@ -2,6 +2,7 @@
 #include "models/qwen3_5/program/internal.h"
 
 #include "core/arena.h"
+#include "core/buffer.h"
 #include "core/gdn_replay_records.h"
 #include "core/host_kv_arena.h"
 #include "ninfer/ops/gdn_replay.h"
@@ -149,7 +150,7 @@ struct DFlashDraftHandoff {
     DFlashDraftHandoff(const DeviceContext& device, std::size_t count)
         : ids(count * sizeof(TokenId)), ready(device) {}
 
-    [[nodiscard]] std::span<TokenId> tokens() const noexcept {
+    [[nodiscard]] std::span<TokenId> tokens() noexcept {
         return {static_cast<TokenId*>(ids.data()), ids.size() / sizeof(TokenId)};
     }
 };
@@ -352,9 +353,9 @@ public:
     const std::size_t graph_allowance_bytes;
     const WorkspacePlan workspace_plan;
 
-    DeviceArena persistent;
-    DeviceArena workspace_storage;
-    WorkspaceArena work;
+    DeviceBuffer persistent;
+    DeviceBuffer workspace_storage;
+    MemoryArena work;
     std::unique_ptr<qwen3_5::DecoderState> decoder;
     std::unique_ptr<HostContextArena> host_context_arena;
     std::unique_ptr<HostKVArena> host_kv_arena;

@@ -16,13 +16,14 @@ inline Tensor as_dense(const Weight& weight) {
     auto* data       = const_cast<void*>(weight.qdata);
     switch (weight.ndim) {
     case 1:
-        return Tensor(data, dtype, {weight.shape[0]});
+        return Tensor(data, weight.device, dtype, {weight.shape[0]});
     case 2:
-        return Tensor(data, dtype, {weight.shape[0], weight.shape[1]});
+        return Tensor(data, weight.device, dtype, {weight.shape[0], weight.shape[1]});
     case 3:
-        return Tensor(data, dtype, {weight.shape[0], weight.shape[1], weight.shape[2]});
+        return Tensor(data, weight.device, dtype,
+                      {weight.shape[0], weight.shape[1], weight.shape[2]});
     default:
-        return Tensor(data, dtype,
+        return Tensor(data, weight.device, dtype,
                       {weight.shape[0], weight.shape[1], weight.shape[2], weight.shape[3]});
     }
 }
@@ -58,6 +59,7 @@ struct WeightGeometry {
 
 struct WeightParent {
     WeightGeometry geometry;
+    Device device;
     const std::byte* data      = nullptr;
     float weight_scale_divisor = 0.0F;
 };
@@ -84,6 +86,7 @@ struct WeightView {
                                                     std::uint64_t row);
 
 struct WeightRowPlanes {
+    Device device;
     const std::byte* codes        = nullptr;
     const std::byte* high         = nullptr;
     const std::byte* scales       = nullptr;

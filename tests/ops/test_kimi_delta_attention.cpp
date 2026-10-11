@@ -1,4 +1,6 @@
 #include "ninfer/ops/kimi_delta_attention.h"
+#include "cuda_fixture.h"
+#include "core/buffer.h"
 
 #include "ops/kda_ref.h"
 #include "ops/op_tester.h"
@@ -177,22 +179,22 @@ struct DeviceInputs {
 };
 
 struct Views {
-    Views(const Case& test_case, DeviceInputs& device, void* state_in_data, void* state_out_data,
-          void* out_data)
-        : q(device.q.p, DType::BF16, {kStateDim, test_case.qheads(), test_case.tokens}),
-          k(device.k.p, DType::BF16, {kStateDim, test_case.qheads(), test_case.tokens}),
-          v(device.v.p, DType::BF16, {kStateDim, test_case.heads, test_case.tokens}),
-          g(device.g.p, DType::BF16, {kStateDim, test_case.heads, test_case.tokens}),
-          beta(device.beta.p, DType::BF16, {test_case.heads, test_case.tokens}),
-          a_log(device.a_log.p, DType::FP32, {test_case.heads}),
-          dt_bias(device.dt_bias.p, DType::FP32, {kStateDim, test_case.heads}),
+    Views(const Case& test_case, DeviceInputs& device, MemorySpan state_in_data,
+          MemorySpan state_out_data, MemorySpan out_data)
+        : q(device.q.span(), DType::BF16, {kStateDim, test_case.qheads(), test_case.tokens}),
+          k(device.k.span(), DType::BF16, {kStateDim, test_case.qheads(), test_case.tokens}),
+          v(device.v.span(), DType::BF16, {kStateDim, test_case.heads, test_case.tokens}),
+          g(device.g.span(), DType::BF16, {kStateDim, test_case.heads, test_case.tokens}),
+          beta(device.beta.span(), DType::BF16, {test_case.heads, test_case.tokens}),
+          a_log(device.a_log.span(), DType::FP32, {test_case.heads}),
+          dt_bias(device.dt_bias.span(), DType::FP32, {kStateDim, test_case.heads}),
           state_in(state_in_data, DType::FP32, {kStateDim, kStateDim, test_case.heads}),
           state_out(state_out_data, DType::FP32, {kStateDim, kStateDim, test_case.heads}),
           out(out_data, DType::BF16, {kStateDim, test_case.heads, test_case.tokens}),
           scratch(std::max<std::size_t>(
               256, ops::kimi_delta_attention_workspace_capacity_bytes(
                        test_case.qheads(), test_case.heads, test_case.tokens, test_case.tokens))),
-          workspace(DeviceSpan{scratch.data(), scratch.bytes()}) {
+          workspace(scratch.span()) {
         scratch.fill(0xff);
     }
 
@@ -207,16 +209,8 @@ struct Views {
     Tensor state_out;
     Tensor out;
     GuardedDeviceBuffer scratch;
-    WorkspaceArena workspace;
+    MemoryArena workspace;
 };
-
-DeviceExecutionView execution(cudaStream_t stream = nullptr) {
-    int device = 0;
-    CUDA_CHECK(cudaGetDevice(&device));
-    cudaDeviceProp properties{};
-    CUDA_CHECK(cudaGetDeviceProperties(&properties, device));
-    return {stream, properties.multiProcessorCount};
-}
 
 int verify_inputs_unchanged(const std::string& label, const kda_ref::Inputs& in,
                             const DeviceInputs& device) {
@@ -262,11 +256,11 @@ int inplace_case(const Case& test_case, std::uint32_t seed) {
     GuardedDeviceBuffer out(in.v.size() * sizeof(std::uint16_t));
     state.copy_from_host(in.state.data(), state.bytes());
     out.fill(0xff);
-    Views views(test_case, device, state.data(), state.data(), out.data());
+    Views views(test_case, device, state.span(), state.span(), out.span());
 
     ops::kimi_delta_attention(views.q, views.k, views.v, views.g, views.beta, views.a_log,
                               views.dt_bias, test_case.lower_bound, kScale, views.workspace,
-                              views.state_out, views.out, execution());
+                              views.state_out, views.out, cuda_environment().default_execution);
     cuda_synchronize();
 
     const std::string label = case_label(test_case) + " inplace";
@@ -292,19 +286,19 @@ int continue_decode(const Case& prefix, const kda_ref::Inputs& prefix_input,
     out.fill(0xff);
     Case single   = c;
     single.tokens = 1;
-    Views views(single, device, state.data(), state.data(), out.data());
+    Views views(single, device, state.span(), state.span(), out.span());
     auto step   = in;
     step.tokens = 1;
     kda_ref::Result expected;
     expected.out.reserve(in.v.size());
-    const auto ex = execution();
+    const auto ex = cuda_environment().default_execution;
     for (int token = 0; token < c.tokens; ++token) {
         const auto slice = [token](const std::vector<float>& source, int width,
-                                   std::vector<float>& destination, const DeviceBuffer& buffer,
+                                   std::vector<float>& destination, DeviceBuffer& buffer,
                                    Tensor& tensor) {
             const auto offset = static_cast<std::size_t>(token) * width;
             destination.assign(source.begin() + offset, source.begin() + offset + width);
-            tensor.data = static_cast<std::uint16_t*>(buffer.p) + offset;
+            tensor.data = static_cast<std::uint16_t*>(buffer.data()) + offset;
         };
         slice(in.q, kStateDim * c.qheads(), step.q, device.q, views.q);
         slice(in.k, kStateDim * c.qheads(), step.k, device.k, views.k);
@@ -341,12 +335,12 @@ int distinct_case(const Case& test_case, std::uint32_t seed, bool decode = false
     state_in.copy_from_host(in.state.data(), state_in.bytes());
     state_out.fill(0xff);
     out.fill(0xff);
-    Views views(test_case, device, state_in.data(), state_out.data(), out.data());
+    Views views(test_case, device, state_in.span(), state_out.span(), out.span());
 
     ops::kimi_delta_attention(views.q, views.k, views.v, views.g, views.beta, views.a_log,
                               views.dt_bias, test_case.lower_bound, kScale, views.workspace,
                               static_cast<const Tensor&>(views.state_in), views.state_out,
-                              views.out, execution());
+                              views.out, cuda_environment().default_execution);
     cuda_synchronize();
 
     const std::string label = case_label(test_case) + " distinct";
@@ -369,12 +363,12 @@ int distinct_exact_alias_case(const Case& test_case, std::uint32_t seed) {
     GuardedDeviceBuffer out(in.v.size() * sizeof(std::uint16_t));
     state.copy_from_host(in.state.data(), state.bytes());
     out.fill(0xff);
-    Views views(test_case, device, state.data(), state.data(), out.data());
+    Views views(test_case, device, state.span(), state.span(), out.span());
 
     ops::kimi_delta_attention(views.q, views.k, views.v, views.g, views.beta, views.a_log,
                               views.dt_bias, test_case.lower_bound, kScale, views.workspace,
                               static_cast<const Tensor&>(views.state_in), views.state_out,
-                              views.out, execution());
+                              views.out, cuda_environment().default_execution);
     cuda_synchronize();
 
     const std::string label = case_label(test_case) + " distinct exact-alias";
@@ -446,20 +440,21 @@ int batch_update_case(const Case& test_case, const std::vector<int>& state_slots
     states.copy_from_host(initial_states.data(), states.bytes());
     out.fill(0xff);
 
-    Tensor q(device.q.p, DType::BF16, {kStateDim, test_case.qheads(), 1, batch});
-    Tensor k(device.k.p, DType::BF16, {kStateDim, test_case.qheads(), 1, batch});
-    Tensor v(device.v.p, DType::BF16, {kStateDim, test_case.heads, 1, batch});
-    Tensor g(device.g.p, DType::BF16, {kStateDim, test_case.heads, 1, batch});
-    Tensor beta(device.beta.p, DType::BF16, {test_case.heads, 1, batch});
-    Tensor a_log(device.a_log.p, DType::FP32, {test_case.heads});
-    Tensor dt_bias(device.dt_bias.p, DType::FP32, {kStateDim, test_case.heads});
-    Tensor states_tensor(states.data(), DType::FP32,
+    Tensor q(device.q.span(), DType::BF16, {kStateDim, test_case.qheads(), 1, batch});
+    Tensor k(device.k.span(), DType::BF16, {kStateDim, test_case.qheads(), 1, batch});
+    Tensor v(device.v.span(), DType::BF16, {kStateDim, test_case.heads, 1, batch});
+    Tensor g(device.g.span(), DType::BF16, {kStateDim, test_case.heads, 1, batch});
+    Tensor beta(device.beta.span(), DType::BF16, {test_case.heads, 1, batch});
+    Tensor a_log(device.a_log.span(), DType::FP32, {test_case.heads});
+    Tensor dt_bias(device.dt_bias.span(), DType::FP32, {kStateDim, test_case.heads});
+    Tensor states_tensor(states.span(), DType::FP32,
                          {kStateDim, kStateDim, test_case.heads, slots});
-    Tensor state_slots_tensor(device_state_slots.p, DType::I32, {batch});
-    Tensor out_tensor(out.data(), DType::BF16, {kStateDim, test_case.heads, 1, batch});
+    Tensor state_slots_tensor(device_state_slots.span(), DType::I32, {batch});
+    Tensor out_tensor(out.span(), DType::BF16, {kStateDim, test_case.heads, 1, batch});
 
     ops::kimi_delta_attention_batch_update(q, k, v, g, beta, a_log, dt_bias, kLowerBound, kScale,
-                                           states_tensor, state_slots_tensor, out_tensor, nullptr);
+                                           states_tensor, state_slots_tensor, out_tensor,
+                                           ninfer::test::cuda_environment().default_execution);
     cuda_synchronize();
 
     const std::string label =
@@ -505,16 +500,16 @@ int graph_replay_case() {
     GuardedDeviceBuffer state_out(input.state.size() * sizeof(float));
     GuardedDeviceBuffer out(input.v.size() * sizeof(std::uint16_t));
     state_in.copy_from_host(input.state.data(), state_in.bytes());
-    Views views(c, device, state_in.data(), state_out.data(), out.data());
+    Views views(c, device, state_in.span(), state_out.span(), out.span());
     cudaStream_t stream = nullptr;
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    const auto stream_execution = ninfer::test::cuda_environment().context.execution_view(stream);
     CUDA_CHECK(
         cudaStreamSynchronize(nullptr)); // Drain fixture initialization on the default stream.
-    const auto ex = execution(stream);
-    auto launch   = [&] {
+    auto launch = [&] {
         ops::kimi_delta_attention(views.q, views.k, views.v, views.g, views.beta, views.a_log,
-                                    views.dt_bias, c.lower_bound, kScale, views.workspace,
-                                    views.state_in, views.state_out, views.out, ex);
+                                  views.dt_bias, c.lower_bound, kScale, views.workspace,
+                                  views.state_in, views.state_out, views.out, stream_execution);
     };
     launch();
     CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -529,15 +524,15 @@ int graph_replay_case() {
         input                  = make_inputs(c, 56789U + replay);
         const auto upload_bf16 = [](DeviceBuffer& dst, const std::vector<float>& values) {
             const auto bits = bf16_bits(values);
-            dst.copy_from_host(bits.data(), dst.bytes);
+            dst.copy_from_host(bits.data(), dst.size());
         };
         upload_bf16(device.q, input.q);
         upload_bf16(device.k, input.k);
         upload_bf16(device.v, input.v);
         upload_bf16(device.g, input.g);
         upload_bf16(device.beta, input.beta);
-        device.a_log.copy_from_host(input.a_log.data(), device.a_log.bytes);
-        device.dt_bias.copy_from_host(input.dt_bias.data(), device.dt_bias.bytes);
+        device.a_log.copy_from_host(input.a_log.data(), device.a_log.size());
+        device.dt_bias.copy_from_host(input.dt_bias.data(), device.dt_bias.size());
         state_in.copy_from_host(input.state.data(), state_in.bytes());
         CUDA_CHECK(cudaStreamSynchronize(nullptr));
         CUDA_CHECK(cudaMemsetAsync(out.data(), 0xff, out.bytes(), stream));
@@ -564,30 +559,37 @@ int graph_replay_case() {
 int batch_contract_rejection_cases() {
     constexpr int heads          = 2;
     constexpr int batch_capacity = 9;
-    DeviceBuffer vectors(static_cast<std::size_t>(kStateDim) * heads * batch_capacity *
-                         sizeof(std::uint16_t));
-    DeviceBuffer beta_buffer(static_cast<std::size_t>(heads) * batch_capacity *
+    DeviceBuffer vectors(ninfer::test::cuda_environment().context.device(),
+                         static_cast<std::size_t>(kStateDim) * heads * batch_capacity *
                              sizeof(std::uint16_t));
-    DeviceBuffer a_log_buffer(static_cast<std::size_t>(heads) * sizeof(float));
-    DeviceBuffer dt_buffer(static_cast<std::size_t>(kStateDim) * heads * sizeof(float));
-    DeviceBuffer state_buffer(static_cast<std::size_t>(kStateDim) * kStateDim * heads * 2 *
-                              sizeof(float));
-    DeviceBuffer slot_buffer(static_cast<std::size_t>(batch_capacity) * sizeof(std::int32_t));
+    DeviceBuffer beta_buffer(ninfer::test::cuda_environment().context.device(),
+                             static_cast<std::size_t>(heads) * batch_capacity *
+                                 sizeof(std::uint16_t));
+    DeviceBuffer a_log_buffer(ninfer::test::cuda_environment().context.device(),
+                              static_cast<std::size_t>(heads) * sizeof(float));
+    DeviceBuffer dt_buffer(ninfer::test::cuda_environment().context.device(),
+                           static_cast<std::size_t>(kStateDim) * heads * sizeof(float));
+    DeviceBuffer state_buffer(ninfer::test::cuda_environment().context.device(),
+                              static_cast<std::size_t>(kStateDim) * kStateDim * heads * 2 *
+                                  sizeof(float));
+    DeviceBuffer slot_buffer(ninfer::test::cuda_environment().context.device(),
+                             static_cast<std::size_t>(batch_capacity) * sizeof(std::int32_t));
 
     const auto rejects = [&](int tokens, int batch, DType slot_dtype) {
-        Tensor q(vectors.p, DType::BF16, {kStateDim, heads, tokens, batch});
-        Tensor k(vectors.p, DType::BF16, {kStateDim, heads, tokens, batch});
-        Tensor v(vectors.p, DType::BF16, {kStateDim, heads, tokens, batch});
-        Tensor g(vectors.p, DType::BF16, {kStateDim, heads, tokens, batch});
-        Tensor beta(beta_buffer.p, DType::BF16, {heads, tokens, batch});
-        Tensor a_log(a_log_buffer.p, DType::FP32, {heads});
-        Tensor dt_bias(dt_buffer.p, DType::FP32, {kStateDim, heads});
-        Tensor states(state_buffer.p, DType::FP32, {kStateDim, kStateDim, heads, 2});
-        Tensor state_slots(slot_buffer.p, slot_dtype, {batch});
-        Tensor out(vectors.p, DType::BF16, {kStateDim, heads, tokens, batch});
+        Tensor q(vectors.span(), DType::BF16, {kStateDim, heads, tokens, batch});
+        Tensor k(vectors.span(), DType::BF16, {kStateDim, heads, tokens, batch});
+        Tensor v(vectors.span(), DType::BF16, {kStateDim, heads, tokens, batch});
+        Tensor g(vectors.span(), DType::BF16, {kStateDim, heads, tokens, batch});
+        Tensor beta(beta_buffer.span(), DType::BF16, {heads, tokens, batch});
+        Tensor a_log(a_log_buffer.span(), DType::FP32, {heads});
+        Tensor dt_bias(dt_buffer.span(), DType::FP32, {kStateDim, heads});
+        Tensor states(state_buffer.span(), DType::FP32, {kStateDim, kStateDim, heads, 2});
+        Tensor state_slots(slot_buffer.span(), slot_dtype, {batch});
+        Tensor out(vectors.span(), DType::BF16, {kStateDim, heads, tokens, batch});
         try {
-            ops::kimi_delta_attention_batch_update(q, k, v, g, beta, a_log, dt_bias, kLowerBound,
-                                                   kScale, states, state_slots, out, nullptr);
+            ops::kimi_delta_attention_batch_update(
+                q, k, v, g, beta, a_log, dt_bias, kLowerBound, kScale, states, state_slots, out,
+                ninfer::test::cuda_environment().default_execution);
         } catch (const std::invalid_argument&) { return true; }
         cuda_synchronize();
         return false;
@@ -611,35 +613,43 @@ int batch_contract_rejection_cases() {
 
 int contract_rejection_cases() {
     constexpr int heads = 2;
-    DeviceBuffer vectors(static_cast<std::size_t>(kStateDim) * heads * sizeof(std::uint16_t));
-    DeviceBuffer beta_buffer(static_cast<std::size_t>(heads) * sizeof(std::uint16_t));
-    DeviceBuffer a_log_buffer(static_cast<std::size_t>(heads) * sizeof(float));
-    DeviceBuffer dt_buffer(static_cast<std::size_t>(kStateDim) * heads * sizeof(float));
-    DeviceBuffer state_buffer(static_cast<std::size_t>(kStateDim) * kStateDim * heads *
-                              sizeof(float));
+    DeviceBuffer vectors(ninfer::test::cuda_environment().context.device(),
+                         static_cast<std::size_t>(kStateDim) * heads * sizeof(std::uint16_t));
+    DeviceBuffer beta_buffer(ninfer::test::cuda_environment().context.device(),
+                             static_cast<std::size_t>(heads) * sizeof(std::uint16_t));
+    DeviceBuffer a_log_buffer(ninfer::test::cuda_environment().context.device(),
+                              static_cast<std::size_t>(heads) * sizeof(float));
+    DeviceBuffer dt_buffer(ninfer::test::cuda_environment().context.device(),
+                           static_cast<std::size_t>(kStateDim) * heads * sizeof(float));
+    DeviceBuffer state_buffer(ninfer::test::cuda_environment().context.device(),
+                              static_cast<std::size_t>(kStateDim) * kStateDim * heads *
+                                  sizeof(float));
 
-    Tensor q(vectors.p, DType::BF16, {kStateDim, heads, 1});
-    Tensor k(vectors.p, DType::BF16, {kStateDim, heads, 1});
-    Tensor v(vectors.p, DType::BF16, {kStateDim, heads, 1});
-    Tensor g(vectors.p, DType::BF16, {kStateDim, heads, 1});
-    Tensor beta(beta_buffer.p, DType::BF16, {heads, 1});
-    Tensor a_log(a_log_buffer.p, DType::FP32, {heads});
-    Tensor dt_bias(dt_buffer.p, DType::FP32, {kStateDim, heads});
-    Tensor state(state_buffer.p, DType::FP32, {kStateDim, kStateDim, heads});
-    Tensor out(vectors.p, DType::BF16, {kStateDim, heads, 1});
+    Tensor q(vectors.span(), DType::BF16, {kStateDim, heads, 1});
+    Tensor k(vectors.span(), DType::BF16, {kStateDim, heads, 1});
+    Tensor v(vectors.span(), DType::BF16, {kStateDim, heads, 1});
+    Tensor g(vectors.span(), DType::BF16, {kStateDim, heads, 1});
+    Tensor beta(beta_buffer.span(), DType::BF16, {heads, 1});
+    Tensor a_log(a_log_buffer.span(), DType::FP32, {heads});
+    Tensor dt_bias(dt_buffer.span(), DType::FP32, {kStateDim, heads});
+    Tensor state(state_buffer.span(), DType::FP32, {kStateDim, kStateDim, heads});
+    Tensor out(vectors.span(), DType::BF16, {kStateDim, heads, 1});
 
-    WorkspaceArena workspace(256);
+    ninfer::DeviceBuffer workspace_storage(ninfer::test::cuda_environment().context.device(), 256);
+
+    MemoryArena workspace(workspace_storage.span());
     const auto rejects = [&](const Tensor& test_g, float lower_bound, float scale) {
         try {
             ops::kimi_delta_attention(q, k, v, test_g, beta, a_log, dt_bias, lower_bound, scale,
-                                      workspace, state, out, execution());
+                                      workspace, state, out, cuda_environment().default_execution);
         } catch (const std::invalid_argument&) { return true; }
         cuda_synchronize();
         return false;
     };
 
-    int failures = 0;
-    Tensor wrong_g(vectors.p, DType::FP32, {kStateDim, heads, 1});
+    int failures  = 0;
+    auto wrong_g  = g;
+    wrong_g.dtype = DType::FP32;
     if (!rejects(wrong_g, kLowerBound, kScale)) {
         std::cerr << "kimi_delta_attention accepted FP32 raw gate\n";
         ++failures;

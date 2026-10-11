@@ -4,6 +4,7 @@
 // Narrow one-case profiling example:
 //   ./ninfer_l2norm_bench --tokens 1024
 #include "ninfer/ops/l2norm.h"
+#include "core/buffer.h"
 #include "op_measurement.cuh"
 
 #include <cuda_bf16.h>
@@ -23,12 +24,12 @@ void run(int d, int heads, int tokens) {
     DeviceBuffer x   = make_bf16(n, 101U);
     DeviceBuffer out = make_zeros(n * 2);
 
-    Tensor tx(x.p, DType::BF16, {d, heads, tokens});
-    Tensor tout(out.p, DType::BF16, {d, heads, tokens});
+    Tensor tx(x.span(), DType::BF16, {d, heads, tokens});
+    Tensor tout(out.span(), DType::BF16, {d, heads, tokens});
 
     const double bytes = 2.0 * static_cast<double>(n) * 2.0;
     const Result result =
-        bench_loop([&](cudaStream_t stream) { ops::l2norm(tx, 1.0e-6f, tout, stream); }, bytes);
+        bench_loop([&](CudaExecutionView cuda) { ops::l2norm(tx, 1.0e-6f, tout, cuda); }, bytes);
 
     char tag[80];
     std::snprintf(tag, sizeof(tag), "l2norm T=%-4d [D=%d,heads=%d]", tokens, d, heads);

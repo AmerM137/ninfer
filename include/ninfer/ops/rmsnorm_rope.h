@@ -1,8 +1,8 @@
 #pragma once
 
+#include "core/device.h"
 #include "core/tensor.h"
 
-#include <cuda_runtime.h>
 
 namespace ninfer::ops {
 
@@ -26,7 +26,7 @@ namespace ninfer::ops {
  * The Op owns no workspace or persistent state.
  */
 void rmsnorm_rope(const Tensor& positions, const Tensor& q_norm_weight, const Tensor& k_norm_weight,
-                  Tensor& q, Tensor& k, cudaStream_t stream);
+                  Tensor& q, Tensor& k, CudaExecutionView execution);
 
 /**
  * Single-K form of the same formula and effects. x is BF16 [128,8,T], norm_weight is BF16 [128],
@@ -34,6 +34,6 @@ void rmsnorm_rope(const Tensor& positions, const Tensor& q_norm_weight, const Te
  * overlap either read-only input.
  */
 void rmsnorm_rope(const Tensor& positions, const Tensor& norm_weight, Tensor& x,
-                  cudaStream_t stream);
+                  CudaExecutionView execution);
 
 } // namespace ninfer::ops

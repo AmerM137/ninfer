@@ -1,4 +1,5 @@
 #include "core/weight.h"
+#include "core/buffer.h"
 #include "ninfer/ops/linear_add.h"
 
 #include "core/device.h"
@@ -131,21 +132,24 @@ int main(int argc, char** argv) {
             *std::min_element(options.t_sweep.begin(), options.t_sweep.end());
         cudaStream_t stream = nullptr;
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+        const auto cuda = ninfer::bench::device_context().execution_view(stream);
         bench::L2FlushBuffer flush(kFlushBytes);
         DeviceBuffer input    = bench::make_bf16(static_cast<std::size_t>(options.k) * max_t, 101U);
         DeviceBuffer residual = bench::make_bf16(static_cast<std::size_t>(options.n) * max_t, 103U);
         bench::SavedBuffer residual_initial(residual);
-        const auto restore                   = [&](cudaStream_t s) { residual_initial.restore(s); };
+        const auto restore = [&](CudaExecutionView cuda) { residual_initial.restore(cuda); };
         bench::PackedQuantizedWeight packed  = bench::make_nvfp4_weight(options.n, options.k);
         const std::size_t workspace_capacity = ops::linear_add_workspace_capacity_bytes(
             QType::NVFP4, options.n, options.k, options.policy, min_t, max_t);
-        WorkspaceArena workspace(std::max<std::size_t>(workspace_capacity, 256));
+        ninfer::DeviceBuffer workspace_storage(ninfer::bench::device_context().device(),
+                                               std::max<std::size_t>(workspace_capacity, 256));
+        MemoryArena workspace(workspace_storage.span());
 
         const auto make_launch = [&](std::int32_t tokens) {
-            return [&, tokens](cudaStream_t launch_stream) {
-                Tensor x(input.p, DType::BF16, {options.k, tokens});
-                Tensor out(residual.p, DType::BF16, {options.n, tokens});
-                ops::linear_add(x, packed.weight, out, options.policy, workspace, launch_stream);
+            return [&, tokens](CudaExecutionView cuda) {
+                Tensor x(input.span(), DType::BF16, {options.k, tokens});
+                Tensor out(residual.span(), DType::BF16, {options.n, tokens});
+                ops::linear_add(x, packed.weight, out, options.policy, workspace, cuda);
             };
         };
 
@@ -153,19 +157,19 @@ int main(int argc, char** argv) {
             const std::int32_t tokens = options.t_sweep.front();
             const auto launch         = make_launch(tokens);
             for (int iteration = 0; iteration < options.warmup; ++iteration) {
-                restore(stream);
-                bench::flush_l2(flush, stream);
-                launch(stream);
+                restore(cuda);
+                bench::flush_l2(flush, cuda);
+                launch(cuda);
             }
             CUDA_CHECK(cudaStreamSynchronize(stream));
-            restore(stream);
-            bench::flush_l2(flush, stream);
+            restore(cuda);
+            bench::flush_l2(flush, cuda);
             CUDA_CHECK(cudaStreamSynchronize(stream));
             std::printf("PROFILE linear_add weight_type=NVFP4 policy=%s N=%d K=%d T=%d\n",
                         policy_name(options.policy), options.n, options.k, tokens);
             std::fflush(stdout);
             CUDA_CHECK(cudaProfilerStart());
-            launch(stream);
+            launch(cuda);
             CUDA_CHECK(cudaStreamSynchronize(stream));
             CUDA_CHECK(cudaProfilerStop());
             CUDA_CHECK(cudaStreamDestroy(stream));
@@ -179,7 +183,7 @@ int main(int argc, char** argv) {
         for (const std::int32_t tokens : options.t_sweep) {
             const auto launch              = make_launch(tokens);
             const bench::ColdTiming timing = bench::measure_cold_launch_prepared(
-                restore, launch, flush, stream, options.warmup, options.repeat);
+                restore, launch, flush, cuda, options.warmup, options.repeat);
             const double seconds      = timing.median_us * 1.0e-6;
             const double useful_flops = 2.0 * static_cast<double>(options.n) * options.k * tokens;
             const double model_bytes  = static_cast<double>(packed.model_weight_bytes()) +

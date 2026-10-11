@@ -1,4 +1,5 @@
 #include "core/weight.h"
+#include "cuda_fixture.h"
 #include "ops/linear_swiglu/linear_swiglu_test_common.h"
 
 #include "core/arena.h"
@@ -265,7 +266,7 @@ int run_profile(std::string_view label, const Profile& profile,
 
     test::GuardedDeviceBuffer device_weight(host_weight.payload.size());
     device_weight.copy_from_host(host_weight.payload.data(), host_weight.payload.size());
-    const Weight weight = host_weight.device_weight(device_weight.data());
+    const Weight weight = host_weight.device_weight(device_weight.span());
 
     test::GuardedDeviceBuffer device_activation(host_activation.size() * sizeof(std::uint16_t));
     device_activation.copy_from_host(host_activation.data(),
@@ -274,19 +275,23 @@ int run_profile(std::string_view label, const Profile& profile,
     const ops::LinearPolicy policy    = policy_for(profile.activation_compute);
     const std::size_t workspace_bytes = ops::linear_swiglu_workspace_capacity_bytes(
         profile.qtype, profile.gate_up_rows, profile.input_rows, policy, 1, maximum_tokens);
-    WorkspaceArena workspace(std::max<std::size_t>(workspace_bytes, 256));
+    ninfer::DeviceBuffer workspace_storage(ninfer::test::cuda_environment().context.device(),
+                                           std::max<std::size_t>(workspace_bytes, 256));
+    MemoryArena workspace(workspace_storage.span());
 
     int failures        = 0;
     const auto run_case = [&](int tokens, bool replay) {
         const auto elements = checked_elements(profile.output_rows, tokens, "output size");
         test::GuardedDeviceBuffer output(elements * sizeof(std::uint16_t));
-        Tensor x(device_activation.data(), DType::BF16, {profile.input_rows, tokens});
-        Tensor destination(output.data(), DType::BF16, {profile.output_rows, tokens});
+        Tensor x(device_activation.span(), DType::BF16, {profile.input_rows, tokens});
+        Tensor destination(output.span(), DType::BF16, {profile.output_rows, tokens});
         workspace.reset();
         workspace.reset_peak();
-        const cudaStream_t stream = replay ? graph_context->stream : nullptr;
-        const auto launch         = [&] {
-            ops::linear_swiglu(x, weight, destination, policy, workspace, stream);
+        const auto cuda =
+            replay ? graph_context->execution_view() : cuda_environment().default_execution;
+        const auto stream = cuda.stream();
+        const auto launch = [&] {
+            ops::linear_swiglu(x, weight, destination, policy, workspace, cuda);
         };
         const std::string label_case =
             std::string(label) + " T=" + std::to_string(tokens) + (replay ? " graph" : " eager");
@@ -383,19 +388,22 @@ int run_negative_gate(std::string_view label, const quantized_weight::PackedWeig
                                              sizeof(std::uint16_t));
     weights.copy_from_host(packed.payload.data(), packed.payload.size());
     input_storage.copy_from_host(activation.data(), input_storage.bytes());
-    const Weight weight            = packed.device_weight(weights.data());
+    const Weight weight            = packed.device_weight(weights.span());
     const ops::LinearPolicy policy = policy_for(activation_compute);
-    WorkspaceArena workspace(ops::linear_swiglu_workspace_capacity_bytes(
-        weight.qtype, rows, k, policy, 1, maximum_tokens));
+    ninfer::DeviceBuffer workspace_storage(ninfer::test::cuda_environment().context.device(),
+                                           ops::linear_swiglu_workspace_capacity_bytes(
+                                               weight.qtype, rows, k, policy, 1, maximum_tokens));
+    MemoryArena workspace(workspace_storage.span());
 
     // These inputs are exactly representable by A8/A4. Keep the strict criterion that detects
     // lost projection precision through the negative gate in the complete nonlinear formula.
     constexpr ReductionCriterion kNegativeGateTolerance{1.0 / 256.0, 0.0, 2.0 / 256.0};
     int failures = 0;
     for (const std::int32_t tokens : token_cases) {
-        Tensor input(input_storage.data(), DType::BF16, {k, tokens});
-        Tensor output(output_storage.data(), DType::BF16, {half, tokens});
-        ops::linear_swiglu(input, weight, output, policy, workspace, nullptr);
+        Tensor input(input_storage.span(), DType::BF16, {k, tokens});
+        Tensor output(output_storage.span(), DType::BF16, {half, tokens});
+        ops::linear_swiglu(input, weight, output, policy, workspace,
+                           ninfer::test::cuda_environment().default_execution);
         test::cuda_synchronize();
         const auto elements = checked_elements(half, tokens, "output size");
         const auto actual   = read_bf16_output(output_storage, elements);

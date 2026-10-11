@@ -1,6 +1,6 @@
 #pragma once
 
-#include "core/arena.h"
+#include "core/buffer.h"
 
 #include <cstddef>
 #include <optional>

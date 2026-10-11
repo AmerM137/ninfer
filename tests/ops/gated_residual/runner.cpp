@@ -42,27 +42,27 @@ int verify(const Fixture& f, const std::string& label, bool exact_residual) {
 }
 
 namespace {
-int run(Form form, int m, Pattern pattern, bool alias, bool captured, DeviceExecutionView e) {
+int run(Form form, int m, Pattern pattern, bool alias, bool captured, CudaExecutionView e) {
     Fixture f(form, m, alias);
     f.set(pattern);
-    f.upload(e.stream);
+    f.upload(e.stream());
     DecodeGraphDefinition definition;
     DecodeGraphExecutable graph;
     if (captured) {
-        definition.capture(e.stream, [&] { f.invoke(e); });
+        definition.capture(e.stream(), [&] { f.invoke(e); });
         graph.instantiate(definition);
     }
     int failed = 0;
     for (int phase = 0; phase < (captured ? 2 : 1); ++phase) {
         if (phase) {
             f.set(pattern, phase);
-            f.upload(e.stream);
+            f.upload(e.stream());
         }
         if (captured)
-            graph.launch(e.stream);
+            graph.launch(e.stream());
         else
             f.invoke(e);
-        cuda_synchronize(e.stream);
+        cuda_synchronize(e.stream());
         const auto label = std::string(name(form)) + " M=" + std::to_string(m) +
                            " pattern=" + std::to_string(int(pattern)) +
                            " alias=" + std::to_string(alias) +

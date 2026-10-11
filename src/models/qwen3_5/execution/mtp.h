@@ -14,12 +14,12 @@ namespace ninfer::models::qwen3_5::execution {
                                                          std::int32_t first, std::int32_t last);
 void mtp_projection(const Tensor& hidden, const MtpProjectionParameters& parameters,
                     const AttentionConfig& config, Tensor& query, Tensor& gate, Tensor& key,
-                    Tensor& value, WorkspaceArena& workspace, cudaStream_t stream);
+                    Tensor& value, MemoryArena& workspace, CudaExecutionView execution);
 void mtp_kv_projection(const Tensor& hidden, const MtpProjectionParameters& parameters,
                        const AttentionConfig& config, Tensor& key, Tensor& value,
-                       WorkspaceArena& workspace, cudaStream_t stream);
+                       MemoryArena& workspace, CudaExecutionView execution);
 void mtp_query_gate_projection(const Tensor& hidden, const MtpProjectionParameters& parameters,
                                const AttentionConfig& config, Tensor& query, Tensor& gate,
-                               WorkspaceArena& workspace, cudaStream_t stream);
+                               MemoryArena& workspace, CudaExecutionView execution);
 
 } // namespace ninfer::models::qwen3_5::execution

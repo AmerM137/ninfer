@@ -37,8 +37,8 @@ namespace ninfer::ops {
  *
  * Workspace / execution:
  * The entries require no caller-owned global workspace and allocate no hidden Device storage. They
- * submit to execution.stream, with execution.multiprocessor_count positive. They support CUDA Graph
- * capture/replay; Device metadata is consumed at execution time. Multiple ordered kernels are
+ * submit to execution.stream(), with execution.multiprocessor_count() positive. They support CUDA
+ * Graph capture/replay; Device metadata is consumed at execution time. Multiple ordered kernels are
  * permitted. The caller supplies ready inputs, writable output ranges and storage lifetimes through
  * the last consumer, including graph replay. Ops do not reserve records, advance
  * counters/frontiers, publish state, perform I/O or synchronize Host to inspect Device
@@ -105,7 +105,7 @@ struct PleConvRecordReadView {
  */
 void ple_gate(const PleProjectionView& projected, const Tensor& residual,
               const PleGateParameters& parameters, const PleBatchView& batch,
-              PleConvRecordWindowView records, Tensor& gated_value, DeviceExecutionView execution);
+              PleConvRecordWindowView records, Tensor& gated_value, CudaExecutionView execution);
 
 /**
  * Dilated causal convolution, SiLU and residual addition, optionally followed by norm.
@@ -142,13 +142,13 @@ void ple_gate(const PleProjectionView& projected, const Tensor& residual,
 void ple_conv_add(const Tensor& residual, const Tensor& gated_value, const Tensor& kernel,
                   const PleBatchView& batch, const PleConvStateView& before,
                   const PleConvRecordWindowView& current, Tensor& updated_residual,
-                  DeviceExecutionView execution);
+                  CudaExecutionView execution);
 
 void ple_conv_add_norm(const Tensor& residual, const Tensor& gated_value, const Tensor& kernel,
                        const PleBatchView& batch, const PleConvStateView& before,
                        const PleConvRecordWindowView& current, const Tensor& next_hc_norm_weight,
                        float next_hc_epsilon, Tensor& updated_residual, Tensor& normalized,
-                       DeviceExecutionView execution);
+                       CudaExecutionView execution);
 
 /**
  * Extract the trailing nine columns after an accepted prefix.
@@ -178,6 +178,6 @@ void ple_conv_add_norm(const Tensor& residual, const Tensor& gated_value, const 
  */
 void ple_state_extract(const PleConvStateView& before, const PleConvRecordReadView& records,
                        const Tensor& accepted_columns, PleConvStateView after,
-                       DeviceExecutionView execution);
+                       CudaExecutionView execution);
 
 } // namespace ninfer::ops

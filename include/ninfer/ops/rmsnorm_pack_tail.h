@@ -1,7 +1,7 @@
 #pragma once
 
+#include "core/device.h"
 #include "core/tensor.h"
-#include <cuda_runtime.h>
 
 namespace ninfer::ops {
 
@@ -15,6 +15,6 @@ namespace ninfer::ops {
  * Writes all of output and preserves inputs. No workspace or state is used.
  */
 void rmsnorm_pack_tail(const Tensor& input, const Tensor& weight, Tensor& output,
-                       cudaStream_t stream);
+                       CudaExecutionView execution);
 
 } // namespace ninfer::ops

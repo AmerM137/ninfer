@@ -1,4 +1,5 @@
 #include "core/gdn_replay_records.h"
+#include "core/buffer.h"
 #include "core/linear_attention_state.h"
 
 #include <cstddef>
@@ -10,14 +11,6 @@
 #include <utility>
 
 namespace {
-
-using AlignedBacking = std::unique_ptr<void, decltype(&std::free)>;
-
-AlignedBacking make_backing(std::size_t bytes) {
-    void* data = std::aligned_alloc(256, bytes);
-    if (data == nullptr) { throw std::bad_alloc(); }
-    return AlignedBacking(data, &std::free);
-}
 
 int fail(const char* label) {
     std::cerr << label << '\n';
@@ -78,8 +71,8 @@ int main() {
     ninfer::LayoutBuilder builder;
     const auto layout       = ninfer::plan_gdn_replay_records(builder, spec);
     const std::size_t bytes = builder.finish(256);
-    auto backing            = make_backing(bytes);
-    const ninfer::GdnReplayRecords records({backing.get(), bytes}, layout);
+    ninfer::HostBuffer backing(bytes);
+    const ninfer::GdnReplayRecords records(backing.span(), layout);
 
     failures += expect_shape(records.conv, 256, 4, 15, 1, "conv plane");
     failures += expect_shape(records.key, 128, 2, 4, 15, "key plane");
@@ -173,8 +166,8 @@ int main() {
                         .slot_count     = 7,
                         .conv_dtype     = ninfer::DType::BF16});
     const std::size_t state_bytes = state_builder.finish(256);
-    auto state_backing            = make_backing(state_bytes);
-    ninfer::LinearAttentionStatePool state({state_backing.get(), state_bytes}, state_layout);
+    ninfer::HostBuffer state_backing(state_bytes);
+    ninfer::LinearAttentionStatePool state(state_backing.span(), state_layout);
     const auto all = state.all_layers_view();
     failures +=
         expect(all.conv_layer0.data == state.layer_view(0).conv.data, "conv layer-0 base differs");

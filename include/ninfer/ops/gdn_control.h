@@ -36,10 +36,10 @@ struct GdnNormControlOutputs {
  *   unchanged and both outputs are fully written. No persistent state or workspace.
  *
  * Execution:
- *   Work is submitted to stream; capture/replay observes the current operand contents.
+ *   Work is submitted to execution.stream(); capture/replay observes the current operand contents.
  */
 void gdn_control(const Tensor& a, const Tensor& b, const Tensor& a_log, const Tensor& dt_bias,
-                 GdnControlOutputs out, cudaStream_t stream);
+                 GdnControlOutputs out, CudaExecutionView execution);
 
 /**
  * GDN control projection.
@@ -73,8 +73,8 @@ void gdn_control(const Tensor& a, const Tensor& b, const Tensor& a_log, const Te
  *   reads current contents at the bound addresses. There is no persistent state effect.
  */
 void gdn_control_proj(const Tensor& x, const ProjectionWeights& weights, const Tensor& a_log,
-                      const Tensor& dt_bias, GdnControlOutputs out, WorkspaceArena& workspace,
-                      DeviceExecutionView execution);
+                      const Tensor& dt_bias, GdnControlOutputs out, MemoryArena& workspace,
+                      CudaExecutionView execution);
 
 [[nodiscard]] std::size_t
 gdn_control_proj_workspace_capacity_bytes(const ProjectionWeights& weights, std::int32_t first,
@@ -103,8 +103,8 @@ gdn_control_proj_workspace_capacity_bytes(const ProjectionWeights& weights, std:
  */
 void gdn_norm_control_proj(const Tensor& x, const Tensor& norm_weight, float eps,
                            const ProjectionWeights& weights, const Tensor& a_log,
-                           const Tensor& dt_bias, GdnNormControlOutputs out,
-                           WorkspaceArena& workspace, DeviceExecutionView execution);
+                           const Tensor& dt_bias, GdnNormControlOutputs out, MemoryArena& workspace,
+                           CudaExecutionView execution);
 
 [[nodiscard]] std::size_t
 gdn_norm_control_proj_workspace_capacity_bytes(const ProjectionWeights& weights, std::int32_t first,

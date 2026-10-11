@@ -108,23 +108,23 @@ void tma_folded_up(Operands o, Scratch scratch, cudaStream_t stream) {
 
 } // namespace
 
-void launch(Kind kind, Operands o, Plan p, Scratch scratch, DeviceExecutionView execution) {
+void launch(Kind kind, Operands o, Plan p, Scratch scratch, CudaExecutionView execution) {
     if (kind == Kind::Block)
-        down<Kind::Block>(o, p.down, scratch, execution.stream);
+        down<Kind::Block>(o, p.down, scratch, execution.stream());
     else
-        down<Kind::Final>(o, p.down, scratch, execution.stream);
+        down<Kind::Final>(o, p.down, scratch, execution.stream());
     switch (p.up) {
     case Up::Folded16x16:
-        folded_up<16, 16>(o, scratch, execution.stream);
+        folded_up<16, 16>(o, scratch, execution.stream());
         break;
     case Up::Folded32x32:
-        folded_up<32, 32>(o, scratch, execution.stream);
+        folded_up<32, 32>(o, scratch, execution.stream());
         break;
     case Up::TmaFolded16x64:
-        tma_folded_up<16>(o, scratch, execution.stream);
+        tma_folded_up<16>(o, scratch, execution.stream());
         break;
     case Up::TmaFolded32x64:
-        tma_folded_up<32>(o, scratch, execution.stream);
+        tma_folded_up<32>(o, scratch, execution.stream());
         break;
     }
 }

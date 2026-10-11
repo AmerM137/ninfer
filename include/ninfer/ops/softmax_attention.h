@@ -7,7 +7,6 @@
 #include "core/paged_kv_cache.h"
 #include "core/tensor.h"
 
-#include <cuda_runtime.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -49,8 +48,8 @@ struct ContextAttentionExecutionEnvelope {
  * The single segment needs no transient workspace.
  */
 void softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
-                       AttentionHeadGeometry geometry, float scale, WorkspaceArena& workspace,
-                       Tensor& out, cudaStream_t stream);
+                       AttentionHeadGeometry geometry, float scale, MemoryArena& workspace,
+                       Tensor& out, CudaExecutionView execution);
 
 /**
  * Packed block-diagonal dense attention for the same D72/H16 profile.
@@ -63,7 +62,7 @@ void softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
  */
 void packed_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                               AttentionHeadGeometry geometry, float scale, const Tensor& cu_seqlens,
-                              WorkspaceArena& workspace, Tensor& out, cudaStream_t stream);
+                              MemoryArena& workspace, Tensor& out, CudaExecutionView execution);
 
 /**
  * Equal-length form of packed_softmax_attention. T is divisible by segment_length and consecutive
@@ -72,7 +71,8 @@ void packed_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
  */
 void packed_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                               AttentionHeadGeometry geometry, float scale,
-                              std::int32_t segment_length, Tensor& out, cudaStream_t stream);
+                              std::int32_t segment_length, Tensor& out,
+                              CudaExecutionView execution);
 
 /**
  * Return caller-owned transient capacity for every legal (T,S) pair in the inclusive envelope.
@@ -121,8 +121,8 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                               const Tensor& positions, const Tensor& valid_columns,
                               const Tensor& kv_table_rows, AttentionHeadGeometry geometry,
                               float scale, PagedKVBatchLayerView cache,
-                              CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
-                              Tensor& out, DeviceExecutionView execution);
+                              CausalAttentionExecutionEnvelope envelope, MemoryArena& workspace,
+                              Tensor& out, CudaExecutionView execution);
 
 /**
  * Read-only single-sequence causal attention over an already populated cache.
@@ -136,8 +136,8 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
                                      AttentionHeadGeometry geometry, float scale,
                                      const PagedKVLayerView& cache,
                                      CausalAttentionExecutionEnvelope envelope,
-                                     WorkspaceArena& workspace, Tensor& out,
-                                     DeviceExecutionView execution);
+                                     MemoryArena& workspace, Tensor& out,
+                                     CudaExecutionView execution);
 
 /**
  * Return transient capacity for every W in the inclusive interval at one exact batch size. The
@@ -148,7 +148,7 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
 [[nodiscard]] std::size_t causal_softmax_attention_workspace_capacity_bytes(
     AttentionHeadGeometry geometry, KvCacheStorage cache_storage,
     CausalAttentionExecutionEnvelope envelope, std::int32_t batch_size, std::int32_t min_tokens,
-    std::int32_t max_tokens, DeviceExecutionView execution);
+    std::int32_t max_tokens, std::int32_t multiprocessor_count);
 
 /**
  * Non-causal grouped-query attention over persistent context plus one live query block.
@@ -174,8 +174,8 @@ void context_softmax_attention(const Tensor& q, const Tensor& query_k, const Ten
                                const Tensor& context_lengths, const Tensor& valid_columns,
                                const Tensor& table_rows, AttentionHeadGeometry geometry,
                                float scale, const PagedKVBatchLayerView& context,
-                               ContextAttentionExecutionEnvelope envelope,
-                               WorkspaceArena& workspace, Tensor& out, cudaStream_t stream);
+                               ContextAttentionExecutionEnvelope envelope, MemoryArena& workspace,
+                               Tensor& out, CudaExecutionView execution);
 
 /**
  * Return transient capacity for every T in the inclusive optimized interval at the exact batch

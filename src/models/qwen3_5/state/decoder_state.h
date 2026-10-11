@@ -54,7 +54,7 @@ private:
 
 class PagedKVCache {
 public:
-    PagedKVCache(DeviceSpan backing, const PagedKVCacheLayout& layout);
+    PagedKVCache(MemorySpan backing, const PagedKVCacheLayout& layout);
 
     PagedKVCache(const PagedKVCache&)            = delete;
     PagedKVCache& operator=(const PagedKVCache&) = delete;
@@ -105,7 +105,7 @@ struct DecoderState {
     PagedKVCache text_kv;
     std::optional<PagedKVCache> mtp_kv;
 
-    DecoderState(DeviceSpan backing, const DecoderStateLayout& layout);
+    DecoderState(MemorySpan backing, const DecoderStateLayout& layout);
 
     [[nodiscard]] PagedKVCache* mtp_cache() noexcept;
     [[nodiscard]] const PagedKVCache* mtp_cache() const noexcept;

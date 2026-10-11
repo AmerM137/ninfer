@@ -36,8 +36,12 @@ void candidate_selector_path(const Tensor& candidate_ids, const Tensor& unary_sc
                              const Tensor& projected_hidden, const Tensor& anchors,
                              const Tensor& predecessor_codebook, const Tensor& successor_codebook,
                              const Tensor& base_positions, const SamplingConfig* configs,
-                             Tensor& drafts, Tensor& proposal_q, WorkspaceArena& workspace,
-                             cudaStream_t stream) {
+                             Tensor& drafts, Tensor& proposal_q, MemoryArena& workspace,
+                             CudaExecutionView execution) {
+    if (workspace.device() != execution.device()) {
+        throw std::invalid_argument("candidate_selector_path: workspace belongs to another device");
+    }
+    const auto stream             = execution.stream();
     const std::int32_t batch_size = candidate_ids.ne[2];
     const std::int32_t kSteps     = candidate_ids.ne[1];
     if (kSteps < 1 || kSteps > 15)
@@ -46,23 +50,23 @@ void candidate_selector_path(const Tensor& candidate_ids, const Tensor& unary_sc
         throw std::invalid_argument("candidate_selector_path: B must be in [1,8]");
     }
     common::operand::tensor(candidate_ids, DType::I32, {kCandidates, kSteps, batch_size, 1}, 16,
-                            "candidate_selector_path", "candidate_ids");
+                            "candidate_selector_path", "candidate_ids", execution.device());
     common::operand::tensor(unary_scores, DType::FP32, {kCandidates, kSteps, batch_size, 1}, 16,
-                            "candidate_selector_path", "unary_scores");
+                            "candidate_selector_path", "unary_scores", execution.device());
     common::operand::tensor(projected_hidden, DType::BF16, {kRank, kSteps, batch_size, 1}, 16,
-                            "candidate_selector_path", "projected_hidden");
+                            "candidate_selector_path", "projected_hidden", execution.device());
     common::operand::tensor(anchors, DType::I32, {batch_size, 1, 1, 1}, 16,
-                            "candidate_selector_path", "anchors");
+                            "candidate_selector_path", "anchors", execution.device());
     common::operand::tensor(predecessor_codebook, DType::BF16, {kRank, kCodebookRows, 1, 1}, 16,
-                            "candidate_selector_path", "predecessor_codebook");
+                            "candidate_selector_path", "predecessor_codebook", execution.device());
     common::operand::tensor(successor_codebook, DType::BF16, {kRank, kCodebookRows, 1, 1}, 16,
-                            "candidate_selector_path", "successor_codebook");
+                            "candidate_selector_path", "successor_codebook", execution.device());
     common::operand::tensor(base_positions, DType::I32, {batch_size, 1, 1, 1}, 16,
-                            "candidate_selector_path", "base_positions");
+                            "candidate_selector_path", "base_positions", execution.device());
     common::operand::tensor(drafts, DType::I32, {kSteps, batch_size, 1, 1}, 16,
-                            "candidate_selector_path", "drafts");
+                            "candidate_selector_path", "drafts", execution.device());
     common::operand::tensor(proposal_q, DType::FP32, {kCandidates, kSteps, batch_size, 1}, 16,
-                            "candidate_selector_path", "proposal_q");
+                            "candidate_selector_path", "proposal_q", execution.device());
     if (!common::operand::aligned(configs, alignof(SamplingConfig))) {
         throw std::invalid_argument("candidate_selector_path: invalid configs");
     }

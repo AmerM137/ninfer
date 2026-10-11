@@ -12,7 +12,7 @@ void validate_replay_record(const Tensor& q, const Tensor& k, const Tensor& v, c
                             const Tensor& beta, float scale, const Tensor& states,
                             const Tensor& valid_columns, const Tensor& initial_slots,
                             const Tensor& key_record, const Tensor& value_record,
-                            const Tensor& gate_record, const Tensor& out) {
+                            const Tensor& gate_record, const Tensor& out, Device device) {
     constexpr const char* kOp      = "gated_delta_net_replay_record";
     const std::int32_t qk_heads    = q.ne[1];
     const std::int32_t value_heads = v.ne[1];
@@ -26,24 +26,29 @@ void validate_replay_record(const Tensor& q, const Tensor& k, const Tensor& v, c
         throw std::invalid_argument(std::string(kOp) + ": state slot count must be positive");
     }
 
-    common::operand::tensor(q, DType::BF16, {kStateDim, qk_heads, width, rows}, 8, kOp, "q");
-    common::operand::tensor(k, DType::BF16, {kStateDim, qk_heads, width, rows}, 8, kOp, "k");
-    common::operand::tensor(v, DType::BF16, {kStateDim, value_heads, width, rows}, 2, kOp, "v");
-    common::operand::tensor(g, DType::FP32, {value_heads, width, rows}, 4, kOp, "g");
-    common::operand::tensor(beta, DType::FP32, {value_heads, width, rows}, 4, kOp, "beta");
+    common::operand::tensor(q, DType::BF16, {kStateDim, qk_heads, width, rows}, 8, kOp, "q",
+                            device);
+    common::operand::tensor(k, DType::BF16, {kStateDim, qk_heads, width, rows}, 8, kOp, "k",
+                            device);
+    common::operand::tensor(v, DType::BF16, {kStateDim, value_heads, width, rows}, 2, kOp, "v",
+                            device);
+    common::operand::tensor(g, DType::FP32, {value_heads, width, rows}, 4, kOp, "g", device);
+    common::operand::tensor(beta, DType::FP32, {value_heads, width, rows}, 4, kOp, "beta", device);
     common::operand::tensor(states, DType::FP32, {kStateDim, kStateDim, value_heads, states.ne[3]},
-                            16, kOp, "states");
-    common::operand::tensor(initial_slots, DType::I32, {rows}, 4, kOp, "initial state slots");
+                            16, kOp, "states", device);
+    common::operand::tensor(initial_slots, DType::I32, {rows}, 4, kOp, "initial state slots",
+                            device);
     if (valid_columns.data != nullptr) {
-        common::operand::tensor(valid_columns, DType::I32, {rows}, 4, kOp, "valid columns");
+        common::operand::tensor(valid_columns, DType::I32, {rows}, 4, kOp, "valid columns", device);
     }
     common::operand::tensor(key_record, DType::BF16, {kStateDim, qk_heads, width, rows}, 8, kOp,
-                            "key record");
+                            "key record", device);
     common::operand::tensor(value_record, DType::BF16, {kStateDim, value_heads, width, rows}, 2,
-                            kOp, "value record");
+                            kOp, "value record", device);
     common::operand::tensor(gate_record, DType::FP32, {2, value_heads, width, rows}, 8, kOp,
-                            "gate record");
-    common::operand::tensor(out, DType::BF16, {kStateDim, value_heads, width, rows}, 2, kOp, "out");
+                            "gate record", device);
+    common::operand::tensor(out, DType::BF16, {kStateDim, value_heads, width, rows}, 2, kOp, "out",
+                            device);
     detail::gated_delta_net::require_scale(scale, kOp);
 
     const std::array<const Tensor*, 12> tensors{&q,
@@ -73,9 +78,10 @@ void gated_delta_net_replay_record(const Tensor& q, const Tensor& k, const Tenso
                                    const Tensor& g, const Tensor& beta, float scale,
                                    const Tensor& ssm_states, const Tensor& valid_columns,
                                    const Tensor& initial_state_slots, GdnRecurrenceRecords records,
-                                   Tensor& out, cudaStream_t stream) {
+                                   Tensor& out, CudaExecutionView execution) {
+    const auto stream = execution.stream();
     validate_replay_record(q, k, v, g, beta, scale, ssm_states, valid_columns, initial_state_slots,
-                           records.key, records.value, records.gate, out);
+                           records.key, records.value, records.gate, out, execution.device());
     detail::gated_delta_net::launch_recurrent_record(
         q, k, v, g, beta, scale, ssm_states, valid_columns, initial_state_slots, records.key,
         records.value, records.gate, out, stream);

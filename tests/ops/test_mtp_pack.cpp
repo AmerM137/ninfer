@@ -1,4 +1,5 @@
 #include "ninfer/ops/indexing.h"
+#include "cuda_fixture.h"
 #include "ops/op_tester.h"
 
 #include <cstddef>
@@ -45,10 +46,11 @@ int pack_case(std::int32_t hidden, std::int32_t tokens) {
                                  hidden_values.size() * sizeof(std::uint16_t));
     device_output.fill(0xcd);
 
-    Tensor embedding_tensor(device_embedding.data(), DType::BF16, {hidden, tokens});
-    Tensor hidden_tensor(device_hidden.data(), DType::BF16, {hidden, tokens});
-    Tensor output_tensor(device_output.data(), DType::BF16, {output_rows, tokens});
-    ops::concat_bf16_features(embedding_tensor, hidden_tensor, output_tensor, nullptr);
+    Tensor embedding_tensor(device_embedding.span(), DType::BF16, {hidden, tokens});
+    Tensor hidden_tensor(device_hidden.span(), DType::BF16, {hidden, tokens});
+    Tensor output_tensor(device_output.span(), DType::BF16, {output_rows, tokens});
+    ops::concat_bf16_features(embedding_tensor, hidden_tensor, output_tensor,
+                              ninfer::test::cuda_environment().default_execution);
     cuda_synchronize();
 
     const std::string label =
@@ -104,13 +106,13 @@ int split_case(std::int32_t tokens) {
     device_gate.fill(0xcd);
     device_value.fill(0xcd);
 
-    Tensor input_tensor(device_input.data(), DType::BF16, {kInputRows, tokens});
-    Tensor query_tensor(device_query.data(), DType::BF16, {256, 24, tokens});
-    Tensor key_tensor(device_key.data(), DType::BF16, {256, 4, tokens});
-    Tensor gate_tensor(device_gate.data(), DType::BF16, {256, 24, tokens});
-    Tensor value_tensor(device_value.data(), DType::BF16, {256, 4, tokens});
+    Tensor input_tensor(device_input.span(), DType::BF16, {kInputRows, tokens});
+    Tensor query_tensor(device_query.span(), DType::BF16, {256, 24, tokens});
+    Tensor key_tensor(device_key.span(), DType::BF16, {256, 4, tokens});
+    Tensor gate_tensor(device_gate.span(), DType::BF16, {256, 24, tokens});
+    Tensor value_tensor(device_value.span(), DType::BF16, {256, 4, tokens});
     ops::split_bf16_features(input_tensor, query_tensor, key_tensor, gate_tensor, value_tensor,
-                           nullptr);
+                             ninfer::test::cuda_environment().default_execution);
     cuda_synchronize();
 
     const std::string label = "split_bf16_features T=" + std::to_string(tokens);

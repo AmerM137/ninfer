@@ -14,7 +14,7 @@ struct Fixture {
     Fixture(Form form, int columns, bool in_place);
     void set(Pattern pattern, int phase = 0);
     void upload(cudaStream_t stream);
-    void invoke(DeviceExecutionView execution);
+    void invoke(CudaExecutionView execution);
     int check(const std::string& label) const;
 
     Form form;

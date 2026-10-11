@@ -7,6 +7,7 @@
 //   ./ninfer_causal_conv1d_silu_bench --snapshot --channels 8192 --tokens 6 --slots 7
 // Printed logical GB/s is informational; NCU determines the applicable resource roofline.
 #include "ninfer/ops/causal_conv1d_silu.h"
+#include "core/buffer.h"
 #include "core/device.h"
 #include "op_measurement.cuh"
 
@@ -60,10 +61,11 @@ Result time_stage(const Options& options, const launch_fn& launch, double bytes_
     constexpr int kColdWarmup = 20;
     constexpr int kColdRepeat = 40;
     bench::L2FlushBuffer flush(kFlushBytes);
+    const auto cuda = default_execution();
     const ColdTiming timing =
-        restore ? measure_cold_launch_prepared(restore, launch, flush, nullptr, kColdWarmup,
-                                               kColdRepeat)
-                : measure_cold_launch(launch, flush, nullptr, kColdWarmup, kColdRepeat);
+        restore
+            ? measure_cold_launch_prepared(restore, launch, flush, cuda, kColdWarmup, kColdRepeat)
+            : measure_cold_launch(launch, flush, cuda, kColdWarmup, kColdRepeat);
     Result result;
     result.n_runs        = kColdRepeat;
     result.median_us     = timing.median_us;
@@ -86,8 +88,8 @@ DeviceBuffer make_varied_bf16(std::size_t n, std::uint32_t seed) {
         const float u = static_cast<float>((state >> 8) & 0x00ffffffu) * (1.0f / 16777216.0f);
         h[i]          = f32_to_bf16(2.0f * u - 1.0f);
     }
-    DeviceBuffer d(n * 2u);
-    cudaMemcpy(d.p, h.data(), n * 2u, cudaMemcpyHostToDevice);
+    DeviceBuffer d(ninfer::bench::device_context().device(), n * 2u);
+    cudaMemcpy(d.data(), h.data(), n * 2u, cudaMemcpyHostToDevice);
     return d;
 }
 
@@ -109,23 +111,23 @@ void run_prefill(const Options& options, bool distinct) {
     DeviceBuffer out       = make_zeros(n * 2u);
 
     SavedBuffer initial(state_in);
-    const auto restore = [&](cudaStream_t stream) { initial.restore(stream); };
-    Tensor tx(x.p, DType::BF16, {options.channels, options.tokens});
-    Tensor tw(weight.p, DType::BF16, {options.channels, 4});
-    Tensor tin(state_in.p, DType::BF16, {options.channels, 3});
-    Tensor tout_state(state_out.p, DType::BF16, {options.channels, 3});
-    Tensor tout(out.p, DType::BF16, {options.channels, options.tokens});
+    const auto restore = [&](CudaExecutionView cuda) { initial.restore(cuda); };
+    Tensor tx(x.span(), DType::BF16, {options.channels, options.tokens});
+    Tensor tw(weight.span(), DType::BF16, {options.channels, 4});
+    Tensor tin(state_in.span(), DType::BF16, {options.channels, 3});
+    Tensor tout_state(state_out.span(), DType::BF16, {options.channels, 3});
+    Tensor tout(out.span(), DType::BF16, {options.channels, options.tokens});
 
     // Informational compulsory traffic: x/out, the four-tap weight, and state read/write. NCU
     // counters remain the performance authority.
     const double bytes = 4.0 * static_cast<double>(n) + 20.0 * options.channels;
     const Result r     = time_stage(
         options,
-        [&](cudaStream_t s) {
+        [&](CudaExecutionView cuda) {
             if (distinct) {
-                ops::causal_conv1d_silu(tx, tw, tin, tout_state, tout, s);
+                ops::causal_conv1d_silu(tx, tw, tin, tout_state, tout, cuda);
             } else {
-                ops::causal_conv1d_silu(tx, tw, tin, tout, s);
+                ops::causal_conv1d_silu(tx, tw, tin, tout, cuda);
             }
         },
         bytes, restore);
@@ -155,21 +157,21 @@ void run_split(const Options& options) {
     DeviceBuffer k         = make_zeros(static_cast<std::size_t>(key_dim) * options.tokens * 2u);
     DeviceBuffer v         = make_zeros(static_cast<std::size_t>(value_dim) * options.tokens * 2u);
 
-    Tensor tx(x.p, DType::BF16, {options.channels, options.tokens});
-    Tensor tw(weight.p, DType::BF16, {options.channels, 4});
-    Tensor tin(state_in.p, DType::BF16, {options.channels, 3});
-    Tensor tout_state(state_out.p, DType::BF16, {options.channels, 3});
-    Tensor tq(q.p, DType::BF16, {key_dim, options.tokens});
-    Tensor tk(k.p, DType::BF16, {key_dim, options.tokens});
-    Tensor tv(v.p, DType::BF16, {value_dim, options.tokens});
+    Tensor tx(x.span(), DType::BF16, {options.channels, options.tokens});
+    Tensor tw(weight.span(), DType::BF16, {options.channels, 4});
+    Tensor tin(state_in.span(), DType::BF16, {options.channels, 3});
+    Tensor tout_state(state_out.span(), DType::BF16, {options.channels, 3});
+    Tensor tq(q.span(), DType::BF16, {key_dim, options.tokens});
+    Tensor tk(k.span(), DType::BF16, {key_dim, options.tokens});
+    Tensor tv(v.span(), DType::BF16, {value_dim, options.tokens});
 
     // x in, q+k+v out, the four-tap weight and both states. NCU counters remain the performance
     // authority.
     const double bytes = 4.0 * static_cast<double>(n) + 20.0 * options.channels;
     const Result r     = time_stage(
         options,
-        [&](cudaStream_t s) {
-            ops::causal_conv1d_silu_split(tx, tw, tin, tout_state, tq, tk, tv, s);
+        [&](CudaExecutionView cuda) {
+            ops::causal_conv1d_silu_split(tx, tw, tin, tout_state, tq, tk, tv, cuda);
         },
         bytes);
     const std::string tag =
@@ -186,16 +188,16 @@ void run_decode(const Options& options) {
     DeviceBuffer out    = make_zeros(channels * 2u);
 
     SavedBuffer initial(state);
-    const auto restore = [&](cudaStream_t stream) { initial.restore(stream); };
-    Tensor tx(x.p, DType::BF16, {options.channels, 1});
-    Tensor tw(weight.p, DType::BF16, {options.channels, 4});
-    Tensor ts(state.p, DType::BF16, {options.channels, 3});
-    Tensor tout(out.p, DType::BF16, {options.channels, 1});
+    const auto restore = [&](CudaExecutionView cuda) { initial.restore(cuda); };
+    Tensor tx(x.span(), DType::BF16, {options.channels, 1});
+    Tensor tw(weight.span(), DType::BF16, {options.channels, 4});
+    Tensor ts(state.span(), DType::BF16, {options.channels, 3});
+    Tensor tout(out.span(), DType::BF16, {options.channels, 1});
 
     const double bytes = 24.0 * options.channels;
     const Result r     = time_stage(
-        options, [&](cudaStream_t s) { ops::causal_conv1d_silu(tx, tw, ts, tout, s); }, bytes,
-        restore);
+        options, [&](CudaExecutionView cuda) { ops::causal_conv1d_silu(tx, tw, ts, tout, cuda); },
+        bytes, restore);
     const std::string tag = shape_tag(cache_tag(options, "decode").c_str(), options.channels, 1);
     print_result(tag.c_str(), r);
 }
@@ -228,28 +230,28 @@ void run_snapshot(const Options& options) {
             initial_host[static_cast<std::size_t>(row)] = options.batch * options.tokens + row;
         }
     }
-    CUDA_CHECK(cudaMemcpy(initial_slot.p, initial_host.data(), initial_slot.bytes,
+    CUDA_CHECK(cudaMemcpy(initial_slot.data(), initial_host.data(), initial_slot.size(),
                           cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(snapshot_base_slot.p, base_host.data(), snapshot_base_slot.bytes,
+    CUDA_CHECK(cudaMemcpy(snapshot_base_slot.data(), base_host.data(), snapshot_base_slot.size(),
                           cudaMemcpyHostToDevice));
     if (!options.valid_columns.empty()) {
         valid_columns = make_zeros(options.valid_columns.size() * sizeof(std::int32_t));
-        CUDA_CHECK(cudaMemcpy(valid_columns.p, options.valid_columns.data(), valid_columns.bytes,
-                              cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(valid_columns.data(), options.valid_columns.data(),
+                              valid_columns.size(), cudaMemcpyHostToDevice));
     }
 
     SavedBuffer initial(states);
-    const auto restore = [&](cudaStream_t stream) { initial.restore(stream); };
-    Tensor tx(x.p, DType::BF16, {options.channels, options.tokens, options.batch});
-    Tensor tw(weight.p, DType::BF16, {options.channels, 4});
-    Tensor ts(states.p, DType::BF16, {options.channels, 3, slots});
+    const auto restore = [&](CudaExecutionView cuda) { initial.restore(cuda); };
+    Tensor tx(x.span(), DType::BF16, {options.channels, options.tokens, options.batch});
+    Tensor tw(weight.span(), DType::BF16, {options.channels, 4});
+    Tensor ts(states.span(), DType::BF16, {options.channels, 3, slots});
     Tensor tvalid;
     if (!options.valid_columns.empty()) {
-        tvalid = Tensor(valid_columns.p, DType::I32, {options.batch});
+        tvalid = Tensor(valid_columns.span(), DType::I32, {options.batch});
     }
-    Tensor tslot(initial_slot.p, DType::I32, {options.batch});
-    Tensor tsnapshot_base(snapshot_base_slot.p, DType::I32, {options.batch});
-    Tensor tout(out.p, DType::BF16, {options.channels, options.tokens, options.batch});
+    Tensor tslot(initial_slot.span(), DType::I32, {options.batch});
+    Tensor tsnapshot_base(snapshot_base_slot.span(), DType::I32, {options.batch});
+    Tensor tout(out.span(), DType::BF16, {options.channels, options.tokens, options.batch});
 
     // The selected history and four weights are reusable across T; each token reads x, writes out,
     // and publishes three BF16 state columns.
@@ -257,8 +259,8 @@ void run_snapshot(const Options& options) {
                          10.0 * static_cast<double>(n);
     const Result r = time_stage(
         options,
-        [&](cudaStream_t s) {
-            ops::causal_conv1d_silu_snapshot(tx, tw, ts, tvalid, tslot, tsnapshot_base, tout, s);
+        [&](CudaExecutionView cuda) {
+            ops::causal_conv1d_silu_snapshot(tx, tw, ts, tvalid, tslot, tsnapshot_base, tout, cuda);
         },
         bytes, restore);
     const std::string tag = shape_tag(

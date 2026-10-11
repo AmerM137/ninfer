@@ -1,4 +1,5 @@
 #include "fixtures.h"
+#include "cuda_fixture.h"
 
 namespace ninfer::test::hc {
 const char* name(Form form) {
@@ -21,11 +22,11 @@ Fixture::Fixture(Form f, int m, bool alias)
     : form(f), columns(m), in_place(alias), h(std::size_t(kWidth) * kStreams * m),
       block(std::size_t(kWidth) * m), weight(kWidth * kStreams), injection(kStreams * m),
       dh(h.size() * 2), db(block.size() * 2), dw(weight.size() * 2), dj(injection.size() * 4),
-      dr(h.size() * 2), dz(h.size() * 2), th(dh.data(), DType::BF16, {kWidth, kStreams, m}),
-      tb(db.data(), DType::BF16, {kWidth, m}), tw(dw.data(), DType::BF16, {kWidth, kStreams}),
-      tj(dj.data(), DType::FP32, {kStreams, m}),
-      tr(alias ? dh.data() : dr.data(), DType::BF16, {kWidth, kStreams, m}),
-      tz(dz.data(), DType::BF16, {kWidth, kStreams, m}) {}
+      dr(h.size() * 2), dz(h.size() * 2), th(dh.span(), DType::BF16, {kWidth, kStreams, m}),
+      tb(db.span(), DType::BF16, {kWidth, m}), tw(dw.span(), DType::BF16, {kWidth, kStreams}),
+      tj(dj.span(), DType::FP32, {kStreams, m}),
+      tr(alias ? dh.span() : dr.span(), DType::BF16, {kWidth, kStreams, m}),
+      tz(dz.span(), DType::BF16, {kWidth, kStreams, m}) {}
 
 void Fixture::set(Pattern pattern, int phase) {
     epsilon = kEpsilon;
@@ -112,7 +113,7 @@ void Fixture::upload(cudaStream_t stream) {
     cuda_check(cudaMemsetAsync(dz.data(), 0xff, dz.bytes(), stream), "poison normalized");
 }
 
-void Fixture::invoke(DeviceExecutionView e) {
+void Fixture::invoke(CudaExecutionView e) {
     switch (form) {
     case Form::ExpandNorm:
         ops::hc_expand_norm(tb, tw, epsilon, tr, tz, e);

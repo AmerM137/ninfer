@@ -1,6 +1,7 @@
 // Cold-cache benchmark for the two registered public Q8 LinearPair geometries.
 
 #include "core/weight.h"
+#include "core/buffer.h"
 #include "ninfer/ops/linear_pair.h"
 
 #include "core/device.h"
@@ -133,12 +134,15 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaGetDeviceProperties(&properties, device));
         cudaStream_t stream = nullptr;
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+        const auto cuda = ninfer::bench::device_context().execution_view(stream);
 
         bench::L2FlushBuffer flush(options.flush_bytes);
         DeviceBuffer input =
             bench::make_bf16(static_cast<std::size_t>(options.k) * maximum_tokens, 101U);
-        DeviceBuffer first_output(static_cast<std::size_t>(kRows) * maximum_tokens * 2);
-        DeviceBuffer second_output(static_cast<std::size_t>(kRows) * maximum_tokens * 2);
+        DeviceBuffer first_output(ninfer::bench::device_context().device(),
+                                  static_cast<std::size_t>(kRows) * maximum_tokens * 2);
+        DeviceBuffer second_output(ninfer::bench::device_context().device(),
+                                   static_cast<std::size_t>(kRows) * maximum_tokens * 2);
         bench::PackedQuantizedWeight parent = bench::make_row_split_weight(
             QType::Q8_G32_FP16, kParentRows, options.k, options.k, 501U);
         const Weight first_weight  = bench::row_view(parent.weight, kFirstRow, kRows);
@@ -154,23 +158,23 @@ int main(int argc, char** argv) {
 
         double t1_median = std::numeric_limits<double>::quiet_NaN();
         for (const std::int32_t tokens : options.tokens) {
-            Tensor x(input.p, DType::BF16, {options.k, tokens});
-            Tensor first(first_output.p, DType::BF16, {kRows, tokens});
-            Tensor second(second_output.p, DType::BF16, {kRows, tokens});
-            const auto launch = [&](cudaStream_t launch_stream) {
-                ops::linear_pair(x, first_weight, second_weight, first, second, launch_stream);
+            Tensor x(input.span(), DType::BF16, {options.k, tokens});
+            Tensor first(first_output.span(), DType::BF16, {kRows, tokens});
+            Tensor second(second_output.span(), DType::BF16, {kRows, tokens});
+            const auto launch = [&](CudaExecutionView cuda) {
+                ops::linear_pair(x, first_weight, second_weight, first, second, cuda);
             };
             bench::ColdTiming timing;
             if (options.execution == Execution::Graph) {
                 bench::TimedGraph graph;
-                graph.capture(stream, launch);
-                graph.launch(stream);
+                graph.capture(cuda, launch);
+                graph.launch(cuda);
                 CUDA_CHECK(cudaStreamSynchronize(stream));
                 timing =
-                    bench::measure_cold_graph(graph, flush, stream, options.warmup, options.repeat);
+                    bench::measure_cold_graph(graph, flush, cuda, options.warmup, options.repeat);
             } else {
-                timing = bench::measure_cold_launch(launch, flush, stream, options.warmup,
-                                                    options.repeat);
+                timing =
+                    bench::measure_cold_launch(launch, flush, cuda, options.warmup, options.repeat);
             }
             if (tokens == 1) { t1_median = timing.median_us; }
 

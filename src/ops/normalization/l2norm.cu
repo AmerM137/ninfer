@@ -112,7 +112,8 @@ void require_same_shape(const Tensor& a, const Tensor& b) {
 
 } // namespace
 
-void l2norm(const Tensor& x, float eps, Tensor& out, cudaStream_t stream) {
+void l2norm(const Tensor& x, float eps, Tensor& out, CudaExecutionView execution) {
+    const auto stream = execution.stream();
     if (x.dtype != DType::BF16 || out.dtype != DType::BF16) {
         throw std::invalid_argument("l2norm: x/out must be BF16");
     }
@@ -124,6 +125,9 @@ void l2norm(const Tensor& x, float eps, Tensor& out, cudaStream_t stream) {
     (void)common::operand::numel(out, "l2norm");
     require_same_shape(x, out);
     if (n == 0) { return; }
+    if (x.device != execution.device() || out.device != execution.device()) {
+        throw std::invalid_argument("l2norm: operands must belong to the execution device");
+    }
 
     const std::int64_t rows = n / x.ne[0];
     if (rows > std::numeric_limits<int>::max()) {

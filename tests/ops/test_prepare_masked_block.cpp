@@ -1,4 +1,6 @@
 #include "core/device.h"
+#include "cuda_fixture.h"
+#include "core/buffer.h"
 #include <algorithm>
 #include "ninfer/ops/sequence.h"
 #include "ops/op_tester.h"
@@ -44,13 +46,13 @@ int run_case(int block_size, std::int32_t anchor_value, std::int32_t length_valu
     ids.fill(0xcd);
     positions.fill(0xef);
 
-    Tensor anchor_tensor(anchor.p, DType::I32, {1});
-    Tensor length_tensor(length.p, DType::I32, {1});
-    Tensor valid_tensor(valid.p, DType::I32, {1});
-    Tensor ids_tensor(ids.data(), DType::I32, {block_size, 1});
-    Tensor positions_tensor(positions.data(), DType::I32, {block_size, 1});
+    Tensor anchor_tensor(anchor.span(), DType::I32, {1});
+    Tensor length_tensor(length.span(), DType::I32, {1});
+    Tensor valid_tensor(valid.span(), DType::I32, {1});
+    Tensor ids_tensor(ids.span(), DType::I32, {block_size, 1});
+    Tensor positions_tensor(positions.span(), DType::I32, {block_size, 1});
     ops::prepare_masked_block(anchor_tensor, length_tensor, valid_tensor, kMaskId, ids_tensor,
-                              positions_tensor, nullptr);
+                              positions_tensor, ninfer::test::cuda_environment().default_execution);
     cuda_synchronize();
 
     const std::string label = "prepare_masked_block W=" + std::to_string(block_size);
@@ -85,15 +87,18 @@ int run_batch_case(int width, int batch, bool dense) {
     GuardedDeviceBuffer positions(ids.bytes());
     ids.fill(0xcd);
     positions.fill(0xef);
-    Tensor a(device_anchors.p, DType::I32, {batch});
-    Tensor l(device_lengths.p, DType::I32, {batch});
-    Tensor v(device_valid.p, DType::I32, {batch});
-    Tensor out(ids.data(), DType::I32, {width, batch});
-    Tensor pos(positions.data(), DType::I32, {width, batch});
+    Tensor a(device_anchors.span(), DType::I32, {batch});
+    Tensor l(device_lengths.span(), DType::I32, {batch});
+    Tensor v(device_valid.span(), DType::I32, {batch});
+    Tensor out(ids.span(), DType::I32, {width, batch});
+    Tensor pos(positions.span(), DType::I32, {width, batch});
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    const auto stream_execution = ninfer::test::cuda_environment().context.execution_view(stream);
     cuda_synchronize();
-    const auto launch = [&] { ops::prepare_masked_block(a, l, v, mask, out, pos, stream); };
+    const auto launch = [&] {
+        ops::prepare_masked_block(a, l, v, mask, out, pos, stream_execution);
+    };
     launch();
     CUDA_CHECK(cudaStreamSynchronize(stream));
     if (width == 16 && batch == 8) {
@@ -106,9 +111,12 @@ int run_batch_case(int width, int batch, bool dense) {
         CUDA_CHECK(cudaGraphLaunch(executable, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
         for (int b = 0; b < batch; ++b) { anchors[b] += 11; lengths[b] += 7; valid[b] = 1 + valid[b] % width; }
-        CUDA_CHECK(cudaMemcpyAsync(device_anchors.p, anchors.data(), device_anchors.bytes, cudaMemcpyHostToDevice, stream));
-        CUDA_CHECK(cudaMemcpyAsync(device_lengths.p, lengths.data(), device_lengths.bytes, cudaMemcpyHostToDevice, stream));
-        CUDA_CHECK(cudaMemcpyAsync(device_valid.p, valid.data(), device_valid.bytes, cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(device_anchors.data(), anchors.data(), device_anchors.size(),
+                                   cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(device_lengths.data(), lengths.data(), device_lengths.size(),
+                                   cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(device_valid.data(), valid.data(), device_valid.size(),
+                                   cudaMemcpyHostToDevice, stream));
         CUDA_CHECK(cudaGraphLaunch(executable, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
         CUDA_CHECK(cudaGraphExecDestroy(executable));

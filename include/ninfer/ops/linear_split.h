@@ -4,7 +4,7 @@
 #include "core/tensor.h"
 #include "ninfer/ops/projection_weights.h"
 
-#include <cuda_runtime.h>
+#include "core/device.h"
 #include <span>
 
 namespace ninfer::ops {
@@ -27,11 +27,12 @@ namespace ninfer::ops {
  * allocates no hidden device memory, owns no persistent state and supports Graph replay.
  */
 void linear_split(const Tensor& x, const ProjectionWeights& weights,
-                  std::span<const Tensor> outputs, WorkspaceArena& workspace, cudaStream_t stream);
+                  std::span<const Tensor> outputs, MemoryArena& workspace,
+                  CudaExecutionView execution);
 
 /** Single-parent A16 computation with no transient workspace. */
 void linear_split(const Tensor& x, const Weight& weight, std::span<const Tensor> outputs,
-                  cudaStream_t stream);
+                  CudaExecutionView execution);
 
 /**
  * Minimum call-local capacity covering inclusive [min_columns,max_columns], both positive.

@@ -1,4 +1,5 @@
 #include "core/device.h"
+#include "cuda_fixture.h"
 #include "ninfer/ops/sigmoid_mul.h"
 #include "ops/op_tester.h"
 
@@ -48,9 +49,9 @@ int run_case(const char* label, std::int32_t rows, std::int32_t columns, std::ui
     device_gate.copy_from_host(gate_bits.data(), device_gate.bytes());
     device_x.copy_from_host(x_bits.data(), device_x.bytes());
 
-    Tensor gate_tensor(device_gate.data(), DType::BF16, {rows, columns});
-    Tensor x_tensor(device_x.data(), DType::BF16, {rows, columns});
-    ops::sigmoid_mul(gate_tensor, x_tensor, nullptr);
+    Tensor gate_tensor(device_gate.span(), DType::BF16, {rows, columns});
+    Tensor x_tensor(device_x.span(), DType::BF16, {rows, columns});
+    ops::sigmoid_mul(gate_tensor, x_tensor, ninfer::test::cuda_environment().default_execution);
     cuda_synchronize();
 
     if (graph) {
@@ -58,8 +59,10 @@ int run_case(const char* label, std::int32_t rows, std::int32_t columns, std::ui
         cudaGraph_t captured;
         cudaGraphExec_t executable;
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+        const auto stream_execution =
+            ninfer::test::cuda_environment().context.execution_view(stream);
         CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
-        ops::sigmoid_mul(gate_tensor, x_tensor, stream);
+        ops::sigmoid_mul(gate_tensor, x_tensor, stream_execution);
         CUDA_CHECK(cudaStreamEndCapture(stream, &captured));
         CUDA_CHECK(cudaGraphInstantiate(&executable, captured, nullptr, nullptr, 0));
         for (int replay = 0; replay < 2; ++replay) {
@@ -96,9 +99,9 @@ int run_edge_case() {
     device_gate.copy_from_host(gate_bits.data(), device_gate.bytes());
     device_x.copy_from_host(x_bits.data(), device_x.bytes());
 
-    Tensor gate_tensor(device_gate.data(), DType::BF16, {static_cast<int>(gate.size())});
-    Tensor x_tensor(device_x.data(), DType::BF16, {static_cast<int>(x.size())});
-    ops::sigmoid_mul(gate_tensor, x_tensor, nullptr);
+    Tensor gate_tensor(device_gate.span(), DType::BF16, {static_cast<int>(gate.size())});
+    Tensor x_tensor(device_x.span(), DType::BF16, {static_cast<int>(x.size())});
+    ops::sigmoid_mul(gate_tensor, x_tensor, ninfer::test::cuda_environment().default_execution);
     cuda_synchronize();
 
     int failures = verify_pointwise("sigmoid_mul edge values",

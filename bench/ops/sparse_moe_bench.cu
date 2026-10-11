@@ -5,6 +5,7 @@
 // behind ninfer::ops::sparse_moe().
 
 #include "core/weight.h"
+#include "core/buffer.h"
 #include "ninfer/ops/sparse_moe.h"
 
 #include "core/device.h"
@@ -484,12 +485,13 @@ RoutePattern make_route_pattern(std::int32_t tokens, ExpertDistribution distribu
     return result;
 }
 
-Weight dense_weight(void* data, std::int32_t rows, std::int32_t columns) {
+Weight dense_weight(ConstMemorySpan storage, std::int32_t rows, std::int32_t columns) {
     Weight result{};
-    result.payload         = data;
+    result.device          = storage.device;
+    result.payload         = storage.data;
     result.payload_bytes   = static_cast<std::uint64_t>(rows) * columns * 2ULL;
     result.qtype           = QType::BF16;
-    result.qdata           = data;
+    result.qdata           = storage.data;
     result.n               = rows;
     result.k               = columns;
     result.layout          = QuantLayout::Contiguous;
@@ -504,7 +506,8 @@ Weight dense_weight(void* data, std::int32_t rows, std::int32_t columns) {
 class BenchmarkWeights {
 public:
     BenchmarkWeights(CodecProfile profile, std::uint32_t seed, std::size_t flush_bytes)
-        : router_(static_cast<std::size_t>(kRouterRows) * kHidden * 2),
+        : router_(ninfer::bench::device_context().device(),
+                  static_cast<std::size_t>(kRouterRows) * kHidden * 2),
           routed_gate_(bench::make_row_split_weight(gate_codec(profile), kExperts * 1024, kHidden,
                                                     kHidden, seed ^ 501U)),
           routed_down_(bench::make_row_split_weight(down_codec(profile), kExperts * kHidden,
@@ -520,11 +523,11 @@ public:
             router[static_cast<std::size_t>(expert) * kHidden + expert] = bench::f32_to_bf16(16.0F);
         }
         router[static_cast<std::size_t>(kExperts) * kHidden + kExperts] = bench::f32_to_bf16(4.0F);
-        router_.copy_from_host(router.data(), router_.bytes);
-        bench::flush_l2(flush_, nullptr);
+        router_.copy_from_host(router.data(), router_.size());
+        bench::flush_l2(flush_, bench::default_execution());
 
         weights_ = {
-            dense_weight(router_.p, kRouterRows, kHidden),
+            dense_weight(router_.span(), kRouterRows, kHidden),
             routed_gate_.weight,
             routed_down_.weight,
             shared_gate_.weight,
@@ -535,7 +538,7 @@ public:
 
     [[nodiscard]] const ops::SparseMoeWeights& weights() const noexcept { return weights_; }
 
-    void flush(cudaStream_t stream) { bench::flush_l2(flush_, stream); }
+    void flush(CudaExecutionView cuda) { bench::flush_l2(flush_, cuda); }
 
 private:
     DeviceBuffer router_;
@@ -550,16 +553,18 @@ private:
 class BenchmarkState {
 public:
     BenchmarkState(BenchmarkWeights& fixture, CodecProfile profile, std::int32_t tokens,
-                   ExpertDistribution distribution, std::uint32_t seed,
-                   DeviceExecutionView execution)
-        : fixture_(fixture), execution_(execution),
-          route_pattern_(make_route_pattern(tokens, distribution, seed)),
-          input_(static_cast<std::size_t>(tokens) * kHidden * 2),
-          residual_(static_cast<std::size_t>(tokens) * kHidden * 2),
-          destination_(static_cast<std::size_t>(tokens) * kHidden * 2),
+                   ExpertDistribution distribution, std::uint32_t seed)
+        : fixture_(fixture), route_pattern_(make_route_pattern(tokens, distribution, seed)),
+          input_(ninfer::bench::device_context().device(),
+                 static_cast<std::size_t>(tokens) * kHidden * 2),
+          residual_(ninfer::bench::device_context().device(),
+                    static_cast<std::size_t>(tokens) * kHidden * 2),
+          destination_(ninfer::bench::device_context().device(),
+                       static_cast<std::size_t>(tokens) * kHidden * 2),
           workspace_bytes_(ops::sparse_moe_workspace_capacity_bytes(
               gate_codec(profile), down_codec(profile), tokens, tokens)),
-          workspace_(workspace_bytes_) {
+          workspace_storage_(bench::make_buffer(workspace_bytes_)),
+          workspace_(workspace_storage_.span()) {
         std::vector<std::uint16_t> input(static_cast<std::size_t>(tokens) * kHidden);
         std::vector<std::uint16_t> residual(static_cast<std::size_t>(tokens) * kHidden);
         for (std::int32_t token = 0; token < tokens; ++token) {
@@ -582,13 +587,13 @@ public:
             input[static_cast<std::size_t>(token) * kHidden + kExperts] =
                 bench::f32_to_bf16(0.0625F);
         }
-        input_.copy_from_host(input.data(), input_.bytes);
-        residual_.copy_from_host(residual.data(), residual_.bytes);
-        CUDA_CHECK(
-            cudaMemcpy(destination_.p, residual_.p, destination_.bytes, cudaMemcpyDeviceToDevice));
+        input_.copy_from_host(input.data(), input_.size());
+        residual_.copy_from_host(residual.data(), residual_.size());
+        CUDA_CHECK(cudaMemcpy(destination_.data(), residual_.data(), destination_.size(),
+                              cudaMemcpyDeviceToDevice));
 
-        x_                  = Tensor(input_.p, DType::BF16, {kHidden, tokens});
-        destination_tensor_ = Tensor(destination_.p, DType::BF16, {kHidden, tokens});
+        x_                  = Tensor(input_.span(), DType::BF16, {kHidden, tokens});
+        destination_tensor_ = Tensor(destination_.span(), DType::BF16, {kHidden, tokens});
         CUDA_CHECK(cudaDeviceSynchronize());
     }
 
@@ -596,26 +601,27 @@ public:
 
     [[nodiscard]] std::size_t workspace_bytes() const noexcept { return workspace_bytes_; }
 
-    void prepare(CacheState cache, cudaStream_t stream) {
-        if (cache == CacheState::Cold) { fixture_.flush(stream); }
-        CUDA_CHECK(cudaMemcpyAsync(destination_.p, residual_.p, destination_.bytes,
+    void prepare(CacheState cache, CudaExecutionView cuda) {
+        const auto stream = cuda.stream();
+        if (cache == CacheState::Cold) { fixture_.flush(cuda); }
+        CUDA_CHECK(cudaMemcpyAsync(destination_.data(), residual_.data(), destination_.size(),
                                    cudaMemcpyDeviceToDevice, stream));
     }
 
-    void launch(cudaStream_t stream) {
+    void launch(CudaExecutionView cuda) {
         ops::sparse_moe(x_, fixture_.weights(), ops::SparseMoeEpilogue::AddResidual,
-                        destination_tensor_, workspace_, execution_.on_stream(stream));
+                        destination_tensor_, workspace_, cuda);
     }
 
 private:
     BenchmarkWeights& fixture_;
-    DeviceExecutionView execution_;
     RoutePattern route_pattern_;
     DeviceBuffer input_;
     DeviceBuffer residual_;
     DeviceBuffer destination_;
     std::size_t workspace_bytes_;
-    WorkspaceArena workspace_;
+    DeviceBuffer workspace_storage_;
+    MemoryArena workspace_;
     Tensor x_;
     Tensor destination_tensor_;
 };
@@ -640,10 +646,11 @@ public:
     BodyTimedGraph& operator=(const BodyTimedGraph&) = delete;
 
     template <class Launch>
-    void capture(cudaStream_t stream, Launch&& launch) {
+    void capture(CudaExecutionView cuda, Launch&& launch) {
+        const auto stream = cuda.stream();
         CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
         CUDA_CHECK(cudaEventRecordWithFlags(body_start_, stream, cudaEventRecordExternal));
-        launch(stream);
+        launch(cuda);
         CUDA_CHECK(cudaEventRecordWithFlags(body_stop_, stream, cudaEventRecordExternal));
         CUDA_CHECK(cudaStreamEndCapture(stream, &graph_));
         CUDA_CHECK(cudaGraphInstantiate(&exec_, graph_, 0));
@@ -652,10 +659,14 @@ public:
         if (nodes < 3) { throw std::runtime_error("SparseMoe capture produced an empty graph"); }
     }
 
-    void launch(cudaStream_t stream) const { CUDA_CHECK(cudaGraphLaunch(exec_, stream)); }
+    void launch(CudaExecutionView cuda) const {
+        const auto stream = cuda.stream();
+        CUDA_CHECK(cudaGraphLaunch(exec_, stream));
+    }
 
-    double launch_body_timed(cudaStream_t stream) const {
-        launch(stream);
+    double launch_body_timed(CudaExecutionView cuda) const {
+        const auto stream = cuda.stream();
+        launch(cuda);
         CUDA_CHECK(cudaEventRecord(completion_, stream));
         CUDA_CHECK(cudaEventSynchronize(completion_));
         float milliseconds = 0.0F;
@@ -683,24 +694,25 @@ Stats summarize(std::vector<double> samples) {
     return {percentile(0.50), samples.front(), percentile(0.95)};
 }
 
-Stats measure_eager(BenchmarkState& state, CacheState cache, cudaStream_t stream, int warmup,
+Stats measure_eager(BenchmarkState& state, CacheState cache, CudaExecutionView cuda, int warmup,
                     int repeat) {
+    const auto stream = cuda.stream();
     cudaEvent_t start = nullptr;
     cudaEvent_t stop  = nullptr;
     CUDA_CHECK(cudaEventCreate(&start));
     CUDA_CHECK(cudaEventCreate(&stop));
     for (int index = 0; index < warmup; ++index) {
-        state.prepare(cache, stream);
-        state.launch(stream);
+        state.prepare(cache, cuda);
+        state.launch(cuda);
     }
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     std::vector<double> samples;
     samples.reserve(static_cast<std::size_t>(repeat));
     for (int index = 0; index < repeat; ++index) {
-        state.prepare(cache, stream);
+        state.prepare(cache, cuda);
         CUDA_CHECK(cudaEventRecord(start, stream));
-        state.launch(stream);
+        state.launch(cuda);
         CUDA_CHECK(cudaEventRecord(stop, stream));
         CUDA_CHECK(cudaEventSynchronize(stop));
         float milliseconds = 0.0F;
@@ -713,41 +725,42 @@ Stats measure_eager(BenchmarkState& state, CacheState cache, cudaStream_t stream
 }
 
 Stats measure_graph(BenchmarkState& state, const BodyTimedGraph& graph, CacheState cache,
-                    cudaStream_t stream, int warmup, int repeat) {
+                    CudaExecutionView cuda, int warmup, int repeat) {
+    const auto stream = cuda.stream();
     for (int index = 0; index < warmup; ++index) {
-        state.prepare(cache, stream);
-        graph.launch(stream);
+        state.prepare(cache, cuda);
+        graph.launch(cuda);
     }
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     std::vector<double> samples;
     samples.reserve(static_cast<std::size_t>(repeat));
     for (int index = 0; index < repeat; ++index) {
-        state.prepare(cache, stream);
-        samples.push_back(graph.launch_body_timed(stream));
+        state.prepare(cache, cuda);
+        samples.push_back(graph.launch_body_timed(cuda));
     }
     return summarize(std::move(samples));
 }
 
 std::vector<Result> run_point(BenchmarkWeights& fixture, CodecProfile profile, std::int32_t tokens,
-                              const Options& options, DeviceExecutionView device_execution) {
-    const cudaStream_t stream = device_execution.stream;
-    BenchmarkState state(fixture, profile, tokens, options.distribution, options.seed,
-                         device_execution);
+                              const Options& options, CudaExecutionView device_execution) {
+    const auto cuda   = device_execution;
+    const auto stream = cuda.stream();
+    BenchmarkState state(fixture, profile, tokens, options.distribution, options.seed);
 
     // Match the production graph lifecycle: materialize eagerly, capture from a
     // reset state, instantiate, then prime one replay before configured warmup.
-    state.prepare(CacheState::Warm, stream);
-    state.launch(stream);
+    state.prepare(CacheState::Warm, cuda);
+    state.launch(cuda);
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     BodyTimedGraph graph;
     if (options.execution != Execution::Eager) {
-        state.prepare(CacheState::Warm, stream);
+        state.prepare(CacheState::Warm, cuda);
         CUDA_CHECK(cudaStreamSynchronize(stream));
-        graph.capture(stream, [&](cudaStream_t launch_stream) { state.launch(launch_stream); });
-        state.prepare(CacheState::Warm, stream);
-        graph.launch(stream);
+        graph.capture(cuda, [&](CudaExecutionView cuda) { state.launch(cuda); });
+        state.prepare(CacheState::Warm, cuda);
+        graph.launch(cuda);
         CUDA_CHECK(cudaStreamSynchronize(stream));
     }
 
@@ -757,8 +770,8 @@ std::vector<Result> run_point(BenchmarkWeights& fixture, CodecProfile profile, s
         for (CacheState cache : selected_caches(options.cache)) {
             const Stats stats =
                 execution == Execution::Graph
-                    ? measure_graph(state, graph, cache, stream, options.warmup, options.repeat)
-                    : measure_eager(state, cache, stream, options.warmup, options.repeat);
+                    ? measure_graph(state, graph, cache, cuda, options.warmup, options.repeat)
+                    : measure_eager(state, cache, cuda, options.warmup, options.repeat);
             results.push_back({profile, tokens, options.distribution, options.seed,
                                pattern.unique_experts, pattern.adjacent_overlap, execution, cache,
                                stats, state.workspace_bytes()});
@@ -793,7 +806,7 @@ void write_csv(const std::string& path, const std::vector<Result>& results, cons
     if (!stream) { throw std::runtime_error("failed to open CSV output"); }
     int runtime = 0;
     CUDA_CHECK(cudaRuntimeGetVersion(&runtime));
-    const double peak_memory_gbps = theoretical_memory_gbps(context.device);
+    const double peak_memory_gbps = theoretical_memory_gbps(context.device().index());
     stream << "codec,tokens,distribution,seed,unique_experts,adjacent_overlap,execution,"
               "timed_scope,cache,median_us,min_us,p95_us,unique_weight_gbps,"
               "unique_weight_peak_percent,logical_tflops,workspace_bytes,warmup,repeat,"
@@ -816,7 +829,7 @@ void write_csv(const std::string& path, const std::vector<Result>& results, cons
 #else
                << "Debug"
 #endif
-               << ',' << context.props.name << ',' << runtime << '\n';
+               << ',' << context.properties().name << ',' << runtime << '\n';
     }
 }
 
@@ -824,13 +837,13 @@ void write_csv(const std::string& path, const std::vector<Result>& results, cons
 
 int main(int argc, char** argv) {
     try {
-        const Options options = parse_options(argc, argv);
-        DeviceContext context;
-        const double peak_memory_gbps = theoretical_memory_gbps(context.device);
+        const Options options         = parse_options(argc, argv);
+        auto& context                 = ninfer::bench::device_context();
+        const double peak_memory_gbps = theoretical_memory_gbps(context.device().index());
         std::printf("# gpu=%s compute_capability=%d execution=%s "
                     "timed_scope=full_sparse_moe_device_body cold_flush_mib=%llu "
                     "theoretical_memory=%.1f GB/s\n",
-                    context.props.name, context.compute_capability(),
+                    context.properties().name, context.compute_capability(),
                     options.execution == Execution::Both ? "both"
                                                          : execution_name(options.execution),
                     static_cast<unsigned long long>(options.flush_bytes >> 20), peak_memory_gbps);

@@ -6,9 +6,9 @@ namespace ninfer::ops::detail::gdn_control {
 
 void execute_projection(const Tensor& x, const Weights& weights, const Tensor& a_log,
                         const Tensor& dt_bias, GdnControlOutputs out, Plan plan, Scratch scratch,
-                        DeviceExecutionView execution);
+                        CudaExecutionView execution);
 void execute_norm(const Tensor& x, const Tensor& norm_weight, float eps, const Weights& weights,
                   const Tensor& a_log, const Tensor& dt_bias, GdnNormControlOutputs out,
-                  NormPlan plan, Scratch scratch, DeviceExecutionView execution);
+                  NormPlan plan, Scratch scratch, CudaExecutionView execution);
 
 } // namespace ninfer::ops::detail::gdn_control

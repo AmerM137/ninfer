@@ -38,11 +38,7 @@ void require_tensor_layout(const Tensor& tensor, const char* label, std::int32_t
     }
 }
 
-void require_common(const Tensor& positions, int rotary_dim, float theta,
-                    DeviceExecutionView execution) {
-    if (execution.multiprocessor_count <= 0) {
-        throw std::invalid_argument("rope: positive multiprocessor count required");
-    }
+void require_common(const Tensor& positions, int rotary_dim, float theta) {
     if (positions.dtype != DType::I32) {
         throw std::invalid_argument("rope: positions must be I32");
     }
@@ -82,8 +78,8 @@ void require_rotary_geometry(int axes, int rotary_dim, std::int32_t head_dim) {
 } // namespace
 
 void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& q, Tensor& k,
-          DeviceExecutionView execution) {
-    require_common(positions, rotary_dim, theta, execution);
+          CudaExecutionView execution) {
+    require_common(positions, rotary_dim, theta);
     if (q.dtype != DType::BF16 || k.dtype != DType::BF16) {
         throw std::invalid_argument("rope: q/k must be BF16");
     }
@@ -99,7 +95,10 @@ void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& q, Tenso
     require_tensor_layout(q, "q", head_dim, q_heads, tokens);
     require_tensor_layout(k, "k", head_dim, k_heads, tokens);
     if (q_numel == 0) { return; }
+    common::operand::device(positions.device, execution.device(), "rope", "positions");
     require_positions_storage(positions);
+    common::operand::device(q.device, execution.device(), "rope", "query");
+    common::operand::device(k.device, execution.device(), "rope", "key");
     if (q.data == nullptr || k.data == nullptr) {
         throw std::invalid_argument("rope: q/k data must be non-null");
     }
@@ -107,8 +106,8 @@ void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& q, Tenso
 }
 
 void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& x,
-          DeviceExecutionView execution) {
-    require_common(positions, rotary_dim, theta, execution);
+          CudaExecutionView execution) {
+    require_common(positions, rotary_dim, theta);
     if (x.dtype != DType::BF16) { throw std::invalid_argument("rope: tensor must be BF16"); }
     (void)common::operand::numel(positions, "rope");
     const std::int64_t x_numel  = common::operand::numel(x, "rope");
@@ -119,7 +118,9 @@ void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& x,
     require_rotary_geometry(axes, rotary_dim, head_dim);
     require_tensor_layout(x, "tensor", head_dim, heads, tokens);
     if (x_numel == 0) { return; }
+    common::operand::device(positions.device, execution.device(), "rope", "positions");
     require_positions_storage(positions);
+    common::operand::device(x.device, execution.device(), "rope", "input");
     if (x.data == nullptr) { throw std::invalid_argument("rope: tensor data must be non-null"); }
     detail::rope_dispatch(positions, rotary_dim, theta, x, execution);
 }

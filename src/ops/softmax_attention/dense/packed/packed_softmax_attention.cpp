@@ -53,9 +53,13 @@ std::size_t packed_softmax_attention_workspace_capacity_bytes(AttentionHeadGeome
 
 void packed_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                               AttentionHeadGeometry geometry, float scale, const Tensor& cu_seqlens,
-                              WorkspaceArena& workspace, Tensor& out, cudaStream_t stream) {
-    const std::int32_t tokens =
-        detail::noncausal::validate_qkv(q, k, v, out, geometry, scale, "packed_softmax_attention");
+                              MemoryArena& workspace, Tensor& out, CudaExecutionView execution) {
+    const auto stream         = execution.stream();
+    const std::int32_t tokens = detail::noncausal::validate_qkv(
+        q, k, v, out, geometry, scale, "packed_softmax_attention", execution.device());
+    common::operand::device(cu_seqlens.device, execution.device(), "packed attention", "segments");
+    common::operand::device(workspace.device(), execution.device(), "packed attention",
+                            "workspace");
     const std::int32_t segments = cu_seqlens.ne[0] - 1;
     if (cu_seqlens.dtype != DType::I32 || segments <= 0 || segments > tokens ||
         cu_seqlens.ne[1] != 1 || cu_seqlens.ne[2] != 1 || cu_seqlens.ne[3] != 1 ||
@@ -71,9 +75,11 @@ void packed_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
 
 void packed_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                               AttentionHeadGeometry geometry, float scale,
-                              std::int32_t segment_length, Tensor& out, cudaStream_t stream) {
-    const std::int32_t tokens =
-        detail::noncausal::validate_qkv(q, k, v, out, geometry, scale, "packed_softmax_attention");
+                              std::int32_t segment_length, Tensor& out,
+                              CudaExecutionView execution) {
+    const auto stream         = execution.stream();
+    const std::int32_t tokens = detail::noncausal::validate_qkv(
+        q, k, v, out, geometry, scale, "packed_softmax_attention", execution.device());
     if (segment_length <= 0 || tokens % segment_length != 0) {
         throw std::invalid_argument("packed_softmax_attention: invalid uniform segment length");
     }

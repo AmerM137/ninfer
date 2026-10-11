@@ -204,7 +204,8 @@ void launch_silu_mul(const Tensor& gate, const Tensor& up, Tensor& out, cudaStre
 
 } // namespace
 
-void silu_mul(const Tensor& gate, const Tensor& up, Tensor& out, cudaStream_t stream) {
+void silu_mul(const Tensor& gate, const Tensor& up, Tensor& out, CudaExecutionView execution) {
+    const auto stream = execution.stream();
     if (gate.dtype != DType::BF16 || up.dtype != DType::BF16 || out.dtype != DType::BF16) {
         throw std::invalid_argument("silu_mul: gate/up/out must be BF16");
     }
@@ -215,6 +216,10 @@ void silu_mul(const Tensor& gate, const Tensor& up, Tensor& out, cudaStream_t st
     }
     if (!out.is_contiguous()) { throw std::invalid_argument("silu_mul: out must be contiguous"); }
     if (out.numel() == 0) { return; }
+    if (gate.device != execution.device() || up.device != execution.device() ||
+        out.device != execution.device()) {
+        throw std::invalid_argument("silu_mul: operands must belong to the execution device");
+    }
     if (gate.data == nullptr || up.data == nullptr || out.data == nullptr) {
         throw std::invalid_argument("silu_mul: gate/up/out data must be non-null");
     }

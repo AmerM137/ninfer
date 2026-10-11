@@ -1,7 +1,7 @@
 #pragma once
 
+#include "core/device.h"
 #include "core/tensor.h"
-#include <cuda_runtime.h>
 #include <cstdint>
 
 namespace ninfer::ops {
@@ -14,7 +14,8 @@ namespace ninfer::ops {
  * Copies BF16 bits exactly and preserves unselected columns. Inputs and destination do not
  * overlap. An empty source does no work. No workspace or other state is used.
  */
-void scatter(const Tensor& source, const Tensor& indices, Tensor& destination, cudaStream_t stream);
+void scatter(const Tensor& source, const Tensor& indices, Tensor& destination,
+             CudaExecutionView execution);
 
 /**
  * destination[:,j,lanes[b]] = source[:,j,b], for j < valid_columns[b].
@@ -29,7 +30,7 @@ void scatter(const Tensor& source, const Tensor& indices, Tensor& destination, c
  * the destination slice are preserved. Zero counts read no source values. No workspace is used.
  */
 void scatter_bf16_batch(const Tensor& source, const Tensor& lanes, const Tensor& valid_columns,
-                        Tensor& destination, cudaStream_t stream);
+                        Tensor& destination, CudaExecutionView execution);
 
 /**
  * destination[d,t] = source[feature_offset+d,t].
@@ -39,7 +40,7 @@ void scatter_bf16_batch(const Tensor& source, const Tensor& lanes, const Tensor&
  * bits exactly, writes all of destination and preserves source. No workspace is used.
  */
 void extract_bf16_features(const Tensor& source, std::int32_t feature_offset, Tensor& destination,
-                           cudaStream_t stream);
+                           CudaExecutionView execution);
 
 /**
  * out[:,b] = source[:,selectors[b],b].
@@ -47,14 +48,14 @@ void extract_bf16_features(const Tensor& source, std::int32_t feature_offset, Te
  * out is distinct contiguous BF16 [D,B]. Copies BF16 bits exactly. No workspace or state.
  */
 void gather_bf16_batch_columns(const Tensor& source, const Tensor& selectors, Tensor& out,
-                               cudaStream_t stream);
+                               CudaExecutionView execution);
 
 /**
  * ids[i] = id_map[ids[i]]. The nonempty I32 ids vector is contiguous and updated in place.
  * id_map is a distinct device I32 array [count]; input ids lie in [0,count).
  */
 void remap_ids_inplace(Tensor& ids, const std::int32_t* id_map, std::int32_t count,
-                       cudaStream_t stream);
+                       CudaExecutionView execution);
 
 /**
  * out[0:D,t] = first[:,t]; out[D:2D,t] = second[:,t].
@@ -62,7 +63,7 @@ void remap_ids_inplace(Tensor& ids, const std::int32_t* id_map, std::int32_t cou
  * Copies BF16 bits exactly. Inputs and output do not alias; no workspace or state.
  */
 void concat_bf16_features(const Tensor& first, const Tensor& second, Tensor& out,
-                          cudaStream_t stream);
+                          CudaExecutionView execution);
 
 /**
  * Split contiguous BF16 source [14336,T] into successive feature intervals of widths
@@ -71,6 +72,6 @@ void concat_bf16_features(const Tensor& first, const Tensor& second, Tensor& out
  * T is positive and every output is overwritten. No workspace or state.
  */
 void split_bf16_features(const Tensor& source, Tensor& first, Tensor& second, Tensor& third,
-                         Tensor& fourth, cudaStream_t stream);
+                         Tensor& fourth, CudaExecutionView execution);
 
 } // namespace ninfer::ops

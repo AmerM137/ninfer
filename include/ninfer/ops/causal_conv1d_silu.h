@@ -1,8 +1,8 @@
 #pragma once
 
+#include "core/device.h"
 #include "core/tensor.h"
 
-#include <cuda_runtime.h>
 
 namespace ninfer::ops {
 
@@ -21,12 +21,12 @@ namespace ninfer::ops {
 
 // Reads conv_state as the initial window and replaces it with the final three values after x.
 void causal_conv1d_silu(const Tensor& x, const Tensor& weight, Tensor& conv_state, Tensor& out,
-                        cudaStream_t stream);
+                        CudaExecutionView execution);
 
 // Distinct-state form. conv_state_in and conv_state_out may be disjoint or exactly the same
 // storage; conv_state_out receives the trailing width-3 window of concat(conv_state_in,x).
 void causal_conv1d_silu(const Tensor& x, const Tensor& weight, const Tensor& conv_state_in,
-                        Tensor& conv_state_out, Tensor& out, cudaStream_t stream);
+                        Tensor& conv_state_out, Tensor& out, CudaExecutionView execution);
 
 // Split-output form. `ideal` is unchanged; its rows are written to three destinations instead of
 // one, partitioned in row order as out0, out1, out2. Every destination is contiguous BF16 with the
@@ -36,7 +36,7 @@ void causal_conv1d_silu(const Tensor& x, const Tensor& weight, const Tensor& con
 // same storage. No destination may overlap another, x, weight, or either state.
 void causal_conv1d_silu_split(const Tensor& x, const Tensor& weight, const Tensor& conv_state_in,
                               Tensor& conv_state_out, Tensor& out0, Tensor& out1, Tensor& out2,
-                              cudaStream_t stream);
+                              CudaExecutionView execution);
 
 /**
  * Snapshot form for B independent sequences. `x` and `out` are contiguous BF16 [C,W,B],
@@ -55,6 +55,6 @@ void causal_conv1d_silu_split(const Tensor& x, const Tensor& weight, const Tenso
 void causal_conv1d_silu_snapshot(const Tensor& x, const Tensor& weight, Tensor& conv_states,
                                  const Tensor& valid_columns, const Tensor& initial_state_slots,
                                  const Tensor& snapshot_base_slots, Tensor& out,
-                                 cudaStream_t stream);
+                                 CudaExecutionView execution);
 
 } // namespace ninfer::ops

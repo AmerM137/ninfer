@@ -1,4 +1,5 @@
 #include "ninfer/ops/rmsnorm_pack_tail.h"
+#include "cuda_fixture.h"
 #include "core/decode_graph.h"
 
 #include "ops/norm_test_common.h"
@@ -68,18 +69,21 @@ int run_case(std::int32_t width, std::int32_t batch, std::uint32_t seed, bool gr
     GuardedDeviceBuffer output(output_count * sizeof(std::uint16_t));
     output.fill(0xff);
 
-    Tensor input_tensor(device_input.data, DType::BF16, {kRows, width, batch});
-    Tensor weight_tensor(device_weight.data, DType::BF16, {kRows});
-    Tensor output_tensor(output.data(), DType::BF16, {kRows, (width - 1) * batch});
+    Tensor input_tensor(device_input.memory, DType::BF16, {kRows, width, batch});
+    Tensor weight_tensor(device_weight.memory, DType::BF16, {kRows});
+    Tensor output_tensor(output.span(), DType::BF16, {kRows, (width - 1) * batch});
     if (graph) {
         cuda_check(cudaStreamSynchronize(nullptr), "finish fixture initialization");
         cudaStream_t stream = nullptr;
         cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "create stream");
+        const auto stream_execution =
+            ninfer::test::cuda_environment().context.execution_view(stream);
         {
             DecodeGraphDefinition definition;
             DecodeGraphExecutable executable;
             definition.capture(stream, [&] {
-                ops::rmsnorm_pack_tail(input_tensor, weight_tensor, output_tensor, stream);
+                ops::rmsnorm_pack_tail(input_tensor, weight_tensor, output_tensor,
+                                       stream_execution);
             });
             executable.instantiate(definition);
             for (int replay = 0; replay < 2; ++replay) {
@@ -89,7 +93,8 @@ int run_case(std::int32_t width, std::int32_t batch, std::uint32_t seed, bool gr
         }
         cuda_check(cudaStreamDestroy(stream), "destroy stream");
     } else {
-        ops::rmsnorm_pack_tail(input_tensor, weight_tensor, output_tensor, nullptr);
+        ops::rmsnorm_pack_tail(input_tensor, weight_tensor, output_tensor,
+                               ninfer::test::cuda_environment().default_execution);
         cuda_synchronize();
     }
 

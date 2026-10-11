@@ -1,4 +1,5 @@
 #include "ninfer/ops/indexing.h"
+#include "core/buffer.h"
 #include "op_measurement.cuh"
 
 #include <cuda_runtime.h>
@@ -22,18 +23,20 @@ void run(std::int32_t d, std::int32_t vision_tokens, bool profile_once) {
     DeviceBuffer destination         = make_bf16(static_cast<std::size_t>(d) * prompt_tokens, 103U);
     std::vector<std::int32_t> indices(static_cast<std::size_t>(vision_tokens));
     std::iota(indices.begin(), indices.end(), 1);
-    DeviceBuffer device_indices(indices.size() * sizeof(std::int32_t));
-    cudaMemcpy(device_indices.p, indices.data(), device_indices.bytes, cudaMemcpyHostToDevice);
-    Tensor source_tensor(source.p, DType::BF16, {d, vision_tokens});
-    Tensor destination_tensor(destination.p, DType::BF16, {d, prompt_tokens});
-    Tensor indices_tensor(device_indices.p, DType::I32, {vision_tokens});
+    DeviceBuffer device_indices(ninfer::bench::device_context().device(),
+                                indices.size() * sizeof(std::int32_t));
+    cudaMemcpy(device_indices.data(), indices.data(), device_indices.size(),
+               cudaMemcpyHostToDevice);
+    Tensor source_tensor(source.span(), DType::BF16, {d, vision_tokens});
+    Tensor destination_tensor(destination.span(), DType::BF16, {d, prompt_tokens});
+    Tensor indices_tensor(device_indices.span(), DType::I32, {vision_tokens});
 
-    const auto launch = [&](cudaStream_t stream) {
-        ops::scatter(source_tensor, indices_tensor, destination_tensor, stream);
+    const auto launch = [&](CudaExecutionView cuda) {
+        ops::scatter(source_tensor, indices_tensor, destination_tensor, cuda);
     };
 
     if (profile_once) {
-        launch(nullptr);
+        launch(default_execution());
         cudaDeviceSynchronize();
         std::printf("scatter profile D=%d V=%d\n", d, vision_tokens);
         return;

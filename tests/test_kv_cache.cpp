@@ -252,9 +252,9 @@ int exercise_reservation_and_mapping(ninfer::DeviceContext& context) {
         .planes = {{ninfer::DType::I8, 8, 2, 256}},
     };
     PlannedCache plan = plan_cache(4, 4, 1, geometry);
-    ninfer::DeviceArena arena(plan.bytes);
-    ninfer::DeviceKVPagePool pool({arena.base(), arena.capacity()}, plan.pages);
-    ninfer::KVExecutionTablePool tables({arena.base(), arena.capacity()}, plan.tables, pool);
+    ninfer::DeviceBuffer arena(context.device(), plan.bytes);
+    ninfer::DeviceKVPagePool pool(arena.span(), plan.pages);
+    ninfer::KVExecutionTablePool tables(arena.span(), plan.tables, pool);
 
     std::optional<ninfer::DeviceKVPageReservation> reservation = pool.reserve(3);
     failures += expect(reservation.has_value(), "three-page reservation failed");
@@ -276,7 +276,7 @@ int exercise_reservation_and_mapping(ninfer::DeviceContext& context) {
     pool.materialize(*reservation, 2, pages);
 
     ninfer::KVExecutionRowLease row = tables.acquire(0);
-    tables.publish(row.handle(), 0, pages, context.stream);
+    tables.publish(row.handle(), 0, pages, context.stream());
     context.synchronize();
     const std::vector<std::int32_t> mapping = read_mapping(tables.row(row.handle()), pages.size());
     failures += expect(mapping == std::vector<std::int32_t>({0, 1}),
@@ -290,13 +290,13 @@ int exercise_reservation_and_mapping(ninfer::DeviceContext& context) {
     pages.back().release();
     bool stale_rejected = false;
     try {
-        pool.zero_pages(std::span<const ninfer::DeviceKVPageHandle>(&stale, 1), context.stream);
+        pool.zero_pages(std::span<const ninfer::DeviceKVPageHandle>(&stale, 1), context.stream());
     } catch (const std::invalid_argument&) { stale_rejected = true; }
     failures += expect(stale_rejected, "released page capability remained usable");
 
     PlannedCache other_plan = plan_cache(1, 1, 1, geometry);
-    ninfer::DeviceArena other_arena(other_plan.bytes);
-    ninfer::DeviceKVPagePool other({other_arena.base(), other_arena.capacity()}, other_plan.pages);
+    ninfer::DeviceBuffer other_arena(context.device(), other_plan.bytes);
+    ninfer::DeviceKVPagePool other(other_arena.span(), other_plan.pages);
     const std::uint32_t before                                = pool.reserved_pages();
     const ninfer::DeviceKVPageReservationRequest impossible[] = {
         {.pool = &pool, .pages = 2},
@@ -318,14 +318,11 @@ int exercise_layout_and_transfer(ninfer::DeviceContext& context, ninfer::KVPageG
     int failures                  = 0;
     PlannedCache source_plan      = plan_cache(10, 8, 2, geometry);
     PlannedCache destination_plan = plan_cache(10, 8, 1, geometry);
-    ninfer::DeviceArena source_arena(source_plan.bytes);
-    ninfer::DeviceArena destination_arena(destination_plan.bytes);
-    ninfer::DeviceKVPagePool source({source_arena.base(), source_arena.capacity()},
-                                    source_plan.pages);
-    ninfer::KVExecutionTablePool tables({source_arena.base(), source_arena.capacity()},
-                                        source_plan.tables, source);
-    ninfer::DeviceKVPagePool destination({destination_arena.base(), destination_arena.capacity()},
-                                         destination_plan.pages);
+    ninfer::DeviceBuffer source_arena(context.device(), source_plan.bytes);
+    ninfer::DeviceBuffer destination_arena(context.device(), destination_plan.bytes);
+    ninfer::DeviceKVPagePool source(source_arena.span(), source_plan.pages);
+    ninfer::KVExecutionTablePool tables(source_arena.span(), source_plan.tables, source);
+    ninfer::DeviceKVPagePool destination(destination_arena.span(), destination_plan.pages);
 
     failures += expect_size(source.plane_count(), geometry.planes.size(), label + " plane count");
     const ninfer::Tensor& first_plane = source.plane(0);
@@ -345,7 +342,7 @@ int exercise_layout_and_transfer(ninfer::DeviceContext& context, ninfer::KVPageG
     std::vector<ninfer::DeviceKVPageLease> fragmented            = materialize(source, 5);
     const std::vector<ninfer::DeviceKVPageHandle> source_handles = handles(fragmented);
     ninfer::KVExecutionRowLease row                              = tables.acquire(1);
-    tables.publish(row.handle(), 0, source_handles, context.stream);
+    tables.publish(row.handle(), 0, source_handles, context.stream());
     context.synchronize();
     const std::vector<std::int32_t> physical_mapping =
         read_mapping(tables.row(row.handle()), source_handles.size());
@@ -357,7 +354,7 @@ int exercise_layout_and_transfer(ninfer::DeviceContext& context, ninfer::KVPageG
                             label + " row ownership isolation");
 
     const std::vector<std::vector<unsigned char>> device_bytes =
-        fill_device_pool(source, context.stream);
+        fill_device_pool(source, context.stream());
     context.synchronize();
 
     const ninfer::HostKVPageLayout host_layout =
@@ -382,8 +379,7 @@ int exercise_layout_and_transfer(ninfer::DeviceContext& context, ninfer::KVPageG
         stale_layout.planes[i].geometry = different.planes[i];
         bool stale_rejected             = false;
         try {
-            ninfer::DeviceKVPagePool stale({source_arena.base(), source_arena.capacity()},
-                                           stale_layout);
+            ninfer::DeviceKVPagePool stale(source_arena.span(), stale_layout);
         } catch (const std::logic_error&) { stale_rejected = true; }
         failures += expect(stale_rejected, label + " Device binding accepted stale row geometry");
     }
@@ -404,7 +400,7 @@ int exercise_layout_and_transfer(ninfer::DeviceContext& context, ninfer::KVPageG
                        ninfer::TransferWork{page_payload * pages, run_operations[pages - 1]},
                    label + " contiguous-run quote differs from its physical copy work");
     }
-    const auto export_work = source.copy_to_host(source_handles, host_view, context.stream);
+    const auto export_work = source.copy_to_host(source_handles, host_view, context.stream());
     failures += expect(export_work == ninfer::TransferWork{5 * page_payload,
                                                            run_operations[2] + run_operations[1]},
                        label + " D2H work missed fragmentation or counts Host padding");
@@ -417,9 +413,9 @@ int exercise_layout_and_transfer(ninfer::DeviceContext& context, ninfer::KVPageG
 
     std::vector<ninfer::DeviceKVPageLease> restored                = materialize(destination, 5);
     const std::vector<ninfer::DeviceKVPageHandle> restored_handles = handles(restored);
-    destination.zero_pages(restored_handles, context.stream);
+    destination.zero_pages(restored_handles, context.stream());
     const auto restore_work =
-        destination.copy_from_host(host_arena.view(*host), restored_handles, context.stream);
+        destination.copy_from_host(host_arena.view(*host), restored_handles, context.stream());
     failures +=
         expect(restore_work == ninfer::TransferWork{5 * page_payload, run_operations.back()},
                label + " H2D work differs from the submitted contiguous run");
@@ -427,13 +423,13 @@ int exercise_layout_and_transfer(ninfer::DeviceContext& context, ninfer::KVPageG
     const std::array duplicate_destinations{restored[0].handle(), restored[0].handle()};
     bool duplicate_zero_rejected = false;
     try {
-        destination.zero_pages(duplicate_destinations, context.stream);
+        destination.zero_pages(duplicate_destinations, context.stream());
     } catch (const std::invalid_argument&) { duplicate_zero_rejected = true; }
     failures += expect(duplicate_zero_rejected, label + " duplicate zero destination accepted");
     bool duplicate_restore_rejected = false;
     try {
         destination.copy_from_host(host_arena.view(*host).subview(0, 2), duplicate_destinations,
-                                   context.stream);
+                                   context.stream());
     } catch (const std::invalid_argument&) { duplicate_restore_rejected = true; }
     failures += expect(duplicate_restore_rejected, label + " duplicate H2D destination accepted");
 
@@ -441,13 +437,13 @@ int exercise_layout_and_transfer(ninfer::DeviceContext& context, ninfer::KVPageG
     failures += expect(roundtrip.has_value(), label + " roundtrip Host allocation failed");
     ninfer::HostKVAllocationView roundtrip_view = host_arena.writable_view(*roundtrip);
     std::memset(roundtrip_view.data(), 0, host_layout.page_stride * roundtrip_view.page_count());
-    destination.copy_to_host(restored_handles, roundtrip_view, context.stream);
+    destination.copy_to_host(restored_handles, roundtrip_view, context.stream());
     context.synchronize();
     failures += expect(std::memcmp(roundtrip_view.data(), host_view.data(), expected.size()) == 0,
                        label + " Device -> Host -> Device roundtrip changed bytes");
 
     const auto local_work =
-        destination.copy_page(restored[0].handle(), restored[4].handle(), context.stream);
+        destination.copy_page(restored[0].handle(), restored[4].handle(), context.stream());
     const ninfer::TransferWork expected_local{page_payload,
                                               static_cast<std::uint32_t>(geometry.planes.size())};
     failures +=
@@ -455,13 +451,13 @@ int exercise_layout_and_transfer(ninfer::DeviceContext& context, ninfer::KVPageG
                    destination.device_copy_work(0) == ninfer::TransferWork{},
                label + " D2D work differs from one full page-group copy");
     failures += expect(destination.copy_page(restored[0].handle(), restored[0].handle(),
-                                             context.stream) == ninfer::TransferWork{},
+                                             context.stream()) == ninfer::TransferWork{},
                        label + " D2D self-copy must submit no work");
     const ninfer::DeviceKVPageHandle copied[] = {restored[0].handle(), restored[4].handle()};
     std::optional<ninfer::HostKVAllocation> copied_host = host_arena.allocate(host_layout, 2);
     ninfer::HostKVAllocationView copied_view            = host_arena.writable_view(*copied_host);
     std::memset(copied_view.data(), 0, host_layout.page_stride * 2);
-    destination.copy_to_host(copied, copied_view, context.stream);
+    destination.copy_to_host(copied, copied_view, context.stream());
     context.synchronize();
     const ninfer::HostKVAllocationConstView copied_contents = host_arena.view(*copied_host);
     failures += expect(page_payload_equal(copied_contents, 0, copied_contents, 1),
@@ -470,13 +466,13 @@ int exercise_layout_and_transfer(ninfer::DeviceContext& context, ninfer::KVPageG
                        label + " D2D copy changed its source page");
 
     const ninfer::DeviceKVPageHandle zeroed[] = {restored[1].handle()};
-    destination.zero_pages(zeroed, context.stream);
+    destination.zero_pages(zeroed, context.stream());
     const ninfer::DeviceKVPageHandle zero_observation[] = {restored[0].handle(),
                                                            restored[1].handle()};
     std::optional<ninfer::HostKVAllocation> zero_host   = host_arena.allocate(host_layout, 2);
     ninfer::HostKVAllocationView zero_view              = host_arena.writable_view(*zero_host);
     std::memset(zero_view.data(), 0x5a, host_layout.page_stride * 2);
-    destination.copy_to_host(zero_observation, zero_view, context.stream);
+    destination.copy_to_host(zero_observation, zero_view, context.stream());
     context.synchronize();
     const ninfer::HostKVAllocationConstView zero_contents = host_arena.view(*zero_host);
     failures += expect(page_payload_equal(zero_contents, 0, host_arena.view(*host), 0),
@@ -485,13 +481,12 @@ int exercise_layout_and_transfer(ninfer::DeviceContext& context, ninfer::KVPageG
                        label + " selective zero left page payload bytes");
 
     {
-        ninfer::KVExecutionTablePool destination_tables(
-            {destination_arena.base(), destination_arena.capacity()}, destination_plan.tables,
-            destination);
+        ninfer::KVExecutionTablePool destination_tables(destination_arena.span(),
+                                                        destination_plan.tables, destination);
         auto destination_row = destination_tables.acquire(0);
         const std::array scattered{restored[4].handle(), restored[1].handle(), restored[3].handle(),
                                    restored[0].handle(), restored[2].handle()};
-        destination_tables.publish(destination_row.handle(), 0, scattered, context.stream);
+        destination_tables.publish(destination_row.handle(), 0, scattered, context.stream());
         context.synchronize();
         const auto destination_mapping =
             read_mapping(destination_tables.row(destination_row.handle()), scattered.size());
@@ -504,11 +499,11 @@ int exercise_layout_and_transfer(ninfer::DeviceContext& context, ninfer::KVPageG
 
         // Both producers precede the transfers. H2D reads pinned Host bytes written by the earlier
         // D2H in this stream; no CPU wait or read separates those dependent operations.
-        const auto ordered_source = fill_device_pool(source, context.stream, 89);
-        auto expected_device      = fill_device_pool(destination, context.stream, 37);
-        source.copy_to_host(source_handles, ordered_view, context.stream);
+        const auto ordered_source = fill_device_pool(source, context.stream(), 89);
+        auto expected_device      = fill_device_pool(destination, context.stream(), 37);
+        source.copy_to_host(source_handles, ordered_view, context.stream());
         const auto scattered_work = destination.copy_from_host(
-            host_arena.view(*ordered_host).subview(1, 5), scattered, context.stream);
+            host_arena.view(*ordered_host).subview(1, 5), scattered, context.stream());
         failures += expect(scattered_work ==
                                ninfer::TransferWork{5 * page_payload, 5 * run_operations.front()},
                            label + " scattered H2D work missed the single-page lowering");
@@ -518,7 +513,7 @@ int exercise_layout_and_transfer(ninfer::DeviceContext& context, ninfer::KVPageG
             auto& observed    = observed_device[index];
             observed.resize(plane.bytes());
             CUDA_CHECK(cudaMemcpyAsync(observed.data(), plane.data, observed.size(),
-                                       cudaMemcpyDeviceToHost, context.stream));
+                                       cudaMemcpyDeviceToHost, context.stream()));
         }
         context.synchronize();
 

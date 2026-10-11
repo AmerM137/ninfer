@@ -136,30 +136,30 @@ void run(const char* artifact, SpeculativeBackend backend) {
     qwen::detail::ProgramImpl program(parameters, *plan, device, {});
 
     auto& states      = *program.state_store;
-    const auto source = states.reserve_reset(device.stream);
-    const auto other  = states.reserve_reset(device.stream);
+    const auto source = states.reserve_reset(device.stream());
+    const auto other  = states.reserve_reset(device.stream());
     require(source && other, "fixture state allocation failed");
     const auto source_slot = states.physical_slot(*source);
     const auto other_slot  = states.physical_slot(*other);
-    const auto text        = program.text_kv_addresses->create_active(pages, 1, device.stream);
+    const auto text        = program.text_kv_addresses->create_active(pages, 1, device.stream());
     require(text.has_value(), "fixture text KV allocation failed");
     AddressOwner text_owner{program.text_kv_addresses.get(), *text};
-    program.text_kv_addresses->ensure_mapped_to_tokens(*text, capacity, device.stream);
+    program.text_kv_addresses->ensure_mapped_to_tokens(*text, capacity, device.stream());
     std::array<AddressOwner, 2> full_owners;
     if (program.backend_kv_addresses) {
         for (const auto row : {0, 1}) {
             const auto address =
-                program.backend_kv_addresses->create_active(pages, row, device.stream);
+                program.backend_kv_addresses->create_active(pages, row, device.stream());
             require(address.has_value(), "fixture full KV allocation failed");
             full_owners[row].store  = program.backend_kv_addresses.get();
             full_owners[row].handle = *address;
             program.backend_kv_addresses->ensure_mapped_to_tokens(*address, capacity,
-                                                                  device.stream);
+                                                                  device.stream());
         }
         auto& pool = program.dflash->full->page_pool();
         for (std::size_t plane = 0; plane < pool.plane_count(); ++plane) {
             CUDA_CHECK(cudaMemsetAsync(pool.plane(plane).data, 0, pool.plane(plane).bytes(),
-                                       device.stream));
+                                       device.stream()));
         }
     }
     execution::PrefillContext context{
@@ -186,7 +186,7 @@ void run(const char* artifact, SpeculativeBackend backend) {
         program.dflash_host_ingress->dflash_kv_table_rows[0]    = row;
         CUDA_CHECK(cudaMemcpyAsync(program.io.dflash_decode->ingress.data,
                                    program.dflash_host_ingress, sizeof(qwen::DFlashDecodeIngress),
-                                   cudaMemcpyHostToDevice, device.stream));
+                                   cudaMemcpyHostToDevice, device.stream()));
     };
     const auto prefill = [&](std::uint32_t nominal, std::optional<std::uint32_t> split = {}) {
         const auto result   = execution::prefill_text_chunk(context, tokens, nominal, split, false);
@@ -210,7 +210,7 @@ void run(const char* artifact, SpeculativeBackend backend) {
     const auto destination = states.reserve_destination();
     require(destination.has_value(), "fixture fork destination allocation failed");
     const auto binding = states.begin_fork(*source, *destination);
-    program.state_images->copy_dflash_local(binding.source, binding.destination, device.stream);
+    program.state_images->copy_dflash_local(binding.source, binding.destination, device.stream());
     context.state_source_slot      = binding.source;
     context.state_destination_slot = binding.destination;
     prefill(23, 23); // Actual chunk is seven tokens, shortened at the capture frontier.

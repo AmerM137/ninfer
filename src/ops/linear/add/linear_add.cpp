@@ -35,7 +35,12 @@ detail::LinearAddLaunch select_a16(QType type, int rows, int k, int tokens) {
     }
 }
 
-void validate_operands(const Tensor& x, const Weight& w, const Tensor& residual) {
+void validate_operands(const Tensor& x, const Weight& w, const Tensor& residual,
+                       CudaExecutionView execution) {
+    if (x.device != execution.device() || w.device != execution.device() ||
+        residual.device != execution.device()) {
+        throw std::invalid_argument("linear_add: operands must belong to the execution device");
+    }
     const auto valid = [](const Tensor& tensor, int rows, int tokens) {
         return tensor.dtype == DType::BF16 && tensor.ne[0] == rows && tensor.ne[1] == tokens &&
                tensor.ne[2] == 1 && tensor.ne[3] == 1 && tensor.is_contiguous() &&
@@ -93,18 +98,23 @@ std::size_t linear_add_workspace_capacity_bytes(QType type, std::int32_t rows, s
 }
 
 void linear_add(const Tensor& x, const Weight& w, Tensor& residual, LinearPolicy policy,
-                WorkspaceArena& workspace, cudaStream_t stream) {
+                MemoryArena& workspace, CudaExecutionView execution) {
     validate_policy(policy);
-    validate_operands(x, w, residual);
+    validate_operands(x, w, residual, execution);
+    if (workspace.device() != execution.device()) {
+        throw std::invalid_argument("linear_add: workspace belongs to another device");
+    }
     if (w.qtype == QType::FP8_E4M3FN_ROW_BF16)
-        return detail::fp8_linear_add_dispatch(x, w, residual, policy, workspace, stream);
+        return detail::fp8_linear_add_dispatch(x, w, residual, policy, workspace,
+                                               execution.stream());
     if (w.qtype == QType::NVFP4)
-        return detail::nvfp4_linear_add_dispatch(x, w, residual, policy, workspace, stream);
-    select_a16(w.qtype, w.n, w.k, x.ne[1])(x, w, residual, stream);
+        return detail::nvfp4_linear_add_dispatch(x, w, residual, policy, workspace,
+                                                 execution.stream());
+    select_a16(w.qtype, w.n, w.k, x.ne[1])(x, w, residual, execution.stream());
 }
 
-void linear_add(const Tensor& x, const Weight& w, Tensor& residual, WorkspaceArena& workspace,
-                cudaStream_t stream) {
-    linear_add(x, w, residual, LinearPolicy::A16Only, workspace, stream);
+void linear_add(const Tensor& x, const Weight& w, Tensor& residual, MemoryArena& workspace,
+                CudaExecutionView execution) {
+    linear_add(x, w, residual, LinearPolicy::A16Only, workspace, execution);
 }
 } // namespace ninfer::ops

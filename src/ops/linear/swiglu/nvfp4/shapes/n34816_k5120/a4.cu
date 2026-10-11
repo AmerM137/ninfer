@@ -35,7 +35,7 @@ void launch_gemm(const Weight& weight, Tensor& out, Nvfp4A4Workspace workspace, 
 }
 
 template <class Schedule>
-void launch(const Tensor& x, const Weight& weight, Tensor& out, WorkspaceArena& workspace,
+void launch(const Tensor& x, const Weight& weight, Tensor& out, MemoryArena& workspace,
             cudaStream_t stream) {
     auto scope = workspace.scope();
     const Nvfp4A4Workspace scratch =
@@ -47,7 +47,7 @@ void launch(const Tensor& x, const Weight& weight, Tensor& out, WorkspaceArena& 
 } // namespace
 
 void launch_nvfp4_swiglu_a4(const Tensor& x, const Weight& weight, Tensor& out,
-                            WorkspaceArena& workspace, cudaStream_t stream) {
+                            MemoryArena& workspace, cudaStream_t stream) {
     if (x.ne[1] <= 32) {
         launch<M32N128>(x, weight, out, workspace, stream);
     } else if (x.ne[1] <= M64N128::kBlockTokens) {

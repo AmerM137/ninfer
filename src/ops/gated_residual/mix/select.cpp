@@ -73,10 +73,8 @@ Plan select_plan(Kind kind, std::int32_t columns) {
     throw std::logic_error("hc_mix: missing production route");
 }
 
-std::size_t capacity(Weights weights, std::int32_t first, std::int32_t last,
-                     DeviceExecutionView execution) {
+std::size_t capacity(Weights weights, std::int32_t first, std::int32_t last) {
     describe_weights(weights);
-    validate_execution(execution);
     validate_interval(first, last);
     std::size_t peak = 0;
     // Each route's allocation grows monotonically; the complete interval need not.

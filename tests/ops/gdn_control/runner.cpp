@@ -4,7 +4,7 @@
 
 namespace ninfer::test::gdn_control {
 
-int run(Profile p, Case c, bool normalize_input, DeviceExecutionView execution) {
+int run(Profile p, Case c, bool normalize_input, CudaExecutionView execution) {
     Fixture f(p, c, normalize_input);
     DecodeGraphDefinition definition;
     DecodeGraphExecutable graph;
@@ -12,19 +12,19 @@ int run(Profile p, Case c, bool normalize_input, DeviceExecutionView execution) 
     const auto launch   = [&] { f.invoke(f.arena, execution); };
     if (captured) {
         launch();
-        cuda_synchronize(execution.stream);
-        definition.capture(execution.stream, launch);
+        cuda_synchronize(execution.stream());
+        definition.capture(execution.stream(), launch);
         graph.instantiate(definition);
     }
     int failed = 0;
     for (int phase = 0; phase < (captured ? 3 : 1); ++phase) {
         if (phase) f.advance();
-        f.repaint(execution.stream);
+        f.repaint(execution.stream());
         if (captured)
-            graph.launch(execution.stream);
+            graph.launch(execution.stream());
         else
             launch();
-        cuda_synchronize(execution.stream);
+        cuda_synchronize(execution.stream());
         const auto name = label(p, c, normalize_input) + " phase=" + std::to_string(phase);
         failed += verify_projection(name, f, projection_reference(f));
         failed += f.check(name);

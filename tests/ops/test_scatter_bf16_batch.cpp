@@ -31,13 +31,12 @@ int run_case(int d, int width, int batch, bool padded, int mode, bool replay, in
     auto pool                      = bits(lane_stride * 8, 0xa913);
     GuardedDeviceBuffer input(source.size() * 2), destination(pool.size() * 2), lanes(batch * 4),
         valid(batch * 4);
-    Tensor l(lanes.data(), DType::I32, {batch}), v(valid.data(), DType::I32, {batch});
+    Tensor l(lanes.span(), DType::I32, {batch}), v(valid.span(), DType::I32, {batch});
     std::vector<Tensor> x(features), y(features);
     for (int slice = 0; slice < features; ++slice) {
-        x[slice] = Tensor(static_cast<std::uint16_t*>(input.data()) + slice * source_count,
-                          DType::BF16, {d, width, batch});
-        y[slice] = Tensor(static_cast<std::uint16_t*>(destination.data()) + slice * d, DType::BF16,
-                          {d, width, 8});
+        x[slice] =
+            Tensor(input.span().subspan(slice * source_count * 2), DType::BF16, {d, width, batch});
+        y[slice] = Tensor(destination.span().subspan(slice * d * 2), DType::BF16, {d, width, 8});
         y[slice].nb[1] = column_stride * 2;
         y[slice].nb[2] = lane_stride * 2;
         y[slice].nb[3] = lane_stride * 8 * 2;
@@ -47,7 +46,7 @@ int run_case(int d, int width, int batch, bool padded, int mode, bool replay, in
     DecodeGraphExecutable graph;
     const auto capture = [&] {
         for (int slice = 0; slice < features; ++slice)
-            ops::scatter_bf16_batch(x[slice], l, v, y[slice], device.stream);
+            ops::scatter_bf16_batch(x[slice], l, v, y[slice], device.execution_view());
     };
     std::vector<int> hl(batch), hv(batch);
     int failures = 0;
@@ -85,8 +84,8 @@ int run_case(int d, int width, int batch, bool padded, int mode, bool replay, in
         if (phase == 0) {
             // Check after each slice, while the other slices still contain old state.
             for (int slice = 0; slice < features; ++slice) {
-                ops::scatter_bf16_batch(x[slice], l, v, y[slice], device.stream);
-                cuda_synchronize(device.stream);
+                ops::scatter_bf16_batch(x[slice], l, v, y[slice], device.execution_view());
+                cuda_synchronize(device.stream());
                 oracle(slice);
                 failures += verify_exact(
                     (label + " slice=" + std::to_string(slice)).c_str(),
@@ -94,11 +93,11 @@ int run_case(int d, int width, int batch, bool padded, int mode, bool replay, in
             }
         } else {
             if (phase == 1) {
-                definition.capture(device.stream, capture);
+                definition.capture(device.stream(), capture);
                 graph.instantiate(definition);
             }
-            graph.launch(device.stream);
-            cuda_synchronize(device.stream);
+            graph.launch(device.stream());
+            cuda_synchronize(device.stream());
             for (int slice = 0; slice < features; ++slice) oracle(slice);
             failures += verify_exact(
                 label.c_str(), from_device<std::uint16_t>(destination.data(), expected.size()),

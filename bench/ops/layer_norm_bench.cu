@@ -1,4 +1,5 @@
 #include "ninfer/ops/layer_norm.h"
+#include "core/buffer.h"
 #include "op_measurement.cuh"
 
 #include <cuda_bf16.h>
@@ -20,14 +21,14 @@ void run(int patches) {
     DeviceBuffer weight = make_bf16(d, 103U, .8F, 1.2F);
     DeviceBuffer bias   = make_bf16(d, 105U);
     DeviceBuffer out    = make_zeros(n * 2);
-    Tensor tx(x.p, DType::BF16, {d, patches});
-    Tensor tw(weight.p, DType::BF16, {d});
-    Tensor tb(bias.p, DType::BF16, {d});
-    Tensor tout(out.p, DType::BF16, {d, patches});
+    Tensor tx(x.span(), DType::BF16, {d, patches});
+    Tensor tw(weight.span(), DType::BF16, {d});
+    Tensor tb(bias.span(), DType::BF16, {d});
+    Tensor tout(out.span(), DType::BF16, {d, patches});
 
-    const Result result =
-        bench_loop([&](cudaStream_t stream) { ops::layer_norm(tx, tw, tb, 1.0e-6f, tout, stream); },
-                   n * 4.0 + d * 4.0);
+    const Result result = bench_loop(
+        [&](CudaExecutionView cuda) { ops::layer_norm(tx, tw, tb, 1.0e-6f, tout, cuda); },
+        n * 4.0 + d * 4.0);
 
     char tag[80];
     std::snprintf(tag, sizeof(tag), "layer_norm [1152,%-5d]", patches);

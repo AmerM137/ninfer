@@ -31,7 +31,9 @@ void require_profile(AttentionHeadGeometry geometry, std::uint32_t window, const
     }
 }
 
-void validate_context(const CyclicKVCacheLayerView& context, std::uint32_t window, const char* op) {
+void validate_context(const CyclicKVCacheLayerView& context, std::uint32_t window, const char* op,
+                      Device device) {
+    common::operand::device(context.device(), device, op, "cache");
     if (context.num_kv_heads != kKVHeads || context.head_dim != kHeadDim ||
         context.capacity != window || context.padded_capacity < context.capacity ||
         context.lane_capacity <= 0) {
@@ -49,8 +51,8 @@ void validate_context(const CyclicKVCacheLayerView& context, std::uint32_t windo
                            "context k");
     common::operand::shape(context.v, {kHeadDim, padded, kKVHeads, context.lane_capacity}, op,
                            "context v");
-    common::operand::contiguous_nonnull(context.k, op, "context k");
-    common::operand::contiguous_nonnull(context.v, op, "context v");
+    common::operand::contiguous_nonnull(context.k, op, "context k", device);
+    common::operand::contiguous_nonnull(context.v, op, "context v", device);
 }
 
 struct PartialWorkspace {
@@ -103,7 +105,12 @@ void sliding_window_attention(const Tensor& q, const Tensor& query_k, const Tens
                               std::uint32_t window, float scale,
                               const CyclicKVCacheLayerView& context,
                               SlidingWindowAttentionExecutionEnvelope envelope,
-                              WorkspaceArena& workspace, Tensor& out, cudaStream_t stream) {
+                              MemoryArena& workspace, Tensor& out, CudaExecutionView execution) {
+    if (workspace.device() != execution.device()) {
+        throw std::invalid_argument(
+            "sliding_window_attention: workspace belongs to another device");
+    }
+    const auto stream        = execution.stream();
     constexpr const char* op = "sliding_window_attention";
     require_profile(geometry, window, op);
     if (q.dtype != DType::BF16 || query_k.dtype != DType::BF16 || query_v.dtype != DType::BF16 ||
@@ -130,14 +137,14 @@ void sliding_window_attention(const Tensor& q, const Tensor& query_k, const Tens
     common::operand::shape(valid_columns, {batch, 1, 1, 1}, op, "valid columns");
     common::operand::shape(lanes, {batch, 1, 1, 1}, op, "lanes");
     common::operand::shape(out, {kHeadDim, kQHeads, tokens, batch}, op, "out");
-    common::operand::contiguous_nonnull(q, op, "q");
-    common::operand::contiguous_nonnull(query_k, op, "query k");
-    common::operand::contiguous_nonnull(query_v, op, "query v");
-    common::operand::contiguous_nonnull(positions, op, "positions");
-    common::operand::contiguous_nonnull(valid_columns, op, "valid columns");
-    common::operand::contiguous_nonnull(lanes, op, "lanes");
-    common::operand::contiguous_nonnull(out, op, "out");
-    validate_context(context, window, op);
+    common::operand::contiguous_nonnull(q, op, "q", execution.device());
+    common::operand::contiguous_nonnull(query_k, op, "query k", execution.device());
+    common::operand::contiguous_nonnull(query_v, op, "query v", execution.device());
+    common::operand::contiguous_nonnull(positions, op, "positions", execution.device());
+    common::operand::contiguous_nonnull(valid_columns, op, "valid columns", execution.device());
+    common::operand::contiguous_nonnull(lanes, op, "lanes", execution.device());
+    common::operand::contiguous_nonnull(out, op, "out", execution.device());
+    validate_context(context, window, op, execution.device());
     if (envelope.min_context > envelope.max_context ||
         envelope.max_context >
             static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {

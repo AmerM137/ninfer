@@ -137,9 +137,9 @@ std::uint32_t ProgramImpl::backend_kv_valid(const SequenceState& state) const no
 
 void ProgramImpl::ensure_sequence_kv_mapped(SequenceState& state, std::uint32_t main,
                                             std::uint32_t backend) {
-    text_kv_addresses->ensure_mapped_to_tokens(state.kv->text, main, device.stream);
+    text_kv_addresses->ensure_mapped_to_tokens(state.kv->text, main, device.stream());
     if (state.kv->backend) {
-        backend_kv_addresses->ensure_mapped_to_tokens(*state.kv->backend, backend, device.stream);
+        backend_kv_addresses->ensure_mapped_to_tokens(*state.kv->backend, backend, device.stream());
     }
 }
 
@@ -165,8 +165,8 @@ PagedKVCacheView ProgramImpl::mtp_kv_view(const SequenceState& state) const {
 }
 
 void ProgramImpl::set_device_i32(Tensor& tensor, std::int32_t value) {
-    CUDA_CHECK(
-        cudaMemcpyAsync(tensor.data, &value, sizeof(value), cudaMemcpyHostToDevice, device.stream));
+    CUDA_CHECK(cudaMemcpyAsync(tensor.data, &value, sizeof(value), cudaMemcpyHostToDevice,
+                               device.stream()));
 }
 
 } // namespace ninfer::models::qwen3_5::detail

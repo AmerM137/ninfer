@@ -68,7 +68,7 @@ void ProgramImpl::install_resume_sampling(SequenceState& sequence, RequestContro
 
     try {
         if (penalties) {
-            CUDA_CHECK(cudaMemsetAsync(counts.data, 0, counts.bytes(), device.stream));
+            CUDA_CHECK(cudaMemsetAsync(counts.data, 0, counts.bytes(), device.stream()));
             const auto generated = std::span<const TokenId>(sequence.ledger)
                                        .subspan(request.base->summary.prompt_tokens);
             validate_licensed_tokens(generated);
@@ -85,15 +85,15 @@ void ProgramImpl::install_resume_sampling(SequenceState& sequence, RequestContro
                     Tensor current = ids.slice(0, 0, count);
                     CUDA_CHECK(cudaMemcpyAsync(current.data, generated.data() + begin,
                                                current.bytes(), cudaMemcpyHostToDevice,
-                                               device.stream));
-                    ops::increment_token_counts(current, counts, device.stream);
+                                               device.stream()));
+                    ops::increment_token_counts(current, counts, device.execution_view());
                 }
             }
         }
         Tensor config = sampling_config.slice(1, static_cast<std::int32_t>(sequence.lane), 1);
         CUDA_CHECK(cudaMemcpyAsync(config.data, &request.sampling_host,
                                    sizeof(request.sampling_host), cudaMemcpyHostToDevice,
-                                   device.stream));
+                                   device.stream()));
         // Later workspace users and sampling execute on this same ordered compute stream.
         work.reset();
     } catch (...) {
@@ -251,10 +251,8 @@ ReplayProgress ProgramImpl::advance_replay(SequenceHandle handle,
             }
             replay.vision_plan.emplace(std::move(plan));
             replay.vision = std::make_unique<execution::VisionPrefillSession>(
-                device, parameters,
-                DeviceSpan{workspace_storage.base(), workspace_storage.capacity()},
-                *workspace_plan.vision, replay.prompt, *replay.vision_plan, vision_handoff,
-                vision_handoff_peak_bytes);
+                device, parameters, workspace_storage.span(), *workspace_plan.vision, replay.prompt,
+                *replay.vision_plan, vision_handoff, vision_handoff_peak_bytes);
         }
 
         if (bridge_mtp) {
@@ -283,7 +281,8 @@ ReplayProgress ProgramImpl::advance_replay(SequenceHandle handle,
             } else {
                 Tensor token = io.mtp->target_input_ids.slice(0, 0, 1);
                 CUDA_CHECK(cudaMemcpyAsync(token.data, sequence.ledger.data() + cursor,
-                                           sizeof(TokenId), cudaMemcpyHostToDevice, device.stream));
+                                           sizeof(TokenId), cudaMemcpyHostToDevice,
+                                           device.stream()));
                 execution::mtp_bridge_and_propose(context, token, sequence.tail_hidden,
                                                   bridge.position, rope, false);
             }

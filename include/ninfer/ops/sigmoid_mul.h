@@ -1,8 +1,8 @@
 #pragma once
 
+#include "core/device.h"
 #include "core/tensor.h"
 
-#include <cuda_runtime.h>
 
 namespace ninfer::ops {
 
@@ -14,6 +14,6 @@ namespace ninfer::ops {
  * gate/x are same-shaped, contiguous, non-overlapping BF16 tensors.
  * Updates x in place and preserves gate. Empty tensors perform no device work.
  */
-void sigmoid_mul(const Tensor& gate, Tensor& x, cudaStream_t stream);
+void sigmoid_mul(const Tensor& gate, Tensor& x, CudaExecutionView execution);
 
 } // namespace ninfer::ops

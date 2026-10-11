@@ -1,4 +1,6 @@
 #include "core/weight.h"
+#include "cuda_fixture.h"
+#include "core/buffer.h"
 #include "ninfer/ops/dynamic_grouped_conv.h"
 #include "core/decode_graph.h"
 #include "core/device.h"
@@ -199,7 +201,7 @@ int run_profile(std::int32_t input_rows) {
     const std::size_t capacity     = ops::linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
         input_rows, 2, 16, 1, kMaximumBatch);
 
-    Tensor base(base_device.p, DType::BF16, {kHidden, kTaps, kSides});
+    Tensor base(base_device.span(), DType::BF16, {kHidden, kTaps, kSides});
     const Weight weight = projection_weight.view();
     int failures        = 0;
     for (int width = 2; width <= 16; ++width)
@@ -211,11 +213,11 @@ int run_profile(std::int32_t input_rows) {
             if (exact > capacity)
                 throw std::runtime_error("workspace interval does not cover exact shape");
             GuardedDeviceBuffer scratch(exact);
-            WorkspaceArena workspace(DeviceSpan{scratch.data(), exact});
+            MemoryArena workspace(scratch.span().subspan(0, exact));
             GuardedDeviceBuffer residual_device(bytes);
-            Tensor x(activation_device.p, DType::BF16, {input_rows, width, batch_size});
-            Tensor delta(delta_device.p, DType::BF16, {kGroups, kTaps, width, batch_size});
-            Tensor residual_view(residual_device.data(), DType::BF16, {kHidden, width, batch_size});
+            Tensor x(activation_device.span(), DType::BF16, {input_rows, width, batch_size});
+            Tensor delta(delta_device.span(), DType::BF16, {kGroups, kTaps, width, batch_size});
+            Tensor residual_view(residual_device.span(), DType::BF16, {kHidden, width, batch_size});
             const auto expected =
                 result_oracle(projection, base_kernel, finish_delta, residual, width, batch_size);
             const bool graph_case = std::find(kGraphCases.begin(), kGraphCases.end(),
@@ -238,41 +240,41 @@ int run_profile(std::int32_t input_rows) {
                                           " W=" + std::to_string(width) +
                                           " B=" + std::to_string(batch_size) +
                                           " graph=" + std::to_string(replay);
-                const auto launch = [&](cudaStream_t stream) {
+                const auto launch = [&](CudaExecutionView cuda) {
                     ops::linear_dynamic_grouped_conv_add(x, weight, base, delta, residual_view,
-                                                         workspace, stream);
+                                                         workspace, cuda);
                 };
                 if (replay) {
                     DeviceContext context;
                     cuda_synchronize();
                     DecodeGraphDefinition definition;
                     DecodeGraphExecutable executable;
-                    definition.capture(context.stream, [&] { launch(context.stream); });
+                    definition.capture(context.stream(), [&] { launch(context.execution_view()); });
                     executable.instantiate(definition);
                     for (int iteration = 0; iteration < 2; ++iteration) {
                         cuda_check(cudaMemcpyAsync(residual_device.data(), residual.data(), bytes,
-                                                   cudaMemcpyHostToDevice, context.stream),
+                                                   cudaMemcpyHostToDevice, context.stream()),
                                    "reset graph residual");
-                        executable.launch(context.stream);
-                        cuda_synchronize(context.stream);
+                        executable.launch(context.stream());
+                        cuda_synchronize(context.stream());
                         verify(label + " phase=" + std::to_string(iteration));
                     }
                 } else {
-                    launch(nullptr);
+                    launch(ninfer::test::cuda_environment().default_execution);
                     cuda_synchronize();
                     verify(label);
                 }
             }
         }
 
-    failures += linear_common::verify_preserved(activation_device.p,
+    failures += linear_common::verify_preserved(activation_device.data(),
                                                 std::as_bytes(std::span(activation_bits)),
                                                 "linear dynamic grouped conv add x");
     failures +=
-        linear_common::verify_preserved(base_device.p, std::as_bytes(std::span(base_kernel)),
+        linear_common::verify_preserved(base_device.data(), std::as_bytes(std::span(base_kernel)),
                                         "linear dynamic grouped conv add base");
     failures +=
-        linear_common::verify_preserved(delta_device.p, std::as_bytes(std::span(finish_delta)),
+        linear_common::verify_preserved(delta_device.data(), std::as_bytes(std::span(finish_delta)),
                                         "linear dynamic grouped conv add delta");
     failures += projection_weight.verify_preserved("linear dynamic grouped conv add weight");
     return failures;

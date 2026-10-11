@@ -1,4 +1,5 @@
 #include "ninfer/ops/argmax.h"
+#include "cuda_fixture.h"
 #include "core/device.h"
 #include <algorithm>
 #include "ops/op_tester.h"
@@ -80,9 +81,10 @@ int run_case(std::int32_t physical_rows, std::int32_t valid_rows, std::int32_t t
     device_logits.copy_from_host(logits.data(), logits.size() * sizeof(std::uint16_t));
     device_output.fill(0xcd);
 
-    Tensor logits_tensor(device_logits.data(), DType::BF16, {physical_rows, tokens});
-    Tensor output_tensor(device_output.data(), DType::I32, {tokens});
-    ops::argmax(logits_tensor, output_tensor, valid_rows, nullptr);
+    Tensor logits_tensor(device_logits.span(), DType::BF16, {physical_rows, tokens});
+    Tensor output_tensor(device_output.span(), DType::I32, {tokens});
+    ops::argmax(logits_tensor, output_tensor, valid_rows,
+                ninfer::test::cuda_environment().default_execution);
     cuda_synchronize();
 
     if (physical_rows == 248320 && tokens == 128) {
@@ -90,8 +92,10 @@ int run_case(std::int32_t physical_rows, std::int32_t valid_rows, std::int32_t t
         cudaGraph_t graph;
         cudaGraphExec_t executable;
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+        const auto stream_execution =
+            ninfer::test::cuda_environment().context.execution_view(stream);
         CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
-        ops::argmax(logits_tensor, output_tensor, valid_rows, stream);
+        ops::argmax(logits_tensor, output_tensor, valid_rows, stream_execution);
         CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
         CUDA_CHECK(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
         CUDA_CHECK(cudaGraphLaunch(executable, stream));

@@ -5,10 +5,10 @@
 
 namespace ninfer::ops::detail::gdn_control {
 void launch_n96_k5120(const Inputs& in, GdnControlOutputs out, Plan plan, Scratch scratch,
-                      DeviceExecutionView e) {
+                      CudaExecutionView e) {
     using Geometry = MmaGeometry<48, 5120, 128>;
     if (plan.kernel == Kernel::Gemv) {
-        gemv_kernel<48, 5120><<<96, 256, 0, e.stream>>>(
+        gemv_kernel<48, 5120><<<96, 256, 0, e.stream()>>>(
             static_cast<const __nv_bfloat16*>(in.x.data), static_cast<const __nv_bfloat16*>(in.a),
             static_cast<const __nv_bfloat16*>(in.b), static_cast<const float*>(in.a_log.data),
             static_cast<const float*>(in.dt_bias.data), static_cast<float*>(out.g.data),
@@ -17,12 +17,12 @@ void launch_n96_k5120(const Inputs& in, GdnControlOutputs out, Plan plan, Scratc
         return;
     }
     if (plan.kernel == Kernel::SmallSplit) {
-        small_partial_kernel<8, 512, 4><<<dim3(24, 10, 1), 128, 0, e.stream>>>(
+        small_partial_kernel<8, 512, 4><<<dim3(24, 10, 1), 128, 0, e.stream()>>>(
             static_cast<const __nv_bfloat16*>(in.x.data), static_cast<const __nv_bfloat16*>(in.a),
             static_cast<const __nv_bfloat16*>(in.b), static_cast<float*>(scratch.partial.data),
             in.x.ne[1]);
         CUDA_CHECK(cudaGetLastError());
-        small_reduce_kernel<<<(48 * in.x.ne[1] + 127) / 128, 128, 0, e.stream>>>(
+        small_reduce_kernel<<<(48 * in.x.ne[1] + 127) / 128, 128, 0, e.stream()>>>(
             static_cast<const float*>(scratch.partial.data),
             static_cast<const float*>(in.a_log.data), static_cast<const float*>(in.dt_bias.data),
             static_cast<float*>(out.g.data), static_cast<float*>(out.beta.data), in.x.ne[1]);

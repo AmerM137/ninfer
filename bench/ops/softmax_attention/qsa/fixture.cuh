@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/buffer.h"
 #include "options.h"
 #include "direct_bf16_weight.cuh"
 #include "quantized_weight.cuh"
@@ -32,20 +33,22 @@ struct Weights {
 };
 
 struct Fixture {
-    DeviceBuffer input, output;
+    DeviceBuffer input;
+    DeviceBuffer output;
     Tensor x, packed;
     std::vector<Tensor> split;
 
     Fixture(const Weights& weights, int tokens)
         : input(make_bf16(std::size_t(kInputRows) * tokens, 101U)),
           output(make_zeros(std::size_t(weights.parent_rows) * tokens * 2)),
-          x(input.p, DType::BF16, {kInputRows, tokens}),
-          packed(output.p, DType::BF16, {weights.parent_rows, tokens}) {
-        auto* next = static_cast<std::uint16_t*>(output.p);
+          x(input.span(), DType::BF16, {kInputRows, tokens}),
+          packed(output.span(), DType::BF16, {weights.parent_rows, tokens}) {
+        std::size_t offset = 0;
         for (int rows : weights.rows) {
-            split.emplace_back(next, DType::BF16,
+            const auto bytes = std::size_t(rows) * tokens * sizeof(std::uint16_t);
+            split.emplace_back(output.span().subspan(offset, bytes), DType::BF16,
                                std::initializer_list<std::int32_t>{rows, tokens});
-            next += std::size_t(rows) * tokens;
+            offset += bytes;
         }
     }
 };

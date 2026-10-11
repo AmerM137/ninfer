@@ -53,7 +53,7 @@ plan_linear_attention_state_pool(LayoutBuilder& builder, const LinearAttentionSt
  */
 class LinearAttentionStatePool {
 public:
-    LinearAttentionStatePool(DeviceSpan backing, const LinearAttentionStatePoolLayout& layout);
+    LinearAttentionStatePool(MemorySpan backing, const LinearAttentionStatePoolLayout& layout);
 
     LinearAttentionStatePool(const LinearAttentionStatePool&)            = delete;
     LinearAttentionStatePool& operator=(const LinearAttentionStatePool&) = delete;
@@ -69,6 +69,8 @@ public:
     [[nodiscard]] Tensor conv_slot(std::uint32_t layer, std::int32_t slot) const;
     [[nodiscard]] Tensor recurrent_slot(std::uint32_t layer, std::int32_t slot) const;
 
+    // CUDA mutations require a stream on the storage device. Binding and slicing are
+    // device-independent.
     void copy_slot(std::int32_t src, std::int32_t dst, cudaStream_t stream = nullptr);
     void zero_slot(std::int32_t slot, cudaStream_t stream = nullptr);
     void zero_all(cudaStream_t stream = nullptr);

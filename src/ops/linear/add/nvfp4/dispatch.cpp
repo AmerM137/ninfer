@@ -23,7 +23,7 @@ std::size_t nvfp4_linear_add_workspace_capacity_bytes(std::int32_t rows, std::in
 }
 
 void nvfp4_linear_add_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
-                               WorkspaceArena& arena, cudaStream_t stream) {
+                               MemoryArena& arena, cudaStream_t stream) {
     const auto plan = select_plan(w.n, w.k, policy, x.ne[1]);
     if (plan.a16) return plan.a16(x, w, out, stream);
     auto scope         = arena.scope();

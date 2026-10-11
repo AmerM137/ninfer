@@ -7,7 +7,7 @@ int main(int argc, char** argv) {
     try {
         const auto options = ple::parse_options(argc, argv);
         measurement::hardware();
-        DeviceContext device;
+        auto& device = ninfer::bench::device_context();
         L2FlushBuffer flush(options.timing.flush_bytes);
         measurement::Csv csv(options.timing.csv_out, "offset,inplace");
         for (int t : options.tokens) {
@@ -24,9 +24,9 @@ int main(int argc, char** argv) {
                     for (const auto& cache :
                          measurement::selections(options.timing.cache, "cold", "warm")) {
                         const auto result = measurement::measure(
-                            [&](auto s) { fixture.launch(device.execution_view().on_stream(s)); },
-                            [&](auto s) { fixture.restore(s); }, flush, device.stream,
-                            options.timing, execution, cache);
+                            [&](CudaExecutionView cuda) { fixture.launch(cuda); },
+                            [&](CudaExecutionView cuda) { fixture.restore(cuda); }, flush,
+                            device.execution_view(), options.timing, execution, cache);
                         csv.write(row, result, execution, cache,
                                      std::to_string(options.offset) + "," +
                                          std::to_string(options.inplace));

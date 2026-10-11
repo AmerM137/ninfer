@@ -9,7 +9,7 @@ std::size_t capacity(LinearPolicy policy, std::int32_t, std::int32_t last) {
 }
 
 void launch(const Tensor& x, Weights weights, std::span<const Tensor> outputs,
-            WorkspaceArena* workspace, cudaStream_t stream) {
+            MemoryArena* workspace, cudaStream_t stream) {
     if (!quantized(weights.policy, x.ne[1])) {
         launch_a16(x, weights.first, outputs, stream);
         return;

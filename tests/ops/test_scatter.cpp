@@ -1,4 +1,6 @@
 #include "ninfer/ops/indexing.h"
+#include "cuda_fixture.h"
+#include "core/buffer.h"
 #include "core/device.h"
 #include "core/decode_graph.h"
 #include <algorithm>
@@ -48,10 +50,11 @@ int scatter_case(std::int32_t rows, const std::vector<std::int32_t>& indices,
     device_destination.copy_from_host(destination.data(),
                                       destination.size() * sizeof(std::uint16_t));
 
-    Tensor source_tensor(device_source.data(), DType::BF16, {rows, source_columns});
-    Tensor indices_tensor(device_indices.data(), DType::I32, {source_columns});
-    Tensor destination_tensor(device_destination.data(), DType::BF16, {rows, destination_columns});
-    ops::scatter(source_tensor, indices_tensor, destination_tensor, nullptr);
+    Tensor source_tensor(device_source.span(), DType::BF16, {rows, source_columns});
+    Tensor indices_tensor(device_indices.span(), DType::I32, {source_columns});
+    Tensor destination_tensor(device_destination.span(), DType::BF16, {rows, destination_columns});
+    ops::scatter(source_tensor, indices_tensor, destination_tensor,
+                 ninfer::test::cuda_environment().default_execution);
     cuda_synchronize();
 
     const std::string label =
@@ -87,9 +90,10 @@ int extract_case(std::int32_t source_rows, std::int32_t destination_rows,
     GuardedDeviceBuffer device_destination(expected.size() * sizeof(std::uint16_t));
     device_source.copy_from_host(source.data(), source.size() * sizeof(std::uint16_t));
     device_destination.fill(0xcd);
-    Tensor source_tensor(device_source.data(), DType::BF16, {source_rows, tokens});
-    Tensor destination_tensor(device_destination.data(), DType::BF16, {destination_rows, tokens});
-    ops::extract_bf16_features(source_tensor, source_offset, destination_tensor, nullptr);
+    Tensor source_tensor(device_source.span(), DType::BF16, {source_rows, tokens});
+    Tensor destination_tensor(device_destination.span(), DType::BF16, {destination_rows, tokens});
+    ops::extract_bf16_features(source_tensor, source_offset, destination_tensor,
+                               ninfer::test::cuda_environment().default_execution);
     cuda_synchronize();
 
     const std::string label = "extract_bf16_features source=" + std::to_string(source_rows) +
@@ -118,21 +122,26 @@ int continuation_case(int width, int batch) {
     GuardedDeviceBuffer d_hidden(hidden.size() * sizeof(std::uint16_t));
     GuardedDeviceBuffer d_destination(initial.size() * sizeof(std::uint16_t));
     GuardedDeviceBuffer d_selected(static_cast<std::size_t>(rows) * batch * sizeof(std::uint16_t));
-    DeviceBuffer d_lanes = to_device(lanes), d_selectors = to_device(selectors);
+    DeviceBuffer d_lanes     = to_device(lanes);
+    DeviceBuffer d_selectors = to_device(selectors);
     d_hidden.copy_from_host(hidden.data(), d_hidden.bytes());
-    Tensor h(d_hidden.data(), DType::BF16, {rows, width, batch});
-    Tensor selected(d_selected.data(), DType::BF16, {rows, batch});
-    Tensor dst(d_destination.data(), DType::BF16, {rows, slots});
-    Tensor indices(d_lanes.p, DType::I32, {batch}), sel(d_selectors.p, DType::I32, {batch});
+    Tensor h(d_hidden.span(), DType::BF16, {rows, width, batch});
+    Tensor selected(d_selected.span(), DType::BF16, {rows, batch});
+    Tensor dst(d_destination.span(), DType::BF16, {rows, slots});
+    Tensor indices(d_lanes.span(), DType::I32, {batch}),
+        sel(d_selectors.span(), DType::I32, {batch});
     DeviceContext context;
     cuda_synchronize();
     const auto launch = [&] {
-        ops::gather_bf16_batch_columns(h, sel, selected, context.stream);
-        ops::scatter(selected, indices, dst, context.stream);
+        ops::gather_bf16_batch_columns(h, sel, selected, context.execution_view());
+        ops::scatter(selected, indices, dst, context.execution_view());
     };
     DecodeGraphDefinition definition;
     DecodeGraphExecutable graph;
-    if (width == 16 && batch == 8) { definition.capture(context.stream, launch); graph.instantiate(definition); }
+    if (width == 16 && batch == 8) {
+        definition.capture(context.stream(), launch);
+        graph.instantiate(definition);
+    }
     int failures = 0;
     for (int phase = 0; phase < width; ++phase) {
         auto expected = initial;
@@ -141,9 +150,14 @@ int continuation_case(int width, int batch) {
             std::copy_n(hidden.begin() + static_cast<std::size_t>(b * width + selectors[b]) * rows,
                          rows, expected.begin() + static_cast<std::size_t>(lanes[b]) * rows);
         }
-        CUDA_CHECK(cudaMemcpyAsync(d_selectors.p, selectors.data(), d_selectors.bytes, cudaMemcpyHostToDevice, context.stream));
-        CUDA_CHECK(cudaMemcpyAsync(d_destination.data(), initial.data(), d_destination.bytes(), cudaMemcpyHostToDevice, context.stream));
-        if (graph.ready()) graph.launch(context.stream); else launch();
+        CUDA_CHECK(cudaMemcpyAsync(d_selectors.data(), selectors.data(), d_selectors.size(),
+                                   cudaMemcpyHostToDevice, context.stream()));
+        CUDA_CHECK(cudaMemcpyAsync(d_destination.data(), initial.data(), d_destination.bytes(),
+                                   cudaMemcpyHostToDevice, context.stream()));
+        if (graph.ready())
+            graph.launch(context.stream());
+        else
+            launch();
         context.synchronize();
         failures += verify_exact("continuation slots", from_device<std::uint16_t>(d_destination.data(), expected.size()), expected);
     }

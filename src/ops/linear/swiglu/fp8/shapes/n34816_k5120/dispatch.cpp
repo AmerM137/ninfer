@@ -48,8 +48,7 @@ std::size_t fp8_linear_swiglu_workspace_capacity_bytes(LinearPolicy policy, std:
 }
 
 void fp8_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor& out,
-                                LinearPolicy policy, WorkspaceArena& workspace,
-                                cudaStream_t stream) {
+                                LinearPolicy policy, MemoryArena& workspace, cudaStream_t stream) {
     if (select_route(policy, x.ne[1]) == Fp8LinearSwiGluRoute::A16) {
         launch_a16(x, weight, out, stream);
         return;

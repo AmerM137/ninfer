@@ -44,8 +44,8 @@ Batch validate_convolution(const Tensor& x, const WeightOperands& weights,
                            const Tensor& source_slots, const Tensor& valid_columns,
                            const GdnConvOutputs& outputs, Publication publication,
                            const Tensor& destination);
-void validate_disjoint(const WeightOperands& weights, std::span<const Tensor* const> tensors,
-                       DeviceSpan scratch = {}, const Tensor* alias_first = nullptr,
-                       const Tensor* alias_second = nullptr);
+void validate_storage(const WeightOperands& weights, std::span<const Tensor* const> tensors,
+                      CudaExecutionView execution, MemorySpan scratch = {},
+                      const Tensor* alias_first = nullptr, const Tensor* alias_second = nullptr);
 
 } // namespace ninfer::ops::detail::gdn_input

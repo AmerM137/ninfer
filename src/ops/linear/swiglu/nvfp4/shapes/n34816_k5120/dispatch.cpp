@@ -67,7 +67,7 @@ std::size_t nvfp4_linear_swiglu_workspace_capacity_bytes(LinearPolicy policy,
 }
 
 void nvfp4_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor& out,
-                                  LinearPolicy policy, WorkspaceArena& workspace,
+                                  LinearPolicy policy, MemoryArena& workspace,
                                   cudaStream_t stream) {
     switch (select_route(policy, x.ne[1])) {
     case Nvfp4LinearSwiGluRoute::DecodeFusedA16:

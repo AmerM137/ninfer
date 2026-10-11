@@ -1,4 +1,5 @@
 #include "fixtures.h"
+#include "cuda_fixture.h"
 
 namespace ninfer::test::hc::mix {
 const char* name(Kind kind) { return kind == Kind::Block ? "block-mix" : "final-mix"; }
@@ -45,12 +46,10 @@ std::vector<float> decode(const std::vector<std::uint16_t>& words) {
     return values;
 }
 
-std::size_t capacity_for(const Weights& w, int first, int last, DeviceExecutionView e) {
+std::size_t capacity_for(const Weights& w, int first, int last) {
     if (w.kind == Kind::Block)
-        return ops::hc_mix_workspace_capacity_bytes(ops::HcMixWeights{w.down, w.up}, first, last,
-                                                    e);
-    return ops::hc_mix_workspace_capacity_bytes(ops::HcFinalMixWeights{w.down, w.up}, first, last,
-                                                e);
+        return ops::hc_mix_workspace_capacity_bytes(ops::HcMixWeights{w.down, w.up}, first, last);
+    return ops::hc_mix_workspace_capacity_bytes(ops::HcFinalMixWeights{w.down, w.up}, first, last);
 }
 } // namespace
 
@@ -58,8 +57,8 @@ Weights::Weights(Kind k, Pattern p)
     : kind(k), pattern(p), host_down(matrix(k, p, false)), host_up(matrix(k, p, true)),
       down_values(decode(host_down.bits)), up_values(decode(host_up.bits)),
       device_down(host_down.bits.size() * 2), device_up(host_up.bits.size() * 2),
-      down(host_down.device_weight(device_down.data())),
-      up(host_up.device_weight(device_up.data())) {
+      down(host_down.device_weight(device_down.span())),
+      up(host_up.device_weight(device_up.span())) {
     device_down.copy_from_host(host_down.bits.data(), device_down.bytes());
     device_up.copy_from_host(host_up.bits.data(), device_up.bytes());
 }
@@ -75,14 +74,13 @@ int Weights::check() const {
     return failed;
 }
 
-Fixture::Fixture(Weights& w, int m, DeviceExecutionView e)
-    : weights(w), columns(m), capacity(capacity_for(w, m, m, e)),
-      input_words(std::size_t(kTotal) * m), input(input_words.size() * 2),
-      output(std::size_t(kWidth) * m * 2),
+Fixture::Fixture(Weights& w, int m)
+    : weights(w), columns(m), capacity(capacity_for(w, m, m)), input_words(std::size_t(kTotal) * m),
+      input(input_words.size() * 2), output(std::size_t(kWidth) * m * 2),
       injection(w.kind == Kind::Block ? std::size_t(kStreams) * m * 4 : 0), scratch(capacity),
-      workspace(DeviceSpan{scratch.data(), scratch.bytes()}),
-      z(input.data(), DType::BF16, {kWidth, kStreams, m}),
-      x(output.data(), DType::BF16, {kWidth, m}), j(injection.data(), DType::FP32, {kStreams, m}) {}
+      workspace(scratch.span()), z(input.span(), DType::BF16, {kWidth, kStreams, m}),
+      x(output.span(), DType::BF16, {kWidth, m}),
+      j(w.kind == Kind::Block ? Tensor(injection.span(), DType::FP32, {kStreams, m}) : Tensor{}) {}
 
 void Fixture::upload(std::span<const float> catalog, cudaStream_t stream) {
     cuda_synchronize(stream);
@@ -99,7 +97,7 @@ void Fixture::upload(std::span<const float> catalog, cudaStream_t stream) {
                    "poison injection");
 }
 
-void Fixture::invoke(DeviceExecutionView e) {
+void Fixture::invoke(CudaExecutionView e) {
     if (weights.kind == Kind::Block)
         ops::hc_mix(z, ops::HcMixWeights{weights.down, weights.up}, workspace, x, j, e);
     else
@@ -119,9 +117,7 @@ int Fixture::check(const std::string& label) const {
     return failed;
 }
 
-std::size_t Fixture::query(int first, int last, DeviceExecutionView e) const {
-    return capacity_for(weights, first, last, e);
-}
+std::size_t Fixture::query(int first, int last) const { return capacity_for(weights, first, last); }
 
 std::vector<float> input_catalog(Pattern pattern, int phase) {
     std::vector<float> values(kTotal * kCatalogColumns);

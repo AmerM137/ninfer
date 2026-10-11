@@ -9,7 +9,10 @@ namespace ninfer::ops {
 namespace {
 namespace operand = common::operand;
 
-void require_matrix(const Tensor& t, int rows, int tokens) {
+void require_matrix(const Tensor& t, int rows, int tokens, CudaExecutionView execution) {
+    if (t.device != execution.device()) {
+        throw std::invalid_argument("linear_pair: operand belongs to another device");
+    }
     if (t.dtype != DType::BF16 || t.ne[0] != rows || t.ne[1] != tokens || t.ne[2] != 1 ||
         t.ne[3] != 1 || !t.is_contiguous() || !operand::aligned(t.data, 16))
         throw std::invalid_argument("linear_pair: expected aligned contiguous BF16 matrix");
@@ -39,13 +42,16 @@ std::size_t linear_pair_workspace_capacity_bytes(const Weight& first, const Weig
 }
 
 void linear_pair(const Tensor& x, const Weight& first, const Weight& second, Tensor& first_out,
-                 Tensor& second_out, cudaStream_t stream) {
+                 Tensor& second_out, CudaExecutionView execution) {
     const auto launch = detail::select_linear_pair(x.ne[0], x.ne[1]);
-    require_matrix(x, first.k, x.ne[1]);
-    require_matrix(first_out, 1024, x.ne[1]);
-    require_matrix(second_out, 1024, x.ne[1]);
+    require_matrix(x, first.k, x.ne[1], execution);
+    require_matrix(first_out, 1024, x.ne[1], execution);
+    require_matrix(second_out, 1024, x.ne[1], execution);
     detail::validate_pair_weights(first, second, x.ne[1]);
+    if (first.device != execution.device() || second.device != execution.device()) {
+        throw std::invalid_argument("linear_pair: weights belong to another device");
+    }
     require_nonoverlap(x, first, second, first_out, second_out);
-    launch(x, first, second, first_out, second_out, stream);
+    launch(x, first, second, first_out, second_out, execution.stream());
 }
 } // namespace ninfer::ops

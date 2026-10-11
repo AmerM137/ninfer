@@ -305,7 +305,7 @@ LinearPolicy 和 activation Use 保留在模型参数；缓存不因搬运改变
 
 ### 5.1 一个共享字节池
 
-`DeviceBuffer(C)` 启动时分配。所有 image 起点及大小按 256 B 对齐。
+`DeviceBuffer(device, C)` 启动时分配。所有 image 起点及大小按 256 B 对齐。
 既不按 layer 永久分区，也不使用“最大 expert 大小”的统一槽。
 
 使用一个小型、单 host writer 的有序 extent allocator：
@@ -518,8 +518,8 @@ class ExpertGpuCache {
 public:
     ExpertGpuCache(const HostExpertBacking& source,
                    ExpertCacheConfig config,
-                   DeviceExecutionView compute,
-                   cudaStream_t upload_stream);
+                   CudaExecutionView compute,
+                   CudaExecutionView upload);
     ~ExpertGpuCache();
     ExpertGpuCache(const ExpertGpuCache&) = delete;
     ExpertGpuCache& operator=(const ExpertGpuCache&) = delete;

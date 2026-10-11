@@ -4,7 +4,6 @@
 #include "core/device.h"
 #include "core/tensor.h"
 
-#include <cuda_runtime.h>
 #include <cstddef>
 #include <cstdint>
 
@@ -50,15 +49,15 @@ namespace ninfer::ops {
  */
 void kimi_delta_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
                           const Tensor& beta, const Tensor& A_log, const Tensor& dt_bias,
-                          float lower_bound, float scale, WorkspaceArena& workspace, Tensor& state,
-                          Tensor& out, DeviceExecutionView execution);
+                          float lower_bound, float scale, MemoryArena& workspace, Tensor& state,
+                          Tensor& out, CudaExecutionView execution);
 
 /** Distinct-state form of the same mathematical contract; exact state alias is also allowed. */
 void kimi_delta_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
                           const Tensor& beta, const Tensor& A_log, const Tensor& dt_bias,
-                          float lower_bound, float scale, WorkspaceArena& workspace,
+                          float lower_bound, float scale, MemoryArena& workspace,
                           const Tensor& state_in, Tensor& state_out, Tensor& out,
-                          DeviceExecutionView execution);
+                          CudaExecutionView execution);
 
 /**
  * Scratch-free one-token update for B independent state-pool slots, using the same head mapping.
@@ -71,6 +70,6 @@ void kimi_delta_attention_batch_update(const Tensor& q, const Tensor& k, const T
                                        const Tensor& g, const Tensor& beta, const Tensor& A_log,
                                        const Tensor& dt_bias, float lower_bound, float scale,
                                        Tensor& states, const Tensor& slots, Tensor& out,
-                                       cudaStream_t stream);
+                                       CudaExecutionView execution);
 
 } // namespace ninfer::ops

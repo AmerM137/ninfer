@@ -131,7 +131,8 @@ bool vector_of(const Tensor& t, std::int32_t d) {
 } // namespace
 
 void layer_norm(const Tensor& x, const Tensor& weight, const Tensor& bias, float eps, Tensor& out,
-                cudaStream_t stream) {
+                CudaExecutionView execution) {
+    const auto stream = execution.stream();
     if (x.dtype != DType::BF16 || weight.dtype != DType::BF16 || bias.dtype != DType::BF16 ||
         out.dtype != DType::BF16) {
         throw std::invalid_argument("layer_norm: x/weight/bias/out must be BF16");
@@ -152,6 +153,10 @@ void layer_norm(const Tensor& x, const Tensor& weight, const Tensor& bias, float
         throw std::invalid_argument("layer_norm: weight/bias must have shape [x.ne[0]]");
     }
     if (n == 0) { return; }
+    if (x.device != execution.device() || weight.device != execution.device() ||
+        bias.device != execution.device() || out.device != execution.device()) {
+        throw std::invalid_argument("layer_norm: operands must belong to the execution device");
+    }
     if (!x.is_contiguous() || !weight.is_contiguous() || !bias.is_contiguous() ||
         !out.is_contiguous()) {
         throw std::invalid_argument("layer_norm: tensors must be contiguous");

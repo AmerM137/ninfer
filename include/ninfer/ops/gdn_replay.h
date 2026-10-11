@@ -3,7 +3,7 @@
 #include "core/gdn_replay_records.h"
 #include "core/linear_attention_state.h"
 
-#include <cuda_runtime.h>
+#include "core/device.h"
 
 #include <cstdint>
 #include <span>
@@ -50,7 +50,7 @@ class GdnReplayFoldPlan {
 public:
     GdnReplayFoldPlan(const GdnReplayRecords& records, LinearAttentionStateAllLayersView states);
 
-    void execute(std::span<const GdnReplayFoldRow> rows, cudaStream_t stream) const;
+    void execute(std::span<const GdnReplayFoldRow> rows, CudaExecutionView execution) const;
 
 private:
     GdnReplayRecords records_;

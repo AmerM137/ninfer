@@ -6,21 +6,18 @@ namespace ninfer::ops {
 namespace {
 constexpr detail::qsa::ViewValidation v{"qsa_indexer"};
 
-void profile(int lo, int hi, int batch, QsaIndexerExecutionEnvelope envelope,
-             DeviceExecutionView execution) {
+void profile(int lo, int hi, int batch, QsaIndexerExecutionEnvelope envelope) {
     v.require(lo > 0 && hi >= lo && batch >= 1 && batch <= 8, "T/B interval");
     v.require(envelope.max_visible_tokens <= detail::qsa::kIndexerMaxVisibleTokens,
               "visible-token capacity");
-    v.require(execution.multiprocessor_count > 0, "SM count");
 }
 
 } // namespace
 
 std::size_t qsa_indexer_workspace_capacity_bytes(std::int32_t min_tokens, std::int32_t max_tokens,
                                                  std::int32_t batch_size,
-                                                 QsaIndexerExecutionEnvelope envelope,
-                                                 DeviceExecutionView execution) {
-    profile(min_tokens, max_tokens, batch_size, envelope, execution);
+                                                 QsaIndexerExecutionEnvelope envelope) {
+    profile(min_tokens, max_tokens, batch_size, envelope);
     // The allocation grows monotonically with T until the bounded window is full.
     WorkspaceLayoutBuilder layout;
     detail::qsa::allocate_indexer_workspace(
@@ -31,10 +28,14 @@ std::size_t qsa_indexer_workspace_capacity_bytes(std::int32_t min_tokens, std::i
 }
 
 void qsa_indexer(const Tensor& query, const QsaIndexCacheView& cache, const QsaBatchView& batch,
-                 QsaIndexerExecutionEnvelope envelope, WorkspaceArena& workspace,
-                 QsaBlockSelection& out, DeviceExecutionView execution) {
+                 QsaIndexerExecutionEnvelope envelope, MemoryArena& workspace,
+                 QsaBlockSelection& out, CudaExecutionView execution) {
+    if (workspace.device() != execution.device()) {
+        throw std::invalid_argument("QSA workspace belongs to another device");
+    }
+    const detail::qsa::ViewValidation v{"qsa_indexer", execution.device()};
     const int tokens = query.ne[2], rows = query.ne[3];
-    profile(tokens, tokens, rows, envelope, execution);
+    profile(tokens, tokens, rows, envelope);
     v.dense(query, DType::BF16, {128, 4, tokens, rows}, 16, "query");
     v.dense(batch.positions, DType::I32, {tokens, rows, 1, 1}, 4, "positions");
     v.metadata(batch.valid_columns, rows, "valid columns");

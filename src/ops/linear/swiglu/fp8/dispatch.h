@@ -23,10 +23,9 @@ void launch_fp8_swiglu_small_t(const Tensor& x, const Weight& weight, Tensor& ou
 
 void launch_fp8_swiglu_matrix(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 void launch_fp8_swiglu_a8(const Tensor& x, const Weight& weight, Tensor& out,
-                          WorkspaceArena& workspace, cudaStream_t stream);
+                          MemoryArena& workspace, cudaStream_t stream);
 
 void fp8_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor& out,
-                                LinearPolicy policy, WorkspaceArena& workspace,
-                                cudaStream_t stream);
+                                LinearPolicy policy, MemoryArena& workspace, cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

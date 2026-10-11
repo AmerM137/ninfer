@@ -1,4 +1,6 @@
 #include "prepare_fixture.h"
+#include "cuda_fixture.h"
+#include "core/buffer.h"
 #include "core/decode_graph.h"
 
 #include <array>
@@ -234,13 +236,13 @@ int run(DeviceContext& device, int t, int b, int axes, int alias, int layout, in
             f.parameters.rope_theta  = 1e7F;
         }
         if (phase == 0) {
-            definition.capture(device.stream, [&] { f.launch(device.execution_view()); });
+            definition.capture(device.stream(), [&] { f.launch(device.execution_view()); });
             graph.instantiate(definition);
         }
         if (phase == 1)
             f.launch(device.execution_view());
         else
-            graph.launch(device.stream);
+            graph.launch(device.stream());
         device.synchronize();
         failures +=
             verify(f, "prepare T=" + std::to_string(t) + " B=" + std::to_string(b) +
@@ -261,8 +263,8 @@ int continuation(DeviceContext& device, KvCacheStorage storage = KvCacheStorage:
     auto base = to_device_i32({6}), count = to_device_i32({1});
     ops::qsa_tail_extract(
         f.before,
-        {f.records.view, f.record_rope.view, Tensor(base.p, DType::I32, {1}), f.valid.view},
-        Tensor(count.p, DType::I32, {1}), f.before, device.execution_view());
+        {f.records.view, f.record_rope.view, Tensor(base.span(), DType::I32, {1}), f.valid.view},
+        Tensor(count.span(), DType::I32, {1}), f.before, device.execution_view());
     device.synchronize();
     for (int c = 0; c < 128; ++c) f.tail.at(c, 2, 1) = f.ik.at(c, 0, 0);
     failures += f.tail.preserved("accepted-one canonical tail") +
@@ -305,38 +307,32 @@ int chunking(DeviceContext& device, KvCacheStorage storage = KvCacheStorage::BFl
     int offset = 0;
     auto base  = to_device_i32({63});
     for (int n : {1, 3, 2, 3}) {
-        const auto slice = [&](const Tensor& input, int d, int h) {
-            return Tensor(static_cast<std::uint16_t*>(input.data) + std::int64_t(offset) * d * h,
-                          DType::BF16, {d, h, n, 1});
-        };
         auto p          = f.projected;
-        p.query         = slice(p.query, 256, 24);
-        p.key           = slice(p.key, 256, 2);
-        p.value         = slice(p.value, 256, 2);
-        p.index_query   = slice(p.index_query, 128, 4);
-        p.index_key     = Tensor(static_cast<std::uint16_t*>(p.index_key.data) + offset * 128,
-                                 DType::BF16, {128, n, 1});
+        p.query         = p.query.slice(2, offset, n);
+        p.key           = p.key.slice(2, offset, n);
+        p.value         = p.value.slice(2, offset, n);
+        p.index_query   = p.index_query.slice(2, offset, n);
+        p.index_key     = p.index_key.slice(1, offset, n);
         f.valid.at(0)   = n;
         f.offsets.at(0) = offset;
         f.valid.upload();
         f.offsets.upload();
-        auto batch = f.batch;
-        batch.positions =
-            Tensor(static_cast<int*>(f.positions.view.data) + offset, DType::I32, {n, 1});
+        auto batch      = f.batch;
+        batch.positions = f.positions.view.slice(0, offset, n);
         std::vector<int> coords(n * 3);
         for (int a = 0; a < 3; ++a)
             for (int t = 0; t < n; ++t) coords[t + n * a] = f.rope.at(offset + t, a, 0);
         auto rope    = to_device_i32(coords);
         Tensor q_out = p.query, iq_out = p.index_query;
-        ops::qsa_prepare(p, f.parameters, batch, Tensor(rope.p, DType::I32, {n, 3, 1}), f.before,
-                         f.cache, f.write, q_out, iq_out, device.execution_view());
+        ops::qsa_prepare(p, f.parameters, batch, Tensor(rope.span(), DType::I32, {n, 3, 1}),
+                         f.before, f.cache, f.write, q_out, iq_out, device.execution_view());
         const int frontier = 63 + offset;
         base.copy_from_host(&frontier, 4);
         CUDA_CHECK(cudaStreamSynchronize(nullptr));
         ops::qsa_tail_extract(f.before,
                               {f.records.view.slice(1, offset, n),
                                f.record_rope.view.slice(1, offset, n),
-                               Tensor(base.p, DType::I32, {1}), f.valid.view},
+                               Tensor(base.span(), DType::I32, {1}), f.valid.view},
                               f.valid.view, f.before, device.execution_view());
         device.synchronize();
         offset += n;
@@ -405,12 +401,8 @@ int norm_alignment_and_phase(DeviceContext& device,
         wq.upload();
         wiq.upload();
         for (bool shifted : {true, false}) {
-            f.parameters.query_norm =
-                shifted ? Tensor(static_cast<std::uint16_t*>(wq.view.data) + 1, DType::BF16, {256})
-                        : f.wq.view;
-            f.parameters.index_query_norm =
-                shifted ? Tensor(static_cast<std::uint16_t*>(wiq.view.data) + 1, DType::BF16, {128})
-                        : f.wiq.view;
+            f.parameters.query_norm       = shifted ? wq.view.slice(0, 1, 256) : f.wq.view;
+            f.parameters.index_query_norm = shifted ? wiq.view.slice(0, 1, 128) : f.wiq.view;
             for (float theta : {1e7F, 0.5F}) {
                 f.reset(2, true);
                 f.parameters.rope_theta = theta;
@@ -441,21 +433,23 @@ int read_footprint(DeviceContext& device, KvCacheStorage storage = KvCacheStorag
     for (auto* view : {&f.projected.query, &f.projected.key, &f.projected.value,
                        &f.projected.index_query, &f.projected.index_key}) {
         const int width = view->ne[0] * (view == &f.projected.index_key ? 1 : view->ne[1]);
-        inputs.emplace_back(view->bytes());
-        CUDA_CHECK(cudaMemcpyAsync(inputs.back().p, view->data, width * 2, cudaMemcpyDeviceToDevice,
-                                   device.stream));
-        view->data = inputs.back().p;
+        inputs.emplace_back(device.device(), view->bytes());
+        CUDA_CHECK(cudaMemcpyAsync(inputs.back().data(), view->data, width * 2,
+                                   cudaMemcpyDeviceToDevice, device.stream()));
+        view->data   = inputs.back().data();
+        view->device = inputs.back().device();
     }
-    DeviceBuffer pos(f.positions.view.bytes()), rope(f.rope.view.bytes());
-    CUDA_CHECK(
-        cudaMemcpyAsync(pos.p, f.positions.view.data, 4, cudaMemcpyDeviceToDevice, device.stream));
+    DeviceBuffer pos(ninfer::test::cuda_environment().context.device(), f.positions.view.bytes());
+    DeviceBuffer rope(ninfer::test::cuda_environment().context.device(), f.rope.view.bytes());
+    CUDA_CHECK(cudaMemcpyAsync(pos.data(), f.positions.view.data, 4, cudaMemcpyDeviceToDevice,
+                               device.stream()));
     for (int a = 0; a < 3; ++a)
-        CUDA_CHECK(cudaMemcpyAsync(static_cast<int*>(rope.p) + a * f.T,
+        CUDA_CHECK(cudaMemcpyAsync(static_cast<int*>(rope.data()) + a * f.T,
                                    static_cast<int*>(f.rope.view.data) + a * f.T, 4,
-                                   cudaMemcpyDeviceToDevice, device.stream));
-    f.batch.positions.data = pos.p;
+                                   cudaMemcpyDeviceToDevice, device.stream()));
+    f.batch.positions.data = pos.data();
     auto saved             = f.rope.view;
-    f.rope.view.data       = rope.p;
+    f.rope.view.data       = rope.data();
     f.launch(device.execution_view());
     device.synchronize();
     f.rope.view = saved;

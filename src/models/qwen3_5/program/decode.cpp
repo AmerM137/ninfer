@@ -32,7 +32,7 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
         qwen3_5::OrdinaryDecodeState& ordinary = state.frame;
         CUDA_CHECK(cudaMemcpyAsync(ordinary.ingress.data, &state.host_ingress,
                                    sizeof(qwen3_5::OrdinaryDecodeIngress), cudaMemcpyHostToDevice,
-                                   state.execution.device.stream));
+                                   state.execution.cuda.stream()));
 
         TextContext card(state.execution.device, state.execution.parameters, state.execution.work,
                          state.text_cache, state.execution.linear_attention, state.execution.io,
@@ -51,14 +51,14 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
         card.ordinary_decode_batch(tokens, cache_positions, rope_positions, kv_rows, state_sources,
                                    state_destinations, envelope, hidden, logits);
         ops::scatter(hidden, state_destinations, state.continuation_hidden_store,
-                     state.execution.device.stream);
+                     state.execution.cuda);
         ops::sample(logits, sampled,
                     dimension(state.execution.parameters.model.resources().public_token_count),
                     ordinary.sampling, cache_positions, ops::kSamplePurposeDecode,
-                    state.execution.work, state.execution.device.stream);
+                    state.execution.work, state.execution.cuda);
         CUDA_CHECK(cudaMemcpyAsync(&state.host_egress, ordinary.egress.data,
                                    sizeof(qwen3_5::OrdinaryDecodeEgress), cudaMemcpyDeviceToHost,
-                                   state.execution.device.stream));
+                                   state.execution.cuda.stream()));
     };
 }
 
@@ -97,13 +97,13 @@ void ProgramImpl::install_sampling(SequenceState& sequence, RequestControl& requ
     };
     const bool penalties = request.sampling_host.presence_penalty != 0.0F ||
                            request.sampling_host.frequency_penalty != 0.0F;
-    if (penalties) { CUDA_CHECK(cudaMemsetAsync(counts.data, 0, counts.bytes(), device.stream)); }
+    if (penalties) { CUDA_CHECK(cudaMemsetAsync(counts.data, 0, counts.bytes(), device.stream())); }
     request.sampling_host.token_counts =
         penalties ? static_cast<std::int32_t*>(counts.data) : nullptr;
     Tensor config_lane = sampling_config.slice(1, static_cast<std::int32_t>(sequence.lane), 1);
     CUDA_CHECK(cudaMemcpyAsync(config_lane.data, &request.sampling_host,
                                sizeof(request.sampling_host), cudaMemcpyHostToDevice,
-                               device.stream));
+                               device.stream()));
 }
 
 void ProgramImpl::copy_tail(SequenceState& sequence, const Tensor& source) {
@@ -113,13 +113,13 @@ void ProgramImpl::copy_tail(SequenceState& sequence, const Tensor& source) {
         throw std::logic_error("target tail hidden has an invalid shape");
     }
     CUDA_CHECK(cudaMemcpyAsync(sequence.tail_hidden.data, source.data, sequence.tail_hidden.bytes(),
-                               cudaMemcpyDeviceToDevice, device.stream));
+                               cudaMemcpyDeviceToDevice, device.stream()));
     sequence.tail_hidden_valid = true;
 }
 
 void ProgramImpl::copy_round_token() {
     CUDA_CHECK(cudaMemcpyAsync(host_tokens, io.token.data, sizeof(TokenId), cudaMemcpyDeviceToHost,
-                               device.stream));
+                               device.stream()));
 }
 
 void ProgramImpl::mark_workspace_usage(std::size_t phase_bytes) noexcept {
@@ -170,7 +170,7 @@ void ProgramImpl::enqueue_dflash_context_append(std::span<const std::uint32_t> l
         // DFlash2 has only fixed cyclic state; DFlash also grows its Full backend KV here.
         if (sequence.kv->backend) {
             backend_kv_addresses->ensure_mapped_to_tokens(*sequence.kv->backend, end,
-                                                          device.stream);
+                                                          device.stream());
         }
         minimum_count = std::min(minimum_count, counts[row]);
         maximum_count = std::max(maximum_count, counts[row]);
@@ -179,7 +179,7 @@ void ProgramImpl::enqueue_dflash_context_append(std::span<const std::uint32_t> l
     qwen3_5::DFlashDecodeState& frame = *io.dflash_decode;
     CUDA_CHECK(cudaMemcpyAsync(frame.ingress.data, dflash_host_ingress,
                                sizeof(qwen3_5::DFlashDecodeIngress), cudaMemcpyHostToDevice,
-                               device.stream));
+                               device.stream()));
     const auto batch                = static_cast<std::int32_t>(lanes.size());
     Tensor active_lane_tensor       = frame.active_lanes.slice(0, 0, batch);
     Tensor state_destination_tensor = frame.state_destination_slots.slice(0, 0, batch);
@@ -194,7 +194,8 @@ void ProgramImpl::enqueue_dflash_context_append(std::span<const std::uint32_t> l
         work.alloc(DType::BF16, {dimension(parameters.draft->feature_projection.weight.k),
                                  static_cast<std::int32_t>(draft_window + 1U), batch});
     ops::prepare_ragged_prefix(dflash->pending_features, active_lane_tensor, device_starts,
-                               device_ends, features, positions, device_counts, device.stream);
+                               device_ends, features, positions, device_counts,
+                               device.execution_view());
 
     execution::DFlashAppendContext state{{device, parameters, work, state_images->linear(),
                                           replay_records ? &*replay_records : nullptr, io,
@@ -820,7 +821,7 @@ runtime::ExecutionTiming ProgramImpl::resolve_non_speculative_pending(
     if (request.pending.kind == PendingKind::Begin && terminal && sequence.state.fork_pending) {
         const StateImageSelectors selectors = state_selectors(sequence);
         timing.resume_submit();
-        state_images->copy_slot(selectors.source, selectors.destination, device.stream);
+        state_images->copy_slot(selectors.source, selectors.destination, device.stream());
         timing.begin_wait();
         device.synchronize();
         timing.end_wait();

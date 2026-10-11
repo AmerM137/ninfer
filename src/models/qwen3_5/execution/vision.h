@@ -44,13 +44,14 @@ public:
 
     [[nodiscard]] const VisionConfig& config() const noexcept { return config_; }
 
-    [[nodiscard]] static Tensor bind_output(DeviceSpan backing, const VisionWorkspacePlan& plan,
+    [[nodiscard]] static Tensor bind_output(MemorySpan backing, const VisionWorkspacePlan& plan,
                                             std::size_t merged_tokens);
-    void encode(const VisionItemView& item, Tensor& output, DeviceSpan backing,
+    void encode(const VisionItemView& item, Tensor& output, MemorySpan backing,
                 const VisionWorkspacePlan& plan) const;
 
 private:
     DeviceContext& ctx_;
+    CudaExecutionView execution_;
     const VisionConfig& config_;
     const VisionParameters& parameters_;
 };
@@ -64,7 +65,7 @@ struct VisionChunk {
 class VisionPrefillSession {
 public:
     VisionPrefillSession(DeviceContext& device, const execution::Parameters& parameters,
-                         DeviceSpan workspace, const VisionWorkspacePlan& workspace_plan,
+                         MemorySpan workspace, const VisionWorkspacePlan& workspace_plan,
                          const qwen3_5::PreparedPromptData& prompt, const VisionPrefillPlan& plan,
                          VisionHandoffState& handoff, std::size_t& handoff_peak_bytes);
     ~VisionPrefillSession();
@@ -86,7 +87,7 @@ private:
     }
 
     DeviceContext& device_;
-    DeviceSpan workspace_;
+    MemorySpan workspace_;
     const VisionWorkspacePlan& workspace_plan_;
     const qwen3_5::PreparedPromptData& prompt_;
     const VisionPrefillPlan& plan_;

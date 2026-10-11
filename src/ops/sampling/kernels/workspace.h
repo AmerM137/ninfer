@@ -46,7 +46,7 @@ struct WorkspaceLayout {
     std::int32_t partial_stride = 0;
     bool acceptance             = false;
 
-    [[nodiscard]] Workspace bind(DeviceSpan backing) const {
+    [[nodiscard]] Workspace bind(MemorySpan backing) const {
         if (bytes == 0) { return {}; }
         return {
             static_cast<unsigned long long*>(partial_keys.bind(backing).data),

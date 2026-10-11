@@ -6,6 +6,7 @@
 // captured per graph, and the reported node count is the captured graph's real node count.
 
 #include "core/weight.h"
+#include "core/buffer.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/linear_add.h"
 
@@ -141,6 +142,7 @@ int main(int argc, char** argv) {
 
         cudaStream_t stream = nullptr;
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+        const auto cuda = ninfer::bench::device_context().execution_view(stream);
         bench::L2FlushBuffer flush(options.flush_bytes);
         DeviceBuffer input =
             bench::make_bf16(static_cast<std::size_t>(options.hidden) * max_t, 101U);
@@ -157,14 +159,16 @@ int main(int argc, char** argv) {
         // The A16 routes report a zero-capacity profile, and the arena type rejects a zero-byte
         // allocation, so the owning arena is non-empty here. Every row still reports how many of
         // those bytes the public Op actually consumes.
-        WorkspaceArena workspace(std::max<std::size_t>(workspace_capacity, 256));
+        ninfer::DeviceBuffer workspace_storage(ninfer::bench::device_context().device(),
+                                               std::max<std::size_t>(workspace_capacity, 256));
+        MemoryArena workspace(workspace_storage.span());
 
         if (options.profile) {
             const std::int32_t tokens = options.tokens.front();
-            Tensor x(input.p, DType::BF16, {options.hidden, tokens});
-            Tensor out(residual.p, DType::BF16, {kRows, tokens});
+            Tensor x(input.span(), DType::BF16, {options.hidden, tokens});
+            Tensor out(residual.span(), DType::BF16, {kRows, tokens});
             workspace.reset();
-            ops::linear_add(x, packed.weight, out, ops::LinearPolicy::A16Only, workspace, stream);
+            ops::linear_add(x, packed.weight, out, ops::LinearPolicy::A16Only, workspace, cuda);
             CUDA_CHECK(cudaStreamSynchronize(stream));
             std::printf("profile op=linear_add qtype=q5_g64_fp16 rows=%d k=%d T=%d "
                         "workspace_sweep=%zu workspace_exact=%zu workspace_used=%zu\n",
@@ -187,29 +191,26 @@ int main(int argc, char** argv) {
         rows.reserve(options.tokens.size());
 
         for (const std::int32_t tokens : options.tokens) {
-            Tensor x(input.p, DType::BF16, {options.hidden, tokens});
-            Tensor out(residual.p, DType::BF16, {kRows, tokens});
-            const auto restore = [&](cudaStream_t prepare_stream) {
-                residual_initial.restore(prepare_stream);
-            };
-            const auto body = [&](cudaStream_t launch_stream) {
-                ops::linear_add(x, packed.weight, out, ops::LinearPolicy::A16Only, workspace,
-                                launch_stream);
+            Tensor x(input.span(), DType::BF16, {options.hidden, tokens});
+            Tensor out(residual.span(), DType::BF16, {kRows, tokens});
+            const auto restore = [&](CudaExecutionView cuda) { residual_initial.restore(cuda); };
+            const auto body    = [&](CudaExecutionView cuda) {
+                ops::linear_add(x, packed.weight, out, ops::LinearPolicy::A16Only, workspace, cuda);
             };
 
             bench::TimedGraph graph;
-            if (options.graph) graph.capture(stream, body);
+            if (options.graph) graph.capture(cuda, body);
 
             const bench::ColdTiming timing =
-                options.graph ? bench::measure_cold_graph_prepared(restore, graph, flush, stream,
+                options.graph ? bench::measure_cold_graph_prepared(restore, graph, flush, cuda,
                                                                    options.warmup, options.repeat)
-                              : bench::measure_cold_launch_prepared(restore, body, flush, stream,
+                              : bench::measure_cold_launch_prepared(restore, body, flush, cuda,
                                                                     options.warmup, options.repeat);
 
             // Evidence for the public zero-extra-workspace contract: consume from a freshly reset
             // arena in a single untimed call and report what the Op actually took.
             workspace.reset();
-            body(stream);
+            body(cuda);
             CUDA_CHECK(cudaStreamSynchronize(stream));
             const std::size_t workspace_used = workspace.used();
 

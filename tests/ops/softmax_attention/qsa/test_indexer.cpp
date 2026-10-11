@@ -1,4 +1,6 @@
 #include "indexer_fixture.h"
+#include "cuda_fixture.h"
+#include "core/buffer.h"
 #include "core/decode_graph.h"
 
 #include <numeric>
@@ -121,10 +123,9 @@ int run(DeviceContext& device, int t, int b, int history, int layout, Pattern pa
         bool replay = false, std::uint32_t capacity = 262144) {
     Fixture f(t, b, history, layout, pattern);
     f.envelope.max_visible_tokens = capacity;
-    const auto bytes =
-        ops::qsa_indexer_workspace_capacity_bytes(1, t, b, f.envelope, device.execution_view());
+    const auto bytes              = ops::qsa_indexer_workspace_capacity_bytes(1, t, b, f.envelope);
     GuardedDeviceBuffer scratch(std::max<std::size_t>(256, bytes));
-    WorkspaceArena workspace(DeviceSpan{scratch.data(), std::max<std::size_t>(256, bytes)});
+    MemoryArena workspace(scratch.span().subspan(0, std::max<std::size_t>(256, bytes)));
     DecodeGraphDefinition definition;
     DecodeGraphExecutable graph;
     int failures     = 0;
@@ -135,12 +136,12 @@ int run(DeviceContext& device, int t, int b, int history, int layout, Pattern pa
         if (phase == 0) scratch.fill(0x7f);
         cuda_synchronize();
         if (replay && phase == 0) {
-            definition.capture(device.stream,
+            definition.capture(device.stream(),
                                [&] { f.launch(workspace, device.execution_view()); });
             graph.instantiate(definition);
         }
         if (replay)
-            graph.launch(device.stream);
+            graph.launch(device.stream());
         else
             f.launch(workspace, device.execution_view());
         device.synchronize();
@@ -158,41 +159,46 @@ int run(DeviceContext& device, int t, int b, int history, int layout, Pattern pa
 int read_footprint(DeviceContext& device) {
     Fixture f(8, 4, 32772, 0, Pattern::Dyadic);
     f.reset(0);
-    DeviceBuffer query(f.q_host.size() * 2), keys(f.k_host.size() * 2),
-        positions(f.positions.size() * 4), table(f.tables.size() * 4);
-    f.query.data              = query.p;
-    f.cache.keys.data         = keys.p;
-    f.cache.block_tables.data = table.p;
-    f.batch.positions.data    = positions.p;
+    DeviceBuffer query(ninfer::test::cuda_environment().context.device(), f.q_host.size() * 2);
+    DeviceBuffer keys(ninfer::test::cuda_environment().context.device(), f.k_host.size() * 2);
+    DeviceBuffer positions(ninfer::test::cuda_environment().context.device(),
+                           f.positions.size() * 4);
+    DeviceBuffer table(ninfer::test::cuda_environment().context.device(), f.tables.size() * 4);
+    f.query.data              = query.data();
+    f.cache.keys.data         = keys.data();
+    f.cache.block_tables.data = table.data();
+    f.batch.positions.data    = positions.data();
     for (int b = 0; b < f.B; ++b) {
         const int n = f.valid[b];
         if (!n) continue;
-        CUDA_CHECK(cudaMemcpyAsync(static_cast<int*>(positions.p) + b * f.T,
+        CUDA_CHECK(cudaMemcpyAsync(static_cast<int*>(positions.data()) + b * f.T,
                                    f.positions.data() + b * f.T, n * 4, cudaMemcpyHostToDevice,
-                                   device.stream));
+                                   device.stream()));
         for (int t = 0; t < n; ++t) {
             if ((f.positions[b * f.T + t] + 1) / 4 <= 512) continue;
             const auto m = std::size_t(b * f.T + t) * 512;
-            CUDA_CHECK(cudaMemcpyAsync(static_cast<std::uint16_t*>(query.p) + m,
+            CUDA_CHECK(cudaMemcpyAsync(static_cast<std::uint16_t*>(query.data()) + m,
                                        f.q_host.data() + m, 1024, cudaMemcpyHostToDevice,
-                                       device.stream));
+                                       device.stream()));
         }
         const int c = (f.positions[b * f.T + n - 1] + 1) / 4;
         if (c <= 512) continue;
         const int page_count = (c + 15) / 16, row = f.table_rows[b];
-        CUDA_CHECK(cudaMemcpyAsync(static_cast<int*>(table.p) + row * f.table_stride,
+        CUDA_CHECK(cudaMemcpyAsync(static_cast<int*>(table.data()) + row * f.table_stride,
                                    f.tables.data() + row * f.table_stride, page_count * 4,
-                                   cudaMemcpyHostToDevice, device.stream));
+                                   cudaMemcpyHostToDevice, device.stream()));
         for (int p = 0; p < page_count; ++p) {
             const auto offset =
                 std::int64_t(f.tables[row * f.table_stride + p]) * f.key_page_stride;
-            CUDA_CHECK(cudaMemcpyAsync(static_cast<std::uint16_t*>(keys.p) + offset,
+            CUDA_CHECK(cudaMemcpyAsync(static_cast<std::uint16_t*>(keys.data()) + offset,
                                        f.k_host.data() + offset, std::min(16, c - p * 16) * 256,
-                                       cudaMemcpyHostToDevice, device.stream));
+                                       cudaMemcpyHostToDevice, device.stream()));
         }
     }
-    WorkspaceArena workspace(
-        ops::qsa_indexer_workspace_capacity_bytes(8, 8, 4, f.envelope, device.execution_view()));
+    ninfer::DeviceBuffer workspace_storage(
+        ninfer::test::cuda_environment().context.device(),
+        ops::qsa_indexer_workspace_capacity_bytes(8, 8, 4, f.envelope));
+    MemoryArena workspace(workspace_storage.span());
     f.launch(workspace, device.execution_view());
     device.synchronize();
     return verify(f, "masked reads", false);
@@ -210,12 +216,12 @@ int rejects(F&& call) {
 int validation(DeviceContext& device) {
     Fixture f(1, 1, 4, 0, Pattern::Dyadic);
     f.reset(0);
-    WorkspaceArena workspace(
-        ops::qsa_indexer_workspace_capacity_bytes(1, 1, 1, f.envelope, device.execution_view()));
-    int failures  = rejects([&] {
-        (void)ops::qsa_indexer_workspace_capacity_bytes(2, 1, 1, f.envelope,
-                                                         device.execution_view());
-    });
+    ninfer::DeviceBuffer workspace_storage(
+        ninfer::test::cuda_environment().context.device(),
+        ops::qsa_indexer_workspace_capacity_bytes(1, 1, 1, f.envelope));
+    MemoryArena workspace(workspace_storage.span());
+    int failures =
+        rejects([&] { (void)ops::qsa_indexer_workspace_capacity_bytes(2, 1, 1, f.envelope); });
     auto original = f.query;
     f.query.nb[1] += 2;
     failures += rejects([&] { f.launch(workspace, device.execution_view()); });
@@ -228,10 +234,9 @@ int validation(DeviceContext& device) {
     failures += rejects([&] { f.launch(workspace, device.execution_view()); });
     f.envelope.max_visible_tokens = 0;
     f.reset(0, true);
-    if (ops::qsa_indexer_workspace_capacity_bytes(1, 1, 1, f.envelope, device.execution_view()) !=
-        0)
-        ++failures;
-    WorkspaceArena empty(256);
+    if (ops::qsa_indexer_workspace_capacity_bytes(1, 1, 1, f.envelope) != 0) ++failures;
+    ninfer::DeviceBuffer empty_storage(ninfer::test::cuda_environment().context.device(), 256);
+    MemoryArena empty(empty_storage.span());
     f.launch(empty, device.execution_view());
     device.synchronize();
     failures += verify(f, "zero envelope");

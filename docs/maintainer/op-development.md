@@ -218,7 +218,7 @@ follows the contract's complexity; there is no mandatory list of section heading
  * x/y are same-shaped, contiguous, non-overlapping BF16 tensors.
  * Updates x in place and preserves y. Empty tensors perform no device work.
  */
-void residual_add(const Tensor& y, Tensor& x, cudaStream_t stream);
+void residual_add(const Tensor& y, Tensor& x, CudaExecutionView execution);
 ```
 
 The contract must be sufficient to write an independent implementation and oracle. A name such as
@@ -367,11 +367,23 @@ Program owns persistent state instances and lifetime; core owns model-independen
 containers; an Op owns only the documented reads, writes, outputs, and state transition of one
 call.
 
+CUDA entries receive the `CudaExecutionView` propagated from the owning `DeviceContext`.
+Validate operand residency with the family's existing shape/layout checks, including active
+optional planes and workspace. Thin overloads delegate to that complete validation. Private
+launchers may receive the extracted stream; a composing Op forwards the execution view.
+Raw device pointers in explicit CUDA descriptors belong to that same execution device and remain
+the caller's lifetime responsibility. No entry infers execution from an operand or queries CUDA
+pointer attributes on the launch path.
+
 ### 5.2 Workspace
 
-Caller-owned `WorkspaceArena&` or an explicit caller-owned scratch view is the transient workspace
+Caller-owned `MemoryArena&` or an explicit caller-owned scratch view is the transient workspace
 boundary. An Op may suballocate within its call scope, but it must not allocate hidden device
-memory, retain a scratch pointer, or own the arena.
+memory, retain a scratch pointer, or own the arena. The arena borrows its backing allocation;
+its capacity and cursor do not confer ownership or completion.
+For CUDA entries, even a zero-capacity arena carries the execution device. Zero scratch means
+no allocation, not an unlocated workspace. Absent optional tensors and explicitly supported
+zero-work inputs follow the individual Op's contract and need no backing.
 
 An entry with statically zero scratch omits both the arena argument and a sizing query. A
 scratch-capable entry accepts caller-owned workspace and exposes one authoritative capacity query
@@ -380,6 +392,10 @@ for its fixed host-visible profile and inclusive extent interval.
 The query returns the minimum high-water capacity sufficient for every legal extent in that
 interval. An exact-call query uses equal interval endpoints. Invalid profiles and intervals throw;
 zero is reserved for a legal route that requires no caller-owned global scratch.
+
+Capacity queries consume host-visible geometry and explicit hardware facts such as SM count.
+They do not require a stream or a synthetic execution view. Planned tensors have no residency;
+binding to a real backing span supplies it.
 
 Account for route transitions and nonmonotone regions when computing the interval maximum. An
 upper-endpoint query suffices only for a region whose allocation is known to be nondecreasing.

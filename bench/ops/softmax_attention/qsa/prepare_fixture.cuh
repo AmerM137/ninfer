@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/buffer.h"
 #include "state_fixture.cuh"
 #include "ninfer/ops/qsa.h"
 
@@ -10,9 +11,29 @@
 namespace ninfer::bench::qsa {
 
 struct PrepareFixture {
-    DeviceBuffer q, k, v, iq, ik, wq, wk, wiq, wik, out_q, out_iq, keys, values, index_keys;
-    DeviceBuffer key_scales, value_scales;
-    DeviceBuffer positions, rope, valid, table_rows, slots, offsets, tables;
+    DeviceBuffer q;
+    DeviceBuffer k;
+    DeviceBuffer v;
+    DeviceBuffer iq;
+    DeviceBuffer ik;
+    DeviceBuffer wq;
+    DeviceBuffer wk;
+    DeviceBuffer wiq;
+    DeviceBuffer wik;
+    DeviceBuffer out_q;
+    DeviceBuffer out_iq;
+    DeviceBuffer keys;
+    DeviceBuffer values;
+    DeviceBuffer index_keys;
+    DeviceBuffer key_scales;
+    DeviceBuffer value_scales;
+    DeviceBuffer positions;
+    DeviceBuffer rope;
+    DeviceBuffer valid;
+    DeviceBuffer table_rows;
+    DeviceBuffer slots;
+    DeviceBuffer offsets;
+    DeviceBuffer tables;
     StatePlane<std::uint16_t> before_raw, record_raw;
     StatePlane<std::int32_t> before_rope, record_rope;
     std::unique_ptr<SavedBuffer> saved_q, saved_iq;
@@ -32,7 +53,8 @@ struct PrepareFixture {
           iq(make_bf16(std::size_t(512) * tokens * o.batch, 109)),
           ik(make_bf16(std::size_t(128) * tokens * o.batch, 113)), wq(make_bf16(256, 127)),
           wk(make_bf16(256, 131)), wiq(make_bf16(128, 137)), wik(make_bf16(128, 139)),
-          out_q(o.inplace ? 0 : q.bytes), out_iq(o.inplace ? 0 : iq.bytes),
+          out_q(ninfer::bench::device_context().device(), o.inplace ? 0 : q.size()),
+          out_iq(ninfer::bench::device_context().device(), o.inplace ? 0 : iq.size()),
           before_raw(128, 3, o.batch, DType::BF16, o.layout),
           record_raw(128, tokens, o.batch, DType::BF16, o.layout),
           before_rope(3, o.batch, 1, DType::I32, o.layout, true),
@@ -80,7 +102,7 @@ struct PrepareFixture {
         const auto allocate_plane = [=](DeviceBuffer& buffer, DType dtype, int leading) {
             if (leading == 0) return Tensor{};
             buffer = make_zeros(std::size_t(pages) * leading * 64 * 2 * dtype_size(dtype));
-            return Tensor(buffer.p, dtype, {leading, 64, 2, pages});
+            return Tensor(buffer.span(), dtype, {leading, 64, 2, pages});
         };
         const auto k_data =
             allocate_plane(keys, schema.key.data_dtype, schema.key.data_leading_extent);
@@ -91,38 +113,40 @@ struct PrepareFixture {
         const auto v_scales = allocate_plane(value_scales, schema.value.scale_dtype,
                                              schema.value.scale_leading_extent);
         index_keys          = make_zeros(std::size_t(pages) * 128 * 16 * 2);
-        projected           = {Tensor(q.p, DType::BF16, {256, 24, tokens, B}),
-                               Tensor(k.p, DType::BF16, {256, 2, tokens, B}),
-                               Tensor(v.p, DType::BF16, {256, 2, tokens, B}),
-                               Tensor(iq.p, DType::BF16, {128, 4, tokens, B}),
-                               Tensor(ik.p, DType::BF16, {128, tokens, B})};
-        parameters          = {Tensor(wq.p, DType::BF16, {256}), Tensor(wk.p, DType::BF16, {256}),
-                               Tensor(wiq.p, DType::BF16, {128}), Tensor(wik.p, DType::BF16, {128})};
-        batch   = {Tensor(positions.p, DType::I32, {tokens, B}), Tensor(valid.p, DType::I32, {B}),
-                   Tensor(table_rows.p, DType::I32, {B})};
-        before  = {before_raw.view, before_rope.view, Tensor(slots.p, DType::I32, {B})};
-        records = {record_raw.view, record_rope.view, Tensor(offsets.p, DType::I32, {B})};
-        Tensor block_tables(tables.p, DType::I32, {logical, B});
+        projected           = {Tensor(q.span(), DType::BF16, {256, 24, tokens, B}),
+                               Tensor(k.span(), DType::BF16, {256, 2, tokens, B}),
+                               Tensor(v.span(), DType::BF16, {256, 2, tokens, B}),
+                               Tensor(iq.span(), DType::BF16, {128, 4, tokens, B}),
+                               Tensor(ik.span(), DType::BF16, {128, tokens, B})};
+        parameters = {Tensor(wq.span(), DType::BF16, {256}), Tensor(wk.span(), DType::BF16, {256}),
+                      Tensor(wiq.span(), DType::BF16, {128}),
+                      Tensor(wik.span(), DType::BF16, {128})};
+        batch      = {Tensor(positions.span(), DType::I32, {tokens, B}),
+                      Tensor(valid.span(), DType::I32, {B}), Tensor(table_rows.span(), DType::I32, {B})};
+        before     = {before_raw.view, before_rope.view, Tensor(slots.span(), DType::I32, {B})};
+        records    = {record_raw.view, record_rope.view, Tensor(offsets.span(), DType::I32, {B})};
+        Tensor block_tables(tables.span(), DType::I32, {logical, B});
         cache = {{k_data, v_data, k_scales, v_scales, block_tables, 256, 2, o.storage},
-                 {Tensor(index_keys.p, DType::BF16, {128, 16, 1, pages}), block_tables}};
-        rho   = Tensor(rope.p, DType::I32, {tokens, A, B});
-        query = o.inplace ? projected.query : Tensor(out_q.p, DType::BF16, {256, 24, tokens, B});
-        index_query =
-            o.inplace ? projected.index_query : Tensor(out_iq.p, DType::BF16, {128, 4, tokens, B});
+                 {Tensor(index_keys.span(), DType::BF16, {128, 16, 1, pages}), block_tables}};
+        rho   = Tensor(rope.span(), DType::I32, {tokens, A, B});
+        query =
+            o.inplace ? projected.query : Tensor(out_q.span(), DType::BF16, {256, 24, tokens, B});
+        index_query = o.inplace ? projected.index_query
+                                : Tensor(out_iq.span(), DType::BF16, {128, 4, tokens, B});
         if (o.inplace) {
             saved_q  = std::make_unique<SavedBuffer>(q);
             saved_iq = std::make_unique<SavedBuffer>(iq);
         }
     }
 
-    void restore(cudaStream_t stream) const {
+    void restore(CudaExecutionView cuda) const {
         if (saved_q) {
-            saved_q->restore(stream);
-            saved_iq->restore(stream);
+            saved_q->restore(cuda);
+            saved_iq->restore(cuda);
         }
     }
 
-    void launch(DeviceExecutionView execution) {
+    void launch(CudaExecutionView execution) {
         ops::qsa_prepare(projected, parameters, batch, rho, before, cache, records, query,
                          index_query, execution);
     }

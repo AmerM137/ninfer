@@ -50,10 +50,8 @@ void ProgramImpl::initialize_prefill(std::uint32_t lane, std::uint32_t base) {
         }
         if (!vision.uses.empty()) {
             staged.vision = std::make_unique<execution::VisionPrefillSession>(
-                device, parameters,
-                DeviceSpan{workspace_storage.base(), workspace_storage.capacity()},
-                *workspace_plan.vision, staged.prompt, vision, vision_handoff,
-                vision_handoff_peak_bytes);
+                device, parameters, workspace_storage.span(), *workspace_plan.vision, staged.prompt,
+                vision, vision_handoff, vision_handoff_peak_bytes);
         }
     }
 }
@@ -337,8 +335,8 @@ BindingReservation ProgramImpl::start_binding(const RequestBasePlan& base, runti
                                     ? state_store->reserve_logical_destination()
                                     : state_store->reserve_destination();
         if (!tx.reserved_state) { throw std::logic_error("binding lost its state capacity"); }
-        context_source_ready_.record(device.stream);
-        context_source_ready_.wait(device.transfer_stream);
+        context_source_ready_.record(device.stream());
+        context_source_ready_.wait(device.transfer_stream());
         if (tx.backup_state) {
             auto backup = state_store->reserve_device_to_host(checkpoint(*source).state);
             if (!backup) {
@@ -353,9 +351,10 @@ BindingReservation ProgramImpl::start_binding(const RequestBasePlan& base, runti
             start_context_transfer_timer(runtime::ContextResourceClass::State);
             auto transfer =
                 tx.borrow_state
-                    ? state_store->begin_host_to_device(*tx.reserved_state, device.transfer_stream)
+                    ? state_store->begin_host_to_device(*tx.reserved_state,
+                                                        device.transfer_stream())
                     : state_store->begin_host_fork(checkpoint(*source).state, *tx.reserved_state,
-                                                   device.transfer_stream);
+                                                   device.transfer_stream());
             if (transfer) { tx.state_transfer.emplace(std::move(*transfer)); }
             if (!tx.state_transfer) {
                 throw std::logic_error("binding could not reserve its Host state fork");
@@ -399,10 +398,9 @@ void ProgramImpl::install_binding(ContextTransaction& tx) {
         if (request.prefill && request.prefill->vision_plan &&
             !request.prefill->vision_plan->uses.empty()) {
             request.prefill->vision = std::make_unique<execution::VisionPrefillSession>(
-                device, parameters,
-                DeviceSpan{workspace_storage.base(), workspace_storage.capacity()},
-                *workspace_plan.vision, request.prefill->prompt, *request.prefill->vision_plan,
-                vision_handoff, vision_handoff_peak_bytes);
+                device, parameters, workspace_storage.span(), *workspace_plan.vision,
+                request.prefill->prompt, *request.prefill->vision_plan, vision_handoff,
+                vision_handoff_peak_bytes);
         }
         install_resume_sampling(state, request);
     } else {
@@ -489,10 +487,10 @@ void ProgramImpl::prepare_binding(ContextTransaction& tx) {
             copy_local_for_context(tx, selectors.source, selectors.destination);
         }
     } else if (!tx.source) {
-        state_store->activate_reset(*tx.reserved_state, device.transfer_stream);
+        state_store->activate_reset(*tx.reserved_state, device.transfer_stream());
     }
     tx.submitted = !tx.source || !tx.transfers.empty();
-    if (tx.submitted) { context_completion_.record(device.transfer_stream); }
+    if (tx.submitted) { context_completion_.record(device.transfer_stream()); }
 }
 
 void ProgramImpl::complete_binding(ContextTransaction& tx, ContextProgress& out) {
@@ -575,14 +573,14 @@ void ProgramImpl::complete_binding(ContextTransaction& tx, ContextProgress& out)
                       tx.backend_activation);
     }
     if (tx.text_fork) {
-        text_kv_addresses->commit_prefix_fork(std::move(*tx.text_fork), device.stream);
+        text_kv_addresses->commit_prefix_fork(std::move(*tx.text_fork), device.stream());
     } else {
-        text_kv_addresses->commit_activation(std::move(*tx.text_activation), device.stream);
+        text_kv_addresses->commit_activation(std::move(*tx.text_activation), device.stream());
     }
     if (tx.backend_fork) {
-        backend_kv_addresses->commit_prefix_fork(std::move(*tx.backend_fork), device.stream);
+        backend_kv_addresses->commit_prefix_fork(std::move(*tx.backend_fork), device.stream());
     } else if (tx.backend_activation) {
-        backend_kv_addresses->commit_activation(std::move(*tx.backend_activation), device.stream);
+        backend_kv_addresses->commit_activation(std::move(*tx.backend_activation), device.stream());
     }
     tx.binding_history->owner = this;
     tx.reserved_kv.reset();

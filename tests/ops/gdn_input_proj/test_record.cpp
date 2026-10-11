@@ -1,4 +1,6 @@
 #include "core/weight.h"
+#include "cuda_fixture.h"
+#include "core/buffer.h"
 #include "core/device.h"
 #include "ninfer/ops/gdn_input_proj.h"
 
@@ -139,36 +141,44 @@ int run_case(std::string_view label, std::int32_t hidden, std::int32_t value_row
     GuardedBf16Tensor record_z(z_rows, aggregate_columns);
     GuardedBf16Tensor conv_record(channels, aggregate_columns);
 
-    Tensor x(device_x.p, DType::BF16, {hidden, width, batch});
-    Tensor conv_weight(device_conv_weight.p, DType::BF16, {channels, 4});
-    Tensor snapshot_state_view(snapshot_state.p, DType::BF16, {channels, 3, slots});
-    Tensor record_state_view(record_state.p, DType::BF16, {channels, 3, source_slots});
+    Tensor x(device_x.span(), DType::BF16, {hidden, width, batch});
+    Tensor conv_weight(device_conv_weight.span(), DType::BF16, {channels, 4});
+    Tensor snapshot_state_view(snapshot_state.span(), DType::BF16, {channels, 3, slots});
+    Tensor record_state_view(record_state.span(), DType::BF16, {channels, 3, source_slots});
     Tensor valid;
-    if (!dense) { valid = Tensor(device_valid.p, DType::I32, {batch}); }
-    Tensor initial(device_initial.p, DType::I32, {batch});
-    Tensor snapshot_initial(device_snapshot_initial.p, DType::I32, {batch});
-    Tensor snapshot_base(device_snapshot.p, DType::I32, {batch});
-    Tensor snapshot_q(snapshot_query.data(), DType::BF16, {kQueryRows, width, batch});
-    Tensor snapshot_k(snapshot_key.data(), DType::BF16, {kKeyRows, width, batch});
-    Tensor snapshot_v(snapshot_value.data(), DType::BF16, {value_rows, width, batch});
-    Tensor snapshot_z_view(snapshot_z.data(), DType::BF16, {z_rows, width, batch});
-    Tensor record_q(record_query.data(), DType::BF16, {kQueryRows, width, batch});
-    Tensor record_k(record_key.data(), DType::BF16, {kKeyRows, width, batch});
-    Tensor record_v(record_value.data(), DType::BF16, {value_rows, width, batch});
-    Tensor record_z_view(record_z.data(), DType::BF16, {z_rows, width, batch});
-    Tensor conv_record_view(conv_record.data(), DType::BF16, {channels, width, batch});
+    if (!dense) { valid = Tensor(device_valid.span(), DType::I32, {batch}); }
+    Tensor initial(device_initial.span(), DType::I32, {batch});
+    Tensor snapshot_initial(device_snapshot_initial.span(), DType::I32, {batch});
+    Tensor snapshot_base(device_snapshot.span(), DType::I32, {batch});
+    Tensor snapshot_q(snapshot_query.span(), DType::BF16, {kQueryRows, width, batch});
+    Tensor snapshot_k(snapshot_key.span(), DType::BF16, {kKeyRows, width, batch});
+    Tensor snapshot_v(snapshot_value.span(), DType::BF16, {value_rows, width, batch});
+    Tensor snapshot_z_view(snapshot_z.span(), DType::BF16, {z_rows, width, batch});
+    Tensor record_q(record_query.span(), DType::BF16, {kQueryRows, width, batch});
+    Tensor record_k(record_key.span(), DType::BF16, {kKeyRows, width, batch});
+    Tensor record_v(record_value.span(), DType::BF16, {value_rows, width, batch});
+    Tensor record_z_view(record_z.span(), DType::BF16, {z_rows, width, batch});
+    Tensor conv_record_view(conv_record.span(), DType::BF16, {channels, width, batch});
 
-    WorkspaceArena snapshot_workspace(std::max<std::size_t>(256, snapshot_workspace_bytes));
-    WorkspaceArena record_workspace(std::max<std::size_t>(256, record_workspace_bytes));
+    ninfer::DeviceBuffer snapshot_workspace_storage(
+        ninfer::test::cuda_environment().context.device(),
+        std::max<std::size_t>(256, snapshot_workspace_bytes));
+
+    MemoryArena snapshot_workspace(snapshot_workspace_storage.span());
+    ninfer::DeviceBuffer record_workspace_storage(
+        ninfer::test::cuda_environment().context.device(),
+        std::max<std::size_t>(256, record_workspace_bytes));
+    MemoryArena record_workspace(record_workspace_storage.span());
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    const auto stream_execution = ninfer::test::cuda_environment().context.execution_view(stream);
     cuda_synchronize();
     const auto launch = [&] {
         snapshot_launch(x, conv_weight, snapshot_state_view, valid, snapshot_initial, snapshot_base,
                         snapshot_q, snapshot_k, snapshot_v, snapshot_z_view, snapshot_workspace,
-                        stream);
+                        stream_execution);
         record_launch(x, conv_weight, record_state_view, valid, initial, conv_record_view, record_q,
-                      record_k, record_v, record_z_view, record_workspace, stream);
+                      record_k, record_v, record_z_view, record_workspace, stream_execution);
     };
     launch();
     CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -186,7 +196,7 @@ int run_case(std::string_view label, std::int32_t hidden, std::int32_t value_row
         CUDA_CHECK(cudaStreamSynchronize(stream));
         // The same graph must consume changed inputs at the captured addresses.
         activation_bits = bf16_bits(make_bf16_activation(hidden, aggregate_columns, seed + 19));
-        CUDA_CHECK(cudaMemcpyAsync(device_x.p, activation_bits.data(),
+        CUDA_CHECK(cudaMemcpyAsync(device_x.data(), activation_bits.data(),
                                    activation_bits.size() * sizeof(std::uint16_t),
                                    cudaMemcpyHostToDevice, stream));
         CUDA_CHECK(cudaGraphLaunch(executable, stream));
@@ -275,18 +285,17 @@ int run_q4_q5() {
             kZRows, width, batch, std::move(valid), snapshot_bytes, record_bytes,
             [&](const Tensor& x, const Tensor& conv, Tensor& state, const Tensor& valid_columns,
                 const Tensor& initial, const Tensor& snapshot_base, Tensor& q, Tensor& k, Tensor& v,
-                Tensor& z, WorkspaceArena& workspace, cudaStream_t stream) {
+                Tensor& z, MemoryArena& workspace, CudaExecutionView cuda) {
                 ops::gdn_input_proj_conv_snapshot(
                     x, ops::PairedProjectionWeights{qk.view(), value_z.view()}, conv,
-                    {state, initial, snapshot_base}, valid_columns, {q, k, v, z}, workspace,
-                    stream);
+                    {state, initial, snapshot_base}, valid_columns, {q, k, v, z}, workspace, cuda);
             },
             [&](const Tensor& x, const Tensor& conv, const Tensor& state,
                 const Tensor& valid_columns, const Tensor& initial, Tensor& record, Tensor& q,
-                Tensor& k, Tensor& v, Tensor& z, WorkspaceArena& workspace, cudaStream_t stream) {
+                Tensor& k, Tensor& v, Tensor& z, MemoryArena& workspace, CudaExecutionView cuda) {
                 ops::gdn_input_proj_conv_record(
                     x, ops::PairedProjectionWeights{qk.view(), value_z.view()}, conv,
-                    {state, initial}, valid_columns, {q, k, v, z}, record, workspace, stream);
+                    {state, initial}, valid_columns, {q, k, v, z}, record, workspace, cuda);
             },
             seed);
     };
@@ -332,18 +341,17 @@ int run_q8(std::int32_t kHidden = 2048) {
             record_bytes,
             [&](const Tensor& x, const Tensor& conv, Tensor& state, const Tensor& valid_columns,
                 const Tensor& initial, const Tensor& snapshot_base, Tensor& q, Tensor& k, Tensor& v,
-                Tensor& z, WorkspaceArena& workspace, cudaStream_t stream) {
+                Tensor& z, MemoryArena& workspace, CudaExecutionView cuda) {
                 ops::gdn_input_proj_conv_snapshot(
                     x, ops::SingleProjectionWeight{parent.view(), ops::LinearPolicy::A16Only}, conv,
-                    {state, initial, snapshot_base}, valid_columns, {q, k, v, z}, workspace,
-                    stream);
+                    {state, initial, snapshot_base}, valid_columns, {q, k, v, z}, workspace, cuda);
             },
             [&](const Tensor& x, const Tensor& conv, const Tensor& state,
                 const Tensor& valid_columns, const Tensor& initial, Tensor& record, Tensor& q,
-                Tensor& k, Tensor& v, Tensor& z, WorkspaceArena& workspace, cudaStream_t stream) {
+                Tensor& k, Tensor& v, Tensor& z, MemoryArena& workspace, CudaExecutionView cuda) {
                 ops::gdn_input_proj_conv_record(
                     x, ops::SingleProjectionWeight{parent.view(), ops::LinearPolicy::A16Only}, conv,
-                    {state, initial}, valid_columns, {q, k, v, z}, record, workspace, stream);
+                    {state, initial}, valid_columns, {q, k, v, z}, record, workspace, cuda);
             },
             seed);
     };
@@ -389,18 +397,17 @@ int run_nvfp4() {
             record_bytes,
             [&](const Tensor& x, const Tensor& conv, Tensor& state, const Tensor& valid_columns,
                 const Tensor& initial, const Tensor& snapshot_base, Tensor& q, Tensor& k, Tensor& v,
-                Tensor& z, WorkspaceArena& workspace, cudaStream_t stream) {
+                Tensor& z, MemoryArena& workspace, CudaExecutionView cuda) {
                 ops::gdn_input_proj_conv_snapshot(
                     x, ops::SingleProjectionWeight{parent.view(), policy}, conv,
-                    {state, initial, snapshot_base}, valid_columns, {q, k, v, z}, workspace,
-                    stream);
+                    {state, initial, snapshot_base}, valid_columns, {q, k, v, z}, workspace, cuda);
             },
             [&](const Tensor& x, const Tensor& conv, const Tensor& state,
                 const Tensor& valid_columns, const Tensor& initial, Tensor& record, Tensor& q,
-                Tensor& k, Tensor& v, Tensor& z, WorkspaceArena& workspace, cudaStream_t stream) {
+                Tensor& k, Tensor& v, Tensor& z, MemoryArena& workspace, CudaExecutionView cuda) {
                 ops::gdn_input_proj_conv_record(
                     x, ops::SingleProjectionWeight{parent.view(), policy}, conv, {state, initial},
-                    valid_columns, {q, k, v, z}, record, workspace, stream);
+                    valid_columns, {q, k, v, z}, record, workspace, cuda);
             },
             seed);
     };
@@ -426,17 +433,17 @@ int run_fp8_case(DevicePackedWeight& parent, std::int32_t width, std::int32_t ba
         5120, 6144, 6144, width, batch, std::move(valid), snapshot_bytes, record_bytes,
         [&](const Tensor& x, const Tensor& conv, Tensor& state, const Tensor& valid_columns,
             const Tensor& initial, const Tensor& snapshot_base, Tensor& q, Tensor& k, Tensor& v,
-            Tensor& z, WorkspaceArena& workspace, cudaStream_t stream) {
+            Tensor& z, MemoryArena& workspace, CudaExecutionView cuda) {
             ops::gdn_input_proj_conv_snapshot(x, ops::SingleProjectionWeight{parent.view(), policy},
                                               conv, {state, initial, snapshot_base}, valid_columns,
-                                              {q, k, v, z}, workspace, stream);
+                                              {q, k, v, z}, workspace, cuda);
         },
         [&](const Tensor& x, const Tensor& conv, const Tensor& state, const Tensor& valid_columns,
             const Tensor& initial, Tensor& record, Tensor& q, Tensor& k, Tensor& v, Tensor& z,
-            WorkspaceArena& workspace, cudaStream_t stream) {
+            MemoryArena& workspace, CudaExecutionView cuda) {
             ops::gdn_input_proj_conv_record(x, ops::SingleProjectionWeight{parent.view(), policy},
                                             conv, {state, initial}, valid_columns, {q, k, v, z},
-                                            record, workspace, stream);
+                                            record, workspace, cuda);
         },
         seed);
 }

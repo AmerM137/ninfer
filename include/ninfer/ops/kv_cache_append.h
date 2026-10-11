@@ -1,10 +1,10 @@
 #pragma once
 
+#include "core/device.h"
 #include "core/cyclic_kv_cache.h"
 #include "core/paged_kv_cache.h"
 #include "core/tensor.h"
 
-#include <cuda_runtime.h>
 
 #include <cstdint>
 
@@ -62,7 +62,7 @@ struct KVCacheAppendPrefixExecutionEnvelope {
  * or commit authority.
  */
 void kv_cache_append(const Tensor& k, const Tensor& v, const Tensor& positions,
-                     PagedKVLayerView cache, cudaStream_t stream);
+                     PagedKVLayerView cache, CudaExecutionView execution);
 
 /**
  * Append device-selected BF16 prefixes to batched paged growing-cache storage.
@@ -81,7 +81,7 @@ void kv_cache_append(const Tensor& k, const Tensor& v, const Tensor& positions,
 void kv_cache_append_prefix(const Tensor& k, const Tensor& v, const Tensor& positions,
                             const Tensor& counts, const Tensor& table_rows,
                             KVCacheAppendPrefixExecutionEnvelope envelope,
-                            PagedKVBatchLayerView cache, cudaStream_t stream);
+                            PagedKVBatchLayerView cache, CudaExecutionView execution);
 
 /**
  * Append device-selected BF16 prefixes to lane-owned cyclic storage.
@@ -99,6 +99,6 @@ void kv_cache_append_prefix(const Tensor& k, const Tensor& v, const Tensor& posi
 void kv_cache_append_prefix(const Tensor& k, const Tensor& v, const Tensor& positions,
                             const Tensor& counts, const Tensor& lanes,
                             KVCacheAppendPrefixExecutionEnvelope envelope,
-                            CyclicKVCacheLayerView cache, cudaStream_t stream);
+                            CyclicKVCacheLayerView cache, CudaExecutionView execution);
 
 } // namespace ninfer::ops

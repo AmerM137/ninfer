@@ -38,7 +38,8 @@ void prepare_masked_block_launch(const Tensor& anchors, const Tensor& lengths,
 
 void prepare_masked_block(const Tensor& anchors, const Tensor& lengths, const Tensor& valid_columns,
                           std::int32_t mask_id, Tensor& ids, Tensor& positions,
-                          cudaStream_t stream) {
+                          CudaExecutionView execution) {
+    const auto stream             = execution.stream();
     const std::int32_t block_size = ids.ne[0];
     const std::int32_t batch_size = ids.ne[1];
     if (block_size < 1 || block_size > 16) {
@@ -50,16 +51,16 @@ void prepare_masked_block(const Tensor& anchors, const Tensor& lengths, const Te
     if (mask_id < 0) {
         throw std::invalid_argument("prepare_masked_block: mask_id must be nonnegative");
     }
-    common::operand::tensor(anchors, DType::I32, {batch_size}, 1, "prepare_masked_block",
-                            "anchors");
-    common::operand::tensor(lengths, DType::I32, {batch_size}, 1, "prepare_masked_block",
-                            "lengths");
+    common::operand::tensor(anchors, DType::I32, {batch_size}, 1, "prepare_masked_block", "anchors",
+                            execution.device());
+    common::operand::tensor(lengths, DType::I32, {batch_size}, 1, "prepare_masked_block", "lengths",
+                            execution.device());
     common::operand::tensor(valid_columns, DType::I32, {batch_size}, 1, "prepare_masked_block",
-                            "valid_columns");
+                            "valid_columns", execution.device());
     common::operand::tensor(ids, DType::I32, {block_size, batch_size}, 1, "prepare_masked_block",
-                            "ids");
+                            "ids", execution.device());
     common::operand::tensor(positions, DType::I32, {block_size, batch_size}, 1,
-                            "prepare_masked_block", "positions");
+                            "prepare_masked_block", "positions", execution.device());
     const auto output          = common::operand::range(ids, "prepare_masked_block");
     const auto position_output = common::operand::range(positions, "prepare_masked_block");
     common::operand::disjoint(output, position_output, "prepare_masked_block");

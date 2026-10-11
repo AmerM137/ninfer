@@ -71,34 +71,42 @@ void prepare_verify_ids_launch(const Tensor& anchors, const Tensor& drafts,
 
 void prepare_verify_inputs(const Tensor& anchors, const Tensor& drafts,
                            const Tensor& base_positions, const Tensor& current_extents,
-                           Tensor& verify_ids, Tensor& positions, cudaStream_t stream) {
+                           Tensor& verify_ids, Tensor& positions, CudaExecutionView execution) {
+    const auto stream        = execution.stream();
     constexpr const char* op = "prepare_verify_inputs";
     const std::int32_t k     = drafts.ne[0];
     const std::int32_t batch = drafts.ne[1];
     if (k < 1) { throw std::invalid_argument("prepare_verify_inputs: K must be >=1"); }
     if (batch < 1) { throw std::invalid_argument("prepare_verify_inputs: B must be >=1"); }
-    common::operand::tensor(anchors, DType::I32, {batch}, 1, op, "anchors");
-    common::operand::tensor(drafts, DType::I32, {k, batch}, 1, op, "drafts");
-    common::operand::tensor(base_positions, DType::I32, {batch}, 1, op, "base_positions");
-    common::operand::tensor(current_extents, DType::I32, {batch}, 1, op, "current_extents");
-    common::operand::tensor(verify_ids, DType::I32, {k + 1, batch}, 1, op, "verify_ids");
-    common::operand::tensor(positions, DType::I32, {k + 1, batch}, 1, op, "positions");
+    common::operand::tensor(anchors, DType::I32, {batch}, 1, op, "anchors", execution.device());
+    common::operand::tensor(drafts, DType::I32, {k, batch}, 1, op, "drafts", execution.device());
+    common::operand::tensor(base_positions, DType::I32, {batch}, 1, op, "base_positions",
+                            execution.device());
+    common::operand::tensor(current_extents, DType::I32, {batch}, 1, op, "current_extents",
+                            execution.device());
+    common::operand::tensor(verify_ids, DType::I32, {k + 1, batch}, 1, op, "verify_ids",
+                            execution.device());
+    common::operand::tensor(positions, DType::I32, {k + 1, batch}, 1, op, "positions",
+                            execution.device());
     prepare_verify_inputs_launch(anchors, drafts, base_positions, current_extents, verify_ids,
                                  positions, stream);
 }
 
 void prepare_verify_ids(const Tensor& anchors, const Tensor& drafts, const Tensor& current_extents,
-                        Tensor& verify_ids, cudaStream_t stream) {
+                        Tensor& verify_ids, CudaExecutionView execution) {
+    const auto stream        = execution.stream();
     constexpr const char* op = "prepare_verify_ids";
     const std::int32_t k     = drafts.ne[0];
     const std::int32_t batch = drafts.ne[1];
     if (k < 1 || batch < 1) {
         throw std::invalid_argument("prepare_verify_ids: K and B must be positive");
     }
-    common::operand::tensor(anchors, DType::I32, {batch}, 1, op, "anchors");
-    common::operand::tensor(drafts, DType::I32, {k, batch}, 1, op, "drafts");
-    common::operand::tensor(current_extents, DType::I32, {batch}, 1, op, "current_extents");
-    common::operand::tensor(verify_ids, DType::I32, {k + 1, batch}, 1, op, "verify_ids");
+    common::operand::tensor(anchors, DType::I32, {batch}, 1, op, "anchors", execution.device());
+    common::operand::tensor(drafts, DType::I32, {k, batch}, 1, op, "drafts", execution.device());
+    common::operand::tensor(current_extents, DType::I32, {batch}, 1, op, "current_extents",
+                            execution.device());
+    common::operand::tensor(verify_ids, DType::I32, {k + 1, batch}, 1, op, "verify_ids",
+                            execution.device());
     prepare_verify_ids_launch(anchors, drafts, current_extents, verify_ids, stream);
 }
 

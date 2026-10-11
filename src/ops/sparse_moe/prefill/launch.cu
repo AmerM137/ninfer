@@ -10,11 +10,11 @@ using namespace common;
 
 void launch_prefill(const Tensor& x, const SparseMoeWeights& weights, Tensor& destination,
                     const PrefillPlan& plan, const PrefillWorkspace& workspace,
-                    DeviceExecutionView execution) {
+                    CudaExecutionView execution) {
     if (x.ne[1] != plan.tokens || destination.ne[1] != plan.tokens || plan.slice_tokens < 1) {
         throw std::invalid_argument("sparse_moe prefill: launch plan does not match tensors");
     }
-    const cudaStream_t stream = execution.stream;
+    const cudaStream_t stream = execution.stream();
 
     const auto* router = static_cast<const __nv_bfloat16*>(weights.router_shared_gate.qdata);
     const auto* routed_gate_codes = static_cast<const std::uint8_t*>(weights.routed_gate_up.qdata);
@@ -56,8 +56,8 @@ void launch_prefill(const Tensor& x, const SparseMoeWeights& weights, Tensor& de
         auto* output             = static_cast<__nv_bfloat16*>(output_slice.data);
         const int route_tiles    = (tokens + kRouteTileTokens - 1) / kRouteTileTokens;
         const int assignments    = tokens * kTopK;
-        const auto selected =
-            select_prefill_slice(tokens, weights.routed_down.qtype, execution.multiprocessor_count);
+        const auto selected      = select_prefill_slice(tokens, weights.routed_down.qtype,
+                                                        execution.multiprocessor_count());
         const bool adaptive = selected.adaptive;
         sparse_moe_prefill_router_mma_kernel<<<dim3((kRouterRows + kRouterBM - 1) / kRouterBM,
                                                     (tokens + kRouterBN - 1) / kRouterBN),

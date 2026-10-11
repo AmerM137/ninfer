@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/buffer.h"
 #include "state_fixture.cuh"
 #include "ninfer/ops/qsa.h"
 
@@ -13,7 +14,10 @@ struct TailFixture {
     StatePlane<std::uint16_t> raw_before, raw_after, raw_records;
     StatePlane<std::int32_t> rope_before, rope_after, rope_records;
     std::vector<int> bases, counts, commits;
-    DeviceBuffer slots, base, valid, accepted;
+    DeviceBuffer slots;
+    DeviceBuffer base;
+    DeviceBuffer valid;
+    DeviceBuffer accepted;
     std::unique_ptr<SavedBuffer> saved_raw, saved_rope;
     ops::QsaTailStateView before, after;
     ops::QsaRawRecordReadView records;
@@ -57,27 +61,27 @@ struct TailFixture {
         base     = measurement::make_i32(bases);
         valid    = measurement::make_i32(counts);
         accepted = measurement::make_i32(commits);
-        const Tensor selected(slots.p, DType::I32, {o.batch});
+        const Tensor selected(slots.span(), DType::I32, {o.batch});
         before = {raw_before.view, rope_before.view, selected};
         after  = {o.inplace ? raw_before.view : raw_after.view,
                  o.inplace ? rope_before.view : rope_after.view, selected};
-        records = {raw_records.view, rope_records.view, Tensor(base.p, DType::I32, {o.batch}),
-                   Tensor(valid.p, DType::I32, {o.batch})};
-        count   = Tensor(accepted.p, DType::I32, {o.batch});
+        records = {raw_records.view, rope_records.view, Tensor(base.span(), DType::I32, {o.batch}),
+                   Tensor(valid.span(), DType::I32, {o.batch})};
+        count   = Tensor(accepted.span(), DType::I32, {o.batch});
         if (o.inplace) {
             saved_raw  = std::make_unique<SavedBuffer>(raw_before.storage);
             saved_rope = std::make_unique<SavedBuffer>(rope_before.storage);
         }
     }
 
-    void restore(cudaStream_t stream) const {
+    void restore(CudaExecutionView cuda) const {
         if (saved_raw) {
-            saved_raw->restore(stream);
-            saved_rope->restore(stream);
+            saved_raw->restore(cuda);
+            saved_rope->restore(cuda);
         }
     }
 
-    void launch(DeviceExecutionView execution) {
+    void launch(CudaExecutionView execution) {
         ops::qsa_tail_extract(before, records, count, after, execution);
     }
 };

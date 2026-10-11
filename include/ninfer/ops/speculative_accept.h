@@ -1,9 +1,9 @@
 #pragma once
 
+#include "core/device.h"
 #include "core/tensor.h"
 #include "ninfer/ops/sampling.h"
 
-#include <cuda_runtime.h>
 
 #include <cstdint>
 
@@ -66,7 +66,7 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
                                       Tensor& lengths, Tensor& anchors, Tensor& licensed_tokens,
                                       Tensor& licensed_counts, Tensor& accepted,
                                       std::int32_t token_domain, const SamplingConfig* configs,
-                                      WorkspaceArena& workspace, cudaStream_t stream);
+                                      MemoryArena& workspace, CudaExecutionView execution);
 
 // Caller-owned transient capacity over the inclusive draft-count and batch intervals.
 // The raw-greedy execution envelope requires no workspace.
@@ -121,12 +121,15 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
  *   Caller-owned transient storage reported by
  *   speculative_accept_sparse_drafts_workspace_capacity_bytes().
  */
-void speculative_accept_sparse_drafts(
-    const Tensor& target_tokens, const Tensor& logits, const Tensor& drafts,
-    const Tensor& candidate_ids, const Tensor& proposal_q, const Tensor& current_extents,
-    Tensor& round_lengths, Tensor& round_anchors, Tensor& licensed_tokens, Tensor& licensed_counts,
-    Tensor& accepted_drafts, std::int32_t token_domain, const SamplingConfig* configs,
-    SpeculativeAcceptExecutionEnvelope envelope, WorkspaceArena& workspace, cudaStream_t stream);
+void speculative_accept_sparse_drafts(const Tensor& target_tokens, const Tensor& logits,
+                                      const Tensor& drafts, const Tensor& candidate_ids,
+                                      const Tensor& proposal_q, const Tensor& current_extents,
+                                      Tensor& round_lengths, Tensor& round_anchors,
+                                      Tensor& licensed_tokens, Tensor& licensed_counts,
+                                      Tensor& accepted_drafts, std::int32_t token_domain,
+                                      const SamplingConfig* configs,
+                                      SpeculativeAcceptExecutionEnvelope envelope,
+                                      MemoryArena& workspace, CudaExecutionView execution);
 
 
 

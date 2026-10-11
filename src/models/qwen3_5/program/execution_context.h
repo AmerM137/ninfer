@@ -29,9 +29,19 @@ using detail::DFlashPersistentState;
 using qwen3_5::PromptModality;
 
 struct ExecutionCore {
+    ExecutionCore(DeviceContext& device, const execution::Parameters& parameters, MemoryArena& work,
+                  LinearAttentionStatePool& linear_attention,
+                  const GdnReplayRecords* replay_records, qwen3_5::RoundState& io,
+                  Tensor& prefill_hidden, std::uint32_t prefill_chunk, ProposalHead proposal_head)
+        : device(device), cuda(device.execution_view()), parameters(parameters), work(work),
+          linear_attention(linear_attention), replay_records(replay_records), io(io),
+          prefill_hidden(prefill_hidden), prefill_chunk(prefill_chunk),
+          proposal_head(proposal_head) {}
+
     DeviceContext& device;
+    const CudaExecutionView cuda;
     const execution::Parameters& parameters;
-    WorkspaceArena& work;
+    MemoryArena& work;
     LinearAttentionStatePool& linear_attention;
     const GdnReplayRecords* replay_records;
     qwen3_5::RoundState& io;
@@ -135,7 +145,7 @@ struct TargetVerifyFrameView {
 void configure_text_card(TextContext& card, const ExecutionCore& execution,
                          const ops::SamplingConfig* sampling, std::int32_t state_source_slot,
                          std::int32_t state_destination_slot, std::uint32_t mtp_proposal_extent);
-void target_verify_forward(ExecutionCore&, TextContext&, TargetVerifyFrameView,
+void target_verify_forward(TextContext&, TargetVerifyFrameView,
                            ops::CausalAttentionExecutionEnvelope);
 void target_accept(ExecutionCore&, Tensor& continuation_hidden_store, TargetVerifyFrameView);
 

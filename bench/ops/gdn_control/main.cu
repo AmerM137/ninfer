@@ -7,7 +7,7 @@ int main(int argc, char** argv) {
     try {
         const auto o = gdn_control::parse(argc, argv);
         measurement::hardware();
-        DeviceContext device;
+        auto& device = ninfer::bench::device_context();
         std::optional<gdn_control::Weights> weights;
         if (o.op != gdn_control::Op::Control) weights.emplace(o);
         L2FlushBuffer flush(o.timing.flush_bytes);
@@ -18,8 +18,8 @@ int main(int argc, char** argv) {
                  measurement::selections(o.timing.execution, "graph", "eager"))
                 for (const auto& cache : measurement::selections(o.timing.cache, "cold", "warm")) {
                     const auto result = measurement::measure(
-                        [&](auto stream) { f.launch({stream, device.multiprocessor_count()}); },
-                        [](auto) {}, flush, device.stream, o.timing, execution, cache);
+                        [&](CudaExecutionView cuda) { f.launch(cuda); }, [](auto) {}, flush,
+                        device.execution_view(), o.timing, execution, cache);
                     const auto workspace_peak = f.arena ? f.arena->peak_used() : 0;
                     if ((f.arena && f.arena->used() != 0) || workspace_peak != f.capacity)
                         throw std::runtime_error("workspace capacity/execution mismatch");

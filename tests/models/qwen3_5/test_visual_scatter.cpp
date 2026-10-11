@@ -1,4 +1,6 @@
 #include "ops/op_tester.h"
+#include "cuda_fixture.h"
+#include "core/buffer.h"
 #include "models/qwen3_5/execution/visual_scatter.h"
 
 #include <algorithm>
@@ -31,13 +33,15 @@ int main() {
     round_to_bf16(token_embeddings);
     round_to_bf16(visual_embeddings);
     DeviceBuffer dvisual = to_device_bf16(visual_embeddings);
-    Tensor visual(dvisual.p, DType::BF16, {d, v});
+    Tensor visual(dvisual.span(), DType::BF16, {d, v});
     const std::vector<std::int32_t> scatter_indices{2, 4, 7};
-    WorkspaceArena work(1ULL << 20);
+    ninfer::DeviceBuffer work_storage(ninfer::test::cuda_environment().context.device(),
+                                      1ULL << 20);
+    MemoryArena work(work_storage.span());
 
     auto run = [&](std::int32_t prompt_tokens, const char* label) {
         DeviceBuffer dinput = to_device_bf16(token_embeddings);
-        Tensor input(dinput.p, DType::BF16, {d, t});
+        Tensor input(dinput.span(), DType::BF16, {d, t});
         work.reset();
         const auto window = models::qwen3_5::plan_mtp_alignment_window(
             static_cast<std::uint32_t>(prompt_tokens), 0, t);
@@ -45,8 +49,9 @@ int main() {
             scatter_indices, static_cast<std::uint32_t>(prompt_tokens), window);
         Tensor destination_indices =
             work.alloc(DType::I32, {static_cast<std::int32_t>(overlap.size())});
-        models::qwen3_5::detail::scatter_shifted_visual_embeddings(input, visual, overlap,
-                                                                   destination_indices, nullptr);
+        models::qwen3_5::detail::scatter_shifted_visual_embeddings(
+            input, visual, overlap, destination_indices,
+            ninfer::test::cuda_environment().default_execution);
         cudaDeviceSynchronize();
 
         std::vector<double> reference(token_embeddings.begin(), token_embeddings.end());

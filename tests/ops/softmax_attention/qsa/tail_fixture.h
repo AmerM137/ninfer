@@ -19,8 +19,8 @@ struct Plane {
     std::unique_ptr<GuardedDeviceBuffer> device;
 
     Plane(int features, int columns, int outer, int layout)
-        : view(nullptr, std::is_same_v<Word, std::uint16_t> ? DType::BF16 : DType::I32,
-               {features, columns, outer}),
+        : view(Tensor::metadata(std::is_same_v<Word, std::uint16_t> ? DType::BF16 : DType::I32,
+                                {features, columns, outer})),
           leading(layout == 1 ? 1 : 0) {
         if (layout == 1) {
             view.nb[1] = (features + 3) * sizeof(Word);
@@ -39,6 +39,7 @@ struct Plane {
         host.resize(leading + span);
         device    = std::make_unique<GuardedDeviceBuffer>(host.size() * sizeof(Word));
         view.data = static_cast<Word*>(device->data()) + leading;
+        view.device = device->device();
     }
 
     std::size_t index(int feature, int column, int outer = 0) const {

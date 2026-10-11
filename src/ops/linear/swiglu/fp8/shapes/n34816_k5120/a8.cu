@@ -15,7 +15,7 @@ std::size_t fp8_linear_swiglu_partial_capacity_bytes(std::int32_t max_tokens) {
 }
 
 void launch_fp8_swiglu_a8(const Tensor& x, const Weight& weight, Tensor& out,
-                          WorkspaceArena& workspace, cudaStream_t stream) {
+                          MemoryArena& workspace, cudaStream_t stream) {
     auto scope         = workspace.scope();
     const auto scratch = allocate_fp8_a8_workspace(
         workspace, x.ne[1], weight.k, fp8_linear_swiglu_partial_capacity_bytes(x.ne[1]));

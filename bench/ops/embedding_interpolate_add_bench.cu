@@ -1,4 +1,5 @@
 #include "ninfer/ops/embedding.h"
+#include "core/buffer.h"
 #include "op_measurement.cuh"
 
 #include <cuda_runtime.h>
@@ -36,23 +37,24 @@ void run(std::int32_t patches, bool profile_once) {
                 (patch * 17 + corner * 49) % kRows;
         }
     }
-    DeviceBuffer di(indices.size() * sizeof(std::int32_t));
-    DeviceBuffer dw(weights.size() * sizeof(float));
-    cudaMemcpy(di.p, indices.data(), di.bytes, cudaMemcpyHostToDevice);
-    cudaMemcpy(dw.p, weights.data(), dw.bytes, cudaMemcpyHostToDevice);
+    DeviceBuffer di(ninfer::bench::device_context().device(),
+                    indices.size() * sizeof(std::int32_t));
+    DeviceBuffer dw(ninfer::bench::device_context().device(), weights.size() * sizeof(float));
+    cudaMemcpy(di.data(), indices.data(), di.size(), cudaMemcpyHostToDevice);
+    cudaMemcpy(dw.data(), weights.data(), dw.size(), cudaMemcpyHostToDevice);
     SavedBuffer initial(x);
-    const auto restore = [&](cudaStream_t stream) { initial.restore(stream); };
-    Tensor ttable(table.p, DType::BF16, {kD, kRows});
-    Tensor tx(x.p, DType::BF16, {kD, patches});
-    Tensor ti(di.p, DType::I32, {4, patches});
-    Tensor tw(dw.p, DType::FP32, {4, patches});
+    const auto restore = [&](CudaExecutionView cuda) { initial.restore(cuda); };
+    Tensor ttable(table.span(), DType::BF16, {kD, kRows});
+    Tensor tx(x.span(), DType::BF16, {kD, patches});
+    Tensor ti(di.span(), DType::I32, {4, patches});
+    Tensor tw(dw.span(), DType::FP32, {4, patches});
 
-    const auto launch = [&](cudaStream_t stream) {
-        ops::embedding_interpolate_add(ttable, ti, tw, tx, stream);
+    const auto launch = [&](CudaExecutionView cuda) {
+        ops::embedding_interpolate_add(ttable, ti, tw, tx, cuda);
     };
 
     if (profile_once) {
-        launch(nullptr);
+        launch(default_execution());
         cudaDeviceSynchronize();
         std::printf("embedding_interpolate_add profile P=%d\n", patches);
         return;

@@ -5,6 +5,7 @@
 // initialization, and L2 eviction are outside the timed interval. Both graph and eager launches
 // report host submission time separately from CUDA-event GPU latency.
 
+#include "core/buffer.h"
 #include "ninfer/ops/gated_delta_net.h"
 #include "ninfer/ops/gdn_replay.h"
 
@@ -43,10 +44,11 @@ __global__ void initialize_record_gates(float* gates, std::size_t pairs) {
 class FoldFixture {
 public:
     FoldFixture(const Profile& profile, std::int32_t width)
-        : profile_(profile), width_(width), record_storage_(record_bytes(profile, width)),
-          records_({record_storage_.p, record_storage_.bytes}, record_layout_),
-          state_storage_(state_bytes(profile)),
-          states_({state_storage_.p, state_storage_.bytes}, state_layout_) {
+        : profile_(profile), width_(width),
+          record_storage_(ninfer::bench::device_context().device(), record_bytes(profile, width)),
+          records_(record_storage_.span(), record_layout_),
+          state_storage_(ninfer::bench::device_context().device(), state_bytes(profile)),
+          states_(state_storage_.span(), state_layout_) {
         record_storage_.fill(0); // alignment gaps only; represented planes are filled below.
         state_storage_.fill(0);
         CUDA_CHECK(bench::fixture::fill_values(static_cast<__nv_bfloat16*>(records_.conv.data),
@@ -71,7 +73,7 @@ public:
         initial_ = std::make_unique<bench::SavedBuffer>(state_storage_);
     }
 
-    void restore(cudaStream_t stream) const { initial_->restore(stream); }
+    void restore(CudaExecutionView cuda) const { initial_->restore(cuda); }
 
     [[nodiscard]] const ops::GdnReplayFoldPlan& fold_plan() const { return fold_plan_; }
 
@@ -138,13 +140,18 @@ public:
           v_(bench::make_bf16(value_elements(), 105U)),
           g_(bench::make_f32(gate_elements(), 211U, -1.5F, -.1F)),
           beta_(bench::make_f32(gate_elements(), 213U, .1F, .9F)),
-          record_states_(record_state_elements() * sizeof(float)),
+          record_states_(ninfer::bench::device_context().device(),
+                         record_state_elements() * sizeof(float)),
           record_initial_(make_i32(record_initial_slots())), valid_(make_valid()),
-          record_out_(value_elements() * sizeof(std::uint16_t)),
-          key_record_(qk_elements() * sizeof(std::uint16_t)),
-          value_record_(value_elements() * sizeof(std::uint16_t)),
-          gate_record_(gate_elements() * 2 * sizeof(float)) {
-        CUDA_CHECK(bench::fixture::fill_values(static_cast<float*>(record_states_.p),
+          record_out_(ninfer::bench::device_context().device(),
+                      value_elements() * sizeof(std::uint16_t)),
+          key_record_(ninfer::bench::device_context().device(),
+                      qk_elements() * sizeof(std::uint16_t)),
+          value_record_(ninfer::bench::device_context().device(),
+                        value_elements() * sizeof(std::uint16_t)),
+          gate_record_(ninfer::bench::device_context().device(),
+                       gate_elements() * 2 * sizeof(float)) {
+        CUDA_CHECK(bench::fixture::fill_values(static_cast<float*>(record_states_.data()),
                                                record_state_elements(), 217U, -.02F, .02F));
         CUDA_CHECK(cudaDeviceSynchronize());
         record_out_.fill(0);
@@ -153,23 +160,25 @@ public:
         gate_record_.fill(0);
     }
 
-    void launch_record(cudaStream_t stream) {
-        Tensor q(q_.p, DType::BF16, {kStateDim, kQkHeads, width_, batch_});
-        Tensor k(k_.p, DType::BF16, {kStateDim, kQkHeads, width_, batch_});
-        Tensor v(v_.p, DType::BF16, {kStateDim, profile_.value_heads, width_, batch_});
-        Tensor g(g_.p, DType::FP32, {profile_.value_heads, width_, batch_});
-        Tensor beta(beta_.p, DType::FP32, {profile_.value_heads, width_, batch_});
-        Tensor states(record_states_.p, DType::FP32,
+    void launch_record(CudaExecutionView cuda) {
+        Tensor q(q_.span(), DType::BF16, {kStateDim, kQkHeads, width_, batch_});
+        Tensor k(k_.span(), DType::BF16, {kStateDim, kQkHeads, width_, batch_});
+        Tensor v(v_.span(), DType::BF16, {kStateDim, profile_.value_heads, width_, batch_});
+        Tensor g(g_.span(), DType::FP32, {profile_.value_heads, width_, batch_});
+        Tensor beta(beta_.span(), DType::FP32, {profile_.value_heads, width_, batch_});
+        Tensor states(record_states_.span(), DType::FP32,
                       {kStateDim, kStateDim, profile_.value_heads, batch_});
         Tensor valid = valid_tensor();
-        Tensor initial(record_initial_.p, DType::I32, {batch_});
-        Tensor key_record(key_record_.p, DType::BF16, {kStateDim, kQkHeads, width_, batch_});
-        Tensor value_record(value_record_.p, DType::BF16,
+        Tensor initial(record_initial_.span(), DType::I32, {batch_});
+        Tensor key_record(key_record_.span(), DType::BF16, {kStateDim, kQkHeads, width_, batch_});
+        Tensor value_record(value_record_.span(), DType::BF16,
                             {kStateDim, profile_.value_heads, width_, batch_});
-        Tensor gate_record(gate_record_.p, DType::FP32, {2, profile_.value_heads, width_, batch_});
-        Tensor out(record_out_.p, DType::BF16, {kStateDim, profile_.value_heads, width_, batch_});
+        Tensor gate_record(gate_record_.span(), DType::FP32,
+                           {2, profile_.value_heads, width_, batch_});
+        Tensor out(record_out_.span(), DType::BF16,
+                   {kStateDim, profile_.value_heads, width_, batch_});
         ops::gated_delta_net_replay_record(q, k, v, g, beta, scale(), states, valid, initial,
-                                           {key_record, value_record, gate_record}, out, stream);
+                                           {key_record, value_record, gate_record}, out, cuda);
     }
 
 private:
@@ -205,9 +214,9 @@ private:
         return valid_policy_.empty() ? DeviceBuffer{} : make_i32(valid_policy_);
     }
 
-    [[nodiscard]] Tensor valid_tensor() const {
-        if (valid_.p == nullptr) return {};
-        return Tensor(valid_.p, DType::I32, {batch_});
+    [[nodiscard]] Tensor valid_tensor() {
+        if (valid_.data() == nullptr) return {};
+        return Tensor(valid_.span(), DType::I32, {batch_});
     }
 
     Profile profile_;

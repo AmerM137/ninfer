@@ -139,10 +139,11 @@ void test_host_roundtrip(bool dflash, ninfer::DeviceContext& device, bool dflash
                    40ULL * 1024 * 1024,
                "DFlash2 local snapshot must transfer exactly 40 MiB");
     }
-    ninfer::DeviceArena arena(planned.bytes);
-    q36::StateImageDevicePool pool({arena.base(), arena.capacity()}, planned.layout);
+    ninfer::DeviceBuffer arena_storage(device.device(), planned.bytes);
+    ninfer::MemoryArena arena(arena_storage.span());
+    q36::StateImageDevicePool pool(arena.storage(), planned.layout);
     fill_slot(pool, 0, dflash ? 0x19 : 0x25);
-    pool.zero_slot(1, device.stream);
+    pool.zero_slot(1, device.stream());
 
     ninfer::HostContextArena host_backing(planned.layout.host.image_bytes,
                                           planned.layout.host.image_bytes);
@@ -152,13 +153,13 @@ void test_host_roundtrip(bool dflash, ninfer::DeviceContext& device, bool dflash
     expect(!host.allocate().has_value(), "HostStatePool reports capacity exhaustion");
     expect(host.occupied() == 1, "HostStatePool occupied count after allocation");
 
-    pool.copy_to_host(0, host.writable_view(*handle), device.stream);
+    pool.copy_to_host(0, host.writable_view(*handle), device.stream());
     device.synchronize();
     expect(host.publish(*handle), "Host state publication accepts its reservation");
     expect(host_backing.reserved_bytes() == 0 &&
                host_backing.live_bytes() == planned.layout.host.image_bytes,
            "Host state publication converts reservation to one live allocation");
-    pool.copy_from_host(host.view(*handle), 1, device.stream);
+    pool.copy_from_host(host.view(*handle), 1, device.stream());
     device.synchronize();
     expect_slot(pool, 1, dflash ? 0x19 : 0x25,
                 dflash ? "DFlash Host roundtrip" : "common Host roundtrip");
@@ -241,8 +242,9 @@ int main() {
 
     ninfer::DeviceContext device(0);
     PlannedPool planned = plan_pool(true);
-    ninfer::DeviceArena arena(planned.bytes);
-    q36::StateImageDevicePool pool({arena.base(), arena.capacity()}, planned.layout);
+    ninfer::DeviceBuffer arena_storage(device.device(), planned.bytes);
+    ninfer::MemoryArena arena(arena_storage.span());
+    q36::StateImageDevicePool pool(arena.storage(), planned.layout);
 
     expect(pool.slot_count() == 4, "StateImage slot count");
     expect(pool.linear().layer_count() == 2, "StateImage Linear Attention layer count");
@@ -255,12 +257,12 @@ int main() {
 
     fill_slot(pool, 0, 0x11);
     fill_slot(pool, 1, 0x52);
-    pool.copy_slot(0, 2, device.stream);
+    pool.copy_slot(0, 2, device.stream());
     device.synchronize();
     expect_slot(pool, 0, 0x11, "StateImage D2D source isolation");
     expect_slot(pool, 2, 0x11, "StateImage D2D complete destination");
 
-    pool.zero_slot(1, device.stream);
+    pool.zero_slot(1, device.stream());
     device.synchronize();
     expect_zero_slot(pool, 1, "StateImage zero complete destination");
     expect_slot(pool, 0, 0x11, "StateImage zero source isolation");

@@ -1,4 +1,5 @@
 #include "ninfer/ops/embedding.h"
+#include "cuda_fixture.h"
 #include "ops/op_tester.h"
 
 #include <algorithm>
@@ -86,11 +87,12 @@ int run_case(std::int32_t patches, std::uint32_t seed) {
     device_weights.copy_from_host(weights.data(), weights.size() * sizeof(float));
     device_x.copy_from_host(x_bits.data(), x_bits.size() * sizeof(std::uint16_t));
 
-    Tensor table_tensor(device_table.data(), DType::BF16, {kDimensions, kTableRows});
-    Tensor indices_tensor(device_indices.data(), DType::I32, {4, patches});
-    Tensor weights_tensor(device_weights.data(), DType::FP32, {4, patches});
-    Tensor x_tensor(device_x.data(), DType::BF16, {kDimensions, patches});
-    ops::embedding_interpolate_add(table_tensor, indices_tensor, weights_tensor, x_tensor, nullptr);
+    Tensor table_tensor(device_table.span(), DType::BF16, {kDimensions, kTableRows});
+    Tensor indices_tensor(device_indices.span(), DType::I32, {4, patches});
+    Tensor weights_tensor(device_weights.span(), DType::FP32, {4, patches});
+    Tensor x_tensor(device_x.span(), DType::BF16, {kDimensions, patches});
+    ops::embedding_interpolate_add(table_tensor, indices_tensor, weights_tensor, x_tensor,
+                                   ninfer::test::cuda_environment().default_execution);
     cuda_synchronize();
 
     const std::string label = "embedding_interpolate_add D=1152 R=2304 P=" + std::to_string(patches);

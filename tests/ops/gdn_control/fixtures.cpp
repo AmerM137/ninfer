@@ -1,4 +1,5 @@
 #include "fixtures.h"
+#include "cuda_fixture.h"
 #include "ninfer/ops/weight_input.h"
 #include <algorithm>
 
@@ -29,8 +30,10 @@ std::vector<std::uint16_t> bits(const std::vector<float>& values) {
 
 Weights::Weights(Profile p, Pattern pattern)
     : profile(p), a(std::size_t(p.heads) * p.input_rows), b(a.size()),
-      first(a.size() * 2 * (p.storage == Storage::Parent ? 2 : 1)),
-      second(p.storage == Storage::Pair ? a.size() * 2 : 0) {
+      first(ninfer::test::cuda_environment().context.device(),
+            a.size() * 2 * (p.storage == Storage::Parent ? 2 : 1)),
+      second(ninfer::test::cuda_environment().context.device(),
+             p.storage == Storage::Pair ? a.size() * 2 : 0) {
     fill_uniform(a, 103, -0.015F, 0.015F);
     fill_uniform(b, 105, -0.015F, 0.015F);
     if (pattern == Pattern::ZeroA) std::fill(a.begin(), a.end(), 0);
@@ -70,8 +73,9 @@ Weights::Weights(Profile p, Pattern pattern)
                                                      : p.heads),
         std::uint64_t(reshaped_parent ? p.input_rows / 2 : p.input_rows)};
     const WeightParent pa{weight_geometry(QType::BF16, QuantLayout::Contiguous, parent_shape),
-                          static_cast<const std::byte*>(first.p)};
-    const WeightParent pb{pa.geometry, static_cast<const std::byte*>(second.p)};
+                          first.device(), static_cast<const std::byte*>(first.data())};
+    const WeightParent pb{pa.geometry, second.device(),
+                          static_cast<const std::byte*>(second.data())};
     const WeightView av{{std::uint64_t(p.heads), std::uint64_t(p.input_rows)}, {{&pa, 0, count}}};
     WeightView bv{{std::uint64_t(p.heads), std::uint64_t(p.input_rows)}, {}};
     if (p.storage == Storage::Parent)
@@ -81,7 +85,7 @@ Weights::Weights(Profile p, Pattern pattern)
     prepared           = ops::prepare_gdn_control_proj_weights({av}, {bv});
     const auto* single = std::get_if<ops::SingleProjectionWeight>(&prepared);
     if ((p.storage == Storage::Parent) != bool(single) ||
-        (single && single->weight.qdata != first.p))
+        (single && single->weight.qdata != first.data()))
         throw std::runtime_error("control preparation changed the stored representation");
 }
 
@@ -111,20 +115,23 @@ Fixture::Fixture(Profile p, Case c, bool n)
     : profile(p), test_case(c), normalize_input(n), weights(p, c.pattern),
       capacity(workspace_capacity(weights.prepared, n, c.columns, c.columns)),
       prefix(c.prefix ? 17 : 0), x(std::size_t(p.input_rows) * c.columns), norm_gain(p.input_rows),
-      a_log(p.heads), dt_bias(p.heads), device_x(x.size() * 2),
-      device_norm_weight(norm_gain.size() * 2), device_a_log(a_log.size() * 4),
-      device_dt_bias(dt_bias.size() * 4), g(std::size_t(p.heads) * c.columns * 4),
-      beta(std::size_t(p.heads) * c.columns * 4), normalized(x.size() * 2),
+      a_log(p.heads), dt_bias(p.heads),
+      device_x(ninfer::test::cuda_environment().context.device(), x.size() * 2),
+      device_norm_weight(ninfer::test::cuda_environment().context.device(), norm_gain.size() * 2),
+      device_a_log(ninfer::test::cuda_environment().context.device(), a_log.size() * 4),
+      device_dt_bias(ninfer::test::cuda_environment().context.device(), dt_bias.size() * 4),
+      g(std::size_t(p.heads) * c.columns * 4), beta(std::size_t(p.heads) * c.columns * 4),
+      normalized(x.size() * 2),
       scratch(std::max<std::size_t>(256, capacity + (c.prefix ? 256 : 0))),
-      input(device_x.p, DType::BF16, {p.input_rows, c.columns}),
-      norm_weight(device_norm_weight.p, DType::BF16, {p.input_rows}),
-      a_log_tensor(device_a_log.p, DType::FP32, {p.heads}),
-      dt_bias_tensor(device_dt_bias.p, DType::FP32, {p.heads}),
-      normalized_tensor(normalized.data(), DType::BF16, {p.input_rows, c.columns}),
-      outputs{Tensor(g.data(), DType::FP32, {p.heads, c.columns}),
-              Tensor(beta.data(), DType::FP32, {p.heads, c.columns})},
+      input(device_x.span(), DType::BF16, {p.input_rows, c.columns}),
+      norm_weight(device_norm_weight.span(), DType::BF16, {p.input_rows}),
+      a_log_tensor(device_a_log.span(), DType::FP32, {p.heads}),
+      dt_bias_tensor(device_dt_bias.span(), DType::FP32, {p.heads}),
+      normalized_tensor(normalized.span(), DType::BF16, {p.input_rows, c.columns}),
+      outputs{Tensor(g.span(), DType::FP32, {p.heads, c.columns}),
+              Tensor(beta.span(), DType::FP32, {p.heads, c.columns})},
       arena(
-          DeviceSpan{scratch.data(), std::max<std::size_t>(256, capacity + (c.prefix ? 256 : 0))}) {
+          scratch.span().subspan(0, std::max<std::size_t>(256, capacity + (c.prefix ? 256 : 0)))) {
     fill_uniform(x, 101, -1.F, 1.F);
     fill_uniform(norm_gain, 107, -0.125F, 0.125F);
     fill_uniform(a_log, 111, -2.F, 1.F);
@@ -186,7 +193,7 @@ void Fixture::repaint(cudaStream_t stream) {
                                std::max<std::size_t>(256, capacity + (prefix ? 256 : 0)), stream));
 }
 
-void Fixture::invoke(WorkspaceArena& ws, DeviceExecutionView execution) {
+void Fixture::invoke(MemoryArena& ws, CudaExecutionView execution) {
     if (normalize_input)
         ops::gdn_norm_control_proj(input, norm_weight, kEps, weights.prepared, a_log_tensor,
                                    dt_bias_tensor, {normalized_tensor, outputs}, ws, execution);

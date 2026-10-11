@@ -64,7 +64,7 @@ void instantiate_graph_family(DecodeGraphFamily& family, const char* label, Devi
             topology.executable.update(profile.definition);
             topology.installed_profile = profile_index;
         }
-        topology.executable.upload(device.stream);
+        topology.executable.upload(device.stream());
         device.synchronize();
     };
 
@@ -124,7 +124,7 @@ void ProgramImpl::prepare_graphs() {
 
     std::array<StateImageHandle, kMaximumConcurrency> capture_states{};
     for (std::uint32_t row = 0; row < max_concurrency; ++row) {
-        std::optional<StateImageHandle> state = state_store->reserve_reset(device.stream);
+        std::optional<StateImageHandle> state = state_store->reserve_reset(device.stream());
         if (!state) { throw std::bad_alloc(); }
         capture_states[row] = *state;
     }
@@ -148,17 +148,17 @@ void ProgramImpl::prepare_graphs() {
         allocations.reserve(max_concurrency);
         for (std::uint32_t row = 0; row < max_concurrency; ++row) {
             std::optional<KVAddressSpaceHandle> allocation =
-                addresses.create_active(1, static_cast<std::int32_t>(row), device.stream);
+                addresses.create_active(1, static_cast<std::int32_t>(row), device.stream());
             if (!allocation) { throw std::bad_alloc(); }
             allocations.push_back(*allocation);
-            addresses.ensure_mapped_to_tokens(*allocation, 1, device.stream);
+            addresses.ensure_mapped_to_tokens(*allocation, 1, device.stream());
 
             // Capture profiles exercise arbitrary context envelopes. Repeating each row's private
             // page across its temporary table keeps every dummy read/write address valid without
             // reserving C full contexts solely for graph construction.
             tables.publish_repeated(addresses.execution_row(*allocation).handle(),
                                     addresses.physical_page(*allocation, 0),
-                                    tables.logical_page_capacity(), device.stream);
+                                    tables.logical_page_capacity(), device.stream());
         }
     };
     reserve_capture_rows(decoder->text_kv, *text_kv_addresses, text_capture_allocations,
@@ -187,7 +187,7 @@ void ProgramImpl::prepare_graphs() {
         }
         if (io.dflash_prefill) { controls.push_back(io.dflash_prefill->local_append_count); }
         for (const Tensor& tensor : controls) {
-            CUDA_CHECK(cudaMemsetAsync(tensor.data, 0, tensor.bytes(), device.stream));
+            CUDA_CHECK(cudaMemsetAsync(tensor.data, 0, tensor.bytes(), device.stream()));
         }
     };
     const auto zero_capture_pages =
@@ -198,7 +198,7 @@ void ProgramImpl::prepare_graphs() {
             for (std::uint32_t row = 0; row < batch_size; ++row) {
                 pages.push_back(addresses.physical_page(allocations[row], 0));
             }
-            cache.page_pool().zero_pages(pages, device.stream);
+            cache.page_pool().zero_pages(pages, device.stream());
         };
     const auto prepare_representative = [&](std::uint32_t frontier, std::uint32_t batch_size) {
         if (batch_size == 0 || batch_size > max_concurrency) {
@@ -217,11 +217,11 @@ void ProgramImpl::prepare_graphs() {
                                batch_size);
         }
         for (std::uint32_t row = 0; row < batch_size; ++row) {
-            state_images->zero_slot(capture_state_slot(row), device.stream);
+            state_images->zero_slot(capture_state_slot(row), device.stream());
             if (dflash) {
                 const Tensor pending =
                     dflash->pending_features.slice(2, static_cast<std::int32_t>(row), 1);
-                CUDA_CHECK(cudaMemsetAsync(pending.data, 0, pending.bytes(), device.stream));
+                CUDA_CHECK(cudaMemsetAsync(pending.data, 0, pending.bytes(), device.stream()));
             }
         }
         set_device_i32(io.pos, checked_i32(frontier, "graph representative position"));
@@ -356,7 +356,7 @@ void ProgramImpl::prepare_graphs() {
             const auto& profile = ordinary_graphs.profiles[*topology.installed_profile];
             prepare_representative(profile.min_execution_frontier, profile.batch_size);
             device.synchronize();
-            topology.executable.launch(device.stream);
+            topology.executable.launch(device.stream());
             device.synchronize();
         }
     }
@@ -463,23 +463,23 @@ void ProgramImpl::prepare_graphs() {
             auto& finish_exec = speculative_finish_graphs.install(finish);
             prepare_representative(forward.min_execution_frontier, forward.batch_size);
             device.synchronize();
-            topology.executable.launch(device.stream);
-            finish_exec.launch(device.stream);
+            topology.executable.launch(device.stream());
+            finish_exec.launch(device.stream());
             device.synchronize();
         }
     }
 
     clear_stable_controls();
-    state_images->zero_all(device.stream);
+    state_images->zero_all(device.stream());
     if (dflash) {
         CUDA_CHECK(cudaMemsetAsync(dflash->prefill_features.data, 0,
-                                   dflash->prefill_features.bytes(), device.stream));
+                                   dflash->prefill_features.bytes(), device.stream()));
         CUDA_CHECK(cudaMemsetAsync(dflash->prefill_positions.data, 0,
-                                   dflash->prefill_positions.bytes(), device.stream));
+                                   dflash->prefill_positions.bytes(), device.stream()));
         CUDA_CHECK(cudaMemsetAsync(dflash->pending_features.data, 0,
-                                   dflash->pending_features.bytes(), device.stream));
+                                   dflash->pending_features.bytes(), device.stream()));
     }
-    CUDA_CHECK(cudaMemsetAsync(token_counts.data, 0, token_counts.bytes(), device.stream));
+    CUDA_CHECK(cudaMemsetAsync(token_counts.data, 0, token_counts.bytes(), device.stream()));
     device.synchronize();
     for (std::uint32_t row = 0; row < max_concurrency; ++row) {
         if (!state_store->release(capture_states[row])) {

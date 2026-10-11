@@ -38,7 +38,7 @@ DFlashFeatureSink make_dflash_prefill_sink(PrefillContext& state) {
             };
             CUDA_CHECK(cudaMemcpyAsync(frame.ingress.data, state.dflash_prefill_host_ingress,
                                        sizeof(qwen3_5::DFlashPrefillIngress),
-                                       cudaMemcpyHostToDevice, state.execution.device.stream));
+                                       cudaMemcpyHostToDevice, state.execution.cuda.stream()));
             const auto exact = static_cast<std::uint32_t>(features.ne[1]);
             dflash_append_context(state, features, positions, frame.append_count,
                                   frame.state_destination_slot, frame.full_kv_table_row,
@@ -124,7 +124,7 @@ void mtp_bridge_multimodal(PrefillContext& state, const PreparedPromptData& prom
     Tensor bridge_token = state.execution.io.mtp->target_input_ids.slice(0, 0, 1);
     const TokenId token = prompt.token_ids[state.text_kv_base];
     CUDA_CHECK(cudaMemcpyAsync(bridge_token.data, &token, sizeof(token), cudaMemcpyHostToDevice,
-                               state.execution.device.stream));
+                               state.execution.cuda.stream()));
 
     Tensor visual_embedding;
     const Tensor* composed_embedding = nullptr;
@@ -160,14 +160,14 @@ void sample_from_hidden(PrefillContext& state, const Tensor& hidden, std::int32_
     state.execution.work.reset();
     Tensor logits = state.execution.io.logits.slice(1, 0, 1);
     project(hidden, state.execution.parameters.text.output_head, logits, state.execution.work,
-            state.execution.device.stream);
+            state.execution.cuda);
     CUDA_CHECK(cudaMemcpyAsync(state.execution.io.pos.data, &absolute_position,
                                sizeof(absolute_position), cudaMemcpyHostToDevice,
-                               state.execution.device.stream));
+                               state.execution.cuda.stream()));
     ops::sample(logits, state.execution.io.token,
                 dimension(state.execution.parameters.model.resources().public_token_count),
                 state.sampling, state.execution.io.pos, purpose, state.execution.work,
-                state.execution.device.stream);
+                state.execution.cuda);
     state.execution.work.reset();
 }
 
@@ -215,7 +215,7 @@ PrefillProgress ProgramImpl::advance_prefill(SequenceHandle handle,
         config.mask        = fill_grammar_mask(masks, 0, {});
         Tensor config_lane = sampling_config.slice(1, static_cast<std::int32_t>(lane), 1);
         CUDA_CHECK(cudaMemcpyAsync(config_lane.data, &config, sizeof(config),
-                                   cudaMemcpyHostToDevice, device.stream));
+                                   cudaMemcpyHostToDevice, device.stream()));
     }
     auto progress = wrap_prefill(lane, advance_prefill_raw(lane, timing));
     if (!progress.complete) { settle_unit(lane); }
@@ -330,7 +330,7 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
     try {
         timing.resume_submit();
         replay_fold->execute(std::span<const ops::GdnReplayFoldRow>(fold_rows.data(), lanes.size()),
-                             device.stream);
+                             device.execution_view());
 
         // Sparse acceptance reads counts. Publish only the prefix licensed by the Frontend.
         if (speculative_backend == SpeculativeBackend::DFlash2) {
@@ -346,7 +346,7 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
                 Tensor counts =
                     token_counts.slice(1, static_cast<std::int32_t>(lanes[row]), 1)
                         .view({dimension(parameters.model.resources().public_token_count)});
-                ops::increment_token_counts(ids, counts, device.stream);
+                ops::increment_token_counts(ids, counts, device.execution_view());
             }
         }
 
@@ -373,11 +373,11 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
             }
             CUDA_CHECK(cudaMemcpyAsync(selector_tensor.data, hidden_selectors.data(),
                                        lanes.size() * sizeof(std::int32_t), cudaMemcpyHostToDevice,
-                                       device.stream));
+                                       device.stream()));
             ops::gather_bf16_batch_columns(hidden, selector_tensor, selected,
-                                                    device.stream);
+                                           device.execution_view());
             ops::scatter(selected, destinations, state_images->continuation_hidden_store(),
-                         device.stream);
+                         device.execution_view());
         }
 
         if (is_masked_draft_backend(speculative_backend)) {
@@ -539,7 +539,7 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 Tensor bridge_token = io.mtp->target_input_ids.slice(0, 0, 1);
                 const TokenId token = staged.prompt.token_ids[staged.base];
                 CUDA_CHECK(cudaMemcpyAsync(bridge_token.data, &token, sizeof(token),
-                                           cudaMemcpyHostToDevice, device.stream));
+                                           cudaMemcpyHostToDevice, device.stream()));
                 execution::mtp_bridge_and_propose(schedule_state, bridge_token, previous_hidden,
                                                   bridge.position, bridge.rope_position, false);
             }
@@ -699,7 +699,7 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
         if (staged.prepare_mtp && staged.initial_mtp_extent != 0) {
             CUDA_CHECK(cudaMemcpyAsync(initial_drafts.data(), io.mtp->draft_tokens.data,
                                        staged.initial_mtp_extent * sizeof(TokenId),
-                                       cudaMemcpyDeviceToHost, device.stream));
+                                       cudaMemcpyDeviceToHost, device.stream()));
         }
         timing.begin_wait();
         device.synchronize();

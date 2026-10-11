@@ -1,4 +1,5 @@
 #include "ops/linear_add/linear_add_test_common.h"
+#include "cuda_fixture.h"
 #include "ops/linear_common.h"
 
 #include "ninfer/ops/linear_add.h"
@@ -46,11 +47,14 @@ int cancellation_conformance() {
         dw.copy_from_host(packed.payload.data(), dw.bytes());
         dx.copy_from_host(activation.data(), dx.bytes());
         dr.copy_from_host(residual.data(), dr.bytes());
-        const auto weight = packed.device_weight(dw.data());
-        Tensor input(dx.data(), DType::BF16, {k, t});
-        Tensor output(dr.data(), DType::BF16, {n, t});
-        WorkspaceArena workspace(256);
-        ops::linear_add(input, weight, output, workspace, nullptr);
+        const auto weight = packed.device_weight(dw.span());
+        Tensor input(dx.span(), DType::BF16, {k, t});
+        Tensor output(dr.span(), DType::BF16, {n, t});
+        ninfer::DeviceBuffer workspace_storage(ninfer::test::cuda_environment().context.device(),
+                                               256);
+        MemoryArena workspace(workspace_storage.span());
+        ops::linear_add(input, weight, output, workspace,
+                        ninfer::test::cuda_environment().default_execution);
         test::cuda_check(cudaDeviceSynchronize(), "synchronize cancellation LinearAdd");
         dr.copy_to_host(residual.data(), dr.bytes());
         std::vector<double> actual(residual.size()), reference(residual.size(), expected);

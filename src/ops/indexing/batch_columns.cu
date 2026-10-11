@@ -60,16 +60,18 @@ void remap_ids_inplace_launch(Tensor& ids, const std::int32_t* id_map, std::int3
 } // namespace
 
 void gather_bf16_batch_columns(const Tensor& source, const Tensor& selectors, Tensor& out,
-                               cudaStream_t stream) {
+                               CudaExecutionView execution) {
+    const auto stream        = execution.stream();
     constexpr const char* op = "gather_bf16_batch_columns";
     common::operand::dtype(source, DType::BF16, op, "source");
-    common::operand::contiguous_nonnull(source, op, "source");
+    common::operand::contiguous_nonnull(source, op, "source", execution.device());
     if (source.ne[0] <= 0 || source.ne[1] <= 0 || source.ne[2] <= 0 || source.ne[3] != 1) {
         throw std::invalid_argument("gather_bf16_batch_columns: invalid source shape");
     }
-    common::operand::tensor(selectors, DType::I32, {source.ne[2]}, 1, op, "selectors");
+    common::operand::tensor(selectors, DType::I32, {source.ne[2]}, 1, op, "selectors",
+                            execution.device());
     common::operand::dtype(out, DType::BF16, op, "out");
-    common::operand::contiguous_nonnull(out, op, "out");
+    common::operand::contiguous_nonnull(out, op, "out", execution.device());
     if (out.ne[0] != source.ne[0] || out.ne[1] != source.ne[2] || out.ne[2] != 1 ||
         out.ne[3] != 1) {
         throw std::invalid_argument("gather_bf16_batch_columns: invalid output shape");
@@ -78,10 +80,11 @@ void gather_bf16_batch_columns(const Tensor& source, const Tensor& selectors, Te
 }
 
 void remap_ids_inplace(Tensor& ids, const std::int32_t* id_map, std::int32_t n,
-                       cudaStream_t stream) {
+                       CudaExecutionView execution) {
+    const auto stream        = execution.stream();
     constexpr const char* op = "remap_ids_inplace";
     common::operand::dtype(ids, DType::I32, op, "ids");
-    common::operand::contiguous_nonnull(ids, op, "ids");
+    common::operand::contiguous_nonnull(ids, op, "ids", execution.device());
     if (ids.ne[0] <= 0 || ids.ne[1] != 1 || ids.ne[2] != 1 || ids.ne[3] != 1) {
         throw std::invalid_argument("remap_ids_inplace: ids must be a non-empty vector");
     }

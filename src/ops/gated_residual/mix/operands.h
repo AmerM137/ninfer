@@ -24,10 +24,9 @@ struct Operands {
 };
 
 void describe_weights(Weights weights);
-void validate_execution(DeviceExecutionView execution);
 void validate_interval(std::int32_t first, std::int32_t last);
 Operands validate(Weights weights, const Tensor& normalized, Tensor& output, Tensor* injection,
-                  DeviceExecutionView execution);
+                  CudaExecutionView execution);
 void validate_scratch(Weights weights, const Tensor& normalized, const Tensor& output,
-                      const Tensor* injection, DeviceSpan scratch);
+                      const Tensor* injection, MemorySpan scratch);
 } // namespace ninfer::ops::detail::hc::mix

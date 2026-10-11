@@ -1,7 +1,7 @@
 #pragma once
 
+#include "core/device.h"
 #include "core/tensor.h"
-#include <cuda_runtime.h>
 
 namespace ninfer::ops {
 
@@ -15,6 +15,6 @@ namespace ninfer::ops {
  * An empty tensor does no work. No workspace or state is used.
  */
 void layer_norm(const Tensor& x, const Tensor& weight, const Tensor& bias, float eps, Tensor& out,
-                cudaStream_t stream);
+                CudaExecutionView execution);
 
 } // namespace ninfer::ops

@@ -5,7 +5,7 @@
 #include "core/tensor.h"
 #include "ninfer/ops/linear.h"
 
-#include <cuda_runtime.h>
+#include "core/device.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -36,10 +36,10 @@ namespace ninfer::ops {
  * with AllowA4. The overload without a policy uses A16Only.
  * Caller workspace is scoped to the call; A16 requires no scratch. No persistent state.
  */
-void linear_add(const Tensor& x, const Weight& w, Tensor& residual, WorkspaceArena& ws,
-                cudaStream_t stream);
+void linear_add(const Tensor& x, const Weight& w, Tensor& residual, MemoryArena& ws,
+                CudaExecutionView execution);
 
 void linear_add(const Tensor& x, const Weight& w, Tensor& residual, LinearPolicy policy,
-                WorkspaceArena& ws, cudaStream_t stream);
+                MemoryArena& ws, CudaExecutionView execution);
 
 } // namespace ninfer::ops

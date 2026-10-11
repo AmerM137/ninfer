@@ -6,18 +6,18 @@ using namespace ninfer;
 using namespace ninfer::test::hc::mix;
 
 int run(Weights& weights, std::span<const float> catalog, std::span<const Column> ref, int m,
-        DeviceExecutionView execution, bool captured = false) {
-    Fixture f(weights, m, execution);
-    f.upload(catalog, execution.stream);
+        CudaExecutionView execution, bool captured = false) {
+    Fixture f(weights, m);
+    f.upload(catalog, execution.stream());
     DecodeGraphDefinition definition;
     DecodeGraphExecutable graph;
     if (captured) {
-        definition.capture(execution.stream, [&] { f.invoke(execution); });
+        definition.capture(execution.stream(), [&] { f.invoke(execution); });
         graph.instantiate(definition);
-        graph.launch(execution.stream);
+        graph.launch(execution.stream());
     } else
         f.invoke(execution);
-    ninfer::test::cuda_synchronize(execution.stream);
+    ninfer::test::cuda_synchronize(execution.stream());
     const auto label = std::string(name(weights.kind)) + " M=" + std::to_string(m) +
                        " pattern=" + std::to_string(int(weights.pattern)) +
                        " graph=" + std::to_string(captured);
@@ -25,15 +25,15 @@ int run(Weights& weights, std::span<const float> catalog, std::span<const Column
     if (captured) {
         const auto next     = input_catalog(weights.pattern, 1);
         const auto next_ref = reference(weights, next);
-        f.upload(next, execution.stream);
-        graph.launch(execution.stream);
-        ninfer::test::cuda_synchronize(execution.stream);
+        f.upload(next, execution.stream());
+        graph.launch(execution.stream());
+        ninfer::test::cuda_synchronize(execution.stream());
         failed += verify(f, next_ref, label + " changed input") + f.check(label + " changed input");
     }
     return failed;
 }
 
-int suite(Kind kind, DeviceExecutionView e) {
+int suite(Kind kind, CudaExecutionView e) {
     Weights weights(kind, Pattern::Dense);
     const auto catalog = input_catalog(Pattern::Dense);
     const auto ref     = reference(weights, catalog);

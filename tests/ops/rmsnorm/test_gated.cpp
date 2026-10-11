@@ -1,4 +1,6 @@
 #include "ninfer/ops/rmsnorm.h"
+#include "cuda_fixture.h"
+#include "core/buffer.h"
 #include "core/device.h"
 #include "core/decode_graph.h"
 #include "ops/norm_test_common.h"
@@ -54,7 +56,9 @@ struct GatedShape {
 
     std::size_t elements() const { return static_cast<std::size_t>(d) * heads * tokens * batch; }
 
-    Tensor tensor(void* data) const { return Tensor(data, DType::BF16, {d, heads, tokens, batch}); }
+    Tensor tensor(MemorySpan memory) const {
+        return Tensor(memory, DType::BF16, {d, heads, tokens, batch});
+    }
 };
 
 struct Case {
@@ -69,7 +73,7 @@ struct Case {
 };
 
 void invoke(Gate gate, const Tensor& x, const Tensor& w, const Tensor& z, float eps, Tensor& out,
-            DeviceExecutionView execution) {
+            CudaExecutionView execution) {
     if (gate == Gate::Silu)
         ops::silu_gated_rmsnorm(x, w, z, eps, out, execution);
     else
@@ -101,7 +105,7 @@ std::vector<double> gated_rmsnorm_oracle(const std::vector<float>& input,
     return output;
 }
 
-int run_case(DeviceExecutionView execution, Gate kind, const char* description, const Case& c) {
+int run_case(CudaExecutionView execution, Gate kind, const char* description, const Case& c) {
     const std::size_t count = c.shape.elements();
     std::vector<float> input(count), weight(c.shape.d), gate(count);
     fill_uniform(input, c.seed, -c.input_scale, c.input_scale);
@@ -138,10 +142,11 @@ int run_case(DeviceExecutionView execution, Gate kind, const char* description, 
     const std::size_t leading = c.unaligned ? sizeof(std::uint16_t) : 0;
     GuardedDeviceBuffer output(leading + count * sizeof(std::uint16_t));
     void* output_data   = static_cast<std::uint8_t*>(output.data()) + leading;
-    Tensor input_tensor = c.shape.tensor(device_input.data);
-    Tensor weight_tensor(device_weight.data, DType::BF16, {c.shape.d});
-    Tensor gate_tensor = c.shape.tensor(c.shared_input_gate ? device_input.data : device_gate.data);
-    Tensor output_tensor = c.shape.tensor(output_data);
+    Tensor input_tensor = c.shape.tensor(device_input.memory);
+    Tensor weight_tensor(device_weight.memory, DType::BF16, {c.shape.d});
+    Tensor gate_tensor =
+        c.shape.tensor(c.shared_input_gate ? device_input.memory : device_gate.memory);
+    Tensor output_tensor = c.shape.tensor(output.span().subspan(leading));
     const auto launch    = [&] {
         invoke(kind, input_tensor, weight_tensor, gate_tensor, c.eps, output_tensor, execution);
     };
@@ -162,8 +167,8 @@ int run_case(DeviceExecutionView execution, Gate kind, const char* description, 
             const auto update = [&](DeviceInput& device, const std::vector<float>& values) {
                 for (std::size_t i = 0; i < values.size(); ++i)
                     device.expected[i + leading / 2] = f32_to_bf16(values[i]);
-                CUDA_CHECK(cudaMemcpy(device.storage.p, device.expected.data(),
-                                      device.storage.bytes, cudaMemcpyHostToDevice));
+                CUDA_CHECK(cudaMemcpy(device.storage.data(), device.expected.data(),
+                                      device.storage.size(), cudaMemcpyHostToDevice));
             };
             update(device_input, input);
             update(device_weight, weight);
@@ -173,14 +178,14 @@ int run_case(DeviceExecutionView execution, Gate kind, const char* description, 
         cuda_synchronize();
         if (c.graph) {
             if (phase == 0) {
-                definition.capture(execution.stream, launch);
+                definition.capture(execution.stream(), launch);
                 graph.instantiate(definition);
             }
-            graph.launch(execution.stream);
+            graph.launch(execution.stream());
         } else {
             launch();
         }
-        cuda_synchronize(execution.stream);
+        cuda_synchronize(execution.stream());
         const auto reference = gated_rmsnorm_oracle(input, weight, gate, c.shape, c.eps, kind);
         const auto actual    = from_device_bf16(output_data, count);
         const auto criterion = kind == Gate::Silu ? silu_gated_rmsnorm_bf16_criterion()
@@ -208,11 +213,14 @@ int rejects(const std::string& label, Function&& call) {
     return 1;
 }
 
-int run_validation(DeviceExecutionView execution, Gate kind) {
-    DeviceBuffer input(128 * 48 * 2), weight(128 * 2), gate(128 * 48 * 2), output(128 * 48 * 2);
+int run_validation(CudaExecutionView execution, Gate kind) {
+    DeviceBuffer input(ninfer::test::cuda_environment().context.device(), 128 * 48 * 2);
+    DeviceBuffer weight(ninfer::test::cuda_environment().context.device(), 128 * 2);
+    DeviceBuffer gate(ninfer::test::cuda_environment().context.device(), 128 * 48 * 2);
+    DeviceBuffer output(ninfer::test::cuda_environment().context.device(), 128 * 48 * 2);
     const std::array<Tensor, 4> tensors{
-        Tensor(input.p, DType::BF16, {128, 48}), Tensor(weight.p, DType::BF16, {128}),
-        Tensor(gate.p, DType::BF16, {128, 48}), Tensor(output.p, DType::BF16, {128, 48})};
+        Tensor(input.span(), DType::BF16, {128, 48}), Tensor(weight.span(), DType::BF16, {128}),
+        Tensor(gate.span(), DType::BF16, {128, 48}), Tensor(output.span(), DType::BF16, {128, 48})};
     const std::string name = gate_name(kind);
     const auto call        = [&](std::array<Tensor, 4> t, float eps = kEps) {
         invoke(kind, t[0], t[1], t[2], eps, t[3], execution);
@@ -247,14 +255,10 @@ int run_validation(DeviceExecutionView execution, Gate kind) {
                       std::numeric_limits<float>::quiet_NaN()})
         failures +=
             rejects<std::invalid_argument>(name + " invalid eps", [&] { call(tensors, eps); });
-    for (int sms : {0, -1}) {
-        auto invalid_execution                 = execution;
-        invalid_execution.multiprocessor_count = sms;
-        failures += rejects<std::invalid_argument>(name + " invalid SM count", [&] {
-            auto original = tensors;
-            invoke(kind, original[0], original[1], original[2], kEps, original[3],
-                   invalid_execution);
-        });
+    for (const auto device : {Device::cpu(), Device::cuda(execution.device().index() + 1)}) {
+        t           = tensors;
+        t[0].device = device;
+        failures += rejects<std::invalid_argument>(name + " operand device", [&] { call(t); });
     }
     for (int i : {0, 1, 2}) {
         for (std::size_t offset : {std::size_t{0}, std::size_t{2}}) {

@@ -56,16 +56,18 @@ void target_logprobs_launch(const Tensor& logits, const Tensor& target_ids, std:
 } // namespace
 
 void target_logprobs(const Tensor& logits, const Tensor& target_ids, std::int32_t valid_rows,
-                     Tensor& output, cudaStream_t stream) {
+                     Tensor& output, CudaExecutionView execution) {
+    const auto stream        = execution.stream();
     constexpr const char* op = "target_logprobs";
     if (logits.ne[0] <= 0 || logits.ne[1] <= 0 || valid_rows <= 0 || valid_rows > logits.ne[0])
         throw std::invalid_argument("target_logprobs: invalid column or row domain");
     const auto columns = logits.ne[1];
     common::operand::tensor(logits, DType::BF16, {logits.ne[0], columns}, alignof(std::uint16_t),
-                            op, "logits");
+                            op, "logits", execution.device());
     common::operand::tensor(target_ids, DType::I32, {columns}, alignof(std::int32_t), op,
-                            "target_ids");
-    common::operand::tensor(output, DType::FP32, {columns}, alignof(float), op, "output");
+                            "target_ids", execution.device());
+    common::operand::tensor(output, DType::FP32, {columns}, alignof(float), op, "output",
+                            execution.device());
     common::operand::disjoint(common::operand::range(output, op),
                               common::operand::range(logits, op), op);
     common::operand::disjoint(common::operand::range(output, op),

@@ -29,11 +29,11 @@ namespace ninfer::ops {
  * supplies the stream and the selected device's positive physical SM count.
  */
 void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& q, Tensor& k,
-          DeviceExecutionView execution);
+          CudaExecutionView execution);
 
 // Single-tensor form with the same formula and storage contract. The head count comes directly
 // from x; Q versus K role does not change the transformation.
 void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& x,
-          DeviceExecutionView execution);
+          CudaExecutionView execution);
 
 } // namespace ninfer::ops

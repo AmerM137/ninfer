@@ -2,6 +2,7 @@
 // Each measured eager launch or graph-bundle entry calls public sliding_window_attention().
 
 #include "ninfer/ops/sliding_window_attention.h"
+#include "core/buffer.h"
 
 #include "core/device.h"
 #include "core/cyclic_kv_cache.h"
@@ -165,8 +166,8 @@ Options parse_options(int argc, char** argv) {
 CyclicKVCacheLayerView make_context_view(DeviceBuffer& k, DeviceBuffer& v, std::int32_t window,
                                          std::int32_t batch) {
     return {
-        .k               = Tensor(k.p, DType::BF16, {kHeadDim, window, kKvHeads, batch}),
-        .v               = Tensor(v.p, DType::FP16, {kHeadDim, window, kKvHeads, batch}),
+        .k               = Tensor(k.span(), DType::BF16, {kHeadDim, window, kKvHeads, batch}),
+        .v               = Tensor(v.span(), DType::FP16, {kHeadDim, window, kKvHeads, batch}),
         .capacity        = static_cast<std::uint32_t>(window),
         .padded_capacity = static_cast<std::uint32_t>(window),
         .num_kv_heads    = kKvHeads,
@@ -184,9 +185,9 @@ std::size_t workspace_capacity(std::int32_t window, std::int32_t tokens, std::in
 }
 
 DeviceBuffer make_context_values(std::size_t elements) {
-    DeviceBuffer result(elements * sizeof(__half));
-    CUDA_CHECK(
-        bench::fixture::fill_values(static_cast<__half*>(result.p), elements, 311U, -1.F, 1.F));
+    DeviceBuffer result(ninfer::bench::device_context().device(), elements * sizeof(__half));
+    CUDA_CHECK(bench::fixture::fill_values(static_cast<__half*>(result.data()), elements, 311U,
+                                           -1.F, 1.F));
     CUDA_CHECK(cudaDeviceSynchronize());
     return result;
 }
@@ -202,9 +203,12 @@ public:
                                     103U)),
           query_v_(bench::make_bf16(static_cast<std::size_t>(kHeadDim) * kKvHeads * tokens * batch,
                                     105U)),
-          positions_(static_cast<std::size_t>(tokens) * batch * sizeof(std::int32_t)),
-          valid_(static_cast<std::size_t>(batch) * sizeof(std::int32_t)),
-          lane_(static_cast<std::size_t>(batch) * sizeof(std::int32_t)),
+          positions_(ninfer::bench::device_context().device(),
+                     static_cast<std::size_t>(tokens) * batch * sizeof(std::int32_t)),
+          valid_(ninfer::bench::device_context().device(),
+                 static_cast<std::size_t>(batch) * sizeof(std::int32_t)),
+          lane_(ninfer::bench::device_context().device(),
+                static_cast<std::size_t>(batch) * sizeof(std::int32_t)),
           context_k_(bench::make_bf16(
               static_cast<std::size_t>(kHeadDim) * window * kKvHeads * batch, 107U)),
           context_v_(
@@ -212,13 +216,15 @@ public:
           output_(bench::make_zeros(static_cast<std::size_t>(kHeadDim) * kQueryHeads * tokens *
                                     batch * 2)),
           workspace_bytes_(workspace_capacity(window, tokens, batch, maximum)),
-          workspace_(std::max<std::size_t>(workspace_bytes_, 1)),
-          q_tensor_(q_.p, DType::BF16, {kHeadDim, kQueryHeads, tokens, batch}),
-          query_k_tensor_(query_k_.p, DType::BF16, {kHeadDim, kKvHeads, tokens, batch}),
-          query_v_tensor_(query_v_.p, DType::BF16, {kHeadDim, kKvHeads, tokens, batch}),
-          positions_tensor_(positions_.p, DType::I32, {tokens, batch}),
-          valid_tensor_(valid_.p, DType::I32, {batch}), lane_tensor_(lane_.p, DType::I32, {batch}),
-          output_tensor_(output_.p, DType::BF16, {kHeadDim, kQueryHeads, tokens, batch}),
+          workspace_storage_(bench::make_buffer(std::max<std::size_t>(workspace_bytes_, 1))),
+          workspace_(workspace_storage_.span()),
+          q_tensor_(q_.span(), DType::BF16, {kHeadDim, kQueryHeads, tokens, batch}),
+          query_k_tensor_(query_k_.span(), DType::BF16, {kHeadDim, kKvHeads, tokens, batch}),
+          query_v_tensor_(query_v_.span(), DType::BF16, {kHeadDim, kKvHeads, tokens, batch}),
+          positions_tensor_(positions_.span(), DType::I32, {tokens, batch}),
+          valid_tensor_(valid_.span(), DType::I32, {batch}),
+          lane_tensor_(lane_.span(), DType::I32, {batch}),
+          output_tensor_(output_.span(), DType::BF16, {kHeadDim, kQueryHeads, tokens, batch}),
           context_view_(make_context_view(context_k_, context_v_, window, batch)),
           envelope_{0, static_cast<std::uint32_t>(maximum)} {
         std::vector<std::int32_t> host_positions(static_cast<std::size_t>(tokens) * batch);
@@ -230,17 +236,19 @@ public:
                 host_positions[static_cast<std::size_t>(row * tokens + token)] = context + token;
             }
         }
-        CUDA_CHECK(cudaMemcpy(positions_.p, host_positions.data(), positions_.bytes,
+        CUDA_CHECK(cudaMemcpy(positions_.data(), host_positions.data(), positions_.size(),
                               cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(valid_.p, host_valid.data(), valid_.bytes, cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(lane_.p, host_lanes.data(), lane_.bytes, cudaMemcpyHostToDevice));
+        CUDA_CHECK(
+            cudaMemcpy(valid_.data(), host_valid.data(), valid_.size(), cudaMemcpyHostToDevice));
+        CUDA_CHECK(
+            cudaMemcpy(lane_.data(), host_lanes.data(), lane_.size(), cudaMemcpyHostToDevice));
     }
 
-    void launch(cudaStream_t stream) {
+    void launch(CudaExecutionView cuda) {
         ops::sliding_window_attention(q_tensor_, query_k_tensor_, query_v_tensor_,
                                       positions_tensor_, valid_tensor_, lane_tensor_, kGeometry,
                                       static_cast<std::uint32_t>(window_), kScale, context_view_,
-                                      envelope_, workspace_, output_tensor_, stream);
+                                      envelope_, workspace_, output_tensor_, cuda);
     }
 
     [[nodiscard]] std::size_t workspace_bytes() const noexcept { return workspace_bytes_; }
@@ -260,7 +268,8 @@ private:
     DeviceBuffer context_v_;
     DeviceBuffer output_;
     std::size_t workspace_bytes_;
-    WorkspaceArena workspace_;
+    DeviceBuffer workspace_storage_;
+    MemoryArena workspace_;
     Tensor q_tensor_;
     Tensor query_k_tensor_;
     Tensor query_v_tensor_;
@@ -300,16 +309,16 @@ double useful_flops(std::int32_t window, std::int32_t tokens, std::int32_t batch
 
 bench::ColdTiming measure(Case& data, Execution execution, CacheState cache,
                           bench::TimedGraph* graph, bench::L2FlushBuffer& flush,
-                          cudaStream_t stream, int warmup, int repeat) {
+                          CudaExecutionView cuda, int warmup, int repeat) {
     if (execution == Execution::Eager) {
-        const auto launch = [&](cudaStream_t launch_stream) { data.launch(launch_stream); };
+        const auto launch = [&](CudaExecutionView cuda) { data.launch(cuda); };
         return cache == CacheState::Cold
-                   ? bench::measure_cold_launch(launch, flush, stream, warmup, repeat)
-                   : bench::measure_launch(launch, stream, warmup, repeat);
+                   ? bench::measure_cold_launch(launch, flush, cuda, warmup, repeat)
+                   : bench::measure_launch(launch, cuda, warmup, repeat);
     }
     return cache == CacheState::Cold
-               ? bench::measure_cold_graph(*graph, flush, stream, warmup, repeat)
-               : bench::measure_graph(*graph, stream, warmup, repeat);
+               ? bench::measure_cold_graph(*graph, flush, cuda, warmup, repeat)
+               : bench::measure_graph(*graph, cuda, warmup, repeat);
 }
 
 void report(const Result& result) {
@@ -354,21 +363,23 @@ void write_csv(const Options& options, const std::vector<Result>& results) {
     }
 }
 
-void profile(Case& data, const Options& options, bench::L2FlushBuffer& flush, cudaStream_t stream) {
+void profile(Case& data, const Options& options, bench::L2FlushBuffer& flush,
+             CudaExecutionView cuda) {
+    const auto stream         = cuda.stream();
     const Execution execution = options.execution;
     const CacheState cache = options.cache == CacheMode::Cold ? CacheState::Cold : CacheState::Warm;
     bench::TimedGraph graph;
     if (execution == Execution::Graph) {
-        data.launch(stream);
+        data.launch(cuda);
         CUDA_CHECK(cudaStreamSynchronize(stream));
-        graph.capture(stream, [&](cudaStream_t launch_stream) { data.launch(launch_stream); });
-        for (int index = 0; index < options.warmup; ++index) { graph.launch(stream); }
+        graph.capture(cuda, [&](CudaExecutionView cuda) { data.launch(cuda); });
+        for (int index = 0; index < options.warmup; ++index) { graph.launch(cuda); }
     } else {
-        for (int index = 0; index < options.warmup; ++index) { data.launch(stream); }
+        for (int index = 0; index < options.warmup; ++index) { data.launch(cuda); }
     }
     CUDA_CHECK(cudaStreamSynchronize(stream));
     if (cache == CacheState::Cold) {
-        bench::flush_l2(flush, stream);
+        bench::flush_l2(flush, cuda);
         CUDA_CHECK(cudaStreamSynchronize(stream));
     }
 
@@ -377,9 +388,9 @@ void profile(Case& data, const Options& options, bench::L2FlushBuffer& flush, cu
     std::fflush(stdout);
     CUDA_CHECK(cudaProfilerStart());
     if (execution == Execution::Graph)
-        graph.launch(stream);
+        graph.launch(cuda);
     else
-        data.launch(stream);
+        data.launch(cuda);
     CUDA_CHECK(cudaStreamSynchronize(stream));
     CUDA_CHECK(cudaProfilerStop());
 }
@@ -396,13 +407,14 @@ int main(int argc, char** argv) {
         const Options options = parse_options(argc, argv);
         cudaStream_t stream   = nullptr;
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+        const auto cuda = ninfer::bench::device_context().execution_view(stream);
         bench::L2FlushBuffer flush(kFlushBytes);
 
         if (options.profile) {
             Case data(options.window, options.tokens.front(), options.batches.front(),
                       options.contexts.front(),
                       options.envelope_max < 0 ? options.contexts.front() : options.envelope_max);
-            profile(data, options, flush, stream);
+            profile(data, options, flush, cuda);
             CUDA_CHECK(cudaStreamDestroy(stream));
             return 0;
         }
@@ -415,11 +427,11 @@ int main(int argc, char** argv) {
                     Case data(options.window, tokens, batch, context, maximum);
                     bench::TimedGraph graph;
                     if (options.execution != Execution::Eager) {
-                        data.launch(stream);
+                        data.launch(cuda);
                         CUDA_CHECK(cudaStreamSynchronize(stream));
-                        graph.capture(stream, [&](cudaStream_t launch_stream) {
+                        graph.capture(cuda, [&](CudaExecutionView cuda) {
                             for (int call = 0; call < options.graph_calls; ++call)
-                                data.launch(launch_stream);
+                                data.launch(cuda);
                         });
                     }
                     for (const Execution execution : {Execution::Eager, Execution::Graph}) {
@@ -447,8 +459,8 @@ int main(int argc, char** argv) {
                                 data.workspace_bytes(),
                                 useful_bytes(options.window, tokens, batch, context),
                                 useful_flops(options.window, tokens, batch, context),
-                                measure(data, execution, cache, &graph, flush, stream,
-                                        options.warmup, options.repeat),
+                                measure(data, execution, cache, &graph, flush, cuda, options.warmup,
+                                        options.repeat),
                             };
                             result.timing.median_us /= options.graph_calls;
                             result.timing.min_us /= options.graph_calls;

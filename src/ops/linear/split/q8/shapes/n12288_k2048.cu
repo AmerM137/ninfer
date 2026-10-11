@@ -23,7 +23,7 @@ constexpr auto exact_launchers(std::index_sequence<I...>) {
 
 constexpr auto kExact = exact_launchers(std::make_index_sequence<31>{});
 
-void launch_split(const Tensor& x, Weights weights, std::span<const Tensor> out, WorkspaceArena*,
+void launch_split(const Tensor& x, Weights weights, std::span<const Tensor> out, MemoryArena*,
                   cudaStream_t stream) {
     const Output output{static_cast<__nv_bfloat16*>(out[0].data),
                         static_cast<__nv_bfloat16*>(out[1].data)};

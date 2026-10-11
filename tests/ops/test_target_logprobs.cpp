@@ -1,4 +1,6 @@
 #include "ninfer/ops/target_logprobs.h"
+#include "cuda_fixture.h"
+#include "core/buffer.h"
 #include "ops/op_tester.h"
 
 #include <algorithm>
@@ -141,10 +143,11 @@ int run_case(const std::string& label, std::int32_t physical_rows, std::int32_t 
     device_targets.copy_from_host(targets.data(), device_targets.bytes());
     device_output.fill(0xcd);
 
-    Tensor logits_tensor(device_logits.data(), DType::BF16, {physical_rows, columns});
-    Tensor targets_tensor(device_targets.data(), DType::I32, {columns});
-    Tensor output_tensor(device_output.data(), DType::FP32, {columns});
-    ops::target_logprobs(logits_tensor, targets_tensor, valid_rows, output_tensor, nullptr);
+    Tensor logits_tensor(device_logits.span(), DType::BF16, {physical_rows, columns});
+    Tensor targets_tensor(device_targets.span(), DType::I32, {columns});
+    Tensor output_tensor(device_output.span(), DType::FP32, {columns});
+    ops::target_logprobs(logits_tensor, targets_tensor, valid_rows, output_tensor,
+                         ninfer::test::cuda_environment().default_execution);
     cuda_synchronize();
 
     int failures = verify_reduction(label, fp32_as_double(device_output.data(), targets.size()),
@@ -174,43 +177,56 @@ int expect_invalid(const char* label, Function&& function) {
 }
 
 int run_validation_cases() {
-    DeviceBuffer logits_data(8 * 3 * sizeof(std::uint16_t));
-    DeviceBuffer targets_data(3 * sizeof(std::int32_t));
-    DeviceBuffer output_data(3 * sizeof(float));
-    Tensor logits(logits_data.p, DType::BF16, {8, 3});
-    Tensor targets(targets_data.p, DType::I32, {3});
-    Tensor output(output_data.p, DType::FP32, {3});
+    DeviceBuffer logits_data(ninfer::test::cuda_environment().context.device(),
+                             8 * 3 * sizeof(std::uint16_t));
+    DeviceBuffer targets_data(ninfer::test::cuda_environment().context.device(),
+                              3 * sizeof(std::int32_t));
+    DeviceBuffer output_data(ninfer::test::cuda_environment().context.device(), 3 * sizeof(float));
+    Tensor logits(logits_data.span(), DType::BF16, {8, 3});
+    Tensor targets(targets_data.span(), DType::I32, {3});
+    Tensor output(output_data.span(), DType::FP32, {3});
 
     int failures = 0;
-    failures += expect_invalid("target_logprobs rejects valid_rows=0",
-                               [&] { ops::target_logprobs(logits, targets, 0, output, nullptr); });
-    failures += expect_invalid("target_logprobs rejects valid_rows>physical_rows",
-                               [&] { ops::target_logprobs(logits, targets, 9, output, nullptr); });
+    failures += expect_invalid("target_logprobs rejects valid_rows=0", [&] {
+        ops::target_logprobs(logits, targets, 0, output,
+                             ninfer::test::cuda_environment().default_execution);
+    });
+    failures += expect_invalid("target_logprobs rejects valid_rows>physical_rows", [&] {
+        ops::target_logprobs(logits, targets, 9, output,
+                             ninfer::test::cuda_environment().default_execution);
+    });
     failures += expect_invalid("target_logprobs rejects target shape mismatch", [&] {
-        Tensor wrong_targets(targets_data.p, DType::I32, {2});
-        ops::target_logprobs(logits, wrong_targets, 8, output, nullptr);
+        Tensor wrong_targets(targets_data.span(), DType::I32, {2});
+        ops::target_logprobs(logits, wrong_targets, 8, output,
+                             ninfer::test::cuda_environment().default_execution);
     });
     failures += expect_invalid("target_logprobs rejects output dtype", [&] {
-        Tensor wrong_output(output_data.p, DType::BF16, {3});
-        ops::target_logprobs(logits, targets, 8, wrong_output, nullptr);
+        Tensor wrong_output(output_data.span(), DType::BF16, {3});
+        ops::target_logprobs(logits, targets, 8, wrong_output,
+                             ninfer::test::cuda_environment().default_execution);
     });
     failures += expect_invalid("target_logprobs rejects non-contiguous logits", [&] {
         Tensor strided_logits = logits;
         strided_logits.nb[1] += 2;
-        ops::target_logprobs(strided_logits, targets, 8, output, nullptr);
+        ops::target_logprobs(strided_logits, targets, 8, output,
+                             ninfer::test::cuda_environment().default_execution);
     });
     failures += expect_invalid("target_logprobs rejects null output", [&] {
-        Tensor null_output(nullptr, DType::FP32, {3});
-        ops::target_logprobs(logits, targets, 8, null_output, nullptr);
+        auto null_output = output;
+        null_output.data = nullptr;
+        ops::target_logprobs(logits, targets, 8, null_output,
+                             ninfer::test::cuda_environment().default_execution);
     });
     failures += expect_invalid("target_logprobs rejects output alias", [&] {
-        Tensor alias_output(logits_data.p, DType::FP32, {3});
-        ops::target_logprobs(logits, targets, 8, alias_output, nullptr);
+        Tensor alias_output(logits_data.span(), DType::FP32, {3});
+        ops::target_logprobs(logits, targets, 8, alias_output,
+                             ninfer::test::cuda_environment().default_execution);
     });
     failures += expect_invalid("target_logprobs rejects non-matrix logits", [&] {
         Tensor rank_three = logits;
         rank_three.ne[2]  = 2;
-        ops::target_logprobs(rank_three, targets, 8, output, nullptr);
+        ops::target_logprobs(rank_three, targets, 8, output,
+                             ninfer::test::cuda_environment().default_execution);
     });
     return failures;
 }

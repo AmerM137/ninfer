@@ -8,9 +8,9 @@
 namespace ninfer::ops::detail {
 
 void rope_dispatch(const Tensor& positions, int rotary_dim, float theta, Tensor& q, Tensor& k,
-                   DeviceExecutionView execution);
+                   CudaExecutionView execution);
 
 void rope_dispatch(const Tensor& positions, int rotary_dim, float theta, Tensor& x,
-                   DeviceExecutionView execution);
+                   CudaExecutionView execution);
 
 } // namespace ninfer::ops::detail

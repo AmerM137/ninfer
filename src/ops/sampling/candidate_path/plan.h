@@ -27,6 +27,6 @@ void execute_candidate_path(const Tensor& candidate_ids, const Tensor& unary_sco
                             const Tensor& projected_hidden, const Tensor& anchors,
                             const Tensor& predecessor_codebook, const Tensor& successor_codebook,
                             const Tensor& base_positions, const SamplingConfig* configs,
-                            Tensor& drafts, Tensor& proposal_q, WorkspaceArena& workspace,
+                            Tensor& drafts, Tensor& proposal_q, MemoryArena& workspace,
                             cudaStream_t stream);
 } // namespace ninfer::ops::candidate_path_detail

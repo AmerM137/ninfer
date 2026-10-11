@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/buffer.h"
 #include "options.h"
 
 #include <cstdint>
@@ -32,7 +33,7 @@ struct StatePlane {
 
     StatePlane(int features, int count, int outer, DType dtype, const std::string& layout,
                bool state_coordinates = false)
-        : view(nullptr, dtype, {features, count, outer}) {
+        : view(Tensor::metadata(dtype, {features, count, outer})) {
         if (layout == "layered") {
             const int axis = state_coordinates ? 1 : 2;
             view.nb[axis] *= 12;
@@ -45,8 +46,9 @@ struct StatePlane {
                            (outer - 1) * (view.nb[2] / sizeof(Word));
         host.resize(words);
         for (std::size_t i = 0; i < words; ++i) host[i] = Word((i * 37 + 101) & 0x7fff);
-        storage   = DeviceBuffer(words * sizeof(Word));
-        view.data = static_cast<Word*>(storage.p) + leading;
+        storage     = DeviceBuffer(ninfer::bench::device_context().device(), words * sizeof(Word));
+        view.data   = static_cast<Word*>(storage.data()) + leading;
+        view.device = storage.device();
     }
 
     Word& at(int feature, int column, int outer = 0) {

@@ -157,7 +157,9 @@ void argmax_tiled_atomic_launch(const Tensor& logits, Tensor& out, std::int32_t 
 
 } // namespace
 
-void argmax(const Tensor& logits, Tensor& out, std::int32_t valid_rows, cudaStream_t stream) {
+void argmax(const Tensor& logits, Tensor& out, std::int32_t valid_rows,
+            CudaExecutionView execution) {
+    const auto stream = execution.stream();
     if (logits.dtype != DType::BF16) { throw std::invalid_argument("argmax: logits must be BF16"); }
     if (out.dtype != DType::I32) { throw std::invalid_argument("argmax: out must be I32"); }
 
@@ -180,6 +182,9 @@ void argmax(const Tensor& logits, Tensor& out, std::int32_t valid_rows, cudaStre
         throw std::invalid_argument("argmax: out shape must be [logits.ne[1]]");
     }
     if (logits_n == 0) { return; }
+    if (logits.device != execution.device() || out.device != execution.device()) {
+        throw std::invalid_argument("argmax: operands must belong to the execution device");
+    }
 
     if (!logits.is_contiguous() || !out.is_contiguous()) {
         throw std::invalid_argument("argmax: logits/out must be contiguous");

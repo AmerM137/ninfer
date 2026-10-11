@@ -14,7 +14,7 @@ Weights describe_weights(const ProjectionWeights& weights);
 void validate_interval(std::int32_t first, std::int32_t last);
 void validate_segments(std::span<const std::int32_t> rows, const SplitShape& shape);
 void validate_operands(const Tensor& x, Weights weights, std::span<const Tensor> outputs,
-                       const SplitShape& shape);
+                       const SplitShape& shape, CudaExecutionView execution);
 void validate_scratch(const Tensor& x, Weights weights, std::span<const Tensor> outputs,
-                      DeviceSpan scratch);
+                      MemorySpan scratch);
 } // namespace ninfer::ops::detail::linear_split

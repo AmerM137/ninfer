@@ -1,11 +1,11 @@
 #pragma once
 
+#include "core/device.h"
 #include "core/weight.h"
 #include "core/arena.h"
 #include "core/cyclic_kv_cache.h"
 #include "core/tensor.h"
 
-#include <cuda_runtime.h>
 
 #include <array>
 #include <cstddef>
@@ -70,7 +70,8 @@ struct ContextKVMaterializeExecutionEnvelope {
 void context_kv_materialize(
     const Tensor& context, const Tensor& positions, const Tensor& counts, const Tensor& state_slots,
     const std::array<ContextKVMaterializeLayerView, kContextKVMaterializeLayers>& layers,
-    ContextKVMaterializeExecutionEnvelope envelope, WorkspaceArena& workspace, cudaStream_t stream);
+    ContextKVMaterializeExecutionEnvelope envelope, MemoryArena& workspace,
+    CudaExecutionView execution);
 
 /**
  * Return transient capacity for every registered W in the inclusive interval at the exact batch

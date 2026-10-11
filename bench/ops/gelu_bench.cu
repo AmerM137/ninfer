@@ -1,4 +1,5 @@
 #include "ninfer/ops/gelu.h"
+#include "core/buffer.h"
 #include "op_measurement.cuh"
 
 #include <cuda_bf16.h>
@@ -19,11 +20,11 @@ void run(ops::GeluMode mode, int d, int columns) {
     const std::size_t n = static_cast<std::size_t>(d) * static_cast<std::size_t>(columns);
     DeviceBuffer x      = make_bf16(n, 101U);
     SavedBuffer initial(x);
-    const auto restore = [&](cudaStream_t stream) { initial.restore(stream); };
-    Tensor tx(x.p, DType::BF16, {d, columns});
+    const auto restore = [&](CudaExecutionView cuda) { initial.restore(cuda); };
+    Tensor tx(x.span(), DType::BF16, {d, columns});
 
     const Result result = bench_loop_prepared(
-        restore, [&](cudaStream_t stream) { ops::gelu(tx, mode, stream); },
+        restore, [&](CudaExecutionView cuda) { ops::gelu(tx, mode, cuda); },
         static_cast<double>(n) * 4.0);
 
     char tag[96];

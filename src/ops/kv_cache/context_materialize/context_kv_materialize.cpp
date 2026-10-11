@@ -22,7 +22,9 @@ constexpr std::int32_t kBlockWidth = 16;
 constexpr const char* kOp          = "context_kv_materialize";
 
 void require_tensor(const Tensor& tensor, DType dtype, std::int32_t n0, std::int32_t n1,
-                    std::int32_t n2, std::int32_t n3, std::size_t alignment, const char* name) {
+                    std::int32_t n2, std::int32_t n3, std::size_t alignment, const char* name,
+                    Device device) {
+    common::operand::device(tensor.device, device, "context_kv_materialize", "operand");
     if (tensor.dtype != dtype || tensor.ne[0] != n0 || tensor.ne[1] != n1 || tensor.ne[2] != n2 ||
         tensor.ne[3] != n3 || !tensor.is_contiguous() ||
         !common::operand::aligned(tensor.data, alignment)) {
@@ -30,7 +32,8 @@ void require_tensor(const Tensor& tensor, DType dtype, std::int32_t n0, std::int
     }
 }
 
-void require_weight(const Weight& weight, const char* name) {
+void require_weight(const Weight& weight, const char* name, Device device) {
+    common::operand::device(weight.device, device, "context_kv_materialize", name);
     constexpr std::uint64_t kCodeBytes =
         static_cast<std::uint64_t>(kKVSize) * static_cast<std::uint64_t>(kHidden);
     constexpr std::uint64_t kScaleBytes =
@@ -85,15 +88,17 @@ std::size_t key_scratch_capacity(std::int32_t columns) {
 }
 
 void validate_cache(const CyclicKVCacheLayerView& cache, std::int32_t padded,
-                    std::int32_t lane_capacity) {
+                    std::int32_t lane_capacity, Device device) {
     if (cache.capacity != kCapacity ||
         cache.padded_capacity != static_cast<std::uint32_t>(padded) ||
         cache.num_kv_heads != kKVHeads || cache.head_dim != kHeadDim ||
         cache.lane_capacity != lane_capacity || padded < kCapacity || lane_capacity <= 0) {
         throw std::invalid_argument("context_kv_materialize: invalid cyclic cache geometry");
     }
-    require_tensor(cache.k, DType::BF16, kHeadDim, padded, kKVHeads, lane_capacity, 16, "cache K");
-    require_tensor(cache.v, DType::FP16, kHeadDim, padded, kKVHeads, lane_capacity, 16, "cache V");
+    require_tensor(cache.k, DType::BF16, kHeadDim, padded, kKVHeads, lane_capacity, 16, "cache K",
+                   device);
+    require_tensor(cache.v, DType::FP16, kHeadDim, padded, kKVHeads, lane_capacity, 16, "cache V",
+                   device);
 }
 
 } // namespace
@@ -116,15 +121,23 @@ std::size_t context_kv_materialize_workspace_capacity_bytes(std::int32_t batch_s
 void context_kv_materialize(
     const Tensor& context, const Tensor& positions, const Tensor& counts, const Tensor& state_slots,
     const std::array<ContextKVMaterializeLayerView, kContextKVMaterializeLayers>& layers,
-    ContextKVMaterializeExecutionEnvelope envelope, WorkspaceArena& workspace,
-    cudaStream_t stream) {
+    ContextKVMaterializeExecutionEnvelope envelope, MemoryArena& workspace,
+    CudaExecutionView execution) {
+    if (workspace.device() != execution.device()) {
+        throw std::invalid_argument("context_kv_materialize: workspace belongs to another device");
+    }
+    const auto stream        = execution.stream();
     const std::int32_t width = context.ne[1];
     const std::int32_t batch = context.ne[2];
     require_profile(width, batch);
-    require_tensor(context, DType::BF16, kHidden, width, batch, 1, 16, "context");
-    require_tensor(positions, DType::I32, width, batch, 1, 1, alignof(std::int32_t), "positions");
-    require_tensor(counts, DType::I32, batch, 1, 1, 1, alignof(std::int32_t), "counts");
-    require_tensor(state_slots, DType::I32, batch, 1, 1, 1, alignof(std::int32_t), "state slots");
+    require_tensor(context, DType::BF16, kHidden, width, batch, 1, 16, "context",
+                   execution.device());
+    require_tensor(positions, DType::I32, width, batch, 1, 1, alignof(std::int32_t), "positions",
+                   execution.device());
+    require_tensor(counts, DType::I32, batch, 1, 1, 1, alignof(std::int32_t), "counts",
+                   execution.device());
+    require_tensor(state_slots, DType::I32, batch, 1, 1, 1, alignof(std::int32_t), "state slots",
+                   execution.device());
     if (envelope.min_count > envelope.max_count ||
         envelope.max_count > static_cast<std::uint32_t>(width) ||
         envelope.max_count > static_cast<std::uint32_t>(kCapacity)) {
@@ -139,10 +152,11 @@ void context_kv_materialize(
     const std::int32_t lane_capacity = layers.front().cache.lane_capacity;
     for (std::size_t index = 0; index < layers.size(); ++index) {
         const ContextKVMaterializeLayerView& layer = layers[index];
-        require_weight(layer.key_weight, "key weight");
-        require_weight(layer.value_weight, "value weight");
-        require_tensor(layer.key_norm_weight, DType::BF16, kHeadDim, 1, 1, 1, 4, "key norm weight");
-        validate_cache(layer.cache, padded, lane_capacity);
+        require_weight(layer.key_weight, "key weight", execution.device());
+        require_weight(layer.value_weight, "value weight", execution.device());
+        require_tensor(layer.key_norm_weight, DType::BF16, kHeadDim, 1, 1, 1, 4, "key norm weight",
+                       execution.device());
+        validate_cache(layer.cache, padded, lane_capacity, execution.device());
     }
 
     if (envelope.max_count == 0) return;

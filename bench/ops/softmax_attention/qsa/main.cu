@@ -28,11 +28,9 @@ void measure_tail(const qsa::Options& options, DeviceContext& device, L2FlushBuf
                 for (const auto& cache :
                      measurement::selections(options.timing.cache, "cold", "warm")) {
                     const auto result = measurement::measure(
-                        [&](auto stream) {
-                            fixture.launch(device.execution_view().on_stream(stream));
-                        },
-                        [&](auto stream) { fixture.restore(stream); }, flush, device.stream,
-                        options.timing, execution, cache);
+                        [&](CudaExecutionView cuda) { fixture.launch(cuda); },
+                        [&](CudaExecutionView cuda) { fixture.restore(cuda); }, flush,
+                        device.execution_view(), options.timing, execution, cache);
                     csv.write(row, result, execution, cache,
                               qsa::csv_list(fixture.bases) + "," + std::to_string(options.inplace) +
                                   "," + options.layout + "," + std::to_string(round));
@@ -57,11 +55,9 @@ void measure_prepare(const qsa::Options& options, DeviceContext& device, L2Flush
                 for (const auto& cache :
                      measurement::selections(options.timing.cache, "cold", "warm")) {
                     const auto result = measurement::measure(
-                        [&](auto stream) {
-                            fixture.launch(device.execution_view().on_stream(stream));
-                        },
-                        [&](auto stream) { fixture.restore(stream); }, flush, device.stream,
-                        options.timing, execution, cache);
+                        [&](CudaExecutionView cuda) { fixture.launch(cuda); },
+                        [&](CudaExecutionView cuda) { fixture.restore(cuda); }, flush,
+                        device.execution_view(), options.timing, execution, cache);
                     csv.write(row, result, execution, cache,
                               qsa::csv_list(fixture.bases) + "," + std::to_string(options.axes) +
                                   "," + std::to_string(options.inplace) + "," + options.layout +
@@ -89,10 +85,8 @@ void measure_indexer(const qsa::Options& options, DeviceContext& device, L2Flush
                 for (const auto& cache :
                      measurement::selections(options.timing.cache, "cold", "warm")) {
                     const auto result = measurement::measure(
-                        [&](auto stream) {
-                            fixture.launch(device.execution_view().on_stream(stream));
-                        },
-                        [](auto) {}, flush, device.stream, options.timing, execution, cache);
+                        [&](CudaExecutionView cuda) { fixture.launch(cuda); }, [](auto) {}, flush,
+                        device.execution_view(), options.timing, execution, cache);
                     row.workspace_peak = fixture.workspace->peak_used();
                     csv.write(row, result, execution, cache,
                               qsa::csv_list(fixture.contexts) + "," +
@@ -125,10 +119,8 @@ void measure_sparse(const qsa::Options& options, DeviceContext& device, L2FlushB
                 for (const auto& cache :
                      measurement::selections(options.timing.cache, "cold", "warm")) {
                     const auto result = measurement::measure(
-                        [&](auto stream) {
-                            fixture.launch(device.execution_view().on_stream(stream));
-                        },
-                        [](auto) {}, flush, device.stream, options.timing, execution, cache);
+                        [&](CudaExecutionView cuda) { fixture.launch(cuda); }, [](auto) {}, flush,
+                        device.execution_view(), options.timing, execution, cache);
                     row.workspace_peak = fixture.workspace->peak_used();
                     const auto flops   = fixture.selected_tokens * 2 * 24 * 256;
                     csv.write(
@@ -140,8 +132,9 @@ void measure_sparse(const qsa::Options& options, DeviceContext& device, L2FlushB
                             "," + std::to_string(flops) + "," +
                             std::to_string(fixture.selected_tokens * fixture.token_bytes) + "," +
                             std::to_string(fixture.unique_tokens * fixture.token_bytes) + "," +
-                            std::to_string(fixture.key_data.bytes + fixture.value_data.bytes +
-                                           fixture.key_scales.bytes + fixture.value_scales.bytes) +
+                            std::to_string(fixture.key_data.size() + fixture.value_data.size() +
+                                           fixture.key_scales.size() +
+                                           fixture.value_scales.size()) +
                             "," + std::to_string(round));
                 }
     }
@@ -152,7 +145,7 @@ int main(int argc, char** argv) {
     try {
         const auto options = qsa::parse_options(argc, argv);
         measurement::hardware();
-        DeviceContext device;
+        auto& device = ninfer::bench::device_context();
         L2FlushBuffer flush(options.timing.flush_bytes);
         if (options.op == "sparse-gqa") {
             measure_sparse(options, device, flush);
@@ -192,16 +185,16 @@ int main(int argc, char** argv) {
                                 const bool baseline = entry == "linear";
                                 row.op              = baseline ? "linear" : "linear_split";
                                 const auto result   = measurement::measure(
-                                    [&](auto stream) {
+                                    [&](CudaExecutionView cuda) {
                                         if (baseline)
                                             ops::linear(fixture.x, weights.weight, fixture.packed,
-                                                          stream);
+                                                          cuda);
                                         else
                                             ops::linear_split(fixture.x, weights.weight,
-                                                                fixture.split, stream);
+                                                                fixture.split, cuda);
                                     },
-                                    [](auto) {}, flush, device.stream, options.timing, execution,
-                                    cache);
+                                    [](auto) {}, flush, device.execution_view(), options.timing,
+                                    execution, cache);
                                 csv.write(row, result, execution, cache,
                                           std::string(qsa::name(projection)) + "," +
                                               std::to_string(round));

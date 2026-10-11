@@ -1,10 +1,9 @@
 #pragma once
 
+#include "core/device.h"
 #include "core/tensor.h"
 
 #include <cstdint>
-
-#include <cuda_runtime.h> // cudaStream_t
 
 namespace ninfer::ops {
 
@@ -39,9 +38,9 @@ namespace ninfer::ops {
  *   None.
  *
  * Execution:
- *   Enqueues work on stream and owns no persistent state.
+ *   Enqueues work on execution.stream() and owns no persistent state.
  */
 void target_logprobs(const Tensor& logits, const Tensor& target_ids, std::int32_t valid_rows,
-                     Tensor& output, cudaStream_t stream);
+                     Tensor& output, CudaExecutionView execution);
 
 } // namespace ninfer::ops

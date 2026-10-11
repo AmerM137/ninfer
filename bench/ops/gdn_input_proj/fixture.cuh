@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/buffer.h"
 #include "options.h"
 #include "quantized_weight.cuh"
 #include <memory>
@@ -40,8 +41,9 @@ struct Fixture {
           v(make_zeros(std::size_t(value_rows) * columns * 2)),
           records(o.op == "record" ? make_zeros(std::size_t(channels) * columns * 2)
                                    : DeviceBuffer{}),
-          capacity(workspace_capacity()), arena(256 + capacity) {
-        arena.alloc_bytes(256);
+          capacity(workspace_capacity()), arena_storage(make_buffer(256 + capacity)),
+          arena(arena_storage.span()) {
+        (void)arena.alloc_bytes(256);
         std::vector<int> sources(o.batch), bases(o.batch);
         for (int b = 0; b < o.batch; ++b) {
             sources[b] = columns + b;
@@ -60,39 +62,49 @@ struct Fixture {
                                                                         tokens, tokens);
     }
 
-    void restore(cudaStream_t s) const {
-        if (saved) saved->restore(s);
+    void restore(CudaExecutionView cuda) const {
+        if (saved) saved->restore(cuda);
     }
 
-    void launch(cudaStream_t s) {
+    void launch(CudaExecutionView cuda) {
         const int b = options.batch;
-        Tensor input(x.p, DType::BF16, {options.k, tokens, b}),
-            weight(conv.p, DType::BF16, {channels, 4});
-        Tensor state(history.p, DType::BF16, {channels, 3, slots}), src(source.p, DType::I32, {b}),
-            dst(base.p, DType::I32, {b});
+        Tensor input(x.span(), DType::BF16, {options.k, tokens, b}),
+            weight(conv.span(), DType::BF16, {channels, 4});
+        Tensor state(history.span(), DType::BF16, {channels, 3, slots}),
+            src(source.span(), DType::I32, {b}), dst(base.span(), DType::I32, {b});
         Tensor mask;
-        if (valid.p) mask = Tensor(valid.p, DType::I32, {b});
-        ops::GdnConvOutputs out{Tensor(q.p, DType::BF16, {2048, tokens, b}),
-                                Tensor(k.p, DType::BF16, {2048, tokens, b}),
-                                Tensor(v.p, DType::BF16, {value_rows, tokens, b}),
-                                Tensor(z.p, DType::BF16, {value_rows, tokens, b})};
+        if (valid.data()) mask = Tensor(valid.span(), DType::I32, {b});
+        ops::GdnConvOutputs out{Tensor(q.span(), DType::BF16, {2048, tokens, b}),
+                                Tensor(k.span(), DType::BF16, {2048, tokens, b}),
+                                Tensor(v.span(), DType::BF16, {value_rows, tokens, b}),
+                                Tensor(z.span(), DType::BF16, {value_rows, tokens, b})};
         if (options.op == "snapshot")
             ops::gdn_input_proj_conv_snapshot(input, weights, weight, {state, src, dst}, mask, out,
-                                              arena, s);
+                                              arena, cuda);
         else {
-            Tensor record(records.p, DType::BF16, {channels, tokens, b});
+            Tensor record(records.span(), DType::BF16, {channels, tokens, b});
             ops::gdn_input_proj_conv_record(input, weights, weight, {state, src}, mask, out, record,
-                                            arena, s);
+                                            arena, cuda);
         }
     }
 
     const Options& options;
     const ops::ProjectionWeights& weights;
     int tokens, value_rows, channels, columns, slots;
-    DeviceBuffer x, z, conv, history;
+    DeviceBuffer x;
+    DeviceBuffer z;
+    DeviceBuffer conv;
+    DeviceBuffer history;
     std::unique_ptr<SavedBuffer> saved;
-    DeviceBuffer q, k, v, records, source, base, valid;
+    DeviceBuffer q;
+    DeviceBuffer k;
+    DeviceBuffer v;
+    DeviceBuffer records;
+    DeviceBuffer source;
+    DeviceBuffer base;
+    DeviceBuffer valid;
     std::size_t capacity;
-    WorkspaceArena arena;
+    DeviceBuffer arena_storage;
+    MemoryArena arena;
 };
 } // namespace ninfer::bench::gdn_input

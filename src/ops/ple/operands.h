@@ -20,9 +20,9 @@ void validate_conv(const Tensor& residual, const Tensor& gated, const Tensor& ke
                    const PleBatchView& batch, const PleConvStateView& before,
                    const PleConvRecordWindowView& current, const Tensor& updated,
                    const Tensor* norm_weight, float epsilon, const Tensor* normalized,
-                   DeviceExecutionView execution);
+                   CudaExecutionView execution);
 void validate_extract(const PleConvStateView& before, const PleConvRecordReadView& records,
                       const Tensor& accepted, const PleConvStateView& after,
-                      DeviceExecutionView execution);
+                      CudaExecutionView execution);
 
 } // namespace ninfer::ops::detail::ple

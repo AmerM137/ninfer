@@ -85,8 +85,8 @@ struct Cache {
     }
 
     CyclicKVCacheLayerView view() {
-        return {.k               = Tensor(device_k.data(), DType::BF16, {D, padded, Hkv, Lanes}),
-                .v               = Tensor(device_v.data(), DType::FP16, {D, padded, Hkv, Lanes}),
+        return {.k               = Tensor(device_k.span(), DType::BF16, {D, padded, Hkv, Lanes}),
+                .v               = Tensor(device_v.span(), DType::FP16, {D, padded, Hkv, Lanes}),
                 .capacity        = static_cast<std::uint32_t>(window),
                 .padded_capacity = static_cast<std::uint32_t>(padded),
                 .num_kv_heads    = Hkv,
@@ -209,20 +209,20 @@ int run_case(Cache& cache, int width, int batch, int base_context, int envelope_
     const auto capacity = ops::sliding_window_attention_workspace_capacity_bytes(
         Geometry, cache.window, envelope, width, width, batch);
     GuardedDeviceBuffer scratch(std::max<std::size_t>(capacity, 1));
-    DeviceArena workspace(DeviceSpan{scratch.data(), std::max<std::size_t>(capacity, 1)});
+    MemoryArena workspace(scratch.span().subspan(0, std::max<std::size_t>(capacity, 1)));
     GuardedDeviceBuffer dq(q_count * 2), dk(kv_count * 2), dv(kv_count * 2),
         dp(positions.size() * 4), dvalid(batch * 4), dlane(batch * 4), output(q_count * 2);
-    Tensor tq(dq.data(), DType::BF16, {D, Hq, width, batch}),
-        tk(dk.data(), DType::BF16, {D, Hkv, width, batch}),
-        tv(dv.data(), DType::BF16, {D, Hkv, width, batch});
-    Tensor tp(dp.data(), DType::I32, {width, batch}), tvalid(dvalid.data(), DType::I32, {batch}),
-        tlane(dlane.data(), DType::I32, {batch}),
-        to(output.data(), DType::BF16, {D, Hq, width, batch});
+    Tensor tq(dq.span(), DType::BF16, {D, Hq, width, batch}),
+        tk(dk.span(), DType::BF16, {D, Hkv, width, batch}),
+        tv(dv.span(), DType::BF16, {D, Hkv, width, batch});
+    Tensor tp(dp.span(), DType::I32, {width, batch}), tvalid(dvalid.span(), DType::I32, {batch}),
+        tlane(dlane.span(), DType::I32, {batch}),
+        to(output.span(), DType::BF16, {D, Hq, width, batch});
     auto context = cache.view();
     DeviceContext device;
     const auto launch = [&] {
         ops::sliding_window_attention(tq, tk, tv, tp, tvalid, tlane, Geometry, cache.window, Scale,
-                                      context, envelope, workspace, to, device.stream);
+                                      context, envelope, workspace, to, device.execution_view());
     };
     DecodeGraphDefinition definition;
     DecodeGraphExecutable graph;
@@ -263,14 +263,14 @@ int run_case(Cache& cache, int width, int batch, int base_context, int envelope_
         scratch.fill(0xa7);
         cuda_synchronize();
         if (replay && phase == 0) {
-            definition.capture(device.stream, launch);
+            definition.capture(device.stream(), launch);
             graph.instantiate(definition);
         }
         if (replay)
-            graph.launch(device.stream);
+            graph.launch(device.stream());
         else
             launch();
-        cuda_synchronize(device.stream);
+        cuda_synchronize(device.stream());
         const auto expected = oracle(cache, width, batch, q, qk, value, positions, valid, lanes);
         const std::string label = "SWA window=" + std::to_string(cache.window) +
                                   " W=" + std::to_string(width) + " B=" + std::to_string(batch) +

@@ -1,4 +1,6 @@
 #include "ninfer/ops/sequence.h"
+#include "cuda_fixture.h"
+#include "core/buffer.h"
 #include "ninfer/ops/indexing.h"
 #include "ninfer/ops/speculative_accept.h"
 #include "ops/op_tester.h"
@@ -46,28 +48,38 @@ int prepare_verify_case(int k, int batch) {
         lengths[b] = 131072 + 1009 * b;
         for (int j = 0; j < k; ++j) drafts[b * k + j] = 37 + 257 * b + 7919 * j;
     }
-    DeviceBuffer d_anchors = to_device(anchors), d_lengths = to_device(lengths), d_drafts = to_device(drafts);
+    DeviceBuffer d_anchors = to_device(anchors);
+    DeviceBuffer d_lengths = to_device(lengths);
+    DeviceBuffer d_drafts  = to_device(drafts);
     DeviceBuffer d_extents = to_device(extents);
     GuardedDeviceBuffer d_full(width * batch * sizeof(std::int32_t));
     GuardedDeviceBuffer d_ids(d_full.bytes()), d_positions(d_full.bytes());
-    Tensor a(d_anchors.p, DType::I32, {batch}), l(d_lengths.p, DType::I32, {batch});
-    Tensor d(d_drafts.p, DType::I32, {k, batch}), e(d_extents.p, DType::I32, {batch});
-    Tensor full(d_full.data(), DType::I32, {width, batch}), ids(d_ids.data(), DType::I32, {width, batch});
-    Tensor positions(d_positions.data(), DType::I32, {width, batch});
+    Tensor a(d_anchors.span(), DType::I32, {batch}), l(d_lengths.span(), DType::I32, {batch});
+    Tensor d(d_drafts.span(), DType::I32, {k, batch}), e(d_extents.span(), DType::I32, {batch});
+    Tensor full(d_full.span(), DType::I32, {width, batch}),
+        ids(d_ids.span(), DType::I32, {width, batch});
+    Tensor positions(d_positions.span(), DType::I32, {width, batch});
     DeviceContext context;
     cuda_synchronize();
     const auto launch = [&] {
-        ops::prepare_verify_inputs(a, d, l, e, full, positions, context.stream);
-        ops::prepare_verify_ids(a, d, e, ids, context.stream);
+        ops::prepare_verify_inputs(a, d, l, e, full, positions, context.execution_view());
+        ops::prepare_verify_ids(a, d, e, ids, context.execution_view());
     };
     DecodeGraphDefinition definition;
     DecodeGraphExecutable graph;
-    if (k == 15 && batch == 8) { definition.capture(context.stream, launch); graph.instantiate(definition); }
+    if (k == 15 && batch == 8) {
+        definition.capture(context.stream(), launch);
+        graph.instantiate(definition);
+    }
     int failures = 0;
     for (int phase = 0; phase <= k; ++phase) {
         for (int b = 0; b < batch; ++b) extents[b] = (phase + 3 * b) % width;
-        CUDA_CHECK(cudaMemcpyAsync(d_extents.p, extents.data(), d_extents.bytes, cudaMemcpyHostToDevice, context.stream));
-        if (graph.ready()) graph.launch(context.stream); else launch();
+        CUDA_CHECK(cudaMemcpyAsync(d_extents.data(), extents.data(), d_extents.size(),
+                                   cudaMemcpyHostToDevice, context.stream()));
+        if (graph.ready())
+            graph.launch(context.stream());
+        else
+            launch();
         context.synchronize();
         std::vector<std::int32_t> expected_ids(width * batch), expected_positions(width * batch);
         for (int b = 0; b < batch; ++b)
@@ -399,14 +411,14 @@ struct SparseAcceptSuite {
         std::vector<ops::SamplingConfig> device_configs = host_configs;
         for (int row = 0; row < kSparseBatch; ++row) {
             device_configs[static_cast<std::size_t>(row)].token_counts =
-                static_cast<std::int32_t*>(d_token_counts.p) +
+                static_cast<std::int32_t*>(d_token_counts.data()) +
                 static_cast<std::size_t>(row) * kSparseTokenDomain;
         }
         std::optional<DeviceBuffer> d_masks;
         if (!masks.empty()) {
             d_masks.emplace(to_device(masks));
             for (int row = 0; row < kSparseBatch; ++row) {
-                device_configs[row].mask = {static_cast<const std::uint32_t*>(d_masks->p) +
+                device_configs[row].mask = {static_cast<const std::uint32_t*>(d_masks->data()) +
                                                 row * kSparseColumns * mask_words,
                                             mask_words};
             }
@@ -424,34 +436,35 @@ struct SparseAcceptSuite {
         d_licensed_counts.fill(0xef);
         d_accepted.fill(0xab);
 
-        Tensor target_tensor(d_target_tokens.p, DType::I32, {kSparseColumns, kSparseBatch});
-        Tensor logits_tensor(d_logits.p, DType::BF16,
+        Tensor target_tensor(d_target_tokens.span(), DType::I32, {kSparseColumns, kSparseBatch});
+        Tensor logits_tensor(d_logits.span(), DType::BF16,
                              {kSparsePhysicalRows, kSparseColumns, kSparseBatch});
-        Tensor drafts_tensor(d_drafts.p, DType::I32, {kSparseDrafts, kSparseBatch});
-        Tensor candidate_tensor(d_candidate_ids.p, DType::I32,
+        Tensor drafts_tensor(d_drafts.span(), DType::I32, {kSparseDrafts, kSparseBatch});
+        Tensor candidate_tensor(d_candidate_ids.span(), DType::I32,
                                 {kSparseCandidates, kSparseDrafts, kSparseBatch});
-        Tensor q_tensor(d_proposal_q.p, DType::FP32,
+        Tensor q_tensor(d_proposal_q.span(), DType::FP32,
                         {kSparseCandidates, kSparseDrafts, kSparseBatch});
-        Tensor extent_tensor(d_extents.p, DType::I32, {kSparseBatch});
-        Tensor lengths_tensor(d_lengths.data(), DType::I32, {kSparseBatch});
-        Tensor anchors_tensor(d_anchors.data(), DType::I32, {kSparseBatch});
-        Tensor licensed_tensor(d_licensed.data(), DType::I32, {kSparseColumns, kSparseBatch});
-        Tensor licensed_counts_tensor(d_licensed_counts.data(), DType::I32, {kSparseBatch});
-        Tensor accepted_tensor(d_accepted.data(), DType::I32, {kSparseBatch});
+        Tensor extent_tensor(d_extents.span(), DType::I32, {kSparseBatch});
+        Tensor lengths_tensor(d_lengths.span(), DType::I32, {kSparseBatch});
+        Tensor anchors_tensor(d_anchors.span(), DType::I32, {kSparseBatch});
+        Tensor licensed_tensor(d_licensed.span(), DType::I32, {kSparseColumns, kSparseBatch});
+        Tensor licensed_counts_tensor(d_licensed_counts.span(), DType::I32, {kSparseBatch});
+        Tensor accepted_tensor(d_accepted.span(), DType::I32, {kSparseBatch});
         const std::size_t workspace_bytes =
             ops::speculative_accept_sparse_drafts_workspace_capacity_bytes(
                 kSparseTokenDomain, envelope, kSparseDrafts, kSparseDrafts, kSparseBatch,
                 kSparseBatch);
         GuardedDeviceBuffer scratch(std::max<std::size_t>(workspace_bytes, 1));
-        WorkspaceArena workspace(DeviceSpan{scratch.data(), scratch.bytes()});
-        const auto launch = [&](cudaStream_t stream) {
+        MemoryArena workspace(scratch.span());
+        const auto launch = [&](CudaExecutionView cuda) {
             ops::speculative_accept_sparse_drafts(
                 target_tensor, logits_tensor, drafts_tensor, candidate_tensor, q_tensor,
                 extent_tensor, lengths_tensor, anchors_tensor, licensed_tensor,
                 licensed_counts_tensor, accepted_tensor, kSparseTokenDomain,
-                static_cast<const ops::SamplingConfig*>(d_configs.p), envelope, workspace, stream);
+                static_cast<const ops::SamplingConfig*>(d_configs.data()), envelope, workspace,
+                cuda);
         };
-        launch(nullptr);
+        launch(ninfer::test::cuda_environment().default_execution);
         cuda_synchronize();
 
         const auto check_result = [&](const SparseExpected& wanted, const std::string& phase) {
@@ -477,10 +490,12 @@ struct SparseAcceptSuite {
             cudaStream_t stream = nullptr;
             cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking),
                        "sparse graph stream");
+            const auto stream_execution =
+                ninfer::test::cuda_environment().context.execution_view(stream);
             {
                 DecodeGraphDefinition definition;
                 DecodeGraphExecutable executable;
-                definition.capture(stream, [&] { launch(stream); });
+                definition.capture(stream, [&] { launch(stream_execution); });
                 executable.instantiate(definition);
                 for (int pass = 0; pass < 3; ++pass) {
                     auto next_extents = extents;
@@ -568,8 +583,8 @@ struct SparseAcceptSuite {
                                  from_device<float>(d_proposal_q, proposal_q.size()), proposal_q);
         const auto* config_bytes = reinterpret_cast<const std::uint8_t*>(device_configs.data());
         failures += verify_exact(
-            "sparse configs readonly", from_device<std::uint8_t>(d_configs, d_configs.bytes),
-            std::vector<std::uint8_t>(config_bytes, config_bytes + d_configs.bytes));
+            "sparse configs readonly", from_device<std::uint8_t>(d_configs, d_configs.size()),
+            std::vector<std::uint8_t>(config_bytes, config_bytes + d_configs.size()));
         failures += verify_exact((label + " token counts read-only").c_str(),
                                  from_device<std::int32_t>(d_token_counts, token_counts.size()),
                                  token_counts);
@@ -896,7 +911,7 @@ int execute_accept_case(const std::string& label, const std::vector<std::int32_t
     DeviceBuffer d_logits    = to_device(logits_bits);
     DeviceBuffer d_drafts    = to_device(drafts);
     DeviceBuffer d_counts    = to_device(initial_token_counts);
-    config.token_counts      = static_cast<std::int32_t*>(d_counts.p);
+    config.token_counts      = static_cast<std::int32_t*>(d_counts.data());
     DeviceBuffer d_config    = device_config(config);
     const auto config_before = from_device<std::uint8_t>(d_config, sizeof(ops::SamplingConfig));
 
@@ -912,21 +927,24 @@ int execute_accept_case(const std::string& label, const std::vector<std::int32_t
     initialize(d_num, std::vector<std::int32_t>{-11});
     initialize(d_accepted, std::vector<std::int32_t>{-13});
 
-    Tensor targets(d_targets.p, DType::I32, {k + 1});
-    Tensor logits(d_logits.p, DType::BF16, {physical_rows, k + 1});
-    Tensor draft_tensor(d_drafts.p, DType::I32, {k});
-    Tensor extent(d_extent.p, DType::I32, {1});
-    Tensor length(d_length.data(), DType::I32, {1});
-    Tensor token(d_token.data(), DType::I32, {1});
-    Tensor sampled(d_sampled.data(), DType::I32, {k + 1});
-    Tensor num_sampled(d_num.data(), DType::I32, {1});
-    Tensor accepted(d_accepted.data(), DType::I32, {1});
+    Tensor targets(d_targets.span(), DType::I32, {k + 1});
+    Tensor logits(d_logits.span(), DType::BF16, {physical_rows, k + 1});
+    Tensor draft_tensor(d_drafts.span(), DType::I32, {k});
+    Tensor extent(d_extent.span(), DType::I32, {1});
+    Tensor length(d_length.span(), DType::I32, {1});
+    Tensor token(d_token.span(), DType::I32, {1});
+    Tensor sampled(d_sampled.span(), DType::I32, {k + 1});
+    Tensor num_sampled(d_num.span(), DType::I32, {1});
+    Tensor accepted(d_accepted.span(), DType::I32, {1});
     const std::size_t workspace_bytes =
         ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(token_domain, k, k, 1, 1);
-    WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
+    ninfer::DeviceBuffer workspace_storage(ninfer::test::cuda_environment().context.device(),
+                                           std::max<std::size_t>(256, workspace_bytes));
+    MemoryArena workspace(workspace_storage.span());
     ops::speculative_accept_greedy_drafts(
         targets, logits, draft_tensor, extent, length, token, sampled, num_sampled, accepted,
-        token_domain, static_cast<const ops::SamplingConfig*>(d_config.p), workspace, nullptr);
+        token_domain, static_cast<const ops::SamplingConfig*>(d_config.data()), workspace,
+        ninfer::test::cuda_environment().default_execution);
     cuda_synchronize();
 
     int failures = verify_exact((label + " sampled").c_str(), read<std::int32_t>(d_sampled, k + 1),
@@ -1053,7 +1071,7 @@ int grammar_onehot_case(int domain, float temperature) {
     auto device_masks = to_device(masks);
     ops::SamplingConfig config;
     config.temperature  = temperature;
-    config.mask         = {static_cast<const std::uint32_t*>(device_masks.p), words};
+    config.mask         = {static_cast<const std::uint32_t*>(device_masks.data()), words};
     const auto expected = accept_state_oracle(drafts, 2, 51, 73);
     return execute_accept_case("one-hot grammar mask", targets, logits, domain + 2, drafts, 73,
                                domain, config, std::vector<int>(domain, 0), expected);
@@ -1109,9 +1127,12 @@ int batched_sampling_workspace_stride_case() {
     DeviceBuffer d_extents = to_device<std::int32_t>({k, k});
     DeviceBuffer d_lengths = to_device<std::int32_t>({100, 200});
     DeviceBuffer d_anchors = to_device<std::int32_t>({-1, -1});
-    DeviceBuffer d_licensed(static_cast<std::size_t>(columns) * batch * sizeof(std::int32_t));
-    DeviceBuffer d_counts(static_cast<std::size_t>(batch) * sizeof(std::int32_t));
-    DeviceBuffer d_accepted(static_cast<std::size_t>(batch) * sizeof(std::int32_t));
+    DeviceBuffer d_licensed(ninfer::test::cuda_environment().context.device(),
+                            static_cast<std::size_t>(columns) * batch * sizeof(std::int32_t));
+    DeviceBuffer d_counts(ninfer::test::cuda_environment().context.device(),
+                          static_cast<std::size_t>(batch) * sizeof(std::int32_t));
+    DeviceBuffer d_accepted(ninfer::test::cuda_environment().context.device(),
+                            static_cast<std::size_t>(batch) * sizeof(std::int32_t));
 
     ops::SamplingConfig config{};
     config.temperature = 1.0f;
@@ -1119,22 +1140,25 @@ int batched_sampling_workspace_stride_case() {
     const std::vector<ops::SamplingConfig> configs{config, config};
     DeviceBuffer d_configs = to_device(configs);
 
-    Tensor targets(d_targets.p, DType::I32, {columns, batch});
-    Tensor logits_tensor(d_logits.p, DType::BF16, {physical_rows, columns, batch});
-    Tensor draft_tensor(d_drafts.p, DType::I32, {k, batch});
-    Tensor extents(d_extents.p, DType::I32, {batch});
-    Tensor lengths(d_lengths.p, DType::I32, {batch});
-    Tensor anchors(d_anchors.p, DType::I32, {batch});
-    Tensor licensed(d_licensed.p, DType::I32, {columns, batch});
-    Tensor counts(d_counts.p, DType::I32, {batch});
-    Tensor accepted(d_accepted.p, DType::I32, {batch});
+    Tensor targets(d_targets.span(), DType::I32, {columns, batch});
+    Tensor logits_tensor(d_logits.span(), DType::BF16, {physical_rows, columns, batch});
+    Tensor draft_tensor(d_drafts.span(), DType::I32, {k, batch});
+    Tensor extents(d_extents.span(), DType::I32, {batch});
+    Tensor lengths(d_lengths.span(), DType::I32, {batch});
+    Tensor anchors(d_anchors.span(), DType::I32, {batch});
+    Tensor licensed(d_licensed.span(), DType::I32, {columns, batch});
+    Tensor counts(d_counts.span(), DType::I32, {batch});
+    Tensor accepted(d_accepted.span(), DType::I32, {batch});
     const std::size_t workspace_bytes =
         ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(token_domain, k, k, batch,
                                                                        batch);
-    WorkspaceArena workspace(workspace_bytes);
+    ninfer::DeviceBuffer workspace_storage(ninfer::test::cuda_environment().context.device(),
+                                           workspace_bytes);
+    MemoryArena workspace(workspace_storage.span());
     ops::speculative_accept_greedy_drafts(
         targets, logits_tensor, draft_tensor, extents, lengths, anchors, licensed, counts, accepted,
-        token_domain, static_cast<const ops::SamplingConfig*>(d_configs.p), workspace, nullptr);
+        token_domain, static_cast<const ops::SamplingConfig*>(d_configs.data()), workspace,
+        ninfer::test::cuda_environment().default_execution);
     cuda_synchronize();
 
     int failures = verify_exact("speculative sampling B=2 licensed",
@@ -1167,10 +1191,11 @@ int select_hidden_case(int rows, int columns, int accepted_value) {
     DeviceBuffer d_accepted = to_device<std::int32_t>({accepted_value});
     GuardedDeviceBuffer d_out(static_cast<std::size_t>(rows) * sizeof(std::uint16_t));
     d_out.fill(0xcd);
-    Tensor hidden_tensor(d_hidden.p, DType::BF16, {rows, columns});
-    Tensor accepted(d_accepted.p, DType::I32, {1});
-    Tensor out(d_out.data(), DType::BF16, {rows, 1});
-    ops::gather_bf16_batch_columns(hidden_tensor, accepted, out, nullptr);
+    Tensor hidden_tensor(d_hidden.span(), DType::BF16, {rows, columns});
+    Tensor accepted(d_accepted.span(), DType::I32, {1});
+    Tensor out(d_out.span(), DType::BF16, {rows, 1});
+    ops::gather_bf16_batch_columns(hidden_tensor, accepted, out,
+                                   ninfer::test::cuda_environment().default_execution);
     cuda_synchronize();
 
     const std::string label =
@@ -1191,17 +1216,22 @@ int batched_select_hidden_case(int width, int batch) {
     for (std::size_t i = 0; i < hidden.size(); ++i) hidden[i] = static_cast<std::uint16_t>(i * 257 + i / rows * 6113);
     std::vector<std::int32_t> selectors(batch);
     std::vector<std::uint16_t> expected(static_cast<std::size_t>(rows) * batch);
-    DeviceBuffer input = to_device(hidden), indices = to_device(selectors);
+    DeviceBuffer input   = to_device(hidden);
+    DeviceBuffer indices = to_device(selectors);
     GuardedDeviceBuffer output(expected.size() * sizeof(std::uint16_t));
     output.fill(0xcd);
-    Tensor h(input.p, DType::BF16, {rows, width, batch}), i(indices.p, DType::I32, {batch});
-    Tensor o(output.data(), DType::BF16, {rows, batch});
+    Tensor h(input.span(), DType::BF16, {rows, width, batch}),
+        i(indices.span(), DType::I32, {batch});
+    Tensor o(output.span(), DType::BF16, {rows, batch});
     DeviceContext context;
     cuda_synchronize();
-    const auto launch = [&] { ops::gather_bf16_batch_columns(h, i, o, context.stream); };
+    const auto launch = [&] { ops::gather_bf16_batch_columns(h, i, o, context.execution_view()); };
     DecodeGraphDefinition definition;
     DecodeGraphExecutable graph;
-    if (width == 16 && batch == 8) { definition.capture(context.stream, launch); graph.instantiate(definition); }
+    if (width == 16 && batch == 8) {
+        definition.capture(context.stream(), launch);
+        graph.instantiate(definition);
+    }
     int failures = 0;
     // Final commit N is positive here; a zero commit never issues this gather with selector -1.
     for (int phase = 0; phase < width; ++phase) {
@@ -1210,8 +1240,12 @@ int batched_select_hidden_case(int width, int batch) {
             std::copy_n(hidden.begin() + static_cast<std::size_t>(b * width + selectors[b]) * rows,
                          rows, expected.begin() + b * rows);
         }
-        CUDA_CHECK(cudaMemcpyAsync(indices.p, selectors.data(), indices.bytes, cudaMemcpyHostToDevice, context.stream));
-        if (graph.ready()) graph.launch(context.stream); else launch();
+        CUDA_CHECK(cudaMemcpyAsync(indices.data(), selectors.data(), indices.size(),
+                                   cudaMemcpyHostToDevice, context.stream()));
+        if (graph.ready())
+            graph.launch(context.stream());
+        else
+            launch();
         context.synchronize();
         failures += verify_exact("committed hidden N-1", read<std::uint16_t>(output, expected.size()), expected);
         failures += verify_exact("selectors unchanged", from_device<std::int32_t>(indices, batch), selectors);
@@ -1241,9 +1275,9 @@ int remap_case(int token_count) {
     DeviceBuffer d_map = to_device(id_map);
     GuardedDeviceBuffer d_proposals(proposals.size() * sizeof(std::int32_t));
     initialize(d_proposals, proposals);
-    Tensor proposal_tensor(d_proposals.data(), DType::I32, {token_count});
-    ops::remap_ids_inplace(proposal_tensor, static_cast<const std::int32_t*>(d_map.p),
-                                  map_size, nullptr);
+    Tensor proposal_tensor(d_proposals.span(), DType::I32, {token_count});
+    ops::remap_ids_inplace(proposal_tensor, static_cast<const std::int32_t*>(d_map.data()),
+                           map_size, ninfer::test::cuda_environment().default_execution);
     cuda_synchronize();
 
     const std::string label = "proposal remap T=" + std::to_string(token_count);

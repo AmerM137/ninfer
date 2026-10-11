@@ -78,7 +78,7 @@ void launch_small_band(const Tensor& x, const Weight& weight, std::span<const Te
         kTileLaunchers[(x.ne[1] - 17) / 8](x, weight, out, stream);
 }
 
-void launch_split(const Tensor& x, Weights weights, std::span<const Tensor> out, WorkspaceArena*,
+void launch_split(const Tensor& x, Weights weights, std::span<const Tensor> out, MemoryArena*,
                   cudaStream_t stream) {
     const auto& w = weights.first;
     if (x.ne[1] <= 48) return launch_small_band(x, w, out, stream);

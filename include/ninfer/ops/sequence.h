@@ -1,7 +1,7 @@
 #pragma once
 
+#include "core/device.h"
 #include "core/tensor.h"
-#include <cuda_runtime.h>
 #include <cstdint>
 
 namespace ninfer::ops {
@@ -23,7 +23,7 @@ namespace ninfer::ops {
  */
 void prepare_verify_inputs(const Tensor& anchors, const Tensor& drafts,
                            const Tensor& base_positions, const Tensor& current_extents,
-                           Tensor& verify_ids, Tensor& positions, cudaStream_t stream);
+                           Tensor& verify_ids, Tensor& positions, CudaExecutionView execution);
 
 /**
  * Prepare only the target verification ids when the caller already owns the matching position
@@ -31,7 +31,7 @@ void prepare_verify_inputs(const Tensor& anchors, const Tensor& drafts,
  * existing positions remain untouched.
  */
 void prepare_verify_ids(const Tensor& anchors, const Tensor& drafts, const Tensor& current_extents,
-                        Tensor& verify_ids, cudaStream_t stream);
+                        Tensor& verify_ids, CudaExecutionView execution);
 
 /**
  *   For T=K+1 and each row b with A=accepted[b], L=licensed_counts[b]:
@@ -59,7 +59,7 @@ void prepare_autoregressive_round(const Tensor& verify_ids, const Tensor& next_a
                                   const Tensor& rope_deltas, Tensor& alignment_ids,
                                   Tensor& next_extents, Tensor& ar_positions,
                                   Tensor& ar_rope_positions, Tensor& ar_valid_columns,
-                                  std::int32_t max_context, cudaStream_t stream);
+                                  std::int32_t max_context, CudaExecutionView execution);
 
 /**
  * Op: prepare a batch of finite anchor-and-mask query blocks.
@@ -81,7 +81,7 @@ void prepare_autoregressive_round(const Tensor& verify_ids, const Tensor& next_a
  */
 void prepare_masked_block(const Tensor& anchors, const Tensor& lengths, const Tensor& valid_columns,
                           std::int32_t mask_id, Tensor& ids, Tensor& positions,
-                          cudaStream_t stream);
+                          CudaExecutionView execution);
 
 /**
  * Prepare lane-owned BF16 prefixes as one compact ragged batch.
@@ -100,6 +100,6 @@ void prepare_masked_block(const Tensor& anchors, const Tensor& lengths, const Te
  */
 void prepare_ragged_prefix(const Tensor& source, const Tensor& lanes, const Tensor& starts,
                            const Tensor& ends, Tensor& destination, Tensor& positions,
-                           Tensor& counts, cudaStream_t stream);
+                           Tensor& counts, CudaExecutionView execution);
 
 } // namespace ninfer::ops

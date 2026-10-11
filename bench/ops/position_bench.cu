@@ -1,5 +1,6 @@
 // Exact small-T qualification benchmark for offset_i32_positions.
 #include "ninfer/ops/position.h"
+#include "core/buffer.h"
 #include "core/device.h"
 #include "op_measurement.cuh"
 
@@ -22,13 +23,14 @@ Result bench_cold_graph(const launch_fn& launch, double bytes, bench::L2FlushBuf
                         int warmup, int repeat) {
     cudaStream_t stream = nullptr;
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-    launch(stream);
+    const auto cuda = ninfer::bench::device_context().execution_view(stream);
+    launch(cuda);
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     cudaGraph_t graph    = nullptr;
     cudaGraphExec_t exec = nullptr;
     CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
-    launch(stream);
+    launch(cuda);
     CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
     CUDA_CHECK(cudaGraphInstantiate(&exec, graph, 0));
 
@@ -37,7 +39,7 @@ Result bench_cold_graph(const launch_fn& launch, double bytes, bench::L2FlushBuf
     CUDA_CHECK(cudaEventCreate(&begin));
     CUDA_CHECK(cudaEventCreate(&end));
     for (int i = 0; i < warmup; ++i) {
-        bench::flush_l2(flush, stream);
+        bench::flush_l2(flush, cuda);
         CUDA_CHECK(cudaGraphLaunch(exec, stream));
     }
     CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -45,7 +47,7 @@ Result bench_cold_graph(const launch_fn& launch, double bytes, bench::L2FlushBuf
     std::vector<double> samples;
     samples.reserve(static_cast<std::size_t>(repeat));
     for (int i = 0; i < repeat; ++i) {
-        bench::flush_l2(flush, stream);
+        bench::flush_l2(flush, cuda);
         CUDA_CHECK(cudaEventRecord(begin, stream));
         CUDA_CHECK(cudaGraphLaunch(exec, stream));
         CUDA_CHECK(cudaEventRecord(end, stream));
@@ -74,18 +76,20 @@ Result bench_cold_graph(const launch_fn& launch, double bytes, bench::L2FlushBuf
 void run(int tokens, bench::L2FlushBuffer* flush, int warmup, int repeat) {
     std::vector<std::int32_t> host(static_cast<std::size_t>(tokens));
     for (int i = 0; i < tokens; ++i) { host[static_cast<std::size_t>(i)] = 262144 - tokens + i; }
-    DeviceBuffer source(host.size() * sizeof(std::int32_t));
-    DeviceBuffer delta(sizeof(std::int32_t));
-    DeviceBuffer destination(host.size() * sizeof(std::int32_t));
+    DeviceBuffer source(ninfer::bench::device_context().device(),
+                        host.size() * sizeof(std::int32_t));
+    DeviceBuffer delta(ninfer::bench::device_context().device(), sizeof(std::int32_t));
+    DeviceBuffer destination(ninfer::bench::device_context().device(),
+                             host.size() * sizeof(std::int32_t));
     const std::int32_t delta_value = -17;
-    cudaMemcpy(source.p, host.data(), source.bytes, cudaMemcpyHostToDevice);
-    cudaMemcpy(delta.p, &delta_value, sizeof(delta_value), cudaMemcpyHostToDevice);
-    Tensor tsource(source.p, DType::I32, {tokens});
-    Tensor tdelta(delta.p, DType::I32, {1});
-    Tensor tdestination(destination.p, DType::I32, {tokens});
+    cudaMemcpy(source.data(), host.data(), source.size(), cudaMemcpyHostToDevice);
+    cudaMemcpy(delta.data(), &delta_value, sizeof(delta_value), cudaMemcpyHostToDevice);
+    Tensor tsource(source.span(), DType::I32, {tokens});
+    Tensor tdelta(delta.span(), DType::I32, {1});
+    Tensor tdestination(destination.span(), DType::I32, {tokens});
 
-    const auto launch = [&](cudaStream_t stream) {
-        ops::offset_i32_positions(tsource, tdelta, tdestination, stream);
+    const auto launch = [&](CudaExecutionView cuda) {
+        ops::offset_i32_positions(tsource, tdelta, tdestination, cuda);
     };
     const double bytes  = static_cast<double>(tokens * 2 + 1) * sizeof(std::int32_t);
     const Result result = flush == nullptr

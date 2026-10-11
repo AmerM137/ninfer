@@ -1,4 +1,5 @@
 #include "model_context_fixture.h"
+#include "core/buffer.h"
 
 #include "artifact/reader.h"
 #include "core/arena.h"
@@ -229,8 +230,8 @@ void measure_geometry(DeviceContext& device, const GeometryCase& fixture,
     const DeviceKVPagePoolLayout layout =
         plan_device_kv_page_pool(builder, DeviceKVPagePoolSpec{.page_group_count = physical_pages,
                                                                .geometry = fixture.geometry});
-    DeviceBuffer backing(builder.finish(256, "context-cost transfer fixture"));
-    DeviceKVPagePool pool(DeviceSpan{backing.p, backing.bytes}, layout);
+    DeviceBuffer backing(device.device(), builder.finish(256, "context-cost transfer fixture"));
+    DeviceKVPagePool pool(backing.span(), layout);
     auto reservation = pool.reserve(physical_pages);
     if (!reservation) { throw std::runtime_error("failed to reserve transfer fixture pages"); }
     std::vector<DeviceKVPageLease> leases;
@@ -239,7 +240,7 @@ void measure_geometry(DeviceContext& device, const GeometryCase& fixture,
     std::vector<DeviceKVPageHandle> handles;
     handles.reserve(leases.size());
     for (const DeviceKVPageLease& lease : leases) { handles.push_back(lease.handle()); }
-    pool.zero_pages(handles, device.transfer_stream);
+    pool.zero_pages(handles, device.transfer_stream());
 
     const std::size_t host_bytes =
         checked_size_mul(host_layout.page_stride, region_pages, "transfer fixture Host bytes");
@@ -252,28 +253,28 @@ void measure_geometry(DeviceContext& device, const GeometryCase& fixture,
     fill_transfer_payload(host_view.data(), host_bytes, 0x7ac5d3e91b2468f0ULL);
     pool.copy_from_host(HostKVAllocationConstView(host_view),
                         std::span<const DeviceKVPageHandle>(handles).first(region_pages),
-                        device.transfer_stream);
+                        device.transfer_stream());
     pool.copy_from_host(HostKVAllocationConstView(host_view),
                         std::span<const DeviceKVPageHandle>(handles).subspan(region_pages),
-                        device.transfer_stream);
-    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+                        device.transfer_stream());
+    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream()));
 
-    CudaEventTimer timer(device, device.transfer_stream);
+    CudaEventTimer timer(device, device.transfer_stream());
     const auto run = [&](const TransferCase& test) {
         TransferWork work;
         timer.start();
         if (test.direction == TransferDirection::DeviceToHost) {
             const auto source = select_runs(handles, 0, test.pages, test.runs);
-            work =
-                pool.copy_to_host(source, host_view.subview(0, test.pages), device.transfer_stream);
+            work              = pool.copy_to_host(source, host_view.subview(0, test.pages),
+                                                  device.transfer_stream());
         } else if (test.direction == TransferDirection::HostToDevice) {
             const auto destination = select_runs(handles, region_pages, test.pages, test.runs);
             work = pool.copy_from_host(HostKVAllocationConstView(host_view.subview(0, test.pages)),
-                                       destination, device.transfer_stream);
+                                       destination, device.transfer_stream());
         } else {
             for (std::uint32_t page = 0; page < test.pages; ++page) {
                 const auto part = pool.copy_page(handles[page], handles[region_pages + page],
-                                                 device.transfer_stream);
+                                                 device.transfer_stream());
                 work.payload_bytes += part.payload_bytes;
                 work.copy_operations += part.copy_operations;
             }
@@ -333,21 +334,21 @@ void measure_contiguous_d2d(DeviceContext& device, const MeasurementOptions& opt
 
     PinnedHostBuffer host_source(maximum_bytes);
     fill_transfer_payload(host_source.data(), host_source.size(), 0xb3f71d6c4a928e05ULL);
-    DeviceBuffer source(maximum_bytes);
-    DeviceBuffer destination(maximum_bytes);
+    DeviceBuffer source(device.device(), maximum_bytes);
+    DeviceBuffer destination(device.device(), maximum_bytes);
     source.copy_from_host(host_source.data(), host_source.size());
     destination.fill(0xa5);
 
-    CudaEventTimer timer(device, device.transfer_stream);
+    CudaEventTimer timer(device, device.transfer_stream());
     const auto run = [&](const ContiguousCase& test) {
         const std::size_t operation_bytes = test.payload_bytes / test.copy_operations;
         timer.start();
         for (std::uint32_t operation = 0; operation < test.copy_operations; ++operation) {
             const std::size_t offset = static_cast<std::size_t>(operation) * operation_bytes;
-            CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(destination.p) + offset,
-                                       static_cast<const std::byte*>(source.p) + offset,
+            CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(destination.data()) + offset,
+                                       static_cast<const std::byte*>(source.data()) + offset,
                                        operation_bytes, cudaMemcpyDeviceToDevice,
-                                       device.transfer_stream));
+                                       device.transfer_stream()));
         }
         return elapsed_ns(timer.stop_ms());
     };

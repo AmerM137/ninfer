@@ -239,6 +239,7 @@ WeightRowPlanes weight_row_planes(const WeightRegion& region) {
         throw std::invalid_argument("row view requires resident complete logical rows");
     }
     WeightRowPlanes out;
+    out.device          = parent.device;
     out.row_begin       = region.begin / g.shape[1];
     out.row_count       = (region.end - region.begin) / g.shape[1];
     out.code_row_bytes  = g.code_bytes_per_row;
@@ -263,8 +264,8 @@ Tensor weight_tensor(const WeightView& view, std::initializer_list<std::int32_t>
         throw std::invalid_argument("direct tensor requires a resident contiguous weight");
     }
     const auto offset = mul(region.begin, word_bytes(g.format));
-    Tensor out(const_cast<std::byte*>(region.parent->data + offset), direct_dtype(g.format),
-               internal_shape);
+    Tensor out(const_cast<std::byte*>(region.parent->data + offset), region.parent->device,
+               direct_dtype(g.format), internal_shape);
     if (static_cast<std::uint64_t>(out.numel()) != region.end - region.begin) {
         throw std::invalid_argument("native tensor shape differs from its logical weight");
     }
@@ -278,6 +279,7 @@ Weight native_weight(const WeightView& view, float input_divisor) {
         throw std::invalid_argument("native Weight requires a resident logical matrix");
     }
     Weight out;
+    out.device           = region.parent->device;
     out.payload          = region.parent->data;
     out.payload_bytes    = g.bytes;
     out.high_plane_bytes = g.high_bytes;

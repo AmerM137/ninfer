@@ -7,7 +7,7 @@
 
 namespace ninfer::ops::detail {
 void fp8_kv_tiled_attention(const CausalAttentionOperands& p, Fp8KvReadView cache,
-                            CausalKvPartition partition, WorkspaceArena& workspace,
+                            CausalKvPartition partition, MemoryArena& workspace,
                             cudaStream_t stream) {
     auto scope = workspace.scope();
     const auto partial =

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "cuda_fixture.h"
+#include "core/buffer.h"
 #include "fixture.h"
 #include "ninfer/ops/ple.h"
 
@@ -14,7 +16,9 @@ struct ConvFixture {
     int tokens, batch, capacity, slots;
     Words residual, gated, kernel, norm, history, records, updated, normalized;
     std::vector<int> valid, source, offset;
-    DeviceBuffer d_valid, d_source, d_offset;
+    DeviceBuffer d_valid;
+    DeviceBuffer d_source;
+    DeviceBuffer d_offset;
     Tensor y;
     bool inplace;
 
@@ -24,17 +28,19 @@ struct ConvFixture {
           history({D, 9, slots}, layout == 1, column_strides(9, slots, layout)),
           records({D, capacity, b}, layout == 1, column_strides(capacity, b, layout)),
           updated({H, C, t, b}), normalized({H, C, t, b}), valid(b), source(b), offset(b),
-          d_valid(b * 4), d_source(b * 4), d_offset(b * 4),
+          d_valid(ninfer::test::cuda_environment().context.device(), b * 4),
+          d_source(ninfer::test::cuda_environment().context.device(), b * 4),
+          d_offset(ninfer::test::cuda_environment().context.device(), b * 4),
           y(in_place ? residual.tensor : updated.tensor), inplace(in_place) {}
 
-    ops::PleBatchView batch_view() const { return {Tensor(d_valid.p, DType::I32, {batch})}; }
+    ops::PleBatchView batch_view() { return {Tensor(d_valid.span(), DType::I32, {batch})}; }
 
-    ops::PleConvStateView state_view() const {
-        return {history.tensor, Tensor(d_source.p, DType::I32, {batch})};
+    ops::PleConvStateView state_view() {
+        return {history.tensor, Tensor(d_source.span(), DType::I32, {batch})};
     }
 
-    ops::PleConvRecordWindowView record_view() const {
-        return {records.tensor, Tensor(d_offset.p, DType::I32, {batch})};
+    ops::PleConvRecordWindowView record_view() {
+        return {records.tensor, Tensor(d_offset.span(), DType::I32, {batch})};
     }
 
     void prepare(int phase = 0, bool masked = true, float scale = 1.f) {
@@ -77,7 +83,7 @@ struct ConvFixture {
         cuda_synchronize();
     }
 
-    void launch(bool with_norm, DeviceExecutionView execution) {
+    void launch(bool with_norm, CudaExecutionView execution) {
         if (with_norm)
             ops::ple_conv_add_norm(residual.tensor, gated.tensor, kernel.tensor, batch_view(),
                                    state_view(), record_view(), norm.tensor, epsilon, y,

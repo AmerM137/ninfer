@@ -28,13 +28,22 @@ void require_scalar(const Tensor& tensor, DType dtype, const char* name) {
 
 } // namespace
 
-void set_i32_scalar(Tensor& destination, std::int32_t value, cudaStream_t stream) {
+void set_i32_scalar(Tensor& destination, std::int32_t value, CudaExecutionView execution) {
+    if (destination.device != execution.device()) {
+        throw std::invalid_argument("set_i32_scalar: operands must belong to the execution device");
+    }
+    const auto stream = execution.stream();
     require_scalar(destination, DType::I32, "set_i32_scalar destination");
     set_i32_scalar_kernel<<<1, 1, 0, stream>>>(static_cast<std::int32_t*>(destination.data), value);
     CUDA_CHECK(cudaGetLastError());
 }
 
-void assign_i32_scalar(const Tensor& source, Tensor& destination, cudaStream_t stream) {
+void assign_i32_scalar(const Tensor& source, Tensor& destination, CudaExecutionView execution) {
+    if (source.device != execution.device() || destination.device != execution.device()) {
+        throw std::invalid_argument(
+            "assign_i32_scalar: operands must belong to the execution device");
+    }
+    const auto stream = execution.stream();
     require_scalar(source, DType::I32, "assign_i32_scalar source");
     require_scalar(destination, DType::I32, "assign_i32_scalar destination");
     if (source.data == destination.data) {
@@ -45,7 +54,13 @@ void assign_i32_scalar(const Tensor& source, Tensor& destination, cudaStream_t s
 }
 
 void add_i32_scalars(const Tensor& lhs, const Tensor& rhs, Tensor& destination,
-                     cudaStream_t stream) {
+                     CudaExecutionView execution) {
+    if (lhs.device != execution.device() || rhs.device != execution.device() ||
+        destination.device != execution.device()) {
+        throw std::invalid_argument(
+            "add_i32_scalars: operands must belong to the execution device");
+    }
+    const auto stream = execution.stream();
     require_scalar(lhs, DType::I32, "add_i32_scalars lhs");
     require_scalar(rhs, DType::I32, "add_i32_scalars rhs");
     require_scalar(destination, DType::I32, "add_i32_scalars destination");
@@ -58,13 +73,23 @@ void add_i32_scalars(const Tensor& lhs, const Tensor& rhs, Tensor& destination,
     CUDA_CHECK(cudaGetLastError());
 }
 
-void increment_i32_scalar(Tensor& scalar, cudaStream_t stream) {
+void increment_i32_scalar(Tensor& scalar, CudaExecutionView execution) {
+    if (scalar.device != execution.device()) {
+        throw std::invalid_argument(
+            "increment_i32_scalar: operands must belong to the execution device");
+    }
+    const auto stream = execution.stream();
     require_scalar(scalar, DType::I32, "increment_i32_scalar scalar");
     increment_i32_scalar_kernel<<<1, 1, 0, stream>>>(static_cast<std::int32_t*>(scalar.data));
     CUDA_CHECK(cudaGetLastError());
 }
 
-void increment_i64_scalar(Tensor& scalar, cudaStream_t stream) {
+void increment_i64_scalar(Tensor& scalar, CudaExecutionView execution) {
+    if (scalar.device != execution.device()) {
+        throw std::invalid_argument(
+            "increment_i64_scalar: operands must belong to the execution device");
+    }
+    const auto stream = execution.stream();
     require_scalar(scalar, DType::I64, "increment_i64_scalar scalar");
     increment_i64_scalar_kernel<<<1, 1, 0, stream>>>(static_cast<std::int64_t*>(scalar.data));
     CUDA_CHECK(cudaGetLastError());

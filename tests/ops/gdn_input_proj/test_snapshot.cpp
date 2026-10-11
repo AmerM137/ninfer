@@ -1,4 +1,6 @@
 #include "core/weight.h"
+#include "cuda_fixture.h"
+#include "core/buffer.h"
 #include "core/device.h"
 #include "ninfer/ops/gdn_input_proj.h"
 
@@ -336,18 +338,20 @@ int run_batched_case(std::string_view label, std::int32_t hidden, std::int32_t v
     GuardedBf16Tensor value(value_rows, aggregate_columns);
     GuardedBf16Tensor z(z_rows, aggregate_columns);
 
-    Tensor x(device_activation.p, DType::BF16, {hidden, width, batch});
-    Tensor conv(device_conv_weight.p, DType::BF16, {channels, 4});
-    Tensor conv_state(state.data(), DType::BF16, {channels, 3, slots});
+    Tensor x(device_activation.span(), DType::BF16, {hidden, width, batch});
+    Tensor conv(device_conv_weight.span(), DType::BF16, {channels, 4});
+    Tensor conv_state(state.span(), DType::BF16, {channels, 3, slots});
     Tensor valid;
-    if (!valid_columns.empty()) { valid = Tensor(device_valid.p, DType::I32, {batch}); }
-    Tensor initial(device_initial.p, DType::I32, {batch});
-    Tensor snapshot_base(device_snapshot_base.p, DType::I32, {batch});
-    Tensor q(query.data(), DType::BF16, {kQueryRows, width, batch});
-    Tensor k(key.data(), DType::BF16, {kKeyRows, width, batch});
-    Tensor v(value.data(), DType::BF16, {value_rows, width, batch});
-    Tensor z_output(z.data(), DType::BF16, {z_rows, width, batch});
-    WorkspaceArena workspace(std::max<std::size_t>(1, workspace_bytes));
+    if (!valid_columns.empty()) { valid = Tensor(device_valid.span(), DType::I32, {batch}); }
+    Tensor initial(device_initial.span(), DType::I32, {batch});
+    Tensor snapshot_base(device_snapshot_base.span(), DType::I32, {batch});
+    Tensor q(query.span(), DType::BF16, {kQueryRows, width, batch});
+    Tensor k(key.span(), DType::BF16, {kKeyRows, width, batch});
+    Tensor v(value.span(), DType::BF16, {value_rows, width, batch});
+    Tensor z_output(z.span(), DType::BF16, {z_rows, width, batch});
+    ninfer::DeviceBuffer workspace_storage(ninfer::test::cuda_environment().context.device(),
+                                           std::max<std::size_t>(1, workspace_bytes));
+    MemoryArena workspace(workspace_storage.span());
 
     launch(x, conv, conv_state, valid, initial, snapshot_base, q, k, v, z_output, workspace);
     cuda_synchronize();
@@ -480,22 +484,25 @@ int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& value_z_we
     GuardedBf16Tensor key(kKeyRows, tokens);
     GuardedBf16Tensor value(kValueRows, tokens);
     GuardedBf16Tensor z(kZRows, tokens);
-    Tensor x(device_activation.p, DType::BF16, {kHidden, tokens});
-    Tensor conv(device_conv_weight.p, DType::BF16, {kChannels, 4});
-    Tensor conv_state(state.data(), DType::BF16, {kChannels, 3, slots});
-    Tensor initial(device_initial.p, DType::I32, {1});
-    Tensor snapshot_base(device_snapshot_base.p, DType::I32, {1});
+    Tensor x(device_activation.span(), DType::BF16, {kHidden, tokens});
+    Tensor conv(device_conv_weight.span(), DType::BF16, {kChannels, 4});
+    Tensor conv_state(state.span(), DType::BF16, {kChannels, 3, slots});
+    Tensor initial(device_initial.span(), DType::I32, {1});
+    Tensor snapshot_base(device_snapshot_base.span(), DType::I32, {1});
     Tensor q                          = query.tensor();
     Tensor k                          = key.tensor();
     Tensor v                          = value.tensor();
     Tensor z_output                   = z.tensor();
     const std::size_t workspace_bytes = ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
         ops::PairedProjectionWeights{query_key.view(), value_z_weight.view()}, 1, tokens, tokens);
-    WorkspaceArena workspace(std::max<std::size_t>(1, workspace_bytes));
+    ninfer::DeviceBuffer workspace_storage(ninfer::test::cuda_environment().context.device(),
+                                           std::max<std::size_t>(1, workspace_bytes));
+    MemoryArena workspace(workspace_storage.span());
 
     ops::gdn_input_proj_conv_snapshot(
         x, ops::PairedProjectionWeights{query_key.view(), value_z_weight.view()}, conv,
-        {conv_state, initial, snapshot_base}, Tensor{}, {q, k, v, z_output}, workspace, nullptr);
+        {conv_state, initial, snapshot_base}, Tensor{}, {q, k, v, z_output}, workspace,
+        ninfer::test::cuda_environment().default_execution);
     cuda_synchronize();
 
     const std::size_t initial_base = static_cast<std::size_t>(initial_slot) * 3 * kChannels;
@@ -609,10 +616,11 @@ int run_q4_q5() {
         },
         [&](const Tensor& x, const Tensor& conv, Tensor& state, const Tensor& valid,
             const Tensor& initial, const Tensor& snapshot_base, Tensor& q, Tensor& k, Tensor& v,
-            Tensor& z, WorkspaceArena& workspace) {
+            Tensor& z, MemoryArena& workspace) {
             ops::gdn_input_proj_conv_snapshot(
                 x, ops::PairedProjectionWeights{query_key.view(), value_z_weight.view()}, conv,
-                {state, initial, snapshot_base}, valid, {q, k, v, z}, workspace, nullptr);
+                {state, initial, snapshot_base}, valid, {q, k, v, z}, workspace,
+                ninfer::test::cuda_environment().default_execution);
         });
     // The batched organisations whose aggregate column count is 10 reach the same Q5 parent
     // mechanism as the dense B=1 W=10 case above, through the seam of a multi-request call: B=2/W=5
@@ -644,10 +652,11 @@ int run_q4_q5() {
         },
         [&](const Tensor& x, const Tensor& conv, Tensor& state, const Tensor& valid,
             const Tensor& initial, const Tensor& snapshot_base, Tensor& q, Tensor& k, Tensor& v,
-            Tensor& z, WorkspaceArena& workspace) {
+            Tensor& z, MemoryArena& workspace) {
             ops::gdn_input_proj_conv_snapshot(
                 x, ops::PairedProjectionWeights{query_key.view(), value_z_weight.view()}, conv,
-                {state, initial, snapshot_base}, valid, {q, k, v, z}, workspace, nullptr);
+                {state, initial, snapshot_base}, valid, {q, k, v, z}, workspace,
+                ninfer::test::cuda_environment().default_execution);
         });
 
     // One batched case with mixed valid prefixes whose aggregate column count is 8 (4 x 2): two
@@ -681,10 +690,11 @@ int run_q4_q5() {
         },
         [&](const Tensor& x, const Tensor& conv, Tensor& state, const Tensor& valid,
             const Tensor& initial, const Tensor& snapshot_base, Tensor& q, Tensor& k, Tensor& v,
-            Tensor& z, WorkspaceArena& workspace) {
+            Tensor& z, MemoryArena& workspace) {
             ops::gdn_input_proj_conv_snapshot(
                 x, ops::PairedProjectionWeights{query_key.view(), value_z_weight.view()}, conv,
-                {state, initial, snapshot_base}, valid, {q, k, v, z}, workspace, nullptr);
+                {state, initial, snapshot_base}, valid, {q, k, v, z}, workspace,
+                ninfer::test::cuda_environment().default_execution);
         });
     // One batched case with mixed valid prefixes whose aggregate column count is 48 (16 x 3). The
     // projection is routed once for the whole call from that aggregate column count - so this case
@@ -717,10 +727,11 @@ int run_q4_q5() {
         },
         [&](const Tensor& x, const Tensor& conv, Tensor& state, const Tensor& valid,
             const Tensor& initial, const Tensor& snapshot_base, Tensor& q, Tensor& k, Tensor& v,
-            Tensor& z, WorkspaceArena& workspace) {
+            Tensor& z, MemoryArena& workspace) {
             ops::gdn_input_proj_conv_snapshot(
                 x, ops::PairedProjectionWeights{query_key.view(), value_z_weight.view()}, conv,
-                {state, initial, snapshot_base}, valid, {q, k, v, z}, workspace, nullptr);
+                {state, initial, snapshot_base}, valid, {q, k, v, z}, workspace,
+                ninfer::test::cuda_environment().default_execution);
         });
     failures += query_key.verify_preserved("batched Q4/Q5 query/key weight");
     failures += value_z_weight.verify_preserved("batched Q4/Q5 value/z weight");
@@ -757,23 +768,25 @@ int run_q8_case(DevicePackedWeight& parent, std::int32_t tokens, std::int32_t in
     GuardedBf16Tensor key(kKeyRows, tokens);
     GuardedBf16Tensor value(kValueRows, tokens);
     GuardedBf16Tensor z(kZRows, tokens);
-    Tensor x(device_activation.p, DType::BF16, {kHidden, tokens});
-    Tensor conv(device_conv_weight.p, DType::BF16, {kChannels, 4});
-    Tensor conv_state(state.data(), DType::BF16, {kChannels, 3, slots});
-    Tensor initial(device_initial.p, DType::I32, {1});
-    Tensor snapshot_base(device_snapshot_base.p, DType::I32, {1});
+    Tensor x(device_activation.span(), DType::BF16, {kHidden, tokens});
+    Tensor conv(device_conv_weight.span(), DType::BF16, {kChannels, 4});
+    Tensor conv_state(state.span(), DType::BF16, {kChannels, 3, slots});
+    Tensor initial(device_initial.span(), DType::I32, {1});
+    Tensor snapshot_base(device_snapshot_base.span(), DType::I32, {1});
     Tensor q                          = query.tensor();
     Tensor k                          = key.tensor();
     Tensor v                          = value.tensor();
     Tensor z_output                   = z.tensor();
     const std::size_t workspace_bytes = ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
         ops::SingleProjectionWeight{parent.view(), ops::LinearPolicy::A16Only}, 1, tokens, tokens);
-    WorkspaceArena workspace(std::max<std::size_t>(1, workspace_bytes));
+    ninfer::DeviceBuffer workspace_storage(ninfer::test::cuda_environment().context.device(),
+                                           std::max<std::size_t>(1, workspace_bytes));
+    MemoryArena workspace(workspace_storage.span());
 
-    const auto launch = [&](cudaStream_t stream) {
+    const auto launch = [&](CudaExecutionView cuda) {
         ops::gdn_input_proj_conv_snapshot(
             x, ops::SingleProjectionWeight{parent.view(), ops::LinearPolicy::A16Only}, conv,
-            {conv_state, initial, snapshot_base}, Tensor{}, {q, k, v, z_output}, workspace, stream);
+            {conv_state, initial, snapshot_base}, Tensor{}, {q, k, v, z_output}, workspace, cuda);
     };
     if (graph) {
         cudaStream_t stream;
@@ -781,8 +794,10 @@ int run_q8_case(DevicePackedWeight& parent, std::int32_t tokens, std::int32_t in
         cudaGraphExec_t executable;
         cuda_synchronize();
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+        const auto stream_execution =
+            ninfer::test::cuda_environment().context.execution_view(stream);
         CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
-        launch(stream);
+        launch(stream_execution);
         CUDA_CHECK(cudaStreamEndCapture(stream, &captured));
         CUDA_CHECK(cudaGraphInstantiate(&executable, captured, nullptr, nullptr, 0));
         CUDA_CHECK(cudaGraphLaunch(executable, stream));
@@ -792,15 +807,15 @@ int run_q8_case(DevicePackedWeight& parent, std::int32_t tokens, std::int32_t in
                                    cudaMemcpyHostToDevice, stream));
         activation      = make_bf16_activation(kHidden, tokens, 1701U + tokens);
         activation_bits = bf16_bits(activation);
-        CUDA_CHECK(cudaMemcpyAsync(device_activation.p, activation_bits.data(),
-                                   device_activation.bytes, cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(device_activation.data(), activation_bits.data(),
+                                   device_activation.size(), cudaMemcpyHostToDevice, stream));
         CUDA_CHECK(cudaGraphLaunch(executable, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
         CUDA_CHECK(cudaGraphExecDestroy(executable));
         CUDA_CHECK(cudaGraphDestroy(captured));
         CUDA_CHECK(cudaStreamDestroy(stream));
     } else {
-        launch(nullptr);
+        launch(cuda_environment().default_execution);
         cuda_synchronize();
     }
 
@@ -889,10 +904,11 @@ int run_q8(std::int32_t hidden = 2048) {
                 },
                 [&](const Tensor& x, const Tensor& conv, Tensor& state, const Tensor& valid,
                     const Tensor& initial, const Tensor& bases, Tensor& q, Tensor& k, Tensor& v,
-                    Tensor& z, WorkspaceArena& workspace) {
+                    Tensor& z, MemoryArena& workspace) {
                     ops::gdn_input_proj_conv_snapshot(
                         x, ops::SingleProjectionWeight{parent.view(), ops::LinearPolicy::A16Only},
-                        conv, {state, initial, bases}, valid, {q, k, v, z}, workspace, nullptr);
+                        conv, {state, initial, bases}, valid, {q, k, v, z}, workspace,
+                        ninfer::test::cuda_environment().default_execution);
                 });
         }
     }
@@ -929,22 +945,25 @@ int run_nvfp4_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearP
     GuardedBf16Tensor key(kKeyRows, tokens);
     GuardedBf16Tensor value(kValueRows, tokens);
     GuardedBf16Tensor z(kZRows, tokens);
-    Tensor x(device_activation.p, DType::BF16, {kHidden, tokens});
-    Tensor conv(device_conv_weight.p, DType::BF16, {kChannels, 4});
-    Tensor conv_state(state.data(), DType::BF16, {kChannels, 3, slots});
-    Tensor initial(device_initial.p, DType::I32, {1});
-    Tensor snapshot_base(device_snapshot_base.p, DType::I32, {1});
+    Tensor x(device_activation.span(), DType::BF16, {kHidden, tokens});
+    Tensor conv(device_conv_weight.span(), DType::BF16, {kChannels, 4});
+    Tensor conv_state(state.span(), DType::BF16, {kChannels, 3, slots});
+    Tensor initial(device_initial.span(), DType::I32, {1});
+    Tensor snapshot_base(device_snapshot_base.span(), DType::I32, {1});
     Tensor q                          = query.tensor();
     Tensor k                          = key.tensor();
     Tensor v                          = value.tensor();
     Tensor z_output                   = z.tensor();
     const std::size_t workspace_bytes = ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
         ops::SingleProjectionWeight{parent.view(), policy}, 1, tokens, tokens);
-    WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
+    ninfer::DeviceBuffer workspace_storage(ninfer::test::cuda_environment().context.device(),
+                                           std::max<std::size_t>(256, workspace_bytes));
+    MemoryArena workspace(workspace_storage.span());
 
     ops::gdn_input_proj_conv_snapshot(x, ops::SingleProjectionWeight{parent.view(), policy}, conv,
                                       {conv_state, initial, snapshot_base}, Tensor{},
-                                      {q, k, v, z_output}, workspace, nullptr);
+                                      {q, k, v, z_output}, workspace,
+                                      ninfer::test::cuda_environment().default_execution);
     cuda_synchronize();
 
     const std::size_t initial_base = static_cast<std::size_t>(initial_slot) * 3 * kChannels;
@@ -1033,10 +1052,11 @@ int run_nvfp4() {
         },
         [&](const Tensor& x, const Tensor& conv, Tensor& state, const Tensor& valid,
             const Tensor& initial, const Tensor& snapshot_base, Tensor& q, Tensor& k, Tensor& v,
-            Tensor& z, WorkspaceArena& workspace) {
+            Tensor& z, MemoryArena& workspace) {
             ops::gdn_input_proj_conv_snapshot(
                 x, ops::SingleProjectionWeight{parent.view(), ops::LinearPolicy::AllowA4}, conv,
-                {state, initial, snapshot_base}, valid, {q, k, v, z}, workspace, nullptr);
+                {state, initial, snapshot_base}, valid, {q, k, v, z}, workspace,
+                ninfer::test::cuda_environment().default_execution);
         });
     failures += parent.verify_preserved("batched NVFP4 parent weight");
     return failures;
@@ -1074,29 +1094,32 @@ int run_fp8_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearPol
     GuardedBf16Tensor key(kKeyRows, tokens);
     GuardedBf16Tensor value(kValueRows, tokens);
     GuardedBf16Tensor z(kZRows, tokens);
-    Tensor x(device_activation.p, DType::BF16, {kHidden, tokens});
-    Tensor conv(device_conv_weight.p, DType::BF16, {kChannels, 4});
-    Tensor conv_state(state.data(), DType::BF16, {kChannels, 3, slots});
-    Tensor initial(device_initial.p, DType::I32, {1});
+    Tensor x(device_activation.span(), DType::BF16, {kHidden, tokens});
+    Tensor conv(device_conv_weight.span(), DType::BF16, {kChannels, 4});
+    Tensor conv_state(state.span(), DType::BF16, {kChannels, 3, slots});
+    Tensor initial(device_initial.span(), DType::I32, {1});
     Tensor snapshot_base =
-        shared_state_selectors ? initial : Tensor(device_snapshot_base.p, DType::I32, {1});
+        shared_state_selectors ? initial : Tensor(device_snapshot_base.span(), DType::I32, {1});
     Tensor q                          = query.tensor();
     Tensor k                          = key.tensor();
     Tensor v                          = value.tensor();
     Tensor z_output                   = z.tensor();
     const std::size_t workspace_bytes = ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
         ops::SingleProjectionWeight{parent.view(), policy}, 1, tokens, tokens);
-    WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
+    ninfer::DeviceBuffer workspace_storage(ninfer::test::cuda_environment().context.device(),
+                                           std::max<std::size_t>(256, workspace_bytes));
+    MemoryArena workspace(workspace_storage.span());
 
     if (convenience) {
         ops::gdn_input_proj_conv_snapshot(
             x, ops::SingleProjectionWeight{parent.view(), ops::LinearPolicy::A16Only}, conv,
             {conv_state, initial, snapshot_base}, Tensor{}, {q, k, v, z_output}, workspace,
-            nullptr);
+            ninfer::test::cuda_environment().default_execution);
     } else {
         ops::gdn_input_proj_conv_snapshot(x, ops::SingleProjectionWeight{parent.view(), policy},
                                           conv, {conv_state, initial, snapshot_base}, Tensor{},
-                                          {q, k, v, z_output}, workspace, nullptr);
+                                          {q, k, v, z_output}, workspace,
+                                          ninfer::test::cuda_environment().default_execution);
     }
     cuda_synchronize();
 
@@ -1198,10 +1221,11 @@ int run_fp8() {
             },
             [&](const Tensor& x, const Tensor& conv, Tensor& state, const Tensor& valid,
                 const Tensor& initial, const Tensor& snapshot_base, Tensor& q, Tensor& k, Tensor& v,
-                Tensor& z, WorkspaceArena& workspace) {
+                Tensor& z, MemoryArena& workspace) {
                 ops::gdn_input_proj_conv_snapshot(
                     x, ops::SingleProjectionWeight{parent.view(), ops::LinearPolicy::AllowA8}, conv,
-                    {state, initial, snapshot_base}, valid, {q, k, v, z}, workspace, nullptr);
+                    {state, initial, snapshot_base}, valid, {q, k, v, z}, workspace,
+                    ninfer::test::cuda_environment().default_execution);
             });
     };
     failures += run_batched(4, 2, {4, 2}, 937U);

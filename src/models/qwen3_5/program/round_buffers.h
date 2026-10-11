@@ -183,8 +183,8 @@ struct RoundStateLayout {
 };
 
 struct OrdinaryDecodeState {
-    DeviceSpan ingress;
-    DeviceSpan egress;
+    MemorySpan ingress;
+    MemorySpan egress;
     Tensor tokens;
     Tensor cache_positions;
     Tensor rope_positions;
@@ -197,7 +197,7 @@ struct OrdinaryDecodeState {
     Tensor hidden;
 
     OrdinaryDecodeState() = default;
-    OrdinaryDecodeState(DeviceSpan backing, const OrdinaryDecodeStateLayout& layout,
+    OrdinaryDecodeState(MemorySpan backing, const OrdinaryDecodeStateLayout& layout,
                         std::uint32_t batch_capacity);
 };
 
@@ -216,11 +216,11 @@ struct MtpPrefillState {
     Tensor target_positions;
 
     MtpPrefillState() = default;
-    MtpPrefillState(DeviceSpan backing, const MtpPrefillStateLayout& layout);
+    MtpPrefillState(MemorySpan backing, const MtpPrefillStateLayout& layout);
 };
 
 struct DFlashPrefillState {
-    DeviceSpan ingress;
+    MemorySpan ingress;
     Tensor append_count;
     Tensor state_destination_slot;
     Tensor full_kv_table_row;
@@ -228,12 +228,12 @@ struct DFlashPrefillState {
     Tensor local_append_count;
 
     DFlashPrefillState() = default;
-    DFlashPrefillState(DeviceSpan backing, const DFlashPrefillStateLayout& layout);
+    DFlashPrefillState(MemorySpan backing, const DFlashPrefillStateLayout& layout);
 };
 
 struct MtpDecodeState {
-    DeviceSpan ingress;
-    DeviceSpan egress;
+    MemorySpan ingress;
+    MemorySpan egress;
     Tensor anchors;
     Tensor base_frontiers;
     Tensor remaining_budgets;
@@ -268,13 +268,13 @@ struct MtpDecodeState {
     Tensor ar_valid_columns;
 
     MtpDecodeState() = default;
-    MtpDecodeState(DeviceSpan backing, const MtpDecodeStateLayout& layout,
+    MtpDecodeState(MemorySpan backing, const MtpDecodeStateLayout& layout,
                    std::uint32_t batch_capacity, std::uint32_t draft_window);
 };
 
 struct DFlashDecodeState {
-    DeviceSpan ingress;
-    DeviceSpan egress;
+    MemorySpan ingress;
+    MemorySpan egress;
     Tensor anchors;
     Tensor execution_frontiers;
     Tensor context_frontiers;
@@ -306,7 +306,7 @@ struct DFlashDecodeState {
     Tensor target_continuation_hidden;
 
     DFlashDecodeState() = default;
-    DFlashDecodeState(DeviceSpan backing, const DFlashDecodeStateLayout& layout,
+    DFlashDecodeState(MemorySpan backing, const DFlashDecodeStateLayout& layout,
                       std::uint32_t batch_capacity, std::uint32_t draft_window);
 };
 
@@ -325,7 +325,7 @@ struct RoundState {
     std::optional<DFlashDecodeState> dflash_decode;
 
     RoundState() = default;
-    RoundState(DeviceSpan backing, const RoundStateLayout& layout);
+    RoundState(MemorySpan backing, const RoundStateLayout& layout);
 };
 
 } // namespace ninfer::models::qwen3_5

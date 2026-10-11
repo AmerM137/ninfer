@@ -3,6 +3,5 @@
 #include "ops/gated_residual/mix/workspace.h"
 
 namespace ninfer::ops::detail::hc::mix {
-void launch(Kind kind, Operands operands, Plan plan, Scratch scratch,
-            DeviceExecutionView execution);
+void launch(Kind kind, Operands operands, Plan plan, Scratch scratch, CudaExecutionView execution);
 } // namespace ninfer::ops::detail::hc::mix
