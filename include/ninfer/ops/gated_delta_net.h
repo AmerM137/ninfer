@@ -34,7 +34,7 @@ namespace ninfer::ops {
  *
  * Shapes/dtypes are contiguous q/k BF16 [128,Hqk,T], v/out BF16 [128,Hv,T], g/beta FP32 [Hv,T],
  * and state FP32 [128,128,Hv], where Hqk>=1, Hv>=Hqk, and Hv%Hqk==0. `scale` is 1/sqrt(128). When
- * `normalize_qk` is true, the recurrent implementation consumes raw q/k and applies
+ * `normalize_qk` is true, the Op consumes raw q/k and applies
  * x / sqrt(sum(x^2) + 1e-6) independently to every 128-element row before using it. When false,
  * q/k are consumed as supplied. The outputs approximate the complete recurrence above from
  * represented inputs. The master state is FP32; output storage is BF16. Scratch capacity is

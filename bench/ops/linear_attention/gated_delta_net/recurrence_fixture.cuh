@@ -2,7 +2,7 @@
 
 #include "recurrence_options.h"
 #include "ninfer_bench_common.h"
-#include "ops/linear_attention/gated_delta_net/common.h"
+#include "ops/linear_attention/gated_delta_net/operands.h"
 
 namespace ninfer::bench::gdn_recurrence {
 namespace gated_delta_net_detail      = ninfer::ops::detail::gated_delta_net;

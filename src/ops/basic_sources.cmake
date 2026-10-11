@@ -1,7 +1,6 @@
 target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/weight_input.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/argmax.cu"
-  "${CMAKE_CURRENT_LIST_DIR}/launcher/causal_conv1d.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/mtp_pack.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/mtp_round.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/speculative_round.cu"
@@ -10,7 +9,6 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/launcher/sampling.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/target_logprobs.cu"
   "${CMAKE_CURRENT_LIST_DIR}/wrapper/argmax.cpp"
-  "${CMAKE_CURRENT_LIST_DIR}/wrapper/causal_conv1d_silu.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/wrapper/mtp_pack.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/wrapper/mtp_round.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/wrapper/speculative_round.cpp"

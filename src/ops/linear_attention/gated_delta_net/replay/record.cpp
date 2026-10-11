@@ -26,24 +26,25 @@ void validate_replay_record(const Tensor& q, const Tensor& k, const Tensor& v, c
         throw std::invalid_argument(std::string(kOp) + ": state slot count must be positive");
     }
 
-    require_tensor(q, DType::BF16, {kStateDim, qk_heads, width, rows}, 8, kOp, "q");
-    require_tensor(k, DType::BF16, {kStateDim, qk_heads, width, rows}, 8, kOp, "k");
-    require_tensor(v, DType::BF16, {kStateDim, value_heads, width, rows}, 2, kOp, "v");
-    require_tensor(g, DType::FP32, {value_heads, width, rows}, 4, kOp, "g");
-    require_tensor(beta, DType::FP32, {value_heads, width, rows}, 4, kOp, "beta");
-    require_tensor(states, DType::FP32, {kStateDim, kStateDim, value_heads, states.ne[3]}, 16, kOp,
-                   "states");
-    require_tensor(initial_slots, DType::I32, {rows}, 4, kOp, "initial state slots");
+    common::operand::tensor(q, DType::BF16, {kStateDim, qk_heads, width, rows}, 8, kOp, "q");
+    common::operand::tensor(k, DType::BF16, {kStateDim, qk_heads, width, rows}, 8, kOp, "k");
+    common::operand::tensor(v, DType::BF16, {kStateDim, value_heads, width, rows}, 2, kOp, "v");
+    common::operand::tensor(g, DType::FP32, {value_heads, width, rows}, 4, kOp, "g");
+    common::operand::tensor(beta, DType::FP32, {value_heads, width, rows}, 4, kOp, "beta");
+    common::operand::tensor(states, DType::FP32, {kStateDim, kStateDim, value_heads, states.ne[3]},
+                            16, kOp, "states");
+    common::operand::tensor(initial_slots, DType::I32, {rows}, 4, kOp, "initial state slots");
     if (valid_columns.data != nullptr) {
-        require_tensor(valid_columns, DType::I32, {rows}, 4, kOp, "valid columns");
+        common::operand::tensor(valid_columns, DType::I32, {rows}, 4, kOp, "valid columns");
     }
-    require_tensor(key_record, DType::BF16, {kStateDim, qk_heads, width, rows}, 8, kOp,
-                   "key record");
-    require_tensor(value_record, DType::BF16, {kStateDim, value_heads, width, rows}, 2, kOp,
-                   "value record");
-    require_tensor(gate_record, DType::FP32, {2, value_heads, width, rows}, 8, kOp, "gate record");
-    require_tensor(out, DType::BF16, {kStateDim, value_heads, width, rows}, 2, kOp, "out");
-    require_scale(scale, kOp);
+    common::operand::tensor(key_record, DType::BF16, {kStateDim, qk_heads, width, rows}, 8, kOp,
+                            "key record");
+    common::operand::tensor(value_record, DType::BF16, {kStateDim, value_heads, width, rows}, 2,
+                            kOp, "value record");
+    common::operand::tensor(gate_record, DType::FP32, {2, value_heads, width, rows}, 8, kOp,
+                            "gate record");
+    common::operand::tensor(out, DType::BF16, {kStateDim, value_heads, width, rows}, 2, kOp, "out");
+    detail::gated_delta_net::require_scale(scale, kOp);
 
     const std::array<const Tensor*, 12> tensors{&q,
                                                 &k,
@@ -57,12 +58,12 @@ void validate_replay_record(const Tensor& q, const Tensor& k, const Tensor& v, c
                                                 &value_record,
                                                 &gate_record,
                                                 &out};
-    std::array<MemoryRange, 12> ranges{};
+    std::array<common::operand::Range, 12> ranges{};
     std::size_t count = 0;
     for (const Tensor* tensor : tensors) {
-        if (tensor->data != nullptr) ranges[count++] = tensor_range(*tensor, kOp);
+        if (tensor->data != nullptr) ranges[count++] = common::operand::range(*tensor, kOp);
     }
-    require_pairwise_disjoint(std::span(ranges.data(), count),
+    common::operand::disjoint(std::span(ranges.data(), count),
                               "gated_delta_net_replay_record: tensors must not overlap");
 }
 

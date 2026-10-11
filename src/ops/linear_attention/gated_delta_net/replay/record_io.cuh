@@ -1,6 +1,8 @@
 #pragma once
 
-#include "ops/linear_attention/gated_delta_net/transition.cuh"
+#include "ops/common/cuda/reduce.cuh"
+#include "ops/common/cuda/memory.cuh"
+#include "ops/linear_attention/gated_delta_net/kernels/transition.cuh"
 
 namespace ninfer::ops::detail::gated_delta_net {
 struct RecordEffects {
@@ -41,7 +43,7 @@ struct RecordAccess {
     __nv_bfloat16* value_record;
     uint2* gate_record;
     __nv_bfloat16* out;
-    head_map heads;
+    HeadMap heads;
     std::int32_t width;
     std::int64_t state_slot_stride;
     float scale;
@@ -99,7 +101,7 @@ struct RecordAccess {
             static_cast<int>(coord.value_head) % heads.group_size() == 0) {
             __nv_bfloat16* destination =
                 key_record + (column(coord, token) * heads.H_qk + coord.qk_head) * kStateDim;
-            store_vec(destination + coord.dqk_base, raw.bits);
+            common::store_vec(destination + coord.dqk_base, raw.bits);
         }
     }
 
@@ -121,7 +123,7 @@ struct RecordAccess {
 };
 
 template <bool Masked>
-__global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
+__global__ void __launch_bounds__(common::kWarpSize* kNumWarps, 2)
     recurrent_record_kernel(RecordAccess<Masked> access) {
     const RecurrentCoordinates coord = access.coordinates();
     const std::int32_t valid         = access.active_columns(coord);

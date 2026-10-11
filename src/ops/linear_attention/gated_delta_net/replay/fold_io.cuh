@@ -1,7 +1,7 @@
 #pragma once
 
-#include "ops/linear_attention/gated_delta_net/transition.cuh"
-
+#include "ops/common/cuda/reduce.cuh"
+#include "ops/linear_attention/gated_delta_net/kernels/transition.cuh"
 #include "ops/linear_attention/gated_delta_net/replay/launch.h"
 
 namespace ninfer::ops::detail::gated_delta_net {
@@ -134,7 +134,7 @@ struct FoldAccess {
             static_cast<std::int32_t>(coord.value_head) * 8 + coord.state_tile;
         if (tile_block >= Geometry::kConvChannels / 128) { return; }
 
-        const std::int32_t tid     = coord.warp * kWarpSize + coord.lane;
+        const std::int32_t tid     = coord.warp * common::kWarpSize + coord.lane;
         const std::int32_t channel = tile_block * 128 + tid;
         const __nv_bfloat16* source_history =
             conv_layer0 + static_cast<std::int64_t>(coord.layer) * conv_layer_stride +
@@ -172,7 +172,7 @@ struct FoldAccess {
 };
 
 template <class Geometry>
-__global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
+__global__ void __launch_bounds__(common::kWarpSize* kNumWarps, 2)
     recurrent_fold_kernel(const __grid_constant__ FoldAccess<Geometry> access) {
     const RecurrentCoordinates coord = access.coordinates();
     const std::int32_t valid         = access.active_columns(coord);

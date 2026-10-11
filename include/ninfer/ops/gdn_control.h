@@ -20,7 +20,7 @@ struct GdnNormControlOutputs {
 };
 
 /**
- * Op: GDN control preparation.
+ * GDN control preparation.
  *
  * Math / indexing:
  *   g[h,m] = -exp(a_log[h]) * softplus(a[h,m] + dt_bias[h])
@@ -32,9 +32,8 @@ struct GdnNormControlOutputs {
  *   M is nonnegative; an empty matrix performs no device work.
  *
  * Numeric / effects:
- *   The complete formula is evaluated over the represented inputs. FP32 outputs are compared
- *   directly with an independent FP64 oracle. All inputs and outputs must be disjoint;
- *   inputs remain unchanged and both outputs are fully written. No persistent state or workspace.
+ *   The complete formula consumes represented inputs. All operands are disjoint; inputs remain
+ *   unchanged and both outputs are fully written. No persistent state or workspace.
  *
  * Execution:
  *   Work is submitted to stream; capture/replay observes the current operand contents.
@@ -43,7 +42,7 @@ void gdn_control(const Tensor& a, const Tensor& b, const Tensor& a_log, const Te
                  GdnControlOutputs out, cudaStream_t stream);
 
 /**
- * Op: GDN control projection.
+ * GDN control projection.
  *
  * Math / indexing:
  *   a[h,m] = sum_k Wa[h,k] * x[k,m]
@@ -62,8 +61,7 @@ void gdn_control(const Tensor& a, const Tensor& b, const Tensor& a_log, const Te
  *
  * Numeric / effects:
  *   The complete formula consumes represented x directly; there is no input normalization or
- *   public BF16 projection intermediate. FP32 outputs are compared directly with an independent
- *   FP64 oracle. Private reduction, staging and accumulator precision are implementation choices.
+ *   public BF16 projection intermediate. Outputs approximate the complete fused formula.
  *   All inputs, outputs and allocated scratch are disjoint. Inputs remain unchanged; both outputs
  *   are fully written. Combined weights produce zero-copy row views, without runtime repacking.
  *
@@ -83,7 +81,7 @@ gdn_control_proj_workspace_capacity_bytes(const ProjectionWeights& weights, std:
                                           std::int32_t last);
 
 /**
- * Op: input RMSNorm and GDN control projection.
+ * Input RMSNorm and GDN control projection.
  *
  * Math / indexing:
  *   n[k,m] = x[k,m] / sqrt(mean_j(x[j,m]^2) + eps) * (1 + norm_weight[k])
@@ -98,11 +96,9 @@ gdn_control_proj_workspace_capacity_bytes(const ProjectionWeights& weights, std:
  *   eps is positive and finite.
  *
  * Numeric:
- *   normalized is the explicit BF16 output for other projections. Promoted normalized and FP32
- *   controls are compared directly with the complete independent FP64 formula. The oracle does
- *   not reproduce output storage rounding. Controls derive from n, without a required rounding
- *   through normalized. Private operand staging and fusion/materialization are implementation
- *   choices. The additional norm input and output obey the same non-overlap and preservation
+ *   normalized is the explicit BF16 output for other projections. Controls derive from n, without
+ *   a required rounding through normalized. Both outputs approximate the complete fused formula.
+ *   The additional norm input and output obey the same non-overlap and preservation
  *   rules. Workspace and capture/replay follow the projection contract above.
  */
 void gdn_norm_control_proj(const Tensor& x, const Tensor& norm_weight, float eps,

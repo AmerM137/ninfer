@@ -1,4 +1,5 @@
 #include "ops/linear_attention/gated_delta_net/replay/launch.h"
+#include "ops/common/cuda/reduce.cuh"
 #include "ops/linear_attention/gated_delta_net/replay/record_io.cuh"
 #include "core/device.h"
 #include <cuda_bf16.h>
@@ -13,10 +14,10 @@ void launch_recurrent_record_fixed(const Tensor& q, const Tensor& k, const Tenso
                                    const Tensor& initial_state_slots, Tensor& key_record,
                                    Tensor& value_record, Tensor& gate_record, Tensor& out,
                                    cudaStream_t stream) {
-    const auto heads = head_map::of(q.ne[1], v.ne[1]);
+    const auto heads = HeadMap::of(q.ne[1], v.ne[1]);
     const dim3 grid(static_cast<unsigned>(v.ne[1]), static_cast<unsigned>(q.ne[3]),
                     static_cast<unsigned>(kStateDim / kBlockDv));
-    const dim3 block(kWarpSize, kNumWarps, 1);
+    const dim3 block(common::kWarpSize, kNumWarps, 1);
     const std::int64_t state_slot_stride =
         static_cast<std::int64_t>(kStateDim) * kStateDim * ssm_states.ne[2];
     const RecordAccess<Masked> access{

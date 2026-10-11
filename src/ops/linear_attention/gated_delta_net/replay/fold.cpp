@@ -7,41 +7,32 @@ namespace ninfer::ops {
 namespace {
 using namespace detail::gated_delta_net::replay;
 
-bool is_registered_fold_geometry(const GdnReplayRecordSpec& spec) {
-    const bool geometry_48 = spec.layers == 48 && spec.qk_heads == 16 && spec.value_heads == 48 &&
-                             spec.conv_channels == 10240;
-    const bool geometry_30 = spec.layers == 30 && spec.qk_heads == 16 && spec.value_heads == 32 &&
-                             spec.conv_channels == 8192;
-    const bool geometry_36 = spec.layers == 36 && spec.qk_heads == 16 && spec.value_heads == 48 &&
-                             spec.conv_channels == 10240;
-    return geometry_48 || geometry_30 || geometry_36;
-}
-
 void validate_fold_records(const GdnReplayRecords& records) {
     constexpr const char* kOp       = "gdn_replay_fold";
     const GdnReplayRecordSpec& spec = records.spec;
-    if (!is_registered_fold_geometry(spec) || spec.record_capacity <= 0 ||
-        spec.record_capacity > kMaximumRows || spec.width < 2 || spec.width > 16 ||
-        spec.key_dim != kStateDim || spec.value_dim != kStateDim) {
+    (void)detail::gated_delta_net::select_fold_geometry(spec);
+    if (spec.record_capacity <= 0 || spec.record_capacity > kMaximumRows || spec.width < 2 ||
+        spec.width > 16 || spec.key_dim != kStateDim || spec.value_dim != kStateDim) {
         throw std::invalid_argument(std::string(kOp) + ": unsupported record geometry");
     }
     if (spec.layers > std::numeric_limits<std::int32_t>::max() / spec.record_capacity) {
         throw std::overflow_error(std::string(kOp) + ": record outer extent overflows");
     }
     const std::int32_t outer = spec.layers * spec.record_capacity;
-    require_tensor(records.conv, DType::BF16, {spec.conv_channels, spec.width, outer}, 256, kOp,
-                   "conv records");
-    require_tensor(records.key, DType::BF16, {kStateDim, spec.qk_heads, spec.width, outer}, 256,
-                   kOp, "key records");
-    require_tensor(records.value, DType::BF16, {kStateDim, spec.value_heads, spec.width, outer},
-                   256, kOp, "value records");
-    require_tensor(records.gate, DType::FP32, {2, spec.value_heads, spec.width, outer}, 256, kOp,
-                   "gate records");
+    common::operand::tensor(records.conv, DType::BF16, {spec.conv_channels, spec.width, outer}, 256,
+                            kOp, "conv records");
+    common::operand::tensor(records.key, DType::BF16, {kStateDim, spec.qk_heads, spec.width, outer},
+                            256, kOp, "key records");
+    common::operand::tensor(records.value, DType::BF16,
+                            {kStateDim, spec.value_heads, spec.width, outer}, 256, kOp,
+                            "value records");
+    common::operand::tensor(records.gate, DType::FP32, {2, spec.value_heads, spec.width, outer},
+                            256, kOp, "gate records");
 
-    const std::array<MemoryRange, 4> record_ranges{
-        tensor_range(records.conv, kOp), tensor_range(records.key, kOp),
-        tensor_range(records.value, kOp), tensor_range(records.gate, kOp)};
-    require_pairwise_disjoint(record_ranges, "gdn_replay_fold: record planes overlap");
+    const std::array<common::operand::Range, 4> record_ranges{
+        common::operand::range(records.conv, kOp), common::operand::range(records.key, kOp),
+        common::operand::range(records.value, kOp), common::operand::range(records.gate, kOp)};
+    common::operand::disjoint(record_ranges, "gdn_replay_fold: record planes overlap");
 }
 
 void validate_fold_states(const GdnReplayRecords& records,
@@ -56,11 +47,12 @@ void validate_fold_states(const GdnReplayRecords& records,
         state.conv_dtype != DType::BF16) {
         throw std::invalid_argument(std::string(kOp) + ": state geometry does not match records");
     }
-    require_tensor(states.conv_layer0, DType::BF16, {record.conv_channels, 3, state.slot_count},
-                   256, kOp, "conv state layer 0");
-    require_tensor(states.recurrent_layer0, DType::FP32,
-                   {kStateDim, kStateDim, record.value_heads, state.slot_count}, 256, kOp,
-                   "recurrent state layer 0");
+    common::operand::tensor(states.conv_layer0, DType::BF16,
+                            {record.conv_channels, 3, state.slot_count}, 256, kOp,
+                            "conv state layer 0");
+    common::operand::tensor(states.recurrent_layer0, DType::FP32,
+                            {kStateDim, kStateDim, record.value_heads, state.slot_count}, 256, kOp,
+                            "recurrent state layer 0");
     if (states.conv_layer_stride_bytes <= 0 || states.recurrent_layer_stride_bytes <= 0 ||
         states.conv_layer_stride_bytes % static_cast<std::int64_t>(sizeof(std::uint16_t)) != 0 ||
         states.recurrent_layer_stride_bytes % static_cast<std::int64_t>(sizeof(float)) != 0 ||
@@ -79,12 +71,13 @@ void validate_fold_states(const GdnReplayRecords& records,
     std::int32_t conv_layer      = 0;
     std::int32_t recurrent_layer = 0;
     while (conv_layer < record.layers && recurrent_layer < record.layers) {
-        const MemoryRange conv = layer_range(states.conv_layer0, states.conv_layer_stride_bytes,
-                                             conv_layer, "gdn_replay_fold conv state");
-        const MemoryRange recurrent =
+        const common::operand::Range conv =
+            layer_range(states.conv_layer0, states.conv_layer_stride_bytes, conv_layer,
+                        "gdn_replay_fold conv state");
+        const common::operand::Range recurrent =
             layer_range(states.recurrent_layer0, states.recurrent_layer_stride_bytes,
                         recurrent_layer, "gdn_replay_fold recurrent state");
-        if (overlaps(conv, recurrent)) {
+        if (common::operand::overlaps(conv, recurrent)) {
             throw std::invalid_argument("gdn_replay_fold: state layer regions overlap");
         }
         if (conv.end <= recurrent.begin) {
@@ -97,19 +90,21 @@ void validate_fold_states(const GdnReplayRecords& records,
 
 void require_records_disjoint_from_states(const GdnReplayRecords& records,
                                           LinearAttentionStateAllLayersView states) {
-    const std::array<MemoryRange, 4> record_ranges{
-        tensor_range(records.conv, "gdn_replay_fold conv records"),
-        tensor_range(records.key, "gdn_replay_fold key records"),
-        tensor_range(records.value, "gdn_replay_fold value records"),
-        tensor_range(records.gate, "gdn_replay_fold gate records")};
-    for (const MemoryRange record : record_ranges) {
+    const std::array<common::operand::Range, 4> record_ranges{
+        common::operand::range(records.conv, "gdn_replay_fold conv records"),
+        common::operand::range(records.key, "gdn_replay_fold key records"),
+        common::operand::range(records.value, "gdn_replay_fold value records"),
+        common::operand::range(records.gate, "gdn_replay_fold gate records")};
+    for (const common::operand::Range record : record_ranges) {
         for (std::int32_t layer = 0; layer < records.spec.layers; ++layer) {
-            const MemoryRange conv = layer_range(states.conv_layer0, states.conv_layer_stride_bytes,
-                                                 layer, "gdn_replay_fold conv state");
-            const MemoryRange recurrent =
+            const common::operand::Range conv =
+                layer_range(states.conv_layer0, states.conv_layer_stride_bytes, layer,
+                            "gdn_replay_fold conv state");
+            const common::operand::Range recurrent =
                 layer_range(states.recurrent_layer0, states.recurrent_layer_stride_bytes, layer,
                             "gdn_replay_fold recurrent state");
-            if (overlaps(record, conv) || overlaps(record, recurrent)) {
+            if (common::operand::overlaps(record, conv) ||
+                common::operand::overlaps(record, recurrent)) {
                 throw std::invalid_argument("gdn_replay_fold: records overlap state storage");
             }
         }

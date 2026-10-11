@@ -9,7 +9,7 @@
 #include "core/linear_attention_state.h"
 #include "core/weight.h"
 #include "ops/input_projection_test_common.h"
-#include "ops/linear_attention/gated_delta_net/launch.h"
+#include "ops/linear_attention/gated_delta_net/recurrence/launch.h"
 #include "ops/op_tester.h"
 
 #include <cuda_runtime.h>

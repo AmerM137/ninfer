@@ -1,7 +1,7 @@
 #include "ninfer/ops/gated_delta_net.h"
 
 #include "core/device.h"
-#include "ops/linear_attention/gated_delta_net/launch.h"
+#include "ops/linear_attention/gated_delta_net/recurrence/launch.h"
 
 #include "ops/op_tester.h"
 

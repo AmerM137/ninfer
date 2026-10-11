@@ -1,4 +1,5 @@
 #include "ops/linear_attention/gated_delta_net/replay/launch.h"
+#include "ops/common/cuda/reduce.cuh"
 #include "ops/linear_attention/gated_delta_net/replay/fold_io.cuh"
 #include <type_traits>
 #include "core/device.h"
@@ -35,7 +36,7 @@ void launch_replay_fold_fixed(const GdnReplayRecords& records,
     const dim3 grid(static_cast<unsigned>(Geometry::kValueHeads),
                     static_cast<unsigned>(active_rows),
                     static_cast<unsigned>(Geometry::kLayers * (kStateDim / kBlockDv)));
-    const dim3 block(kWarpSize, kNumWarps, 1);
+    const dim3 block(common::kWarpSize, kNumWarps, 1);
     recurrent_fold_kernel<Geometry><<<grid, block, 0, stream>>>(access);
     CUDA_CHECK(cudaGetLastError());
 }
@@ -45,28 +46,17 @@ void launch_replay_fold_fixed(const GdnReplayRecords& records,
 void launch_replay_fold(const GdnReplayRecords& records, LinearAttentionStateAllLayersView states,
                         const GdnReplayFoldKernelRows& rows, std::int32_t active_rows,
                         cudaStream_t stream) {
-    if (records.spec.layers == FoldGeometry48x48::kLayers &&
-        records.spec.qk_heads == FoldGeometry48x48::kQkHeads &&
-        records.spec.value_heads == FoldGeometry48x48::kValueHeads &&
-        records.spec.conv_channels == FoldGeometry48x48::kConvChannels) {
-        launch_replay_fold_fixed<FoldGeometry48x48>(records, states, rows, active_rows, stream);
-        return;
+    switch (select_fold_geometry(records.spec)) {
+    case FoldGeometryId::Layers48Heads48:
+        return launch_replay_fold_fixed<FoldGeometry48x48>(records, states, rows, active_rows,
+                                                           stream);
+    case FoldGeometryId::Layers30Heads32:
+        return launch_replay_fold_fixed<FoldGeometry30x32>(records, states, rows, active_rows,
+                                                           stream);
+    case FoldGeometryId::Layers36Heads48:
+        return launch_replay_fold_fixed<FoldGeometry36x48>(records, states, rows, active_rows,
+                                                           stream);
     }
-    if (records.spec.layers == FoldGeometry30x32::kLayers &&
-        records.spec.qk_heads == FoldGeometry30x32::kQkHeads &&
-        records.spec.value_heads == FoldGeometry30x32::kValueHeads &&
-        records.spec.conv_channels == FoldGeometry30x32::kConvChannels) {
-        launch_replay_fold_fixed<FoldGeometry30x32>(records, states, rows, active_rows, stream);
-        return;
-    }
-    if (records.spec.layers == FoldGeometry36x48::kLayers &&
-        records.spec.qk_heads == FoldGeometry36x48::kQkHeads &&
-        records.spec.value_heads == FoldGeometry36x48::kValueHeads &&
-        records.spec.conv_channels == FoldGeometry36x48::kConvChannels) {
-        launch_replay_fold_fixed<FoldGeometry36x48>(records, states, rows, active_rows, stream);
-        return;
-    }
-    throw std::invalid_argument("GDN replay fold launcher received an unregistered geometry");
 }
 
 } // namespace ninfer::ops::detail::gated_delta_net

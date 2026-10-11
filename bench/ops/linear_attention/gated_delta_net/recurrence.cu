@@ -1,15 +1,14 @@
 // Public GDN and production-stage timing. Private launchers also measure the prefill
 // recurrent/chunked crossover, independently of decode/ReplaySSM.
 // Graph/eager timing and cache conditioning use the shared Op measurement harness.
+#include "ops/linear_attention/gated_delta_net/recurrence/plan.h"
 #include "ninfer/ops/gated_delta_net.h"
 #include "ninfer/ops/l2norm.h"
 #include "op_measurement.cuh"
 #include "recurrence_fixture.cuh"
-#include "ops/linear_attention/gated_delta_net/chunked/launch.h"
-#include "ops/linear_attention/gated_delta_net/launch.h"
-
+#include "ops/linear_attention/gated_delta_net/recurrence/chunked/launch.h"
+#include "ops/linear_attention/gated_delta_net/recurrence/launch.h"
 #include <cuda_runtime.h>
-
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
@@ -204,7 +203,9 @@ std::vector<BenchRow> run_prefill(const Options& options, std::int32_t tokens,
         options.mode == Mode::ChunkedRaw || options.mode == Mode::ChunkedNormalized;
     const bool force_recurrent = options.mode == Mode::Recurrent;
     const bool chunked =
-        force_chunked || (!force_recurrent && tokens >= chunked_detail::kMinTokens);
+        force_chunked ||
+        (!force_recurrent && gated_delta_net_detail::select_recurrence_route(tokens) ==
+                                 gated_delta_net_detail::RecurrenceRoute::Chunked);
     const Problem problem{options.qk_heads, options.value_heads, tokens};
     Operands operands(problem, !normalize);
     const std::size_t state_elements = std::size_t(state_dim) * state_dim * problem.value_heads;
@@ -230,21 +231,21 @@ std::vector<BenchRow> run_prefill(const Options& options, std::int32_t tokens,
     auto* control =
         chunked ? static_cast<chunked_detail::ControlChunk*>(layout.control.bind(backing).data)
                 : nullptr;
-    const chunked_detail::Arguments args{static_cast<const __nv_bfloat16*>(q.data),
-                                         static_cast<const __nv_bfloat16*>(k.data),
-                                         static_cast<const __nv_bfloat16*>(v.data),
-                                         static_cast<const float*>(g.data),
-                                         static_cast<const float*>(beta.data),
-                                         static_cast<const float*>(si.data),
-                                         static_cast<float*>(so.data),
-                                         static_cast<__nv_bfloat16*>(out.data),
-                                         problem.qk_heads,
-                                         problem.value_heads,
-                                         tokens,
-                                         gated_delta_net_scale()};
-    const int tile =
-        chunked ? chunked_detail::value_tile(problem.value_heads, execution.multiprocessor_count)
-                : 0;
+    const gated_delta_net_detail::RecurrenceOperands args{static_cast<const __nv_bfloat16*>(q.data),
+                                                          static_cast<const __nv_bfloat16*>(k.data),
+                                                          static_cast<const __nv_bfloat16*>(v.data),
+                                                          static_cast<const float*>(g.data),
+                                                          static_cast<const float*>(beta.data),
+                                                          static_cast<const float*>(si.data),
+                                                          static_cast<float*>(so.data),
+                                                          static_cast<__nv_bfloat16*>(out.data),
+                                                          problem.qk_heads,
+                                                          problem.value_heads,
+                                                          tokens,
+                                                          gated_delta_net_scale()};
+    const int tile              = chunked ? ops::detail::gated_delta_net::select_value_tile(
+                                   problem.value_heads, execution.multiprocessor_count)
+                                          : 0;
     const auto prep_io          = prepare_traffic(problem, bytes);
     const auto rec_io           = recurrence_traffic(problem, tile ? state_dim / tile : 0);
     const TrafficBytes total_io = chunked ? TrafficBytes{prep_io.total + rec_io.total,
@@ -254,8 +255,7 @@ std::vector<BenchRow> run_prefill(const Options& options, std::int32_t tokens,
         chunked_detail::launch_prepare(args, qk, control, normalize, stream);
     };
     auto recurrence = [&](cudaStream_t stream) {
-        chunked_detail::launch_recurrence(args, qk, control,
-                                          {stream, execution.multiprocessor_count});
+        chunked_detail::launch_recurrence(args, qk, control, tile, stream);
     };
     auto pipeline = [&](cudaStream_t stream) {
         if (force_chunked) {
