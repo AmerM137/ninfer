@@ -127,6 +127,18 @@ struct Q5ScalarDecodeAtom {
 };
 
 struct Q5SimtDecodeAtom {
+    __device__ static __forceinline__ void
+    load_eight(const std::uint8_t* codes, const std::uint8_t* high, const std::uint8_t* scales,
+               std::int64_t group_index, int lane_in_group, float (&weights)[8]) {
+        const std::uint32_t packed = *reinterpret_cast<const std::uint32_t*>(
+            codes + group_index * Q5RowSplitStorage::kCodeBytesPerGroup + lane_in_group * 4);
+        const std::uint8_t high_bits =
+            high[group_index * Q5RowSplitStorage::kHighBytesPerGroup + lane_in_group];
+        const auto scale_bits = *reinterpret_cast<const std::uint16_t*>(
+            scales + group_index * Q5RowSplitStorage::kScaleBytesPerGroup);
+        decode_eight(packed, high_bits, scale_bits, weights);
+    }
+
     __device__ static __forceinline__ void decode_eight(std::uint32_t packed,
                                                         std::uint8_t high_bits,
                                                         std::uint16_t scale_bits,
@@ -217,6 +229,18 @@ __device__ __forceinline__ int unpack_q6_code(const std::uint8_t* codes, const s
 }
 
 struct Q6SimtDecodeAtom {
+    __device__ static __forceinline__ void
+    load_eight(const std::uint8_t* codes, const std::uint8_t* high, const std::uint8_t* scales,
+               std::int64_t group_index, int lane_in_group, float (&weights)[8]) {
+        const std::uint32_t packed = *reinterpret_cast<const std::uint32_t*>(
+            codes + group_index * Q6RowSplitStorage::kCodeBytesPerGroup + lane_in_group * 4);
+        const std::uint16_t high_bits = *reinterpret_cast<const std::uint16_t*>(
+            high + group_index * Q6RowSplitStorage::kHighBytesPerGroup + lane_in_group * 2);
+        const auto scale_bits = *reinterpret_cast<const std::uint16_t*>(
+            scales + group_index * Q6RowSplitStorage::kScaleBytesPerGroup);
+        decode_eight(packed, high_bits, scale_bits, weights);
+    }
+
     __device__ static __forceinline__ void decode_eight(std::uint32_t packed,
                                                         std::uint16_t high_bits,
                                                         std::uint16_t scale_bits,
@@ -298,6 +322,15 @@ __device__ __forceinline__ __nv_bfloat162 dequant_q8_pair(std::uint16_t packed, 
 }
 
 struct Q8ScalarDecodeAtom {
+    __device__ static __forceinline__ float load_one(const std::uint8_t* codes,
+                                                     const std::uint8_t* scales,
+                                                     std::int64_t group_index, int lane) {
+        const float scale = __half2float(
+            __ushort_as_half(*reinterpret_cast<const std::uint16_t*>(scales + group_index * 2)));
+        return static_cast<float>(static_cast<std::int8_t>(codes[group_index * kGroupK + lane])) *
+               scale;
+    }
+
     static constexpr int kGroupK = Q8RowSplitStorage::kGroupK;
 
     __device__ static __forceinline__ void

@@ -168,6 +168,7 @@ __device__ __forceinline__ void warp_reduce_argmax(float& value, std::int32_t& i
     }
 }
 
+// Requires a multiple of 32 threads, at most 512. Only thread 0 owns the block result.
 __device__ __forceinline__ void block_reduce_argmax(float& value, std::int32_t& index) {
     __shared__ float warp_values[16];
     __shared__ std::int32_t warp_indices[16];

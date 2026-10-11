@@ -27,7 +27,7 @@ enum class SparseMoeEpilogue : std::uint8_t {
  * the same call with a default-constructed SparseMoeHints produces bit-identical output.
  *
  * next_weight_prefetch names a weight span the next decode-step consumer will stream; the decode
- * D4 epilogue issues fire-and-forget L2 prefetches over its first bytes. The span is caller-owned
+ * computation may prefetch its first bytes into L2. The span is caller-owned
  * and read once, inside the call: the Op keeps no state between calls, and no hidden channel
  * carries it.
  */
@@ -47,19 +47,19 @@ struct SparseMoeHints {
                                                               std::int32_t max_tokens);
 
 /**
- * Closed sparse-MoE Op for the exact future 35B-A3B geometry.
+ * Sparse mixture of SwiGLU experts with a shared expert and residual addition.
  *
- * For contiguous BF16 x [2048,T] and destination [2048,T] with T>0, 256 routed experts, top-8
- * selection, and one always-on shared expert, this Op owns router projection and selection,
- * selected routed and shared SwiGLU projections, down projections, their merge, and the
- * AddResidual epilogue independently for every token column. At an exact top-8 boundary tie the
- * lower expert id wins. destination is the only observable mutation: its incoming value is the
- * residual and its outgoing value is the BF16 sparse-MoE result plus that residual.
+ * For each contiguous BF16 x[:,t] and destination[:,t], both [2048,T], T>0:
+ *   scores = router_shared_gate * x
+ *   E = top8(scores[0:256]), breaking ties by lower expert id
+ *   alpha = softmax(scores[E]); beta = sigmoid(scores[256])
+ *   h_e = silu(gate_e * x) * (up_e * x)
+ *   destination' = BF16(destination + sum_e_in_E alpha_e * (down_e * h_e)
+ *                                   + beta * (shared_down * h_shared))
  *
- * The complete mathematical oracle starts from represented BF16 inputs, exact stored-weight
- * decode, and evaluates the logical formula naively in FP32/FP64. Scores, route weights, expert
- * activations, workspace representation, reduction association, and scale placement are private
- * execution choices rather than semantic rounding boundaries.
+ * Stored weights are interpreted through their exact numeric formats. Internal staging,
+ * accumulation and scale placement are private; they add no semantic rounding boundaries.
+ * destination is the only observable mutation. All inputs remain unchanged.
  *
  * The five weights have the exact registered shapes: BF16 router/shared gate [257,2048], routed
  * gate/up [256*1024,2048], routed down [256*2048,512], shared gate/up [1024,2048], and shared down

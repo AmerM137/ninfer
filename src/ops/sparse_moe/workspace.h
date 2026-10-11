@@ -1,36 +1,51 @@
 #pragma once
 
-#include "core/weight.h"
 #include "core/arena.h"
-#include "core/tensor.h"
-#include "ninfer/ops/sparse_moe.h"
+#include "core/layout.h"
+#include "ops/sparse_moe/plan.h"
 
-#include <cuda_runtime.h>
+namespace ninfer::ops::moe_detail {
 
-#include <cstddef>
-#include <cstdint>
-
-namespace ninfer::ops::detail {
-
-// RTX 5090 codec frontiers balance trace-like and independent expert distributions. The public
-// workspace query starts at the earliest codec-specific prefill route.
-inline constexpr std::int32_t kSparseMoePrefillWorkspaceMin = 20;
-inline constexpr std::int32_t kSparseMoePrefillQ4Q5Min      = 47;
-inline constexpr std::int32_t kSparseMoePrefillQ4Q6Min      = 47;
-inline constexpr std::int32_t kSparseMoePrefillQ8Q8Min      = 20;
-inline constexpr std::int32_t kSparseMoePrefillWideMin      = 768;
-inline constexpr std::int32_t kSparseMoePrefillSliceMax     = 4096;
-inline constexpr std::int32_t kSparseMoeRouteTileTokens     = 8;
-// 257 logits padded to a 16-byte-aligned per-token stride.
-inline constexpr std::int32_t kSparseMoeRouterScoreRows = 260;
-
-struct SparseMoePrefillPlan {
-    std::int32_t tokens         = 0;
-    std::int32_t slice_tokens   = 0;
-    std::size_t workspace_bytes = 0;
+struct DecodeWorkspace {
+    Tensor ids;
+    Tensor alpha;
+    Tensor shared_scale;
+    Tensor scratch;
 };
 
-struct SparseMoePrefillWorkspace {
+template <class Arena>
+DecodeWorkspace allocate_decode_workspace(Arena& arena) {
+    DecodeWorkspace out;
+    out.ids          = arena.alloc(DType::I32, {8}, 16);
+    out.alpha        = arena.alloc(DType::FP32, {8}, 16);
+    out.shared_scale = arena.alloc(DType::FP32, {1}, 4);
+    // router uses the first 257 values as scores. gate/up then reuses the same lifetime for [9,512]
+    // natural FP32 SwiGLU results consumed by down/merge.
+    out.scratch = arena.alloc(DType::FP32, {9, 512}, 256);
+    return out;
+}
+
+struct SmallWorkspace {
+    Tensor token_ids;
+    Tensor token_alpha;
+    Tensor shared_scale;
+    Tensor scratch;
+};
+
+template <class Arena>
+SmallWorkspace allocate_small_workspace(Arena& arena, std::int32_t tokens) {
+    SmallWorkspace out;
+    const std::int32_t assignments = 8 * tokens;
+    out.token_ids                  = arena.alloc(DType::I32, {assignments}, 16);
+    out.token_alpha                = arena.alloc(DType::FP32, {assignments}, 16);
+    out.shared_scale               = arena.alloc(DType::FP32, {tokens}, 16);
+    // router uses [T,257,4] partial router scores. After selection, each token reuses
+    // its [9,512] region for eight routed and one shared SwiGLU activations.
+    out.scratch = arena.alloc(DType::FP32, {512, 9 * tokens}, 256);
+    return out;
+}
+
+struct PrefillWorkspace {
     Tensor token_ids;
     Tensor token_alpha;
     // Selection writes one rank local to a routing tile. The gather must keep this source separate
@@ -68,12 +83,10 @@ struct SparseMoePrefillWorkspace {
 };
 
 template <class Arena>
-SparseMoePrefillWorkspace allocate_sparse_moe_prefill_workspace(Arena& arena,
-                                                                std::int32_t capacity_tokens) {
-    SparseMoePrefillWorkspace out;
+PrefillWorkspace allocate_prefill_workspace(Arena& arena, std::int32_t capacity_tokens) {
+    PrefillWorkspace out;
     const std::int32_t assignments = 8 * capacity_tokens;
-    const std::int32_t route_tiles =
-        (capacity_tokens + kSparseMoeRouteTileTokens - 1) / kSparseMoeRouteTileTokens;
+    const std::int32_t route_tiles = (capacity_tokens + kRouteTileTokens - 1) / kRouteTileTokens;
 
     out.token_ids    = arena.alloc(DType::I32, {assignments}, 256);
     out.token_alpha  = arena.alloc(DType::FP32, {assignments}, 256);
@@ -97,7 +110,7 @@ SparseMoePrefillWorkspace allocate_sparse_moe_prefill_workspace(Arena& arena,
     // [1] is how many experts the route touched, which picks the gate/up pipeline depth.
     out.route_job_count = arena.alloc(DType::I32, {2}, 256);
 
-    out.score_storage = arena.alloc(DType::FP32, {kSparseMoeRouterScoreRows, capacity_tokens}, 256);
+    out.score_storage     = arena.alloc(DType::FP32, {kRouterScoreRows, capacity_tokens}, 256);
     out.shared_activation = Tensor(out.score_storage.data, DType::BF16, {512, capacity_tokens});
 
     out.grouped_io = arena.alloc(DType::BF16, {2048, assignments}, 256);
@@ -107,15 +120,4 @@ SparseMoePrefillWorkspace allocate_sparse_moe_prefill_workspace(Arena& arena,
     return out;
 }
 
-[[nodiscard]] bool sparse_moe_uses_prefill(std::int32_t tokens, QType routed_gate_up,
-                                           QType routed_down) noexcept;
-[[nodiscard]] std::size_t sparse_moe_prefill_workspace_bytes(std::int32_t max_tokens);
-[[nodiscard]] SparseMoePrefillPlan
-resolve_sparse_moe_prefill_plan(std::int32_t tokens, QType routed_gate_up, QType routed_down);
-
-void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
-                               Tensor& destination, const SparseMoePrefillPlan& plan,
-                               const SparseMoePrefillWorkspace& workspace,
-                               DeviceExecutionView execution);
-
-} // namespace ninfer::ops::detail
+} // namespace ninfer::ops::moe_detail
