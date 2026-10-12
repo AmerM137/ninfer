@@ -74,6 +74,7 @@ private:
         std::optional<WeightParent> device;
         std::optional<WeightParent> host;
         std::vector<std::byte> host_data;
+        std::vector<float> weight_divisors;
     };
 
     DeviceBuffer device_storage_;

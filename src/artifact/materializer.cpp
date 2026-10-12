@@ -82,25 +82,30 @@ struct ReadSpan {
     std::uint64_t end   = 0;
 };
 
-float read_divisor(const Reader& reader, ObjectHandle handle, const WeightGeometry& geometry,
-                   std::span<const std::byte> host, MaterializationStats& stats) {
-    if (geometry.format != QType::NVFP4 && geometry.format != QType::NF4_G16_E4M3FN) {
-        return 0.0F;
-    }
-    std::array<std::byte, 4> word{};
-    if (!host.empty()) {
-        std::copy_n(host.data() + geometry.divisor_offset, word.size(), word.data());
-    } else {
+std::vector<float> read_divisors(const Reader& reader, ObjectHandle handle,
+                                 const WeightGeometry& geometry, std::span<const std::byte> host,
+                                 MaterializationStats& stats) {
+    if (!geometry.divisor_count) { return {}; }
+    const auto bytes = geometry.divisor_count * sizeof(float);
+    std::vector<std::byte> owned;
+    std::span<const std::byte> words;
+    if (host.empty()) {
         const auto& object = reader.directory().tensor(handle);
-        reader.read_into(checked_add(object.offset, geometry.divisor_offset, "weight divisor"),
-                         word);
-        stats.read_bytes = checked_add(stats.read_bytes, word.size(), "read bytes");
+        owned              = reader.read_range(
+            checked_add(object.offset, geometry.divisor_offset, "weight divisors"), bytes);
+        stats.read_bytes = checked_add(stats.read_bytes, bytes, "read bytes");
+        words            = owned;
+    } else {
+        words = host.subspan(geometry.divisor_offset, bytes);
     }
-    const auto value = std::bit_cast<float>(read_u32_le(word.data()));
-    if (!std::isfinite(value) || value <= 0) {
-        throw ArtifactError(reader.directory().tensor(handle).id + ": invalid weight divisor");
+    std::vector<float> values(geometry.divisor_count);
+    for (std::size_t i = 0; i < values.size(); ++i) {
+        values[i] = std::bit_cast<float>(read_u32_le(words.data() + i * sizeof(float)));
+        if (!std::isfinite(values[i]) || values[i] <= 0) {
+            throw ArtifactError(reader.directory().tensor(handle).id + ": invalid weight divisor");
+        }
     }
-    return value;
+    return values;
 }
 
 } // namespace
@@ -174,9 +179,10 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
             checked_add(out.stats_.retained_host_bytes, storage.host_data.size(), "retained bytes");
         if (std::holds_alternative<TensorObject>(object)) {
             const auto& geometry = reader.geometry(placement.object);
-            const auto divisor =
-                read_divisor(reader, placement.object, geometry, storage.host_data, out.stats_);
-            storage.host = WeightParent{geometry, Device::cpu(), storage.host_data.data(), divisor};
+            storage.weight_divisors =
+                read_divisors(reader, placement.object, geometry, storage.host_data, out.stats_);
+            storage.host = WeightParent{geometry, Device::cpu(), storage.host_data.data(),
+                                        storage.weight_divisors};
         }
     }
     MemoryArena arena(out.device_storage_.span());
@@ -195,11 +201,13 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
         if (offset != placement.offset) {
             throw ArtifactError("device offset differs from materialization plan");
         }
-        const auto divisor     = object.host
-                                     ? object.host->weight_scale_divisor
-                                     : read_divisor(reader, placement.object, geometry, {}, out.stats_);
-        object.device          = WeightParent{geometry, storage.device,
-                                     static_cast<const std::byte*>(storage.data), divisor};
+        if (!object.host) {
+            object.weight_divisors =
+                read_divisors(reader, placement.object, geometry, {}, out.stats_);
+        }
+        object.device =
+            WeightParent{geometry, storage.device, static_cast<const std::byte*>(storage.data),
+                         object.weight_divisors};
         const auto& descriptor = reader.directory().tensor(placement.object);
         for (const auto& segment : reader.segments(descriptor.offset, descriptor.bytes)) {
             ranges.push_back({segment.file_index, segment.file_offset,

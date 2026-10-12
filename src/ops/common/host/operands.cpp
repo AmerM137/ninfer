@@ -88,8 +88,11 @@ Nvfp4WeightGeometry validate_nvfp4_weight(const Weight& weight, const char* oper
         throw std::invalid_argument(std::string(operation) + ": invalid NVFP4 weight");
     }
 
-    const auto* payload = static_cast<const std::byte*>(weight.payload);
-    if (weight.qdata != payload || weight.scales != payload + geometry.scale_plane_offset) {
+    const auto backing = operand::range(weight.payload, weight.payload_bytes, operation);
+    const auto codes   = operand::range(weight.qdata, geometry.code_plane_bytes, operation);
+    const auto scales  = operand::range(weight.scales, geometry.scale_plane_bytes, operation);
+    if (codes.begin < backing.begin || codes.end > backing.end || scales.begin < backing.begin ||
+        scales.end > backing.end || operand::overlaps(codes, scales)) {
         throw std::invalid_argument(std::string(operation) + ": invalid NVFP4 plane geometry");
     }
     return geometry;

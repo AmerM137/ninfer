@@ -365,7 +365,8 @@ lead 规划，不假定与 Main 相同。最终容量、Host reservation、迁�
    hash、按实际 divisor 构建的 NF4→BF16 LUT/行解码；接入 cold backing、bounded
    cache/queues、ticket、pinned E 和 H2D/Graph 交接。持久 NF4 codec 与独立 SSD
    实验已经存在，但不构成生产 reader 或完整 PLE 能力，接口设计见 PLE I/O。
-2. **NVFP4 MoE 与 expert streaming。** 在现有 per-expert bank 表示上落实路由/shared
+2. **MoE 与 expert streaming。** 在现有 rank-3 bank 表示上落实 Main NVFP4 和 MTP
+   block-FP8 expert 计算，以及路由/shared
    计算、完整 Op 边界、A16/A4 及 activation divisor 复用、cache lease/eviction、
    计算前 readiness、搬运粒度和重叠。Grouped/fused 策略与驻留调度仍需细化，不重新
    下放成一轮纯 Linear 任务；PLE 与 expert H2D 的实际竞争也须在完整 schedule 评估。

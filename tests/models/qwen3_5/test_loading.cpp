@@ -237,7 +237,8 @@ void native_uses() {
     const std::array<std::uint64_t, 2> shape{128, 64};
     const auto geometry = weight_geometry(QType::NVFP4, QuantLayout::BlockScaleK16M128x4, shape);
     std::vector<std::byte> bytes(geometry.bytes);
-    const WeightParent parent{geometry, Device::cpu(), bytes.data(), 8.0F};
+    const std::array divisors{8.0F};
+    const WeightParent parent{geometry, Device::cpu(), bytes.data(), divisors};
     const WeightView gate{{64, 64}, {{&parent, 0, 4096}}};
     const WeightView up{{64, 64}, {{&parent, 4096, 8192}}};
     const auto joined = ops::prepare_linear_swiglu_weight({gate, ops::LinearPolicy::AllowA4, 2.0F},
@@ -269,7 +270,7 @@ void native_uses() {
     const auto first  = ops::prepare_linear_weight({full, ops::LinearPolicy::AllowA4, 2.0F});
     require(first.weight.input_scale_divisor == 2.0F && second.weight.input_scale_divisor == 3.0F &&
                 first.policy == ops::LinearPolicy::AllowA4 &&
-                second.policy == ops::LinearPolicy::A16Only && parent.weight_scale_divisor == 8.0F,
+                second.policy == ops::LinearPolicy::A16Only && parent.weight_divisors[0] == 8.0F,
             "preparing one use modified another use or its shared parent");
     rejects<std::invalid_argument>(
         [&] {

@@ -111,24 +111,24 @@ Vision patch Conv3d 的 kernel=stride=`[2,16,16]`，已分块输入可按 C/T/H/
 
 | 用途 | 固定来源 |
 |---|---|
-| Config、资源、非主 routed-expert 参数及自量化源 | `/home/neroued/models/llm/qwen/Qwen3.8-Flash-Next/base-hf-bf16` |
-| Main routed experts | `/home/neroued/models/llm/qwen/Qwen3.8-Flash-Next/nvidia-nvfp4-experts/experts.safetensors.index.json` |
+| Config、资源、Main 非 routed-expert 参数、Vision 及 PLE 自量化源 | `/home/neroued/models/llm/qwen/Qwen3.8-Flash-Next/base-hf-bf16` |
+| Main routed experts、MTP 独有参数 | `/home/neroued/models/llm/qwen/Qwen3.8-Flash-Next/nvidia-nvfp4` |
 
-NVIDIA 来源为 `nvidia/Qwen3.8-Flash-Next-NVFP4`，revision
-`fc694b54fb0174e0913e6adf86691ef85a4ead47`。专用 index 只覆盖本地的主 expert 分片；
-转换不从上游完整 index 推断本地还具备 MTP/PLE 权重。该 recipe 导入主 expert 的原始
-NVFP4 编码和校准参数，其余使用 BF16 源。具体来源与转换方法进入 `.conversion.json`。
+NVIDIA 来源为完整 `nvidia/Qwen3.8-Flash-Next-NVFP4` checkpoint，以 `--source nvidia=PATH`
+提供。Recipe 保值导入 Main NVFP4 experts 和 MTP block-FP8 experts；MTP 其余独有参数
+从该来源保留 BF16 words。PLE 仍从 BF16 来源生成 NF4。具体来源与转换方法进入
+`.conversion.json`。
 
 | 部分 | 持久表示 | 计算许可/消费方式 |
 |---|---|---|
-| Main routed gate/up/down | NVIDIA NVFP4，G16/E4M3FN scale，每 expert 每 parent 一个 FP32 divisor | `AllowA4`；同一编码供 A16 或已资格化的 A4 路线 |
+| Main routed gate/up/down | NVIDIA NVFP4，G16/E4M3FN scale，bank 内每 expert 矩阵一个 FP32 divisor | `AllowA4`；同一编码供 A16 或已资格化的 A4 路线 |
 | Main GDN QKVZ/output、QSA Q/gate/output | BF16 源转 Q8 G32/FP16 scale | `A16Only` |
 | HC、QSA K/V/indexer、PLE 投影、router/shared FFN | 原 BF16 words | `A16Only` |
 | GDN AB、conv/norm，其他 norm/bias | 原 BF16 words | 投影 A16；其余按各自 Op 数学 |
 | GDN A_log / dt_bias | 源 BF16 精确展开为 FP32，各 `[48]` | 保留原始含义，不预计算 exp |
 | Token embedding / LM head | 两份独立 BF16 对象 | lookup / A16 head；MTP 共享对应对象 |
 | PLE 表 | BF16 源转 `nf4_g16_e4m3fn` | lookup 解码为 BF16 |
-| MTP routed experts | BF16 源自量化为 NVFP4 | `A16Only`，无 A4 校准辅助值 |
+| MTP routed experts | NVIDIA E4M3FN codes，128×128 块 BF16 multiplier | `A16Only`，原编码导入 |
 | MTP 其他独有参数、全部 Vision | 原 BF16 words | 投影 `A16Only` |
 | PLE controls | 原始 35 个 INT64 | 无损资源，见 §4 |
 
@@ -167,21 +167,21 @@ Codes/scales words 保留，随后做目标 layout 的 packing/swizzle。Recipro
 
 Recipe 检查同 expert 的 gate/up 两个 multiplier words 均相等，且同层各 experts 的
 gate/up 输入 multiplier 相等、down 输入 multiplier 相等；条件不满足则拒绝该来源。
-Gate/up 可因此共用一个 parent 的 `d_w`，不同 expert 仍各自持有 divisor。
+Gate/up 可因此共用同一矩阵的 `d_w`，同一 bank 内不同 expert 仍各自持有 divisor。
 主模型 activation divisors 存为 FP32 `[48,2]`：C-order 元素 `2*l` 为 gate/up 输入，
 `2*l+1` 为 down 输入。对应 Uses 共享该 scalar 引用，weight divisor 与 activation divisor
 分别解释。
 
-### 2.3 PLE 与 MTP 自量化
+### 2.3 MTP FP8 导入与 PLE 自量化
 
-两者使用 [stored_scale_mse](tensor-formats.md#36-stored_scale_mse-conversion-method)。
-PLE 每个原始 shard 独立计算完整 `amax` 与 divisor；MTP 每 expert 的合并 gate/up parent
-及 down parent 分别计算。固定 codebook、完整 scale 候选域、FP64 误差和平局规则由该
-通用合同维护。分块只改变工作集，不能改变分组或 divisor。
+MTP 使用 `fp8_e4m3fn_block128x128_bf16`，源 `weight` 和 `weight_scale_inv` 分别是
+E4M3FN codes 和 BF16 块乘数，重建为 `code_value * scale`。Gate/up 的 scale 可以不同；
+640 行边界与 128 行块对齐，合并时直接拼接各自 codes 和 scale 行，不改变数值表示。
 
-该方法不提供 activation calibration。NVIDIA 来源的 MTP/PLE 使用不同表示，本 recipe
-从 BF16 自量化，MTP 不继承主 expert 的 A4 许可。主 expert 的来源校准也不能替代整个
-Q8/NVFP4/NF4 组合的模型质量验证；这仍属于模型接入后的验收。
+PLE 使用 [stored_scale_mse](tensor-formats.md#36-stored_scale_mse-conversion-method)，
+每个原始 shard 独立计算完整 `amax` 与 divisor。固定 codebook、完整 scale 候选域、
+FP64 误差和平局规则由该通用合同维护。分块只改变工作集，不能改变分组或 divisor。
+MTP 保持 A16 激活许可；完整量化组合的模型质量及 MTP 接受率在模型接入后验证。
 
 ## 3. 物理 parent 与行顺序
 
@@ -190,7 +190,7 @@ Q8/NVFP4/NF4 组合的模型质量验证；这仍属于模型接入后的验收�
 原生 Tensor 第 0 维连续；`M=T*B`、`column=t+T*b`。普通 Linear 使用 `[K,M]→[N,M]`，
 MTP fc_hidden 共享作用于四条 stream 时使用 `4M` 列。
 
-| Parent | 数量 Main / MTP | `[N,K]` | 格式 | 行顺序 |
+| Parent | 数量 Main / MTP | 逻辑 shape | 格式 | 行顺序 |
 |---|---:|---|---|---|
 | GDN QKVZ | 36 / 0 | `[16384,2560]` | Q8 | Q `[0,2048)`；K `[2048,4096)`；V `[4096,10240)`；Z `[10240,16384)` |
 | GDN AB | 36 / 0 | `[96,2560]` | BF16 | a `[0,48)`；b `[48,96)` |
@@ -206,8 +206,8 @@ MTP fc_hidden 共享作用于四条 stream 时使用 `4M` 列。
 | PLE KV | 1 / 0 | `[12800,2560]` | BF16 | 四流 key `[0,10240)`；共享 value `[10240,12800)` |
 | MoE input | 48 / 1 | `[1793,2560]` | BF16 | router `[0,512)`；shared score `[512,513)`；shared gate `[513,1153)`；shared up `[1153,1793)` |
 | Shared expert down | 48 / 1 | `[2560,640]` | BF16 | 原 down_proj 行序 |
-| Routed expert gate/up | 24576 / 512 | `[1280,2560]` | NVFP4 | 每 expert 独立；gate `[0,640)`；up `[640,1280)` |
-| Routed expert down | 24576 / 512 | `[2560,640]` | NVFP4 | 每 expert 独立 |
+| Routed expert gate/up bank | 48 / 1 | `[512,1280,2560]` | Main NVFP4 / MTP block-FP8 | expert-major；每 expert 内 gate `[0,640)`、up `[640,1280)` |
+| Routed expert down bank | 48 / 1 | `[512,2560,640]` | Main NVFP4 / MTP block-FP8 | expert-major |
 | MTP fc_embedding | 0 / 1 | `[2560,2560]` | BF16 | 独立矩阵，M 列 |
 | MTP fc_hidden | 0 / 1 | `[2560,2560]` | BF16 | 独立矩阵，共享作用于四流，4M 列 |
 | LM head | 一份，MTP 共享 | `[248320,2560]` | BF16 | vocabulary 顺序 |
@@ -263,14 +263,19 @@ native view。PLE channel 连续布局已做 Op 对照，未显示与源布局�
 Use 输入名以 adapter 为准。同 parent 的完整行 `[a,b)` 对应 Binding 逻辑元素区间
 `[a*K,b*K)`。区间不包含 scale bytes，上传和绑定不重新排列 Q/gate 或卷积。
 
-每 expert 有两个普通 rank-2 NVFP4 objects，Main 共 49152 个、MTP 共 1024 个。
+每层有 gate/up、down 两个 rank-3 bank objects，Main 共 96 个、MTP 共 2 个。
 逻辑 bank 为 gate/up 各 `[512,640,2560]`、down `[512,2560,640]`；Binding parts 按
-expert ID 引用各自 parent 的 gate/up 两半或完整 down。每个 part 必须保留 parent geometry、
-scale swizzle 与独立 `d_w`。Bank 是有序对象集合，不增加新的数值格式。
+expert ID 引用 parent 内各矩阵的 gate/up 两半或完整 down。逻辑 range 沿 C-order 元素
+计数；scale 和 divisor 不属于该元素域。NVFP4 part 保留 bank geometry、scale swizzle
+及所属矩阵的 `d_w`。
 
-NVFP4 使用 `block_scale_k16_m128x4_v1`：每 expert 的 gate/up payload 为 1843204 B，
-down 为 921604 B，共 2764808 B。对象起点按 256 B 对齐，相邻起点跨度合计 2765312 B；
-activation divisor 经 Use 引用辅助对象。GPU expert cache 保存同一编码原字节。
+Main 使用 `batched_block_scale_k16_m128x4_v1`，每个 bank 按全部 codes、全部 swizzled
+scales、FP32 divisors `[512]` 排列。Gate/up bank 为 943720448 B，down 为 471861248 B。
+对象按 256 B 对齐；activation divisor 经 Use 引用辅助对象。单 expert 的编码可通过固定
+plane 步长取得，GPU cache 保存原 codes/scales 和对应 divisor。
+
+MTP 使用 `block_scale_m128_k128_v1`：自然行序 codes 后接 BF16 scales
+`[512,10,20]` 或 `[512,20,5]`。两个 bank 分别为 1677926400 B 和 838963200 B。
 
 PLE table Binding 按 shard ID 引用 128 个完整 NF4 parents，保留原 shard 边界和各自
 divisor。使用 `row_paged_g16_4k_v1`；本实例每行 90 B，每 4 KiB 页 45 行，每 shard
@@ -291,8 +296,8 @@ lookup 的 BF16 精确舍入与行解码见 [PLE I/O](qwen4_exp-ple-io.md)。
 hash 的 64-bit word、EOS 与历史规则由 PLE I/O 合同维护。
 
 本 recipe 的物理放置顺序是资源/辅助值、Main 固定权重、Vision、MTP、Main experts、
-PLE shards。Main experts 按 layer→expert→gate_up/down 相邻放置，PLE 按 shard ID 放置，
-对象起点 4096 B 对齐。MTP experts 位于自己的常驻组件区域。共享 embedding/head 不复制，
+PLE shards。Main experts 按 layer→gate_up/down bank 放置，PLE 按 shard ID 放置。
+普通权重对象按 256 B 对齐，PLE 对象按 4096 B 对齐。MTP experts 位于自己的常驻组件区域。共享 embedding/head 不复制，
 A16/A4 共用同一份 NVFP4 编码。对象允许跨 V3 续卷，文件名不承担参数身份。
 
 ## 5. 驻留与容量
@@ -320,14 +325,14 @@ staging、请求状态及 Graph。完整 Host expert backing 包括已缓存到 
 | Main routed experts | 67947921408 | 63.281433 |
 | PLE NF4 表 | 29127344640 | 27.126954 |
 | Vision | 897862112 | 0.836199 |
-| MTP experts | 1415581696 | 1.318363 |
+| MTP experts | 2516889600 | 2.344036 |
 | MTP 其他独有权重 | 181136896 | 0.168697 |
-| 全部组件 | **106987990648** | **99.640331** |
+| 全部组件 | **108089298552** | **100.666004** |
 
 Text-only payload 约 97.317072 GiB；启用 Vision+MTP 时固定 GPU 权重 payload 约
-9.231944 GiB，再加 Main expert cache。本机全组件产物入口为
-`out/qwen3_8_flash_next.ninfer`，另有同名前缀的 `.part-0001`、`.part-0002`、`.part-0003`，
-四文件合计 **107025649668 bytes**。文件集合总长与上述 payload 分开计算，PLE
+10.257617 GiB，再加 Main expert cache。本机全组件产物入口为
+`out/qwen3_8_flash_next.ninfer`，续卷由入口的 `files` 表声明。
+文件集合总长与上述 payload 分开计算，PLE
 磁盘化只改变驻留成本。RAM 还须计入 reader/cache metadata、pinned staging、进程和系统
 占用；GPU 还须计入页组、固定状态、候选记录、workspace、Graph 和传输槽。
 执行资源的具体容量与同时存活关系见[执行文档](qwen4_exp-execution.md)和

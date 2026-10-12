@@ -320,6 +320,7 @@ group size、scale 类型和解码规则直接由该 codec 定义。
 | q8_g32_fp16 | Codes `[-127,127]`，G32，FP16 multiplier |
 | nvfp4 | E2M1 codes、G16 E4M3FN block scale、FP32 weight divisor |
 | fp8_e4m3fn_row_bf16 | E4M3FN codes，每行一个 BF16 multiplier |
+| fp8_e4m3fn_block128x128_bf16 | E4M3FN codes，每 128×128 块一个 BF16 multiplier |
 | nf4_g16_e4m3fn | 固定 NF4 codebook，G16 E4M3FN block scale，FP32 weight divisor |
 
 量化名字末尾的 FP16/BF16 表示 scale 类型。激活计算许可在 uses 中表达。
@@ -336,6 +337,8 @@ Code 范围、特殊浮点值、舍入与精确重建按[数值合同](tensor-fo
 | contiguous_le_v1 | bf16/fp32/int32，rank 0..16 | 256 |
 | row_split_k128_v1 | q4_g64_fp16、q5_g64_fp16、q6_g64_fp16、q8_g32_fp16，正 rank-2 `[N,K]` | 256 |
 | block_scale_k16_m128x4_v1 | nvfp4，`N%128=0`、`K%64=0` | 256 |
+| batched_block_scale_k16_m128x4_v1 | nvfp4，rank-3 `[E,N,K]`，`N%128=0`、`K%64=0` | 256 |
+| block_scale_m128_k128_v1 | fp8_e4m3fn_block128x128_bf16，`[N,K]` 或 `[E,N,K]`，N/K 为 128 的倍数 | 256 |
 | row_scale_v1 | fp8_e4m3fn_row_bf16，正 rank-2 `[N,K]` | 256 |
 | row_paged_g16_4k_v1 | nf4_g16_e4m3fn，正 rank-2 `[N,K]`、`K%16=0`、encoded row≤4096 B | 4096 |
 | raw_bytes_v1 | Resource，非空字节串 | 1 |
@@ -409,7 +412,8 @@ Binder 检查逻辑覆盖和对应关系，并保留每个 Part 的 parent、原
 
 Zero-copy view 由实际 layout 与 consumer 的寻址能力决定。RowSplit 的一段逻辑行涉及 base、
 可选 high-bit 和 scale 等多个 plane 区间；NVFP4 的 view 还保留原 parent 的 scale swizzle 与
-weight divisor。Materializer 上传 parent 的原始编码，Op 准备其真实可消费的 view。
+所属矩阵的 weight divisor。Bank 中各矩阵的 divisor 独立；一个 native NVFP4 矩阵 view
+不能跨越 divisor 域。Materializer 上传 parent 的原始编码，Op 准备其真实可消费的 view。
 需要改变 packing 或重新组织编码的工作由 converter 完成。
 
 文件分片只影响 parent 字节的获取。即使一个 parent 跨多个文件，以上逻辑引用和 Op 参数关系

@@ -113,7 +113,7 @@ class PrepareRequest:
         cursor = 0
         for item in self.inputs:
             source = item.source
-            if len(source.shape) != 2 or source.shape[1] != self.target.shape[1]:
+            if len(source.shape) != 2 or source.shape[1] != self.target.shape[-1]:
                 raise ValueError(
                     f"{item.parameter}: encoded grouping requires complete rows"
                 )
@@ -238,54 +238,83 @@ def fp8_row_maxabs(request: PrepareRequest) -> PreparedMethod:
 
 
 def import_encoded(request: PrepareRequest) -> PreparedMethod:
-    """Preserve the current FP8/NVFP4 source codes, scales and weight divisor."""
+    """Preserve FP8/NVFP4 words, with independent divisors for bank matrices."""
+    block_fp8 = request.target.format == "fp8_e4m3fn_block128x128_bf16"
     if (
-        request.target.format not in ("nvfp4", "fp8_e4m3fn_row_bf16")
-        or len(request.target.shape) != 2
+        request.target.format
+        not in ("nvfp4", "fp8_e4m3fn_row_bf16", "fp8_e4m3fn_block128x128_bf16")
+        or len(request.target.shape) not in (2, 3)
+        or (
+            len(request.target.shape) == 3
+            and request.target.format == "fp8_e4m3fn_row_bf16"
+        )
     ):
-        raise ValueError("import_encoded requires a known encoded matrix target")
+        raise ValueError("import_encoded requires an encoded matrix or bank target")
     _preflight(request, values=False)
+    n, k = request.target.shape[-2:]
+    matrices = request.target.shape[0] if len(request.target.shape) == 3 else 1
     auxiliaries = {}
-    weight_divisor = None
+    divisors = {}
+    cursor = 0
     for item in request.inputs:
         source = item.source
+        if len(source.shape) != 2 or source.shape[1] != k:
+            raise ValueError(
+                f"{item.parameter}: encoded grouping requires complete rows"
+            )
+        if block_fp8 and source.shape[0] % 128:
+            raise ValueError(
+                f"{item.parameter}: FP8 source must contain whole 128-row blocks"
+            )
         if source.read_encoded is None:
             raise ValueError(f"{item.parameter}: encoded rows are unavailable")
-        first = source.read_encoded(0, 1)
+        first = source.read_encoded(0, 128 if block_fp8 else 1)
         if first.format != request.target.format:
             raise ValueError(
                 f"{item.parameter}: source {first.format} differs from target {request.target.format}"
             )
         if first.format == "nvfp4":
-            if weight_divisor is None:
-                weight_divisor = first.weight_divisor
-            elif first.weight_divisor != weight_divisor:
-                raise ValueError(
-                    "NVFP4 weight divisors differ; choose separate parents or a conversion method"
-                )
+            for matrix in range(cursor // n, (cursor + source.shape[0] - 1) // n + 1):
+                if matrix in divisors and divisors[matrix] != first.weight_divisor:
+                    raise ValueError("NVFP4 weight divisors differ within one matrix")
+                divisors[matrix] = first.weight_divisor
             for parameter, input_name in item.uses:
                 key = (parameter, input_name, "activation_input_divisor")
                 if key in request.auxiliary_overrides:
-                    auxiliaries[key] = request.auxiliary_overrides[key]
+                    value = request.auxiliary_overrides[key]
                 elif request.policies[(parameter, input_name)] == "AllowA4":
                     if source.input_divisor is None:
                         raise ValueError(
                             f"{parameter}: supply an activation divisor for AllowA4"
                         )
-                    auxiliaries[key] = AuxiliaryValue.activation_divisor(
-                        source.input_divisor()
+                    value = AuxiliaryValue.activation_divisor(source.input_divisor())
+                else:
+                    continue
+                if key in auxiliaries and auxiliaries[key] != value:
+                    raise ValueError(
+                        f"{parameter}: activation divisors differ within one Use"
                     )
-    n = request.target.shape[0]
+                auxiliaries[key] = value
+        cursor += source.shape[0]
     chunk = (
         max(128, request.rows_per_chunk // 128 * 128)
-        if request.target.format == "nvfp4"
+        if request.target.format == "nvfp4" or block_fp8
         else request.rows_per_chunk
     )
 
     def produce(output):
-        for begin in range(0, n, chunk):
-            words = request.encoded_rows(begin, min(n, begin + chunk))
-            output.write_codes(begin, words.codes, words.scales, words.weight_divisor)
+        for matrix in range(matrices):
+            for begin in range(0, n, chunk):
+                words = request.encoded_rows(
+                    matrix * n + begin, matrix * n + min(n, begin + chunk)
+                )
+                output.write_codes(
+                    begin,
+                    words.codes,
+                    words.scales,
+                    words.weight_divisor,
+                    matrix=matrix,
+                )
 
     return request.job(produce=produce, auxiliaries=auxiliaries)
 

@@ -82,9 +82,6 @@ SingleProjectionWeight single(const WeightView& view, std::span<const WeightInpu
     const auto policy = common_policy(inputs);
     float divisor     = 0;
     if (region.parent->geometry.format == QType::NVFP4) {
-        require(std::isfinite(region.parent->weight_scale_divisor) &&
-                    region.parent->weight_scale_divisor > 0,
-                "NVFP4 parent requires a positive weight divisor");
         for (const auto& input : inputs) {
             if (!input.activation_input_divisor) {
                 require(!allows_a4(policy), "NVFP4 A4 native input requires an activation divisor");

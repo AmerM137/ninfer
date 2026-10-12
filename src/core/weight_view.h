@@ -34,23 +34,25 @@ struct WeightGeometry {
     QType format       = QType::BF16;
     QuantLayout layout = QuantLayout::Contiguous;
     std::vector<std::uint64_t> shape;
-    std::uint64_t elements            = 0;
-    std::uint64_t bytes               = 0;
-    std::uint64_t alignment           = 256;
-    std::uint64_t padded_columns      = 0;
-    std::uint64_t group_size          = 0;
-    std::uint64_t code_bytes_per_row  = 0;
-    std::uint64_t high_bytes_per_row  = 0;
-    std::uint64_t scale_bytes_per_row = 0;
-    std::uint64_t code_bytes          = 0;
-    std::uint64_t high_offset         = 0;
-    std::uint64_t high_bytes          = 0;
-    std::uint64_t scale_offset        = 0;
-    std::uint64_t scale_bytes         = 0;
-    std::uint64_t divisor_offset      = 0;
-    std::uint64_t row_bytes           = 0;
-    std::uint64_t rows_per_page       = 0;
-    std::uint64_t page_count          = 0;
+    std::uint64_t elements           = 0;
+    std::uint64_t bytes              = 0;
+    std::uint64_t alignment          = 256;
+    std::uint64_t padded_columns     = 0;
+    std::uint64_t group_size         = 0;
+    std::uint64_t code_bytes_per_row = 0;
+    std::uint64_t high_bytes_per_row = 0;
+    std::uint64_t scale_block_rows   = 1;
+    std::uint64_t scale_row_bytes    = 0;
+    std::uint64_t code_bytes         = 0;
+    std::uint64_t high_offset        = 0;
+    std::uint64_t high_bytes         = 0;
+    std::uint64_t scale_offset       = 0;
+    std::uint64_t scale_bytes        = 0;
+    std::uint64_t divisor_offset     = 0;
+    std::uint64_t divisor_count      = 0;
+    std::uint64_t row_bytes          = 0;
+    std::uint64_t rows_per_page      = 0;
+    std::uint64_t page_count         = 0;
 };
 
 [[nodiscard]] WeightGeometry weight_geometry(QType format, QuantLayout layout,
@@ -60,8 +62,9 @@ struct WeightGeometry {
 struct WeightParent {
     WeightGeometry geometry;
     Device device;
-    const std::byte* data      = nullptr;
-    float weight_scale_divisor = 0.0F;
+    const std::byte* data = nullptr;
+    // Host metadata borrowed from the backing owner, including for CUDA parents.
+    std::span<const float> weight_divisors;
 };
 
 struct WeightRegion {
@@ -87,14 +90,15 @@ struct WeightView {
 
 struct WeightRowPlanes {
     Device device;
-    const std::byte* codes        = nullptr;
-    const std::byte* high         = nullptr;
-    const std::byte* scales       = nullptr;
-    std::uint64_t row_begin       = 0;
-    std::uint64_t row_count       = 0;
-    std::uint64_t code_row_bytes  = 0;
-    std::uint64_t high_row_bytes  = 0;
-    std::uint64_t scale_row_bytes = 0;
+    const std::byte* codes         = nullptr;
+    const std::byte* high          = nullptr;
+    const std::byte* scales        = nullptr;
+    std::uint64_t row_begin        = 0;
+    std::uint64_t row_count        = 0;
+    std::uint64_t code_row_bytes   = 0;
+    std::uint64_t high_row_bytes   = 0;
+    std::uint64_t scale_row_bytes  = 0;
+    std::uint64_t scale_block_rows = 1;
     // NVFP4 keeps the parent scale base; use its row origin and block geometry.
     bool swizzled_scales = false;
 };
@@ -102,8 +106,8 @@ struct WeightRowPlanes {
 [[nodiscard]] WeightRowPlanes weight_row_planes(const WeightRegion& region);
 [[nodiscard]] Tensor weight_tensor(const WeightView& view,
                                    std::initializer_list<std::int32_t> internal_shape);
-// Existing Weight ABI: complete quantized parents, direct regions, and RowSplit row views.
-// Arbitrary FP8/NVFP4 regions use their explicit planes until a native consumer supports them.
+// A matrix view preserves K and scale-block boundaries. NVFP4 views stay within one
+// matrix divisor domain; block scales are rebased to the view's local coordinates.
 [[nodiscard]] Weight native_weight(const WeightView& view, float input_divisor = 0.0F);
 
 } // namespace ninfer

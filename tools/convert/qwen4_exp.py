@@ -152,32 +152,39 @@ class Builder:
     ):
         shape = tuple(shape)
         original = tuple(source_shape or shape)
-        info = self.base.describe(source)
-        if info.shape != original or info.dtype != "BF16":
-            raise ValueError(
-                f"{source}: expected BF16 {original}, got {info.dtype} {info.shape}"
-            )
-        self.consumed.add(source)
-        ref = tensor_source(
-            self.base,
-            source,
-            shape if offset else original,
-            offset=offset,
-            source_shape=original,
-        )
-        if transpose is not None:
-            ref = transpose_source(ref, transpose, shape)
-        elif rows is not None:
-            ref = select_rows(ref, tuple(rows))
-        elif ref.shape != shape:
+
+        def factory(store, format=None):
+            if format not in (None, direct):
+                raise ValueError(f"{name}: this source mapping requires {direct}")
+            info = store.describe(source)
+            if info.shape != original or info.dtype != "BF16":
+                raise ValueError(
+                    f"{source}: expected BF16 {original}, got {info.dtype} {info.shape}"
+                )
             ref = tensor_source(
-                self.base, source, shape, offset=offset, source_shape=original
+                store,
+                source,
+                shape if offset else original,
+                offset=offset,
+                source_shape=original,
             )
+            if transpose is not None:
+                ref = transpose_source(ref, transpose, shape)
+            elif rows is not None:
+                ref = select_rows(ref, tuple(rows))
+            elif ref.shape != shape:
+                ref = tensor_source(
+                    store, source, shape, offset=offset, source_shape=original
+                )
+            return ref
+
+        self.consumed.add(source)
         self.model.add(
             Parameter(
                 name,
                 shape,
-                ref,
+                factory(self.base),
+                source_factory=factory,
                 inputs=tuple(inputs),
                 direct_format=direct,
                 residency=name.split("/")[0],

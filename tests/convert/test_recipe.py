@@ -288,6 +288,52 @@ def test_incompatible_nvfp4_divisors_keep_default_parents_separate():
         recipe.prepare(device="cpu")
 
 
+def test_nvfp4_bank_import_preserves_expert_divisor_domains(tmp_path):
+    model = Model({"text": {"config": {}}})
+    logical = array_source(torch.zeros((3, 128, 64)), "unused bf16 bank")
+    for role in ("gate", "up"):
+        model.add(Parameter(role, logical.shape, logical))
+    recipe = Recipe(model)
+    parts, codes, scales = [], [], []
+    for expert, divisor in enumerate((2.0, 3.0, 5.0)):
+        expert_codes, expert_scales = [], []
+        for role, shift in (("gate", 11), ("up", 37)):
+            source, q, s = _encoded_source(role, divisor, shift=expert * 23 + shift)
+            parts.append((role, expert * 8192, (expert + 1) * 8192, source))
+            expert_codes.append(q)
+            expert_scales.append(s)
+        codes.append(torch.cat(expert_codes))
+        scales.append(torch.cat(expert_scales))
+    recipe.parent(
+        parts,
+        shape=(3, 256, 64),
+        format="nvfp4",
+        method=import_encoded,
+        layout="batched_block_scale_k16_m128x4_v1",
+    )
+    prepared = recipe.prepare(device="cpu", rows_per_chunk=511)
+    path = tmp_path / "bank.ninfer"
+    _write(path, model, prepared)
+    with Artifact(path) as artifact:
+        payload = artifact.read_object(prepared.weights[0].spec.id)
+    assert payload == encode_nvfp4(
+        torch.stack(codes),
+        torch.stack(scales),
+        struct.pack("<fff", 2, 3, 5),
+        (3, 256, 64),
+    )
+    assert [p["range"] for p in prepared.bindings["gate"]["parts"]] == [
+        [0, 8192],
+        [16384, 24576],
+        [32768, 40960],
+    ]
+    assert [p["range"] for p in prepared.bindings["up"]["parts"]] == [
+        [8192, 16384],
+        [24576, 32768],
+        [40960, 49152],
+    ]
+
+
 def test_alias_does_not_inherit_another_uses_calibration():
     model = Model({"text": {"config": {}}})
     source, _, _ = _encoded_source("key", 2.0)

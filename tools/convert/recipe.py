@@ -11,6 +11,7 @@ from typing import Sequence
 from tools.artifact.layouts import encoded_size
 from tools.artifact.formats import (
     DirectFormat,
+    Fp8BlockFormat,
     Fp8RowFormat,
     Nvfp4Format,
     Nf4Format,
@@ -75,6 +76,8 @@ def default_layout(format: str) -> str:
         return "contiguous_le_v1"
     if isinstance(kind, Fp8RowFormat):
         return "row_scale_v1"
+    if isinstance(kind, Fp8BlockFormat):
+        return "block_scale_m128_k128_v1"
     if isinstance(kind, Nvfp4Format):
         return "block_scale_k16_m128x4_v1"
     if isinstance(kind, Nf4Format):

@@ -64,11 +64,16 @@ int verify_output(std::string_view label, const GuardedBf16Tensor& output,
     return failures;
 }
 
-WeightParent physical_parent(const Weight& weight) {
+WeightParent physical_parent(const DevicePackedWeight& source) {
+    const auto weight = source.view();
     const std::array shape{static_cast<std::uint64_t>(weight.n),
                            static_cast<std::uint64_t>(weight.k)};
-    return {weight_geometry(weight.qtype, weight.layout, shape), weight.device,
-            static_cast<const std::byte*>(weight.payload), weight.weight_scale_divisor};
+    auto geometry       = weight_geometry(weight.qtype, weight.layout, shape);
+    const auto divisors = weight.qtype == QType::NVFP4
+                              ? std::span(&source.host.weight.weight_scale_divisor, 1)
+                              : std::span<const float>{};
+    return {std::move(geometry), weight.device, static_cast<const std::byte*>(weight.payload),
+            divisors};
 }
 
 WeightView rows(const WeightParent& parent, std::uint64_t begin, std::uint64_t count) {
@@ -93,8 +98,8 @@ int run_target_projection_case(DevicePackedWeight& parent, DevicePackedWeight* g
     GuardedDeviceBuffer scratch(std::max<std::size_t>(capacity, 1));
     MemoryArena workspace(scratch.span().subspan(0, std::max<std::size_t>(capacity, 1)));
     DeviceContext device;
-    const auto first    = physical_parent(parent.view());
-    const auto second   = gate_value ? physical_parent(gate_value->view()) : first;
+    const auto first    = physical_parent(parent);
+    const auto second   = gate_value ? physical_parent(*gate_value) : first;
     const auto q_weight = rows(first, 0, qrows), k_weight = rows(first, qrows, kvrows);
     const auto g_weight = rows(dual ? second : first, dual ? 0 : 7168, qrows);
     const auto v_weight = rows(dual ? second : first, dual ? 6144 : 13312, kvrows);
@@ -380,7 +385,7 @@ int run_nvfp4_target_case(DevicePackedWeight& parent, std::int32_t tokens,
     ninfer::DeviceBuffer workspace_storage(ninfer::test::cuda_environment().context.device(),
                                            std::max<std::size_t>(capacity, 256));
     MemoryArena workspace(workspace_storage.span());
-    const auto physical = physical_parent(parent.view());
+    const auto physical = physical_parent(parent);
     const auto qw = rows(physical, 0, 6144), kw = rows(physical, 6144, 1024);
     const auto gw = rows(physical, 7168, 6144), vw = rows(physical, 13312, 1024);
     const auto divisor      = parent.view().input_scale_divisor;
@@ -548,7 +553,7 @@ int run_q8_qkv_case(DevicePackedWeight& parent, std::int32_t hidden, const char*
     if (graph_replay) context.emplace();
     const auto cuda   = context ? context->execution_view() : cuda_environment().default_execution;
     const auto stream = cuda.stream();
-    const auto physical       = physical_parent(parent.view());
+    const auto physical = physical_parent(parent);
     const auto qw = rows(physical, 0, 4096), kw = rows(physical, 4096, 1024);
     const auto vw = rows(physical, 5120, 1024);
     const auto prepared =

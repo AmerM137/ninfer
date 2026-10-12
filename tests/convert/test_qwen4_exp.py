@@ -75,6 +75,15 @@ def test_qsa_q_gate_rows_and_gdn_conv_axes():
     assert torch.equal(conv, store.tensors["linear_attn.conv1d.weight"][:, 0, :].T)
     assert model.parameters["text/gdn/a_log"].direct_format == "fp32"
     assert model.parameters["text/gdn/dt_bias"].direct_format == "fp32"
+    replacement = Checkpoint({name: values + 1 for name, values in store.tensors.items()})
+    assert torch.equal(
+        model.source("text/attention/query", replacement).values().reshape(-1, 2),
+        query + 1,
+    )
+    assert torch.equal(
+        model.source("text/gdn/convolution", replacement).values().reshape(4, 8),
+        conv + 1,
+    )
 
 
 def test_expert_source_splits_each_expert_gate_up_before_joining_bank():

@@ -11,6 +11,7 @@ from .methods import (
     stored_scale_mse,
 )
 from .recipe import AuxiliaryReference
+from .sources.fp8_block import fp8_block_source
 from .sources.modelopt_nvfp4 import ModelOptNvfp4
 from .sources.safetensors import tensor_source
 
@@ -185,10 +186,11 @@ def qwen3_8_27b_nvfp4(model, recipe, sources):
 
 
 def qwen3_8_flash_next(model, recipe, sources):
-    """Qwen4Exp: Q8 main projections, imported NVFP4 experts and paged NF4 PLE."""
+    """Qwen4Exp: NVIDIA NVFP4/FP8 expert banks, Q8 projections and paged NF4 PLE."""
     recipe.provenance.update(
         mapping="qwen4_exp_v1",
         nvidia_nvfp4="preserve_codes_scales; RN_FP32(1/multiplier) divisors",
+        nvidia_mtp="preserve_e4m3fn_codes_bf16_block128x128_scales",
         stored_scale_mse="g16_fp64_exhaustive_e4m3fn_v1",
         q_gate_order="all_query_heads_then_all_gate_heads",
         convolution_order="tap_channel",
@@ -247,12 +249,14 @@ def qwen3_8_flash_next(model, recipe, sources):
 
     h, intermediate, experts = 2560, 640, 512
     width = h * intermediate
-    nvidia = ModelOptNvfp4(sources["nvidia_experts"])
+    nvidia = ModelOptNvfp4(sources["nvidia"])
     controls = []
     covered = set()
     for layer in range(48):
         p = f"text/layers/{layer}/moe/experts/"
         layer_inputs = None
+        gate_up_parts = []
+        down_parts = []
         for expert in range(experts):
             prefix = f"model.language_model.layers.{layer}.mlp.experts.{expert}."
             refs = {}
@@ -283,22 +287,29 @@ def qwen3_8_flash_next(model, recipe, sources):
                     f"{prefix}: activation multipliers differ within the layer"
                 )
             first, last = expert * width, (expert + 1) * width
+            gate_up_parts.extend(
+                (p + role, first, last, refs[role]) for role in ("gate", "up")
+            )
+            down_parts.append((p + "down", first, last, refs["down"]))
+        for part, shape, order in (
+            (gate_up_parts, (experts, 2 * intermediate, h), 0),
+            (down_parts, (experts, h, intermediate), 1),
+        ):
             recipe.parent(
-                [(p + role, first, last, refs[role]) for role in ("gate", "up")],
-                shape=(2 * intermediate, h),
+                part,
+                shape=shape,
                 format="nvfp4",
                 method=import_encoded,
-                order=(3, layer, expert, 0),
+                layout="batched_block_scale_k16_m128x4_v1",
+                order=(3, layer, order),
             )
-            recipe.parent(
-                [(p + "down", first, last, refs["down"])],
-                shape=(h, intermediate),
-                format="nvfp4",
-                method=import_encoded,
-                order=(3, layer, expert, 1),
-            )
-    if covered != set(nvidia.store.weight_map):
-        raise ValueError("NVIDIA source must be the complete dedicated experts index")
+    expected_experts = {
+        key
+        for key in nvidia.store.weight_map
+        if key.startswith("model.language_model.layers.") and ".mlp.experts." in key
+    }
+    if covered != expected_experts:
+        raise ValueError("NVIDIA source must contain the complete main expert tensors")
     recipe.auxiliary_tensor(
         "expert_activation_divisors",
         AuxiliaryValue("fp32", (48, 2), b"".join(controls)),
@@ -320,42 +331,35 @@ def qwen3_8_flash_next(model, recipe, sources):
     if "mtp" in model.components:
         for role in ("token_embedding", "output_head"):
             recipe.share("mtp/" + role, "text/" + role)
+        for name, parameter in model.parameters.items():
+            if name.startswith("mtp/") and parameter.source_factory is not None:
+                recipe.assign(name, source=model.source(name, nvidia.store))
         p = "mtp/layers/0/moe/experts/"
+        gate_up_parts = []
+        down_parts = []
         for expert in range(experts):
             refs = {}
             for role in ("gate", "up", "down"):
-                down = role == "down"
-                name = "mtp.layers.0.mlp.experts." + (
-                    "down_proj" if down else "gate_up_proj"
-                )
-                offset = (
-                    expert * width if down else (2 * expert + int(role == "up")) * width
-                )
-                refs[role] = tensor_source(
-                    sources["base"],
-                    name,
-                    (h, intermediate) if down else (intermediate, h),
-                    offset=offset,
-                    source_shape=(
-                        (experts, h, intermediate)
-                        if down
-                        else (experts, 2 * intermediate, h)
-                    ),
+                refs[role] = fp8_block_source(
+                    nvidia.store,
+                    f"mtp.layers.0.mlp.experts.{expert}.{role}_proj",
+                    (h, intermediate) if role == "down" else (intermediate, h),
                 )
             first, last = expert * width, (expert + 1) * width
-            recipe.parent(
-                [(p + role, first, last, refs[role]) for role in ("gate", "up")],
-                shape=(2 * intermediate, h),
-                format="nvfp4",
-                method=stored_scale_mse,
-                order=(2, 1, expert, 0),
+            gate_up_parts.extend(
+                (p + role, first, last, refs[role]) for role in ("gate", "up")
             )
+            down_parts.append((p + "down", first, last, refs["down"]))
+        for part, shape, order in (
+            (gate_up_parts, (experts, 2 * intermediate, h), 0),
+            (down_parts, (experts, h, intermediate), 1),
+        ):
             recipe.parent(
-                [(p + "down", first, last, refs["down"])],
-                shape=(h, intermediate),
-                format="nvfp4",
-                method=stored_scale_mse,
-                order=(2, 1, expert, 1),
+                part,
+                shape=shape,
+                format="fp8_e4m3fn_block128x128_bf16",
+                method=import_encoded,
+                order=(2, 1, order),
             )
 
     rows, k = cfg["ple_shard_shape"]

@@ -57,7 +57,7 @@ The built-in recipes are ordinary Python functions in
 | `qwen3_6_35b_a3b` | Q4 experts, Q5/Q6 expert down, Q8 shared/projection weights | None |
 | `qwen3_6_27b_nvfp4` | Imported NVFP4, selected BF16 projections, Q8 vocabulary weights | `quantized` |
 | `qwen3_8_27b_nvfp4` | Imported NVFP4/FP8, FP8 embedding generated from BF16 | `quantized` |
-| `qwen3_8_flash_next` | Q8 main projections, NVIDIA NVFP4 experts, paged NF4 PLE, BF16 auxiliary projections/Vision, self-quantized NVFP4 MTP experts | `nvidia_experts` |
+| `qwen3_8_flash_next` | Q8 main projections, NVIDIA NVFP4 expert banks, NVIDIA block-FP8 MTP experts, paged NF4 PLE, BF16 auxiliary projections/Vision | `nvidia` |
 
 These names select conversion choices. Runtime execution is selected from the architecture,
 configuration and actual bindings stored in the artifact. `--name` sets the public model name;
@@ -83,13 +83,13 @@ as `--source dflash=PATH` or `--source dflash2=PATH`. An artifact may contain se
 components; the Engine loads only the ones selected at startup, including at most one speculative
 backend. Component availability and startup selection are independent.
 
-For Qwen3.8-Flash-Next, select the dedicated NVIDIA expert index:
+For Qwen3.8-Flash-Next, select the complete NVIDIA checkpoint for Main experts and MTP:
 
 ```bash
 OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 python3 -m tools.convert \
   --model /path/to/Qwen3.8-Flash-Next/base-hf-bf16 \
   --recipe qwen3_8_flash_next \
-  --source nvidia_experts=/path/to/nvidia-nvfp4-experts/experts.safetensors.index.json \
+  --source nvidia=/path/to/Qwen3.8-Flash-Next/nvidia-nvfp4 \
   --components text,vision,mtp \
   --rows-per-chunk 16384 \
   --name qwen3.8-flash-next \
@@ -100,7 +100,10 @@ The Qwen4Exp adapter supports Text, Vision and MTP conversion. Engine execution,
 indexed proposal are not yet connected for this architecture. CUDA self-quantization compiles
 the SM120 encoder on first use and requires a CUDA toolkit, C++ compiler and Ninja.
 PLE uses two bounded passes per shard, with no full-table materialization. The complete recipe
-contains about 99.64 GiB of weight/control payload, split by the existing V3 writer.
+contains about 100.67 GiB of weight/control payload, split by the existing V3 writer.
+Main experts use two NVFP4 banks per layer with independent matrix divisors. MTP uses two
+128×128 block-FP8 banks, preserving NVIDIA E4M3FN codes and BF16 multipliers; its other private
+parameters also come from the NVIDIA source. PLE alone uses the BF16-to-NF4 stored-scale method.
 See the [model and weight contract](maintainer/qwen4_exp-model.md) for exact layouts and precision.
 
 ## Change part of a recipe
@@ -175,6 +178,7 @@ The converter currently writes these formats:
 | `bf16`, `fp32`, `int32` | `cast_direct` | Direct words through the source reader |
 | `q4_g64_fp16`, `q5_g64_fp16`, `q6_g64_fp16`, `q8_g32_fp16` | `grouped_absmax` | Supply a custom method/source if needed |
 | `fp8_e4m3fn_row_bf16` | `fp8_row_maxabs` | `import_encoded` |
+| `fp8_e4m3fn_block128x128_bf16` | None | `import_encoded` |
 | `nvfp4` | `stored_scale_mse` | `import_encoded` |
 | `nf4_g16_e4m3fn` | `stored_scale_mse` | Supply encoded words through `TensorOutput` |
 
@@ -182,6 +186,8 @@ The converter currently writes these formats:
 rounds input values to BF16, then produces E4M3FN codes and one BF16 multiplier per row.
 `import_encoded` preserves compatible code and scale words, including NVFP4's matrix weight divisor.
 It does not dequantize and requantize them.
+Rank-three NVFP4 targets select `batched_block_scale_k16_m128x4_v1` explicitly; each matrix owns
+its divisor. Block-FP8 uses `block_scale_m128_k128_v1` for matrices and banks.
 
 `stored_scale_mse` computes one FP32 divisor from the complete parent amax, then searches stored
 E4M3FN scales per G16 group using FP64 reconstruction error. NF4 uses the fixed codebook;
@@ -373,6 +379,8 @@ including explicit groups. `output.write_codes` performs the registered packing 
 codes/scales; the method should not duplicate that byte-layout logic. Direct output uses
 `output.write_values`. Keep source blocks and temporary device tensors bounded to the method's
 working set. `--rows-per-chunk` defaults to 512; custom methods own how they use it.
+For an encoded bank, `output.write_codes(..., matrix=e)` writes rows within matrix e. NVFP4
+checks divisor consistency within that matrix; block-FP8 writes complete 128-row scale blocks.
 
 ## Resources, files and inspection
 
