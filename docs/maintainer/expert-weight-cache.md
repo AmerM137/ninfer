@@ -5,8 +5,8 @@
 执行与生命周期由 [Engine 架构](engine-architecture.md)拥有。
 
 当前公开 Engine 仍使用全 GPU 权重。这里提供后续 CPU/GPU MoE 接入所需的底层能力，
-GPU 路由、专家子集计算与完整融合计算已有独立 Op；CPU expert 算子、混合 Program 调度
-和 Engine 显存预算选项尚未接入。
+GPU 路由、专家子集计算与完整融合计算已有独立 Op；CPU `routed_swiglu` 支持 Q4 GU + Q5/Q6
+down，直接消费 Host bank 并产生 FP32 分项。混合 Program 调度和 Engine 显存预算选项尚未接入。
 
 ## 来源与身份
 
@@ -159,22 +159,24 @@ CUDA 提交失败后缓存停止接受工作，销毁前排空已提交传输和
 - `topk_softmax_route` 写出 logical expert IDs、原始 top-k softmax 系数和独立 shared sigmoid
   系数。路由张量为 I32/FP32 `[K,T]`，shared 系数为 FP32 `[T]`。
 - `routed_swiglu` 消费同一次路由，可以计算 All、None、mask 的 1 侧或 0 侧；不重新归一化。
-  mask 表示计算分工，offset table 表示物理位置。两者独立，未选 expert 的偏移和权重不被读取。
+  mask 表示计算分工，GPU offset table 表示物理位置。两者独立，未选 expert 的偏移和权重不被读取。
   可选 shared term 在 GPU 上计算一次，也适用于 None。
-- 分项计算可写 FP32 `[H,T]`；最终计算可写 BF16，或在一次最终舍入前加上原 BF16 residual。
+- CPU 分支写 FP32 `[H,T]`；GPU 分项可写 FP32，最终计算可写 BF16，或在一次最终舍入前加上原 BF16 residual。
   `sum_contributions` 接受一到两份 FP32 分项与可选 BF16 residual，产生 BF16 输出。
 - `topk_softmax_swiglu_moe` 定义完整 router、routed/shared SwiGLU 与可选 residual 的融合计算。
   它与独立 Op 共用 kernel 机制，保有自己的格式/shape 分派和调优策略；全 GPU Main/MTP
   通过这一入口执行。
 
 当前 CUDA 数学支持 35B 的 Q4+Q5、Q4+Q6 和 Q8+Q8 expert profile，shared 为 Q8。
+CPU 支持 Q4+Q5、Q4+Q6，输入为 BF16，SiLU 与 down 输入保持 FP32，不量化激活。
 NVFP4/Block-FP8 的来源与寻址可描述，不表示这些 expert 数学已实现。
 `CudaSwiGLUExperts` 借用 affine 或 indexed GPU bank；`CpuSwiGLUExperts` 借用完整原生 Host bank，
-留给 CPU 数学消费者。activation divisor 属于 Use，matrix divisor 属于权重表示，二者不互相替代。
+直接按各 plane 的偏移和步长消费。activation divisor 属于 Use，matrix divisor 属于权重表示，二者不互相替代。
 融合 GU/down 分别取相关 Use 的 activation policy 交集；NVFP4 A4 需要共同的正值 activation divisor。
 
-Op 不分配长期资源、不上传权重，也不读取 Host 路由值。Program 提供 scratch 和执行 view，
-负责发布、acquire/release 及 bridge 完成依赖。固定 profile 的 Graph 可以重放新的路由、mask 和
+Op 不分配长期资源或上传权重；CUDA 分支消费 Device 路由，CPU 分支同步消费 Host 路由。
+Program 提供 scratch 和执行 view，负责发布、acquire/release 及 bridge 完成依赖。
+固定 profile 的 CUDA Graph 可以重放新的路由、mask 和
 索引内容；更新必须发生在旧消费者结束之后。shared 始终驻留 GPU，不进入动态 expert 集合。
 
 ## 后续接入
@@ -205,7 +207,7 @@ Op 不分配长期资源、不上传权重，也不读取 Host 路由值。Progr
   Graph/运行时保留。先按最低 KV 判断 resident 是否可行；Host 模式在满足最低 KV 后
   分配 expert 容量，显式 KV 配置可以扩大上下文池。Host 来源及其注册容量单独计费。
 
-CPU expert 数学、indexed GPU expert kernel、两侧交接和最终归约均需完成各自的数学与状态
-验证，再开放公共 Engine 的预算与混合执行选项。CPU 计算与 DMA 的带宽竞争仍需实测。
+CPU/GPU 子集计算与最终归约在 Op 层验证；Program 的异步交接、缓冲复用和阶段切换仍需完成
+状态验证，再开放公共 Engine 的预算与混合执行选项。CPU 计算与 DMA 的带宽竞争仍需实测。
 
 测试与实测入口分别见 [Tests](../../tests/README.md) 和 [Benchmarks](../../bench/README.md)。

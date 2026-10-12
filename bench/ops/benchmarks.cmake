@@ -51,6 +51,7 @@ ninfer_add_op_bench(ninfer_prepare_masked_block_bench
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/prepare_masked_block_bench.cu")
 ninfer_add_op_bench(ninfer_sampling_select_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/sampling_select_bench.cu")
 ninfer_add_op_bench(ninfer_moe_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/moe/main.cu")
+ninfer_add_op_bench(ninfer_moe_cpu_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/moe/cpu.cpp")
 ninfer_add_op_bench(ninfer_linear_pair_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/linear_pair_bench.cu")
 ninfer_add_op_bench(ninfer_context_kv_materialize_bench
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/context_kv_materialize_bench.cu")

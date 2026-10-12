@@ -1123,6 +1123,29 @@ computation when interpreting the gap. Logical FLOP/s counts only the requested 
 The complete call uses empty external read-ahead hints; next-projection cache warming and its
 downstream effect are covered by Engine measurements.
 
+`ninfer_moe_cpu_bench` measures the complete synchronous CPU `routed_swiglu` call, including
+validation, grouping, decoding, arithmetic and worker publication/join. Setup and CPU/GPU transfers
+are excluded. Native Host banks stay alive for the whole run. `repeat` reuses a fixed subset;
+`stream` rotates selected experts across prefaulted banks (by default at least four times reported
+LLC in actually selected weights). `same`, `skew` and `independent` vary reuse within each call.
+
+```bash
+./build/bench/ninfer_moe_cpu_bench --format q4-q5 --workers 16 --caller-cpu 31 \
+  --tokens 1,8,72 --active 1,8 --cache stream --distribution same --samples 240 --read-reference
+```
+
+Output includes min/median/p95/max wall time, useful encoded-weight GiB/s, logical GFLOP/s,
+workspace and reuse footprint. Process CPU cost uses a separate interval of at least 250 ms at
+the same cadence; `--gap-us` is excluded from call latency and included in that accounting.
+`encoded_read_bytes` models the selected four/two/one-column tiles and eight-token chunks; it
+includes repeated weight reads, but is not a hardware traffic counter. `--read-reference` times
+the same bank/column grouping and row ownership with decode and arithmetic removed. Its median
+is an access-pattern reference, not a strict roofline or an end-to-end offload result.
+That option also reports sustained sequential read GB/s over the complete native-bank corpus,
+using the same worker team. Unique encoded bytes divided by this bandwidth give a compulsory-read
+memory roofline reference for a streaming call; repeated tile reads may hit cache and must not all
+be charged as DRAM bytes. No compute-peak or Engine-throughput claim follows from either reference.
+
 ## Q8 context K/V LinearPair benchmark
 
 `ninfer_linear_pair_bench` measures one public `linear_pair()` call over exact adjacent Q8

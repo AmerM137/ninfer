@@ -187,6 +187,18 @@ suite covers the resident codec profiles, FP32/BF16 outputs, residual modes, exp
 banks, empty GPU assignments, Graph relocation and workspace guards. The complete MoE retains
 its existing numerical samples and criteria.
 
+`ninfer_moe_cpu_test` qualifies Q4+Q5/Q6 CPU routed SwiGLU against decoded-input FP64 mathematics,
+using an FP32 forward-error budget for dot products, SiLU, multiplication and weighted reduction.
+`ninfer_moe_cpu_avx2_test` and `ninfer_moe_cpu_fma_test` use the same public entry and oracle with
+restricted test-only dispatch. All three run with CUDA devices hidden. They cover mask/None
+semantics, arbitrary token tails through T=72, affine and strided parent banks, workspace and alias
+checks, signed code domains, scale extremes and tiny-BF16 cancellation around the BF16-dot guard.
+`ninfer_moe_test` also qualifies complementary CPU/GPU subsets plus GPU shared/residual composition.
+
+```bash
+ctest --test-dir build -R '^ninfer_moe(_cpu(_avx2|_fma)?)?_test$' --output-on-failure
+```
+
 Run the 35B-A3B MoE route independently:
 
 ```bash

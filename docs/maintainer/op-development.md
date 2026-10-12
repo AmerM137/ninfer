@@ -323,7 +323,9 @@ matching admission or launch predicate. An Op never infers it from model identit
 - `cuda/`: memory instructions, reductions and ordering, MMA, asynchronous pipelines and
   shared-memory storage;
 - `quant/`: packed-format decoding, encoding and explicit scale/rounding profiles;
-- `host/`: operand checks, represented-weight validation and launch resource configuration.
+- `host/`: operand checks, represented-weight validation and launch resource configuration;
+- `cpu/`: ISA-specific vector conversions, reductions and packed integer decoding; included only
+  by compilation units built for that ISA.
 
 Keep small companion facilities together: vector types with conversions, cache policy and swizzles
 with memory operations, and asynchronous copy with its synchronization. Split a header for a real
@@ -374,6 +376,12 @@ launchers may receive the extracted stream; a composing Op forwards the executio
 Raw device pointers in explicit CUDA descriptors belong to that same execution device and remain
 the caller's lifetime responsibility. No entry infers execution from an operand or queries CUDA
 pointer attributes on the launch path.
+
+CPU entries receive `CpuExecutionView` from the owning fixed `CpuExecutor` and borrow CPU tensors,
+native weight banks and caller scratch until synchronous return. Select ISA implementations using
+the bound workers' common features. Keep advanced ISA flags local to kernel compilation units;
+the caller-side entry and selection remain baseline C++. Workers neither allocate storage nor
+call CUDA. Program owns CPU/GPU handoff and overlap, not the Op or executor.
 
 ### 5.2 Workspace
 
