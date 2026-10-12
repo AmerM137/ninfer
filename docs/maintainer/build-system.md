@@ -1,7 +1,7 @@
 # Build system
 
 NInfer builds from its source tree with CMake 3.28+ and C++/CUDA 20.
-The supported architecture is `sm_120a`; CUDA 13.1 is the validated development toolkit.
+The supported architecture is `sm_120a`; CUDA 13.4 is the validated development toolkit.
 Product commands and prerequisites are in the
 [README](../../README.md#quick-start); test and measurement workflows live in
 [tests](../../tests/README.md) and [benchmarks](../../bench/README.md).
@@ -25,7 +25,7 @@ to model media decoding and remains required when apps are disabled. Curl and sp
 only for product support. A Python 3 interpreter is found when tests are configured. The larger Python
 pytest suites and conversion/evaluation scripts run separately from CMake and CTest.
 
-CUDA 13.1 and Python 3.11 describe the maintained environment, not configuration version gates.
+CUDA 13.4 and Python 3.11 describe the maintained environment, not configuration version gates.
 CMake also discovers FFmpeg without imposing library version floors. Actual language/API support
 is exercised by compilation and tests. CPU facilities target Linux x86-64 and use hwloc >= 2.5
 for topology discovery without changing the caller's binding. The internal `ninfer_cpu` target

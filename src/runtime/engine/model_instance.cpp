@@ -126,8 +126,9 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
     StartupPhaseScope binding(options.startup_observer, StartupPhase::TargetPlan);
     auto plan = models::qwen3_5::plan_load(reader, models::load_options(options));
     binding.complete();
-    auto model =
-        models::qwen3_5::materialize_model(std::move(plan), device, &options.startup_observer);
+    auto model = models::qwen3_5::materialize_model(
+        models::qwen3_5::resolve_load(std::move(plan), device.device()), device,
+        &options.startup_observer);
     device.synchronize();
     StartupPhaseScope frontend(options.startup_observer, StartupPhase::FrontendInitialize);
     auto instance = std::make_unique<ModelInstance>(std::move(model), options);

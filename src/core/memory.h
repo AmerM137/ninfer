@@ -70,6 +70,16 @@ struct MemorySpan {
     }
 };
 
+// A pinned CPU range and its address in one CUDA device's mapping. The backing and
+// registration outlive this view and every transfer using it.
+struct CudaHostView {
+    ConstMemorySpan host;
+    const void* device_address = nullptr;
+    Device cuda_device;
+
+    [[nodiscard]] CudaHostView subspan(std::size_t offset, std::size_t count) const;
+};
+
 // Checks backing and location, including pinned memory's CPU residency.
 void validate_memory(ConstMemorySpan memory);
 

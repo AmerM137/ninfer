@@ -1,4 +1,5 @@
 #include "artifact/binder.h"
+#include "artifact/materializer.h"
 #include "artifact/fixture.h"
 
 #include <cuda_runtime.h>
@@ -117,7 +118,12 @@ void materialization_cuda_errors(DeviceContext& device) {
         trace       = {.failure = failure};
         bool caught = false;
         try {
-            (void)materialize(reader, std::move(binder).finish(), device);
+            (void)materialize(reader,
+                              plan_materialization(
+                                  reader,
+                                  std::array{PlacementRequest{reader.find("q5"), device.device()}},
+                                  std::move(binder).finish()),
+                              device.transfer_view());
         } catch (const ArtifactError&) { caught = true; }
         const auto result = std::exchange(trace, {});
         require(result.injected && caught, "CUDA loading error did not propagate as an exception");
@@ -134,7 +140,12 @@ void materialization_cuda_errors(DeviceContext& device) {
     Reader reader(fixture.entry);
     Binder binder(reader);
     (void)binder.parameter("matrix", {2, 130});
-    auto recovered = materialize(reader, std::move(binder).finish(), device);
+    auto recovered =
+        materialize(reader,
+                    plan_materialization(
+                        reader, std::array{PlacementRequest{reader.find("q5"), device.device()}},
+                        std::move(binder).finish()),
+                    device.transfer_view());
     std::array<std::byte, 528> received{};
     CUDA_CHECK(cudaMemcpy(received.data(), recovered.device_parent(reader.find("q5")).data,
                           received.size(), cudaMemcpyDeviceToHost));

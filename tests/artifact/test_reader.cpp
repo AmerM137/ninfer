@@ -47,9 +47,11 @@ void file_set_and_bindings() {
                 binder.use("row", "context").activation_policy == ActivationPolicy::AllowA8,
             "Use policy changed");
     (void)binder.resource("text", "tokenizer.json");
-    auto plan = std::move(binder).finish();
+    const std::array requests{PlacementRequest{full.binding.parts[0].object, Device::cuda(0)},
+                              PlacementRequest{row.binding.parts[0].object, Device::cuda(0)}};
+    auto plan = plan_materialization(reader, requests, std::move(binder).finish());
     require(plan.device_objects.size() == 1 && plan.device_capacity_bytes == 528 &&
-                plan.host_objects.size() == 1,
+                plan.resources.objects.size() == 1,
             "selected parent deduplication or residency failed");
 }
 

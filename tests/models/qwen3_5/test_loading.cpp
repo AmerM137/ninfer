@@ -191,7 +191,6 @@ void logical_data_and_instances() {
     require(plan.parameter(plan.weights().text.token_embedding).binding.parts[0].object ==
                 plan.parameter(plan.weights().text.output_head).binding.parts[0].object,
             "explicit shared embedding/head did not bind the same parent");
-    const auto capacity = plan.materialization().device_capacity_bytes;
     require(!plan.weights().vision && plan.resources().preprocessor_config_json.empty(),
             "unused Vision was required");
     rejects([&] { (void)qwen::plan_load(reader, {.vision = true}); },
@@ -199,6 +198,8 @@ void logical_data_and_instances() {
     rejects([&] { (void)qwen::plan_load(reader, {.speculative = SpeculativeBackend::Mtp}); },
             "absent MTP was accepted");
 
+    const auto resolved                   = qwen::resolve_load(std::move(plan), Device::cuda(0));
+    const auto capacity                   = resolved.materialization().device_capacity_bytes;
     fixture.file.root["metadata"]["name"] = "another-training-run-and-recipe";
     fixture.file.root["components"]["text"]["config"]["num_hidden_layers"] = 2;
     fixture.file.root["components"]["text"]["config"]["layer_types"]       = {"full_attention",
@@ -229,7 +230,9 @@ void logical_data_and_instances() {
     require(expanded.weights().text.layers.size() == 2 &&
                 expanded.config().text.compact_layer_indices == std::vector<std::uint32_t>{0, 1},
             "config did not drive layer geometry and compact indices");
-    require(expanded.materialization().device_capacity_bytes == capacity,
+    require(qwen::resolve_load(std::move(expanded), Device::cuda(0))
+                    .materialization()
+                    .device_capacity_bytes == capacity,
             "cross-layer sharing duplicated parent storage");
 }
 

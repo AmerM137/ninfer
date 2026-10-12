@@ -34,6 +34,24 @@ private:
     std::size_t alignment_ = 256;
 };
 
+// Owns CUDA registration, not the Host allocation. The caller finishes all uses
+// before unregistering and keeps the original Host backing alive until then.
+class CudaHostRegistration {
+public:
+    CudaHostRegistration() noexcept = default;
+    CudaHostRegistration(ConstMemorySpan host, Device cuda_device);
+    ~CudaHostRegistration();
+    CudaHostRegistration(const CudaHostRegistration&)            = delete;
+    CudaHostRegistration& operator=(const CudaHostRegistration&) = delete;
+    CudaHostRegistration(CudaHostRegistration&& other) noexcept;
+    CudaHostRegistration& operator=(CudaHostRegistration&& other) noexcept;
+
+    [[nodiscard]] CudaHostView view() const noexcept { return view_; }
+
+private:
+    CudaHostView view_;
+};
+
 class DeviceBuffer {
 public:
     DeviceBuffer() noexcept = default;
@@ -88,6 +106,9 @@ public:
     [[nodiscard]] MemorySpan span() noexcept { return {data_, bytes_, device(), true}; }
 
     [[nodiscard]] ConstMemorySpan span() const noexcept { return {data_, bytes_, device(), true}; }
+
+    // Establish once at the owning resource's initialization boundary.
+    [[nodiscard]] CudaHostView cuda_view(Device cuda_device) const;
 
 private:
     void* data_        = nullptr;

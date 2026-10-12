@@ -16,6 +16,8 @@ struct LayoutRegion {
     std::size_t bytes     = 0;
     std::size_t alignment = 1;
 
+    friend bool operator==(const LayoutRegion&, const LayoutRegion&) = default;
+
     [[nodiscard]] MemorySpan bind(MemorySpan backing) const;
     [[nodiscard]] ConstMemorySpan bind(ConstMemorySpan backing) const;
 };

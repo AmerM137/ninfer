@@ -220,5 +220,62 @@ int main() {
         },
         "transfer execution device mismatch");
 
+    ninfer::HostBuffer registered(4096, 4096);
+    auto* source_bytes = static_cast<unsigned char*>(registered.data());
+    for (std::size_t i = 0; i < registered.size(); ++i) {
+        source_bytes[i] = (i * 13 + i / 31) % 251;
+    }
+    ninfer::CudaHostRegistration registration(registered.span(), device.device());
+    const auto view         = registration.view();
+    auto moved_registration = std::move(registration);
+    failures += expect_size(registration.view().host.bytes, 0, "moved registration is empty");
+    registration = std::move(moved_registration);
+    ninfer::CudaHostCopyBatch batch(device.device(), 2);
+    {
+        ninfer::HostBuffer no_data;
+        ninfer::CudaHostRegistration no_registration(no_data.span(), device.device());
+        batch.append(transferred.span().subspan(0, 0), no_registration.view());
+        batch.submit(device.transfer_view());
+        failures += expect_size(batch.size(), 0, "empty registered transfer");
+    }
+    batch.append(transferred.span().subspan(0, 32), view.subspan(71, 32));
+    batch.append(transferred.span().subspan(32, 96), view.subspan(1001, 96));
+    batch.submit(device.transfer_view());
+    uploaded.record(device.transfer_stream());
+    uploaded.wait(device.stream());
+    ninfer::copy_bytes_async(result.span(), transferred.span(), device.execution_view());
+    device.synchronize();
+    if (std::memcmp(result.data(), source_bytes + 71, 32) ||
+        std::memcmp(static_cast<unsigned char*>(result.data()) + 32, source_bytes + 1001, 96)) {
+        ++failures;
+        std::cerr << "registered batch transfer changed bytes\n";
+    }
+    ninfer::copy_host_2d_async(transferred.span(), 32, view.subspan(111, 97), 27, 16, 4,
+                               device.transfer_view());
+    uploaded.record(device.transfer_stream());
+    uploaded.wait(device.stream());
+    ninfer::copy_bytes_async(result.span(), transferred.span(), device.execution_view());
+    device.synchronize();
+    for (std::size_t row = 0; row < 4; ++row) {
+        if (std::memcmp(static_cast<unsigned char*>(result.data()) + row * 32,
+                        source_bytes + 111 + row * 27, 16)) {
+            ++failures;
+        }
+    }
+    failures += expect_throws<std::out_of_range>(
+        [&] {
+            ninfer::copy_host_2d_async(transferred.span(), 32, view.subspan(0, 96), 27, 16, 4,
+                                       device.transfer_view());
+        },
+        "registered strided transfer extent");
+    failures += expect_throws<std::invalid_argument>(
+        [&] {
+            auto wrong        = view;
+            wrong.cuda_device = ninfer::Device::cuda(device.device().index() + 1);
+            batch.clear();
+            batch.append(transferred.span(), wrong.subspan(0, 128));
+        },
+        "registered transfer execution device mismatch");
+
     return failures == 0 ? 0 : fail("arena test failed");
 }

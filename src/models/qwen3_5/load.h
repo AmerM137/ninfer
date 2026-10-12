@@ -1,5 +1,6 @@
 #pragma once
 
+#include "models/qwen3_5/expert_weights.h"
 #include "models/qwen3_5/model.h"
 
 #include <filesystem>
@@ -12,6 +13,8 @@ struct ParameterReference;
 } // namespace ninfer::artifact
 
 namespace ninfer::models::qwen3_5 {
+
+class ResolvedLoadPlan;
 
 // Cold load plan borrows its Reader until materialization. Its selected Host bytes and parsed
 // resources already have owners; no Program or device allocation is needed for plan_load.
@@ -26,7 +29,7 @@ public:
     [[nodiscard]] const Config& config() const;
     [[nodiscard]] const ModelWeights& weights() const;
     [[nodiscard]] const FrontendResources& resources() const;
-    [[nodiscard]] const artifact::MaterializationPlan& materialization() const;
+    [[nodiscard]] std::span<const ExpertBankDescription> expert_banks() const;
     [[nodiscard]] const artifact::ParameterReference& parameter(WeightId id) const;
     [[nodiscard]] std::span<const WeightUse> uses(WeightId id) const;
 
@@ -35,12 +38,36 @@ private:
     std::unique_ptr<Impl> impl_;
     explicit LoadPlan(std::unique_ptr<Impl> impl);
     friend LoadPlan plan_load(const artifact::Reader&, LoadOptions);
-    friend std::unique_ptr<Model> materialize_model(LoadPlan&&, DeviceContext&,
+    friend ResolvedLoadPlan resolve_load(LoadPlan&&, Device, std::optional<Device>);
+    friend std::unique_ptr<Model> materialize_model(ResolvedLoadPlan&&, DeviceContext&,
                                                     const StartupObserver*);
 };
 
+class ResolvedLoadPlan {
+public:
+    [[nodiscard]] const LoadPlan& logical() const noexcept { return logical_; }
+
+    [[nodiscard]] const artifact::MaterializationPlan& materialization() const noexcept {
+        return materialization_;
+    }
+
+private:
+    friend ResolvedLoadPlan resolve_load(LoadPlan&&, Device, std::optional<Device>);
+    friend std::unique_ptr<Model> materialize_model(ResolvedLoadPlan&&, DeviceContext&,
+                                                    const StartupObserver*);
+    ResolvedLoadPlan(LoadPlan&& logical, artifact::MaterializationPlan&& materialization,
+                     std::vector<Device>&& devices, std::vector<Device>&& bank_devices);
+    artifact::MaterializationPlan materialization_;
+    LoadPlan logical_;
+    std::vector<Device> devices_;
+    std::vector<Device> bank_devices_;
+};
+
 [[nodiscard]] LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options = {});
-[[nodiscard]] std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
+[[nodiscard]] ResolvedLoadPlan resolve_load(LoadPlan&& plan, Device cuda,
+                                            std::optional<Device> main_experts = {});
+[[nodiscard]] std::unique_ptr<Model> materialize_model(ResolvedLoadPlan&& plan,
+                                                       DeviceContext& device,
                                                        const StartupObserver* observer = nullptr);
 [[nodiscard]] std::unique_ptr<Model> load_model(const std::filesystem::path& path,
                                                 LoadOptions options, DeviceContext& device,

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "core/weight_view.h"
+#include "core/weight_bank.h"
 #include "ninfer/ops/linear.h"
 
 #include <cstddef>
@@ -52,6 +52,7 @@ struct DenseWeights {
 };
 
 struct MoeWeights {
+    ExpertBankId bank;
     WeightId router, shared_score;
     std::vector<DenseWeights> experts;
     DenseWeights shared;

@@ -21,8 +21,7 @@ WeightId Bindings::parameter(std::string name, artifact::Shape shape,
         throw artifact::ArtifactError(name + ": duplicate model parameter declaration");
     }
     PendingWeight pending;
-    pending.reference =
-        binder.parameter(name, std::move(shape), artifact::Residency::Device, exact_format);
+    pending.reference = binder.parameter(name, std::move(shape), exact_format);
     for (const auto& input : inputs) {
         const auto& use = binder.use(name, input);
         if (!use.activation_policy) {
@@ -69,11 +68,13 @@ WeightId Bindings::direct(std::string name, artifact::Shape shape, QType format)
 }
 
 std::vector<BoundWeight> resolve_weights(std::vector<PendingWeight>&& pending,
-                                         const artifact::MaterializedArtifact& materialized) {
+                                         const artifact::MaterializedArtifact& materialized,
+                                         std::span<const Device> devices) {
     std::vector<BoundWeight> out;
     out.reserve(pending.size());
-    for (auto& item : pending) {
-        auto view = artifact::bind_view(item.reference, materialized);
+    for (std::size_t i = 0; i < pending.size(); ++i) {
+        auto& item = pending[i];
+        auto view  = artifact::bind_view(item.reference, materialized, devices[i]);
         out.push_back({std::move(item.reference.name), std::move(item.source_objects),
                        std::move(view), std::move(item.uses)});
     }

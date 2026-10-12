@@ -298,21 +298,30 @@ void CudaCompletionEvent::record(cudaStream_t stream) {
     if (event_ == nullptr || stream == nullptr) {
         throw std::logic_error("CUDA completion event is not recordable");
     }
-    CUDA_CHECK(cudaEventRecord(event_, stream));
+    const auto status = cudaEventRecord(event_, stream);
+    if (status != cudaSuccess) {
+        throw std::runtime_error(cuda_error_message("cudaEventRecord failed", status));
+    }
 }
 
 void CudaCompletionEvent::wait(cudaStream_t stream) const {
     if (event_ == nullptr || stream == nullptr) {
         throw std::logic_error("CUDA completion event is not waitable");
     }
-    CUDA_CHECK(cudaStreamWaitEvent(stream, event_, 0));
+    const auto status = cudaStreamWaitEvent(stream, event_, 0);
+    if (status != cudaSuccess) {
+        throw std::runtime_error(cuda_error_message("cudaStreamWaitEvent failed", status));
+    }
 }
 
 void CudaCompletionEvent::record_external(cudaStream_t stream) {
     if (event_ == nullptr || stream == nullptr) {
         throw std::logic_error("CUDA completion event is not recordable");
     }
-    CUDA_CHECK(cudaEventRecordWithFlags(event_, stream, cudaEventRecordExternal));
+    const auto status = cudaEventRecordWithFlags(event_, stream, cudaEventRecordExternal);
+    if (status != cudaSuccess) {
+        throw std::runtime_error(cuda_error_message("cudaEventRecordWithFlags failed", status));
+    }
 }
 
 bool CudaCompletionEvent::ready() const {
@@ -320,13 +329,15 @@ bool CudaCompletionEvent::ready() const {
     const cudaError_t status = cudaEventQuery(event_);
     if (status == cudaSuccess) { return true; }
     if (status == cudaErrorNotReady) { return false; }
-    CUDA_CHECK(status);
-    return false;
+    throw std::runtime_error(cuda_error_message("cudaEventQuery failed", status));
 }
 
 void CudaCompletionEvent::synchronize() const {
     if (event_ == nullptr) { throw std::logic_error("CUDA completion event is empty"); }
-    CUDA_CHECK(cudaEventSynchronize(event_));
+    const auto status = cudaEventSynchronize(event_);
+    if (status != cudaSuccess) {
+        throw std::runtime_error(cuda_error_message("cudaEventSynchronize failed", status));
+    }
 }
 
 } // namespace ninfer

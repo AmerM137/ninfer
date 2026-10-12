@@ -8,12 +8,16 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <cstring>
 #include <filesystem>
 #include <iostream>
 #include <map>
 #include <memory>
 #include <set>
 #include <string>
+
+#include <sys/resource.h>
 
 namespace {
 
@@ -62,17 +66,29 @@ void check_selection(const qwen::LoadPlan& plan, const LoadOptions& options) {
                     plan.resources().video_preprocessor_config_json.empty(),
                 "Text-only loading retained Vision resources");
     }
-    std::set<std::size_t> parents;
-    std::uint64_t end = 0;
-    for (const auto& item : plan.materialization().device_objects) {
-        require(parents.insert(item.object.index).second,
-                "device parent was planned more than once");
-        require(item.offset >= end && item.offset % item.alignment == 0,
-                "device placement overlaps or is unaligned");
-        end = item.offset + item.bytes;
-    }
-    require(end == plan.materialization().device_capacity_bytes,
-            "weight capacity differs from actual placements");
+}
+
+void check_placement(const qwen::ResolvedLoadPlan& plan) {
+    const auto check = [](const auto& objects, std::uint64_t capacity,
+                          std::uint64_t alignment = 1) {
+        std::set<std::size_t> parents;
+        std::uint64_t end = 0;
+        for (const auto& item : objects) {
+            require(parents.insert(item.object.index).second,
+                    "parent was planned twice at one location");
+            require(item.region.offset >= end && item.region.offset % item.region.alignment == 0,
+                    "weight placement overlaps or is unaligned");
+            end = item.region.offset + item.region.bytes;
+        }
+        require((end + alignment - 1) / alignment * alignment == capacity,
+                "weight capacity differs from placements");
+    };
+    check(plan.materialization().device_objects, plan.materialization().device_capacity_bytes);
+    const auto& placement = plan.materialization();
+    check(placement.ordinary_host_objects,
+          placement.host_capacity_bytes - placement.registered_host_bytes);
+    check(placement.registered_host_objects, placement.registered_host_bytes,
+          placement.host_alignment);
 }
 
 // Exercise native grouping after Reader destruction, independently of Program selection.
@@ -120,7 +136,24 @@ void check_native_inputs(const qwen::Model& model) {
         if (const auto* mlp = std::get_if<qwen::DenseWeights>(&weights.ffn)) {
             dense(*mlp);
         } else {
-            const auto& moe = std::get<qwen::MoeWeights>(weights.ffn);
+            const auto& moe  = std::get<qwen::MoeWeights>(weights.ffn);
+            const auto& bank = model.expert_banks()[moe.bank.index];
+            for (const auto e : {0U, static_cast<unsigned>(moe.experts.size() - 1)}) {
+                const auto gu       = matrix_weight(bank.gate_up, e);
+                const auto down     = matrix_weight(bank.down, e);
+                const auto gate_ref = native_weight(model.weight(moe.experts[e].gate).view);
+                const auto down_ref = native_weight(model.weight(moe.experts[e].down).view);
+                require(gu.qdata == gate_ref.qdata && down.qdata == down_ref.qdata &&
+                            down.qhigh == down_ref.qhigh && down.scales == down_ref.scales,
+                        "bank source differs from logical expert Binding");
+            }
+            if (bank.gate_up.parent->device == Device::cpu()) {
+                require(bank.gate_up_upload.host.data == bank.gate_up.parent->data &&
+                            bank.down_upload.host.data == bank.down.parent->data &&
+                            bank.gate_up_upload.device_address && bank.down_upload.device_address,
+                        "Host expert bank has no matching registered source");
+                return;
+            }
             std::vector<ops::WeightInput> gate_up, down;
             for (const auto& expert : moe.experts) {
                 gate_up.push_back(model.input(expert.gate));
@@ -187,7 +220,7 @@ int main(int argc, char** argv) {
     try {
         std::filesystem::path path;
         LoadOptions options;
-        bool host_only = false;
+        bool host_only = false, host_experts = false;
         for (int i = 1; i < argc; ++i) {
             const std::string arg(argv[i]);
             const auto value = [&]() -> std::string {
@@ -200,6 +233,8 @@ int main(int argc, char** argv) {
                 options.vision = true;
             } else if (arg == "--host-only") {
                 host_only = true;
+            } else if (arg == "--host-experts") {
+                host_experts = true;
             } else if (arg == "--scoring") {
                 options.purpose = EnginePurpose::CausalScoring;
             } else if (arg == "--speculative") {
@@ -225,8 +260,9 @@ int main(int argc, char** argv) {
                     throw std::invalid_argument("unknown proposal head");
                 }
             } else if (arg == "--help") {
-                std::cout << "--artifact PATH [--vision] [--speculative none|mtp|dflash|dflash2]\n"
-                             "[--proposal full|optimized] [--host-only] [--scoring]\n";
+                std::cout
+                    << "--artifact PATH [--vision] [--speculative none|mtp|dflash|dflash2]\n"
+                       "[--proposal full|optimized] [--host-only] [--host-experts] [--scoring]\n";
                 return 0;
             } else {
                 throw std::invalid_argument("unknown argument " + arg);
@@ -242,20 +278,31 @@ int main(int argc, char** argv) {
         std::uint64_t expected_h2d = 0;
         {
             artifact::Reader reader(path);
-            auto plan = qwen::plan_load(reader, options);
-            check_selection(plan, options);
+            auto logical = qwen::plan_load(reader, options);
+            check_selection(logical, options);
+            auto plan =
+                qwen::resolve_load(std::move(logical), Device::cuda(0),
+                                   host_experts ? std::optional(Device::cpu()) : std::nullopt);
+            check_placement(plan);
             if (host_only) {
                 std::cout << path.filename().string() << ": Host binding passed, architecture="
-                          << architecture_name(plan.config().text.architecture)
-                          << " V=" << plan.resources().public_token_count
+                          << architecture_name(plan.logical().config().text.architecture)
+                          << " V=" << plan.logical().resources().public_token_count
                           << " device_bytes=" << plan.materialization().device_capacity_bytes
                           << '\n';
                 return 0;
             }
-            for (const auto& item : plan.materialization().device_objects) {
+            const auto& placement = plan.materialization();
+            for (const auto& item : placement.device_objects) { expected_h2d += item.region.bytes; }
+            auto parents = placement.device_objects;
+            parents.insert(parents.end(), placement.ordinary_host_objects.begin(),
+                           placement.ordinary_host_objects.end());
+            parents.insert(parents.end(), placement.registered_host_objects.begin(),
+                           placement.registered_host_objects.end());
+            for (const auto& item : parents) {
                 const auto& object   = reader.directory().tensor(item.object);
                 const auto& geometry = reader.geometry(item.object);
-                expected_h2d += object.bytes;
+
                 const auto size = std::min<std::uint64_t>(64, object.bytes);
                 std::set<std::uint64_t> offsets{0, (object.bytes - size) / 2, object.bytes - size};
                 if (geometry.high_bytes) { offsets.insert(geometry.high_offset); }
@@ -280,8 +327,12 @@ int main(int argc, char** argv) {
                 if (!visited.insert(parent).second) { continue; }
                 for (const auto& sample : samples.at(weight.source_objects[i])) {
                     std::vector<std::byte> received(sample.bytes.size());
-                    CUDA_CHECK(cudaMemcpy(received.data(), parent->data + sample.offset,
-                                          received.size(), cudaMemcpyDeviceToHost));
+                    if (parent->device == Device::cpu()) {
+                        std::memcpy(received.data(), parent->data + sample.offset, received.size());
+                    } else {
+                        CUDA_CHECK(cudaMemcpy(received.data(), parent->data + sample.offset,
+                                              received.size(), cudaMemcpyDeviceToHost));
+                    }
                     require(received == sample.bytes,
                             "resident parent differs from original v3 bytes");
                 }
@@ -295,9 +346,15 @@ int main(int argc, char** argv) {
                 "tokenizer did not survive Reader destruction");
         require(!model->resources().chat_template_jinja.empty(),
                 "template bytes were lost after loading");
+        rusage usage{};
+        getrusage(RUSAGE_SELF, &usage);
         std::cout << path.filename().string()
-                  << ": GPU loading and native inputs passed, parents=" << visited.size()
+                  << ": loading and native inputs passed, parents=" << visited.size()
                   << " device_bytes=" << model->storage_stats().device_capacity_bytes
+                  << " host_bytes=" << model->storage_stats().host_capacity_bytes
+                  << " h2d_bytes=" << model->storage_stats().h2d_bytes
+                  << " materialization_seconds=" << model->storage_stats().upload_seconds
+                  << " peak_rss_kib=" << usage.ru_maxrss
                   << " V=" << model->resources().public_token_count << '\n';
         model.reset();
         device->synchronize();

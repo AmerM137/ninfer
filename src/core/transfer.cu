@@ -46,6 +46,22 @@ void enqueue(MemorySpan destination, ConstMemorySpan source, cudaMemcpyKind kind
     }
 }
 
+void validate_host_copy(MemorySpan destination, CudaHostView source, Device device) {
+    validate_memory(destination);
+    validate_memory(source.host);
+    if (destination.device != device || source.cuda_device != device ||
+        source.host.device != Device::cpu() || !source.host.host_pinned ||
+        (source.host.bytes && !source.device_address)) {
+        throw std::invalid_argument("H2D copy requires a registered source for its CUDA device");
+    }
+}
+
+void check_copy(cudaError_t error) {
+    if (error != cudaSuccess) {
+        throw std::runtime_error(std::string("CUDA host copy: ") + cudaGetErrorString(error));
+    }
+}
+
 } // namespace
 
 void copy_bytes_async(MemorySpan destination, ConstMemorySpan source, CudaExecutionView execution) {
@@ -62,6 +78,56 @@ void copy_bytes(MemorySpan destination, ConstMemorySpan source, CudaExecutionVie
     if (error != cudaSuccess) {
         throw std::runtime_error(std::string("CUDA copy completion: ") + cudaGetErrorString(error));
     }
+}
+
+void copy_host_2d_async(MemorySpan destination, std::size_t destination_pitch, CudaHostView source,
+                        std::size_t source_pitch, std::size_t width, std::size_t rows,
+                        CudaExecutionView execution) {
+    validate_host_copy(destination, source, execution.device());
+    if (!width || !rows) { return; }
+    const auto fits = [&](std::size_t bytes, std::size_t pitch) {
+        return width <= pitch && width <= bytes && rows - 1 <= (bytes - width) / pitch;
+    };
+    if (!fits(destination.bytes, destination_pitch) || !fits(source.host.bytes, source_pitch)) {
+        throw std::out_of_range("pitched H2D copy exceeds backing");
+    }
+    CudaDeviceScope scope(execution.device());
+    // Explicit H2D consumes the CPU address; the batch API below consumes CUDA mappings.
+    check_copy(cudaMemcpy2DAsync(destination.data, destination_pitch, source.host.data,
+                                 source_pitch, width, rows, cudaMemcpyHostToDevice,
+                                 execution.stream()));
+}
+
+CudaHostCopyBatch::CudaHostCopyBatch(Device device, std::size_t capacity)
+    : device_(device), sources_(capacity), destinations_(capacity), sizes_(capacity) {
+    if (device.type() != DeviceType::CUDA) {
+        throw std::invalid_argument("H2D batch requires a CUDA destination device");
+    }
+}
+
+void CudaHostCopyBatch::append(MemorySpan destination, CudaHostView source) {
+    validate_host_copy(destination, source, device_);
+    if (destination.bytes != source.host.bytes) {
+        throw std::invalid_argument("H2D copy spans must have equal byte lengths");
+    }
+    if (!source.host.bytes) { return; }
+    if (count_ == capacity()) { throw std::length_error("H2D batch descriptor capacity exceeded"); }
+    destinations_[count_] = destination.data;
+    sources_[count_]      = source.device_address;
+    sizes_[count_++]      = source.host.bytes;
+}
+
+void CudaHostCopyBatch::submit(CudaExecutionView execution) const {
+    if (execution.device() != device_ || !execution.stream()) {
+        throw std::invalid_argument("H2D batch requires its CUDA device and an explicit stream");
+    }
+    if (!count_) { return; }
+    CudaDeviceScope scope(device_);
+    cudaMemcpyAttributes attributes{};
+    attributes.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+    std::size_t first         = 0;
+    check_copy(cudaMemcpyBatchAsync(destinations_.data(), sources_.data(), sizes_.data(), count_,
+                                    &attributes, &first, 1, execution.stream()));
 }
 
 } // namespace ninfer

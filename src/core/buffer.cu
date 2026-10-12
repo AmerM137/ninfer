@@ -33,7 +33,58 @@ void release_pinned(void* data) noexcept {
     }
 }
 
+CudaHostView map_host(ConstMemorySpan host, Device device) {
+    CudaDeviceScope scope(device);
+    void* mapped = nullptr;
+    if (host.bytes) {
+        check(cudaHostGetDevicePointer(&mapped, const_cast<void*>(host.data), 0),
+              "cudaHostGetDevicePointer");
+    }
+    return {{host.data, host.bytes, Device::cpu(), true}, mapped, device};
+}
+
+void release_registration(CudaHostView view) noexcept {
+    if (!view.host.bytes) { return; }
+    try {
+        CudaDeviceScope scope(view.cuda_device);
+        check(cudaHostUnregister(const_cast<void*>(view.host.data)), "cudaHostUnregister");
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "CUDA registration cleanup failed: %s\n", error.what());
+    }
+}
+
 } // namespace
+
+CudaHostRegistration::CudaHostRegistration(ConstMemorySpan host, Device cuda_device) {
+    validate_memory(host);
+    if (host.device != Device::cpu() || host.host_pinned) {
+        throw std::invalid_argument("CUDA registration requires ordinary Host backing");
+    }
+    CudaDeviceScope scope(cuda_device);
+    if (host.bytes) {
+        check(cudaHostRegister(const_cast<void*>(host.data), host.bytes, cudaHostRegisterDefault),
+              "cudaHostRegister");
+    }
+    try {
+        view_ = map_host(host, cuda_device);
+    } catch (...) {
+        release_registration({host, nullptr, cuda_device});
+        throw;
+    }
+}
+
+CudaHostRegistration::~CudaHostRegistration() { release_registration(view_); }
+
+CudaHostRegistration::CudaHostRegistration(CudaHostRegistration&& other) noexcept
+    : view_(std::exchange(other.view_, {})) {}
+
+CudaHostRegistration& CudaHostRegistration::operator=(CudaHostRegistration&& other) noexcept {
+    if (this != &other) {
+        release_registration(view_);
+        view_ = std::exchange(other.view_, {});
+    }
+    return *this;
+}
 
 DeviceBuffer::DeviceBuffer(Device device, std::size_t bytes) : bytes_(bytes), device_(device) {
     CudaDeviceScope scope(device);
@@ -97,6 +148,10 @@ PinnedHostBuffer& PinnedHostBuffer::operator=(PinnedHostBuffer&& other) noexcept
         bytes_ = std::exchange(other.bytes_, 0);
     }
     return *this;
+}
+
+CudaHostView PinnedHostBuffer::cuda_view(Device cuda_device) const {
+    return map_host(span(), cuda_device);
 }
 
 } // namespace ninfer

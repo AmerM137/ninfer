@@ -2,6 +2,8 @@
 
 #include "core/memory.h"
 
+#include <vector>
+
 namespace ninfer {
 
 class CudaExecutionView;
@@ -14,5 +16,34 @@ void copy_bytes(MemorySpan destination, ConstMemorySpan source, CudaExecutionVie
 // Host endpoints must be pinned; CUDA endpoints must belong to execution.device().
 // The caller keeps both spans alive and orders all consumers through the stream or an event.
 void copy_bytes_async(MemorySpan destination, ConstMemorySpan source, CudaExecutionView execution);
+
+// Copies rows of unchanged bytes. Both pitches include the gap between rows;
+// source and destination spans cover all addressed rows.
+void copy_host_2d_async(MemorySpan destination, std::size_t destination_pitch, CudaHostView source,
+                        std::size_t source_pitch, std::size_t width, std::size_t rows,
+                        CudaExecutionView execution);
+
+// Preallocated descriptors for independent H2D copies. Destinations do not overlap;
+// source backing and mappings outlive completion. Calls within a batch are unordered.
+class CudaHostCopyBatch {
+public:
+    CudaHostCopyBatch(Device device, std::size_t capacity);
+
+    void clear() noexcept { count_ = 0; }
+
+    void append(MemorySpan destination, CudaHostView source);
+    void submit(CudaExecutionView execution) const;
+
+    [[nodiscard]] std::size_t size() const noexcept { return count_; }
+
+    [[nodiscard]] std::size_t capacity() const noexcept { return sources_.size(); }
+
+private:
+    Device device_;
+    std::vector<const void*> sources_;
+    std::vector<void*> destinations_;
+    std::vector<std::size_t> sizes_;
+    std::size_t count_ = 0;
+};
 
 } // namespace ninfer

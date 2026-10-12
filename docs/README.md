@@ -68,5 +68,5 @@ status and remaining requirements. Concrete Op contracts live in `include/ninfer
 | [Qwen4Exp model and weights](maintainer/qwen4_exp-model.md) | architecture, quantization, merged matrices, source binding and residency budgets |
 | [Qwen4Exp execution and state](maintainer/qwen4_exp-execution.md) | layer flow, cross-Op handoffs, transactions, state lifetime and remaining integration |
 | [Qwen4Exp PLE I/O](maintainer/qwen4_exp-ple-io.md) | exact Host lookup, cold backing, bounded async reads, H2D and cancellation |
-| [Expert weight cache](maintainer/expert-weight-cache.md) | planned Qwen3.5-35B-A3B Host backing, GPU replicas, prefill and CPU/GPU decode |
+| [Expert weight cache](maintainer/expert-weight-cache.md) | affine expert sources, explicit placement, GPU replica cache and pending mixed execution |
 | [Linear test maintenance](maintainer/linear-test-reorganization-plan.md) | pending consolidation of test runners and explicit case contracts |

@@ -1,0 +1,137 @@
+#pragma once
+
+#include "core/device.h"
+#include "core/layout.h"
+#include "core/weight_bank.h"
+
+#include <memory>
+#include <optional>
+
+namespace ninfer {
+
+struct ExpertMatrixEntryLayout {
+    LayoutRegion codes, high, scales;
+
+    friend bool operator==(const ExpertMatrixEntryLayout&,
+                           const ExpertMatrixEntryLayout&) = default;
+};
+
+struct ExpertBankCacheLayout {
+    ExpertMatrixEntryLayout gate_up, down;
+    std::size_t entry_bytes   = 0;
+    std::size_t payload_bytes = 0;
+    std::size_t first_entry   = 0;
+    std::uint32_t count       = 0;
+    bool resident             = false;
+    LayoutRegion offsets, gate_up_divisors, down_divisors;
+
+    friend bool operator==(const ExpertBankCacheLayout&, const ExpertBankCacheLayout&) = default;
+};
+
+struct ExpertCacheConfig {
+    std::size_t capacity_bytes       = 0;
+    std::size_t max_batch_bytes      = 96 * 1024 * 1024;
+    std::size_t max_batch_copies     = 4096;
+    std::uint32_t upload_slots       = 3;
+    std::uint32_t max_in_flight_uses = 8;
+
+    friend bool operator==(const ExpertCacheConfig&, const ExpertCacheConfig&) = default;
+};
+
+struct ExpertCacheRequirements {
+    ExpertCacheConfig config;
+    std::vector<ExpertBankCacheLayout> banks;
+    std::size_t entry_count   = 0;
+    std::size_t offset_bytes  = 0;
+    std::size_t divisor_bytes = 0;
+    std::size_t pinned_bytes  = 0;
+
+    friend bool operator==(const ExpertCacheRequirements&,
+                           const ExpertCacheRequirements&) = default;
+};
+
+inline constexpr std::uint64_t kExpertAbsentOffset = UINT64_MAX;
+
+// offsets == nullptr: plane + expert * stride; otherwise plane + offsets[logical_expert].
+// Only keys protected by a live use may be read. Unpublished offsets are not consumable.
+// Cached planes have 16-byte alignment; encoded scale ordering is unchanged.
+// Divisors are always indexed by logical expert, independently of cache allocation.
+struct ExpertMatrixDeviceView {
+    const std::byte* codes    = nullptr;
+    const std::byte* high     = nullptr;
+    const std::byte* scales   = nullptr;
+    std::uint64_t code_stride = 0, high_stride = 0, scale_stride = 0;
+    const std::uint64_t* offsets = nullptr;
+    const float* divisors        = nullptr;
+    std::uint64_t divisor_stride = 0;
+};
+
+struct ExpertBankDeviceView {
+    ExpertMatrixDeviceView gate_up, down;
+    std::uint32_t count = 0;
+};
+
+class ExpertCache;
+
+struct ExpertCacheUse {
+    const ExpertCache* owner = nullptr;
+    std::uint32_t slot       = 0;
+    std::uint64_t generation = 0;
+};
+
+struct ExpertCacheProgress {
+    bool required_published       = false;
+    bool waiting_for_consumers    = false;
+    bool waiting_for_uploads      = false;
+    std::size_t submitted_batches = 0;
+    std::size_t submitted_bytes   = 0;
+};
+
+struct ExpertUploadBudget {
+    std::size_t max_bytes   = SIZE_MAX;
+    std::size_t max_batches = 4;
+};
+
+struct ExpertCacheUsage {
+    std::size_t used_bytes         = 0;
+    std::size_t largest_free_bytes = 0;
+    std::size_t published_experts  = 0;
+    std::uint64_t data_bytes = 0, index_bytes = 0;
+    std::size_t in_flight_bytes   = 0;
+    std::uint64_t data_copy_calls = 0, index_copy_calls = 0;
+    std::uint64_t planning_nanoseconds = 0, submit_nanoseconds = 0, rebuilds = 0;
+};
+
+[[nodiscard]] ExpertCacheRequirements
+describe_expert_cache(std::span<const ExpertBankSource> sources, const ExpertCacheConfig& config);
+
+// Program-owned, one Host writer. Sources and DeviceContext outlive the cache.
+// Upload and consumer views use explicit non-null streams, which also outlive the cache.
+// All handoffs run outside capture. Every acquired use must be released, including resident banks.
+// prepare replaces the desired set; progress submits bounded work without waiting on the GPU.
+// acquire protects exactly its keys and adds the upload dependency to the consumer stream.
+// release follows the last real use, including Graph replay, on that same stream.
+class ExpertCache {
+public:
+    ExpertCache(std::span<const ExpertBankSource> sources,
+                const ExpertCacheRequirements& requirements, const DeviceContext& device,
+                CudaExecutionView upload);
+    ~ExpertCache();
+    ExpertCache(const ExpertCache&)            = delete;
+    ExpertCache& operator=(const ExpertCache&) = delete;
+
+    void prepare(std::span<const ExpertKey> required, std::span<const ExpertKey> prefetch = {});
+    ExpertCacheProgress progress(ExpertUploadBudget budget = {});
+    // nullopt means weights are not published; exceeding the configured use count is an error.
+    [[nodiscard]] std::optional<ExpertCacheUse> acquire(std::span<const ExpertKey> required,
+                                                        CudaExecutionView execution);
+    void release(ExpertCacheUse use, CudaExecutionView execution);
+    [[nodiscard]] const ExpertBankDeviceView& view(ExpertBankId bank) const;
+    [[nodiscard]] ExpertCacheUsage usage() const;
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+} // namespace ninfer

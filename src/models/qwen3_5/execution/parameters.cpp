@@ -285,6 +285,11 @@ private:
 } // namespace
 
 Parameters::Parameters(const Model& source) : model(source) {
+    for (const auto& bank : model.expert_banks()) {
+        if (bank.gate_up.parent->device.type() != DeviceType::CUDA) {
+            throw std::invalid_argument("resident execution requires GPU expert sources");
+        }
+    }
     const Prepare prepare(model);
     const auto& w        = model.weights();
     text.token_embedding = native_weight(model.weight(w.text.token_embedding).view);

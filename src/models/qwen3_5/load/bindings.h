@@ -1,6 +1,7 @@
 #pragma once
 
 #include "artifact/binder.h"
+#include "artifact/materializer.h"
 #include "models/qwen3_5/config.h"
 #include "models/qwen3_5/frontend/resources.h"
 #include "models/qwen3_5/weights.h"
@@ -64,6 +65,7 @@ void bind_dflash2(Bindings& bindings, DraftWeights& weights, const DraftConfig& 
                                             std::uint32_t public_tokens);
 [[nodiscard]] std::vector<BoundWeight>
 resolve_weights(std::vector<PendingWeight>&& pending,
-                const artifact::MaterializedArtifact& materialized);
+                const artifact::MaterializedArtifact& materialized,
+                std::span<const Device> devices);
 
 } // namespace ninfer::models::qwen3_5::loading

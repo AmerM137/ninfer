@@ -357,3 +357,22 @@ Arguments are K, Graph enabled, optimized head enabled, maximum B, target KV (`b
 `15 1 1 8 bf16 0 3`. Run GPU integration tests serially. The individual Op suites remain the
 numerical/state-transition oracle; the fixed Engine fixture does not define bit parity across
 arbitrary floating-point routes.
+
+## Expert sources and replicas
+
+`ninfer_weight_bank_test` checks local matrix/plane addressing for INT, NVFP4 and block-FP8.
+`ninfer_expert_cache_test` checks encoded bytes, variable entry sizes, bounded upload batches, required-set
+changes, fragmentation, delayed consumers, Graph replay, independent prefetch readiness and failed
+submission cleanup. The byte oracle is the immutable source representation, not another cache.
+`ninfer_artifact_cpu_materialization_test` runs with CUDA devices hidden and verifies aligned Host
+backing and retained resource lifetimes. The materialization suite also checks dual-destination I/O,
+registered/ordinary Host regions and registered backing moves. Registered transfer views and pitched
+copies are also exercised by `ninfer_arena_test`.
+
+The opt-in loader test accepts `--host-experts` to put Main experts in registered RAM while retaining MTP and
+fixed tensors on GPU. This checks storage and binding, not mixed MoE execution:
+
+```bash
+build/tests/ninfer_qwen3_5_loading_real_test --artifact out/qwen3_6_35b_a3b.ninfer \
+  --vision --speculative mtp --host-experts
+```

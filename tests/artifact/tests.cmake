@@ -27,3 +27,8 @@ set_tests_properties(
 set_tests_properties(
   ninfer_artifact_materialization_test
   PROPERTIES SKIP_RETURN_CODE 77)
+
+add_test(NAME ninfer_artifact_cpu_materialization_test
+  COMMAND ninfer_artifact_materialization_test --cpu-only)
+set_tests_properties(ninfer_artifact_cpu_materialization_test
+  PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=")

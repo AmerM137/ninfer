@@ -1342,3 +1342,28 @@ interpret a local measurement.
 
 Raw reports and profiler captures remain local under `profiles/bench`, `profiles/ncu`, and
 `profiles/nsys`.
+
+## Expert replica transport
+
+`ninfer_expert_cache_bench` uses real encoded bank parents through the production loader and cache.
+Initialization is outside the transfer samples. It reports five cold-replica samples with warm RAM
+sources, min/median/max wall latency, Host planning/submission, upload-stream timeline,
+data/index bytes and copy API calls. These calls are not a hardware DMA transaction count.
+All-hit Host timing has 101 samples with a real GPU code-plane reader between acquire and release;
+its launch and device time are excluded from the Host timing. The H2D roofline reads the same
+registered source backing in contiguous chunks, with 128 MiB warmup and at least 1 GiB measured.
+Registered Host bytes and registration time are reported separately from steady-state transport.
+The scattered samples use a fixed shuffled expert set. These measurements do not measure MoE computation.
+The overlap case uses four synthetic GPU reads of the current cached bank while loading the next.
+
+```bash
+build/bench/ninfer_expert_cache_bench --artifact out/qwen3_8_flash_next.ninfer \
+  --bank text/layers/0/moe/experts --experts 512
+build/bench/ninfer_expert_cache_bench --artifact out/qwen3_6_35b_a3b.ninfer \
+  --bank text/layers/0/moe/experts --experts 256
+```
+
+Layer 34 of the 35B artifact selects its Q6 down bank. `--batch-mib N` changes the maximum payload
+per upload batch; default is 96 MiB, with three in-flight slots. Slots contain index snapshots and
+descriptors, not weight payloads. `--resident` checks direct GPU plane access without dynamic replicas,
+for example Flash Next `--bank mtp/layers/0/moe/experts --experts 512 --resident`.

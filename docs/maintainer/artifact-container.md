@@ -291,7 +291,7 @@ Tensor bytes 等于对应 `(format,layout,shape)` 的 encoded size。
 对象间隙和末尾未引用的逻辑 payload 字节没有加载语义。常规 writer 只为对齐留空，并在最后
 一个对象结束处截断。完整编码对象内部的 padding 继续遵循其 layout 合同。
 
-多个逻辑用途共享同一个对象时都引用同一 ID；materializer 据此建立一次 backing。
+多个逻辑用途共享同一个对象时都引用同一 ID；materializer 在每个需要的位置建立一次 backing。
 没有被本次用途引用的对象保持未驻留。对象 ID、排列和文件位置只参与加载与诊断，执行中的
 权重引用由 binder 一次性解析。
 
@@ -551,7 +551,13 @@ copy_bytes          = b - a
 I/O 层可将这些段继续切成传输块，按原偏移写入同一个目标对象。File header 和文件对齐区
 不参与复制；跨文件数据通过上述范围映射交给 materializer。
 
-Materializer 按实际使用的 parent 去重，安排 device/host backing，再取得 typed view。
+Binder 只解析逻辑引用与 owning Host 资源；放置方案按 `(parent, Device)` 去重，
+使用 LayoutBuilder 分别规划 CPU/GPU backing。CPU tensor 使用对齐的可缓存 HostBuffer；
+声明 `CudaTransfer` 的 CPU 对象集中到独立注册区域，加载后建立由 backing owner 持有的
+CUDA 注册和传输视图。注册不改变 Device 或文件格式，同一 Host parent 的访问需求合并。
+资源字节单独保留原地址。Materializer 用有界 I/O 块向所需位置分发原编码，
+同一 parent 双端需求不重复读取完整 payload；`bind_view` 显式选择 Device。
+仅有 `CpuOnly` Host 需求的 materialization 不建立 CUDA 资源。
 辅助 scalar、索引等需要 owning Host 值的用途可以按 Binding 读取对应元素区间，保持其数值类型。
 Reader 的 JSON 与符号索引用于冷加载，运行时使用解析后的引用与直接调用。
 

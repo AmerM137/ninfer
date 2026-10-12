@@ -113,7 +113,11 @@ Program 将具体状态和物理可行性通过原生合同提供给 runtime。�
 
 ### 2.5 实例生命周期与固定执行
 
-Binder 按架构/config 解析所选功能的逻辑需求，Materializer 建立稳定 backing 并上传原字节。
+Binder 按架构/config 解析所选功能的逻辑需求，`LoadPlan` 不决定位置。
+`resolve_load` 建立显式放置与 Host/Device 容量，Materializer 按原编码建立稳定 backing。
+同一物理 parent 在各位置分别去重；CPU/GPU 双端需求可由同一次有界 I/O 分发。
+公开 Engine 选择 resident 路径；内部 expert 来源与副本能力见
+[Expert 权重缓存](expert-weight-cache.md)。
 ModelInstance 持有 Model、const Parameters、Frontend 与 Program。Planner 查询各层及后端需求，
 结合权重驻留后的 Device 余量解析容量，建立最终布局。
 
@@ -124,7 +128,7 @@ allocation；销毁时先结束 Engine worker 与未决设备工作，再销毁 
 模型代码维护有限调用写法、跨 Op 融合和阶段关系。纯分段投影统一调用 LinearSplit；Parameters 保存
 逻辑输出行顺序及单/双 parent 参数。例如 Q4 的 Q/K 与 Q5 的 gate/V 按逻辑行拼接，完整
 FP8 parent 和 NVFP4 矩阵视图直接提供同一行序。通用权重准备解析存储视图，实际 Op 检查可执行的格式与分段。
-View 保留 parent 几何、planes 和元素范围，共享对象只驻留一次，各使用位置保留独立 Use。
+View 保留 parent 几何、planes 和元素范围，共享对象在同一 Device 只驻留一次，各使用位置保留独立 Use。
 激活许可为 `A16Only={A16}`、`AllowA8={A16,A8}`、`AllowA4={A16,A8,A4}`；融合调用取相关许可交集。
 
 Reader、binder、原生参数准备、容量查询、warmup 和执行各自检查所消费的合同。可执行范围由实际
@@ -141,6 +145,11 @@ Reader、binder、原生参数准备、容量查询、warmup 和执行各自检�
 `DeviceBuffer` 拥有指定 GPU 的分配。`MemorySpan` / `ConstMemorySpan` 借用 backing，记录容量、
 位置及 host pinned 属性。`MemoryArena` 只管理 span 上的分配游标；Program 分别持有 backing
 和 workspace arena，scope 退出只回退游标，不等待设备工作。容量规划使用无 backing 的描述符。
+
+`CudaHostRegistration` 拥有已有 Host 范围的 CUDA 注册，借用其 allocation。
+`CudaHostView` 分别记录 CPU 范围、CUDA 映射地址和目标 GPU；注册不改变 CPU residency。
+模型的长期传输来源由 Model 同时持有 backing 和 registration；Program 完成使用后先注销，
+再释放 backing。有界批量 H2D 描述符及 pitched 字节复制属于 Core transfer 基础。
 
 `DeviceContext` 拥有 CUDA streams 和设备属性，并创建只读的 `CudaExecutionView`。Program、
 模型上下文及组合 Op 沿调用链传递该视图；Op 入口检查实际操作数和 workspace 属于执行 GPU，

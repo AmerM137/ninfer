@@ -145,6 +145,8 @@ is nested in `weights-materialize`; shared Host context pinning and CUDA Graph p
 `program-initialize`. Nested durations explain
 their parent and must not be added to it. Disabled zero-capacity phases are omitted. Byte progress is
 reported as submitted work, while only a synchronized terminal event reports completed bytes.
+Weight materialization counts payload bytes placed on both Host and Device; a parent placed at both
+locations contributes both copies. H2D statistics count only the Device copy.
 The normal pretty view retains weight materialization, enabled Host pinning, CUDA Graph preparation,
 and the merged Engine-ready summary. Internal staging, planning, frontend, Program aggregate, and
 finalization phases remain `debug`; elapsed time alone does not make an internal milestone useful to

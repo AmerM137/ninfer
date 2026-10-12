@@ -16,7 +16,7 @@ struct InstanceInfo {
     std::string name;
 };
 
-class LoadPlan;
+class ResolvedLoadPlan;
 
 class Model {
 public:
@@ -39,6 +39,8 @@ public:
 
     [[nodiscard]] std::span<const BoundWeight> weight_data() const noexcept { return bound_; }
 
+    [[nodiscard]] std::span<const ExpertBankSource> expert_banks() const noexcept { return banks_; }
+
     [[nodiscard]] const FrontendResources& resources() const noexcept { return resources_; }
 
     [[nodiscard]] const InstanceInfo& info() const noexcept { return info_; }
@@ -48,10 +50,11 @@ public:
     }
 
 private:
-    friend std::unique_ptr<Model> materialize_model(LoadPlan&&, DeviceContext&,
+    friend std::unique_ptr<Model> materialize_model(ResolvedLoadPlan&&, DeviceContext&,
                                                     const StartupObserver*);
     Model(Config config, LoadOptions options, ModelWeights weights, std::vector<BoundWeight> bound,
-          FrontendResources resources, InstanceInfo info, artifact::MaterializedArtifact backing);
+          std::vector<ExpertBankSource> banks, FrontendResources resources, InstanceInfo info,
+          artifact::MaterializedArtifact backing);
 
     // Destroy all borrowers before backing. The caller keeps DeviceContext alive through cleanup.
     artifact::MaterializedArtifact backing_;
@@ -59,6 +62,7 @@ private:
     LoadOptions options_;
     ModelWeights weights_;
     std::vector<BoundWeight> bound_;
+    std::vector<ExpertBankSource> banks_;
     FrontendResources resources_;
     InstanceInfo info_;
 };

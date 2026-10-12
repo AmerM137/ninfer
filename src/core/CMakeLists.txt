@@ -29,6 +29,8 @@ add_library(ninfer_core STATIC
   layout.cpp
   tensor.cpp
   weight_view.cpp
+  weight_bank.cpp
+  expert_cache.cpp
   decode_graph.cpp
 )
 ninfer_internal_includes(ninfer_core)

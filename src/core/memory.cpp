@@ -34,4 +34,10 @@ MemorySpan MemorySpan::subspan(std::size_t offset, std::size_t count) const {
     return {const_cast<void*>(part.data), part.bytes, part.device, part.host_pinned};
 }
 
+CudaHostView CudaHostView::subspan(std::size_t offset, std::size_t count) const {
+    const auto part    = host.subspan(offset, count);
+    const auto* mapped = static_cast<const std::byte*>(device_address);
+    return {part, mapped ? mapped + offset : nullptr, cuda_device};
+}
+
 } // namespace ninfer
