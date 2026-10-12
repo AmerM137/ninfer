@@ -14,9 +14,12 @@ namespace ninfer::models::qwen3_5::execution {
 std::size_t ffn_workspace_bytes(const FfnParameters& parameters, std::int32_t first,
                                 std::int32_t last, bool mtp) {
     if (first <= 0 || last < first) { throw std::invalid_argument("FFN: invalid column interval"); }
-    if (const auto* moe = std::get_if<ops::SparseMoeWeights>(&parameters)) {
-        return ops::sparse_moe_workspace_capacity_bytes(moe->routed_gate_up.qtype,
-                                                        moe->routed_down.qtype, first, last);
+    if (const auto* moe = std::get_if<MoeParameters>(&parameters)) {
+        if (moe->resident.device.type() != DeviceType::CUDA) {
+            throw std::invalid_argument("resident FFN requires GPU expert sources");
+        }
+        return ops::topk_softmax_swiglu_moe_workspace_capacity_bytes(
+            moe->profile, ops::MoeEpilogue::AddResidual, first, last);
     }
     const auto& p    = std::get<DenseParameters>(parameters);
     const auto& gu   = p.gate_up.weight;
@@ -50,16 +53,18 @@ std::size_t ffn_workspace_bytes(const FfnParameters& parameters, std::int32_t fi
 }
 
 void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual,
-         const ops::SparseMoeHints& hints, MemoryArena& workspace, CudaExecutionView execution,
+         const ops::MoeExecutionHints& hints, MemoryArena& workspace, CudaExecutionView execution,
          bool mtp) {
     auto scope         = workspace.scope();
     const auto columns = hidden.ne[1];
-    if (const auto* moe = std::get_if<ops::SparseMoeWeights>(&parameters)) {
+    if (const auto* moe = std::get_if<MoeParameters>(&parameters)) {
         const auto storage =
             workspace.alloc_bytes(ffn_workspace_bytes(parameters, columns, columns));
         MemoryArena scratch(storage);
-        ops::sparse_moe(hidden, *moe, ops::SparseMoeEpilogue::AddResidual, residual, hints, scratch,
-                        execution);
+        const ops::MoeWeights weights{
+            moe->control, {moe->resident, moe->activation_divisors}, moe->shared};
+        ops::topk_softmax_swiglu_moe(hidden, moe->profile, weights, ops::MoeEpilogue::AddResidual,
+                                     residual, scratch, execution, hints);
         return;
     }
     const auto& p    = std::get<DenseParameters>(parameters);

@@ -68,11 +68,36 @@ struct ExpertBankSource {
     CudaHostView down_upload;
 };
 
+// Affine planes use base + expert * stride. Indexed planes use base + offsets[expert].
+// Divisors are independently indexed by logical expert; a null plane is absent.
+struct ExpertMatrixDeviceView {
+    const std::byte* codes    = nullptr;
+    const std::byte* high     = nullptr;
+    const std::byte* scales   = nullptr;
+    std::uint64_t code_stride = 0, high_stride = 0, scale_stride = 0;
+    const std::uint64_t* offsets = nullptr;
+    const float* divisors        = nullptr;
+    std::uint64_t divisor_stride = 0;
+    // Indexed addresses refer into this backing; the owner retains selected entries through
+    // execution.
+    ConstMemorySpan indexed_storage;
+};
+
+struct ExpertBankDeviceView {
+    ExpertMatrixDeviceView gate_up, down;
+    std::uint32_t count = 0;
+    Device device;
+};
+
 [[nodiscard]] WeightBankLayout describe_weight_bank(const WeightGeometry& geometry,
                                                     const WeightBankRegion& region);
 [[nodiscard]] WeightBankView bind_weight_bank(const WeightParent& parent,
                                               const WeightBankLayout& layout);
 [[nodiscard]] Weight matrix_weight(const WeightBankView& bank, std::uint32_t expert,
                                    float input_divisor = 0.0F);
+// Borrows resident CUDA planes and their original divisor arrays; performs no allocation.
+[[nodiscard]] ExpertMatrixDeviceView device_weight_bank(const WeightBankView& bank);
+[[nodiscard]] ExpertBankDeviceView device_expert_bank(const WeightBankView& gate_up,
+                                                      const WeightBankView& down);
 
 } // namespace ninfer

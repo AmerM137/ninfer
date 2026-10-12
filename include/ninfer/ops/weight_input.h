@@ -2,7 +2,6 @@
 
 #include "core/weight_view.h"
 #include "ninfer/ops/projection_weights.h"
-#include "ninfer/ops/sparse_moe.h"
 
 #include <optional>
 #include <span>
@@ -28,10 +27,5 @@ struct WeightInput {
                                                                  const WeightInput& b);
 [[nodiscard]] SingleProjectionWeight prepare_linear_swiglu_weight(const WeightInput& gate,
                                                                   const WeightInput& up);
-[[nodiscard]] SparseMoeWeights
-prepare_sparse_moe_weights(const WeightInput& router, const WeightInput& shared_score,
-                           std::span<const WeightInput> expert_gate_up,
-                           std::span<const WeightInput> expert_down, const WeightInput& shared_gate,
-                           const WeightInput& shared_up, const WeightInput& shared_down);
 
 } // namespace ninfer::ops

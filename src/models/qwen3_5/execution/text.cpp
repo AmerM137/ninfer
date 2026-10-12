@@ -25,7 +25,7 @@
 #include "ninfer/ops/position.h"
 #include "ninfer/ops/residual_add.h"
 #include "ninfer/ops/rope.h"
-#include "ninfer/ops/sparse_moe.h"
+#include "ninfer/ops/moe.h"
 #include "ninfer/ops/scalar.h"
 #include "ninfer/ops/sigmoid_mul.h"
 #include "ninfer/ops/silu_mul.h"
@@ -318,7 +318,7 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
                                    const Tensor& rope_positions,
                                    ops::CausalAttentionExecutionEnvelope envelope,
                                    Tensor& mtp_hidden) {
-    const int T    = x.ne[1];
+    const int T = x.ne[1];
 
     const auto projection = workspace::mtp_attention_projection(work_, config_, T);
     Tensor q              = projection.query.view({dimension(config_.attention->head_dim),
@@ -830,8 +830,8 @@ void TextContext::mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor
 }
 
 void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase ph) {
-    const auto& p  = std::get<AttentionParameters>(w.mixer);
-    const int T    = x.ne[1];
+    const auto& p = std::get<AttentionParameters>(w.mixer);
+    const int T   = x.ne[1];
     if (active_causal_attention_envelope_ == nullptr) {
         throw std::logic_error("Text GQA execution envelope is not set");
     }
@@ -917,8 +917,8 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
 }
 
 void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase ph) {
-    const auto& p  = std::get<GdnParameters>(w.mixer);
-    const int T    = x.ne[1];
+    const auto& p = std::get<GdnParameters>(w.mixer);
+    const int T   = x.ne[1];
 
     const auto control = workspace::gdn_control(work_, config_, T);
     Tensor h           = control.hidden;
@@ -1049,14 +1049,14 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
                     p.output.policy, work_, execution_);
 }
 
-ops::SparseMoeHints TextContext::next_projection_hints(int layer) const {
+ops::MoeExecutionHints TextContext::next_projection_hints(int layer) const {
     const auto next = static_cast<std::size_t>(layer) + 1;
     return next < parameters_.text.layers.size() ? parameters_.text.layers[next].projection_prefetch
-                                                 : ops::SparseMoeHints{};
+                                                 : ops::MoeExecutionHints{};
 }
 
 void TextContext::mlp_tail(const BlockParameters& weights, Tensor& x, Phase,
-                           const ops::SparseMoeHints& hints) {
+                           const ops::MoeExecutionHints& hints) {
     Tensor h = workspace::post_mixer_hidden(work_, config_, x.ne[1]);
     ops::rmsnorm(x, weights.post_attention_norm, config_.rms_norm_eps, true, h, execution_);
     ffn(h, weights.ffn, x, hints, work_, execution_);

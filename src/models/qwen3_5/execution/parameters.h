@@ -1,6 +1,7 @@
 #pragma once
 
 #include "models/qwen3_5/model.h"
+#include "ninfer/ops/moe.h"
 #include "ninfer/ops/weight_input.h"
 
 #include <array>
@@ -27,7 +28,16 @@ struct DenseParameters {
     LinearParameters down;
 };
 
-using FfnParameters = std::variant<DenseParameters, ops::SparseMoeWeights>;
+struct MoeParameters {
+    ops::MoeProfile profile;
+    Weight control;
+    ops::SwiGLUWeights shared;
+    ExpertBankId bank;
+    ops::ExpertActivationDivisors activation_divisors;
+    ExpertBankDeviceView resident;
+};
+
+using FfnParameters = std::variant<DenseParameters, MoeParameters>;
 
 struct AttentionParameters {
     ops::ProjectionWeights projection;
@@ -48,7 +58,7 @@ struct BlockParameters {
     Tensor input_norm, post_attention_norm;
     std::variant<AttentionParameters, GdnParameters> mixer;
     FfnParameters ffn;
-    ops::SparseMoeHints projection_prefetch;
+    ops::MoeExecutionHints projection_prefetch;
 };
 
 struct TextParameters {

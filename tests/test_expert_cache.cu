@@ -175,7 +175,16 @@ ExpertCacheUse acquire(ExpertCache& cache, std::span<const ExpertKey> keys,
 void verify(ExpertCache& cache, const ExpertBankSource& source, ExpertKey key,
             const DeviceContext& device) {
     const std::array keys{key};
-    const auto use        = acquire(cache, keys, device.execution_view());
+    const auto use  = acquire(cache, keys, device.execution_view());
+    const auto view = cache.view(key.bank);
+    require(view.device == device.device(), "expert view lost its device");
+    for (const auto* matrix : {&view.gate_up, &view.down}) {
+        if (matrix->offsets) {
+            require(matrix->indexed_storage.device == device.device() &&
+                        matrix->indexed_storage.data && matrix->indexed_storage.bytes,
+                    "indexed expert view lost its backing range");
+        }
+    }
     const auto dimensions = sizes(source);
     DeviceBuffer output(device.device(), total(dimensions));
     gather<<<(output.size() + 255) / 256, 256, 0, device.stream()>>>(

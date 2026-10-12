@@ -1090,42 +1090,38 @@ roofline.
   --context-capacity 262144 --execution graph --cache both
 ```
 
-## 35B sparse-MoE dFlash benchmark
+## MoE benchmark
 
-`ninfer_sparse_moe_bench` measures the complete routed-plus-shared post-mixer Op for the 35B Text
-Q4+Q5/Q6 profiles and the MTP Q8+Q8 profile. It is a long-lived public Op benchmark: fixture setup
-uses `sparse_moe_workspace_capacity_bytes()`, and every eager or captured measurement calls only
-`ninfer::ops::sparse_moe()`. Production dispatch exclusively owns decode, Small-T, prefill,
-workspace views, launch decomposition, and schedule selection.
-
-CUDA Graph replay is the default and authoritative execution mode. The benchmark eagerly
-materializes the public call, captures it with stable tensor and workspace addresses, instantiates
-the graph, and primes one replay before configured warmup. Timing-enabled external event nodes
-surround the captured public call, so `graph_replay` reports the complete device-side SparseMoe
-body while excluding fixture reset, L2 eviction, graph capture/instantiation/prime, host launch,
-and host synchronization. `eager` uses the same public-call lambda and is only a comparison mode.
+`ninfer_moe_bench` calls the public MoE interfaces over the 35B Q4+Q5/Q6 and Q8+Q8 profiles.
+`--op complete` measures router, routed/shared SwiGLU and BF16 residual addition; `route` measures
+routing only. `routed` and `routed-shared` consume routes prepared outside timing and write FP32.
+The latter includes the shared branch. Their `--subset all|mask-ones|mask-zeros|none` selects the
+logical expert assignments; the fixture's mask assigns odd IDs to the 1 side.
 
 ```bash
-cmake --build build --parallel --target ninfer_sparse_moe_bench
-./build/bench/ninfer_sparse_moe_bench \
-  --codec q4-q5 --tokens 1 --execution graph --cache both \
-  --distribution trace-like --warmup 20 --repeat 200
-./build/bench/ninfer_sparse_moe_bench \
-  --codec q4-q5 --sweep 1:128:1 --execution graph --cache cold \
-  --distribution trace-like --warmup 5 --repeat 50 \
-  --csv-out profiles/bench/sparse_moe_public_graph.csv
+./build/bench/ninfer_moe_bench --codec q4-q5 --tokens 1 --execution graph --cache both
+./build/bench/ninfer_moe_bench --codec all --sweep 1:64:1 --distribution trace-like \
+  --execution graph --cache both --warmup 10 --repeat 80 --csv-out /tmp/moe.csv
+./build/bench/ninfer_moe_bench --op routed-shared --codec q4-q5 --tokens 32 \
+  --subset mask-ones --execution graph --cache cold
 ```
 
-Each cold sample flushes 256 MiB before the timed interval. `trace-like` is the primary
-single-sequence verification distribution; `independent` and `same` bound zero and complete expert
-overlap. `--execution eager|graph|both` and `--cache cold|warm|both` change only the harness around
-the same public call. The CSV `timed_scope` is `full_sparse_moe_device_body`; it contains no private
-route, candidate, grid, block, or launch-count fields.
+Graph replay is the default and authoritative timing mode. External event nodes bracket only the
+public Op's device work. Input preparation, residual reset, L2 eviction, Graph setup/prime, Host
+submission and synchronization are outside that interval. `eager` measures the same public call.
+Cold samples flush 256 MiB; warm samples reuse the working set. `trace-like` provides repeated but
+changing experts; `independent` and `same` cover low and full overlap. Production code alone chooses
+the implementation.
 
-`unique_weight_gbps` counts the router, shared weights, and each selected expert's encoded weights
-once, so it is a distribution-aware useful-traffic lower bound rather than measured DRAM traffic.
-Its peak percentage uses the device's theoretical DDR bandwidth. `logical_tflops` counts the
-router plus eight routed and one shared gate/up and down matrix products.
+CSV rows identify the Op, subset, selected assignment count, distribution, cache state and execution
+mode. They report median/min/p95 latency, workspace, useful encoded-weight bandwidth and logical
+FLOP/s. `unique_weight_gbps` counts each selected expert once, plus the control/shared matrices
+actually used by that Op; it is a useful-traffic lower bound, not measured DRAM traffic.
+`memory_lower_bound_us` divides these bytes by theoretical device bandwidth. For a measured
+roofline, substitute sustained bandwidth and include private reloads, staging traffic and padded
+computation when interpreting the gap. Logical FLOP/s counts only the requested matrix products.
+The complete call uses empty external read-ahead hints; next-projection cache warming and its
+downstream effect are covered by Engine measurements.
 
 ## Q8 context K/V LinearPair benchmark
 

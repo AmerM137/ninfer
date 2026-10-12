@@ -10,7 +10,7 @@
 #include "core/weight.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/softmax_attention.h"
-#include "ninfer/ops/sparse_moe.h"
+#include "ninfer/ops/moe.h"
 #include "models/qwen3_5/state/decoder_state.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 #include "models/qwen3_5/program/round_buffers.h"
@@ -162,8 +162,8 @@ private:
     void attn_mix(const BlockParameters& weights, Tensor& x, int index, Phase phase);
     void gdn_mix(const BlockParameters& weights, Tensor& x, int index, Phase phase);
     void mlp_tail(const BlockParameters& weights, Tensor& x, Phase phase,
-                  const ops::SparseMoeHints& hints);
-    [[nodiscard]] ops::SparseMoeHints next_projection_hints(int layer) const;
+                  const ops::MoeExecutionHints& hints);
+    [[nodiscard]] ops::MoeExecutionHints next_projection_hints(int layer) const;
     void run_layers(Tensor& x, Phase phase);
     template <class Tap>
     void run_layers(Tensor& x, Phase phase, Tap& tap);

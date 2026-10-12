@@ -214,55 +214,40 @@ struct ExpertCache::Impl {
             const auto bind = [&](const WeightBankView& matrix,
                                   const ExpertMatrixEntryLayout& image,
                                   const LayoutRegion& divisor_region) {
-                ExpertMatrixDeviceView view;
-                const auto plane = [&](const WeightBankPlane& input_plane,
-                                       const LayoutRegion& output_plane) {
-                    if (!input_plane.expert_bytes) {
-                        return static_cast<const std::byte*>(nullptr);
-                    }
-                    if (layout.resident) {
-                        return static_cast<const std::byte*>(matrix.plane(input_plane, 0).data);
-                    }
-                    return pool.data()
-                               ? static_cast<const std::byte*>(pool.data()) + output_plane.offset
-                               : nullptr;
-                };
-                view.codes  = plane(matrix.layout.codes, image.codes);
-                view.high   = plane(matrix.layout.high, image.high);
-                view.scales = plane(matrix.layout.scales, image.scales);
                 if (layout.resident) {
                     if (matrix.parent->device != ctx.device()) {
                         throw std::invalid_argument("resident expert belongs to another GPU");
                     }
-                    view.code_stride  = matrix.layout.codes.expert_stride;
-                    view.high_stride  = matrix.layout.high.expert_stride;
-                    view.scale_stride = matrix.layout.scales.expert_stride;
-                    if (matrix.layout.has_divisors) {
-                        view.divisors =
-                            reinterpret_cast<const float*>(matrix.parent->data +
-                                                           matrix.parent->geometry.divisor_offset) +
-                            matrix.layout.divisor_begin;
-                        view.divisor_stride = matrix.layout.divisor_stride;
+                    return device_weight_bank(matrix);
+                }
+                ExpertMatrixDeviceView view;
+                const auto plane = [&](const LayoutRegion& region) -> const std::byte* {
+                    return pool.data() && region.bytes
+                               ? static_cast<const std::byte*>(pool.data()) + region.offset
+                               : nullptr;
+                };
+                view.codes           = plane(image.codes);
+                view.high            = plane(image.high);
+                view.scales          = plane(image.scales);
+                view.indexed_storage = pool.span();
+                view.offsets =
+                    static_cast<const std::uint64_t*>(layout.offsets.bind(offsets.span()).data);
+                if (divisor_region.bytes) {
+                    std::vector<float> values(layout.count);
+                    for (std::uint32_t e = 0; e < layout.count; ++e) {
+                        values[e] = matrix.divisor(e);
                     }
-                } else {
-                    view.offsets =
-                        static_cast<const std::uint64_t*>(layout.offsets.bind(offsets.span()).data);
-                    if (divisor_region.bytes) {
-                        std::vector<float> values(layout.count);
-                        for (std::uint32_t e = 0; e < layout.count; ++e) {
-                            values[e] = matrix.divisor(e);
-                        }
-                        divisors.copy_from_host(values.data(), divisor_region.bytes,
-                                                divisor_region.offset);
-                        view.divisors =
-                            static_cast<const float*>(divisor_region.bind(divisors.span()).data);
-                        view.divisor_stride = 1;
-                    }
+                    divisors.copy_from_host(values.data(), divisor_region.bytes,
+                                            divisor_region.offset);
+                    view.divisors =
+                        static_cast<const float*>(divisor_region.bind(divisors.span()).data);
+                    view.divisor_stride = 1;
                 }
                 return view;
             };
             views.push_back({bind(source.gate_up, layout.gate_up, layout.gate_up_divisors),
-                             bind(source.down, layout.down, layout.down_divisors), layout.count});
+                             bind(source.down, layout.down, layout.down_divisors), layout.count,
+                             ctx.device()});
             if (!layout.resident) {
                 for (std::uint32_t e = 0; e < layout.count; ++e) {
                     entries.push_back({ExpertKey{ExpertBankId{static_cast<std::uint32_t>(b)}, e}});

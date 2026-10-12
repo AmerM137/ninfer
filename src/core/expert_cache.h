@@ -52,25 +52,6 @@ struct ExpertCacheRequirements {
 
 inline constexpr std::uint64_t kExpertAbsentOffset = UINT64_MAX;
 
-// offsets == nullptr: plane + expert * stride; otherwise plane + offsets[logical_expert].
-// Only keys protected by a live use may be read. Unpublished offsets are not consumable.
-// Cached planes have 16-byte alignment; encoded scale ordering is unchanged.
-// Divisors are always indexed by logical expert, independently of cache allocation.
-struct ExpertMatrixDeviceView {
-    const std::byte* codes    = nullptr;
-    const std::byte* high     = nullptr;
-    const std::byte* scales   = nullptr;
-    std::uint64_t code_stride = 0, high_stride = 0, scale_stride = 0;
-    const std::uint64_t* offsets = nullptr;
-    const float* divisors        = nullptr;
-    std::uint64_t divisor_stride = 0;
-};
-
-struct ExpertBankDeviceView {
-    ExpertMatrixDeviceView gate_up, down;
-    std::uint32_t count = 0;
-};
-
 class ExpertCache;
 
 struct ExpertCacheUse {
@@ -126,6 +107,7 @@ public:
     [[nodiscard]] std::optional<ExpertCacheUse> acquire(std::span<const ExpertKey> required,
                                                         CudaExecutionView execution);
     void release(ExpertCacheUse use, CudaExecutionView execution);
+    // Only experts protected by a live use may be consumed. Encoded planes are 16-byte aligned.
     [[nodiscard]] const ExpertBankDeviceView& view(ExpertBankId bank) const;
     [[nodiscard]] ExpertCacheUsage usage() const;
 

@@ -1,3 +1,4 @@
+#include "ninfer/ops/moe.h"
 #include "artifact/binder.h"
 #include "artifact/fixture.h"
 #include "artifact/reader.h"
@@ -154,16 +155,25 @@ void check_native_inputs(const qwen::Model& model) {
                         "Host expert bank has no matching registered source");
                 return;
             }
-            std::vector<ops::WeightInput> gate_up, down;
-            for (const auto& expert : moe.experts) {
-                gate_up.push_back(model.input(expert.gate));
-                gate_up.push_back(model.input(expert.up));
-                down.push_back(model.input(expert.down));
-            }
-            (void)ops::prepare_sparse_moe_weights(
-                model.input(moe.router), model.input(moe.shared_score), gate_up, down,
-                model.input(moe.shared.gate), model.input(moe.shared.up),
-                model.input(moe.shared.down));
+            const auto device = device_expert_bank(bank.gate_up, bank.down);
+            require(device.device == bank.gate_up.parent->device &&
+                        device.count == moe.experts.size(),
+                    "native expert view differs from bank");
+            const std::array control{model.input(moe.router), model.input(moe.shared_score)};
+            (void)ops::prepare_linear_weight(control);
+            const ops::SwiGLUWeights shared{
+                ops::prepare_linear_swiglu_weight(model.input(moe.shared.gate),
+                                                  model.input(moe.shared.up)),
+                ops::prepare_linear_weight(model.input(moe.shared.down))};
+            const ops::MoeProfile profile{
+                ops::routed_swiglu_profile(
+                    bank.gate_up, bank.down,
+                    std::get<qwen::MoeConfig>(model.config().text.ffn).num_experts_per_tok,
+                    model.input(moe.experts.front().gate).policy,
+                    model.input(moe.experts.front().down).policy),
+                ops::swiglu_profile(shared)};
+            (void)ops::topk_softmax_swiglu_moe_workspace_capacity_bytes(
+                profile, ops::MoeEpilogue::AddResidual, 1, 1);
         }
     };
     const auto& weights = model.weights();

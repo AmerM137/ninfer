@@ -180,6 +180,13 @@ NINFER_TEST_ARTIFACT=$PWD/out/qwen3_8_27b_nvfp4.ninfer \
   ctest --test-dir build -R ninfer_qwen3_5_score_real_test --output-on-failure
 ```
 
+`ninfer_moe_test` qualifies routing, complete MoE and routed SwiGLU.
+`ninfer_sum_contributions_test` covers FP32 partial summation with optional BF16 residual.
+Their independent FP64 oracles start from represented inputs and decoded logical weights. The MoE
+suite covers the resident codec profiles, FP32/BF16 outputs, residual modes, expert masks, strided/indexed
+banks, empty GPU assignments, Graph relocation and workspace guards. The complete MoE retains
+its existing numerical samples and criteria.
+
 Run the 35B-A3B MoE route independently:
 
 ```bash

@@ -96,4 +96,34 @@ Weight matrix_weight(const WeightBankView& bank, std::uint32_t expert, float inp
     return native_weight({{r.rows, k}, {{bank.parent, begin, begin + r.rows * k}}}, input_divisor);
 }
 
+ExpertMatrixDeviceView device_weight_bank(const WeightBankView& bank) {
+    if (!bank.parent || bank.parent->device.type() != DeviceType::CUDA) {
+        throw std::invalid_argument("device weight bank requires CUDA backing");
+    }
+    const auto& layout = bank.layout;
+    ExpertMatrixDeviceView out;
+    out.codes        = static_cast<const std::byte*>(bank.plane(layout.codes, 0).data);
+    out.high         = static_cast<const std::byte*>(bank.plane(layout.high, 0).data);
+    out.scales       = static_cast<const std::byte*>(bank.plane(layout.scales, 0).data);
+    out.code_stride  = layout.codes.expert_stride;
+    out.high_stride  = layout.high.expert_stride;
+    out.scale_stride = layout.scales.expert_stride;
+    if (layout.has_divisors) {
+        out.divisors = reinterpret_cast<const float*>(bank.parent->data +
+                                                      bank.parent->geometry.divisor_offset) +
+                       layout.divisor_begin;
+        out.divisor_stride = layout.divisor_stride;
+    }
+    return out;
+}
+
+ExpertBankDeviceView device_expert_bank(const WeightBankView& gate_up, const WeightBankView& down) {
+    if (!gate_up.parent || !down.parent || gate_up.parent->device != down.parent->device ||
+        gate_up.layout.region.count != down.layout.region.count) {
+        throw std::invalid_argument("expert bank matrices differ in device or count");
+    }
+    return {device_weight_bank(gate_up), device_weight_bank(down), gate_up.layout.region.count,
+            gate_up.parent->device};
+}
+
 } // namespace ninfer

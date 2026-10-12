@@ -1,11 +1,12 @@
 # Expert 权重来源与 GPU 副本缓存
 
-本文约定已实现的 bank 视图、放置加载和 GPU 副本容器。
+本文约定已实现的 bank 视图、放置加载、GPU 副本容器与 MoE 计算交接。
 数学与量化布局由 [artifact 格式](artifact-container.md)和各 Op 合同拥有；
 执行与生命周期由 [Engine 架构](engine-architecture.md)拥有。
 
 当前公开 Engine 仍使用全 GPU 权重。这里提供后续 CPU/GPU MoE 接入所需的底层能力，
-尚未实现混合 MoE 计算、Program 调度或 Engine 显存预算选项。
+GPU 路由、专家子集计算与完整融合计算已有独立 Op；CPU expert 算子、混合 Program 调度
+和 Engine 显存预算选项尚未接入。
 
 ## 来源与身份
 
@@ -53,7 +54,8 @@ Qwen3.5 的 bank ID 按 Main 层顺序建立，选中的 MTP bank 追加在末�
    Model 持有最终 backing，所有原生权重与 bank 视图借用它，不依赖 Reader 生命周期。
 
 这里保留完整 parent 原编码，不运行期 repack，也不把 Host 来源保存成大量单 expert 对象。
-`Parameters` 当前拒绝 CPU expert 来源进入 resident 执行路径。
+`Parameters` 保存 bank 身份、矩阵 profile 与 Use 元数据，可以描述 CPU 来源；
+resident FFN 的 workspace/执行边界要求 CUDA 常驻视图，尚不执行混合放置。
 Flash Next 的 NVFP4/Block-FP8 bank 可通过通用 artifact/core 接口加载；
 这不代表已接入完整 Qwen4Exp 模型执行。
 
@@ -76,6 +78,8 @@ NVFP4 的 matrix divisor 是静态元数据：CPU 来源在启动时镜像到 GP
 由来源建立者保证；artifact materializer 从原 payload 提取并验证。
 运行期上传只搬 codes/high/scales，divisor 始终按 logical expert ID 寻址。
 
+`device_weight_bank` / `device_expert_bank` 从原生 CUDA bank 建立借用视图，不分配或重排权重。
+`ExpertBankDeviceView` 同时记录逻辑 expert 数和 CUDA device。
 `ExpertMatrixDeviceView` 的寻址合同：
 
 ```text
@@ -84,7 +88,8 @@ cached:   offsets != nullptr; plane_address = plane_base + offsets[expert]
 divisor_address = divisor_base + expert * divisor_stride
 ```
 
-缓存的 plane_base 是 pool_base 加该 bank 的 plane 偏移。offset table、pool 和 divisor
+缓存的 plane_base 是 pool_base 加该 bank 的 plane 偏移；`indexed_storage` 描述整个被借用的
+pool 范围，用于检查输出和 scratch 不与权重重叠。offset table、pool 和 divisor
 分配地址终身稳定，可供 Graph 捕获。`UINT64_MAX` 是未发布哨兵；消费者只可读取
 acquire 成功所保护的 keys，不能把表里其他条目的内容当作可用性保证。
 
@@ -146,12 +151,38 @@ CUDA 提交失败后缓存停止接受工作，销毁前排空已提交传输和
 注册及首次上传的准备成本在启动阶段处理。CPU 计算与 DMA 可以同时读取不可变来源，
 但共享系统内存带宽；数据上传和小 bridge 传输的推进由后续 Program 接入决定。
 
+## MoE 计算交接
+
+数学、输入输出与 alias 合同由 [MoE Op](../../include/ninfer/ops/moe.h) 和
+[SumContributions](../../include/ninfer/ops/sum_contributions.h) 拥有。
+
+- `topk_softmax_route` 写出 logical expert IDs、原始 top-k softmax 系数和独立 shared sigmoid
+  系数。路由张量为 I32/FP32 `[K,T]`，shared 系数为 FP32 `[T]`。
+- `routed_swiglu` 消费同一次路由，可以计算 All、None、mask 的 1 侧或 0 侧；不重新归一化。
+  mask 表示计算分工，offset table 表示物理位置。两者独立，未选 expert 的偏移和权重不被读取。
+  可选 shared term 在 GPU 上计算一次，也适用于 None。
+- 分项计算可写 FP32 `[H,T]`；最终计算可写 BF16，或在一次最终舍入前加上原 BF16 residual。
+  `sum_contributions` 接受一到两份 FP32 分项与可选 BF16 residual，产生 BF16 输出。
+- `topk_softmax_swiglu_moe` 定义完整 router、routed/shared SwiGLU 与可选 residual 的融合计算。
+  它与独立 Op 共用 kernel 机制，保有自己的格式/shape 分派和调优策略；全 GPU Main/MTP
+  通过这一入口执行。
+
+当前 CUDA 数学支持 35B 的 Q4+Q5、Q4+Q6 和 Q8+Q8 expert profile，shared 为 Q8。
+NVFP4/Block-FP8 的来源与寻址可描述，不表示这些 expert 数学已实现。
+`CudaSwiGLUExperts` 借用 affine 或 indexed GPU bank；`CpuSwiGLUExperts` 借用完整原生 Host bank，
+留给 CPU 数学消费者。activation divisor 属于 Use，matrix divisor 属于权重表示，二者不互相替代。
+融合 GU/down 分别取相关 Use 的 activation policy 交集；NVFP4 A4 需要共同的正值 activation divisor。
+
+Op 不分配长期资源、不上传权重，也不读取 Host 路由值。Program 提供 scratch 和执行 view，
+负责发布、acquire/release 及 bridge 完成依赖。固定 profile 的 Graph 可以重放新的路由、mask 和
+索引内容；更新必须发生在旧消费者结束之后。shared 始终驻留 GPU，不进入动态 expert 集合。
+
 ## 后续接入
 
 后续计算与 Program 接入保留以下执行约定；缓存自身不实现这些策略：
 
-- 在读取完整权重前决定 resident 或 Host 来源。完整 GPU 放置可行时，沿用现有融合
-  SparseMoe，不建立完整 Host expert 副本。Host 模式保留完整原编码来源，运行期不从
+- 在读取完整权重前决定 resident 或 Host 来源。完整 GPU 放置可行时，使用完整融合
+  `topk_softmax_swiglu_moe`，不建立完整 Host expert 副本。Host 模式保留完整原编码来源，运行期不从
   磁盘补 expert，也不写回权重。
 - 大块 prefill、Replay 和 CausalScoring 在实际 MoE 消费前取得整个 bank；容量至少能
   容纳最大的动态 bank。预取可以分批，计算不拆成部分 expert 子集。下一 bank 来自
@@ -164,7 +195,8 @@ CUDA 提交失败后缓存停止接受工作，销毁前排空已提交传输和
   副本。数据池不永久划出 decode 专区。首 token 发布不等待恢复 D，副本布局不进入
   StateImage，也不随 speculative rejection 回滚。
 - CPU 使用已有固定 CpuExecutor；Program 预分配 activations、routes 和 partial buffers。
-  CPU/GPU routed 分支分别产生 FP32 partial[H,T]，在 GPU 与 shared 分支、residual 合并。
+  CPU 分支产生 FP32 partial[H,T]；GPU 分支可同时计算自身 routed 子集和 shared，产生另一份
+  FP32 partial[H,T]。随后在 GPU 合并两份分项与 residual，shared 只计一次。
   激活交接缓冲区的复用服从各自完成依赖，与权重上传槽分别计费。
 - resident 保留完整 CUDA Graph；混合执行使用经过验证的 GPU 分段 Graph 或显式 eager
   路径，在启动时确定。所选 MTP 仍常驻 GPU，DFlash/DFlash2 的 Main verification 经过

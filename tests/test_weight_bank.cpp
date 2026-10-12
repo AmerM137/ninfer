@@ -28,6 +28,7 @@ void integers() {
         HostBuffer bytes(g.bytes);
         WeightParent parent{g, Device::cpu(), static_cast<const std::byte*>(bytes.data())};
         const auto bank = bind_weight_bank(parent, describe_weight_bank(g, {128, 3, 128, 512}));
+        rejects([&] { (void)device_weight_bank(bank); });
         for (unsigned e = 0; e < 3; ++e) {
             const auto w     = matrix_weight(bank, e);
             const auto row   = 128 + e * 512;

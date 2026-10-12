@@ -1,0 +1,50 @@
+#include "core/nvtx.h"
+#include "ninfer/ops/moe.h"
+#include "ops/moe/operands.h"
+#include "ops/moe/topk_softmax_route/dispatch.h"
+#include "ops/moe/workspace.h"
+
+namespace ninfer::ops {
+namespace {
+std::size_t route_bytes(int tokens) {
+    WorkspaceLayoutBuilder layout;
+    (void)detail::allocate_route(layout, detail::moe_route::select_h2048_e256_k8(tokens), tokens);
+    return layout.peak_bytes(1);
+}
+} // namespace
+
+std::size_t topk_softmax_route_workspace_capacity_bytes(const RouteProfile& profile, int first,
+                                                        int last) {
+    detail::validate_route_profile(profile);
+    detail::validate_interval(first, last);
+    return detail::interval_capacity(first, last, detail::moe_route::allocation_boundaries(),
+                                     route_bytes);
+}
+
+void topk_softmax_route(const Tensor& x, const RouteProfile& profile, const Weight& control,
+                        ExpertRoutes& routes, Tensor& shared_coefficients, MemoryArena& workspace,
+                        CudaExecutionView execution) {
+    detail::validate_route_profile(profile);
+    detail::MoeOperands operands("topk_softmax_route", execution);
+    const int tokens = operands.input(x, profile.hidden);
+    operands.control(control, profile);
+    operands.routes(routes, profile.top_k, tokens, true);
+    operands.coefficient(shared_coefficients, tokens, true);
+    operands.workspace(workspace,
+                       topk_softmax_route_workspace_capacity_bytes(profile, tokens, tokens));
+    operands.finish();
+    nvtx::ScopedRange range(nvtx::Name::TopkSoftmaxRoute, nvtx::Category::Moe, tokens);
+    for (std::int64_t start = 0; start < tokens; start += detail::kMoeSliceTokens) {
+        const int offset   = static_cast<int>(start);
+        const int count    = std::min(tokens - offset, detail::kMoeSliceTokens);
+        auto scope         = workspace.scope();
+        const auto plan    = detail::moe_route::select_h2048_e256_k8(count);
+        const auto storage = detail::allocate_route(workspace, plan, count);
+        const ExpertRoutes result{routes.ids.slice(1, offset, count),
+                                  routes.coefficients.slice(1, offset, count)};
+        detail::launch_route(x.slice(1, offset, count), control, result,
+                             shared_coefficients.slice(0, offset, count), plan, storage, {},
+                             execution);
+    }
+}
+} // namespace ninfer::ops
