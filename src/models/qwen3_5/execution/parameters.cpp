@@ -106,28 +106,31 @@ public:
 
     FfnParameters ffn(const BlockWeights& w) const {
         if (const auto* d = std::get_if<DenseWeights>(&w.ffn)) { return dense(*d); }
-        const auto& moe = std::get<MoeWeights>(w.ffn);
-        return with_context(model_.weight(moe.router).name, [&] {
-            const auto& source = model_.expert_banks()[moe.bank.index];
+        return moe(std::get<MoeWeights>(w.ffn));
+    }
+
+    MoeParameters moe(const MoeWeights& w) const {
+        return with_context(model_.weight(w.router).name, [&] {
+            const auto& source = model_.expert_banks()[w.bank.index];
             ExpertUse gate_up, down;
-            for (const auto& expert : moe.experts) {
+            for (const auto& expert : w.experts) {
                 gate_up.include(model_.input(expert.gate));
                 gate_up.include(model_.input(expert.up));
                 down.include(model_.input(expert.down));
             }
             MoeParameters out;
-            const std::array control{model_.input(moe.router), model_.input(moe.shared_score)};
+            const std::array control{model_.input(w.router), model_.input(w.shared_score)};
             out.control = ops::prepare_linear_weight(control).weight;
-            out.shared  = {ops::prepare_linear_swiglu_weight(model_.input(moe.shared.gate),
-                                                             model_.input(moe.shared.up)),
-                           linear(moe.shared.down)};
+            out.shared  = {ops::prepare_linear_swiglu_weight(model_.input(w.shared.gate),
+                                                             model_.input(w.shared.up)),
+                           linear(w.shared.down)};
             out.profile = {
                 ops::routed_swiglu_profile(
                     source.gate_up, source.down,
                     dimension(std::get<MoeConfig>(model_.config().text.ffn).num_experts_per_tok),
                     gate_up.policy, down.policy),
                 ops::swiglu_profile(out.shared)};
-            out.bank                = moe.bank;
+            out.bank                = w.bank;
             out.activation_divisors = {gate_up.calibration(source.gate_up.layout.format),
                                        down.calibration(source.down.layout.format)};
             if (source.gate_up.parent->device.type() == DeviceType::CUDA) {

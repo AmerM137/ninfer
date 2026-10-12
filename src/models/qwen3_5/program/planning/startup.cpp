@@ -1,6 +1,7 @@
 #include "models/qwen3_5/execution/attention.h"
-#include "models/qwen3_5/execution/ffn.h"
+#include "models/qwen3_5/execution/dense_mlp.h"
 #include "models/qwen3_5/execution/gdn.h"
+#include "models/qwen3_5/execution/moe.h"
 #include "models/qwen3_5/execution/mtp.h"
 #include "models/qwen3_5/program/planning/graph_profiles.h"
 #include "models/qwen3_5/program/internal.h"
@@ -362,7 +363,13 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
             }
             auto stage = layout.scope();
             (void)workspace::post_mixer_hidden(layout, config, last);
-            scratch(layout, execution::ffn_workspace_bytes(block.ffn, first, last));
+            if (const auto* dense = std::get_if<execution::DenseParameters>(&block.ffn)) {
+                scratch(layout, execution::dense_mlp_workspace_bytes(*dense, first, last,
+                                                                     execution::DenseMlpUse::Text));
+            } else {
+                scratch(layout, execution::moe_workspace_bytes(
+                                    std::get<execution::MoeParameters>(block.ffn), first, last));
+            }
         }
         if (!plan.causal_scoring) {
             linear_scratch(layout, parameters.text.output_head, first, last);
@@ -370,7 +377,14 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     };
     const auto mtp_post_mixer = [&](WorkspaceLayoutBuilder& layout, int first, int last) {
         linear_scratch(layout, parameters.mtp->output, first, last);
-        scratch(layout, execution::ffn_workspace_bytes(parameters.mtp->ffn, first, last, true));
+        if (const auto* dense = std::get_if<execution::DenseParameters>(&parameters.mtp->ffn)) {
+            scratch(layout, execution::dense_mlp_workspace_bytes(*dense, first, last,
+                                                                 execution::DenseMlpUse::Mtp));
+        } else {
+            scratch(layout,
+                    execution::moe_workspace_bytes(
+                        std::get<execution::MoeParameters>(parameters.mtp->ffn), first, last));
+        }
     };
     const auto proposal_scratch = [&](WorkspaceLayoutBuilder& layout, std::int32_t columns) {
         if (plan.proposal_head == ProposalHead::Optimized) {

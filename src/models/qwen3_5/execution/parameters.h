@@ -1,7 +1,8 @@
 #pragma once
 
+#include "models/qwen3_5/execution/dense_mlp.h"
+#include "models/qwen3_5/execution/moe.h"
 #include "models/qwen3_5/model.h"
-#include "ninfer/ops/moe.h"
 #include "ninfer/ops/weight_input.h"
 
 #include <array>
@@ -22,20 +23,6 @@ using LinearParameters = ops::SingleProjectionWeight;
     }
     return static_cast<std::int32_t>(value);
 }
-
-struct DenseParameters {
-    LinearParameters gate_up;
-    LinearParameters down;
-};
-
-struct MoeParameters {
-    ops::MoeProfile profile;
-    Weight control;
-    ops::SwiGLUWeights shared;
-    ExpertBankId bank;
-    ops::ExpertActivationDivisors activation_divisors;
-    ExpertBankDeviceView resident;
-};
 
 using FfnParameters = std::variant<DenseParameters, MoeParameters>;
 

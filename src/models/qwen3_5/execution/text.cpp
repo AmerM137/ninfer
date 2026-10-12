@@ -1,8 +1,9 @@
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/execution/text.h"
 #include "models/qwen3_5/execution/attention.h"
+#include "models/qwen3_5/execution/dense_mlp.h"
 #include "models/qwen3_5/execution/gdn.h"
-#include "models/qwen3_5/execution/ffn.h"
+#include "models/qwen3_5/execution/moe.h"
 #include "models/qwen3_5/execution/mtp.h"
 #include "models/qwen3_5/execution/workspace.h"
 
@@ -398,7 +399,11 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
 
     {
         auto post_mixer_scope = work_.scope();
-        ffn(mh, mtp_->ffn, x, {}, work_, execution_, true);
+        if (const auto* dense = std::get_if<DenseParameters>(&mtp_->ffn)) {
+            dense_mlp(mh, *dense, x, DenseMlpUse::Mtp, work_, execution_);
+        } else {
+            moe(mh, std::get<MoeParameters>(mtp_->ffn), x, {}, work_, execution_);
+        }
     }
 
     Tensor flat_mtp_hidden = mtp_hidden.view({dimension(config_.hidden_size), T});
@@ -547,7 +552,11 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
         ops::rmsnorm(x_last, mtp_->post_attention_norm, config_.rms_norm_eps, true, mh, execution_);
         {
             auto post_mixer_scope = work_.scope();
-            ffn(mh, mtp_->ffn, x_last, {}, work_, execution_, true);
+            if (const auto* dense = std::get_if<DenseParameters>(&mtp_->ffn)) {
+                dense_mlp(mh, *dense, x_last, DenseMlpUse::Mtp, work_, execution_);
+            } else {
+                moe(mh, std::get<MoeParameters>(mtp_->ffn), x_last, {}, work_, execution_);
+            }
         }
         ops::rmsnorm(x_last, mtp_->final_norm, config_.rms_norm_eps, true, *final_hidden,
                      execution_);
@@ -1055,11 +1064,15 @@ ops::MoeExecutionHints TextContext::next_projection_hints(int layer) const {
                                                  : ops::MoeExecutionHints{};
 }
 
-void TextContext::mlp_tail(const BlockParameters& weights, Tensor& x, Phase,
-                           const ops::MoeExecutionHints& hints) {
+void TextContext::post_mixer(const BlockParameters& weights, Tensor& x, int layer) {
     Tensor h = workspace::post_mixer_hidden(work_, config_, x.ne[1]);
     ops::rmsnorm(x, weights.post_attention_norm, config_.rms_norm_eps, true, h, execution_);
-    ffn(h, weights.ffn, x, hints, work_, execution_);
+    if (const auto* dense = std::get_if<DenseParameters>(&weights.ffn)) {
+        dense_mlp(h, *dense, x, DenseMlpUse::Text, work_, execution_);
+    } else {
+        moe(h, std::get<MoeParameters>(weights.ffn), x, next_projection_hints(layer), work_,
+            execution_);
+    }
 }
 
 template <class Tap>
@@ -1091,7 +1104,7 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                                                 : nvtx::Name::VerifyPostMixer,
                                         nvtx::Category::PostMixer, layer);
                 auto scope = work_.scope();
-                mlp_tail(block, x, ph, next_projection_hints(static_cast<int>(layer)));
+                post_mixer(block, x, static_cast<int>(layer));
             }
             if constexpr (Tap::enabled) {
                 tap.capture_layer(static_cast<int>(layer), x, execution_);

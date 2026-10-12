@@ -161,8 +161,7 @@ private:
 
     void attn_mix(const BlockParameters& weights, Tensor& x, int index, Phase phase);
     void gdn_mix(const BlockParameters& weights, Tensor& x, int index, Phase phase);
-    void mlp_tail(const BlockParameters& weights, Tensor& x, Phase phase,
-                  const ops::MoeExecutionHints& hints);
+    void post_mixer(const BlockParameters& weights, Tensor& x, int layer);
     [[nodiscard]] ops::MoeExecutionHints next_projection_hints(int layer) const;
     void run_layers(Tensor& x, Phase phase);
     template <class Tap>
