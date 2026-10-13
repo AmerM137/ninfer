@@ -7,10 +7,16 @@
 
 namespace ninfer::models::qwen4_exp {
 
+inline constexpr std::uint32_t kPleHeads             = 16;
+inline constexpr std::uint32_t kPleRowElements       = 160;
+inline constexpr std::uint32_t kPleEmbeddingElements = kPleHeads * kPleRowElements;
+inline constexpr std::size_t kPleRowBytes            = kPleRowElements / 2 + kPleRowElements / 16;
+inline constexpr std::size_t kPleEmbeddingBytes = kPleEmbeddingElements * sizeof(std::uint16_t);
+
 struct PleHashControls {
     std::array<std::int64_t, 3> multipliers;
-    std::array<std::int64_t, 16> vocab_sizes;
-    std::array<std::int64_t, 16> offsets;
+    std::array<std::int64_t, kPleHeads> vocab_sizes;
+    std::array<std::int64_t, kPleHeads> offsets;
 };
 
 struct PleRowSource {

@@ -1,9 +1,9 @@
 # Qwen4Exp PLE：Host hash、NF4 查表与异步 I/O
 
 本文定义 PLE Host 准备合同：精确 token hash、NF4→BF16 解码、不可变磁盘 backing、
-有界读取服务，以及交给 Program 的窗口与完成通知。Core 精确 LUT/行解码、Artifact
-文件 backing、`PleTableSource` 和 io_uring 读队列已实现；hash、行缓存、窗口服务及
-Program 交接仍待接入。独立 SSD 实验是选型依据。
+有界读取服务，以及交给 Program 的窗口与完成通知。精确 LUT/行解码、文件 backing、
+Host hash、行缓存/去重、增量窗口和 GPU 槽交接已实现，完整模型 Program 接入仍待完成。
+独立 SSD 实验是选型依据；生产组件的实测入口见 [Benchmarks](../../bench/README.md)。
 
 [模型与权重](qwen4_exp-model.md)维护实例几何与量化选择；
 [数值格式](tensor-formats.md#35-nf4_g16_e4m3fn)与
@@ -158,6 +158,12 @@ seal 冻结有效长度；全部有效 E 完成且无效尾列置零 → 发布 
 maps 按启动容量分配。首版起始配置为 **64 MiB 原始行缓存、128 个在途读、两个完整
 窗口槽**，允许在预算内调整；这些不是模型数学常数。
 
+`PlePrepareService` 借用不可变 `PleTableSource` 和调用者提供的 Host 输出。单 worker
+使用内部 `RowReader` 推进固定容量的行/页索引、共享读取和 CPU 解码；控制操作与 E 写入
+通过短的有界临界区排序，等待磁盘或新 IDs 时不持锁。Cache 为四路原始行缓存、轮转替换。
+取消会立即撤销不再有消费者的未提交页；在途页完成后退役，仍有其他窗口需要的页继续共享。
+必需窗口优先于预取窗口，`prioritize` 用于调用方将预取窗口提升为当前必需输入。
+
 物理在途读按 `(file, aligned_offset, length)` 合并，可服务多个窗口。行缓存按已绑定
 模型内的全局 g 索引，g 唯一决定该行及 divisor；复用 cache 或读到错误草稿的行不推进
 模型状态。64 MiB 包含行数据、索引及替换 metadata，可设为零。页 buffer 主要承担
@@ -180,7 +186,7 @@ maps 按启动容量分配。首版起始配置为 **64 MiB 原始行缓存、12
 | seal | 接受 B 个最终有效长度，满足 `0<=n[b]<=known_columns[b]<=T`；之后不可追加。被截去候选表示不再参与本窗口验证，不表示最终接受前缀 |
 | poll / embedding | poll 不同步 GPU；只有 seal 且全部有效 E 完成后才可获得 HostReady 的 borrowed pinned embedding。具体失败原因交给 Program |
 | cancel / drained | 丢弃未提交任务并排空该 ticket 的 Host writers；drained 只说明没有 I/O/CPU writer 引用，不证明 H2D 或 GPU 消费已经结束 |
-| release | 正常或失败/取消路径均须由 Program 证明该代次全部 Host/CUDA 引用退役后释放；Preparing 即使暂时没有在途 I/O，也须先 cancel，不能作为已完成窗口释放 |
+| release | 正常或失败/取消路径均须证明该代次全部 Host/CUDA 引用退役；Preparing 须先 cancel。调用立即使 ticket 失效，worker 回收后槽重新可用；使用 GPU owner 时统一调用其 `try_release` |
 
 每次 append 即可发起相应行读取，不必等全部草稿产生。seal 截去的尾列必须置零，晚到
 读结果不得再写这些 E 区域；HostReady 之前不发起 H2D。普通已知窗口可以 prepare 后
@@ -222,6 +228,12 @@ ticket 身份后，在 transfer stream 排入 H2D，再 record 当前 slot/gener
 消费者 stream 的 wait 必须引用**已排入 record 的当前代次**；未 record 的 event
 不代表未来 SSD 完成，不能先等空 event 再由 Host 补依赖。
 Copy/event 入队后即可排入 GPU wait，生产路径不必像微测量一样在 Host 等 H2D 完成。
+
+`PleGpuPreparation` 拥有固定 pinned/Device E 槽和 `PlePrepareService`。`upload` 排入
+复制与 record；`embedding` 建立消费 stream 的 wait；最后消费者之后调用
+`record_consumed`。`try_release` 同时核对 Host drain、上传与消费者完成。
+`upload_complete` 只查询物理传输完成，取消后仍可查询；取得可消费视图仍须通过
+`embedding` 的窗口状态检查。`device_slot` 为启动时构建每槽 graph 提供稳定地址。
 
 Program 等待当前 GPU unit 时仍需推进 HostReady 和 transfer 提交，不能一直阻塞在
 整个 unit 的 `device.synchronize()` 上，让已就绪的下一窗口无法上传。推进可位于

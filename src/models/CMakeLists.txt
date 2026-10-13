@@ -5,6 +5,12 @@ ninfer_internal_includes(ninfer_model_loading)
 target_link_libraries(ninfer_model_loading PUBLIC ninfer_artifact ninfer_text ninfer_ops)
 
 add_library(ninfer_model_runtime STATIC)
+target_sources(ninfer_model_runtime PRIVATE
+  qwen4_exp/ple/hash.cpp
+  qwen4_exp/ple/row_reader.cpp
+  qwen4_exp/ple/prepare.cpp
+  qwen4_exp/ple/gpu.cpp
+)
 ninfer_internal_includes(ninfer_model_runtime)
 target_link_libraries(ninfer_model_runtime
   PUBLIC ninfer_model_loading ninfer_ops ninfer_runtime_support

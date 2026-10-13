@@ -31,13 +31,14 @@ PleTableSource::PleTableSource(const artifact::Reader& reader, const artifact::B
     for (const auto& part : table.parts) {
         const auto& g = reader.geometry(part.object);
         if (g.format != QType::NF4_G16_E4M3FN || g.layout != QuantLayout::RowPagedG16_4K ||
-            g.shape.size() != 2 || g.shape[1] != 160 || part.begin || part.end != g.elements)
+            g.shape.size() != 2 || g.shape[1] != kPleRowElements || part.begin ||
+            part.end != g.elements)
             throw ArtifactError("PLE requires complete NF4 shards with width 160");
         impl_->rows = checked_add(impl_->rows, g.shape[0], "PLE rows");
         objects.push_back(part.object);
     }
     if (impl_->rows > std::numeric_limits<std::uint32_t>::max() ||
-        checked_mul(impl_->rows, 160, "PLE elements") != table.elements)
+        checked_mul(impl_->rows, kPleRowElements, "PLE elements") != table.elements)
         throw ArtifactError("PLE table logical extent is inconsistent");
     impl_->backing = prepare_file_backing(reader, objects);
     impl_->shards.reserve(objects.size());
@@ -67,7 +68,7 @@ PleTableSource::PleTableSource(const artifact::Reader& reader, const artifact::B
     };
     auto& c = impl_->controls;
     for (std::size_t i = 0; i < 3; ++i) c.multipliers[i] = word(i);
-    for (std::size_t i = 0; i < 16; ++i) {
+    for (std::size_t i = 0; i < kPleHeads; ++i) {
         c.vocab_sizes[i] = word(3 + i);
         c.offsets[i]     = word(19 + i);
         if (c.vocab_sizes[i] <= 0 || c.offsets[i] < 0 ||

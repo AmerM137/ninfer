@@ -18,7 +18,8 @@ ownership contracts are defined in [Engine architecture](../docs/maintainer/engi
 - `runtime/` — scheduler fairness, cache resource policy, capacity and context-cost calculations;
 - `cpu/` — topology/ISA, bounded task admission, bound collectives, publication and shutdown;
 - `io/` — bounded direct reads, partial submission, completion, wakeup and borrowed-buffer lifetime;
-- `models/qwen4_exp/` — PLE disk-source binding and exact NF4 lookup through production I/O;
+- `models/qwen4_exp/` — PLE disk binding, exact hash/NF4 reconstruction, incremental windows,
+  cancellation and Host/CUDA buffer lifetimes;
 - `bench/ttft/` — HTTP measurements, campaign orchestration and workload construction;
 - root C++ tests — core storage, public API, serving protocols, logging, benchmark reports and
   causal-scoring evaluation;
@@ -66,10 +67,12 @@ After building, `ctest --preset dev` runs the same CTest suite. See
 The chat-template reference test uses Python Jinja2.
 
 PLE reading foundations run with
-`ctest --test-dir build -R 'ninfer_(nf4|read_queue|artifact_backing|ple_table)' --output-on-failure`.
+`ctest --test-dir build -R 'ninfer_(nf4|read_queue|artifact_backing|ple_(table|prepare))' --output-on-failure`.
 The NF4 oracle uses exact Python fractions. The PLE fixture includes a row split across three files.
 These tests use small synthetic files to check addressing, decoded values and queue lifecycle.
 Real-weight I/O throughput measurements belong to separate, explicitly selected benchmarks.
+The Host preparation test runs without visible CUDA devices. The GPU test delays upload/consumption,
+injects event-record failures and checks graph consumption against independently reconstructed E.
 
 CPU foundation tests link only the C++ `ninfer_cpu` target and need no GPU:
 `ctest --test-dir build -R '^ninfer_cpu_.*_test$' --output-on-failure`.

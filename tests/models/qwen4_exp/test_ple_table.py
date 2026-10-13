@@ -80,13 +80,17 @@ def check(executable, path):
     )
 
 
-def fixture(path, divisor=2.0, invalid_controls=False):
+def fixture(path, divisor=2.0, invalid_controls=False, hash_controls=None):
     sizes = (46, 2)
     specs = [ResourceSpec("controls", 280)] + [
         TensorSpec(f"shard-{i}", (n, 160), "nf4_g16_e4m3fn", "row_paged_g16_4k_v1")
         for i, n in enumerate(sizes)
     ]
-    controls = [0x123456789123456, -77, 1234567890123456] + [1] * 16 + list(range(16))
+    controls = (
+        list(hash_controls)
+        if hash_controls is not None
+        else [0x123456789123456, -77, 1234567890123456] + [1] * 16 + list(range(16))
+    )
     if invalid_controls:
         controls[3] = 0
     with ArtifactWriter(

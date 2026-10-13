@@ -1,0 +1,3 @@
+add_executable(ninfer_ple_prepare_bench "${CMAKE_CURRENT_LIST_DIR}/ple_prepare.cpp")
+ninfer_internal_includes(ninfer_ple_prepare_bench)
+target_link_libraries(ninfer_ple_prepare_bench PRIVATE ninfer_model_runtime)
