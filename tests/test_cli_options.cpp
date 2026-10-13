@@ -31,7 +31,18 @@ int check(bool condition, const char* message) {
 } // namespace
 
 int main() {
-    int failures      = 0;
+    int failures = 0;
+    failures +=
+        check(parse({"ninfer", "model.ninfer", "--prompt", "hello", "--prefill-chunk", "8192"})
+                      .prefill_chunk == 8192,
+              "explicit prefill chunk was not preserved");
+    for (const auto* value : {"auto", "0", "129"}) {
+        failures += check(rejects([&] {
+                              (void)parse({"ninfer", "model.ninfer", "--prompt", "hello",
+                                           "--prefill-chunk", value});
+                          }),
+                          "invalid prefill chunk was accepted");
+    }
     const auto choice = parse({"ninfer", "model.ninfer", "--prompt", "hello", "--choice", "",
                                "--choice", "a|b", "--choice", "你好"});
     failures += check(choice.choices == std::vector<std::string>{"", "a|b", "你好"},

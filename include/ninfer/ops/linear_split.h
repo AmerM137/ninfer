@@ -41,8 +41,14 @@ void linear_split(const Tensor& x, const Weight& weight, std::span<const Tensor>
  * Capacity starts at a 256-byte-aligned arena cursor and excludes trailing padding.
  */
 [[nodiscard]] std::size_t
-linear_split_workspace_capacity_bytes(const ProjectionWeights& weights,
+linear_split_workspace_capacity_bytes(const ProjectionProfile& weights,
                                       std::span<const std::int32_t> output_rows,
                                       std::int32_t min_columns, std::int32_t max_columns);
 
+[[nodiscard]] inline std::size_t
+linear_split_workspace_capacity_bytes(const ProjectionWeights& weights,
+                                      std::span<const std::int32_t> rows, std::int32_t first,
+                                      std::int32_t last) {
+    return linear_split_workspace_capacity_bytes(projection_profile(weights), rows, first, last);
+}
 } // namespace ninfer::ops

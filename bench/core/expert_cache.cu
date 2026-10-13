@@ -54,6 +54,18 @@ ExpertCacheUse acquire(ExpertCache& cache, std::span<const ExpertKey> keys,
     throw std::runtime_error("cache did not make progress");
 }
 
+void place(ExpertCache& cache, const ExpertCacheRequirements& req, std::span<const ExpertKey> keys,
+           std::size_t begin = 0) {
+    std::vector<ExpertPlacement> entries;
+    std::size_t offset = 0;
+    for (const auto key : keys) {
+        entries.push_back({key, offset});
+        offset += req.banks[key.bank.index].entry_bytes;
+    }
+    cache.replace({begin, req.config.capacity_bytes - begin, 256}, entries);
+    cache.prepare({keys});
+}
+
 void verify(ExpertCache& cache, const ExpertBankSource& source, ExpertKey key,
             const DeviceContext& device) {
     const std::array keys{key};
@@ -106,8 +118,7 @@ void print(const char* label, std::vector<Measurement> values) {
               << " submit_ms=" << median.submit_ms << " upload_timeline_ms=" << median.gpu_ms
               << " bytes=" << median.delta.data_bytes << " index_bytes=" << median.delta.index_bytes
               << " copy_calls=" << (median.delta.data_copy_calls + median.delta.index_copy_calls)
-              << " GBps=" << median.delta.data_bytes / median.wall_ms / 1e6
-              << " rebuilds=" << median.delta.rebuilds << '\n';
+              << " GBps=" << median.delta.data_bytes / median.wall_ms / 1e6 << '\n';
 }
 
 } // namespace
@@ -222,7 +233,7 @@ int main(int argc, char** argv) {
         std::vector<ExpertKey> full;
         for (unsigned e = 0; e < count; ++e) { full.push_back({{0}, e}); }
         const auto one = std::array{ExpertKey{{0}, 0}};
-        cache.prepare(one);
+        place(cache, req, one);
         verify(cache, source, one[0], device);
         DeviceBuffer warm_sum(device.device(), sizeof(unsigned long long));
         warm_sum.fill();
@@ -234,7 +245,7 @@ int main(int argc, char** argv) {
         for (int i = 0; i < 101; ++i) {
             device.synchronize();
             const auto start = Clock::now();
-            cache.prepare(one);
+            cache.prepare({one});
             const auto use = cache.acquire(one, device.execution_view());
             if (!use) { throw std::runtime_error("resident hit unavailable"); }
             const auto admission_us = milliseconds(start) * 1000;
@@ -264,7 +275,7 @@ int main(int argc, char** argv) {
                 std::uint64_t previous_offset = 0;
                 sum.fill();
                 if (overlap) {
-                    instance.prepare(full);
+                    place(instance, req, full);
                     previous = acquire(instance, full, device.execution_view());
                     device.synchronize();
                     check(cudaMemcpy(&previous_offset, instance.view({0}).gate_up.offsets, 8,
@@ -289,7 +300,7 @@ int main(int argc, char** argv) {
                     }
                     instance.release(*previous, device.execution_view());
                 }
-                instance.prepare(keys);
+                place(instance, req, keys, overlap ? bank_bytes : 0);
                 const auto use = acquire(instance, keys, device.execution_view());
                 instance.release(use, device.execution_view());
                 device.synchronize();
@@ -301,7 +312,6 @@ int main(int argc, char** argv) {
                 delta.data_copy_calls -= before.data_copy_calls;
                 delta.index_copy_calls -= before.index_copy_calls;
                 delta.planning_nanoseconds -= before.planning_nanoseconds;
-                delta.rebuilds -= before.rebuilds;
                 delta.submit_nanoseconds -= before.submit_nanoseconds;
                 samples.push_back({wall, delta.planning_nanoseconds / 1e6,
                                    delta.submit_nanoseconds / 1e6, gpu, delta});
@@ -317,23 +327,21 @@ int main(int argc, char** argv) {
               measure(std::min<std::uint32_t>(128, count), false, true));
         print("full_bank", measure(count, false));
         print("consumer_plus_next_bank", measure(count, true));
-        // Required-set changes use one shared capacity and preserve reusable entries.
+        // Explicit region reconstruction, including reuse after a released consumer.
         auto transition_req                  = req;
         transition_req.config.capacity_bytes = bank_bytes;
         ExpertCache transitions(sources, transition_req, device, device.transfer_view());
         const auto report_change = [&](const char* label, const std::vector<ExpertKey>& keys) {
             const auto before = transitions.usage();
             const auto start  = Clock::now();
-            transitions.prepare(keys);
+            place(transitions, transition_req, keys);
             const auto use = acquire(transitions, keys, device.execution_view());
             transitions.release(use, device.execution_view());
             device.synchronize();
             const auto after = transitions.usage();
             std::cout << label << " ms=" << milliseconds(start)
                       << " bytes=" << after.data_bytes - before.data_bytes
-                      << " used=" << after.used_bytes
-                      << " largest_free=" << after.largest_free_bytes
-                      << " rebuilds=" << after.rebuilds - before.rebuilds << '\n';
+                      << " used=" << after.used_bytes << '\n';
         };
         std::vector<ExpertKey> fixed(full.begin(),
                                      full.begin() + std::min<std::size_t>(8, full.size()));

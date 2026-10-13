@@ -171,12 +171,14 @@ int test_cli_contract() {
                                   "--draft-tokens", "6"});
         },
         "unsupported MTP window");
-    failures += expect_throws<std::invalid_argument>(
-        [] {
-            (void)parse_for_test(
-                {"ninfer_bench", "--weights", "model.ninfer", "--prefill-chunk", "129"});
-        },
-        "misaligned prefill chunk");
+    for (const auto* value : {"auto", "0", "129"}) {
+        failures += expect_throws<std::invalid_argument>(
+            [&] {
+                (void)parse_for_test(
+                    {"ninfer_bench", "--weights", "model.ninfer", "--prefill-chunk", value});
+            },
+            "invalid prefill chunk");
+    }
     const qb::BenchOptions fp8 =
         parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--kv-dtype", "fp8"});
     failures += expect(fp8.kv_cache == ninfer::KvCacheStorage::Fp8E4M3Row256, "FP8 KV");
@@ -283,54 +285,71 @@ std::vector<qb::TestResult> sample_results() {
 
 qb::BenchEnvironment sample_environment() {
     qb::BenchEnvironment env;
-    env.gpu_name                 = "RTX 5090";
-    env.cuda_runtime_version     = "13.1";
-    env.cuda_driver_version      = "590.1";
-    env.device_id                = 0;
-    env.artifact_path            = "model.ninfer";
-    env.artifact_file_size_bytes = 17500000000ULL;
-    env.load                     = {.architecture         = "Qwen3_5ForCausalLM",
-                                    .model_name           = "qwen3.6-27b",
-                                    .prefill_signature    = "groupwise-int",
-                                    .load_seconds         = 2.5,
-                                    .upload_seconds       = 2.0,
-                                    .artifact_bytes_read  = 17500000000ULL,
-                                    .host_to_device_bytes = 17400000000ULL,
-                                    .peak_staging_bytes   = 134217728ULL,
-                                    .device_object_count  = 1118,
-                                    .host_object_count    = 6};
-    env.memory.device            = 0;
-    env.memory.max_context       = 4096;
-    env.memory.kv_capacity       = 8192;
-    env.memory.kv_cache          = ninfer::KvCacheStorage::Int8Group64;
-    env.memory.weights           = {17400000000ULL, 17400000000ULL, 17400000000ULL};
-    env.memory.sequence          = {2000000000ULL, 1900000000ULL, 1900000000ULL};
-    env.memory.workspace         = {100000000ULL, 0, 0};
-    env.memory.vision_workspace  = ninfer::VisionWorkspaceMemorySummary{
-         .aggregate_prompt_tokens = 4096,
-         .max_item_tokens         = 4096,
-         .general_capacity_bytes  = 75000000ULL,
-         .encode_peak_bytes       = 90000000ULL,
-         .handoff_offset_bytes    = 75000000ULL,
-         .handoff_capacity_bytes  = 25000000ULL,
-         .handoff_active_bytes    = 0,
-         .handoff_peak_bytes      = 20000000ULL,
+    env.gpu_name                   = "RTX 5090";
+    env.cuda_runtime_version       = "13.1";
+    env.cuda_driver_version        = "590.1";
+    env.device_id                  = 0;
+    env.artifact_path              = "model.ninfer";
+    env.artifact_file_size_bytes   = 17500000000ULL;
+    env.load                       = {.architecture         = "Qwen3_5ForCausalLM",
+                                      .model_name           = "qwen3.6-27b",
+                                      .prefill_signature    = "groupwise-int",
+                                      .load_seconds         = 2.5,
+                                      .upload_seconds       = 2.0,
+                                      .artifact_bytes_read  = 17500000000ULL,
+                                      .host_to_device_bytes = 17400000000ULL,
+                                      .peak_staging_bytes   = 134217728ULL,
+                                      .device_object_count  = 1118,
+                                      .host_object_count    = 6};
+    env.memory.device              = 0;
+    env.memory.device_budget_bytes = 32ULL * 1024 * 1024 * 1024;
+    env.memory.max_context         = 4096;
+    env.memory.kv_capacity         = 8192;
+    env.memory.kv_cache            = ninfer::KvCacheStorage::Int8Group64;
+    env.memory.weights             = {17400000000ULL, 17400000000ULL, 17400000000ULL};
+    env.memory.sequence            = {2000000000ULL, 1900000000ULL, 1900000000ULL};
+    env.memory.workspace           = {100000000ULL, 0, 0};
+
+    env.memory.vision_workspace = ninfer::VisionWorkspaceMemorySummary{
+        .aggregate_prompt_tokens = 4096,
+        .max_item_tokens         = 4096,
+        .general_capacity_bytes  = 75000000ULL,
+        .encode_peak_bytes       = 90000000ULL,
+        .handoff_offset_bytes    = 75000000ULL,
+        .handoff_capacity_bytes  = 25000000ULL,
+        .handoff_active_bytes    = 0,
+        .handoff_peak_bytes      = 20000000ULL,
     };
     env.memory.cuda_graph_allowance_bytes = 150000000ULL;
     env.memory.kv_payload_bytes           = 123456ULL;
-    env.max_context                       = 4096;
-    env.prefill_chunk                     = 1024;
-    env.kv_cache                          = ninfer::KvCacheStorage::Int8Group64;
-    env.speculative.backend               = ninfer::SpeculativeBackend::Mtp;
-    env.speculative.draft_tokens          = 5;
-    env.speculative.proposal_head         = ninfer::ProposalHead::Optimized;
-    env.use_cuda_graph                    = true;
-    env.decode_graph_primed               = true;
-    env.decode_graph_prime_output_tokens  = 13;
-    env.repetitions                       = 2;
-    env.warmup                            = 1;
-    env.corpus_path                       = "bench/fixtures/bench_corpus.ids";
-    env.corpus_tokens                     = 65536;
+
+    env.memory.moe = ninfer::MoeMemorySummary{
+        .cache_bytes              = 4096,
+        .fixed_bytes              = 2048,
+        .window_bytes             = 2048,
+        .window_count             = 2,
+        .used_bytes               = 4096,
+        .target_bytes             = 4096,
+        .ready_bytes              = 3072,
+        .fixed_experts_per_layer  = {2, 2},
+        .target_experts_per_layer = {4, 4},
+        .ready_experts_per_layer  = {3, 3},
+        .uploaded_bytes           = 8192,
+        .prefetched_bytes         = 1024,
+    };
+    env.max_context                      = 4096;
+    env.prefill_chunk                    = 1024;
+    env.kv_cache                         = ninfer::KvCacheStorage::Int8Group64;
+    env.speculative.backend              = ninfer::SpeculativeBackend::Mtp;
+    env.speculative.draft_tokens         = 5;
+    env.speculative.proposal_head        = ninfer::ProposalHead::Optimized;
+    env.use_cuda_graph                   = true;
+    env.decode_graph_primed              = true;
+    env.decode_graph_prime_output_tokens = 13;
+    env.repetitions                      = 2;
+    env.warmup                           = 1;
+    env.corpus_path                      = "bench/fixtures/bench_corpus.ids";
+    env.corpus_tokens                    = 65536;
     return env;
 }
 
@@ -346,7 +365,14 @@ int test_report_contract() {
         return fail(std::string("invalid benchmark JSON: ") + error.what());
     }
 
-    failures += expect(report.at("schema_version") == 19, "report schema v19");
+    failures += expect(report.at("schema_version") == 23, "report schema v23");
+    const auto& moe = report.at("memory").at("moe");
+    failures += expect(moe.at("used_bytes") == 4096 && moe.at("target_bytes") == 4096 &&
+                           moe.at("ready_bytes") == 3072 && moe.at("prefetched_bytes") == 1024 &&
+                           moe.at("fixed_bytes") == 2048 && moe.at("window_bytes") == 2048 &&
+                           moe.at("window_count") == 2 &&
+                           moe.at("ready_experts_per_layer") == Json::array({3, 3}),
+                       "MoE cache targets and ready state have distinct report fields");
     failures += expect(report.at("config").at("speculative_backend") == "mtp" &&
                            report.at("config").at("draft_tokens") == 5,
                        "report identifies its backend and window");
@@ -359,6 +385,8 @@ int test_report_contract() {
     failures +=
         expect(report.at("load").at("host_to_device_bytes") == 17400000000ULL, "load H2D bytes");
     failures += expect(report.at("memory").at("kv_cache") == "int8-group64", "memory KV");
+    failures += expect(report.at("memory").at("device_budget_bytes") == 32ULL * 1024 * 1024 * 1024,
+                       "effective Device budget");
     failures += expect(report.at("memory").at("kv_capacity") == 8192, "memory KV capacity");
     failures += expect(report.at("memory").at("workspace").at("capacity_bytes") == 100000000ULL,
                        "workspace capacity");

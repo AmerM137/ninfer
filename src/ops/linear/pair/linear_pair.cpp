@@ -41,6 +41,17 @@ std::size_t linear_pair_workspace_capacity_bytes(const Weight& first, const Weig
     return 0;
 }
 
+std::size_t linear_pair_workspace_capacity_bytes(LinearProfile first, LinearProfile second,
+                                                 std::int32_t min_tokens, std::int32_t max_tokens) {
+    if (min_tokens <= 0 || max_tokens < min_tokens || first.qtype != QType::Q8_G32_FP16 ||
+        second.qtype != QType::Q8_G32_FP16 || first.n != 1024 || second.n != 1024 ||
+        first.k != second.k) {
+        throw std::invalid_argument("linear_pair: invalid matrix profile or token interval");
+    }
+    (void)detail::select_linear_pair(first.k, max_tokens);
+    return 0;
+}
+
 void linear_pair(const Tensor& x, const Weight& first, const Weight& second, Tensor& first_out,
                  Tensor& second_out, CudaExecutionView execution) {
     const auto launch = detail::select_linear_pair(x.ne[0], x.ne[1]);

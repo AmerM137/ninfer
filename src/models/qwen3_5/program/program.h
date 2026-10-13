@@ -19,10 +19,12 @@ struct DeviceContext;
 namespace ninfer::models::qwen3_5 {
 namespace execution {
 class Parameters;
-}
+struct ModelProfile;
+} // namespace execution
 
 namespace detail {
 struct SequencePlanImpl;
+struct MoePlan;
 struct SequencePlannerImpl;
 struct RequestBasePlanImpl;
 struct ResumeStateImpl;
@@ -92,8 +94,9 @@ private:
     explicit SequencePlanner(std::unique_ptr<detail::SequencePlannerImpl> impl) noexcept;
     std::unique_ptr<detail::SequencePlannerImpl> impl_;
 
-    friend SequencePlanner make_sequence_planner(const execution::Parameters&, DeviceContext&,
-                                                 const EngineOptions&);
+    friend SequencePlanner make_sequence_planner(std::shared_ptr<const execution::ModelProfile>,
+                                                 DeviceContext&, const EngineOptions&,
+                                                 std::shared_ptr<const detail::MoePlan>);
 };
 
 class RequestBasePlan {
@@ -489,7 +492,7 @@ public:
     [[nodiscard]] AbortResult abort(SequenceHandle sequence) noexcept;
     void fail_all_cleanup() noexcept;
     [[nodiscard]] PhysicalUsageSnapshot physical_usage() const noexcept;
-    [[nodiscard]] MemorySummary memory_summary() const noexcept;
+    [[nodiscard]] MemorySummary memory_summary() const;
     void reset_memory_peaks() noexcept;
 private:
     explicit Program(std::unique_ptr<detail::ProgramImpl> impl) noexcept;
@@ -497,6 +500,10 @@ private:
     friend std::unique_ptr<Program> create_program(const execution::Parameters&, SequencePlan&&,
                                                    DeviceContext&, const StartupObserver&);
 };
+
+[[nodiscard]] SequencePlanner make_sequence_planner(std::shared_ptr<const execution::ModelProfile>,
+                                                    DeviceContext&, const EngineOptions&,
+                                                    std::shared_ptr<const detail::MoePlan> = {});
 
 [[nodiscard]] SequencePlanner make_sequence_planner(const execution::Parameters&, DeviceContext&,
                                                     const EngineOptions&);

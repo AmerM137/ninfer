@@ -341,7 +341,8 @@ private:
 
 } // namespace
 
-Parameters::Parameters(const Model& source) : model(source) {
+Parameters::Parameters(const Model& source, std::shared_ptr<const ModelProfile> profile)
+    : model(source), profile(profile ? std::move(profile) : describe_model(source)) {
     const Prepare prepare(model);
     const auto& w        = model.weights();
     text.token_embedding = native_weight(model.weight(w.text.token_embedding).view);

@@ -74,4 +74,19 @@ private:
     DeviceBuffer input_, residual_, ids_, coefficients_, shared_;
 };
 
+class HostBank {
+public:
+    explicit HostBank(const Fixture& fixture);
+    ~HostBank();
+    HostBank(const HostBank&)            = delete;
+    HostBank& operator=(const HostBank&) = delete;
+
+    void register_upload(Device device);
+    [[nodiscard]] ExpertBankSource source() const;
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
 } // namespace ninfer::test::moe

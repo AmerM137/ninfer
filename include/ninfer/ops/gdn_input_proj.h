@@ -71,7 +71,7 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const ProjectionWeights& weig
                                   MemoryArena& workspace, CudaExecutionView execution);
 
 [[nodiscard]] std::size_t
-gdn_input_proj_conv_snapshot_workspace_capacity_bytes(const ProjectionWeights& weights,
+gdn_input_proj_conv_snapshot_workspace_capacity_bytes(const ProjectionProfile& weights,
                                                       std::int32_t batch, std::int32_t min_tokens,
                                                       std::int32_t max_tokens);
 
@@ -99,8 +99,19 @@ void gdn_input_proj_conv_record(const Tensor& x, const ProjectionWeights& weight
                                 CudaExecutionView execution);
 
 [[nodiscard]] std::size_t
-gdn_input_proj_conv_record_workspace_capacity_bytes(const ProjectionWeights& weights,
+gdn_input_proj_conv_record_workspace_capacity_bytes(const ProjectionProfile& weights,
                                                     std::int32_t batch, std::int32_t min_tokens,
                                                     std::int32_t max_tokens);
 
+[[nodiscard]] inline std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+    const ProjectionWeights& weights, std::int32_t batch, std::int32_t first, std::int32_t last) {
+    return gdn_input_proj_conv_snapshot_workspace_capacity_bytes(projection_profile(weights), batch,
+                                                                 first, last);
+}
+
+[[nodiscard]] inline std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
+    const ProjectionWeights& weights, std::int32_t batch, std::int32_t first, std::int32_t last) {
+    return gdn_input_proj_conv_record_workspace_capacity_bytes(projection_profile(weights), batch,
+                                                               first, last);
+}
 } // namespace ninfer::ops

@@ -5,6 +5,18 @@ download an artifact using the [project README](../README.md) before following t
 
 The examples use Qwen3.8-27B NVFP4 with FP8 KV storage.
 
+For Qwen3.6-35B-A3B, `NINFER_VRAM_BUDGET_MIB` caps the Engine's GPU allocation budget. If the
+model cannot remain fully on GPU, Main MoE experts use CPU/GPU eager execution:
+
+```bash
+NINFER_VRAM_BUDGET_MIB=16384 ./build/apps/ninfer out/qwen3_6_35b_a3b.ninfer \
+  --no-cuda-graph --prompt "Explain how a compiler works." --max-context 8192 --max-new 128
+```
+
+`--prefill-chunk N` sets a fixed positive multiple of 128. When omitted, the default is 1024 for
+resident models and 4096 for CPU expert offload. Serving and offline scoring use the same Engine
+defaults. See [expert execution](maintainer/expert-weight-cache.md) for ownership and scheduling.
+
 ## Text input
 
 ```bash
@@ -249,8 +261,8 @@ The table lists executable defaults. The examples above select FP8 KV and MTP3.
 | Option | Meaning | Default |
 |---|---|---:|
 | `--max-context N` | per-sequence logical context ceiling | `2048` |
-| `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `--max-context` | `2048` |
-| `--prefill-chunk N` | positive text-prefill chunk, in multiples of 128 | `1024` |
+| `--kv-capacity N\|auto` | shared Main Text KV capacity; `auto` maximizes resident-model KV, or reserves one context with CPU expert offload; omitted means `--max-context` | `2048` |
+| `--prefill-chunk N` | text-prefill chunk; positive multiple of 128 | `1024`; CPU expert offload: `4096` |
 | `--max-new N` | requested output-token limit | `128` |
 | `--device N` | CUDA device index | `0` |
 | `--kv-dtype bf16\|int8\|fp8\|nvfp4\|k8v4` | KV-cache storage | `bf16` |
@@ -317,11 +329,14 @@ The artifact describes its model configuration and weight representations;
 `--kv-dtype` independently selects runtime KV storage. The prepared prompt must fit
 `--max-context`; generation stops at the remaining context capacity when necessary.
 `--kv-capacity N` controls the shared physical Main Text KV pool independently and is rounded up to
-the 64-token page size. `--kv-capacity auto` loads the selected weights, measures the remaining GPU
-memory, and directly chooses the largest legal page capacity for the complete enabled runtime
-layout. This includes the selected speculative backend, fixed sequence state, unified workspace,
-and CUDA Graph allowance, while leaving the default 1 GiB automatic headroom
-unallocated. It does not probe allocations or resize the pool at request time. The single-request
+the 64-token page size. Startup plans the selected weights and complete enabled runtime layout
+from artifact metadata before allocating their backing. With resident weights,
+`--kv-capacity auto` chooses the largest legal page capacity within the available Device budget,
+including the selected speculative backend, fixed sequence state, unified workspace and CUDA
+Graph allowance, while leaving the default 1 GiB automatic headroom unallocated. With CPU expert
+offload, `auto` reserves one full context and assigns the remaining budget to expert storage;
+set an explicit capacity when more shared KV is needed. Startup does not probe allocations or
+resize the pool at request time. The single-request
 CLI normally leaves the option omitted so it follows
 `--max-context`; the distinction matters primarily to a concurrent Engine or server.
 

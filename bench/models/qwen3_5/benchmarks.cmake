@@ -13,3 +13,8 @@ add_executable(ninfer_qwen3_5_dflash_round_bench
 ninfer_internal_includes(ninfer_qwen3_5_dflash_round_bench)
 target_link_libraries(ninfer_qwen3_5_dflash_round_bench PRIVATE
   ninfer_engine ninfer_model_runtime ninfer_core)
+
+add_executable(ninfer_qwen3_5_moe_execution_bench
+  "${CMAKE_CURRENT_LIST_DIR}/moe_execution_bench.cpp")
+ninfer_internal_includes(ninfer_qwen3_5_moe_execution_bench)
+target_link_libraries(ninfer_qwen3_5_moe_execution_bench PRIVATE ninfer_model_runtime)

@@ -19,7 +19,7 @@ void require_rope_axes(const Tensor& positions, const RopeConfig& config) {
 
 } // namespace
 
-std::size_t attention_projection_workspace_bytes(const AttentionParameters& parameters,
+std::size_t attention_projection_workspace_bytes(const AttentionProfile& parameters,
                                                  std::int32_t first, std::int32_t last) {
     return ops::linear_split_workspace_capacity_bytes(parameters.projection,
                                                       parameters.projection_rows, first, last);

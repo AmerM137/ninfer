@@ -1,6 +1,7 @@
 #include "models/qwen3_5/measurement.h"
 
 #include "models/qwen3_5/frontend/digest.h"
+#include "models/qwen3_5/program/planning/moe.h"
 
 #include <nlohmann/json.hpp>
 
@@ -10,7 +11,7 @@
 
 namespace ninfer::models::qwen3_5 {
 
-std::string prefill_signature(const Model& model) {
+std::string prefill_signature(const Model& model, const detail::MoePlan* moe, std::uint32_t chunk) {
     using Json         = nlohmann::json;
     const auto& config = model.config();
     const auto& t      = config.text;
@@ -22,6 +23,20 @@ std::string prefill_signature(const Model& model) {
                {"num_hidden_layers", t.num_hidden_layers},
                {"rms_norm_eps", t.rms_norm_eps},
                {"layer_types", t.layer_types}};
+    if (moe) {
+        auto& execution = facts["moe_execution"];
+        execution       = {{"implementation", "eager-fixed-windows-1"},
+                           {"chunk", chunk},
+                           {"workers", moe->team.worker_cpus.size()},
+                           {"cache_bytes", moe->cache.config.capacity_bytes},
+                           {"fixed_bytes", moe->cache.config.fixed_bytes},
+                           {"window_count", moe->window_count},
+                           {"layers", Json::array()}};
+        for (const auto& layer : moe->layers) {
+            execution["layers"].push_back({layer.hybrid_max_tokens, layer.priority,
+                                           layer.fixed_experts, layer.cache_experts});
+        }
+    }
     if (t.attention) {
         const auto& a      = *t.attention;
         facts["attention"] = {a.num_attention_heads, a.num_key_value_heads, a.head_dim};

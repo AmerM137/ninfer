@@ -1,4 +1,5 @@
 #pragma once
+#include "models/qwen3_5/program/moe_resources.h"
 #include "models/qwen3_5/program/internal.h"
 
 #include "core/arena.h"
@@ -32,11 +33,12 @@ struct ExecutionCore {
     ExecutionCore(DeviceContext& device, const execution::Parameters& parameters, MemoryArena& work,
                   LinearAttentionStatePool& linear_attention,
                   const GdnReplayRecords* replay_records, qwen3_5::RoundState& io,
-                  Tensor& prefill_hidden, std::uint32_t prefill_chunk, ProposalHead proposal_head)
+                  Tensor& prefill_hidden, std::uint32_t prefill_chunk, ProposalHead proposal_head,
+                  detail::MoeResources* moe = nullptr)
         : device(device), cuda(device.execution_view()), parameters(parameters), work(work),
           linear_attention(linear_attention), replay_records(replay_records), io(io),
           prefill_hidden(prefill_hidden), prefill_chunk(prefill_chunk),
-          proposal_head(proposal_head) {}
+          proposal_head(proposal_head), moe(moe) {}
 
     DeviceContext& device;
     const CudaExecutionView cuda;
@@ -48,6 +50,7 @@ struct ExecutionCore {
     Tensor& prefill_hidden;
     std::uint32_t prefill_chunk;
     ProposalHead proposal_head;
+    detail::MoeResources* moe;
 };
 
 struct PrefillContext {

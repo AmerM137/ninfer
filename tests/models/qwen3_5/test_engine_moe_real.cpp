@@ -5,23 +5,24 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
 namespace {
 
-ninfer::EngineOptions engine_options(const char* artifact) {
+ninfer::EngineOptions engine_options(const char* artifact, bool offload = false) {
     ninfer::EngineOptions options;
-    options.artifact_path             = artifact;
-    options.max_context               = 4096;
-    options.kv_capacity               = ninfer::KvCapacityPolicy::explicit_capacity(4096);
-    options.prefill_chunk             = 1024;
-    options.kv_cache                  = ninfer::KvCacheStorage::Int8Group64;
-    options.speculative.backend       = ninfer::SpeculativeBackend::Mtp;
-    options.speculative.draft_tokens  = 3;
-    options.speculative.proposal_head = ninfer::ProposalHead::Optimized;
-    options.enable_vision             = true;
-    options.use_cuda_graph            = true;
+    options.artifact_path                     = artifact;
+    options.max_context                       = 4096;
+    options.kv_capacity                       = ninfer::KvCapacityPolicy::explicit_capacity(4096);
+    options.kv_cache                          = ninfer::KvCacheStorage::Int8Group64;
+    options.speculative.backend               = ninfer::SpeculativeBackend::Mtp;
+    options.speculative.draft_tokens          = 3;
+    options.speculative.proposal_head         = ninfer::ProposalHead::Optimized;
+    options.enable_vision                     = true;
+    options.use_cuda_graph                    = !offload;
+    options.context_cache.host_capacity_bytes = 0;
     return options;
 }
 
@@ -80,7 +81,8 @@ int verify_loaded_product(const ninfer::Engine& engine) {
         vision->handoff_capacity_bytes >
             memory.workspace.capacity_bytes - vision->handoff_offset_bytes ||
         vision->handoff_active_bytes != 0 || vision->handoff_peak_bytes != 0 ||
-        memory.workspace_logical_peak_bytes != 0 || memory.cuda_graph_allowance_bytes == 0) {
+        memory.workspace_logical_peak_bytes != 0 ||
+        (memory.cuda_graph_allowance_bytes != 0) != engine.options().use_cuda_graph) {
         std::cerr << "35B Engine construction has an invalid memory summary\n";
         return 1;
     }
@@ -248,22 +250,96 @@ int exercise_maximum_configuration(const char* artifact) {
     return 0;
 }
 
+int exercise_expert_priority(const char* artifact) {
+    auto options            = engine_options(artifact, true);
+    options.speculative     = {};
+    options.enable_vision   = false;
+    options.max_concurrency = 8;
+    options.prefill_chunk   = 2048;
+    options.moe.expert_priority.emplace(40);
+    auto& priority = *options.moe.expert_priority;
+    for (std::size_t layer = 0; layer < priority.size(); ++layer) {
+        for (std::uint32_t e = 0; e < 256; ++e) {
+            priority[layer].push_back((255 - e + layer) % 256);
+        }
+    }
+    ninfer::Engine engine(options);
+    const auto before = engine.memory_summary();
+    if (engine.options().prefill_chunk != 2048 || before.prefill_chunk != 2048) {
+        throw std::runtime_error("explicit prefill chunk changed during offload startup");
+    }
+    if (!before.moe || before.moe->target_experts_per_layer.size() != priority.size()) {
+        throw std::runtime_error("expert priority cache was not materialized");
+    }
+    std::vector<ninfer::GenerationHandle> calls;
+    for (unsigned i = 0; i < 8; ++i) {
+        calls.push_back(
+            engine.submit(engine.prepare_tokens(std::vector<ninfer::TokenId>(8 + i, 198)),
+                          greedy_options(4, false)));
+    }
+    for (auto& call : calls) {
+        if (call.wait().generated_token_ids.size() != 4) {
+            throw std::runtime_error("priority cache lost a compact batch row");
+        }
+    }
+    const auto warmed = engine.memory_summary().moe;
+    if (warmed->ready_bytes != before.moe->ready_bytes ||
+        warmed->uploaded_bytes != before.moe->uploaded_bytes) {
+        throw std::runtime_error("stable small-T execution changed its expert replicas");
+    }
+    const auto result = engine.generate(
+        engine.prepare_tokens(std::vector<ninfer::TokenId>(128, 198)), greedy_options(2, false));
+    if (result.generated_token_ids.size() != 2 ||
+        engine.memory_summary().moe->uploaded_bytes <= before.moe->uploaded_bytes) {
+        throw std::runtime_error("priority cache did not stream its missing experts");
+    }
+    return 0;
+}
+
 } // namespace
 
-int main() {
-    const char* artifact = std::getenv("NINFER_TEST_ARTIFACT");
-    if (artifact == nullptr || *artifact == '\0') {
-        std::cout << "skip: NINFER_TEST_ARTIFACT is not set\n";
-        return 77;
-    }
+int main(int argc, char** argv) {
+    try {
+        const bool offload = argc == 2 && std::string_view(argv[1]) == "--offload";
+        if (argc != 1 && !offload)
+            throw std::invalid_argument("expected --offload or no arguments");
+        const char* artifact = std::getenv("NINFER_TEST_ARTIFACT");
+        if (artifact == nullptr || *artifact == '\0') {
+            std::cout << "skip: NINFER_TEST_ARTIFACT is not set\n";
+            return 77;
+        }
 
-    {
-        ninfer::Engine engine(engine_options(artifact));
-        if (const int result = verify_loaded_product(engine); result != 0) { return result; }
-        if (const int result = exercise_text_mtp_and_prefix(engine); result != 0) { return result; }
-        if (const int result = exercise_vision(engine); result != 0) { return result; }
+        {
+            ninfer::Engine engine(engine_options(artifact, offload));
+            if (const int result = verify_loaded_product(engine); result != 0) { return result; }
+            const auto before         = engine.memory_summary();
+            const auto expected_chunk = offload ? 4096U : 1024U;
+            if (engine.options().prefill_chunk != expected_chunk ||
+                before.prefill_chunk != expected_chunk) {
+                throw std::runtime_error(
+                    "Engine did not resolve the expected default prefill chunk");
+            }
+            if (before.moe.has_value() != offload) {
+                throw std::runtime_error("MoE test did not select the requested residency");
+            }
+            if (const int result = exercise_text_mtp_and_prefix(engine); result != 0) {
+                return result;
+            }
+            if (const int result = exercise_vision(engine); result != 0) { return result; }
+        }
+        if (!offload) {
+            if (const int result = exercise_maximum_configuration(artifact); result != 0) {
+                return result;
+            }
+        } else {
+            if (const int result = exercise_expert_priority(artifact); result != 0) {
+                return result;
+            }
+        }
+        std::cout << "ok\n";
+        return 0;
+    } catch (const std::exception& error) {
+        std::cerr << error.what() << '\n';
+        return 1;
     }
-    if (const int result = exercise_maximum_configuration(artifact); result != 0) { return result; }
-    std::cout << "ok\n";
-    return 0;
 }

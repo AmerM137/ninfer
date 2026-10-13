@@ -30,10 +30,10 @@ struct ConvPlan {
     [[nodiscard]] bool materialized() const { return kernel == ConvKernel::Materialized; }
 };
 
-ProjectionPlan select_projection_plan(const WeightOperands& weights, std::int32_t columns);
+ProjectionPlan select_projection_plan(const WeightProfile& weights, std::int32_t columns);
 // Publication does not select arithmetic. Snapshot and record consume the same physical block.
-ConvPlan select_conv_plan(const WeightOperands& weights, Batch batch);
-std::size_t convolution_capacity(const WeightOperands& weights, Publication publication,
+ConvPlan select_conv_plan(const WeightProfile& weights, Batch batch);
+std::size_t convolution_capacity(const WeightProfile& weights, Publication publication,
                                  std::int32_t batch, std::int32_t first, std::int32_t last);
 
 } // namespace ninfer::ops::detail::gdn_input

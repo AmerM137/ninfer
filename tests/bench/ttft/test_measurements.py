@@ -223,7 +223,7 @@ def logged_campaign(tmp_path, records, events, *, required=()):
 
 def done_event(service_id, wire_id, response_id, *, preemptions=0, replay=0):
     return {
-        "artifact_type": "ninfer_serve_request_log", "schema_version": 23,
+        "artifact_type": "ninfer_serve_request_log", "schema_version": 27,
         "event": "request_done", "server_instance_id": "serve-test",
         "request": {"request_id": service_id, "http_request_id": wire_id,
                     "response_id": response_id},
@@ -270,8 +270,7 @@ def test_unavailable_diagnostics_never_become_zero_counters(tmp_path, problem):
     measured["response_id"] = "response-a"
     event = done_event(1, "req_wire", "response-a")
     if problem == "legacy":
-        event["schema_version"] = 21
-        event["request"] = {"request_id": 1}
+        event["schema_version"] = 26
     elif problem == "conflict":
         event["request"]["response_id"] = "different-response"
     elif problem == "missing_counters":
@@ -297,7 +296,7 @@ def test_mechanism_not_observed_keeps_valid_performance(tmp_path):
     assert summary["ttft_groups"][0]["median_ttft_ns"] == 4_000_000
 
 
-def runtime_interval(*, schema=23, final=None, state_bytes=0, main_bytes=0,
+def runtime_interval(*, schema=27, final=None, state_bytes=0, main_bytes=0,
                      host_seconds=0.0, occupied=0, peak=None):
     occupancy = {"device_state_slots": 1, "device_main_kv_pages": 8,
                  "device_backend_kv_pages": 0, "host_state_slots": 1,
@@ -364,7 +363,7 @@ def test_missing_runtime_fields_remain_explicit(tmp_path):
 
 
 def test_unsupported_runtime_schema_is_unavailable(tmp_path):
-    summary = summarize_campaign(logged_campaign(tmp_path, [], [runtime_interval(schema=22)]))
+    summary = summarize_campaign(logged_campaign(tmp_path, [], [runtime_interval(schema=26)]))
     assert summary["global_runtime_observations"][0]["reason"] == "unsupported_runtime_schema"
 
 
@@ -451,7 +450,6 @@ def first_output_event():
 def test_first_output_partition_preserves_terminal_and_overlapping_work(tmp_path):
     measured = record([output(101_000_000), ProtocolEvent("terminal", "done", 102_000_000)])
     done = first_output_event()
-    done["schema_version"] = 25
     done["generation"]["admission"] = {
         "preferred_reused_tokens": 19057, "source_wait_seconds": 0.003,
         "revoked_checkpoints": 1, "fallback_reason": "source_revoked",
@@ -626,10 +624,9 @@ def test_replay_progress_uses_engine_interval_and_subtracts_self(tmp_path, other
     measured = record([output(5_000_000), ProtocolEvent("terminal", "done", 15_000_000)])
     measured["response_id"] = "response-a"
     done = done_event(1, "req_wire", "response-a", preemptions=1, replay=1)
-    done["schema_version"] = 24
     def transition(name, at, replayed, decoded):
         return {
-            "artifact_type": "ninfer_serve_request_log", "schema_version": 24,
+            "artifact_type": "ninfer_serve_request_log", "schema_version": 27,
             "event": "request_scheduling", "server_instance_id": "serve-test",
             "request": {"request_id": 1, "http_request_id": "req_wire"},
             "engine_request_id": 11, "preemption_index": 1, "route": "replay",
@@ -673,9 +670,8 @@ def test_replay_evidence_missing_events_cannot_prove_no_other_progress(tmp_path,
     measured = record([output(5_000_000), ProtocolEvent("terminal", "done", 15_000_000)])
     measured["response_id"] = "response-a"
     done = done_event(1, "req_wire", "response-a", preemptions=1, replay=1)
-    done["schema_version"] = 24
     event = {
-        "artifact_type": "ninfer_serve_request_log", "schema_version": 24,
+        "artifact_type": "ninfer_serve_request_log", "schema_version": 27,
         "event": "request_scheduling", "server_instance_id": "serve-test",
         "request": {"request_id": 1, "http_request_id": "req_wire"},
         "engine_request_id": 11, "preemption_index": 1, "route": "replay",

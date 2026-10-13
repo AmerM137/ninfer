@@ -5,6 +5,7 @@ target_sources(ninfer_model_runtime PRIVATE
 
   "${CMAKE_CURRENT_LIST_DIR}/program/program.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/program_impl.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/program/moe_resources.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/context_work.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/prefix_identity.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/round_buffers.cpp"
@@ -15,6 +16,7 @@ target_sources(ninfer_model_runtime PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/program/grammar_masks.cpp"
 
   "${CMAKE_CURRENT_LIST_DIR}/program/planning/startup.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/program/planning/moe.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/planning/graph_profiles.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/planning/request_plan.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/planning/source.cpp"

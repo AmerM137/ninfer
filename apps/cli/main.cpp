@@ -182,11 +182,23 @@ void print_generation_summary(const ninfer::GenerationResult& result,
                                    memory.runtime_reservation_bytes;
     print_metric("device", std::to_string(memory.device));
     print_metric("max context", std::to_string(memory.max_context));
+    print_metric("prefill chunk", std::to_string(memory.prefill_chunk));
+    print_metric("device budget", format_bytes(memory.device_budget_bytes));
     print_metric("KV capacity policy", format_kv_capacity_mode(memory.kv_capacity_mode));
     print_metric("KV capacity", std::to_string(memory.kv_capacity));
     print_metric("KV page groups", std::to_string(memory.kv_capacity_page_groups) + " / " +
                                        std::to_string(memory.kv_capacity_max_page_groups));
     print_metric("gpu weights used", format_arena_used(memory.weights));
+    if (memory.moe) {
+        print_metric("expert Host weights", format_bytes(memory.moe->host_weights_bytes));
+        print_metric("expert GPU cache", format_bytes(memory.moe->cache_bytes));
+        print_metric("expert fixed", format_bytes(memory.moe->fixed_bytes));
+        print_metric("expert windows", format_bytes(memory.moe->window_bytes));
+        print_metric("expert cache used", format_bytes(memory.moe->used_bytes));
+        print_metric("expert cache target", format_bytes(memory.moe->target_bytes));
+        print_metric("expert cache ready", format_bytes(memory.moe->ready_bytes));
+        print_metric("expert CPU workers", std::to_string(memory.moe->cpu_workers));
+    }
     print_metric("gpu sequence used", format_arena_used(memory.sequence));
     print_metric("kv cache dtype", format_kv_cache(memory.kv_cache));
     print_metric("kv cache payload", format_bytes(memory.kv_payload_bytes));

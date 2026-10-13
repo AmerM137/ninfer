@@ -112,29 +112,33 @@ SingleProjectionWeight single(std::span<const WeightInput> inputs) {
     return single(concatenate_rows(inputs), inputs);
 }
 
-} // namespace
-
-SingleProjectionWeight prepare_linear_weight(const WeightInput& input) {
-    return single({&input, 1});
+LinearProfile describe_single(const WeightView& view, std::span<const WeightInput> inputs) {
+    const auto region = contiguous_weight_region(view);
+    require(view.shape.size() == 2 && view.shape[0] <= INT32_MAX && view.shape[1] <= INT32_MAX,
+            "projection dimensions exceed int32");
+    const auto& geometry = region.parent->geometry;
+    const auto layout    = geometry.layout == QuantLayout::BatchedBlockScaleK16M128x4
+                               ? QuantLayout::BlockScaleK16M128x4
+                               : geometry.layout;
+    return {geometry.format, static_cast<std::int32_t>(view.shape[0]),
+            static_cast<std::int32_t>(view.shape[1]), common_policy(inputs), layout};
 }
 
-SingleProjectionWeight prepare_linear_weight(std::span<const WeightInput> rows) {
-    return single(rows);
-}
-
-ProjectionWeights prepare_projection_weights(std::span<const WeightInput> rows) {
+template <class Make>
+auto projection_regions(std::span<const WeightInput> rows, Make make) {
     const auto view = concatenate_rows(rows);
-    if (contiguous(view)) return single(view, rows);
+    if (contiguous(view)) return std::vector{make(view, rows)};
 
     const auto columns = view.shape[1];
     WeightView bank{{0, columns}, {}};
     std::uint64_t elements = 0;
     std::vector<WeightInput> bank_rows;
-    std::vector<SingleProjectionWeight> banks;
+    using Result = decltype(make(view, rows));
+    std::vector<Result> banks;
     const auto finish_bank = [&] {
         require(elements % columns == 0, "projection parent boundary must align to a matrix row");
         bank.shape[0] = elements / columns;
-        banks.push_back(single(bank, bank_rows));
+        banks.push_back(make(bank, bank_rows));
     };
     for (const auto& input : rows) {
         bool included = false;
@@ -157,6 +161,36 @@ ProjectionWeights prepare_projection_weights(std::span<const WeightInput> rows) 
         }
     }
     finish_bank();
+    return banks;
+}
+
+} // namespace
+
+SingleProjectionWeight prepare_linear_weight(const WeightInput& input) {
+    return single({&input, 1});
+}
+
+SingleProjectionWeight prepare_linear_weight(std::span<const WeightInput> rows) {
+    return single(rows);
+}
+
+LinearProfile describe_linear_weight(std::span<const WeightInput> rows) {
+    return describe_single(concatenate_rows(rows), rows);
+}
+
+ProjectionProfile describe_projection_weights(std::span<const WeightInput> rows) {
+    auto banks = projection_regions(rows, describe_single);
+    if (banks.size() == 1) return {banks[0], {}};
+    banks[0].policy = banks[1].policy = LinearPolicy::A16Only;
+    return {banks[0], banks[1]};
+}
+
+ProjectionWeights prepare_projection_weights(std::span<const WeightInput> rows) {
+    const auto banks =
+        projection_regions(rows, [](const WeightView& view, std::span<const WeightInput> inputs) {
+            return single(view, inputs);
+        });
+    if (banks.size() == 1) return banks[0];
     return PairedProjectionWeights{banks[0].weight, banks[1].weight};
 }
 

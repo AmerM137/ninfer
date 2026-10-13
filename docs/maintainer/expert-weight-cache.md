@@ -4,9 +4,9 @@
 数学与量化布局由 [artifact 格式](artifact-container.md)和各 Op 合同拥有；
 执行与生命周期由 [Engine 架构](engine-architecture.md)拥有。
 
-当前公开 Engine 仍使用全 GPU 权重。这里提供后续 CPU/GPU MoE 接入所需的底层能力，
-GPU 路由、专家子集计算与完整融合计算已有独立 Op；CPU `routed_swiglu` 支持 Q4 GU + Q5/Q6
-down，直接消费 Host bank 并产生 FP32 分项。混合 Program 调度和 Engine 显存预算选项尚未接入。
+Engine 支持常驻 GPU，以及受显存预算约束的 eager MoE 混合执行。CPU `routed_swiglu`
+支持 Q4 GU + Q5/Q6 down，直接消费 Host bank 并产生 FP32 分项。GPU 使用同一组
+logical expert ID，既可以计算固定子集，也可以消费补齐后的整层 bank。
 
 ## 来源与身份
 
@@ -38,7 +38,9 @@ Qwen3.5 的 bank ID 按 Main 层顺序建立，选中的 MTP bank 追加在末�
 
 1. `Binder` 检查逻辑引用、Use 和所选资源；辅助值按对应元素区间取得 owning Host 值。
    `PreparedResources` 持有已读资源，移动到最终 backing 后保留 frontend 借用的地址。
-2. `LoadPlan` 保留配置、逻辑引用、Use 和 expert source 描述。
+2. `LoadPlan` 保留配置、逻辑引用、Use 和 expert source 描述，提供无 backing 的权重几何
+   和不消费计划的放置查询。Engine 显式建立不可变 `ModelProfile`，在读取大权重前查询
+   实际 Op 的 workspace 并联合解析容量。纯逻辑 binder 不承担执行布局约束。
    `resolve_load` 指定目标 GPU，以及 Main experts 使用 GPU 或 CPU 来源。
    MTP、router、shared expert 和其余固定权重仍在 GPU；放置沿显式 WeightId 展开。
 3. `plan_materialization` 按 `(physical object, Device)` 去重，并用 `LayoutBuilder`
@@ -54,8 +56,9 @@ Qwen3.5 的 bank ID 按 Main 层顺序建立，选中的 MTP bank 追加在末�
    Model 持有最终 backing，所有原生权重与 bank 视图借用它，不依赖 Reader 生命周期。
 
 这里保留完整 parent 原编码，不运行期 repack，也不把 Host 来源保存成大量单 expert 对象。
-`Parameters` 保存 bank 身份、矩阵 profile 与 Use 元数据，可以描述 CPU 来源；
-resident FFN 的 workspace/执行边界要求 CUDA 常驻视图，尚不执行混合放置。
+`Parameters` 保存 bank 身份、矩阵 profile 与 Use 元数据，可以描述 CPU 来源。
+workspace 查询消费数学 profile；完整 GPU FFN 显式接受 resident/cached CUDA bank，
+混合单层执行另外借用原生 Host bank 和交接资源。
 Flash Next 的 NVFP4/Block-FP8 bank 可通过通用 artifact/core 接口加载；
 这不代表已接入完整 Qwen4Exp 模型执行。
 
@@ -70,7 +73,7 @@ Host 目录条目数、GPU offset/divisor 表和 pinned 索引快照容量。
 
 CPU 来源的每个 entry 是完整 expert 的 GU/down 数据块，只包含 codes/high/scales。
 各 plane 至少 16-byte 对齐，entry 按 256-byte 对齐；不同 bank 使用自己的 entry 大小。
-所有 bank 共用一个 byte pool，不永久分层，也不把小 expert 填充成最大 expert。
+所有 bank 共用一个 byte pool；Program 显式规划固定区和可复用区域，不把小 expert 填充成最大 expert。
 entry 不是序列化 parent，不追加虚假的 divisor trailer。
 
 NVFP4 的 matrix divisor 是静态元数据：CPU 来源在启动时镜像到 GPU，常驻 GPU 来源
@@ -106,12 +109,20 @@ Flash Next Main 48 个 bank 的两组 divisor 共 196,608 B；offset 表同为 1
 
 ## 准备、发布和消费
 
-`prepare(required,prefetch)` 替换目标集合；重复 key 只计一次。
-required 必须能放入 C。prefetch 是可放弃的建议，不自动决定 expert 由 GPU 计算。
+`ExpertPlacement` 指定 logical key 及其在区域内的 256-byte 对齐偏移。构造时安装
+`[0,fixed_bytes)` 的固定布局；固定条目在缓存生命周期内不能替换。`replace(region,entries)`
+完整重建一个可复用区域：新布局不能重叠、切断已有 entry 或借用区域外的同一 key。
+调用者先 release 旧消费者；上传流等待其完成事件后覆盖 payload 与索引。未提交的旧上传被取消，
+已提交上传通过同一条流排序。替换不搬移区域外副本，也不执行权重 D2D。
+替换的 reader wait 当即排入上传流。Program 必须先提交当前层的完整上传及发布事件，
+再替换后续预取窗口，避免后续窗口的等待挡住尚未提交的当前层数据。
+
+`prepare(ExpertCacheRequest)` 选择已有安置的 required 和 prefetch，重复 key 只计一次。
+它只改变上传需求，保留所选条目的地址与跨批进度。布局、窗口轮转和保留集合由 Program 决定。
 
 `progress(ExpertUploadBudget)` 按本次 payload 字节数与批次数预算提交工作，不显式等待 GPU。
 启动配置同时限制单批 payload、复制描述符数和在途批次数；零预算只检查完成状态。
-返回值包含 required 是否已发布、是否等待消费者或上传槽，以及本次提交的批数和字节数。
+返回值包含 required 是否已发布、prefetch 是否已经就绪、是否等待上传槽，以及本次提交的批数和字节数。
 
 权重直接从注册来源复制，不经过 CPU packing。较大的连续 bank 区间使用 pitched H2D，
 小集合与离散区间使用批量 H2D；选择仅依赖实际地址和规模。传输描述符预分配并复用。
@@ -127,7 +138,7 @@ entry 对齐空隙不计入传输 payload。
 ```text
 encoded data DMA → changed offset entries DMA → slot completion event
     → acquire: consumer stream wait → kernels / Graph replay
-    → release: consumer completion event → reuse / eviction
+    → release: consumer completion event → region replacement
 ```
 
 索引只更新已可安全修改的条目，可合并相邻 dirty 条目，不覆盖正在被其他 use 读取的表项。
@@ -135,21 +146,18 @@ encoded data DMA → changed offset entries DMA → slot completion event
 该次上传已完成。后续无关预取不会成为旧数据消费者的新依赖。
 
 `acquire(keys,execution)` 在发布已经排入流后即可成功，不要求 Host 已观察到 DMA 完成。
-未发布时返回空；耗尽启动时配置的 use 数量属于调用错误。
+未发布时返回空；已 release 的 use 占满有界环时返回空，由调用方等待回收；全部槽仍有未 release 的 use 属于调用错误。
 成功取得的每个 use 都须在同一 consumer stream 调用一次 `release`，包括 resident bank。
 release 必须位于最后一次真实 kernel/Graph replay 之后；这两个交接操作在 capture 外执行。
-use 完成事件 ready 前，所需 entry 保持 pin，不被覆盖。
+区域替换在上传流等待已 release 的 consumer event，再更新 payload 和 offset；
+尚未 release 的 use 阻止替换。use 记录副本代次，旧 use 完成不会减少新副本的 pin。
+Host 的 release 不代表 GPU 已完成读取。CUDA 提交失败后停止接受工作，销毁前排空
+已提交传输和消费者。
 
-回收按 LRU 选择不在 required、没有 pin 的 entry，并合并空闲区。
-可选预取先确认回收后能形成足够的连续空间，不驱逐后仍无法装入，也不触发碎片重建。
-required 总量能容纳但碎片阻塞时，等待旧使用者完成后清空可重建
-副本，重新连续装入 required；来源不可变，所以无需 D2D 移动或写回。
-CUDA 提交失败后缓存停止接受工作，销毁前排空已提交传输和消费者，再释放存储。
-
-缓存不包含 CPU 线程池、不执行 MoE 数学，也不拥有 prefill/decode 策略。
+缓存不包含 CPU 线程池、不执行 MoE 数学，也不拥有模型执行策略。
 上层通过 required/prefetch 和 progress 预算表达实际需求；已经提交的复制不能撤回。
 注册及首次上传的准备成本在启动阶段处理。CPU 计算与 DMA 可以同时读取不可变来源，
-但共享系统内存带宽；数据上传和小 bridge 传输的推进由后续 Program 接入决定。
+但共享系统内存带宽；Program 为权重上传和小 bridge 分配独立 streams。
 
 ## MoE 计算交接
 
@@ -179,35 +187,68 @@ Program 提供 scratch 和执行 view，负责发布、acquire/release 及 bridg
 固定 profile 的 CUDA Graph 可以重放新的路由、mask 和
 索引内容；更新必须发生在旧消费者结束之后。shared 始终驻留 GPU，不进入动态 expert 集合。
 
-## 后续接入
+`execution/moe` 的单层执行借用 `MoeExecutionView`。`MoePartition` 从本层已就绪 GPU ID
+快照建立互补 mask 与 cache keys，CPU/GPU 在本次调用消费同一快照。mask 在计算流更新，
+pinned staging 在 DMA 完成前不复用。`MoeBridge` 持有 CPU team、普通 Host scratch、
+pinned/Device frame，以及独立的 bridge stream/events。资源查询分别返回两端 frame 和
+scratch 上界，可对多个 profile 取最大值；GPU scratch 由调用者提供，route/routed 顺序复用。
+纯 GPU 分工不建立 CPU team 或 bridge，完整融合调用显式接受 resident/indexed bank。
 
-后续计算与 Program 接入保留以下执行约定；缓存自身不实现这些策略：
+调用方先用 cache `prepare/progress` 发布 required。混合调用先在计算流提交 route，
+再由 bridge 等待并回传 hidden 和连续的 IDs/coefficients。调用方持有 GPU 分工的 lease，提交 GPU
+routed/shared；控制线程等输入就绪后运行同步 CPU collective，与 GPU 分支重叠。
+CPU FP32 分项上传后，计算流等待并合并两份分项与 residual。正常路径只等待 CPU 输入，
+最终输出按计算流排序。一份 frame 由单个控制线程在固定 streams 上连续复用；下一次
+route/D2H 经过上一层 combine，因而不会覆盖仍在上传的 Host 分项。资源销毁排空两条流。
+若本次路由没有 CPU assignment，跳过 CPU collective 和分项回传。单层 cache 交接在 capture 外执行。
 
-- 在读取完整权重前决定 resident 或 Host 来源。完整 GPU 放置可行时，使用完整融合
-  `topk_softmax_swiglu_moe`，不建立完整 Host expert 副本。Host 模式保留完整原编码来源，运行期不从
-  磁盘补 expert，也不写回权重。
-- 大块 prefill、Replay 和 CausalScoring 在实际 MoE 消费前取得整个 bank；容量至少能
-  容纳最大的动态 bank。预取可以分批，计算不拆成部分 expert 子集。下一 bank 来自
-  模型调用顺序；独立的 embedding/mixer 可与上传重叠。
-- decode、verification 和 forced control 使用启动时确定的各层 GPU 集合 D，其余
-  被路由选中的 expert 由 CPU 计算。两侧 assignment 互斥且完备，消费同一次路由及其
-  原系数，不分别重新归一化。verify 的实际 T 可以大于 batch，不能把 CPU 数学限制为 T=1。
-- 真正进入下一执行类别时才切换集合：完成旧消费者，补齐新 required，再开始消费。
-  D 完整就绪后在连续 decode rounds 中保持布局；相同阶段的后续 chunk/round 复用已有
-  副本。数据池不永久划出 decode 专区。首 token 发布不等待恢复 D，副本布局不进入
-  StateImage，也不随 speculative rejection 回滚。
-- CPU 使用已有固定 CpuExecutor；Program 预分配 activations、routes 和 partial buffers。
-  CPU 分支产生 FP32 partial[H,T]；GPU 分支可同时计算自身 routed 子集和 shared，产生另一份
-  FP32 partial[H,T]。随后在 GPU 合并两份分项与 residual，shared 只计一次。
-  激活交接缓冲区的复用服从各自完成依赖，与权重上传槽分别计费。
-- resident 保留完整 CUDA Graph；混合执行使用经过验证的 GPU 分段 Graph 或显式 eager
-  路径，在启动时确定。所选 MTP 仍常驻 GPU，DFlash/DFlash2 的 Main verification 经过
-  同一混合 FFN，draft dense 权重沿用现有路径。
-- 总显存预算包含固定权重、Program 状态、KV、workspace、bridge、cache、静态表和
-  Graph/运行时保留。先按最低 KV 判断 resident 是否可行；Host 模式在满足最低 KV 后
-  分配 expert 容量，显式 KV 配置可以扩大上下文池。Host 来源及其注册容量单独计费。
+## Engine 预算与逐层执行
 
-CPU/GPU 子集计算与最终归约在 Op 层验证；Program 的异步交接、缓冲复用和阶段切换仍需完成
-状态验证，再开放公共 Engine 的预算与混合执行选项。CPU 计算与 DMA 的带宽竞争仍需实测。
+`NINFER_VRAM_BUDGET_MIB` 是引擎可使用的 Device 容量上限，另受启动时实际空闲显存限制。
+预算包含固定权重、Program State/KV、workspace、cache、offset/divisor 表、bridge/masks
+及运行时余量。自动 KV 先保证一个完整上下文；Host 模式把其余容量优先用于 expert。
+显式 KV 配置仍完整兑现。Host 来源、注册范围和 pinned frame 单独报告，注册范围是
+Host backing 的子集。MTP、router、shared、Vision 和 draft 始终留在 GPU。
+
+完整 GPU 放置可行时走原融合路径，不创建 Host expert 副本。否则保留完整原编码 Host
+来源；`EngineOptions::moe.expert_priority` 可指定每个 Main 层全部 logical ID 的优先级排列，
+默认使用 ID 顺序。各层按字节均衡分配额度，以完整 expert 为单位选取优先级前缀；排列本身
+不强制启用 offload。优先级影响目标集合，实际 GPU 分工由已就绪副本决定。
+`moe.cpu_workers=0` 自动选择物理核并为控制线程留核；非零指定团队规模。
+
+`MoeResources` 由 Program 持有。扣除固定资源、KV、workspace、bridge/masks 和索引后，
+剩余容量 C 分成固定区 R 和流式窗口。启动时联合求解均衡的固定额度及窗口容量：每层完整
+bank 为 W_l，固定 expert 为 R_l，每个窗口必须容纳 `max_l(W_l-R_l)`。不先扣除两个完整 bank。
+规划枚举完整 expert 的额度边界，并利用取整余量；固定集合取各层优先级前缀，数量和地址终身稳定。
+默认使用两个窗口；预算不足双窗口时使用单窗口，连单窗口也不可行时拒绝该容量计划。
+
+小 T 把全部窗口空间合并为一段连续额外缓存，继续按均衡字节额度扩展每层的优先级前缀。
+固定布局、额外布局及各层缺失集合都在启动时确定；初始固定与额外上传完成后才进入执行。
+每次 Main traversal 只依据实际 T 形成需求：
+
+- 小 T：GPU/CPU 消费同一 ready 集合及其补集。稳定时复用快照和 lease，无权重上传。
+  从大 T 返回时，在层间按层序分批恢复额外布局；无需等待全部恢复，未 ready 的 expert 由 CPU
+  计算。每个完整 expert 上传完成后才进入快照，恢复完成后重新稳定。
+- 大 T：窗口紧凑装载当前层的缺失集合，与固定副本合成完整 indexed bank；另一窗口预取下一层。
+  当前数据先单独发布完成事件，再推进下一层上传。窗口最后读取之后可排入下一次覆盖，
+  单窗口模式按相同依赖顺序加载。不同层缺失字节数导致的窗口尾部余量暂不使用。
+
+prefill、Replay、ordinary/control 和 speculative verification 共用该入口，不依据请求阶段
+改变 MoE 策略。权重上传与当前层计算及下一层 mixer 重叠；连续大 T 不在 chunk 边界恢复
+小 T 布局。大小 T 切换只重建窗口，不改变固定区；一次完整额外缓存恢复的 H2D 不超过窗口总容量。
+恢复途中再次进入大 T 时，取消未提交恢复，并在已有上传之后重建流式布局。
+cache 不进入 StateImage、checkpoint 或 speculative 回滚。
+
+MemorySummary 报告池容量、固定区、窗口总容量与数量、实际占用、完整小 T 目标和实际 ready
+字节及逐层数量。固定区加窗口等于 cache_bytes；ready 与 target 是其中的状态或目标，不能重复相加。
+另报告 H2D 总量及其中的预取字节，不再提供碎片整理计数。
+
+`prefill_chunk=0` 表示未指定：常驻模型默认 1024，CPU expert offload 默认 4096。
+`--prefill-chunk N` 接受 128 的正整数倍，启动时按指定值或固定默认值规划容量，实际调用
+受 context 剩余长度限制。测量签名包含优先级、各层缓存额度、团队、池容量和 chunk，
+不把常驻模型的重算成本标定直接套给 offload。
+
+常驻执行保留 CUDA Graph。当前混合执行要求 `use_cuda_graph=false`；MTP 的 Main
+verification 和 DFlash 的 target 使用相同调度，MTP 自身及 draft 延续常驻路径。
 
 测试与实测入口分别见 [Tests](../../tests/README.md) 和 [Benchmarks](../../bench/README.md)。

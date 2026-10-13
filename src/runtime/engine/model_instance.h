@@ -19,10 +19,12 @@ struct ModelInstance {
     const models::qwen3_5::execution::Parameters parameters;
     models::qwen3_5::Frontend frontend;
     KvCapacityResolution kv_capacity_resolution;
+    std::size_t device_budget_bytes = 0;
     const std::uint32_t capacity;
     std::unique_ptr<models::qwen3_5::Program> program;
 
-    ModelInstance(std::unique_ptr<models::qwen3_5::Model> model, const EngineOptions& options);
+    ModelInstance(std::unique_ptr<models::qwen3_5::Model> model, const EngineOptions& options,
+                  std::shared_ptr<const models::qwen3_5::execution::ModelProfile> profile);
     ~ModelInstance();
     ModelInstance(const ModelInstance&)            = delete;
     ModelInstance& operator=(const ModelInstance&) = delete;

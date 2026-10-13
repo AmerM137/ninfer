@@ -58,11 +58,11 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const ProjectionWeights& weig
         });
 }
 
-std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(const ProjectionWeights& weights,
+std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(const ProjectionProfile& weights,
                                                                   std::int32_t batch,
                                                                   std::int32_t first,
                                                                   std::int32_t last) {
-    return input::convolution_capacity(input::describe_weights(weights),
+    return input::convolution_capacity(input::describe_profile(weights),
                                        input::Publication::Snapshot, batch, first, last);
 }
 
@@ -93,11 +93,11 @@ void gdn_input_proj_conv_record(const Tensor& x, const ProjectionWeights& weight
         });
 }
 
-std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(const ProjectionWeights& weights,
+std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(const ProjectionProfile& weights,
                                                                 std::int32_t batch,
                                                                 std::int32_t first,
                                                                 std::int32_t last) {
-    return input::convolution_capacity(input::describe_weights(weights), input::Publication::Record,
+    return input::convolution_capacity(input::describe_profile(weights), input::Publication::Record,
                                        batch, first, last);
 }
 

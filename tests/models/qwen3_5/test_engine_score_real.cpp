@@ -21,7 +21,7 @@ int main() {
     options.kv_cache      = ninfer::KvCacheStorage::Fp8E4M3Row256;
     ninfer::Engine engine(options);
     const auto& effective = engine.options();
-    if (effective.max_concurrency != 1 || effective.prefill_chunk != 1024 ||
+    if (effective.max_concurrency != 1 || effective.prefill_chunk == 0 ||
         effective.kv_capacity.mode != ninfer::KvCapacityMode::Explicit ||
         effective.kv_capacity.explicit_tokens != effective.max_context ||
         effective.context_cache.enabled ||

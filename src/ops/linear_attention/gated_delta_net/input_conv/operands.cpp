@@ -35,32 +35,36 @@ void validate_rowsplit(const Weight& w) {
 
 } // namespace
 
-WeightOperands describe_weights(const ProjectionWeights& weights) {
-    if (const auto* pair = std::get_if<PairedProjectionWeights>(&weights)) {
-        const auto& a = pair->first;
-        const auto& b = pair->second;
+WeightProfile describe_profile(const ProjectionProfile& weights) {
+    if (weights.second) {
+        const auto& a = weights.first;
+        const auto& b = *weights.second;
         if (a.qtype != QType::Q4_G64_FP16 || b.qtype != QType::Q5_G64_FP16 || a.n != 4096 ||
             a.k != 5120 || b.n != 12288 || b.k != 5120)
             throw std::invalid_argument("GDN input: unsupported paired weight geometry");
-        return {Format::Q4Q5, {5120, 6144}, &a, &b, LinearPolicy::A16Only};
+        return {Format::Q4Q5, {5120, 6144}, LinearPolicy::A16Only};
     }
-    const auto& single = std::get<SingleProjectionWeight>(weights);
-    const auto& w      = single.weight;
-    if (!valid_linear_policy(single.policy))
+    const auto& w = weights.first;
+    if (!valid_linear_policy(w.policy))
         throw std::invalid_argument("GDN input: invalid activation permission");
     if (w.qtype == QType::Q8_G32_FP16) {
-        if (w.n == 12288 && w.k == 2048)
-            return {Format::Q8, {2048, 4096}, &w, nullptr, single.policy};
-        if (w.n == 16384 && w.k == 2560)
-            return {Format::Q8, {2560, 6144}, &w, nullptr, single.policy};
+        if (w.n == 12288 && w.k == 2048) return {Format::Q8, {2048, 4096}, w.policy};
+        if (w.n == 16384 && w.k == 2560) return {Format::Q8, {2560, 6144}, w.policy};
     }
     if (w.n == 16384 && w.k == 5120) {
-        if (w.qtype == QType::FP8_E4M3FN_ROW_BF16)
-            return {Format::Fp8, {5120, 6144}, &w, nullptr, single.policy};
-        if (w.qtype == QType::NVFP4)
-            return {Format::Nvfp4, {5120, 6144}, &w, nullptr, single.policy};
+        if (w.qtype == QType::FP8_E4M3FN_ROW_BF16) return {Format::Fp8, {5120, 6144}, w.policy};
+        if (w.qtype == QType::NVFP4) return {Format::Nvfp4, {5120, 6144}, w.policy};
     }
     throw std::invalid_argument("GDN input: unsupported single-parent weight geometry");
+}
+
+WeightOperands describe_weights(const ProjectionWeights& weights) {
+    const auto profile = describe_profile(projection_profile(weights));
+    if (const auto* single = std::get_if<SingleProjectionWeight>(&weights)) {
+        return {profile, &single->weight, nullptr};
+    }
+    const auto& pair = std::get<PairedProjectionWeights>(weights);
+    return {profile, &pair.first, &pair.second};
 }
 
 void validate_weights(const WeightOperands& weights) {

@@ -51,20 +51,33 @@ void vector(const Tensor& tensor, DType type, int rows, bool backing = true) {
 
 } // namespace
 
+Geometry describe_profile(const ProjectionProfile& weights) {
+    const auto& a = weights.first;
+    require(valid_linear_policy(a.policy), "invalid activation permission");
+    if (!weights.second) {
+        require(a.qtype == QType::BF16 &&
+                    ((a.n == 96 && (a.k == 5120 || a.k == 2560)) || (a.n == 64 && a.k == 2048)),
+                "unsupported parent geometry");
+        return {a.n / 2, a.k};
+    }
+    const auto& b = *weights.second;
+    require(a.qtype == QType::BF16 && b.qtype == QType::BF16 && a.n == 48 && a.k == 5120 &&
+                b.n == 48 && b.k == 5120,
+            "unsupported paired geometry");
+    return {48, 5120};
+}
+
 Weights describe_weights(const ProjectionWeights& weights) {
+    const auto geometry = describe_profile(projection_profile(weights));
     if (const auto* single = std::get_if<SingleProjectionWeight>(&weights)) {
         const auto& w = single->weight;
-        require(valid_linear_policy(single->policy), "invalid activation permission");
-        const bool supported =
-            (w.n == 96 && (w.k == 5120 || w.k == 2560)) || (w.n == 64 && w.k == 2048);
-        require(supported, "unsupported parent geometry");
         describe_matrix(w, w.n, w.k);
-        return {{w.n / 2, w.k}, &w, nullptr};
+        return {geometry, &w, nullptr};
     }
     const auto& pair = std::get<PairedProjectionWeights>(weights);
     describe_matrix(pair.first, 48, 5120);
     describe_matrix(pair.second, 48, 5120);
-    return {{48, 5120}, &pair.first, &pair.second};
+    return {geometry, &pair.first, &pair.second};
 }
 
 void validate_weights(const Weights& weights) {

@@ -77,7 +77,7 @@ void gdn_control_proj(const Tensor& x, const ProjectionWeights& weights, const T
                       CudaExecutionView execution);
 
 [[nodiscard]] std::size_t
-gdn_control_proj_workspace_capacity_bytes(const ProjectionWeights& weights, std::int32_t first,
+gdn_control_proj_workspace_capacity_bytes(const ProjectionProfile& weights, std::int32_t first,
                                           std::int32_t last);
 
 /**
@@ -107,7 +107,18 @@ void gdn_norm_control_proj(const Tensor& x, const Tensor& norm_weight, float eps
                            CudaExecutionView execution);
 
 [[nodiscard]] std::size_t
-gdn_norm_control_proj_workspace_capacity_bytes(const ProjectionWeights& weights, std::int32_t first,
+gdn_norm_control_proj_workspace_capacity_bytes(const ProjectionProfile& weights, std::int32_t first,
                                                std::int32_t last);
 
+[[nodiscard]] inline std::size_t
+gdn_control_proj_workspace_capacity_bytes(const ProjectionWeights& weights, std::int32_t first,
+                                          std::int32_t last) {
+    return gdn_control_proj_workspace_capacity_bytes(projection_profile(weights), first, last);
+}
+
+[[nodiscard]] inline std::size_t
+gdn_norm_control_proj_workspace_capacity_bytes(const ProjectionWeights& weights, std::int32_t first,
+                                               std::int32_t last) {
+    return gdn_norm_control_proj_workspace_capacity_bytes(projection_profile(weights), first, last);
+}
 } // namespace ninfer::ops

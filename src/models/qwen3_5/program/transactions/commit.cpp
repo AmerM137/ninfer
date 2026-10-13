@@ -267,7 +267,7 @@ runtime::ExecutionTiming ProgramImpl::append_forced_tokens(
                 execution::PrefillContext schedule_state{
                     {device, parameters, work, state_images->linear(),
                      replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-                     proposal_head},
+                     proposal_head, moe.get()},
                     mtp_kv_view(sequence),
                     decoder->text_kv,
                     decoder->mtp_cache(),

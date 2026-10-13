@@ -84,8 +84,8 @@ TensorRegion alias_tensor(const TensorRegion& storage, DType dtype,
     return out;
 }
 
-VisionWorkspaceLayout build_workspace_layout(const VisionConfig& config,
-                                             const VisionParameters& parameters,
+template <class Profile>
+VisionWorkspaceLayout build_workspace_layout(const VisionConfig& config, const Profile& parameters,
                                              std::size_t patches64, std::size_t tokens64,
                                              std::size_t handoff_offset_bytes) {
     if (patches64 == 0 || tokens64 == 0 ||
@@ -103,9 +103,9 @@ VisionWorkspaceLayout build_workspace_layout(const VisionConfig& config,
     const auto patches = static_cast<std::int32_t>(patches64);
     const auto tokens  = static_cast<std::int32_t>(tokens64);
 
-    const auto capacity = [](const LinearParameters& p, std::int32_t first, std::int32_t last) {
-        return ops::linear_workspace_capacity_bytes(p.weight.qtype, p.weight.n, p.weight.k,
-                                                    p.policy, first, last);
+    const auto capacity = [](const auto& weight, std::int32_t first, std::int32_t last) {
+        const auto p = ops::linear_profile(weight);
+        return ops::linear_workspace_capacity_bytes(p.qtype, p.n, p.k, p.policy, first, last);
     };
     const auto minimum_patches =
         dimension(std::uint64_t(config.spatial_merge_size) * config.spatial_merge_size);
@@ -182,10 +182,10 @@ VisionWorkspaceLayout build_workspace_layout(const VisionConfig& config,
     {
         LayoutBuilder finish;
         (void)finish.add(handoff_offset_bytes, kWorkspaceAlignment, "handoff start");
-        (void)finish.add(
-            checked_mul(checked_mul(parameters.merger_fc2.weight.n, tokens64, "output elements"), 2,
-                        "output bytes"),
-            1, "handoff");
+        (void)finish.add(checked_mul(checked_mul(ops::linear_profile(parameters.merger_fc2).n,
+                                                 tokens64, "output elements"),
+                                     2, "output bytes"),
+                         1, "handoff");
         out.merger_second_scratch =
             finish.add(final_scratch, kWorkspaceAlignment, "merger second scratch");
         out.bytes = std::max(out.bytes, finish.finish(1, "merger call"));
@@ -234,15 +234,15 @@ std::size_t VisionContext::workspace_bytes(const VisionConfig& config,
         .bytes;
 }
 
-VisionWorkspacePlan VisionContext::plan_workspace(const VisionConfig& config,
-                                                  const VisionParameters& parameters,
-                                                  std::uint32_t max_merged_tokens,
-                                                  std::size_t general_capacity_bytes) {
+template <class Profile>
+static VisionWorkspacePlan
+plan_vision_workspace(const VisionConfig& config, const Profile& parameters,
+                      std::uint32_t max_merged_tokens, std::size_t general_capacity_bytes) {
     if (max_merged_tokens == 0 || general_capacity_bytes == 0) {
         throw std::invalid_argument("Vision workspace extents must be positive");
     }
     VisionWorkspacePlan out;
-    out.output_hidden          = parameters.merger_fc2.weight.n;
+    out.output_hidden          = ops::linear_profile(parameters.merger_fc2).n;
     out.max_merged_tokens      = max_merged_tokens;
     out.general_capacity_bytes = general_capacity_bytes;
     out.handoff_offset_bytes =
@@ -261,6 +261,18 @@ VisionWorkspacePlan VisionContext::plan_workspace(const VisionConfig& config,
         out.encode_peak_bytes,
         checked_add(out.handoff_offset_bytes, out.handoff_capacity_bytes, "workspace capacity"));
     return out;
+}
+
+VisionWorkspacePlan VisionContext::plan_workspace(const VisionConfig& config,
+                                                  const VisionParameters& parameters,
+                                                  std::uint32_t tokens, std::size_t general) {
+    return plan_vision_workspace(config, parameters, tokens, general);
+}
+
+VisionWorkspacePlan VisionContext::plan_workspace(const VisionConfig& config,
+                                                  const VisionProfile& parameters,
+                                                  std::uint32_t tokens, std::size_t general) {
+    return plan_vision_workspace(config, parameters, tokens, general);
 }
 
 Tensor VisionContext::bind_output(MemorySpan backing, const VisionWorkspacePlan& plan,

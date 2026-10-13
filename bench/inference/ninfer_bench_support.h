@@ -15,7 +15,7 @@
 
 namespace ninfer::bench {
 
-inline constexpr int kSchemaVersion                   = 19;
+inline constexpr int kSchemaVersion                   = 23;
 inline constexpr std::string_view kArtifactType       = "ninfer_bench_report";
 inline constexpr std::string_view kDefaultCorpusPath  = "bench/fixtures/bench_corpus.ids";
 inline constexpr int kDecodeSeedTokens                = 1;
@@ -23,7 +23,7 @@ inline constexpr int kDefaultNPrompt                  = 512;
 inline constexpr int kDefaultNGen                     = 128;
 inline constexpr int kDefaultRepetitions              = 5;
 inline constexpr int kDefaultWarmup                   = 1;
-inline constexpr std::uint32_t kDefaultPrefillChunk   = 1024;
+inline constexpr std::uint32_t kDefaultPrefillChunk   = 0;
 inline constexpr std::uint32_t kPrefillChunkAlignment = 128;
 
 enum class TestKind { Prefill, Decode, PrefillDecode };
@@ -91,6 +91,7 @@ struct TestResult {
     std::vector<double> repetition_wall_seconds;
     std::size_t workspace_peak_bytes           = 0;
     std::size_t workspace_allocator_peak_bytes = 0;
+    std::uint64_t expert_upload_bytes          = 0;
 };
 
 struct Stats {

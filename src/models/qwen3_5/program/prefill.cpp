@@ -72,7 +72,7 @@ PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const Tok
     TextContext card(state.execution.device, state.execution.parameters, state.execution.work,
                      state.text_cache, state.execution.linear_attention, state.execution.io,
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
-                     state.text_kv_base, state.mtp_kv, state.mtp_cache);
+                     state.text_kv_base, state.mtp_kv, state.mtp_cache, state.execution.moe);
     configure_text_card(card, state.execution, state.sampling, state.state_source_slot,
                         state.state_destination_slot, state.mtp_proposal_extent);
     card.set_prefill_gpu_timer(state.prefill_gpu_timer);
@@ -97,7 +97,7 @@ PrefillChunkResult prefill_multimodal_chunk(PrefillContext& state, const Prepare
     TextContext card(state.execution.device, state.execution.parameters, state.execution.work,
                      state.text_cache, state.execution.linear_attention, state.execution.io,
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
-                     state.text_kv_base, state.mtp_kv, state.mtp_cache);
+                     state.text_kv_base, state.mtp_kv, state.mtp_cache, state.execution.moe);
     configure_text_card(card, state.execution, state.sampling, state.state_source_slot,
                         state.state_destination_slot, state.mtp_proposal_extent);
     card.set_prefill_gpu_timer(state.prefill_gpu_timer);
@@ -503,7 +503,7 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
         execution::PrefillContext schedule_state{
             {device, parameters, work, state_images->linear(),
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head},
+             proposal_head, moe.get()},
             mtp_kv_view(sequence),
             decoder->text_kv,
             decoder->mtp_cache(),

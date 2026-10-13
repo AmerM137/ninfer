@@ -9,26 +9,26 @@
 
 namespace ninfer::models::qwen3_5::execution {
 
-std::size_t mtp_projection_workspace_bytes(const MtpProjectionParameters& parameters,
+std::size_t mtp_projection_workspace_bytes(const MtpProjectionProfile& parameters,
                                            std::int32_t first, std::int32_t last) {
     const auto& p = parameters.packed;
-    const auto& w = p.weight;
     if (!parameters.rows) {
-        return ops::linear_split_workspace_capacity_bytes(p, parameters.output_rows, first, last);
+        return ops::linear_split_workspace_capacity_bytes(ops::ProjectionProfile{p, {}},
+                                                          parameters.output_rows, first, last);
     }
     WorkspaceLayoutBuilder layout;
-    (void)layout.alloc(DType::BF16, {w.n, last});
+    (void)layout.alloc(DType::BF16, {p.n, last});
     (void)layout.alloc_bytes(
-        ops::linear_workspace_capacity_bytes(w.qtype, w.n, w.k, p.policy, first, last));
+        ops::linear_workspace_capacity_bytes(p.qtype, p.n, p.k, p.policy, first, last));
     return layout.peak_bytes(1);
 }
 
-std::size_t mtp_kv_workspace_bytes(const MtpProjectionParameters& parameters,
+std::size_t mtp_kv_workspace_bytes(const MtpProjectionProfile& parameters,
                                    const AttentionConfig& config, std::int32_t first,
                                    std::int32_t last) {
     if (parameters.rows) {
-        return ops::linear_pair_workspace_capacity_bytes((*parameters.rows)[1].weight,
-                                                         (*parameters.rows)[3].weight, first, last);
+        return ops::linear_pair_workspace_capacity_bytes((*parameters.rows)[1],
+                                                         (*parameters.rows)[3], first, last);
     }
     WorkspaceLayoutBuilder layout;
     (void)layout.alloc(DType::BF16, {dimension(config.query_width()), last});
@@ -37,14 +37,13 @@ std::size_t mtp_kv_workspace_bytes(const MtpProjectionParameters& parameters,
     return layout.peak_bytes(1);
 }
 
-std::size_t mtp_query_gate_workspace_bytes(const MtpProjectionParameters& parameters,
+std::size_t mtp_query_gate_workspace_bytes(const MtpProjectionProfile& parameters,
                                            const AttentionConfig& config, std::int32_t first,
                                            std::int32_t last) {
     if (parameters.rows) {
         const auto bytes = [&](std::size_t index) {
             const auto& p = (*parameters.rows)[index];
-            const auto& w = p.weight;
-            return ops::linear_workspace_capacity_bytes(w.qtype, w.n, w.k, p.policy, first, last);
+            return ops::linear_workspace_capacity_bytes(p.qtype, p.n, p.k, p.policy, first, last);
         };
         return std::max(bytes(0), bytes(2));
     }

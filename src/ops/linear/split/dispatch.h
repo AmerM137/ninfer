@@ -27,5 +27,5 @@ extern const SplitShape kQ4Q5SplitN7168N7168K5120, kQ4Q5SplitN4096N12288K5120;
 extern const SplitShape kFp8SplitN14336K5120, kFp8SplitN16384K5120;
 extern const SplitShape kNvfp4SplitN14336K5120, kNvfp4SplitN16384K5120;
 
-const SplitShape& select_split_shape(Weights weights);
+const SplitShape& select_split_shape(ProjectionProfile weights);
 } // namespace ninfer::ops::detail::linear_split

@@ -101,7 +101,9 @@ void expert_cache_cuda_errors(const ExpertBankSource& source, const DeviceContex
         bool caught = false, unusable = false;
         {
             ExpertCache cache(sources, req, device, device.transfer_view());
-            cache.prepare(std::array{ExpertKey{{0}, 0}});
+            cache.replace({0, req.config.capacity_bytes, 256},
+                          std::array{ExpertPlacement{{{0}, 0}, 0}});
+            cache.prepare({std::array{ExpertKey{{0}, 0}}});
             trace.active  = true;
             trace.failure = failure;
             try {

@@ -142,6 +142,14 @@ struct ContextCostOptions {
     std::filesystem::path preset_path;
 };
 
+struct MoeOptions {
+    // Descending cache priority: a permutation of all logical expert IDs per Main layer.
+    // Dense layers have empty rows. nullopt uses ID order; capacity determines each prefix.
+    std::optional<std::vector<std::vector<std::uint32_t>>> expert_priority;
+    // Zero selects physical cores while reserving a control-thread core when available.
+    std::uint32_t cpu_workers = 0;
+};
+
 struct EngineOptions {
     std::filesystem::path artifact_path;
     std::filesystem::path chat_template_path;
@@ -153,8 +161,10 @@ struct EngineOptions {
     std::uint32_t max_concurrency      = 1;
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;
-    std::uint32_t prefill_chunk        = 1024;
-    KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
+    // Zero uses 1024 tokens, or 4096 with CPU expert offload.
+    std::uint32_t prefill_chunk = 0;
+    MoeOptions moe;
+    KvCacheStorage kv_cache = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;
     std::size_t media_live_bytes  = kDefaultMediaLiveBytes;
@@ -925,9 +935,33 @@ struct VisionWorkspaceMemorySummary {
     std::size_t handoff_peak_bytes        = 0;
 };
 
+struct MoeMemorySummary {
+    std::size_t host_weights_bytes    = 0;
+    std::size_t registered_host_bytes = 0;
+    std::size_t cache_bytes           = 0;
+    std::size_t fixed_bytes           = 0;
+    std::size_t window_bytes          = 0;
+    std::uint32_t window_count        = 0;
+    std::size_t used_bytes            = 0;
+    std::size_t target_bytes          = 0;
+    std::size_t ready_bytes           = 0;
+    std::uint32_t cpu_workers         = 0;
+    std::vector<std::uint32_t> fixed_experts_per_layer;
+    std::vector<std::uint32_t> target_experts_per_layer;
+    std::vector<std::uint32_t> ready_experts_per_layer;
+    std::size_t bridge_device_bytes = 0;
+    std::size_t bridge_pinned_bytes = 0;
+    std::size_t cpu_workspace_bytes = 0;
+    std::uint64_t uploaded_bytes    = 0;
+    std::uint64_t prefetched_bytes  = 0;
+};
+
 struct MemorySummary {
-    int device                                = 0;
-    std::uint32_t max_context                 = 0;
+    int device                      = 0;
+    std::uint32_t max_context       = 0;
+    std::uint32_t prefill_chunk     = 0;
+    std::size_t device_budget_bytes = 0;
+    std::optional<MoeMemorySummary> moe;
     KvCapacityMode kv_capacity_mode           = KvCapacityMode::Explicit;
     std::uint32_t kv_capacity                 = 0; // Resolved page-aligned Main KV capacity.
     std::uint32_t kv_capacity_page_groups     = 0;

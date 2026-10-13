@@ -195,8 +195,14 @@ semantics, arbitrary token tails through T=72, affine and strided parent banks, 
 checks, signed code domains, scale extremes and tiny-BF16 cancellation around the BF16-dot guard.
 `ninfer_moe_test` also qualifies complementary CPU/GPU subsets plus GPU shared/residual composition.
 
+`ninfer_qwen3_5_moe_execution_test` qualifies single-layer mixed execution and the Program's
+multi-layer fixed-cache and streaming-window schedule against the same independent complete-MoE oracle. It uses registered native Host banks and the real ExpertCache,
+covering absent CPU-only replicas, explicit region replacement, All/None/partial partitions, variable frame
+reuse through T=1024, delayed bridge progress, failed acquisition and asynchronous teardown.
+
 ```bash
 ctest --test-dir build -R '^ninfer_moe(_cpu(_avx2|_fma)?)?_test$' --output-on-failure
+ctest --test-dir build -R '^ninfer_qwen3_5_moe_execution_test$' --output-on-failure
 ```
 
 Run the 35B-A3B MoE route independently:
@@ -205,6 +211,12 @@ Run the 35B-A3B MoE route independently:
 NINFER_TEST_ARTIFACT=$PWD/out/qwen3_6_35b_a3b.ninfer \
   ctest --test-dir build -R ninfer_qwen3_5_moe_real_test --output-on-failure
 ```
+
+`ninfer_qwen3_5_moe_offload_real_test` uses the same artifact with a 16 GiB Device budget and
+eager execution. It covers MTP, prefix reuse, Vision, per-layer expert priorities,
+eight resident rows, and stable small-T cache reuse. The DFlash and
+preemption real tests also accept `NINFER_TEST_EAGER=1`; combine it with
+`NINFER_VRAM_BUDGET_MIB` to exercise offload. CausalScoring always uses eager execution.
 
 Without `NINFER_TEST_ARTIFACT`, CTest marks these real Engine tests as skipped. Real-artifact targets
 carry the `real` label and `RUN_SERIAL` so CTest runs them alone. Run directly invoked GPU
@@ -381,7 +393,7 @@ arbitrary floating-point routes.
 
 `ninfer_weight_bank_test` checks local matrix/plane addressing for INT, NVFP4 and block-FP8.
 `ninfer_expert_cache_test` checks encoded bytes, variable entry sizes, bounded upload batches, required-set
-changes, fragmentation, delayed consumers, Graph replay, independent prefetch readiness and failed
+changes, immutable fixed regions, window reconstruction, interrupted restoration, partial uploads, delayed consumers, Graph replay, independent prefetch readiness and failed
 submission cleanup. The byte oracle is the immutable source representation, not another cache.
 `ninfer_artifact_cpu_materialization_test` runs with CUDA devices hidden and verifies aligned Host
 backing and retained resource lifetimes. The materialization suite also checks dual-destination I/O,

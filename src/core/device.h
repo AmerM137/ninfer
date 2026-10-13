@@ -86,6 +86,21 @@ private:
     bool changed_ = false;
 };
 
+// An additional nonblocking stream. Its owner orders and completes borrowed buffer uses.
+class CudaStream {
+public:
+    explicit CudaStream(const DeviceContext& device);
+    ~CudaStream();
+    CudaStream(const CudaStream&)            = delete;
+    CudaStream& operator=(const CudaStream&) = delete;
+
+    [[nodiscard]] cudaStream_t stream() const noexcept { return stream_; }
+
+private:
+    Device device_;
+    cudaStream_t stream_ = nullptr;
+};
+
 class CudaEventTimer {
 public:
     explicit CudaEventTimer(const DeviceContext& ctx);

@@ -11,13 +11,13 @@
 
 namespace ninfer::models::qwen3_5::execution {
 
-std::size_t dense_mlp_workspace_bytes(const DenseParameters& parameters, std::int32_t first,
+std::size_t dense_mlp_workspace_bytes(const DenseProfile& parameters, std::int32_t first,
                                       std::int32_t last, DenseMlpUse use) {
     if (first <= 0 || last < first) {
         throw std::invalid_argument("Dense MLP: invalid column interval");
     }
-    const auto& gu   = parameters.gate_up.weight;
-    const auto& down = parameters.down.weight;
+    const auto& gu   = parameters.gate_up;
+    const auto& down = parameters.down;
     WorkspaceLayoutBuilder layout;
     if (use == DenseMlpUse::Mtp) {
         (void)layout.alloc(DType::BF16, {gu.n, last});

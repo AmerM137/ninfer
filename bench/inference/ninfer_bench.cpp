@@ -110,11 +110,11 @@ void run_repetition(ninfer::Engine& engine, const ninfer::bench::BenchEnvironmen
     const double wall_seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
     for (std::uint32_t row = 0; row < env.concurrency; ++row) {
-        auto& result           = generated[row];
+        auto& result = generated[row];
         const bool constrained =
             env.constraint.has_value() && (!env.mixed_constraints || row % 2 == 0);
-        const auto count       = static_cast<std::uint32_t>(result.generated_token_ids.size());
-        const bool at_limit    = result.finish_reason == ninfer::FinishReason::OutputLimit &&
+        const auto count    = static_cast<std::uint32_t>(result.generated_token_ids.size());
+        const bool at_limit = result.finish_reason == ninfer::FinishReason::OutputLimit &&
                               count == test.requested_output_tokens();
         const bool grammar_done = constrained &&
                                   result.finish_reason == ninfer::FinishReason::StopToken &&
@@ -236,8 +236,9 @@ int main(int argc, char** argv) {
                   << ", kv_cache=" << ninfer::bench::kv_cache_name(options.kv_cache) << ")\n";
         ninfer::Engine engine(std::move(engine_options));
         fill_cuda_environment(env, options.device);
-        env.load   = engine.load_summary();
-        env.memory = engine.memory_summary();
+        env.load          = engine.load_summary();
+        env.memory        = engine.memory_summary();
+        env.prefill_chunk = env.memory.prefill_chunk;
 
         prime_decode_graph(engine, env, corpus);
 
@@ -256,6 +257,7 @@ int main(int argc, char** argv) {
             for (int warmup = 0; warmup < options.warmup; ++warmup) {
                 run_repetition(engine, env, test, corpus);
             }
+            const auto before = engine.memory_summary();
             result.reps.reserve(static_cast<std::size_t>(options.repetitions) * env.concurrency);
             if (options.profile_measured) {
                 require_cuda(cudaDeviceSynchronize(), "profile pre-boundary synchronize");
@@ -271,6 +273,10 @@ int main(int argc, char** argv) {
             const ninfer::MemorySummary memory    = engine.memory_summary();
             result.workspace_peak_bytes           = memory.workspace_logical_peak_bytes;
             result.workspace_allocator_peak_bytes = memory.workspace.peak_used_bytes;
+            if (memory.moe) {
+                result.expert_upload_bytes =
+                    memory.moe->uploaded_bytes - before.moe->uploaded_bytes;
+            }
             results.push_back(std::move(result));
         }
 

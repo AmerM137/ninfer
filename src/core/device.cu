@@ -190,6 +190,23 @@ CudaDeviceScope::~CudaDeviceScope() {
     if (changed_) { log_cuda_error("restore CUDA device", cudaSetDevice(previous_)); }
 }
 
+CudaStream::CudaStream(const DeviceContext& device) : device_(device.device()) {
+    CudaDeviceScope scope(device_);
+    const auto error = cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking);
+    if (error != cudaSuccess) {
+        throw std::runtime_error(cuda_error_message("cudaStreamCreateWithFlags failed", error));
+    }
+}
+
+CudaStream::~CudaStream() {
+    try {
+        CudaDeviceScope scope(device_);
+        destroy_stream(stream_);
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "CUDA stream cleanup failed: %s\n", error.what());
+    }
+}
+
 std::size_t DeviceContext::total_vram() const noexcept { return props_.totalGlobalMem; }
 
 const char* DeviceContext::sync_mode() const {

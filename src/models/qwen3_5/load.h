@@ -27,6 +27,11 @@ public:
     LoadPlan& operator=(const LoadPlan&) = delete;
 
     [[nodiscard]] const Config& config() const;
+    [[nodiscard]] const LoadOptions& options() const;
+    // Geometry and Use only; no backing or execution address until materialization.
+    [[nodiscard]] ops::WeightInput input(WeightId) const;
+    [[nodiscard]] ops::WeightInput input(WeightUseId) const;
+    [[nodiscard]] artifact::MaterializationPlan placement(Device cuda, Device main_experts) const;
     [[nodiscard]] const ModelWeights& weights() const;
     [[nodiscard]] const FrontendResources& resources() const;
     [[nodiscard]] std::span<const ExpertBankDescription> expert_banks() const;

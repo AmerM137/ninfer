@@ -17,6 +17,8 @@ struct LoadPlan::Impl {
     std::vector<ExpertBankDescription> expert_banks;
     FrontendResources resources;
     InstanceInfo info;
+    std::vector<WeightParent> geometry_parents;
+    std::vector<WeightView> geometry_views;
 };
 
 LoadPlan::LoadPlan(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
@@ -26,6 +28,20 @@ LoadPlan::LoadPlan(LoadPlan&&) noexcept            = default;
 LoadPlan& LoadPlan::operator=(LoadPlan&&) noexcept = default;
 
 const Config& LoadPlan::config() const { return impl_->config; }
+
+const LoadOptions& LoadPlan::options() const { return impl_->options; }
+
+ops::WeightInput LoadPlan::input(WeightUseId id) const {
+    const auto& use = impl_->pending.at(id.parameter.index).uses.at(id.use_index);
+    return {impl_->geometry_views.at(id.parameter.index), use.policy, use.activation_input_divisor};
+}
+
+ops::WeightInput LoadPlan::input(WeightId id) const {
+    if (impl_->pending.at(id.index).uses.size() != 1) {
+        throw artifact::ArtifactError("weight description requires an explicit Use");
+    }
+    return input(WeightUseId{id, 0});
+}
 
 const ModelWeights& LoadPlan::weights() const { return impl_->weights; }
 
@@ -98,6 +114,16 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
     out->prepared_resources = std::move(binder).finish();
     out->info.name          = reader.directory().metadata.value(
         "name", std::string(architecture_name(text.architecture)));
+    out->geometry_parents.resize(reader.directory().objects.size());
+    for (const auto& pending : out->pending) {
+        WeightView view{pending.reference.shape, {}};
+        for (const auto& part : pending.reference.binding.parts) {
+            auto& parent = out->geometry_parents.at(part.object.index);
+            if (!parent.geometry.elements) parent.geometry = reader.geometry(part.object);
+            view.parts.push_back({&parent, part.begin, part.end});
+        }
+        out->geometry_views.push_back(std::move(view));
+    }
     return LoadPlan(std::move(out));
 }
 
@@ -108,42 +134,55 @@ ResolvedLoadPlan::ResolvedLoadPlan(LoadPlan&& logical,
     : materialization_(std::move(materialization)), logical_(std::move(logical)),
       devices_(std::move(devices)), bank_devices_(std::move(bank_devices)) {}
 
-ResolvedLoadPlan resolve_load(LoadPlan&& plan, Device cuda, std::optional<Device> main_experts) {
-    if (!plan.impl_) { throw artifact::ArtifactError("load plan was already consumed"); }
-    const auto expert_device = main_experts.value_or(cuda);
+namespace {
+struct Placement {
+    artifact::MaterializationPlan storage;
+    std::vector<Device> weights, banks;
+};
+
+template <class Data>
+Placement describe_placement(const Data& data, Device cuda, Device expert_device) {
     if (cuda.type() != DeviceType::CUDA ||
         (expert_device != cuda && expert_device != Device::cpu())) {
         throw artifact::ArtifactError("weight placement requires the selected GPU or CPU");
     }
-    auto& data = *plan.impl_;
-    std::vector<Device> devices(data.pending.size(), cuda);
-    std::vector<Device> bank_devices;
-    for (const auto& bank : data.expert_banks) {
-        bank_devices.push_back(bank.mtp ? cuda : expert_device);
-    }
-    const auto place_experts = [&](const BlockWeights& layer) {
+    Placement out;
+    out.weights.assign(data.pending.size(), cuda);
+    for (const auto& bank : data.expert_banks) out.banks.push_back(bank.mtp ? cuda : expert_device);
+    const auto place = [&](const BlockWeights& layer) {
         if (const auto* moe = std::get_if<MoeWeights>(&layer.ffn)) {
             for (const auto& expert : moe->experts) {
                 for (const auto id : {expert.gate, expert.up, expert.down}) {
-                    devices[id.index] = bank_devices[moe->bank.index];
+                    out.weights[id.index] = out.banks[moe->bank.index];
                 }
             }
         }
     };
-    for (const auto& layer : data.weights.text.layers) { place_experts(layer); }
-    if (data.weights.mtp) { place_experts(data.weights.mtp->layer); }
+    for (const auto& layer : data.weights.text.layers) place(layer);
+    if (data.weights.mtp) place(data.weights.mtp->layer);
     std::vector<artifact::PlacementRequest> requests;
     for (std::size_t i = 0; i < data.pending.size(); ++i) {
         for (const auto& part : data.pending[i].reference.binding.parts) {
-            requests.push_back({part.object, devices[i],
-                                devices[i] == Device::cpu() ? artifact::HostAccess::CudaTransfer
-                                                            : artifact::HostAccess::CpuOnly});
+            requests.push_back({part.object, out.weights[i],
+                                out.weights[i] == Device::cpu() ? artifact::HostAccess::CudaTransfer
+                                                                : artifact::HostAccess::CpuOnly});
         }
     }
-    auto placement =
-        artifact::plan_materialization(*data.reader, requests, std::move(data.prepared_resources));
-    return ResolvedLoadPlan(std::move(plan), std::move(placement), std::move(devices),
-                            std::move(bank_devices));
+    out.storage = artifact::plan_materialization(*data.reader, requests);
+    return out;
+}
+} // namespace
+
+artifact::MaterializationPlan LoadPlan::placement(Device cuda, Device main_experts) const {
+    return describe_placement(*impl_, cuda, main_experts).storage;
+}
+
+ResolvedLoadPlan resolve_load(LoadPlan&& plan, Device cuda, std::optional<Device> main_experts) {
+    if (!plan.impl_) throw artifact::ArtifactError("load plan was already consumed");
+    auto placement = describe_placement(*plan.impl_, cuda, main_experts.value_or(cuda));
+    placement.storage.resources = std::move(plan.impl_->prepared_resources);
+    return ResolvedLoadPlan(std::move(plan), std::move(placement.storage),
+                            std::move(placement.weights), std::move(placement.banks));
 }
 
 std::unique_ptr<Model> materialize_model(ResolvedLoadPlan&& plan, DeviceContext& device,

@@ -880,11 +880,11 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--api-key KEY` | required bearer or `x-api-key` value | unset |
 | `--model-id ID` | override the public OpenAI model alias | artifact `metadata.name`, or architecture name |
 | `--max-context N` | logical context ceiling of each sequence | `8192` |
-| `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `--max-context` | `8192` |
+| `--kv-capacity N\|auto` | shared Main Text KV capacity; `auto` maximizes resident-model KV, or reserves one context with CPU expert offload; omitted means `--max-context` | `8192` |
 | `--max-concurrency N` | resident execution lanes; valid range `1..8` | `1` |
 | `--max-pending-requests N` | additional requests allowed to wait for admission | `16` |
 | `--pending-timeout-ms N` | maximum preparation-plus-admission wait | `30000` |
-| `--prefill-chunk N` | text-prefill chunk | `1024` |
+| `--prefill-chunk N` | text-prefill chunk; positive multiple of 128 | `1024`; CPU expert offload: `4096` |
 | `--log-stats-interval-ms N` | aggregate throughput report interval; `0` disables it | `5000` |
 | `--log-level trace\|debug\|info\|warning\|error\|critical\|off` | pretty stderr verbosity | `info` |
 | `--device N` | CUDA device index | `0` |
@@ -1004,7 +1004,7 @@ in append mode and flushes every event, so successive model or MTP blocks may sh
 file. The parent directory must already exist. Failure to open the file aborts startup; the log path
 is also rejected if it resolves to the model artifact.
 
-Every line is one `ninfer_serve_request_log` schema-v25 JSON object. All events carry
+Every line is one `ninfer_serve_request_log` schema-v27 JSON object. All events carry
 `timestamp_unix_ms` and a process-unique `server_instance_id`; request IDs are monotonic only within
 that server instance. Successful request-start records include request-scoped acquisition,
 media-preprocessing wall/work, tokenizer, cache hit/miss/single-flight, and payload-size fields;

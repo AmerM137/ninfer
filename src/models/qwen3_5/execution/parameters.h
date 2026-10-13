@@ -132,13 +132,14 @@ struct ProposalParameters {
 // Shape-dependent kernel selection and scratch remain with the calling implementation and Op.
 class Parameters {
 public:
-    explicit Parameters(const Model& source);
+    explicit Parameters(const Model& source, std::shared_ptr<const ModelProfile> profile = {});
     Parameters(const Parameters&)            = delete;
     Parameters& operator=(const Parameters&) = delete;
     Parameters(Parameters&&)                 = delete;
     Parameters& operator=(Parameters&&)      = delete;
 
     const Model& model;
+    const std::shared_ptr<const ModelProfile> profile;
     TextParameters text;
     std::optional<MtpParameters> mtp;
     std::optional<VisionParameters> vision;

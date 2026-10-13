@@ -61,7 +61,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
                                CudaEventTimer(device_in, device_in.transfer_stream()),
                                CudaEventTimer(device_in, device_in.transfer_stream())},
       prefill_gpu_timer_(device_in) {
-    if (&parameters != plan.parameters || parameters.model.options() != plan.features) {
+    if (parameters.profile != plan.profile || parameters.model.options() != plan.features) {
         throw std::invalid_argument("Program parameters do not match the frozen sequence plan");
     }
     if (workspace_plan.general_capacity == 0 ||
@@ -221,6 +221,14 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         CUDA_CHECK(
             cudaMemsetAsync(sampling_config.data, 0, sampling_config.bytes(), device.stream()));
     }
+    if (plan.moe) {
+        std::vector<const execution::MoeParameters*> layers;
+        for (const auto& block : parameters.text.layers) {
+            layers.push_back(std::get_if<execution::MoeParameters>(&block.ffn));
+        }
+        moe = std::make_unique<MoeResources>(plan.moe, layers, parameters.model.expert_banks(),
+                                             device);
+    }
     device.synchronize();
     if (use_cuda_graph) {
         StartupPhaseScope graph_phase(startup_observer, StartupPhase::CudaGraphPrepare);
@@ -233,6 +241,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
 }
 
 ProgramImpl::~ProgramImpl() noexcept {
+    moe.reset();
     if (device.transfer_stream() != nullptr) {
         (void)cudaStreamSynchronize(device.transfer_stream());
     }
@@ -299,7 +308,8 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
         text_kv_addresses->ensure_mapped_to_tokens(*address, predictor_count, device.stream());
 
         const std::int32_t state_slot = state_store->physical_slot(*state);
-        const auto flush              = [&] {
+
+        const auto flush = [&] {
             if (staged_columns == 0) { return; }
             if (staged_columns != staged_targets.size() || staged_columns > kCausalScoreTile) {
                 throw std::logic_error("causal score staging has an invalid shape");
@@ -309,16 +319,16 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
             const auto columns = static_cast<std::int32_t>(staged_columns);
             Tensor logits      = work.alloc(
                 DType::BF16, {dimension(parameters.model.config().text.vocab_size), columns});
-            Tensor target_ids = work.alloc(DType::I32, {columns});
-            Tensor logprobs   = work.alloc(DType::FP32, {columns});
-            Tensor hidden     = score_hidden->slice(1, 0, columns);
+            Tensor target_ids        = work.alloc(DType::I32, {columns});
+            Tensor logprobs          = work.alloc(DType::FP32, {columns});
+            Tensor hidden            = score_hidden->slice(1, 0, columns);
+            const auto public_tokens = dimension(parameters.model.resources().public_token_count);
             execution::project(hidden, parameters.text.output_head, logits, work,
                                device.execution_view());
             CUDA_CHECK(cudaMemcpyAsync(target_ids.data, staged_targets.data(), target_ids.bytes(),
                                        cudaMemcpyHostToDevice, device.stream()));
-            ops::target_logprobs(logits, target_ids,
-                                 dimension(parameters.model.resources().public_token_count),
-                                 logprobs, device.execution_view());
+            ops::target_logprobs(logits, target_ids, public_tokens, logprobs,
+                                 device.execution_view());
             CUDA_CHECK(cudaMemcpyAsync(score_logprobs_host->data(), logprobs.data, logprobs.bytes(),
                                        cudaMemcpyDeviceToHost, device.stream()));
             device.synchronize();
@@ -332,21 +342,21 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
         std::uint32_t cursor = 0;
         while (cursor < predictor_count) {
             const std::uint32_t nominal = std::min(prefill_chunk, predictor_count - cursor);
-            execution::PrefillContext schedule_state{{device, parameters, work,
-                                                      state_images->linear(), nullptr, io,
-                                                      prefill_hidden, prefill_chunk, proposal_head},
-                                                     {},
-                                                     decoder->text_kv,
-                                                     nullptr,
-                                                     nullptr,
-                                                     cursor,
-                                                     nullptr,
-                                                     nullptr,
-                                                     state_slot,
-                                                     state_slot,
-                                                     0,
-                                                     0,
-                                                     nullptr};
+            execution::PrefillContext schedule_state{
+                {device, parameters, work, state_images->linear(), nullptr, io, prefill_hidden,
+                 prefill_chunk, proposal_head, moe.get()},
+                {},
+                decoder->text_kv,
+                nullptr,
+                nullptr,
+                cursor,
+                nullptr,
+                nullptr,
+                state_slot,
+                state_slot,
+                0,
+                0,
+                nullptr};
             mark_workspace_usage(workspace_plan.text_prefill);
             const execution::PrefillChunkResult result = execution::prefill_text_chunk(
                 schedule_state, std::span<const TokenId>(prompt.token_ids), nominal, std::nullopt,
@@ -427,13 +437,41 @@ runtime::ContextTransferObservation ProgramImpl::context_transfer_observation(
     };
 }
 
-MemorySummary ProgramImpl::memory_summary() const noexcept {
-    MemorySummary out;
-    out.device          = device.device().index();
-    out.max_context     = capacity;
-    out.kv_capacity     = kv_capacity;
-    out.kv_cache        = kv_storage;
+MemorySummary ProgramImpl::memory_summary() const {
     const auto& weights = parameters.model.storage_stats();
+    MemorySummary out;
+    out.device        = device.device().index();
+    out.max_context   = capacity;
+    out.prefill_chunk = prefill_chunk;
+    if (moe) {
+        const auto& plan = moe->plan();
+        MoeMemorySummary summary;
+        summary.host_weights_bytes    = weights.host_capacity_bytes;
+        summary.registered_host_bytes = weights.registered_host_bytes;
+        summary.cache_bytes           = plan.cache.config.capacity_bytes;
+        summary.fixed_bytes           = plan.cache.config.fixed_bytes;
+        summary.window_bytes          = summary.cache_bytes - summary.fixed_bytes;
+        summary.window_count          = plan.window_count;
+        const auto usage              = moe->cache_usage();
+        summary.used_bytes            = usage.used_bytes;
+        summary.target_bytes          = plan.target_bytes;
+        summary.ready_bytes           = usage.ready_cache_bytes;
+        summary.cpu_workers           = static_cast<std::uint32_t>(plan.team.worker_cpus.size());
+        for (const auto& layer : plan.layers) {
+            summary.fixed_experts_per_layer.push_back(layer.fixed_experts);
+            summary.target_experts_per_layer.push_back(layer.cache_experts);
+            summary.ready_experts_per_layer.push_back(
+                layer.experts ? usage.ready_experts_per_bank.at(layer.bank.index) : 0);
+        }
+        summary.bridge_device_bytes = plan.bridge.device_frame_bytes;
+        summary.bridge_pinned_bytes = plan.bridge.pinned_frame_bytes;
+        summary.cpu_workspace_bytes = plan.bridge.cpu_workspace_bytes;
+        summary.uploaded_bytes      = moe->uploaded_bytes();
+        summary.prefetched_bytes    = usage.prefetched_bytes;
+        out.moe                     = std::move(summary);
+    }
+    out.kv_capacity = kv_capacity;
+    out.kv_cache    = kv_storage;
     out.weights  = ArenaMemorySummary{weights.device_capacity_bytes, weights.device_capacity_bytes,
                                      weights.device_capacity_bytes};
     out.sequence = ArenaMemorySummary{persistent.size(), persistent.size(), persistent.size()};
@@ -503,6 +541,5 @@ void ProgramImpl::reset_memory_peaks() noexcept {
                      workspace_plan.vision->handoff_offset_bytes + active_handoff_bytes);
     }
 }
-
 
 } // namespace ninfer::models::qwen3_5::detail

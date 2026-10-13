@@ -294,20 +294,27 @@ void Program::fail_all_cleanup() noexcept { impl_->fail_all_cleanup(); }
 
 PhysicalUsageSnapshot Program::physical_usage() const noexcept { return impl_->physical_usage(); }
 
-MemorySummary Program::memory_summary() const noexcept { return impl_->memory_summary(); }
+MemorySummary Program::memory_summary() const { return impl_->memory_summary(); }
 
 void Program::reset_memory_peaks() noexcept { impl_->reset_memory_peaks(); }
 
 SequencePlanner make_sequence_planner(const execution::Parameters& parameters,
                                       DeviceContext& device, const EngineOptions& options) {
-    return SequencePlanner(detail::make_sequence_planner_impl(parameters, device, options));
+    return make_sequence_planner(parameters.profile, device, options);
+}
+
+SequencePlanner make_sequence_planner(std::shared_ptr<const execution::ModelProfile> profile,
+                                      DeviceContext& device, const EngineOptions& options,
+                                      std::shared_ptr<const detail::MoePlan> moe) {
+    return SequencePlanner(
+        detail::make_sequence_planner_impl(std::move(profile), device, options, std::move(moe)));
 }
 
 std::unique_ptr<Program> create_program(const execution::Parameters& parameters,
                                         SequencePlan&& plan, DeviceContext& device,
                                         const StartupObserver& startup_observer) {
     if (plan.impl_ == nullptr) { throw std::invalid_argument("sequence plan is empty"); }
-    if (plan.impl_->parameters != &parameters) {
+    if (plan.impl_->profile != parameters.profile) {
         throw std::invalid_argument("sequence plan belongs to another model instance");
     }
     if (plan.impl_->multiprocessor_count != device.multiprocessor_count()) {

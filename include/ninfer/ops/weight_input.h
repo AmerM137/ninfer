@@ -15,6 +15,9 @@ struct WeightInput {
     std::optional<float> activation_input_divisor;
 };
 
+[[nodiscard]] LinearProfile describe_linear_weight(std::span<const WeightInput> rows);
+[[nodiscard]] ProjectionProfile describe_projection_weights(std::span<const WeightInput> rows);
+
 // Prepare the existing native forms; no device allocation, upload, execution or graph rewrite.
 // Runtime shape/phase choices and scratch remain with the actual calling Op.
 [[nodiscard]] SingleProjectionWeight prepare_linear_weight(const WeightInput& input);

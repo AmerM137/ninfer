@@ -75,13 +75,17 @@ struct MoeWeights {
     SwiGLUWeights shared;
 };
 
-// Pure L2 read-ahead; the referenced CUDA span remains live through the call.
+// Pure L2 read-ahead; the referenced CUDA storage outlives the submitted device work.
 struct MoeExecutionHints {
     const void* read_ahead       = nullptr;
     std::size_t read_ahead_bytes = 0;
 };
 
 [[nodiscard]] SwiGLUProfile swiglu_profile(const SwiGLUWeights& weights);
+[[nodiscard]] SwiGLUProfile swiglu_profile(LinearProfile gate_up, LinearProfile down);
+[[nodiscard]] RoutedSwiGLUProfile
+routed_swiglu_profile(const WeightBankLayout& gate_up, const WeightBankLayout& down,
+                      std::int32_t top_k, LinearPolicy gate_up_policy, LinearPolicy down_policy);
 [[nodiscard]] RoutedSwiGLUProfile
 routed_swiglu_profile(const WeightBankView& gate_up, const WeightBankView& down, std::int32_t top_k,
                       LinearPolicy gate_up_policy, LinearPolicy down_policy);

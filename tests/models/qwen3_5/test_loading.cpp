@@ -323,12 +323,26 @@ void invalid_model_data() {
     bad([](Json& root) { root["components"]["text"]["config"]["vocab_size"] = 264; });
 }
 
+void cold_matrix_profile() {
+    const auto geometry = weight_geometry(QType::NVFP4, QuantLayout::BatchedBlockScaleK16M128x4,
+                                          std::array<std::uint64_t, 3>{2, 256, 128});
+    const WeightParent parent{geometry};
+    const WeightView matrix{{128, 128}, {{&parent, 256 * 128, 384 * 128}}};
+    const std::array inputs{ops::WeightInput{matrix, ops::LinearPolicy::AllowA4, 2.0F}};
+    const auto profile = ops::describe_linear_weight(inputs);
+    require(profile.qtype == QType::NVFP4 && profile.n == 128 && profile.k == 128 &&
+                profile.layout == QuantLayout::BlockScaleK16M128x4 &&
+                profile.policy == ops::LinearPolicy::AllowA4,
+            "cold matrix profile did not preserve the local NVFP4 matrix layout");
+}
+
 } // namespace
 
 int main() {
     try {
         logical_data_and_instances();
         native_uses();
+        cold_matrix_profile();
         invalid_model_data();
         std::cout << "model config, binding, resources and Use checks passed\n";
         return 0;

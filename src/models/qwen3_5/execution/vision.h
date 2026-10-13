@@ -42,6 +42,11 @@ public:
                                                             std::uint32_t max_merged_tokens,
                                                             std::size_t general_capacity_bytes);
 
+    [[nodiscard]] static VisionWorkspacePlan plan_workspace(const VisionConfig& config,
+                                                            const VisionProfile& profile,
+                                                            std::uint32_t max_tokens,
+                                                            std::size_t general_bytes);
+
     [[nodiscard]] const VisionConfig& config() const noexcept { return config_; }
 
     [[nodiscard]] static Tensor bind_output(MemorySpan backing, const VisionWorkspacePlan& plan,

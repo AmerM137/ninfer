@@ -317,6 +317,28 @@ Json vision_workspace_json(const std::optional<ninfer::VisionWorkspaceMemorySumm
                 {"handoff_peak_bytes", vision->handoff_peak_bytes}};
 }
 
+Json moe_memory_json(const std::optional<ninfer::MoeMemorySummary>& moe) {
+    if (!moe) return nullptr;
+    return Json{{"host_weights_bytes", moe->host_weights_bytes},
+                {"registered_host_bytes", moe->registered_host_bytes},
+                {"cache_bytes", moe->cache_bytes},
+                {"fixed_bytes", moe->fixed_bytes},
+                {"window_bytes", moe->window_bytes},
+                {"window_count", moe->window_count},
+                {"fixed_experts_per_layer", moe->fixed_experts_per_layer},
+                {"used_bytes", moe->used_bytes},
+                {"target_bytes", moe->target_bytes},
+                {"ready_bytes", moe->ready_bytes},
+                {"cpu_workers", moe->cpu_workers},
+                {"target_experts_per_layer", moe->target_experts_per_layer},
+                {"ready_experts_per_layer", moe->ready_experts_per_layer},
+                {"bridge_device_bytes", moe->bridge_device_bytes},
+                {"bridge_pinned_bytes", moe->bridge_pinned_bytes},
+                {"cpu_workspace_bytes", moe->cpu_workspace_bytes},
+                {"uploaded_bytes", moe->uploaded_bytes},
+                {"prefetched_bytes", moe->prefetched_bytes}};
+}
+
 Json speculative_json(const GenerationMetrics& metrics) {
     return Json{{"backend", product::speculative_backend_name(metrics.speculative_backend)},
                 {"draft_window", metrics.speculative_draft_window},
@@ -560,6 +582,8 @@ std::string format_server_start_json(
              {"greedy", options.greedy}};
     record["memory"] =
         Json{{"weights", arena_json(memory.weights)},
+             {"device_budget_bytes", memory.device_budget_bytes},
+             {"moe", moe_memory_json(memory.moe)},
              {"sequence", arena_json(memory.sequence)},
              {"workspace", arena_json(memory.workspace)},
              {"vision_workspace", vision_workspace_json(memory.vision_workspace)},

@@ -1,4 +1,5 @@
 #pragma once
+#include "models/qwen3_5/program/moe_resources.h"
 #include "models/qwen3_5/program/internal.h"
 
 #include "core/arena.h"
@@ -332,7 +333,7 @@ public:
     [[nodiscard]] AbortResult abort(SequenceHandle) noexcept;
     void fail_all_cleanup() noexcept;
     [[nodiscard]] PhysicalUsageSnapshot physical_usage() const noexcept;
-    [[nodiscard]] MemorySummary memory_summary() const noexcept;
+    [[nodiscard]] MemorySummary memory_summary() const;
     void reset_memory_peaks() noexcept;
 
     const execution::Parameters& parameters;
@@ -356,6 +357,7 @@ public:
     DeviceBuffer persistent;
     DeviceBuffer workspace_storage;
     MemoryArena work;
+    std::unique_ptr<MoeResources> moe;
     std::unique_ptr<qwen3_5::DecoderState> decoder;
     std::unique_ptr<HostContextArena> host_context_arena;
     std::unique_ptr<HostKVArena> host_kv_arena;

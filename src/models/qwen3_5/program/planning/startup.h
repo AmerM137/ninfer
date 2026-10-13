@@ -10,6 +10,7 @@
 #include "models/qwen3_5/program/round_buffers.h"
 #include "models/qwen3_5/state/state_image.h"
 #include "models/load_options.h"
+#include "models/qwen3_5/program/planning/moe.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -71,14 +72,15 @@ struct WorkspacePlan {
 };
 
 struct SequencePlanningInputs {
-    const execution::Parameters* parameters = nullptr;
-    std::uint32_t capacity                  = 0;
-    std::uint32_t max_concurrency           = 1;
-    std::uint32_t prefill_chunk             = 0;
-    std::uint32_t draft_window              = 0;
-    SpeculativeBackend speculative_backend  = SpeculativeBackend::None;
-    KvCacheStorage kv_storage               = KvCacheStorage::BFloat16;
-    ProposalHead proposal_head              = ProposalHead::Full;
+    std::shared_ptr<const execution::ModelProfile> profile;
+    std::shared_ptr<const MoePlan> moe;
+    std::uint32_t capacity                 = 0;
+    std::uint32_t max_concurrency          = 1;
+    std::uint32_t prefill_chunk            = 0;
+    std::uint32_t draft_window             = 0;
+    SpeculativeBackend speculative_backend = SpeculativeBackend::None;
+    KvCacheStorage kv_storage              = KvCacheStorage::BFloat16;
+    ProposalHead proposal_head             = ProposalHead::Full;
     models::LoadOptions features;
     bool use_cuda_graph               = true;
     bool causal_scoring               = false;
@@ -87,16 +89,17 @@ struct SequencePlanningInputs {
 };
 
 struct SequencePlanImpl {
-    const execution::Parameters* parameters = nullptr;
-    std::uint32_t capacity                  = 0;
-    std::uint32_t kv_capacity               = 0;
-    std::uint32_t main_page_groups          = 0;
-    std::uint32_t max_concurrency           = 1;
-    std::uint32_t prefill_chunk             = 0;
-    std::uint32_t draft_window              = 0;
-    SpeculativeBackend speculative_backend  = SpeculativeBackend::None;
-    KvCacheStorage kv_storage               = KvCacheStorage::BFloat16;
-    ProposalHead proposal_head              = ProposalHead::Full;
+    std::shared_ptr<const execution::ModelProfile> profile;
+    std::shared_ptr<const MoePlan> moe;
+    std::uint32_t capacity                 = 0;
+    std::uint32_t kv_capacity              = 0;
+    std::uint32_t main_page_groups         = 0;
+    std::uint32_t max_concurrency          = 1;
+    std::uint32_t prefill_chunk            = 0;
+    std::uint32_t draft_window             = 0;
+    SpeculativeBackend speculative_backend = SpeculativeBackend::None;
+    KvCacheStorage kv_storage              = KvCacheStorage::BFloat16;
+    ProposalHead proposal_head             = ProposalHead::Full;
     models::LoadOptions features;
     bool use_cuda_graph               = true;
     bool causal_scoring               = false;
@@ -115,8 +118,9 @@ struct SequencePlannerImpl {
 };
 
 [[nodiscard]] std::unique_ptr<qwen3_5::detail::SequencePlannerImpl>
-make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContext& device,
-                           const EngineOptions& options);
+make_sequence_planner_impl(std::shared_ptr<const execution::ModelProfile> profile,
+                           DeviceContext& device, const EngineOptions& options,
+                           std::shared_ptr<const MoePlan> moe = {});
 [[nodiscard]] std::unique_ptr<SequencePlanImpl>
 finalize_sequence_plan_impl(std::unique_ptr<qwen3_5::detail::SequencePlannerImpl> planner,
                             std::uint32_t main_page_groups);

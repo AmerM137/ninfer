@@ -7,14 +7,14 @@
 namespace ninfer::ops {
 namespace control = detail::gdn_control;
 
-std::size_t gdn_control_proj_workspace_capacity_bytes(const ProjectionWeights& weights,
+std::size_t gdn_control_proj_workspace_capacity_bytes(const ProjectionProfile& weights,
                                                       std::int32_t first, std::int32_t last) {
-    return control::capacity(control::describe_weights(weights).geometry, false, first, last);
+    return control::capacity(control::describe_profile(weights), false, first, last);
 }
 
-std::size_t gdn_norm_control_proj_workspace_capacity_bytes(const ProjectionWeights& weights,
+std::size_t gdn_norm_control_proj_workspace_capacity_bytes(const ProjectionProfile& weights,
                                                            std::int32_t first, std::int32_t last) {
-    return control::capacity(control::describe_weights(weights).geometry, true, first, last);
+    return control::capacity(control::describe_profile(weights), true, first, last);
 }
 
 void gdn_control_proj(const Tensor& x, const ProjectionWeights& weights, const Tensor& a_log,

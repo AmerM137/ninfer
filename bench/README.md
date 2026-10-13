@@ -92,6 +92,8 @@ ninfer_bench --weights <artifact.ninfer>
 ```
 
 With no `-p`, `-n`, or `-pg`, the matrix is `pp512` and `tg128`.
+`--prefill-chunk` accepts a positive multiple of 128. When omitted, Engine uses 1024 for resident
+models or 4096 for CPU expert offload.
 
 Example:
 
@@ -1332,13 +1334,14 @@ are the row profiles the entry admits: `--channels 8192` gives (2048, 2048, 4096
 
 Table, JSON, and CSV reports identify the architecture, model instance, artifact, Engine configuration,
 load summary, memory capacity, KV payload, workspace peak, phase throughput, and speculative
-statistics. JSON schema version 19 records the public value objects directly:
+statistics. JSON schema version 23 records the public value objects directly:
 
 - `config`: constraint type, source/file, literal choices and mixed-request selection, alongside execution settings;
 - `load`: architecture, public name, actual formats, prefill signature, load/upload time,
   file/H2D/staging bytes and Device/Host object counts;
 - `memory`: weights/sequence/unified-workspace arenas, the optional non-additive Vision layout,
-  planned context, KV storage, CUDA Graph allowance, and KV payload;
+  planned context, KV storage, CUDA Graph allowance, KV payload, Device budget and optional MoE
+  Host/cache/bridge resources; MoE `uploaded_bytes` here is the startup snapshot;
 - `repetition_wall_seconds`: each concurrent repetition's submit-to-completion interval;
 - each request sample's `timings`: prepare, Vision, prefill, decode, and total seconds;
 - each request sample's `constraint`: committed completion/branch, compilation cache access, CPU
@@ -1351,6 +1354,8 @@ acceptance.
 Each test reports `workspace_peak_bytes` from the planned phase markers, including CUDA Graph
 replay, and `workspace_allocator_peak_bytes` from host-side arena allocation activity. These are
 intentionally separate: replay reuses captured addresses without advancing the host allocator.
+`expert_upload_bytes` counts expert payload submitted during measured repetitions, excluding
+startup and warmup. It includes all requests in those repetitions.
 
 `reps` contains request samples in repetition-major order, with explicit `repetition` and `row`.
 `output_tok_s` divides each repetition's actual outputs by its wall time.
@@ -1386,3 +1391,37 @@ Layer 34 of the 35B artifact selects its Q6 down bank. `--batch-mib N` changes t
 per upload batch; default is 96 MiB, with three in-flight slots. Slots contain index snapshots and
 descriptors, not weight payloads. `--resident` checks direct GPU plane access without dynamic replicas,
 for example Flash Next `--bank mtp/layers/0/moe/experts --experts 512 --resident`.
+
+## Single-layer mixed MoE execution
+
+`ninfer_qwen3_5_moe_execution_bench` materializes one selected 35B layer's native expert parents,
+control and shared weights. Its production model entry includes route, actual ExpertCache use,
+D2H, CPU/GPU contributions, H2D and residual merge. This is a layer microbenchmark, not Engine
+generation. `--gpu-experts N` assigns logical IDs `[0,N)`; the remaining routed assignments use CPU.
+
+```bash
+build/bench/ninfer_qwen3_5_moe_execution_bench \
+  --artifact out/qwen3_6_35b_a3b.ninfer --layer 0 --tokens 128 --gpu-experts 128 \
+  --workers 16 --caller-cpu 31 --samples 256 --distribution independent --schedule both
+```
+
+Layer 34 selects Q6 down. The 32-input synthetic BF16 Gaussian corpus uses either independent
+columns or identical columns within each batch (`--distribution same`). Initial expert upload
+is reported separately; measured calls reuse the fixed GPU assignment and must not upload expert data. Source,
+cache, frame/scratch capacities, actual assignment counts and unique encoded weight bytes are
+reported. Corpus bytes and per-call unique bytes are logical traffic, not measured DRAM traffic.
+Bridge H2D bytes are averaged over the corpus; batches with no CPU assignments transfer no CPU
+contribution in either schedule. The report includes the number of batches with CPU work.
+
+Timing is Host wall time through final compute-stream completion. Warmup covers at least 100 ms
+and the complete corpus. `--schedule parallel` measures the production entry; `serial` is a
+standalone combination of the same Ops/transfers/team with GPU experts following CPU work. It
+does not include the model entry's validation/frame binding, so its difference is a scheduling
+reference, not an isolated measurement of overlap. `both` alternates order, reversing each
+input's order on successive corpus passes, and reports min/median/p95/max and paired differences.
+`--gap-us N` adds an excluded inter-call gap. Select a CPU affinity allowed on the current machine.
+
+For a timeline, capture this executable with `nsys --trace=cuda,nvtx`; the model marks CPU input
+wait and CPU computation separately. `--profile` brackets measured calls with CUDA profiler API
+calls when capture by that API is appropriate. Profiled durations do not replace ordinary wall
+measurements.

@@ -450,6 +450,65 @@ const ops::MoeProfile& Fixture::profile() const { return impl_->description; }
 
 const ops::MoeWeights& Fixture::weights() const { return impl_->operands; }
 
+struct HostBank::Impl {
+    struct Matrix {
+        HostBuffer storage;
+        WeightParent parent;
+        WeightBankView view;
+        CudaHostRegistration registration;
+
+        Matrix(const Fixture& fixture, bool gate_up) {
+            const auto& profile = fixture.profile().routed.ffn;
+            const int rows      = gate_up ? 2 * kIntermediate : kHidden;
+            const int columns   = gate_up ? kHidden : kIntermediate;
+            const auto type     = gate_up ? profile.gate_up_type : profile.down_type;
+            const std::array<std::uint64_t, 2> shape{std::uint64_t(kExperts) * rows,
+                                                     std::uint64_t(columns)};
+            parent.geometry = weight_geometry(type, QuantLayout::RowSplit, shape);
+            storage         = HostBuffer(parent.geometry.bytes, 4096);
+            std::memset(storage.data(), 0, storage.size());
+            parent.data   = static_cast<const std::byte*>(storage.data());
+            parent.device = Device::cpu();
+            view          = bind_weight_bank(
+                parent, describe_weight_bank(parent.geometry, {0, kExperts, std::uint64_t(rows),
+                                                                        std::uint64_t(rows)}));
+            for (const auto& expert : fixture.experts()) {
+                const auto& packed = gate_up ? expert.gate_up : expert.down;
+                for (const auto [plane, offset] :
+                     {std::pair{view.layout.codes, std::uint64_t{0}},
+                      std::pair{view.layout.high, packed.high_plane_offset},
+                      std::pair{view.layout.scales, packed.scale_plane_offset}}) {
+                    if (!plane.expert_bytes) { continue; }
+                    const auto destination = view.plane(plane, expert.id);
+                    std::memcpy(const_cast<void*>(destination.data), packed.payload.data() + offset,
+                                destination.bytes);
+                }
+            }
+        }
+    };
+
+    Matrix gate_up, down;
+
+    explicit Impl(const Fixture& fixture) : gate_up(fixture, true), down(fixture, false) {}
+};
+
+HostBank::HostBank(const Fixture& fixture) : impl_(std::make_unique<Impl>(fixture)) {}
+
+HostBank::~HostBank() = default;
+
+void HostBank::register_upload(Device device) {
+    for (auto* matrix : {&impl_->gate_up, &impl_->down}) {
+        if (!matrix->registration.view().host.bytes) {
+            matrix->registration = CudaHostRegistration(matrix->storage.span(), device);
+        }
+    }
+}
+
+ExpertBankSource HostBank::source() const {
+    return {impl_->gate_up.view, impl_->down.view, impl_->gate_up.registration.view(),
+            impl_->down.registration.view()};
+}
+
 std::span<const HostExpert> Fixture::experts() const { return impl_->experts; }
 
 const LogicalCase& Fixture::logical(int pattern) const { return impl_->cases.at(pattern); }

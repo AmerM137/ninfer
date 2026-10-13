@@ -82,7 +82,8 @@ ReasoningEffort parse_reasoning_effort(std::string_view text) {
 std::string usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " <model.ninfer> (--prompt <text>|--messages <messages.json>)\n"
-           "       [--max-context N] [--kv-capacity N|auto] [--prefill-chunk N] [--max-new N]\n"
+           "       [--max-context N] [--kv-capacity N|auto] [--prefill-chunk N] [--max-new "
+           "N]\n"
            "       [--device N]\n"
            "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--spec mtp|dflash|dflash2 --draft-tokens "
            "N]\n"
@@ -102,6 +103,8 @@ std::string usage_text(const char* argv0) {
            "Structured message content accepts text, image/image_url, and video/video_url parts;\n"
            "media sources may be local paths, HTTP(S) URLs, or base64 data URIs.\n"
            "--vision enables image/video input and loads the fixed Vision GPU allocations.\n"
+           "--prefill-chunk requires a positive multiple of 128; defaults to 1024, or 4096 with "
+           "CPU expert offload.\n"
            "--thinking-budget caps model-origin thinking tokens; inserted control tokens count "
            "toward --max-new.\n"
            "--kv-capacity auto leaves " +

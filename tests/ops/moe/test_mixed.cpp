@@ -1,48 +1,7 @@
 #include "fixture.h"
 #include "ninfer/ops/sum_contributions.h"
 
-#include <cstring>
-
 namespace ninfer::test::moe {
-namespace {
-
-class CpuBank {
-public:
-    CpuBank(const Fixture& fixture, bool gate_up) {
-        const auto& profile = fixture.profile().routed.ffn;
-        const int rows      = gate_up ? 2 * kIntermediate : kHidden;
-        const int columns   = gate_up ? kHidden : kIntermediate;
-        const auto type     = gate_up ? profile.gate_up_type : profile.down_type;
-        const std::array<std::uint64_t, 2> shape{std::uint64_t(kExperts) * rows,
-                                                 std::uint64_t(columns)};
-        parent_.geometry = weight_geometry(type, QuantLayout::RowSplit, shape);
-        storage_         = HostBuffer(parent_.geometry.bytes);
-        parent_.data     = static_cast<const std::byte*>(storage_.data());
-        parent_.device   = Device::cpu();
-        const WeightBankRegion region{0, kExperts, std::uint64_t(rows), std::uint64_t(rows)};
-        view = bind_weight_bank(parent_, describe_weight_bank(parent_.geometry, region));
-        for (const auto& expert : fixture.experts()) {
-            const auto& packed = gate_up ? expert.gate_up : expert.down;
-            for (const auto [plane, offset] :
-                 {std::pair{view.layout.codes, std::uint64_t{0}},
-                  std::pair{view.layout.high, packed.high_plane_offset},
-                  std::pair{view.layout.scales, packed.scale_plane_offset}}) {
-                if (!plane.expert_bytes) { continue; }
-                const auto destination = view.plane(plane, expert.id);
-                std::memcpy(const_cast<void*>(destination.data), packed.payload.data() + offset,
-                            destination.bytes);
-            }
-        }
-    }
-
-    WeightBankView view;
-
-private:
-    HostBuffer storage_;
-    WeightParent parent_;
-};
-
-} // namespace
 
 int test_mixed(Fixture& fixture, CudaExecutionView execution) {
     using ops::ExpertSubsetKind;
@@ -55,8 +14,9 @@ int test_mixed(Fixture& fixture, CudaExecutionView execution) {
         std::cout << "SKIP: CPU/GPU composition requires AVX2/FMA/F16C\n";
         return 0;
     }
-    CpuBank gate_up(fixture, true), down(fixture, false);
-    const ops::CpuSwiGLUExperts cpu_weights{gate_up.view, down.view, {}};
+    HostBank native(fixture);
+    const auto source = native.source();
+    const ops::CpuSwiGLUExperts cpu_weights{source.gate_up, source.down, {}};
     int failures = 0;
     for (int tokens : {1, 9, 72}) {
         auto batch = fixture.batch(tokens);

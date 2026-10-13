@@ -15,7 +15,7 @@ struct Scratch {
 
 // The same allocation recipe runs on WorkspaceLayoutBuilder and on the call-local arena.
 template <class Allocator>
-Scratch allocate_workspace(Allocator& allocator, const WeightOperands& weights, ProjectionPlan plan,
+Scratch allocate_workspace(Allocator& allocator, const WeightProfile& weights, ProjectionPlan plan,
                            std::int32_t columns, bool materialized_snapshot = false) {
     Scratch out;
     if (materialized_snapshot)
@@ -28,7 +28,7 @@ Scratch allocate_workspace(Allocator& allocator, const WeightOperands& weights, 
     return out;
 }
 
-inline std::size_t workspace_bytes(const WeightOperands& weights, ProjectionPlan plan,
+inline std::size_t workspace_bytes(const WeightProfile& weights, ProjectionPlan plan,
                                    std::int32_t columns, bool materialized_snapshot = false) {
     WorkspaceLayoutBuilder layout;
     (void)allocate_workspace(layout, weights, plan, columns, materialized_snapshot);

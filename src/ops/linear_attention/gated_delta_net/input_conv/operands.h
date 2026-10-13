@@ -16,12 +16,15 @@ struct Geometry {
     [[nodiscard]] std::int32_t channels() const { return query_rows + key_rows + value_rows; }
 };
 
-struct WeightOperands {
+struct WeightProfile {
     Format format;
     Geometry geometry;
+    LinearPolicy policy;
+};
+
+struct WeightOperands : WeightProfile {
     const Weight* first;
     const Weight* second;
-    LinearPolicy policy;
 };
 
 struct Batch {
@@ -34,6 +37,7 @@ struct Batch {
 enum class Publication { Snapshot, Record };
 
 // Metadata-only admission is also used by capacity queries before execution.
+WeightProfile describe_profile(const ProjectionProfile& weights);
 WeightOperands describe_weights(const ProjectionWeights& weights);
 void validate_weights(const WeightOperands& weights);
 void validate_interval(std::int32_t first, std::int32_t last);

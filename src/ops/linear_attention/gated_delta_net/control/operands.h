@@ -15,6 +15,7 @@ struct Weights {
     const Weight* second;
 };
 
+Geometry describe_profile(const ProjectionProfile& weights);
 Weights describe_weights(const ProjectionWeights& weights);
 void validate_weights(const Weights& weights);
 void validate_interval(std::int32_t first, std::int32_t last);

@@ -49,6 +49,16 @@ int main() {
                       "default KV capacity does not follow max context");
     failures += check(!defaults.context_cache.host_capacity_bytes.has_value(),
                       "default Host context capacity was resolved before Engine startup");
+    failures += check(
+        parse({"ninfer-serve", "model.ninfer", "--prefill-chunk", "8192"}).prefill_chunk == 8192,
+        "explicit prefill chunk was not preserved");
+    for (const auto* value : {"auto", "0", "129"}) {
+        bool rejected = false;
+        try {
+            (void)parse({"ninfer-serve", "model.ninfer", "--prefill-chunk", value});
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "invalid prefill chunk was accepted");
+    }
     failures += check(defaults.speculative.backend == ninfer::SpeculativeBackend::None,
                       "speculative decoding is not disabled by default");
     failures += check(defaults.response_store_max_records == kDefaultResponseStoreRecords &&
