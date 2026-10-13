@@ -20,6 +20,9 @@ add_library(ninfer_core STATIC
   transfer.cu
   device.cu
   dtype.cpp
+  nf4.cpp
+  io/file.cpp
+  io/read_queue.cpp
   gdn_replay_records.cpp
   cyclic_kv_cache.cpp
   host_context_arena.cpp
@@ -36,3 +39,4 @@ add_library(ninfer_core STATIC
 ninfer_internal_includes(ninfer_core)
 ninfer_cuda_archive(ninfer_core)
 target_link_libraries(ninfer_core PUBLIC ninfer_cpu CUDA::cudart CUDA::nvtx3 Threads::Threads)
+target_link_libraries(ninfer_core PRIVATE PkgConfig::URING)

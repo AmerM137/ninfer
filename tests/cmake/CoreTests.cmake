@@ -40,6 +40,17 @@ ninfer_add_test(ninfer_tensor_test       SOURCES "${CMAKE_CURRENT_LIST_DIR}/../t
 ninfer_add_test(ninfer_memory_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_memory.cpp"
   LIBRARIES ninfer_core)
 
+ninfer_add_test(ninfer_nf4_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_nf4.cpp"
+  LIBRARIES ninfer_core)
+add_test(NAME ninfer_nf4_exact_test
+  COMMAND ${Python3_EXECUTABLE} -B "${CMAKE_CURRENT_LIST_DIR}/../test_nf4_exact.py"
+    $<TARGET_FILE:ninfer_nf4_test>)
+
+ninfer_add_test(ninfer_read_queue_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../io/test_read_queue.cpp"
+  LIBRARIES ninfer_core PkgConfig::URING)
+target_link_options(ninfer_read_queue_test PRIVATE "LINKER:--wrap=io_uring_submit")
+set_tests_properties(ninfer_read_queue_test PROPERTIES TIMEOUT 30)
+
 ninfer_add_test(ninfer_arena_test        SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_arena.cpp"
   LIBRARIES ninfer_core)
 

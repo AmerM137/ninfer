@@ -358,13 +358,13 @@ lead 规划，不假定与 Main 相同。最终容量、Host reservation、迁�
 | QSA | 分段输入投影、五类 KV 的 Prepare/Sparse GQA、Indexer、tail extraction 已实现 |
 | Paged KV 机制 | `tokens_per_row=1/4` 的共同逻辑页及 Host/Device plane 布局、传输和相应覆盖语义已有通用实现；模型 pool/StateImage 接入仍待完成 |
 | PLE GPU 局部能力 | 共享合同、`ple_conv_add`、`ple_conv_add_norm`、`ple_state_extract` 已实现；Gate 目前只有声明 |
+| PLE 读取基础 | 精确 NF4→BF16 LUT/行解码、长期文件 backing、`PleTableSource`、有界 io_uring 读队列已实现；行缓存和 token 窗口尚未接入 |
 
 真实剩余工作如下；已完成项不再作为重新开展独立调优活动的前置任务。
 
-1. **PLE Gate、hash、运行时 NF4 解码与读取服务。** 实现 `ple_gate`；补齐纯 Host
-   hash、按实际 divisor 构建的 NF4→BF16 LUT/行解码；接入 cold backing、bounded
-   cache/queues、ticket、pinned E 和 H2D/Graph 交接。持久 NF4 codec 与独立 SSD
-   实验已经存在，但不构成生产 reader 或完整 PLE 能力，接口设计见 PLE I/O。
+1. **PLE Gate、hash 与读取服务。** 实现 `ple_gate`、纯 Host hash；组合现有文件
+   backing、NF4 解码和异步读队列，实现行/页去重、bounded cache、ticket、pinned E
+   和 H2D/Graph 交接。完整窗口与预取接口设计见 PLE I/O。
 2. **MoE 与 expert streaming。** 在现有 rank-3 bank 表示上落实 Main NVFP4 和 MTP
    block-FP8 expert 计算，以及路由/shared
    计算、完整 Op 边界、A16/A4 及 activation divisor 复用、cache lease/eviction、

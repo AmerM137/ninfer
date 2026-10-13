@@ -1,0 +1,46 @@
+#pragma once
+
+#include "artifact/backing.h"
+#include "core/nf4.h"
+
+#include <array>
+
+namespace ninfer::models::qwen4_exp {
+
+struct PleHashControls {
+    std::array<std::int64_t, 3> multipliers;
+    std::array<std::int64_t, 16> vocab_sizes;
+    std::array<std::int64_t, 16> offsets;
+};
+
+struct PleRowSource {
+    artifact::FileObjectView object;
+    std::uint64_t offset; // Encoded row's byte offset within object.
+    const Nf4Bf16Lut* lut;
+};
+
+// Immutable disk table in binding order. Reads only framing, divisors and controls at startup.
+// A row is 90 encoded bytes / 160 BF16 values; global row IDs span all shards.
+// Returned views survive owner moves and borrow it through their last I/O/CPU consumer.
+class PleTableSource {
+public:
+    PleTableSource(const artifact::Reader&, const artifact::Binding& table,
+                   artifact::ObjectHandle controls);
+    ~PleTableSource();
+    PleTableSource(PleTableSource&&) noexcept;
+    PleTableSource& operator=(PleTableSource&&) noexcept;
+    PleTableSource(const PleTableSource&)            = delete;
+    PleTableSource& operator=(const PleTableSource&) = delete;
+
+    [[nodiscard]] PleRowSource row(std::uint32_t global_row) const;
+    [[nodiscard]] std::uint64_t rows() const noexcept;
+    [[nodiscard]] const PleHashControls& controls() const noexcept;
+    [[nodiscard]] std::span<const io::FileView> files() const noexcept;
+    [[nodiscard]] std::size_t max_row_segments() const noexcept;
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+} // namespace ninfer::models::qwen4_exp

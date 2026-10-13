@@ -1,8 +1,9 @@
 # Qwen4Exp PLE：Host hash、NF4 查表与异步 I/O
 
-本文定义待接入生产的 PLE Host 准备合同：精确 token hash、NF4→BF16 解码、不可变磁盘
-backing、有界读取服务，以及交给 Program 的窗口与完成通知。已有 NF4 artifact
-format/layout 不等于已实现生产 reader；独立 SSD 实验也不承担这一角色。
+本文定义 PLE Host 准备合同：精确 token hash、NF4→BF16 解码、不可变磁盘 backing、
+有界读取服务，以及交给 Program 的窗口与完成通知。Core 精确 LUT/行解码、Artifact
+文件 backing、`PleTableSource` 和 io_uring 读队列已实现；hash、行缓存、窗口服务及
+Program 交接仍待接入。独立 SSD 实验是选型依据。
 
 [模型与权重](qwen4_exp-model.md)维护实例几何与量化选择；
 [数值格式](tensor-formats.md#35-nf4_g16_e4m3fn)与
@@ -114,10 +115,11 @@ divisor。对于全局行 g，`shard=g//2500012`、`row=g%2500012`；对象内�
 [`row_paged_g16_4k_v1`](storage-layouts.md#6-row_paged_g16_4k_v1) 的几何计算。
 本实例每行 90 B，每 4 KiB 数据页容纳 45 行，末页为 37 行，divisor 在完整数据页之后。
 
-Artifact/Model 需要补充长期 disk placement，验证对象几何、layout、encoded size、
-文件归属和范围，并冻结 V3 逻辑区间到真实文件区间的映射。启动只读取所需目录、280 B
-controls 和 128 个 divisors，不扫描或 materialize **27.126954 GiB** 的整表。
-当前通用 Materializer 的完整 Host/Device placement 不能直接代表这种 cold backing。
+`prepare_file_backing` 验证对象几何、layout、encoded size、文件归属和范围，冻结 V3
+逻辑区间到真实文件区间的映射。`PleTableSource` 按 Binding parts 顺序定义全局行段，
+要求每段引用完整的 160 列 NF4 parent，并拥有各段 LUT 和 hash controls。
+启动只读取所需目录、文件头、280 B controls 和 128 个 divisors，不扫描或 materialize
+**27.126954 GiB** 的整表。具体模型 binder 接入时核对 config 声明的 shard 几何。
 
 Model 持有长期打开的只读文件及不可变 shard 描述；Program 的服务借用这个 backing。
 不得借用加载后将销毁的 Reader，也不能用未 materialize 数据的 Host WeightParent

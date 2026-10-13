@@ -561,6 +561,12 @@ CUDA 注册和传输视图。注册不改变 Device 或文件格式，同一 Hos
 辅助 scalar、索引等需要 owning Host 值的用途可以按 Binding 读取对应元素区间，保持其数值类型。
 Reader 的 JSON 与符号索引用于冷加载，运行时使用解析后的引用与直接调用。
 
+磁盘按需消费使用 `prepare_file_backing`：只为所选对象打开长期只读文件，保存编码几何和
+对象范围映射，不 materialize payload。`FileBacking` 的 views 在 Reader 销毁和 owner
+移动后仍有效；`map_file_range` 使用调用者提供的段缓冲，输出的文件索引属于
+`FileBacking::files()`。Core `io::ReadOnlyFile` 提供显式 buffered/direct 句柄，
+`io::DirectReadQueue` 借用文件和 Host buffers 完成有界异步读取；所有读取退役后才能销毁 backing。
+
 ### 11.3 语义与支持检查
 
 | 情况 | 所有者 |

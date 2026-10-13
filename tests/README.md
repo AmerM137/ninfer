@@ -17,6 +17,8 @@ ownership contracts are defined in [Engine architecture](../docs/maintainer/engi
   Linear and fused Linear suites are separated by their supported weight/activation paths;
 - `runtime/` — scheduler fairness, cache resource policy, capacity and context-cost calculations;
 - `cpu/` — topology/ISA, bounded task admission, bound collectives, publication and shutdown;
+- `io/` — bounded direct reads, partial submission, completion, wakeup and borrowed-buffer lifetime;
+- `models/qwen4_exp/` — PLE disk-source binding and exact NF4 lookup through production I/O;
 - `bench/ttft/` — HTTP measurements, campaign orchestration and workload construction;
 - root C++ tests — core storage, public API, serving protocols, logging, benchmark reports and
   causal-scoring evaluation;
@@ -62,6 +64,12 @@ After building, `ctest --preset dev` runs the same CTest suite. See
 [Build system](../docs/maintainer/build-system.md) for local interpreter presets.
 
 The chat-template reference test uses Python Jinja2.
+
+PLE reading foundations run with
+`ctest --test-dir build -R 'ninfer_(nf4|read_queue|artifact_backing|ple_table)' --output-on-failure`.
+The NF4 oracle uses exact Python fractions. The PLE fixture includes a row split across three files.
+These tests use small synthetic files to check addressing, decoded values and queue lifecycle.
+Real-weight I/O throughput measurements belong to separate, explicitly selected benchmarks.
 
 CPU foundation tests link only the C++ `ninfer_cpu` target and need no GPU:
 `ctest --test-dir build -R '^ninfer_cpu_.*_test$' --output-on-failure`.

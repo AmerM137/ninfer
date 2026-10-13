@@ -2,6 +2,11 @@ ninfer_add_test(ninfer_artifact_reader_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_reader.cpp"
   LIBRARIES ninfer_artifact)
 
+ninfer_add_test(ninfer_artifact_backing_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_backing.cpp"
+  LIBRARIES ninfer_artifact)
+set_tests_properties(ninfer_artifact_backing_test PROPERTIES TIMEOUT 30)
+
 ninfer_add_test(ninfer_artifact_materialization_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_materialization.cpp" "${CMAKE_CURRENT_LIST_DIR}/materialization_cuda_errors.cpp"
   LIBRARIES ninfer_artifact)

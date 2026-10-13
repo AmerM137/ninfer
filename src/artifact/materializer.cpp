@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstring>
 #include <string>
+#include <system_error>
 #include <tuple>
 #include <utility>
 
@@ -331,9 +332,14 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
     std::sort(ranges.begin(), ranges.end(), [](const auto& a, const auto& b) {
         return std::tie(a.file, a.begin) < std::tie(b.file, b.begin);
     });
-    const auto spans           = plan_reads(ranges);
+    const auto spans = plan_reads(ranges);
+    std::vector<std::unique_ptr<io::ReadOnlyFile>> files(reader.directory().files.size());
     std::uint64_t staged_bytes = 0;
     for (const auto& span : spans) {
+        if (!files[span.file]) {
+            files[span.file] = std::make_unique<io::ReadOnlyFile>(
+                reader.open_file(span.file, io::ReadMode::Direct));
+        }
         const auto bytes = align_up(span.end - span.begin, kPayloadAlignment, "direct range bytes");
         if (!span.host_destination)
             staged_bytes = checked_add(staged_bytes, bytes, "staging bytes");
@@ -374,7 +380,10 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
             const auto remaining = span.end - source;
             const auto request   = static_cast<std::size_t>(std::min<std::uint64_t>(
                 block_bytes, align_up(remaining, kPayloadAlignment, "direct block bytes")));
-            const auto received  = reader.read_direct(span.file, source, {destination, request});
+            std::size_t received = 0;
+            try {
+                received = files[span.file]->read_direct(source, {destination, request});
+            } catch (const std::system_error& e) { throw ArtifactError(e.what()); }
             if (received < std::min<std::uint64_t>(request, remaining)) {
                 throw ArtifactError("direct read ended before the required payload");
             }

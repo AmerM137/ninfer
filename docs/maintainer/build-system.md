@@ -30,6 +30,8 @@ CMake also discovers FFmpeg without imposing library version floors. Actual lang
 is exercised by compilation and tests. CPU facilities target Linux x86-64 and use hwloc >= 2.5
 for topology discovery without changing the caller's binding. The internal `ninfer_cpu` target
 is ordinary C++, links hwloc/Threads, and can run its tests without CUDA initialization or linkage.
+Core direct-file I/O uses liburing >= 2.5, discovered through pkg-config. Its registered files and
+buffers are owned by the read queue's caller; the queue creates no CUDA resources or worker threads.
 The libcurl 7.85 minimum has a concrete API basis:
 media acquisition uses `CURLOPT_PROTOCOLS_STR` and `CURLOPT_REDIR_PROTOCOLS_STR`, introduced in
 [that release](https://curl.se/libcurl/c/CURLOPT_PROTOCOLS_STR.html).

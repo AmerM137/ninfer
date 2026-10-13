@@ -1,5 +1,6 @@
 # Immutable loading and mutable execution have separate compile owners.
 add_library(ninfer_model_loading STATIC registry.cpp)
+target_sources(ninfer_model_loading PRIVATE qwen4_exp/ple/table.cpp)
 ninfer_internal_includes(ninfer_model_loading)
 target_link_libraries(ninfer_model_loading PUBLIC ninfer_artifact ninfer_text ninfer_ops)
 
