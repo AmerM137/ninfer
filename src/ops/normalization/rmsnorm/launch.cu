@@ -70,6 +70,14 @@ void launch_instance(const Tensor& x, const Tensor& weight, const Tensor* gate, 
             return;
         }
         break;
+    case Instance::D10240:
+        if constexpr (Kind == Epilogue::Offset) {
+            rmsnorm_cta_bf16x2_kernel<Kind, 512, 10, true, 10240>
+                <<<static_cast<unsigned>(rows), 512, 0, stream>>>(x2, w2, nullptr, out2, d, rows,
+                                                                  eps);
+            return;
+        }
+        break;
     case Instance::Warp:
         if constexpr (is_gated<Kind>) {
             rmsnorm_warp_bf16x2_kernel<Kind, 512, false>

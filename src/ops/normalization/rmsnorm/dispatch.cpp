@@ -10,6 +10,7 @@ namespace {
 Instance select_instance(Epilogue kind, Operands operands, std::int32_t sms) {
     const auto [d, rows, aligned] = operands;
     if (!aligned) return Instance::Generic;
+    if (kind == Epilogue::Offset && d == 10240) return Instance::D10240;
     if (gated(kind) && d == 128) {
         // Sixteen rows per CTA cover one wave; smaller CTAs overlap the next wave.
         if (rows <= 384 || (rows > 16LL * sms && rows <= 6144)) return Instance::D128Block128;

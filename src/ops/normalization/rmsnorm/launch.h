@@ -10,6 +10,7 @@ enum class Instance {
     D256,
     D2048,
     D5120,
+    D10240,
     Warp,
     WarpPrefetch,
     CtaMedium,
