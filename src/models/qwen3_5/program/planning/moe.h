@@ -5,15 +5,21 @@
 #include "ninfer/types.h"
 
 #include <array>
+#include <span>
 
 namespace ninfer::models::qwen3_5 {
 class LoadPlan;
+struct TextConfig;
 
 namespace execution {
 struct ModelProfile;
 }
 
 namespace detail {
+
+// Empty when the model geometry has no calibrated default.
+[[nodiscard]] std::span<const std::uint32_t> default_expert_priority(const TextConfig&,
+                                                                     std::size_t layer);
 
 struct MoeLayerPlan {
     ExpertBankId bank;

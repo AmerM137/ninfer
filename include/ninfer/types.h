@@ -144,7 +144,8 @@ struct ContextCostOptions {
 
 struct MoeOptions {
     // Descending cache priority: a permutation of all logical expert IDs per Main layer.
-    // Dense layers have empty rows. nullopt uses ID order; capacity determines each prefix.
+    // Dense layers have empty rows. nullopt uses the model's calibrated default when available,
+    // otherwise ID order. Capacity determines each prefix.
     std::optional<std::vector<std::vector<std::uint32_t>>> expert_priority;
     // Zero selects physical cores while reserving a control-thread core when available.
     std::uint32_t cpu_workers = 0;

@@ -214,7 +214,11 @@ Host backing 的子集。MTP、router、shared、Vision 和 draft 始终留在 G
 
 完整 GPU 放置可行时走原融合路径，不创建 Host expert 副本。否则保留完整原编码 Host
 来源；`EngineOptions::moe.expert_priority` 可指定每个 Main 层全部 logical ID 的优先级排列，
-默认使用 ID 顺序。各层按字节均衡分配额度，以完整 expert 为单位选取优先级前缀；排列本身
+35B-A3B 配置默认使用内置的逐层静态排序，其他配置使用 ID 顺序；显式排列覆盖默认值。
+内置排序以本地 Qwen3.6-35B-A3B 权重在通用问答、代码、推理、文档、写作、翻译、结构化输出、
+工具和多模态任务中的 Main 路由频率标定，按请求归一化，ordinary／MTP3／DFlash7 权重为
+50%／25%／25%。它只决定缓存放置，路由公式和 expert 计算语义不变；同配置的其他训练权重可提供自己的排序。
+各层按字节均衡分配额度，以完整 expert 为单位选取优先级前缀；排列本身
 不强制启用 offload。优先级影响目标集合，实际 GPU 分工由已就绪副本决定。
 `moe.cpu_workers=0` 自动选择物理核并为控制线程留核；非零指定团队规模。
 

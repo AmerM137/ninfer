@@ -237,6 +237,9 @@ MoePlan describe_moe_plan(const LoadPlan& source, const execution::ModelProfile&
         auto& layer = out.layers[i];
         if (options.expert_priority) {
             layer.priority = (*options.expert_priority)[i];
+        } else if (const auto priority = default_expert_priority(profile.config.text, i);
+                   !priority.empty()) {
+            layer.priority.assign(priority.begin(), priority.end());
         } else {
             layer.priority.resize(layer.experts);
             std::iota(layer.priority.begin(), layer.priority.end(), 0U);
