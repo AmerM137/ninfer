@@ -3,6 +3,7 @@
 #include "artifact/framing.h"
 #include "artifact/reader.h"
 #include "core/buffer.h"
+#include "core/cpu/executor.h"
 #include "core/startup.h"
 
 #include <cuda_runtime.h>
@@ -19,8 +20,31 @@
 namespace ninfer::artifact {
 namespace {
 
-constexpr std::size_t kSlotBytes        = 64ULL * 1024 * 1024;
+constexpr std::size_t kReadBlockBytes   = 64ULL * 1024 * 1024;
 constexpr std::size_t kMaximumSlotCount = 4;
+
+void populate_host_pages(MemorySpan storage) {
+    if (storage.bytes < kReadBlockBytes) return;
+
+    struct Pages {
+        std::byte* data;
+        std::size_t count;
+    } pages{static_cast<std::byte*>(storage.data),
+            (storage.bytes + kPayloadAlignment - 1) / kPayloadAlignment};
+
+    const CpuTopology topology;
+    const auto workers = static_cast<std::uint32_t>(
+        std::min<std::size_t>(16, cpu_worker_order(topology.info()).size()));
+    CpuExecutor team(topology, plan_cpu_team(topology.info(), workers));
+    team.execution_view().run(
+        [](void* argument, const CpuWorkerContext& worker) noexcept {
+            const auto& pages = *static_cast<Pages*>(argument);
+            const auto range  = worker.range(pages.count);
+            for (auto page = range.begin; page < range.end; ++page)
+                pages.data[page * kPayloadAlignment] = std::byte{};
+        },
+        &pages);
+}
 
 void check_cuda(cudaError_t status, const char* operation) {
     if (status != cudaSuccess) {
@@ -88,10 +112,51 @@ struct CopyRange {
 };
 
 struct ReadSpan {
-    std::size_t file    = 0;
-    std::uint64_t begin = 0;
-    std::uint64_t end   = 0;
+    std::size_t file            = 0;
+    std::uint64_t begin         = 0;
+    std::uint64_t end           = 0;
+    std::byte* host_destination = nullptr;
 };
+
+std::vector<ReadSpan> plan_reads(std::span<const CopyRange> ranges) {
+    std::vector<ReadSpan> spans;
+    for (std::size_t i = 0; i < ranges.size(); ++i) {
+        const auto& range = ranges[i];
+        if (i && ranges[i - 1].file == range.file && ranges[i - 1].end > range.begin) {
+            throw ArtifactError("tensor source ranges overlap");
+        }
+        const auto begin = range.begin / kPayloadAlignment * kPayloadAlignment;
+        if (spans.empty() || spans.back().file != range.file ||
+            begin > align_up(spans.back().end, kPayloadAlignment, "direct range")) {
+            spans.push_back({range.file, begin, range.end});
+        } else {
+            spans.back().end = std::max(spans.back().end, range.end);
+        }
+    }
+
+    // Host-only payloads can be filled in place. Keep shared boundary pages and CPU/GPU
+    // fanout in staging so every file byte is read once and GPU uploads remain asynchronous.
+    std::vector<ReadSpan> reads;
+    std::size_t next_range = 0;
+    for (const auto& span : spans) {
+        auto cursor = span.begin;
+        while (next_range < ranges.size() && ranges[next_range].file == span.file &&
+               ranges[next_range].begin < span.end) {
+            const auto& range = ranges[next_range++];
+            if (!range.host || range.device) continue;
+            const auto begin = align_up(range.begin, kPayloadAlignment, "Host direct range");
+            const auto end   = range.end / kPayloadAlignment * kPayloadAlignment;
+            if (begin >= end) continue;
+            auto* destination = range.host + begin - range.begin;
+            if (reinterpret_cast<std::uintptr_t>(destination) % kPayloadAlignment) continue;
+            if (cursor < begin) reads.push_back({span.file, cursor, begin});
+            reads.push_back({span.file, begin, end, destination});
+            cursor = end;
+        }
+        if (cursor < span.end) reads.push_back({span.file, cursor, span.end});
+    }
+    return reads;
+}
 
 void validate_divisors(std::span<float> values, const std::string& name) {
     for (std::size_t i = 0; i < values.size(); ++i) {
@@ -192,6 +257,17 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
                                    plan.resources.objects.size();
     out.host_storage_ = HostBuffer(plan.host_capacity_bytes, plan.host_alignment);
     if (cuda) { out.device_storage_ = DeviceBuffer(plan.device, plan.device_capacity_bytes); }
+    populate_host_pages(out.host_storage_.span());
+    if (plan.registered_host_bytes) {
+        // Pin the populated destination before direct I/O, keeping page faults out of reads.
+        const auto registration_start = std::chrono::steady_clock::now();
+        out.host_registration_        = CudaHostRegistration(
+            out.host_storage_.span().subspan(0, plan.registered_host_bytes), execution->device());
+        out.stats_.registered_host_bytes = plan.registered_host_bytes;
+        out.stats_.host_registration_seconds =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - registration_start)
+                .count();
+    }
     for (auto& resource : plan.resources.objects) {
         reader.validate_object(resource.object);
         const auto& object = reader.directory().object(resource.object);
@@ -208,7 +284,9 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
         LayoutBuilder layout;
         for (const auto& placement : placements) {
             const auto& g       = reader.geometry(placement.object);
-            const auto expected = layout.add(g.bytes, g.alignment, "weight placement");
+            const auto expected = on_device
+                                      ? layout.add(g.bytes, g.alignment, "weight placement")
+                                      : plan_host_tensor_region(layout, reader, placement.object);
             const auto& region  = placement.region;
             if (region.offset != expected.offset || region.bytes != expected.bytes ||
                 region.alignment != expected.alignment) {
@@ -253,32 +331,20 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
     std::sort(ranges.begin(), ranges.end(), [](const auto& a, const auto& b) {
         return std::tie(a.file, a.begin) < std::tie(b.file, b.begin);
     });
-    std::vector<ReadSpan> spans;
-    std::uint64_t aligned_bytes = 0;
-    for (std::size_t i = 0; i < ranges.size(); ++i) {
-        const auto& range = ranges[i];
-        if (i && ranges[i - 1].file == range.file && ranges[i - 1].end > range.begin) {
-            throw ArtifactError("tensor source ranges overlap");
-        }
-        const auto begin = range.begin / kPayloadAlignment * kPayloadAlignment;
-        if (spans.empty() || spans.back().file != range.file ||
-            begin > align_up(spans.back().end, kPayloadAlignment, "direct range")) {
-            spans.push_back({range.file, begin, range.end});
-        } else {
-            spans.back().end = std::max(spans.back().end, range.end);
-        }
-    }
+    const auto spans           = plan_reads(ranges);
+    std::uint64_t staged_bytes = 0;
     for (const auto& span : spans) {
-        aligned_bytes = checked_add(
-            aligned_bytes, align_up(span.end - span.begin, kPayloadAlignment, "direct range bytes"),
-            "direct bytes");
+        const auto bytes = align_up(span.end - span.begin, kPayloadAlignment, "direct range bytes");
+        if (!span.host_destination)
+            staged_bytes = checked_add(staged_bytes, bytes, "staging bytes");
     }
     const auto slot_bytes =
-        static_cast<std::size_t>(std::min<std::uint64_t>(kSlotBytes, aligned_bytes));
-    const auto slot_count = !slot_bytes ? 0
-                            : cuda      ? static_cast<std::size_t>(std::min<std::uint64_t>(
-                                         kMaximumSlotCount, 1 + (aligned_bytes - 1) / slot_bytes))
-                                        : 1;
+        static_cast<std::size_t>(std::min<std::uint64_t>(kReadBlockBytes, staged_bytes));
+    std::size_t slot_count = slot_bytes ? 1 : 0;
+    if (cuda && slot_bytes) {
+        slot_count = static_cast<std::size_t>(
+            std::min<std::uint64_t>(kMaximumSlotCount, 1 + (staged_bytes - 1) / slot_bytes));
+    }
     std::vector<std::unique_ptr<Slot>> slots;
     out.stats_.peak_staging_bytes = slot_bytes * slot_count;
     std::optional<StartupPhaseScope> pin_phase;
@@ -295,14 +361,20 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
     std::uint64_t copied = 0, uploaded_bytes = 0;
     const auto start = std::chrono::steady_clock::now();
     for (const auto& span : spans) {
-        for (auto source = span.begin; source < span.end; source += slot_bytes) {
-            auto& slot = *slots[next_slot++ % slot_count];
-            slot.wait();
+        const auto block_bytes = span.host_destination ? kReadBlockBytes : slot_bytes;
+        for (auto source = span.begin; source < span.end; source += block_bytes) {
+            Slot* slot = nullptr;
+            auto* destination =
+                span.host_destination ? span.host_destination + source - span.begin : nullptr;
+            if (!destination) {
+                slot = slots[next_slot++ % slot_count].get();
+                slot->wait();
+                destination = static_cast<std::byte*>(slot->data());
+            }
             const auto remaining = span.end - source;
             const auto request   = static_cast<std::size_t>(std::min<std::uint64_t>(
-                slot_bytes, align_up(remaining, kPayloadAlignment, "direct block bytes")));
-            const auto received  = reader.read_direct(
-                span.file, source, {static_cast<std::byte*>(slot.data()), request});
+                block_bytes, align_up(remaining, kPayloadAlignment, "direct block bytes")));
+            const auto received  = reader.read_direct(span.file, source, {destination, request});
             if (received < std::min<std::uint64_t>(request, remaining)) {
                 throw ArtifactError("direct read ended before the required payload");
             }
@@ -315,7 +387,7 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
                 const auto begin  = std::max(source, range.begin);
                 const auto end    = std::min(chunk_end, range.end);
                 if (begin < end) {
-                    const auto* bytes = static_cast<const std::byte*>(slot.data()) + begin - source;
+                    const auto* bytes = destination + begin - source;
                     if (!range.divisors.empty()) {
                         const auto object_begin = range.object_offset + begin - range.begin;
                         const auto first        = std::max(object_begin, range.divisor_offset);
@@ -327,7 +399,8 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
                         }
                     }
                     if (range.host) {
-                        std::memcpy(range.host + begin - range.begin, bytes, end - begin);
+                        auto* target = range.host + begin - range.begin;
+                        if (target != bytes) std::memcpy(target, bytes, end - begin);
                         copied = checked_add(copied, end - begin, "materialized payload bytes");
                     }
                     if (range.device) {
@@ -343,8 +416,9 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
                 ++next_range;
             }
             if (uploaded) {
-                check_cuda(cudaEventRecord(slot.event, stream), "record weight staging completion");
-                slot.pending = true;
+                check_cuda(cudaEventRecord(slot->event, stream),
+                           "record weight staging completion");
+                slot->pending = true;
             }
             phase.progress(copied, total);
         }
@@ -363,15 +437,6 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
     out.stats_.h2d_bytes = uploaded_bytes;
     out.stats_.upload_seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-    if (plan.registered_host_bytes) {
-        const auto registration_start = std::chrono::steady_clock::now();
-        out.host_registration_        = CudaHostRegistration(
-            out.host_storage_.span().subspan(0, plan.registered_host_bytes), execution->device());
-        out.stats_.registered_host_bytes = plan.registered_host_bytes;
-        out.stats_.host_registration_seconds =
-            std::chrono::duration<double>(std::chrono::steady_clock::now() - registration_start)
-                .count();
-    }
     phase.complete(copied, total);
     return out;
 }

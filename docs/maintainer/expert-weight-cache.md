@@ -48,8 +48,10 @@ Qwen3.5 的 bank ID 按 Main 层顺序建立，选中的 MTP bank 追加在末�
    注册对象集中在 Host backing 的对齐前缀，普通 CPU 对象使用其后的独立区域。
    同一 parent 同时需要 CPU/GPU 两份 backing 时，两份容量均计入。
 4. Materializer 为 CPU tensor 分配可缓存的 `HostBuffer`，为 GPU tensor 分配
-   `DeviceBuffer`。有界 direct-I/O 块一次读取后可同时分发到 CPU 和 GPU。
-   `CudaTransfer` 区域加载后由 `CudaHostRegistration` 长期注册，仍是 CPU 内存。
+   `DeviceBuffer`。仅供 CPU 的对齐 payload 由 direct I/O 直接写入最终 Host backing；
+   边界页和 CPU/GPU 双端需求使用有界 staging，一次读取后分发。
+   Host 放置保留文件的页内偏移；大块 Host backing 在读取前并行触页，`CudaTransfer`
+   区域随后由 `CudaHostRegistration` 长期注册，仍是可缓存的 CPU 内存。
    Model 持有 allocation 与 registration；Program 结束使用后，先注销，再释放 Host backing。
    仅有 `CpuOnly` 需求的加载不创建 CUDA stream、event 或 pinned buffer。
 5. `bind_view(reference, backing, device)` 明确选择实际位置。

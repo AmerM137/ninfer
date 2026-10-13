@@ -57,6 +57,9 @@ struct MaterializationPlan {
     PreparedResources resources;
 };
 
+// Preserve the source page offset so aligned interiors can be read directly into Host backing.
+[[nodiscard]] LayoutRegion plan_host_tensor_region(LayoutBuilder&, const Reader&, ObjectHandle);
+
 // Deduplicates complete parents independently at each requested location. Tensor placement
 // never reads payloads; only already-prepared resource bytes move through this plan.
 [[nodiscard]] MaterializationPlan plan_materialization(const Reader& reader,

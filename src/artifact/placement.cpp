@@ -1,10 +1,29 @@
 #include "artifact/placement.h"
 
+#include "artifact/framing.h"
 #include "artifact/reader.h"
 
 #include <algorithm>
 
 namespace ninfer::artifact {
+
+LayoutRegion plan_host_tensor_region(LayoutBuilder& layout, const Reader& reader,
+                                     ObjectHandle handle) {
+    const auto& geometry = reader.geometry(handle);
+    const auto& tensor   = reader.directory().tensor(handle);
+    if (geometry.bytes >= 2 * kPayloadAlignment) {
+        const auto source    = reader.segments(tensor.offset, 1).front().file_offset;
+        const auto bias      = source % kPayloadAlignment;
+        const auto alignment = std::min<std::size_t>(geometry.alignment, kPayloadAlignment);
+        if (bias % alignment == 0) {
+            const auto cursor = layout.finish();
+            auto offset       = layout.finish(geometry.alignment);
+            offset += (bias + kPayloadAlignment - offset % kPayloadAlignment) % kPayloadAlignment;
+            if (offset > cursor) (void)layout.add(offset - cursor, 1, "Host I/O alignment");
+        }
+    }
+    return layout.add(geometry.bytes, geometry.alignment, tensor.id);
+}
 
 MaterializationPlan plan_materialization(const Reader& reader,
                                          std::span<const PlacementRequest> requests,
@@ -47,16 +66,16 @@ MaterializationPlan plan_materialization(const Reader& reader,
             auto& layout = registered[i] ? registered_layout : host_layout;
             auto& placements =
                 registered[i] ? out.registered_host_objects : out.ordinary_host_objects;
-            placements.push_back({handle, layout.add(g.bytes, g.alignment, name)});
+            placements.push_back({handle, plan_host_tensor_region(layout, reader, handle)});
             out.host_alignment =
-                std::max(out.host_alignment, static_cast<std::size_t>(g.alignment));
+                std::max({out.host_alignment, static_cast<std::size_t>(g.alignment),
+                          static_cast<std::size_t>(kPayloadAlignment)});
         }
         if (device[i]) {
             out.device_objects.push_back({handle, device_layout.add(g.bytes, g.alignment, name)});
         }
     }
     if (!out.registered_host_objects.empty()) {
-        out.host_alignment        = std::max(out.host_alignment, std::size_t{4096});
         out.registered_host_bytes = registered_layout.finish(out.host_alignment);
     }
     LayoutBuilder host_storage;
