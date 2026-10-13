@@ -163,10 +163,14 @@ struct MoeResources::Impl {
     std::vector<std::size_t> needed;
     std::array<std::size_t, 2> window_layers{SIZE_MAX, SIZE_MAX};
     std::optional<std::thread::id> caller;
-    std::int32_t tokens     = 0;
-    std::size_t active_step = SIZE_MAX;
-    bool cache_settled      = true;
-    bool streaming          = false;
+    std::int32_t tokens         = 0;
+    std::size_t observed_layers = 0;
+    std::size_t cpu_layers      = 0;
+    std::size_t moe_layers      = 0;
+    std::size_t active_step     = SIZE_MAX;
+    bool cache_settled          = true;
+    bool streaming              = false;
+    bool keep_cpu_active        = false;
 
     Impl(std::shared_ptr<const MoePlan> plan,
          std::span<const execution::MoeParameters* const> parameters,
@@ -184,6 +188,7 @@ struct MoeResources::Impl {
         for (std::size_t i = 0; i < layers.size(); ++i) {
             const auto& layer = this->plan->layers[i];
             if (!layer.experts) continue;
+            ++moe_layers;
             if (!parameters[i] || parameters[i]->bank != layer.bank ||
                 parameters[i]->profile.routed.experts != layer.experts)
                 throw std::invalid_argument("MoE schedule profile differs from its layer");
@@ -306,7 +311,7 @@ MoeResources::MoeResources(std::shared_ptr<const MoePlan> plan,
 
 MoeResources::~MoeResources() = default;
 
-void MoeResources::begin(std::int32_t tokens) {
+std::optional<CpuExecutionView::ActiveScope> MoeResources::begin(std::int32_t tokens) {
     auto& state       = *impl_;
     const auto thread = std::this_thread::get_id();
     if (!state.caller) {
@@ -317,10 +322,22 @@ void MoeResources::begin(std::int32_t tokens) {
         throw std::logic_error("MoE schedule has more than one control thread");
     }
     if (tokens <= 0) throw std::invalid_argument("MoE traversal requires positive token count");
-    state.tokens = tokens;
+    // Keep a frequent CPU contributor awake across GPU layers. Sparse CPU use should not
+    // keep the entire team polling; the two thresholds avoid toggling on every token.
+    if (state.tokens != tokens || state.observed_layers != state.moe_layers) {
+        state.keep_cpu_active = false;
+    } else if (state.cpu_layers * 4 >= state.moe_layers) {
+        state.keep_cpu_active = true;
+    } else if (state.cpu_layers * 8 <= state.moe_layers) {
+        state.keep_cpu_active = false;
+    }
+    state.observed_layers = state.cpu_layers = 0;
+    state.tokens                             = tokens;
     state.needed.clear();
+    bool hybrid = false;
     for (std::size_t i = 0; i < state.plan->layers.size(); ++i) {
         const auto& layer = state.plan->layers[i];
+        hybrid |= layer.experts && !layer.requires_full_bank(tokens);
         if (layer.experts && layer.requires_full_bank(tokens) && !layer.stream_layout.empty())
             state.needed.push_back(i);
     }
@@ -336,6 +353,11 @@ void MoeResources::begin(std::int32_t tokens) {
         state.streaming     = streaming;
         if (!streaming) state.cache.prepare({{}, state.extra_keys});
     }
+    if (hybrid && state.keep_cpu_active) {
+        const auto execution = state.bridge.execution_view();
+        if (execution.host) return execution.host->cpu.keep_active();
+    }
+    return std::nullopt;
 }
 
 void MoeResources::before_layer(std::size_t layer) {
@@ -368,14 +390,16 @@ void MoeResources::execute(std::size_t index, const Tensor& hidden, Tensor& resi
     } else {
         state.snapshot(index);
         try {
-            execution::moe(hidden, p, layer.partition->view(), state.sources[p.bank.index],
-                           state.cache.view(p.bank), residual, workspace,
-                           state.bridge.execution_view(), hints);
+            state.cpu_layers +=
+                execution::moe(hidden, p, layer.partition->view(), state.sources[p.bank.index],
+                               state.cache.view(p.bank), residual, workspace,
+                               state.bridge.execution_view(), hints);
         } catch (...) {
             state.release(layer);
             throw;
         }
     }
+    ++state.observed_layers;
     if (!state.cache_settled) state.release(layer);
     state.prepare_step(index + 1);
     state.progress_cache();

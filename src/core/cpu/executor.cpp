@@ -19,13 +19,13 @@ constexpr std::uint32_t work_spin = 32768;
 constexpr std::uint32_t barrier_spin = 32768;
 
 void wait_changed(const std::atomic<std::uint32_t>& value, std::uint32_t previous,
-                  std::uint32_t spins) noexcept {
+                  std::uint32_t spins, bool active_epoch = false) noexcept {
     while (value.load(std::memory_order_acquire) == previous) {
         for (std::uint32_t i = 0; i < spins; ++i) {
             if (value.load(std::memory_order_acquire) != previous) return;
             _mm_pause();
         }
-        value.wait(previous, std::memory_order_acquire);
+        if (!active_epoch || !(previous & 1U)) value.wait(previous, std::memory_order_acquire);
     }
 }
 
@@ -98,7 +98,7 @@ struct CpuExecutor::Impl {
 
     ~Impl() {
         stopping.store(true, std::memory_order_relaxed);
-        epoch.fetch_add(1, std::memory_order_release);
+        epoch.fetch_add(2, std::memory_order_release);
         epoch.notify_all();
         cpu_detail::join_workers(threads);
     }
@@ -113,12 +113,15 @@ struct CpuExecutor::Impl {
         const CpuWorkerContext worker(rank, count, barrier);
         std::uint32_t seen = 0;
         for (;;) {
-            cpu_detail::wait_changed(epoch, seen, cpu_detail::work_spin);
-            seen = epoch.load(std::memory_order_acquire);
+            cpu_detail::wait_changed(epoch, seen, cpu_detail::work_spin, true);
+            const auto next = epoch.load(std::memory_order_acquire);
             if (stopping.load(std::memory_order_relaxed)) return;
-            work(arguments, worker);
-            states[rank].completed.store(seen, std::memory_order_release);
-            states[rank].completed.notify_one();
+            if ((next >> 1) != (seen >> 1)) {
+                work(arguments, worker);
+                states[rank].completed.store(next >> 1, std::memory_order_release);
+                states[rank].completed.notify_one();
+            }
+            seen = next;
         }
     }
 
@@ -128,7 +131,7 @@ struct CpuExecutor::Impl {
             throw std::logic_error("CPU collective is already running");
         work            = function;
         arguments       = argument;
-        const auto next = epoch.fetch_add(1, std::memory_order_release) + 1;
+        const auto next = (epoch.fetch_add(2, std::memory_order_release) + 2U) >> 1;
         epoch.notify_all();
         for (std::uint32_t rank = 0; rank < count; ++rank) {
             auto& done          = states[rank].completed;
@@ -143,6 +146,8 @@ struct CpuExecutor::Impl {
     std::unique_ptr<Worker[]> states;
     cpu_detail::TeamBarrier barrier;
     CpuFeatures features;
+    // Bit 0 controls active waiting. Higher bits identify submitted collectives, so waking
+    // or releasing an idle team never replays work or acknowledges an unexecuted call.
     alignas(64) std::atomic<std::uint32_t> epoch{0};
     std::atomic<bool> stopping{false};
     std::atomic_flag running = ATOMIC_FLAG_INIT;
@@ -161,6 +166,26 @@ const CpuTeamPlan& CpuExecutor::plan() const noexcept { return impl_->plan; }
 std::uint32_t CpuExecutionView::worker_count() const noexcept { return owner_->impl_->count; }
 
 CpuFeatures CpuExecutionView::features() const noexcept { return owner_->impl_->features; }
+
+CpuExecutionView::ActiveScope::ActiveScope(CpuExecutor& owner) : owner_(&owner) {
+    auto& epoch = owner_->impl_->epoch;
+    if (epoch.fetch_or(1U, std::memory_order_acq_rel) & 1U)
+        throw std::logic_error("CPU team already has an active scope");
+    epoch.notify_all();
+}
+
+CpuExecutionView::ActiveScope::~ActiveScope() {
+    if (owner_) {
+        auto& epoch = owner_->impl_->epoch;
+        epoch.fetch_and(~1U, std::memory_order_release);
+        epoch.notify_all();
+    }
+}
+
+CpuExecutionView::ActiveScope::ActiveScope(ActiveScope&& other) noexcept
+    : owner_(std::exchange(other.owner_, nullptr)) {}
+
+CpuExecutionView::ActiveScope CpuExecutionView::keep_active() const { return ActiveScope(*owner_); }
 
 void CpuExecutionView::run(CpuWork work, void* arguments) const {
     owner_->impl_->run(work, arguments);

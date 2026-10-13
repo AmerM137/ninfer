@@ -183,6 +183,10 @@ nearest-even、屏蔽异常和 gradual underflow，计算保留控制模式，�
 负责。团队只提供 rank、连续范围分工与全队 barrier；scratch 由调用者用现有 HostBuffer、
 MemoryArena 和布局类型管理，进入团队前完成划分。
 
+`CpuExecutionView::keep_active()` 返回借用团队的独占作用域，在相邻 collective 之间保持
+worker 轮询；退出后恢复有限自旋与休眠。它不提交工作，也不改变 collective 的完成语义。
+是否启用由调用方依据实际计算频率决定，空闲请求期间不持有该作用域。
+
 两种执行器共享启动确认、初始化失败清理和线程回收机制。CPU 团队不调用 CUDA，也不持有
 传输槽、模型状态或权重副本。Engine/Scoring 的控制线程继续拥有各自的工作循环。
 CPU 团队用于 eager MoE 混合执行；每个 Program 持有固定团队和交接缓冲。

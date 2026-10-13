@@ -1086,8 +1086,8 @@ void TextContext::post_mixer(const BlockParameters& weights, Tensor& x, int laye
 
 template <class Tap>
 void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
-    const bool prefill = ph == Phase::Prefill;
-    if (moe_) moe_->begin(x.ne[1]);
+    const bool prefill      = ph == Phase::Prefill;
+    const auto cpu_activity = moe_ ? moe_->begin(x.ne[1]) : std::nullopt;
     for (std::size_t layer = 0; layer < parameters_.text.layers.size(); ++layer) {
         if (moe_) moe_->before_layer(layer);
         const auto& block  = parameters_.text.layers[layer];

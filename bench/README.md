@@ -1132,13 +1132,15 @@ are excluded. Native Host banks stay alive for the whole run. `repeat` reuses a 
 LLC in actually selected weights). `same`, `skew` and `independent` vary reuse within each call.
 
 ```bash
-./build/bench/ninfer_moe_cpu_bench --format q4-q5 --workers 16 --caller-cpu 31 \
+./build/bench/ninfer_moe_cpu_bench --format q4-q5 --workers 15 --caller-cpu 31 \
   --tokens 1,8,72 --active 1,8 --cache stream --distribution same --samples 240 --read-reference
 ```
 
 Output includes min/median/p95/max wall time, useful encoded-weight GiB/s, logical GFLOP/s,
 workspace and reuse footprint. Process CPU cost uses a separate interval of at least 250 ms at
 the same cadence; `--gap-us` is excluded from call latency and included in that accounting.
+`--keep-active` keeps the worker team polling between calls, including those gaps; the default
+allows workers to park after their bounded spin interval.
 `encoded_read_bytes` models the selected four/two/one-column tiles and eight-token chunks; it
 includes repeated weight reads, but is not a hardware traffic counter. `--read-reference` times
 the same bank/column grouping and row ownership with decode and arithmetic removed. Its median
@@ -1397,12 +1399,14 @@ for example Flash Next `--bank mtp/layers/0/moe/experts --experts 512 --resident
 `ninfer_qwen3_5_moe_execution_bench` materializes one selected 35B layer's native expert parents,
 control and shared weights. Its production model entry includes route, actual ExpertCache use,
 D2H, CPU/GPU contributions, H2D and residual merge. This is a layer microbenchmark, not Engine
-generation. `--gpu-experts N` assigns logical IDs `[0,N)`; the remaining routed assignments use CPU.
+generation. `--gpu-experts N` assigns logical IDs `[0,N)` by default; `--gpu-selection shuffled`
+selects the first N IDs of a deterministic shuffled permutation. The remaining routed assignments
+use CPU.
 
 ```bash
 build/bench/ninfer_qwen3_5_moe_execution_bench \
   --artifact out/qwen3_6_35b_a3b.ninfer --layer 0 --tokens 128 --gpu-experts 128 \
-  --workers 16 --caller-cpu 31 --samples 256 --distribution independent --schedule both
+  --workers 15 --caller-cpu 31 --samples 256 --distribution independent --schedule both
 ```
 
 Layer 34 selects Q6 down. The 32-input synthetic BF16 Gaussian corpus uses either independent
@@ -1420,6 +1424,9 @@ does not include the model entry's validation/frame binding, so its difference i
 reference, not an isolated measurement of overlap. `both` alternates order, reversing each
 input's order on successive corpus passes, and reports min/median/p95/max and paired differences.
 `--gap-us N` adds an excluded inter-call gap. Select a CPU affinity allowed on the current machine.
+`--keep-active` keeps workers polling throughout warmup and measurement; without it, the team
+uses its ordinary bounded spin and park policy. This layer benchmark does not apply the Program's
+adaptive waiting policy.
 
 For a timeline, capture this executable with `nsys --trace=cuda,nvtx`; the model marks CPU input
 wait and CPU computation separately. `--profile` brackets measured calls with CUDA profiler API

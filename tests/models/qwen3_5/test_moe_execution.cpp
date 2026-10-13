@@ -363,15 +363,17 @@ int qualify_schedule(const DeviceContext& device, const CpuTopology& topology,
     GuardedDeviceBuffer storage(plan->bridge.gpu_workspace_bytes);
     MemoryArena workspace(storage.span());
     int failures = 0;
-    for (const int tokens : {1, 8, 9, 48, 1024, 1, 8, 9, 1}) {
+    for (const int tokens : {1, 1, 8, 8, 9, 48, 1024, 1, 1, 8, 9, 1}) {
         std::array<std::unique_ptr<Call>, 4> calls;
         for (std::size_t i = 0; i < calls.size(); ++i) {
             calls[i] = std::make_unique<Call>(*fixtures[i], tokens, i % 3);
         }
-        resources.begin(tokens);
-        for (std::size_t i = 0; i < calls.size(); ++i) {
-            resources.before_layer(i);
-            resources.execute(i, calls[i]->device.x, calls[i]->residual, workspace, {});
+        {
+            const auto cpu_activity = resources.begin(tokens);
+            for (std::size_t i = 0; i < calls.size(); ++i) {
+                resources.before_layer(i);
+                resources.execute(i, calls[i]->device.x, calls[i]->residual, workspace, {});
+            }
         }
         resources.synchronize();
         for (auto& call : calls)

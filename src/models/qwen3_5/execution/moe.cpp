@@ -181,7 +181,7 @@ MoeExecutionRequirements describe_moe_execution(const ops::MoeProfile& profile, 
     return {frame.device_bytes, frame.pinned_bytes, cpu_bytes, std::max(route_bytes, gpu_bytes)};
 }
 
-void moe(const Tensor& hidden, const MoeParameters& parameters, const MoePartitionView& partition,
+bool moe(const Tensor& hidden, const MoeParameters& parameters, const MoePartitionView& partition,
          const ExpertBankSource& source, const ExpertBankDeviceView& bank, Tensor& residual,
          MemoryArena& workspace, MoeExecutionView execution, const ops::MoeExecutionHints& hints) {
     const auto& profile = parameters.profile;
@@ -200,7 +200,7 @@ void moe(const Tensor& hidden, const MoeParameters& parameters, const MoePartiti
     try {
         if (partition.gpu_kind == Subset::All) {
             moe(hidden, parameters, bank, residual, hints, scratch, execution.cuda);
-            return;
+            return false;
         }
         if (!execution.host) { throw std::invalid_argument("mixed MoE requires Host resources"); }
         auto& host = *execution.host;
@@ -222,13 +222,19 @@ void moe(const Tensor& hidden, const MoeParameters& parameters, const MoePartiti
         Frame frame = FrameLayout(profile, hidden.ne[1]).bind(host.device_frame, host.host_frame);
         const ops::RouteProfile route{profile.routed.ffn.hidden, profile.routed.experts,
                                       profile.routed.top_k};
+        // Small frames cost more to hand between streams than to copy in place. Larger
+        // frames keep DMA on the bridge so input/output traffic can overlap GPU experts.
+        const bool parallel_copy = hidden.ne[1] > 8;
+        const auto transfer      = parallel_copy ? host.transfer : execution.cuda;
         ops::topk_softmax_route(hidden, route, parameters.control, frame.device_routes,
                                 frame.shared, scratch, execution.cuda);
-        host.route_ready.record(execution.cuda.stream());
-        host.route_ready.wait(host.transfer.stream());
-        copy_bytes_async(bytes(frame.host_input, true), bytes(hidden), host.transfer);
-        copy_bytes_async(frame.host_route_bytes, frame.device_route_bytes, host.transfer);
-        host.host_ready.record(host.transfer.stream());
+        if (parallel_copy) {
+            host.route_ready.record(execution.cuda.stream());
+            host.route_ready.wait(transfer.stream());
+        }
+        copy_bytes_async(bytes(frame.host_input, true), bytes(hidden), transfer);
+        copy_bytes_async(frame.host_route_bytes, frame.device_route_bytes, transfer);
+        host.host_ready.record(transfer.stream());
 
         ops::routed_swiglu(hidden, profile.routed, {bank, parameters.activation_divisors},
                            frame.device_routes, partition.gpu(), {parameters.shared, frame.shared},
@@ -246,7 +252,7 @@ void moe(const Tensor& hidden, const MoeParameters& parameters, const MoePartiti
         if (!cpu_work) {
             const std::array contributions{frame.gpu_partial};
             ops::sum_contributions(contributions, &residual, residual, execution.cuda);
-            return;
+            return false;
         }
         {
             nvtx::ScopedRange cpu(nvtx::Name::MoeCpu, nvtx::Category::Moe);
@@ -256,11 +262,14 @@ void moe(const Tensor& hidden, const MoeParameters& parameters, const MoePartiti
                                host.cpu);
         }
         copy_bytes_async(bytes(frame.device_cpu_partial), bytes(frame.host_partial, true),
-                         host.transfer);
-        host.partial_ready.record(host.transfer.stream());
-        host.partial_ready.wait(execution.cuda.stream());
+                         transfer);
+        if (parallel_copy) {
+            host.partial_ready.record(transfer.stream());
+            host.partial_ready.wait(execution.cuda.stream());
+        }
         const std::array contributions{frame.gpu_partial, frame.device_cpu_partial};
         ops::sum_contributions(contributions, &residual, residual, execution.cuda);
+        return true;
     } catch (...) {
         drain_after_failure(execution);
         throw;

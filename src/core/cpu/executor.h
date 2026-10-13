@@ -38,10 +38,27 @@ using CpuWork = void (*)(void*, const CpuWorkerContext&) noexcept;
 
 class CpuExecutionView {
 public:
+    class ActiveScope {
+    public:
+        ~ActiveScope();
+        ActiveScope(const ActiveScope&)            = delete;
+        ActiveScope& operator=(const ActiveScope&) = delete;
+        ActiveScope(ActiveScope&&) noexcept;
+        ActiveScope& operator=(ActiveScope&&) = delete;
+
+    private:
+        friend class CpuExecutionView;
+        explicit ActiveScope(CpuExecutor&);
+        CpuExecutor* owner_;
+    };
+
     [[nodiscard]] Device device() const noexcept { return Device::cpu(); }
 
     [[nodiscard]] std::uint32_t worker_count() const noexcept;
     [[nodiscard]] CpuFeatures features() const noexcept;
+    // Wake the team and keep it polling between collectives until the scope ends.
+    // Does not submit work or wait for workers. One scope per executor; it borrows the owner.
+    [[nodiscard]] ActiveScope keep_active() const;
     // Synchronous collective: all writes are visible on return. Arguments and storage are
     // borrowed until then. No nested/concurrent run, worker CUDA calls or escaping exceptions.
     void run(CpuWork, void* arguments) const;
@@ -70,6 +87,7 @@ public:
 
 private:
     friend class CpuExecutionView;
+    friend class CpuExecutionView::ActiveScope;
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

@@ -14,6 +14,7 @@
 #include <cmath>
 #include <iostream>
 #include <numeric>
+#include <optional>
 #include <random>
 #include <string_view>
 #include <thread>
@@ -29,7 +30,8 @@ struct Options {
     int layer = 0, tokens = 1, gpu_experts = 128, workers = 16, caller_cpu = -1;
     int samples = 240, gap_us = 0;
     std::string distribution = "independent", schedule = "both";
-    bool profile = false;
+    std::string gpu_selection = "ordered";
+    bool profile = false, keep_active = false;
 };
 
 int number(std::string_view text) {
@@ -57,6 +59,8 @@ Options parse(int argc, char** argv) {
             result.tokens = number(value());
         else if (argument == "--gpu-experts")
             result.gpu_experts = number(value());
+        else if (argument == "--gpu-selection")
+            result.gpu_selection = value();
         else if (argument == "--workers")
             result.workers = number(value());
         else if (argument == "--caller-cpu")
@@ -71,13 +75,18 @@ Options parse(int argc, char** argv) {
             result.schedule = value();
         else if (argument == "--profile")
             result.profile = true;
+        else if (argument == "--keep-active")
+            result.keep_active = true;
         else
             throw std::invalid_argument(
                 "--artifact PATH [--layer N] [--tokens T] [--gpu-experts N] [--workers N] "
+                "[--gpu-selection ordered|shuffled] "
                 "[--caller-cpu N] [--samples N] [--gap-us N] "
-                "[--distribution same|independent] [--schedule parallel|serial|both] [--profile]");
+                "[--distribution same|independent] [--schedule parallel|serial|both] "
+                "[--keep-active] [--profile]");
     }
     if (result.artifact.empty() || !result.tokens || !result.workers || !result.samples ||
+        (result.gpu_selection != "ordered" && result.gpu_selection != "shuffled") ||
         (result.distribution != "same" && result.distribution != "independent") ||
         (result.schedule != "parallel" && result.schedule != "serial" &&
          result.schedule != "both")) {
@@ -271,8 +280,15 @@ void run(const Options& options) {
     config.capacity_bytes = description.banks[0].entry_bytes * e;
     ExpertCache cache(sources, describe_expert_cache(sources, config), device,
                       device.transfer_view());
-    std::vector<std::int32_t> selected(options.gpu_experts);
+    std::vector<std::int32_t> selected(e);
     std::iota(selected.begin(), selected.end(), 0);
+    if (options.gpu_selection == "shuffled") {
+        std::mt19937 selection(8191);
+        std::shuffle(selected.begin(), selected.end(), selection);
+    }
+    selected.resize(options.gpu_experts);
+    std::vector<bool> on_gpu(e);
+    for (const auto id : selected) on_gpu[id] = true;
     model::detail::MoePartition partition({0}, e, selected, device);
     const auto requirements = model::execution::describe_moe_execution(
         p.profile, partition.gpu_kind(), options.tokens, options.tokens);
@@ -315,7 +331,7 @@ void run(const Options& options) {
                               cudaMemcpyDeviceToHost));
         std::vector<bool> cpu_seen(e), gpu_seen(e);
         for (const auto id : routes) {
-            if (id < options.gpu_experts) {
+            if (on_gpu[id]) {
                 ++gpu_assignments;
                 gpu_union[id] = gpu_seen[id] = true;
             } else {
@@ -344,9 +360,10 @@ void run(const Options& options) {
               << " gu_policy=" << static_cast<int>(p.profile.routed.ffn.gate_up_policy)
               << " down_policy=" << static_cast<int>(p.profile.routed.ffn.down_policy)
               << " tokens=" << options.tokens << " gpu_experts=" << options.gpu_experts
+              << " gpu_selection=" << options.gpu_selection
               << " workers=" << team.worker_cpus.size() << " caller_cpu=" << options.caller_cpu
               << " distribution=" << options.distribution << " samples=" << options.samples
-              << " gap_us=" << options.gap_us << '\n';
+              << " gap_us=" << options.gap_us << " keep_active=" << options.keep_active << '\n';
     std::cout << "worker_cpus=";
     for (std::size_t i = 0; i < team.worker_cpus.size(); ++i) {
         if (i) std::cout << ',';
@@ -387,6 +404,9 @@ void run(const Options& options) {
     // Alternate measured order; initialization and warmup do not enter the wall samples.
     const bool parallel   = options.schedule != "serial" || !execution.host;
     const bool serialized = options.schedule != "parallel" && execution.host.has_value();
+    const auto activity   = options.keep_active && execution.host
+                                ? std::optional(execution.host->cpu.keep_active())
+                                : std::nullopt;
     const auto warmup     = Clock::now();
     int iteration         = 0;
     do {

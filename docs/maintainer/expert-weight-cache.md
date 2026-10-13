@@ -197,12 +197,18 @@ scratch 上界，可对多个 profile 取最大值；GPU scratch 由调用者提
 纯 GPU 分工不建立 CPU team 或 bridge，完整融合调用显式接受 resident/indexed bank。
 
 调用方先用 cache `prepare/progress` 发布 required。混合调用先在计算流提交 route，
-再由 bridge 等待并回传 hidden 和连续的 IDs/coefficients。调用方持有 GPU 分工的 lease，提交 GPU
-routed/shared；控制线程等输入就绪后运行同步 CPU collective，与 GPU 分支重叠。
-CPU FP32 分项上传后，计算流等待并合并两份分项与 residual。正常路径只等待 CPU 输入，
+回传 hidden 和连续的 IDs/coefficients，再提交 GPU routed/shared。小 T 的复制直接按计算流
+排序，较大 T 使用独立 bridge 流及事件，使传输与 GPU 计算重叠。调用方持有 GPU 分工的 lease；
+控制线程等输入就绪后运行同步 CPU collective，与 GPU 分支重叠。
+CPU FP32 分项通过同一传输流上传，计算流按依赖合并两份分项与 residual。正常路径只等待 CPU 输入，
 最终输出按计算流排序。一份 frame 由单个控制线程在固定 streams 上连续复用；下一次
 route/D2H 经过上一层 combine，因而不会覆盖仍在上传的 Host 分项。资源销毁排空两条流。
 若本次路由没有 CPU assignment，跳过 CPU collective 和分项回传。单层 cache 交接在 capture 外执行。
+
+Program 记录每次完整 traversal 中实际参与计算的 CPU 层数；连续相同 T 下，CPU 频繁参与时
+在层间保持团队轮询，稀疏参与时允许休眠。启停使用不同阈值，T 改变或 traversal 未完成时
+重新观察。该策略不依赖 expert 的具体 ID、GPU 命中率假设或请求阶段，作用域在 traversal
+结束时释放；完整 GPU 流式计算不保持 CPU 团队活跃。
 
 ## Engine 预算与逐层执行
 

@@ -64,7 +64,8 @@ struct MoeExecutionView {
 // A single caller reuses the frame on its fixed compute/bridge streams, outside capture.
 // CPU work finishes before return; output and GPU workspace follow compute-stream ordering.
 // Sources, partition and execution resources remain live through their asynchronous consumers.
-void moe(const Tensor& hidden, const MoeParameters& parameters, const MoePartitionView& partition,
+// Returns whether a CPU contribution was evaluated, for the caller's waiting policy.
+bool moe(const Tensor& hidden, const MoeParameters& parameters, const MoePartitionView& partition,
          const ExpertBankSource& source, const ExpertBankDeviceView& bank, Tensor& residual,
          MemoryArena& workspace, MoeExecutionView execution,
          const ops::MoeExecutionHints& hints = {});

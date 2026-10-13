@@ -4,6 +4,7 @@
 #include <sched.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cfenv>
 #include <chrono>
@@ -116,6 +117,47 @@ void reject_nested() {
     call.execution.run([](void*, const CpuWorkerContext&) noexcept {}, nullptr);
 }
 
+void active_scope() {
+    CpuTopology topology;
+    const auto workers = std::min<std::size_t>(4, cpu_worker_order(topology.info()).size());
+    CpuExecutor executor(topology, plan_cpu_team(topology.info(), workers));
+    const auto execution = executor.execution_view();
+    std::array<std::atomic<unsigned>, 4> calls{};
+    const auto count = [](void* pointer, const CpuWorkerContext& worker) noexcept {
+        auto* calls = static_cast<std::atomic<unsigned>*>(pointer);
+        calls[worker.rank()].fetch_add(1, std::memory_order_relaxed);
+        worker.barrier();
+    };
+    for (unsigned i = 0; i < 100; ++i) {
+        {
+            auto active = execution.keep_active();
+            if (i % 20 == 0) std::this_thread::sleep_for(std::chrono::milliseconds(3));
+            for (std::size_t rank = 0; rank < workers; ++rank)
+                require(calls[rank].load() == i, "waking the team replayed a collective");
+            execution.run(count, calls.data());
+            auto moved    = std::move(active);
+            bool rejected = false;
+            try {
+                const auto nested = execution.keep_active();
+            } catch (const std::logic_error&) { rejected = true; }
+            require(rejected, "overlapping active scopes were accepted");
+        }
+        for (std::size_t rank = 0; rank < workers; ++rank)
+            require(calls[rank].load() == i + 1, "active collective completion was lost");
+    }
+    try {
+        const auto active = execution.keep_active();
+        throw std::runtime_error("unwind activity");
+    } catch (const std::runtime_error&) {}
+    {
+        const auto active = execution.keep_active();
+        execution.run(count, calls.data());
+    }
+    execution.run(count, calls.data());
+    for (std::size_t rank = 0; rank < workers; ++rank)
+        require(calls[rank].load() == 102, "scope teardown changed collective execution");
+}
+
 void reject_concurrent() {
     CpuTopology topology;
     CpuExecutor executor(topology, plan_cpu_team(topology.info(), 1));
@@ -155,6 +197,7 @@ int main() {
         run_case(std::min<std::size_t>(4, cpu_worker_order(topology.info()).size()));
         reject_nested();
         reject_concurrent();
+        active_scope();
         std::cout << "OK CPU executor\n";
     } catch (const std::exception& e) {
         std::cerr << e.what() << '\n';

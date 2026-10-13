@@ -25,7 +25,7 @@ std::string prefill_signature(const Model& model, const detail::MoePlan* moe, st
                {"layer_types", t.layer_types}};
     if (moe) {
         auto& execution = facts["moe_execution"];
-        execution       = {{"implementation", "eager-fixed-windows-1"},
+        execution       = {{"implementation", "eager-fixed-windows-2"},
                            {"chunk", chunk},
                            {"workers", moe->team.worker_cpus.size()},
                            {"cache_bytes", moe->cache.config.capacity_bytes},

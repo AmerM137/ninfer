@@ -5,6 +5,7 @@
 #include "models/qwen3_5/execution/moe.h"
 
 #include <memory>
+#include <optional>
 #include <vector>
 
 namespace ninfer::models::qwen3_5::detail {
@@ -68,7 +69,8 @@ public:
     MoeResources(const MoeResources&)            = delete;
     MoeResources& operator=(const MoeResources&) = delete;
 
-    void begin(std::int32_t tokens);
+    // Retain the activity through the traversal; GPU-only streaming does not wake the team.
+    [[nodiscard]] std::optional<CpuExecutionView::ActiveScope> begin(std::int32_t tokens);
     void before_layer(std::size_t layer);
     void execute(std::size_t layer, const Tensor& hidden, Tensor& residual, MemoryArena& workspace,
                  const ops::MoeExecutionHints& hints);

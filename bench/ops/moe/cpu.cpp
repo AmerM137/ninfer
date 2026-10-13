@@ -283,7 +283,7 @@ struct Options {
     std::vector<std::uint32_t> workers{8}, tokens{1}, active{1, 2, 4, 8};
     CpuAffinity cpus;
     std::optional<std::uint32_t> caller_cpu;
-    bool smt = false, workers_given = false, read_reference = false;
+    bool smt = false, workers_given = false, read_reference = false, keep_active = false;
     std::string cache = "both", distribution = "same";
     std::uint32_t samples = 200, banks = 0, gap_us = 0;
 };
@@ -320,7 +320,9 @@ void measure(const Options& options, std::vector<std::unique_ptr<Bank>>& banks,
     const ops::CpuSwiGLUExperts no_weights;
     const ops::ExpertSubset subset{kind, Tensor(mask.data(), Device::cpu(), DType::I32, {E})};
     const auto execution = executor.execution_view();
-    const auto call      = [&](std::size_t index) {
+    const auto activity =
+        options.keep_active ? std::optional(execution.keep_active()) : std::nullopt;
+    const auto call = [&](std::size_t index) {
         const auto& sample  = corpus[index % corpus.size()];
         const auto& weights = active ? banks[sample.bank]->weights : no_weights;
         ops::routed_swiglu(x, profile, weights, sample.routes, subset, out, arena, execution);
@@ -440,6 +442,7 @@ int main(int argc, char** argv) {
                        ">=4x reported LLC)\n"
                        "--gap-us N              outside-call gap, included in process CPU "
                        "accounting (default 0)\n"
+                       "--keep-active           keep workers polling between calls\n"
                        "--read-reference        also time a read-only reference with the same row "
                        "ownership\n";
                 return 0;
@@ -450,6 +453,10 @@ int main(int argc, char** argv) {
             }
             if (arg == "--smt") {
                 options.smt = true;
+                continue;
+            }
+            if (arg == "--keep-active") {
+                options.keep_active = true;
                 continue;
             }
             if (++i == argc) throw std::invalid_argument("missing option value");
@@ -523,6 +530,7 @@ int main(int argc, char** argv) {
                   << " reported_llc_bytes=" << llc_bytes << " banks=" << banks.size()
                   << " format=" << format_name(options.down_format)
                   << " expert_bytes=" << expert_bytes << " bank_bytes=" << E * expert_bytes
+                  << " keep_active=" << options.keep_active
                   << " plane_layout=native_parent_row_views cpu_clock=process_cputime compiler="
                   << __VERSION__ << '\n';
         std::cout << "# caller_cpu_ids=";
