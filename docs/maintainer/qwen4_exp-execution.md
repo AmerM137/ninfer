@@ -364,11 +364,11 @@ lead 规划，不假定与 Main 相同。最终容量、Host reservation、迁�
 
 1. **PLE Program 编排。** 将已有准备组件及 GPU Ops 接入输入 IDs
    handoff、预取、Main Graph 分段、取消与完整 unit 的资源退役。接口见 PLE I/O。
-2. **MoE 与 expert streaming。** 在现有 rank-3 bank 表示上落实 Main NVFP4 和 MTP
-   block-FP8 expert 计算，以及路由/shared
-   计算、完整 Op 边界、A16/A4 及 activation divisor 复用、cache lease/eviction、
-   计算前 readiness、搬运粒度和重叠。Grouped/fused 策略与驻留调度仍需细化，不重新
-   下放成一轮纯 Linear 任务；PLE 与 expert H2D 的实际竞争也须在完整 schedule 评估。
+2. **MoE 与 expert streaming。** 按 [GPU MoE 设计](qwen4_exp-moe-gpu.md)在现有 rank-3
+   bank 上落实 Main W4A4、MTP W8A8/G128 动态激活及 BF16 router/shared，小 M 比较 A16。
+   还需接入 cache lease/eviction、计算前 readiness、搬运粒度和重叠。
+   GPU 计算保持固定 Graph 拓扑；驻留调度由 Program 处理。PLE 与 expert
+   H2D 的实际竞争在完整 schedule 评估。
    Bank/cache、固定区与流式窗口规划、混合执行及预取已有 `models/common/moe` 公共组件；
    接入时提供本模型的计算 profile、策略和 `Write` 出口，由 HC 消费 block 输出。
 3. **原生模型集成。** Qwen4Exp binder、驻留、Parameters、planner、StateImage、层

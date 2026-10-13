@@ -77,7 +77,8 @@ QSA 的四个 index heads 共同选出完整块，供所有 24 个 query heads �
 O projection。精确数学、选块、表示边界与 cache codec 见
 [qsa.h](../../include/ninfer/ops/qsa.h)。
 
-MoE router 从 BF16 投影结果计算 FP32 softmax，选 top-10，并重新归一化选中概率：
+MoE router 对 BF16 输入与权重计算 logits，选 top-10，并以 FP32 softmax 归一化选中概率。
+投影和逐 expert 累加的私有 BF16 舍入不构成额外数学边界：
 
 ```text
 expert_e(x) = W_down_e * (SiLU(W_gate_e*x) * (W_up_e*x))
@@ -86,8 +87,9 @@ shared(x)   = sigmoid(W_shared_gate*x) * shared_ffn(x)
 moe(x)      = routed(x) + shared(x)
 ```
 
-Shared FFN 使用同样的 SwiGLU 结构。MoE 的执行接口、路由和流式 expert 调度仍由
-[执行需求](qwen4_exp-execution.md)细化。
+Shared FFN 使用同样的 SwiGLU 结构。GPU 接口、数值与 kernel 方案见
+[GPU MoE 设计](qwen4_exp-moe-gpu.md)；流式 expert 调度和模型交接见
+[执行需求](qwen4_exp-execution.md)。
 
 MTP 从 Main 最后一层、final mixer 之前的完整 10240 维特征开始；后续 draft step 使用
 前一步 MTP 的 pre-final-mixer 特征。其初始化数学为：
@@ -121,14 +123,14 @@ NVIDIA 来源为完整 `nvidia/Qwen3.8-Flash-Next-NVFP4` checkpoint，以 `--sou
 
 | 部分 | 持久表示 | 计算许可/消费方式 |
 |---|---|---|
-| Main routed gate/up/down | NVIDIA NVFP4，G16/E4M3FN scale，bank 内每 expert 矩阵一个 FP32 divisor | `AllowA4`；同一编码供 A16 或已资格化的 A4 路线 |
+| Main routed gate/up/down | NVIDIA NVFP4，G16/E4M3FN scale，bank 内每 expert 矩阵一个 FP32 divisor | `AllowA4`；GPU 目标以 W4A4 为主，小 M 比较 A16 |
 | Main GDN QKVZ/output、QSA Q/gate/output | BF16 源转 Q8 G32/FP16 scale | `A16Only` |
 | HC、QSA K/V/indexer、PLE 投影、router/shared FFN | 原 BF16 words | `A16Only` |
 | GDN AB、conv/norm，其他 norm/bias | 原 BF16 words | 投影 A16；其余按各自 Op 数学 |
 | GDN A_log / dt_bias | 源 BF16 精确展开为 FP32，各 `[48]` | 保留原始含义，不预计算 exp |
 | Token embedding / LM head | 两份独立 BF16 对象 | lookup / A16 head；MTP 共享对应对象 |
 | PLE 表 | BF16 源转 `nf4_g16_e4m3fn` | lookup 解码为 BF16 |
-| MTP routed experts | NVIDIA E4M3FN codes，128×128 块 BF16 multiplier | `A16Only`，原编码导入 |
+| MTP routed experts | NVIDIA E4M3FN codes，128×128 块 BF16 multiplier | `AllowA8`；GPU 目标为 W8A8/G128 动态激活，小 M 比较 A16 |
 | MTP 其他独有参数、全部 Vision | 原 BF16 words | 投影 `A16Only` |
 | PLE controls | 原始 35 个 INT64 | 无损资源，见 §4 |
 
@@ -178,10 +180,15 @@ MTP 使用 `fp8_e4m3fn_block128x128_bf16`，源 `weight` 和 `weight_scale_inv` 
 E4M3FN codes 和 BF16 块乘数，重建为 `code_value * scale`。Gate/up 的 scale 可以不同；
 640 行边界与 128 行块对齐，合并时直接拼接各自 codes 和 scale 行，不改变数值表示。
 
+Recipe 与产物的 MTP expert Uses 使用 `AllowA8`。GPU 计算目标为 W8A8：每 token 沿 K
+按 128 个值动态量化为 E4M3FN，activation scales 使用 FP32；小 M 的 A16 仅作为性能
+候选。原权重 codes/scales 和布局不变，不需要静态 activation calibration 张量。
+具体计算方案见 [GPU MoE 设计](qwen4_exp-moe-gpu.md)。
+
 PLE 使用 [stored_scale_mse](tensor-formats.md#36-stored_scale_mse-conversion-method)，
 每个原始 shard 独立计算完整 `amax` 与 divisor。固定 codebook、完整 scale 候选域、
 FP64 误差和平局规则由该通用合同维护。分块只改变工作集，不能改变分组或 divisor。
-MTP 保持 A16 激活许可；完整量化组合的模型质量及 MTP 接受率在模型接入后验证。
+完整量化组合的模型质量及 MTP 接受率在模型接入后验证。
 
 ## 3. 物理 parent 与行顺序
 

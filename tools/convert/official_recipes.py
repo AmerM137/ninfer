@@ -361,6 +361,13 @@ def qwen3_8_flash_next(model, recipe, sources):
                 method=import_encoded,
                 order=(2, 1, order),
             )
+        for role in ("gate", "up", "down"):
+            name = p + role
+            recipe.use(
+                name,
+                model.parameters[name].inputs[0],
+                activation_policy="AllowA8",
+            )
 
     rows, k = cfg["ple_shard_shape"]
     for shard in range(cfg["split_ngram_parts"]):
