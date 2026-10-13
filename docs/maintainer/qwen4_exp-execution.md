@@ -357,12 +357,12 @@ lead 规划，不假定与 Main 相同。最终容量、Host reservation、迁�
 | GDN input 与 ReplaySSM | Q8 `[16384,2560]` 的 `linear_split`、融合投影/卷积 snapshot/record 及各自容量查询；`(36,16,48,10240)` 全层 fold 已实现 |
 | QSA | 分段输入投影、五类 KV 的 Prepare/Sparse GQA、Indexer、tail extraction 已实现 |
 | Paged KV 机制 | `tokens_per_row=1/4` 的共同逻辑页及 Host/Device plane 布局、传输和相应覆盖语义已有通用实现；模型 pool/StateImage 接入仍待完成 |
-| PLE GPU 局部能力 | 共享合同、`ple_conv_add`、`ple_conv_add_norm`、`ple_state_extract` 已实现；Gate 目前只有声明 |
+| PLE GPU 局部能力 | `ple_gate`、`ple_conv_add`、`ple_conv_add_norm`、`ple_state_extract` 已实现；Gate 直接消费合并 K/V view，写 BF16 U 和正式 N records |
 | PLE 准备组件 | 精确 hash/NF4 解码、磁盘 backing、行/页去重与缓存、增量窗口、取消和 GPU 双槽交接已实现，并通过真实权重查表及 K/V Linear 消费验证；完整 Program 编排尚未接入 |
 
 真实剩余工作如下；已完成项不再作为重新开展独立调优活动的前置任务。
 
-1. **PLE Gate 与 Program 编排。** 实现 `ple_gate`；将已有准备组件接入输入 IDs
+1. **PLE Program 编排。** 将已有准备组件及 GPU Ops 接入输入 IDs
    handoff、预取、Main Graph 分段、取消与完整 unit 的资源退役。接口见 PLE I/O。
 2. **MoE 与 expert streaming。** 在现有 rank-3 bank 表示上落实 Main NVFP4 和 MTP
    block-FP8 expert 计算，以及路由/shared

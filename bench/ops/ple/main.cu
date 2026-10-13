@@ -32,7 +32,10 @@ int main(int argc, char** argv) {
                                          std::to_string(options.inplace));
                     }
             };
-            if (options.op == "state-extract") {
+            if (options.op == "gate") {
+                ple::GateFixture fixture(options, t);
+                run(fixture);
+            } else if (options.op == "state-extract") {
                 ple::ExtractFixture fixture(options, t);
                 row.commits = ple::csv_list(fixture.commits);
                 run(fixture);

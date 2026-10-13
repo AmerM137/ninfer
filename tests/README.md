@@ -131,6 +131,10 @@ HC suites qualify the public [gated residual forms](../include/ninfer/ops/gated_
 including Mix, using [family-owned criteria](ops/gated_residual/criteria.h). Exact copying and
 mathematical outputs retain their respective references and the public BF16 residual boundary.
 
+PLE GPU Ops run with `ctest --test-dir build -R '^ninfer_ple_(gate|conv|state_extract)_test$'`.
+Gate uses an independent FP64 oracle for U and norm(actual BF16 U), including strided projections,
+record windows, masks, Graph replay and the Conv/StateExtract handoff. These tests perform no file I/O.
+
 Linear tests are independently runnable by weight and activation-compute profile:
 
 ```bash

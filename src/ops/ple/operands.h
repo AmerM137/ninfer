@@ -16,6 +16,10 @@ inline bool pair_aligned(const Tensor& t) {
     return true;
 }
 
+void validate_gate(const PleProjectionView& projected, const Tensor& residual,
+                   const PleGateParameters& parameters, const PleBatchView& batch,
+                   const PleConvRecordWindowView& records, const Tensor& gated,
+                   CudaExecutionView execution);
 void validate_conv(const Tensor& residual, const Tensor& gated, const Tensor& kernel,
                    const PleBatchView& batch, const PleConvStateView& before,
                    const PleConvRecordWindowView& current, const Tensor& updated,

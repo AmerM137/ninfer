@@ -11,6 +11,47 @@ namespace ninfer::bench::ple {
 
 inline constexpr int H = 2560, C = 4, D = H * C;
 
+struct GateFixture {
+    const Options& options;
+    int tokens, capacity;
+    DeviceBuffer projected, residual, norm_key, norm_query, norm_conv, gated, records;
+    std::vector<int> counts;
+    DeviceBuffer valid, offsets;
+
+    GateFixture(const Options& o, int t)
+        : options(o), tokens(t), capacity(t + o.offset),
+          projected(make_bf16(std::size_t(D + H) * t * o.batch, 301, -1, 1)),
+          residual(make_bf16(std::size_t(D) * t * o.batch, 307, -1, 1)),
+          norm_key(make_bf16(D, 311, -.4f, .4f)), norm_query(make_bf16(D, 313, -.4f, .4f)),
+          norm_conv(make_bf16(D, 317, -.4f, .4f)),
+          gated(make_zeros(std::size_t(D) * t * o.batch * 2)),
+          records(make_zeros(std::size_t(D) * capacity * o.batch * 2)),
+          counts(extents(o.valid, t, o.batch)), valid(measurement::make_i32(counts)),
+          offsets(measurement::make_i32(std::vector<int>(o.batch, o.offset))) {}
+
+    void restore(CudaExecutionView) const {}
+
+    void launch(CudaExecutionView execution) {
+        const int b = options.batch;
+        Tensor parent(projected.span(), DType::BF16, {D + H, tokens, b});
+        const auto keys = parent.slice(0, 0, D);
+        Tensor key(keys.data, keys.device, DType::BF16, {H, C, tokens, b});
+        key.nb[2] = parent.nb[1];
+        key.nb[3] = parent.nb[2];
+        Tensor h(residual.span(), DType::BF16, {H, C, tokens, b}),
+            u(gated.span(), DType::BF16, {H, C, tokens, b});
+        const ops::PleGateParameters parameters{Tensor(norm_key.span(), DType::BF16, {H, C}),
+                                                Tensor(norm_query.span(), DType::BF16, {H, C}),
+                                                Tensor(norm_conv.span(), DType::BF16, {H, C}),
+                                                1e-6f};
+        ops::ple_gate({key, parent.slice(0, D, H)}, h, parameters,
+                      {Tensor(valid.span(), DType::I32, {b})},
+                      {Tensor(records.span(), DType::BF16, {D, capacity, b}),
+                       Tensor(offsets.span(), DType::I32, {b})},
+                      u, execution);
+    }
+};
+
 struct ConvFixture {
     const Options& options;
     int tokens, capacity;

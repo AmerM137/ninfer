@@ -624,16 +624,22 @@ at graph construction; eager timing includes their submission on every call.
   --op record --value-heads 48 --tokens 2,8,16 --batch 8 --valid mixed
 ```
 
-## PLE convolution and state extraction
+## PLE gate, convolution and state extraction
 
-`ninfer_ple_bench` measures `--op conv-add|conv-add-norm|state-extract` at H=2560,
+`ninfer_ple_bench` measures `--op gate|conv-add|conv-add-norm|state-extract` at H=2560,
 four streams, dilation=3 and nine history columns. It uses the shared Op measurement harness
 described above, with zero global workspace. `--valid` and `--accepted` accept `dense`, `mixed`,
-or comma-separated per-row counts; zero counts are supported. `--offset` selects the convolution
+or comma-separated per-row counts; zero counts are supported. `--offset` selects the Gate/Conv
 record window. `--inplace` updates the residual or selected history slots and restores the input
 before each measurement. CSV includes the actual counts, record offset and alias mode.
+Gate consumes slices of one packed BF16 `[12800,T,B]` K/V parent and writes U plus N records.
+It has no in-place form. Its unique activation traffic is 85 KiB per active token, plus U zero
+writes for inactive tokens; the three norm vectors total 60 KiB and are reused across tokens.
+This logical-byte count is not a measurement of DRAM traffic or cache reuse.
 
 ```bash
+./build/bench/ninfer_ple_bench --op gate --tokens 1,16,256,1024,2048,4096 --cache both
+./build/bench/ninfer_ple_bench --op gate --tokens 5,16 --batch 8 --valid mixed --offset 5
 ./build/bench/ninfer_ple_bench --op conv-add-norm --tokens 1,16,1024,2048,4096 --cache cold
 ./build/bench/ninfer_ple_bench --op conv-add --tokens 16 --batch 8 --valid mixed --offset 5
 ./build/bench/ninfer_ple_bench --op state-extract --tokens 16 --batch 8 \
