@@ -1,5 +1,7 @@
 #include "ninfer/ops/moe.h"
 
+#include <bit>
+#include <cmath>
 #include <limits>
 #include <stdexcept>
 
@@ -17,6 +19,34 @@ QuantLayout matrix_layout(QuantLayout layout) {
                                                              : layout;
 }
 } // namespace
+
+void ExpertInputUsage::include(const WeightInput& input) {
+    if (!valid_linear_policy(input.policy))
+        throw std::invalid_argument("expert has invalid activation policy");
+    if (input.policy == LinearPolicy::A16Only || policy_ == LinearPolicy::A16Only)
+        policy_ = LinearPolicy::A16Only;
+    else if (input.policy == LinearPolicy::AllowA8)
+        policy_ = LinearPolicy::AllowA8;
+    if (!input.activation_input_divisor) {
+        missing_divisor_ = true;
+        return;
+    }
+    const float value = *input.activation_input_divisor;
+    if (!std::isfinite(value) || value <= 0)
+        throw std::invalid_argument("expert activation divisor must be finite and positive");
+    if (divisor_)
+        unequal_divisors_ |=
+            std::bit_cast<std::uint32_t>(*divisor_) != std::bit_cast<std::uint32_t>(value);
+    else
+        divisor_ = value;
+}
+
+std::optional<float> ExpertInputUsage::activation_divisor(QType format) const {
+    if (format != QType::NVFP4) return std::nullopt;
+    if (allows_a4(policy_) && (!divisor_ || missing_divisor_ || unequal_divisors_))
+        throw std::invalid_argument("NVFP4 expert A4 requires a common activation divisor");
+    return unequal_divisors_ || missing_divisor_ ? std::nullopt : divisor_;
+}
 
 SwiGLUProfile swiglu_profile(const SwiGLUWeights& weights) {
     return swiglu_profile(linear_profile(weights.gate_up), linear_profile(weights.down));

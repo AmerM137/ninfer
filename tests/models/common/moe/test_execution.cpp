@@ -1,5 +1,5 @@
-#include "models/qwen3_5/program/moe_resources.h"
-#include "models/qwen3_5/program/planning/moe.h"
+#include "models/common/moe/resources.h"
+#include "models/common/moe/plan.h"
 #include "ops/moe/fixture.h"
 
 #include <atomic>
@@ -10,11 +10,12 @@
 namespace {
 using namespace ninfer;
 using namespace ninfer::test;
-namespace model = ninfer::models::qwen3_5;
-using model::detail::MoePartition;
-using model::detail::MoeBridge;
-using Clock = std::chrono::steady_clock;
-using Kind  = ops::ExpertSubsetKind;
+namespace shared = ninfer::models::moe;
+using shared::Partition;
+using shared::Bridge;
+using Clock    = std::chrono::steady_clock;
+using Kind     = ops::ExpertSubsetKind;
+using Epilogue = ops::MoeEpilogue;
 
 void require(bool value, const char* message) {
     if (!value) { throw std::runtime_error(message); }
@@ -45,22 +46,28 @@ struct Call {
     moe::Batch batch;
     moe::DeviceBatch device;
     GuardedDeviceBuffer output;
-    Tensor residual;
+    Tensor destination;
+    std::vector<double> expected;
 
-    Call(moe::Fixture& fixture, int tokens, int pattern)
+    Call(moe::Fixture& fixture, int tokens, int pattern, Epilogue epilogue = Epilogue::AddResidual)
         : batch(fixture.batch(tokens, pattern)), device(batch), output(batch.residual.size() * 2),
-          residual(output.span(), DType::BF16, {moe::kHidden, tokens}) {
-        output.copy_from_host(batch.residual.data(), output.bytes());
+          destination(output.span(), DType::BF16, {moe::kHidden, tokens}),
+          expected(
+              fixture.contribution(batch, Kind::All, {}, true, epilogue == Epilogue::AddResidual)) {
+        auto initial = batch.residual;
+        if (epilogue == Epilogue::Write) std::fill(initial.begin(), initial.end(), 0x7fc1);
+        output.copy_from_host(initial.data(), output.bytes());
     }
 
     int verify(const std::string& label) {
-        return verify_reduction(label, from_device_bf16(residual.data, batch.complete.size()),
-                                batch.complete, moe::kCompleteA16) +
+        return verify_reduction(label, from_device_bf16(destination.data, expected.size()),
+                                expected, moe::kCompleteA16) +
                output.verify_guards(label);
     }
 };
 
-int qualify(QType down, const DeviceContext& device, const CpuTopology& topology) {
+int qualify(QType down, const DeviceContext& device, const CpuTopology& topology,
+            Epilogue epilogue) {
     moe::Fixture fixture(QType::Q4_G64_FP16, down);
     moe::HostBank native(fixture);
     native.register_upload(device.device());
@@ -71,8 +78,7 @@ int qualify(QType down, const DeviceContext& device, const CpuTopology& topology
     description           = describe_expert_cache(sources, config);
     ExpertCache cache(sources, description, device, device.transfer_view());
     const auto& weights = fixture.weights();
-    model::execution::MoeParameters parameters{
-        fixture.profile(), weights.control, weights.shared, {0}, {}, {}};
+    shared::Parameters parameters{fixture.profile(), weights.control, weights.shared, {0}, {}, {}};
     const auto team = plan_cpu_team(
         topology.info(), std::min<std::size_t>(4, cpu_worker_order(topology.info()).size()));
     std::vector<std::int32_t> ids(moe::kExperts), half;
@@ -80,41 +86,41 @@ int qualify(QType down, const DeviceContext& device, const CpuTopology& topology
     for (int e : ids) {
         if (e % 2) { half.push_back(e); }
     }
-    MoePartition mixed({0}, moe::kExperts, half, device), none({0}, moe::kExperts, {}, device),
+    Partition mixed({0}, moe::kExperts, half, device), none({0}, moe::kExperts, {}, device),
         all({0}, moe::kExperts, ids, device), other({1}, moe::kExperts, ids, device);
     auto requirements =
-        model::execution::describe_moe_execution(parameters.profile, Kind::MaskOnes, 1, 1024);
+        shared::describe_execution(parameters.profile, Kind::MaskOnes, epilogue, 1, 1024);
     for (auto kind : {Kind::All, Kind::None}) {
         requirements.include(
-            model::execution::describe_moe_execution(parameters.profile, kind, 1, 1024));
+            shared::describe_execution(parameters.profile, kind, epilogue, 1, 1024));
     }
     const auto all_requirements =
-        model::execution::describe_moe_execution(parameters.profile, Kind::All, 1, 128);
+        shared::describe_execution(parameters.profile, Kind::All, epilogue, 1, 128);
     require(all_requirements.pinned_frame_bytes == 0 && all_requirements.device_frame_bytes == 0 &&
                 all_requirements.cpu_workspace_bytes == 0,
             "All-GPU MoE reserved CPU resources");
-    MoeBridge resources(requirements, topology, team, device);
+    Bridge resources(requirements, topology, team, device);
     auto execution = resources.execution_view();
     GuardedDeviceBuffer workspace_storage(requirements.gpu_workspace_bytes);
     MemoryArena workspace(workspace_storage.span());
     int failures       = 0;
-    const auto execute = [&](Call& call, const MoePartition& partition,
-                             model::execution::MoeExecutionView execution) {
+    const auto execute = [&](Call& call, const Partition& partition,
+                             shared::ExecutionView execution) {
         std::optional<ExpertCacheUse> use;
         if (partition.gpu_kind() != Kind::None) {
             use = cache.acquire(partition.gpu_keys(), execution.cuda);
             if (!use) throw std::logic_error("GPU assignment was not published");
         }
         try {
-            model::execution::moe(call.device.x, parameters, partition.view(), sources[0],
-                                  cache.view({0}), call.residual, workspace, execution);
+            shared::execute(call.device.x, parameters, partition.view(), sources[0],
+                            cache.view({0}), epilogue, call.destination, workspace, execution);
         } catch (...) {
             if (use) cache.release(*use, execution.cuda);
             throw;
         }
         if (use) cache.release(*use, execution.cuda);
     };
-    const auto run = [&](Call& call, const MoePartition& partition) {
+    const auto run = [&](Call& call, const Partition& partition) {
         execute(call, partition, execution);
         require(workspace.used() == 0 && execution.host->workspace.used() == 0,
                 "MoE leaked an arena scope");
@@ -123,7 +129,7 @@ int qualify(QType down, const DeviceContext& device, const CpuTopology& topology
     // Allocate all outputs before submission so allocation does not accidentally synchronize reuse.
     std::vector<std::unique_ptr<Call>> calls;
     for (int tokens : {1024, 1, 128, 9, 48, 8, 1}) {
-        calls.push_back(std::make_unique<Call>(fixture, tokens, calls.size() % 3));
+        calls.push_back(std::make_unique<Call>(fixture, tokens, calls.size() % 3, epilogue));
     }
     publish(cache, description, mixed.gpu_keys());
     for (auto& call : calls) { run(*call, mixed); }
@@ -147,14 +153,14 @@ int qualify(QType down, const DeviceContext& device, const CpuTopology& topology
     std::vector<ExpertKey> required(mixed.gpu_keys().begin(), mixed.gpu_keys().end());
     required.insert(required.begin(), {{1}, static_cast<std::uint32_t>(keeper - occupied.begin())});
     publish(cache, description, required);
-    Call relocated(fixture, 9, 2);
+    Call relocated(fixture, 9, 2, epilogue);
     run(relocated, mixed);
     resources.synchronize();
     require(offsets(cache, {0})[half.front()] != old,
             "explicit placement did not change the indexed address");
     failures += relocated.verify("reloaded cached mixed");
 
-    Call cpu_only(fixture, 8, 0);
+    Call cpu_only(fixture, 8, 0, epilogue);
     run(cpu_only, none);
     resources.synchronize();
     failures += cpu_only.verify("CPU routed plus GPU shared");
@@ -162,9 +168,9 @@ int qualify(QType down, const DeviceContext& device, const CpuTopology& topology
     // The same fixed partial partition sees batches with zero/all CPU assignments.
     std::vector<int> selected;
     for (int e : fixture.logical(0).route.ids) { selected.push_back(e); }
-    MoePartition selected_partition({0}, moe::kExperts, selected, device);
+    Partition selected_partition({0}, moe::kExperts, selected, device);
     publish(cache, description, selected_partition.gpu_keys());
-    Call empty_cpu(fixture, 1, 0);
+    Call empty_cpu(fixture, 1, 0, epilogue);
     run(empty_cpu, selected_partition);
     resources.synchronize();
     failures += empty_cpu.verify("mixed partition with no CPU assignment");
@@ -173,18 +179,18 @@ int qualify(QType down, const DeviceContext& device, const CpuTopology& topology
         return std::find(selected.begin(), selected.end(), e) == selected.end();
     });
     const std::array one_unselected{*unselected};
-    MoePartition empty_gpu_partition({0}, moe::kExperts, one_unselected, device);
+    Partition empty_gpu_partition({0}, moe::kExperts, one_unselected, device);
     publish(cache, description, empty_gpu_partition.gpu_keys());
-    Call empty_gpu(fixture, 1, 0);
+    Call empty_gpu(fixture, 1, 0, epilogue);
     run(empty_gpu, empty_gpu_partition);
     resources.synchronize();
     failures += empty_gpu.verify("mixed partition with no GPU assignment");
 
     publish(cache, description, all.gpu_keys());
     {
-        MoeBridge gpu_only(all_requirements, topology, {}, device);
+        Bridge gpu_only(all_requirements, topology, {}, device);
         require(!gpu_only.execution_view().host, "GPU-only resources created a CPU team/bridge");
-        Call complete(fixture, 48, 1);
+        Call complete(fixture, 48, 1, epilogue);
         execute(complete, all, gpu_only.execution_view());
         gpu_only.synchronize();
         failures += complete.verify("cached complete GPU MoE");
@@ -192,8 +198,8 @@ int qualify(QType down, const DeviceContext& device, const CpuTopology& topology
 
     // Delay bridge progress, then queue another layer using the same frame immediately.
     publish(cache, description, mixed.gpu_keys());
-    std::array<std::unique_ptr<Call>, 2> delayed{std::make_unique<Call>(fixture, 128, 1),
-                                                 std::make_unique<Call>(fixture, 1, 2)};
+    std::array<std::unique_ptr<Call>, 2> delayed{std::make_unique<Call>(fixture, 128, 1, epilogue),
+                                                 std::make_unique<Call>(fixture, 1, 2, epilogue)};
     std::atomic<bool> open = false;
     cuda_check(cudaLaunchHostFunc(
                    execution.host->transfer.stream(),
@@ -214,7 +220,7 @@ int qualify(QType down, const DeviceContext& device, const CpuTopology& topology
     // An unpublished assignment fails without retaining a use or corrupting the next call.
     publish(cache, description, other.gpu_keys());
     cuda_synchronize(device.transfer_stream());
-    Call missing(fixture, 1, 0);
+    Call missing(fixture, 1, 0, epilogue);
     bool rejected = false;
     try {
         run(missing, mixed);
@@ -225,9 +231,9 @@ int qualify(QType down, const DeviceContext& device, const CpuTopology& topology
     resources.synchronize();
     failures += missing.verify("reuse after missing cache assignment");
 
-    Call teardown(fixture, 128, 1);
+    Call teardown(fixture, 128, 1, epilogue);
     {
-        MoeBridge pending(requirements, topology, team, device);
+        Bridge pending(requirements, topology, team, device);
         execute(teardown, mixed, pending.execution_view());
     }
     failures += teardown.verify("resource destruction after asynchronous return");
@@ -241,13 +247,13 @@ int qualify(QType down, const DeviceContext& device, const CpuTopology& topology
 
 void qualify_allocation() {
     for (const auto heterogeneous : {false, true}) {
-        model::detail::MoePlan plan;
+        shared::Plan plan;
         std::size_t total = 0, largest = 0;
         for (std::uint32_t i = 0; i < 4; ++i) {
-            model::detail::MoeLayerPlan layer;
-            layer.bank    = {i};
-            layer.experts = 8;
-            for (std::uint32_t e = 0; e < 8; ++e) layer.priority.push_back(7 - e);
+            shared::LayerPlan layer;
+            layer.spec.bank                   = {i};
+            layer.spec.profile.routed.experts = 8;
+            for (std::uint32_t e = 0; e < 8; ++e) layer.spec.priority.push_back(7 - e);
             plan.layers.push_back(layer);
             ExpertBankCacheLayout bank;
             bank.entry_bytes = (heterogeneous ? 2 + i * i : 2) * 256;
@@ -257,7 +263,7 @@ void qualify_allocation() {
         }
         for (std::size_t capacity = 0; capacity <= total + 256; capacity += 256) {
             plan.cache.config.capacity_bytes = capacity;
-            const bool feasible              = model::detail::plan_moe_cache(plan);
+            const bool feasible              = shared::plan_cache(plan);
             require(feasible == (capacity >= largest), "streaming capacity admission differs");
             if (!feasible) continue;
             const auto fixed        = plan.cache.config.fixed_bytes;
@@ -274,7 +280,7 @@ void qualify_allocation() {
                             "streaming window cannot complete a bank");
                 std::vector<bool> seen(8);
                 for (std::uint32_t n = 0; n < layer.fixed_experts; ++n)
-                    seen[layer.priority[n]] = true;
+                    seen[layer.spec.priority[n]] = true;
                 for (const auto& entry : layer.stream_layout) {
                     require(!seen[entry.key.expert], "streaming layout duplicates a fixed expert");
                     seen[entry.key.expert] = true;
@@ -316,48 +322,57 @@ int qualify_schedule(const DeviceContext& device, const CpuTopology& topology,
     ha.register_upload(device.device());
     hb.register_upload(device.device());
     const std::array sources{ha.source(), hb.source(), ha.source(), hb.source()};
-    const std::array<moe::Fixture*, 4> fixtures{&a, &b, &a, &b};
-    std::array<model::execution::MoeParameters, 4> parameters;
-    std::array<const model::execution::MoeParameters*, 4> inputs;
-    auto plan                = std::make_shared<model::detail::MoePlan>();
+    const std::array<moe::Fixture*, 4> fixtures{&a, &a, &b, &b};
+    const std::array<ExpertBankId, 4> order{{{2}, {0}, {3}, {1}}};
+    std::array<shared::Parameters, 4> parameters;
+    std::array<const shared::Parameters*, 4> inputs;
+    std::vector<shared::LayerSpec> specs;
+    shared::ExecutionRequirements bridge;
     const auto layout        = describe_expert_cache(sources, {});
     std::size_t largest_bank = 0;
     for (std::uint32_t i = 0; i < 4; ++i) {
         const auto& weights = fixtures[i]->weights();
-        parameters[i] = {fixtures[i]->profile(), weights.control, weights.shared, {i}, {}, {}};
+        parameters[i] = {fixtures[i]->profile(), weights.control, weights.shared, order[i], {}, {}};
         inputs[i]     = &parameters[i];
-        model::detail::MoeLayerPlan layer;
-        layer.bank              = {i};
-        layer.experts           = moe::kExperts;
-        layer.hybrid_max_tokens = one_large_layer && i != 0 ? 1024 : 8;
+        shared::LayerSpec spec;
+        spec.bank     = order[i];
+        spec.profile  = parameters[i].profile;
+        spec.epilogue = i % 2 ? Epilogue::Write : Epilogue::AddResidual;
+        spec.hybrid   = {one_large_layer && i != 0 ? 1024 : 8, 4};
         for (int e = 0; e < moe::kExperts; ++e) {
             if ((i == 0 && e % 2 == 0) || (i == 1 && e % 4 == 0) || i == 3 ||
                 (one_large_layer && i != 0)) {
-                layer.priority.push_back(e);
+                spec.priority.push_back(e);
             }
         }
         for (int e = 0; e < moe::kExperts; ++e) {
-            if (std::find(layer.priority.begin(), layer.priority.end(), e) == layer.priority.end())
-                layer.priority.push_back(e);
+            if (std::find(spec.priority.begin(), spec.priority.end(), e) == spec.priority.end())
+                spec.priority.push_back(e);
         }
         const auto kind = Kind::MaskOnes;
-        plan->bridge.include(model::execution::describe_moe_execution(parameters[i].profile, kind,
-                                                                      1, layer.hybrid_max_tokens));
-        plan->bridge.include(
-            model::execution::describe_moe_execution(parameters[i].profile, Kind::All, 1, 1024));
-        largest_bank = std::max(largest_bank, moe::kExperts * layout.banks[i].entry_bytes);
-        plan->layers.push_back(std::move(layer));
+        bridge.include(shared::describe_execution(parameters[i].profile, kind, spec.epilogue, 1,
+                                                  spec.hybrid.max_tokens));
+        bridge.include(
+            shared::describe_execution(parameters[i].profile, Kind::All, spec.epilogue, 1, 1024));
+        largest_bank =
+            std::max(largest_bank, moe::kExperts * layout.banks[order[i].index].entry_bytes);
+        specs.push_back(std::move(spec));
     }
+    std::vector<ExpertBankCacheSpec> bank_specs;
+    for (const auto& source : sources)
+        bank_specs.push_back({source.gate_up.layout, source.down.layout, false});
+    auto plan    = std::make_shared<shared::Plan>(shared::describe_plan(bank_specs, specs));
+    plan->bridge = bridge;
     ExpertCacheConfig config;
     // Exercise both one-window admission and double buffering.
     config.capacity_bytes     = bank_capacity * largest_bank;
     config.upload_slots       = 12;
     config.max_in_flight_uses = 5;
     plan->cache               = describe_expert_cache(sources, config);
-    require(model::detail::plan_moe_cache(*plan), "schedule fixture has insufficient capacity");
+    require(shared::plan_cache(*plan), "schedule fixture has insufficient capacity");
     plan->team = plan_cpu_team(topology.info(),
                                std::min<std::size_t>(4, cpu_worker_order(topology.info()).size()));
-    model::detail::MoeResources resources(plan, inputs, sources, device);
+    shared::Resources resources(plan, inputs, sources, device);
     require(resources.cache_usage().ready_cache_bytes == plan->target_bytes,
             "startup returned before the initial expert cache became ready");
     GuardedDeviceBuffer storage(plan->bridge.gpu_workspace_bytes);
@@ -366,13 +381,15 @@ int qualify_schedule(const DeviceContext& device, const CpuTopology& topology,
     for (const int tokens : {1, 1, 8, 8, 9, 48, 1024, 1, 1, 8, 9, 1}) {
         std::array<std::unique_ptr<Call>, 4> calls;
         for (std::size_t i = 0; i < calls.size(); ++i) {
-            calls[i] = std::make_unique<Call>(*fixtures[i], tokens, i % 3);
+            calls[i] =
+                std::make_unique<Call>(*fixtures[i], tokens, i % 3, plan->layers[i].spec.epilogue);
         }
         {
             const auto cpu_activity = resources.begin(tokens);
             for (std::size_t i = 0; i < calls.size(); ++i) {
-                resources.before_layer(i);
-                resources.execute(i, calls[i]->device.x, calls[i]->residual, workspace, {});
+                resources.before_layer(order[i]);
+                resources.execute(order[i], calls[i]->device.x, calls[i]->destination, workspace,
+                                  {});
             }
         }
         resources.synchronize();
@@ -396,7 +413,8 @@ int main() {
         auto& device = cuda_environment().context;
         int failures = 0;
         for (const auto down : {QType::Q5_G64_FP16, QType::Q6_G64_FP16}) {
-            failures += qualify(down, device, topology);
+            for (const auto epilogue : {Epilogue::Write, Epilogue::AddResidual})
+                failures += qualify(down, device, topology, epilogue);
         }
         failures += qualify_schedule(device, topology, 1);
         failures += qualify_schedule(device, topology, 2);

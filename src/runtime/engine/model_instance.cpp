@@ -91,7 +91,7 @@ struct StartupPlan {
     KvCapacityResolution capacity;
     bool host_experts;
     std::uint32_t chunk;
-    std::shared_ptr<const models::qwen3_5::detail::MoePlan> moe;
+    std::shared_ptr<const models::moe::Plan> moe;
 };
 
 StartupPlan plan_startup(const models::qwen3_5::LoadPlan& source,
@@ -142,7 +142,7 @@ StartupPlan plan_startup(const models::qwen3_5::LoadPlan& source,
     const auto runtime_budget = budget - headroom - host.device_capacity_bytes;
     const auto chunk          = options.prefill_chunk ? options.prefill_chunk : 4096U;
     trial.prefill_chunk       = chunk;
-    auto prototype            = std::make_shared<model::detail::MoePlan>(std::move(assignment));
+    auto prototype            = std::make_shared<models::moe::Plan>(std::move(assignment));
     auto initial              = model::make_sequence_planner(profile, device, trial, prototype);
     auto limited              = policy;
     if (limited.mode == KvCapacityMode::Automatic) {
@@ -167,7 +167,7 @@ StartupPlan plan_startup(const models::qwen3_5::LoadPlan& source,
     if (!placement) {
         throw std::invalid_argument("VRAM budget cannot hold MoE execution resources");
     }
-    auto moe        = std::make_shared<model::detail::MoePlan>(std::move(*placement));
+    auto moe        = std::make_shared<models::moe::Plan>(std::move(*placement));
     auto final      = model::make_sequence_planner(profile, device, trial, moe);
     auto resolution = resolve_kv_capacity(limited, final.capacity_curve(), runtime_budget);
     resolution.mode = policy.mode;

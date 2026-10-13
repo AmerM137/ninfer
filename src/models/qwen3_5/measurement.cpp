@@ -11,7 +11,7 @@
 
 namespace ninfer::models::qwen3_5 {
 
-std::string prefill_signature(const Model& model, const detail::MoePlan* moe, std::uint32_t chunk) {
+std::string prefill_signature(const Model& model, const moe::Plan* moe, std::uint32_t chunk) {
     using Json         = nlohmann::json;
     const auto& config = model.config();
     const auto& t      = config.text;
@@ -33,7 +33,7 @@ std::string prefill_signature(const Model& model, const detail::MoePlan* moe, st
                            {"window_count", moe->window_count},
                            {"layers", Json::array()}};
         for (const auto& layer : moe->layers) {
-            execution["layers"].push_back({layer.hybrid_max_tokens, layer.priority,
+            execution["layers"].push_back({layer.hybrid_max_tokens, layer.spec.priority,
                                            layer.fixed_experts, layer.cache_experts});
         }
     }

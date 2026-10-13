@@ -165,6 +165,11 @@ Reader、binder、原生参数准备、容量查询、warmup 和执行各自检�
 MoE 混合执行借用 CPU/CUDA 两端视图。共享专家及其余固定权重留在 GPU，Main routed
 experts 可以使用注册的 CPU 来源；其副本、预取、bridge 与完成依赖由 Program 管理。
 
+`models/common/moe` 提供跨模型的 bank 绑定、缓存规划、混合执行和资源组件。每个 Program
+独占其资源实例；组件消费有序 MoE 调用、计算 profile 和明确策略。模型负责权重角色、
+Main/MTP 放置、整机预算及层连接。`Write` 产出独立 block 输出，`AddResidual` 加回已有
+输出；HC 等模型连接留在对应架构。计算格式、shape 分派和 activation Use 准备归 Ops。
+
 ### 2.7 CPU 执行基础
 
 `CpuTopology` 记录发现线程允许使用的 OS CPU、物理核和可见缓存关系，不改变线程绑定。

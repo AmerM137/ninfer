@@ -6,13 +6,6 @@ ninfer_add_test(ninfer_qwen3_5_loading_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_loading.cpp"
   LIBRARIES ninfer_model_loading)
 
-ninfer_add_op_test(ninfer_qwen3_5_moe_execution_test
-  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_moe_execution.cpp"
-          "${PROJECT_SOURCE_DIR}/tests/ops/moe/fixture.cpp"
-  LIBRARIES ninfer_model_runtime)
-set_tests_properties(ninfer_qwen3_5_moe_execution_test PROPERTIES
-  LABELS "gpu" RUN_SERIAL TRUE RESOURCE_LOCK cpu_team)
-
 ninfer_add_test(ninfer_qwen3_5_frontend_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_frontend.cpp"
   NEEDS_SOURCE_DIR

@@ -1,4 +1,4 @@
-#include "models/qwen3_5/execution/moe.h"
+#include "models/common/moe/execution.h"
 
 #include "core/layout.h"
 #include "core/nvtx.h"
@@ -11,7 +11,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::models::qwen3_5::execution {
+namespace ninfer::models::moe {
 namespace {
 
 using Subset = ops::ExpertSubsetKind;
@@ -82,22 +82,22 @@ MemorySpan bytes(const Tensor& tensor, bool pinned = false) {
     return {tensor.data, tensor.bytes(), tensor.device, pinned};
 }
 
-void validate_inputs(const Tensor& hidden, const Tensor& residual, const ops::MoeProfile& profile,
+void validate_inputs(const Tensor& hidden, const Tensor& output, const ops::MoeProfile& profile,
                      Device device) {
     const auto h = profile.routed.ffn.hidden;
-    for (const auto* tensor : {&hidden, &residual}) {
+    for (const auto* tensor : {&hidden, &output}) {
         if (tensor->device != device || tensor->dtype != DType::BF16 || tensor->ne[0] != h ||
             tensor->ne[1] != hidden.ne[1] || tensor->ne[1] <= 0 || tensor->ne[2] != 1 ||
             tensor->ne[3] != 1 || !tensor->is_contiguous() || tensor->data == nullptr ||
             reinterpret_cast<std::uintptr_t>(tensor->data) % 16) {
             throw std::invalid_argument(
-                "MoE hidden/residual must be aligned contiguous CUDA BF16 [H,T]");
+                "MoE hidden/output must be aligned contiguous CUDA BF16 [H,T]");
         }
     }
     const auto a = reinterpret_cast<std::uintptr_t>(hidden.data);
-    const auto b = reinterpret_cast<std::uintptr_t>(residual.data);
+    const auto b = reinterpret_cast<std::uintptr_t>(output.data);
     if ((a <= b ? b - a : a - b) < hidden.bytes()) {
-        throw std::invalid_argument("MoE hidden and residual overlap");
+        throw std::invalid_argument("MoE hidden and output overlap");
     }
 }
 
@@ -112,7 +112,7 @@ void outside_capture(CudaExecutionView execution) {
     }
 }
 
-void drain_after_failure(MoeExecutionView execution) noexcept {
+void drain_after_failure(ExecutionView execution) noexcept {
     const auto drain = [](cudaStream_t stream) {
         const auto error = cudaStreamSynchronize(stream);
         if (error != cudaSuccess) {
@@ -125,49 +125,52 @@ void drain_after_failure(MoeExecutionView execution) noexcept {
 
 } // namespace
 
-std::size_t moe_workspace_bytes(const ops::MoeProfile& profile, std::int32_t first,
-                                std::int32_t last) {
-    return ops::topk_softmax_swiglu_moe_workspace_capacity_bytes(
-        profile, ops::MoeEpilogue::AddResidual, first, last);
+std::size_t workspace_bytes(const ops::MoeProfile& profile, ops::MoeEpilogue epilogue,
+                            std::int32_t first, std::int32_t last) {
+    return ops::topk_softmax_swiglu_moe_workspace_capacity_bytes(profile, epilogue, first, last);
 }
 
-void moe(const Tensor& hidden, const MoeParameters& parameters, const ExpertBankDeviceView& experts,
-         Tensor& residual, const ops::MoeExecutionHints& hints, MemoryArena& workspace,
-         CudaExecutionView execution) {
+void execute(const Tensor& hidden, const Parameters& parameters,
+             const ExpertBankDeviceView& experts, ops::MoeEpilogue epilogue, Tensor& output,
+             MemoryArena& workspace, CudaExecutionView execution,
+             const ops::MoeExecutionHints& hints) {
     auto scope         = workspace.scope();
     const auto columns = hidden.ne[1];
     const auto storage =
-        workspace.alloc_bytes(moe_workspace_bytes(parameters.profile, columns, columns));
+        workspace.alloc_bytes(workspace_bytes(parameters.profile, epilogue, columns, columns));
     MemoryArena scratch(storage);
     const ops::MoeWeights weights{
         parameters.control, {experts, parameters.activation_divisors}, parameters.shared};
-    ops::topk_softmax_swiglu_moe(hidden, parameters.profile, weights, ops::MoeEpilogue::AddResidual,
-                                 residual, scratch, execution, hints);
+    ops::topk_softmax_swiglu_moe(hidden, parameters.profile, weights, epilogue, output, scratch,
+                                 execution, hints);
 }
 
-ops::ExpertSubset MoePartitionView::gpu() const noexcept { return {gpu_kind, device_mask}; }
+ops::ExpertSubset PartitionView::gpu() const noexcept { return {gpu_kind, device_mask}; }
 
-ops::ExpertSubset MoePartitionView::cpu() const noexcept {
+ops::ExpertSubset PartitionView::cpu() const noexcept {
     const auto kind = gpu_kind == Subset::All    ? Subset::None
                       : gpu_kind == Subset::None ? Subset::All
                                                  : Subset::MaskZeros;
     return {kind, host_mask};
 }
 
-void MoeExecutionRequirements::include(const MoeExecutionRequirements& other) noexcept {
+void ExecutionRequirements::include(const ExecutionRequirements& other) noexcept {
     device_frame_bytes  = std::max(device_frame_bytes, other.device_frame_bytes);
     pinned_frame_bytes  = std::max(pinned_frame_bytes, other.pinned_frame_bytes);
     cpu_workspace_bytes = std::max(cpu_workspace_bytes, other.cpu_workspace_bytes);
     gpu_workspace_bytes = std::max(gpu_workspace_bytes, other.gpu_workspace_bytes);
 }
 
-MoeExecutionRequirements describe_moe_execution(const ops::MoeProfile& profile, Subset gpu_subset,
-                                                std::int32_t first, std::int32_t last) {
+ExecutionRequirements describe_execution(const ops::MoeProfile& profile, Subset gpu_subset,
+                                         ops::MoeEpilogue epilogue, std::int32_t first,
+                                         std::int32_t last) {
+    if (epilogue != ops::MoeEpilogue::Write && epilogue != ops::MoeEpilogue::AddResidual)
+        throw std::invalid_argument("MoE output epilogue is invalid");
     const auto cpu = cpu_subset(gpu_subset);
     if (gpu_subset == Subset::All) {
-        return {0, 0, 0,
-                ops::topk_softmax_swiglu_moe_workspace_capacity_bytes(
-                    profile, ops::MoeEpilogue::AddResidual, first, last)};
+        return {
+            0, 0, 0,
+            ops::topk_softmax_swiglu_moe_workspace_capacity_bytes(profile, epilogue, first, last)};
     }
     const ops::RouteProfile route{profile.routed.ffn.hidden, profile.routed.experts,
                                   profile.routed.top_k};
@@ -181,11 +184,12 @@ MoeExecutionRequirements describe_moe_execution(const ops::MoeProfile& profile, 
     return {frame.device_bytes, frame.pinned_bytes, cpu_bytes, std::max(route_bytes, gpu_bytes)};
 }
 
-bool moe(const Tensor& hidden, const MoeParameters& parameters, const MoePartitionView& partition,
-         const ExpertBankSource& source, const ExpertBankDeviceView& bank, Tensor& residual,
-         MemoryArena& workspace, MoeExecutionView execution, const ops::MoeExecutionHints& hints) {
+bool execute(const Tensor& hidden, const Parameters& parameters, const PartitionView& partition,
+             const ExpertBankSource& source, const ExpertBankDeviceView& bank,
+             ops::MoeEpilogue epilogue, Tensor& output, MemoryArena& workspace,
+             ExecutionView execution, const ops::MoeExecutionHints& hints) {
     const auto& profile = parameters.profile;
-    validate_inputs(hidden, residual, profile, execution.cuda.device());
+    validate_inputs(hidden, output, profile, execution.cuda.device());
     outside_capture(execution.cuda);
     if (partition.bank != parameters.bank || partition.experts != profile.routed.experts) {
         throw std::invalid_argument("MoE partition/source does not match the layer bank");
@@ -194,12 +198,13 @@ bool moe(const Tensor& hidden, const MoeParameters& parameters, const MoePartiti
         throw std::invalid_argument("MoE cache bank does not match the execution device/profile");
     }
     const auto requirements =
-        describe_moe_execution(profile, partition.gpu_kind, hidden.ne[1], hidden.ne[1]);
-    auto scope = workspace.scope();
+        describe_execution(profile, partition.gpu_kind, epilogue, hidden.ne[1], hidden.ne[1]);
+    const Tensor* residual = epilogue == ops::MoeEpilogue::AddResidual ? &output : nullptr;
+    auto scope             = workspace.scope();
     MemoryArena scratch(workspace.alloc_bytes(requirements.gpu_workspace_bytes));
     try {
         if (partition.gpu_kind == Subset::All) {
-            moe(hidden, parameters, bank, residual, hints, scratch, execution.cuda);
+            execute(hidden, parameters, bank, epilogue, output, scratch, execution.cuda, hints);
             return false;
         }
         if (!execution.host) { throw std::invalid_argument("mixed MoE requires Host resources"); }
@@ -251,7 +256,7 @@ bool moe(const Tensor& hidden, const MoeParameters& parameters, const MoePartiti
                         [&](auto id) { return mask[id] == 0; });
         if (!cpu_work) {
             const std::array contributions{frame.gpu_partial};
-            ops::sum_contributions(contributions, &residual, residual, execution.cuda);
+            ops::sum_contributions(contributions, residual, output, execution.cuda);
             return false;
         }
         {
@@ -268,7 +273,7 @@ bool moe(const Tensor& hidden, const MoeParameters& parameters, const MoePartiti
             host.partial_ready.wait(execution.cuda.stream());
         }
         const std::array contributions{frame.gpu_partial, frame.device_cpu_partial};
-        ops::sum_contributions(contributions, &residual, residual, execution.cuda);
+        ops::sum_contributions(contributions, residual, output, execution.cuda);
         return true;
     } catch (...) {
         drain_after_failure(execution);
@@ -276,4 +281,4 @@ bool moe(const Tensor& hidden, const MoeParameters& parameters, const MoePartiti
     }
 }
 
-} // namespace ninfer::models::qwen3_5::execution
+} // namespace ninfer::models::moe

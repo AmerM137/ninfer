@@ -370,6 +370,8 @@ lead 规划，不假定与 Main 相同。最终容量、Host reservation、迁�
    计算、完整 Op 边界、A16/A4 及 activation divisor 复用、cache lease/eviction、
    计算前 readiness、搬运粒度和重叠。Grouped/fused 策略与驻留调度仍需细化，不重新
    下放成一轮纯 Linear 任务；PLE 与 expert H2D 的实际竞争也须在完整 schedule 评估。
+   Bank/cache、固定区与流式窗口规划、混合执行及预取已有 `models/common/moe` 公共组件；
+   接入时提供本模型的计算 profile、策略和 `Write` 出口，由 HC 消费 block 输出。
 3. **原生模型集成。** Qwen4Exp binder、驻留、Parameters、planner、StateImage、层
    编排和 Program 尚未接入。先贯通 Text prefill/ordinary/control/Replay/scoring，
    连同统一提交、checkpoint/offload、取消和 eager/Graph；再完成 Vision 的特征替换

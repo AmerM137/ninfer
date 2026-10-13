@@ -195,14 +195,15 @@ semantics, arbitrary token tails through T=72, affine and strided parent banks, 
 checks, signed code domains, scale extremes and tiny-BF16 cancellation around the BF16-dot guard.
 `ninfer_moe_test` also qualifies complementary CPU/GPU subsets plus GPU shared/residual composition.
 
-`ninfer_qwen3_5_moe_execution_test` qualifies single-layer mixed execution and the Program's
+`ninfer_moe_execution_test` qualifies the shared single-layer execution and the Program-owned
 multi-layer fixed-cache and streaming-window schedule against the same independent complete-MoE oracle. It uses registered native Host banks and the real ExpertCache,
-covering absent CPU-only replicas, explicit region replacement, All/None/partial partitions, variable frame
-reuse through T=1024, delayed bridge progress, failed acquisition and asynchronous teardown.
+covering Write/AddResidual outputs, absent CPU-only replicas, explicit region replacement,
+All/None/partial partitions, bank IDs independent of traversal order, variable frame reuse through
+T=1024, delayed bridge progress, failed acquisition and asynchronous teardown.
 
 ```bash
 ctest --test-dir build -R '^ninfer_moe(_cpu(_avx2|_fma)?)?_test$' --output-on-failure
-ctest --test-dir build -R '^ninfer_qwen3_5_moe_execution_test$' --output-on-failure
+ctest --test-dir build -R '^ninfer_moe_execution_test$' --output-on-failure
 ```
 
 Run the 35B-A3B MoE route independently:

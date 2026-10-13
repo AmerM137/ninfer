@@ -3,6 +3,7 @@
 #include <tuple>
 
 namespace ninfer::test::moe {
+int test_weights();
 int test_complete(Fixture&, CudaExecutionView);
 int test_route(Fixture&, CudaExecutionView);
 int test_routed(Fixture&, CudaExecutionView);
@@ -22,7 +23,7 @@ int main() {
         cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking),
                    "create MoE test stream");
         const auto execution = context.execution_view(stream);
-        int failures         = 0;
+        int failures         = moe::test_weights();
         for (const auto [gu, down, name] :
              {std::tuple{QType::Q4_G64_FP16, QType::Q5_G64_FP16, "q4-q5"},
               std::tuple{QType::Q4_G64_FP16, QType::Q6_G64_FP16, "q4-q6"},

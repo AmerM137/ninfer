@@ -22,8 +22,8 @@
 #include <span>
 #include <vector>
 
-namespace ninfer::models::qwen3_5::detail {
-class MoeResources;
+namespace ninfer::models::moe {
+class Resources;
 }
 
 namespace ninfer::models::qwen3_5::execution {
@@ -76,8 +76,7 @@ public:
                 qwen3_5::RoundState& io, Tensor& prefill_hidden, std::uint32_t prefill_chunk,
                 std::uint32_t text_kv_base,
                 qwen3_5::PagedKVCacheView mtp_kv          = qwen3_5::PagedKVCacheView(),
-                const qwen3_5::PagedKVCache* batch_mtp_kv = nullptr,
-                detail::MoeResources* moe                 = nullptr);
+                const qwen3_5::PagedKVCache* batch_mtp_kv = nullptr, moe::Resources* moe = nullptr);
     ~TextContext();
 
     TextContext(const TextContext&)            = delete;
@@ -211,7 +210,7 @@ private:
     [[nodiscard]] PrefillChunkResult
     prefill_impl(std::span<const int> ids, const TextPrefill* text_prefill,
                  const MultimodalPrefill* multimodal, Tap& tap, bool finalize_at_end);
-    detail::MoeResources* moe_;
+    moe::Resources* moe_;
     DeviceContext& ctx_;
     CudaExecutionView execution_;
     const Parameters& parameters_;

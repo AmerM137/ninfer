@@ -5,6 +5,7 @@
 #include "core/device.h"
 #include "core/weight_bank.h"
 #include "ninfer/ops/projection_weights.h"
+#include "ninfer/ops/weight_input.h"
 
 #include <optional>
 
@@ -29,6 +30,22 @@ struct RoutedSwiGLUProfile {
 
 struct ExpertActivationDivisors {
     std::optional<float> gate_up, down;
+};
+
+// Combines activation permissions and calibration across Uses evaluated by one expert call.
+// NVFP4 A4 requires the same positive divisor for every included input.
+class ExpertInputUsage {
+public:
+    void include(const WeightInput&);
+
+    [[nodiscard]] LinearPolicy policy() const noexcept { return policy_; }
+
+    [[nodiscard]] std::optional<float> activation_divisor(QType format) const;
+
+private:
+    LinearPolicy policy_ = LinearPolicy::AllowA4;
+    std::optional<float> divisor_;
+    bool missing_divisor_ = false, unequal_divisors_ = false;
 };
 
 struct CudaSwiGLUExperts {

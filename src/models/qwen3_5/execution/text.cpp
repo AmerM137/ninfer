@@ -1,10 +1,10 @@
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/execution/text.h"
-#include "models/qwen3_5/program/moe_resources.h"
+#include "models/common/moe/resources.h"
 #include "models/qwen3_5/execution/attention.h"
 #include "models/qwen3_5/execution/dense_mlp.h"
 #include "models/qwen3_5/execution/gdn.h"
-#include "models/qwen3_5/execution/moe.h"
+#include "models/common/moe/execution.h"
 #include "models/qwen3_5/execution/mtp.h"
 #include "models/qwen3_5/execution/workspace.h"
 
@@ -231,7 +231,7 @@ TextContext::TextContext(DeviceContext& ctx, const execution::Parameters& weight
                          LinearAttentionStatePool& state, qwen3_5::RoundState& io,
                          Tensor& prefill_hidden, std::uint32_t prefill_chunk,
                          std::uint32_t text_kv_base, qwen3_5::PagedKVCacheView mtp_kv,
-                         const qwen3_5::PagedKVCache* batch_mtp_kv, detail::MoeResources* moe)
+                         const qwen3_5::PagedKVCache* batch_mtp_kv, moe::Resources* moe)
     : moe_(moe), ctx_(ctx), execution_(ctx.execution_view()), parameters_(weights),
       config_(weights.model.config().text), work_(work), mtp_kv_(mtp_kv),
       batch_text_kv_(batch_text_kv), batch_mtp_kv_(batch_mtp_kv), state_(state), io_(io),
@@ -403,8 +403,9 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
         if (const auto* dense = std::get_if<DenseParameters>(&mtp_->ffn)) {
             dense_mlp(mh, *dense, x, DenseMlpUse::Mtp, work_, execution_);
         } else {
-            const auto& parameters = std::get<MoeParameters>(mtp_->ffn);
-            moe(mh, parameters, parameters.resident, x, {}, work_, execution_);
+            const auto& parameters = std::get<moe::Parameters>(mtp_->ffn);
+            moe::execute(mh, parameters, parameters.resident, ops::MoeEpilogue::AddResidual, x,
+                         work_, execution_);
         }
     }
 
@@ -557,8 +558,9 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
             if (const auto* dense = std::get_if<DenseParameters>(&mtp_->ffn)) {
                 dense_mlp(mh, *dense, x_last, DenseMlpUse::Mtp, work_, execution_);
             } else {
-                const auto& parameters = std::get<MoeParameters>(mtp_->ffn);
-                moe(mh, parameters, parameters.resident, x_last, {}, work_, execution_);
+                const auto& parameters = std::get<moe::Parameters>(mtp_->ffn);
+                moe::execute(mh, parameters, parameters.resident, ops::MoeEpilogue::AddResidual,
+                             x_last, work_, execution_);
             }
         }
         ops::rmsnorm(x_last, mtp_->final_norm, config_.rms_norm_eps, true, *final_hidden,
@@ -1073,13 +1075,12 @@ void TextContext::post_mixer(const BlockParameters& weights, Tensor& x, int laye
     if (const auto* dense = std::get_if<DenseParameters>(&weights.ffn)) {
         dense_mlp(h, *dense, x, DenseMlpUse::Text, work_, execution_);
     } else {
-        const auto& parameters = std::get<MoeParameters>(weights.ffn);
+        const auto& parameters = std::get<moe::Parameters>(weights.ffn);
         if (moe_) {
-            moe_->execute(static_cast<std::size_t>(layer), h, x, work_,
-                          next_projection_hints(layer));
+            moe_->execute(parameters.bank, h, x, work_, next_projection_hints(layer));
         } else {
-            moe(h, parameters, parameters.resident, x, next_projection_hints(layer), work_,
-                execution_);
+            moe::execute(h, parameters, parameters.resident, ops::MoeEpilogue::AddResidual, x,
+                         work_, execution_, next_projection_hints(layer));
         }
     }
 }
@@ -1089,8 +1090,11 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
     const bool prefill      = ph == Phase::Prefill;
     const auto cpu_activity = moe_ ? moe_->begin(x.ne[1]) : std::nullopt;
     for (std::size_t layer = 0; layer < parameters_.text.layers.size(); ++layer) {
-        if (moe_) moe_->before_layer(layer);
-        const auto& block  = parameters_.text.layers[layer];
+        const auto& block = parameters_.text.layers[layer];
+        if (moe_) {
+            if (const auto* parameters = std::get_if<moe::Parameters>(&block.ffn))
+                moe_->before_layer(parameters->bank);
+        }
         const bool full    = config_.layer_types[layer] == MixerKind::FullAttention;
         const auto compact = dimension(config_.compact_layer_indices[layer]);
         nvtx::ScopedRange layer_range(

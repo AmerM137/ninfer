@@ -1,7 +1,7 @@
-#include "models/qwen3_5/program/moe_resources.h"
+#include "models/common/moe/resources.h"
 
 #include "core/transfer.h"
-#include "models/qwen3_5/program/planning/moe.h"
+#include "models/common/moe/plan.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -10,10 +10,10 @@
 #include <thread>
 #include <utility>
 
-namespace ninfer::models::qwen3_5::detail {
+namespace ninfer::models::moe {
 
-MoePartition::MoePartition(ExpertBankId bank, std::int32_t experts,
-                           std::span<const std::int32_t> gpu_experts, const DeviceContext& device)
+Partition::Partition(ExpertBankId bank, std::int32_t experts,
+                     std::span<const std::int32_t> gpu_experts, const DeviceContext& device)
     : bank_(bank), experts_(experts), kind_(ops::ExpertSubsetKind::None), mask_uploaded_(device) {
     if (bank.index == UINT32_MAX || experts <= 0) {
         throw std::invalid_argument("MoE partition requires a bank and positive expert count");
@@ -40,7 +40,7 @@ MoePartition::MoePartition(ExpertBankId bank, std::int32_t experts,
     }
 }
 
-void MoePartition::update(std::span<const ExpertKey> ready, CudaExecutionView execution) {
+void Partition::update(std::span<const ExpertKey> ready, CudaExecutionView execution) {
     if (std::equal(keys_.begin(), keys_.end(), ready.begin(), ready.end())) return;
     if (upload_pending_) mask_uploaded_.synchronize();
     auto* mask = static_cast<std::int32_t*>(mask_.data());
@@ -63,8 +63,8 @@ void MoePartition::update(std::span<const ExpertKey> ready, CudaExecutionView ex
     }
 }
 
-execution::MoePartitionView MoePartition::view() const {
-    execution::MoePartitionView result{bank_, experts_, kind_, {}, {}};
+PartitionView Partition::view() const {
+    PartitionView result{bank_, experts_, kind_, {}, {}};
     if (kind_ == ops::ExpertSubsetKind::MaskOnes) {
         result.host_mask =
             Tensor(const_cast<void*>(mask_.data()), Device::cpu(), DType::I32, {experts_});
@@ -74,7 +74,7 @@ execution::MoePartitionView MoePartition::view() const {
     return result;
 }
 
-struct MoeBridge::Host {
+struct Bridge::Host {
     CudaStream stream;
     CudaExecutionView transfer;
     DeviceBuffer device_frame;
@@ -84,8 +84,8 @@ struct MoeBridge::Host {
     CpuExecutor executor;
     CudaCompletionEvent route_ready, host_ready, partial_ready;
 
-    Host(const execution::MoeExecutionRequirements& requirements, const CpuTopology& topology,
-         CpuTeamPlan team, const DeviceContext& device)
+    Host(const ExecutionRequirements& requirements, const CpuTopology& topology, CpuTeamPlan team,
+         const DeviceContext& device)
         : stream(device), transfer(device.execution_view(stream.stream())),
           device_frame(device.device(), requirements.device_frame_bytes),
           host_frame(requirements.pinned_frame_bytes),
@@ -93,7 +93,7 @@ struct MoeBridge::Host {
           executor(topology, std::move(team)), route_ready(device), host_ready(device),
           partial_ready(device) {}
 
-    execution::MoeHostExecutionView view() {
+    HostExecutionView view() {
         return {executor.execution_view(),
                 transfer,
                 device_frame.span(),
@@ -105,8 +105,8 @@ struct MoeBridge::Host {
     }
 };
 
-MoeBridge::MoeBridge(const execution::MoeExecutionRequirements& requirements,
-                     const CpuTopology& topology, CpuTeamPlan team, const DeviceContext& device)
+Bridge::Bridge(const ExecutionRequirements& requirements, const CpuTopology& topology,
+               CpuTeamPlan team, const DeviceContext& device)
     : cuda_(device.execution_view()) {
     if (requirements.pinned_frame_bytes != 0) {
         host_ = std::make_unique<Host>(requirements, topology, std::move(team), device);
@@ -115,7 +115,7 @@ MoeBridge::MoeBridge(const execution::MoeExecutionRequirements& requirements,
     }
 }
 
-MoeBridge::~MoeBridge() {
+Bridge::~Bridge() {
     try {
         synchronize();
     } catch (const std::exception& error) {
@@ -123,13 +123,13 @@ MoeBridge::~MoeBridge() {
     }
 }
 
-execution::MoeExecutionView MoeBridge::execution_view() noexcept {
-    execution::MoeExecutionView result{cuda_, {}};
+ExecutionView Bridge::execution_view() noexcept {
+    ExecutionView result{cuda_, {}};
     if (host_) { result.host.emplace(host_->view()); }
     return result;
 }
 
-void MoeBridge::synchronize() const {
+void Bridge::synchronize() const {
     CudaDeviceScope scope(cuda_.device());
     // The compute stream may wait on the bridge; both have had all producers submitted.
     const auto transfer = host_ ? cudaStreamSynchronize(host_->transfer.stream()) : cudaSuccess;
@@ -141,15 +141,15 @@ void MoeBridge::synchronize() const {
     }
 }
 
-struct MoeResources::Impl {
+struct Resources::Impl {
     struct Layer {
-        std::unique_ptr<MoePartition> partition;
+        std::unique_ptr<Partition> partition;
         std::vector<ExpertKey> keys, ready;
         std::optional<ExpertCacheUse> use;
     };
 
-    std::shared_ptr<const MoePlan> plan;
-    std::vector<const execution::MoeParameters*> parameters;
+    std::shared_ptr<const Plan> plan;
+    std::vector<const Parameters*> parameters;
     std::span<const ExpertBankSource> sources;
     const DeviceContext& device;
     CpuTopology topology;
@@ -157,7 +157,7 @@ struct MoeResources::Impl {
     CudaStream upload_stream;
     CudaExecutionView upload;
     ExpertCache cache;
-    MoeBridge bridge;
+    Bridge bridge;
     std::vector<Layer> layers;
     std::vector<ExpertKey> extra_keys;
     std::vector<std::size_t> needed;
@@ -166,14 +166,12 @@ struct MoeResources::Impl {
     std::int32_t tokens         = 0;
     std::size_t observed_layers = 0;
     std::size_t cpu_layers      = 0;
-    std::size_t moe_layers      = 0;
     std::size_t active_step     = SIZE_MAX;
     bool cache_settled          = true;
     bool streaming              = false;
     bool keep_cpu_active        = false;
 
-    Impl(std::shared_ptr<const MoePlan> plan,
-         std::span<const execution::MoeParameters* const> parameters,
+    Impl(std::shared_ptr<const Plan> plan, std::span<const Parameters* const> parameters,
          std::span<const ExpertBankSource> sources, const DeviceContext& device)
         : plan(std::move(plan)), parameters(parameters.begin(), parameters.end()), sources(sources),
           device(device), cuda(device.execution_view()), upload_stream(device),
@@ -187,19 +185,18 @@ struct MoeResources::Impl {
         std::vector<ExpertKey> targets;
         for (std::size_t i = 0; i < layers.size(); ++i) {
             const auto& layer = this->plan->layers[i];
-            if (!layer.experts) continue;
-            ++moe_layers;
-            if (!parameters[i] || parameters[i]->bank != layer.bank ||
-                parameters[i]->profile.routed.experts != layer.experts)
+            if (!parameters[i] || parameters[i]->bank != layer.spec.bank ||
+                parameters[i]->profile.routed.experts != layer.spec.profile.routed.experts)
                 throw std::invalid_argument("MoE schedule profile differs from its layer");
-            auto& state     = layers[i];
-            state.partition = std::make_unique<MoePartition>(
-                layer.bank, layer.experts, std::span<const std::int32_t>{}, device);
-            state.ready.reserve(layer.experts);
-            for (std::uint32_t e = 0; e < std::uint32_t(layer.experts); ++e)
-                state.keys.push_back({layer.bank, e});
+            auto& state = layers[i];
+            state.partition =
+                std::make_unique<Partition>(layer.spec.bank, layer.spec.profile.routed.experts,
+                                            std::span<const std::int32_t>{}, device);
+            state.ready.reserve(layer.spec.profile.routed.experts);
+            for (std::uint32_t e = 0; e < std::uint32_t(layer.spec.profile.routed.experts); ++e)
+                state.keys.push_back({layer.spec.bank, e});
             for (std::uint32_t n = 0; n < layer.cache_experts; ++n)
-                targets.push_back({layer.bank, layer.priority[n]});
+                targets.push_back({layer.spec.bank, layer.spec.priority[n]});
         }
         sort_keys(targets);
         for (const auto& placement : this->plan->extra_layout) extra_keys.push_back(placement.key);
@@ -262,7 +259,7 @@ struct MoeResources::Impl {
     void snapshot(std::size_t index) {
         auto& layer = layers[index];
         if (layer.use) return;
-        cache.ready_keys(plan->layers[index].bank, layer.ready);
+        cache.ready_keys(plan->layers[index].spec.bank, layer.ready);
         for (;;) {
             layer.use = cache.acquire(layer.ready, cuda);
             if (layer.use) break;
@@ -304,14 +301,14 @@ struct MoeResources::Impl {
     }
 };
 
-MoeResources::MoeResources(std::shared_ptr<const MoePlan> plan,
-                           std::span<const execution::MoeParameters* const> parameters,
-                           std::span<const ExpertBankSource> sources, const DeviceContext& device)
+Resources::Resources(std::shared_ptr<const Plan> plan,
+                     std::span<const Parameters* const> parameters,
+                     std::span<const ExpertBankSource> sources, const DeviceContext& device)
     : impl_(std::make_unique<Impl>(std::move(plan), parameters, sources, device)) {}
 
-MoeResources::~MoeResources() = default;
+Resources::~Resources() = default;
 
-std::optional<CpuExecutionView::ActiveScope> MoeResources::begin(std::int32_t tokens) {
+std::optional<CpuExecutionView::ActiveScope> Resources::begin(std::int32_t tokens) {
     auto& state       = *impl_;
     const auto thread = std::this_thread::get_id();
     if (!state.caller) {
@@ -324,11 +321,11 @@ std::optional<CpuExecutionView::ActiveScope> MoeResources::begin(std::int32_t to
     if (tokens <= 0) throw std::invalid_argument("MoE traversal requires positive token count");
     // Keep a frequent CPU contributor awake across GPU layers. Sparse CPU use should not
     // keep the entire team polling; the two thresholds avoid toggling on every token.
-    if (state.tokens != tokens || state.observed_layers != state.moe_layers) {
+    if (state.tokens != tokens || state.observed_layers != state.layers.size()) {
         state.keep_cpu_active = false;
-    } else if (state.cpu_layers * 4 >= state.moe_layers) {
+    } else if (state.cpu_layers * 4 >= state.layers.size()) {
         state.keep_cpu_active = true;
-    } else if (state.cpu_layers * 8 <= state.moe_layers) {
+    } else if (state.cpu_layers * 8 <= state.layers.size()) {
         state.keep_cpu_active = false;
     }
     state.observed_layers = state.cpu_layers = 0;
@@ -337,8 +334,8 @@ std::optional<CpuExecutionView::ActiveScope> MoeResources::begin(std::int32_t to
     bool hybrid = false;
     for (std::size_t i = 0; i < state.plan->layers.size(); ++i) {
         const auto& layer = state.plan->layers[i];
-        hybrid |= layer.experts && !layer.requires_full_bank(tokens);
-        if (layer.experts && layer.requires_full_bank(tokens) && !layer.stream_layout.empty())
+        hybrid |= !layer.requires_full_bank(tokens);
+        if (layer.requires_full_bank(tokens) && !layer.stream_layout.empty())
             state.needed.push_back(i);
     }
     const bool streaming = !state.needed.empty();
@@ -360,14 +357,15 @@ std::optional<CpuExecutionView::ActiveScope> MoeResources::begin(std::int32_t to
     return std::nullopt;
 }
 
-void MoeResources::before_layer(std::size_t layer) {
-    impl_->prepare_step(layer);
+void Resources::before_layer(ExpertBankId bank) {
+    impl_->prepare_step(impl_->plan->layer_index(bank));
     impl_->progress_cache();
 }
 
-void MoeResources::execute(std::size_t index, const Tensor& hidden, Tensor& residual,
-                           MemoryArena& workspace, const ops::MoeExecutionHints& hints) {
+void Resources::execute(ExpertBankId bank, const Tensor& hidden, Tensor& output,
+                        MemoryArena& workspace, const ops::MoeExecutionHints& hints) {
     auto& state          = *impl_;
+    const auto index     = state.plan->layer_index(bank);
     const auto& p        = *state.parameters.at(index);
     const auto& selected = state.plan->layers.at(index);
     auto& layer          = state.layers.at(index);
@@ -381,8 +379,8 @@ void MoeResources::execute(std::size_t index, const Tensor& hidden, Tensor& resi
             state.cache.wait_for_progress();
         }
         try {
-            execution::moe(hidden, p, state.cache.view(p.bank), residual, hints, workspace,
-                           state.cuda);
+            moe::execute(hidden, p, state.cache.view(p.bank), selected.spec.epilogue, output,
+                         workspace, state.cuda, hints);
         } catch (...) {
             state.release(layer);
             throw;
@@ -391,9 +389,9 @@ void MoeResources::execute(std::size_t index, const Tensor& hidden, Tensor& resi
         state.snapshot(index);
         try {
             state.cpu_layers +=
-                execution::moe(hidden, p, layer.partition->view(), state.sources[p.bank.index],
-                               state.cache.view(p.bank), residual, workspace,
-                               state.bridge.execution_view(), hints);
+                moe::execute(hidden, p, layer.partition->view(), state.sources[p.bank.index],
+                             state.cache.view(p.bank), selected.spec.epilogue, output, workspace,
+                             state.bridge.execution_view(), hints);
         } catch (...) {
             state.release(layer);
             throw;
@@ -405,14 +403,12 @@ void MoeResources::execute(std::size_t index, const Tensor& hidden, Tensor& resi
     state.progress_cache();
 }
 
-void MoeResources::synchronize() const { impl_->synchronize(); }
+void Resources::synchronize() const { impl_->synchronize(); }
 
-std::uint64_t MoeResources::uploaded_bytes() const noexcept {
-    return impl_->cache.uploaded_bytes();
-}
+std::uint64_t Resources::uploaded_bytes() const noexcept { return impl_->cache.uploaded_bytes(); }
 
-ExpertCacheUsage MoeResources::cache_usage() const { return impl_->cache.usage(); }
+ExpertCacheUsage Resources::cache_usage() const { return impl_->cache.usage(); }
 
-const MoePlan& MoeResources::plan() const { return *impl_->plan; }
+const Plan& Resources::plan() const { return *impl_->plan; }
 
-} // namespace ninfer::models::qwen3_5::detail
+} // namespace ninfer::models::moe

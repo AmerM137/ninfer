@@ -34,18 +34,18 @@ public:
         if (const auto* d = std::get_if<DenseWeights>(&w.ffn)) return dense(*d);
         const auto& moe  = std::get<MoeWeights>(w.ffn);
         const auto& bank = plan_.expert_banks()[moe.bank.index];
-        auto gu          = ops::LinearPolicy::AllowA4;
-        auto dn          = ops::LinearPolicy::AllowA4;
+        ops::ExpertInputUsage gu, dn;
         for (const auto& e : moe.experts) {
-            gu = std::min({gu, plan_.input(e.gate).policy, plan_.input(e.up).policy});
-            dn = std::min(dn, plan_.input(e.down).policy);
+            gu.include(plan_.input(e.gate));
+            gu.include(plan_.input(e.up));
+            dn.include(plan_.input(e.down));
         }
         const auto shared = dense(moe.shared);
         return MoeLayerProfile{
             {ops::routed_swiglu_profile(
                  bank.gate_up.layout, bank.down.layout,
-                 dimension(std::get<MoeConfig>(plan_.config().text.ffn).num_experts_per_tok), gu,
-                 dn),
+                 dimension(std::get<MoeConfig>(plan_.config().text.ffn).num_experts_per_tok),
+                 gu.policy(), dn.policy()),
              ops::swiglu_profile(shared.gate_up, shared.down)},
             moe.bank};
     }

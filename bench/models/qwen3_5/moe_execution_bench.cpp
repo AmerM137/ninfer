@@ -1,7 +1,7 @@
 #include "artifact/views.h"
 #include "core/transfer.h"
 #include "models/qwen3_5/load.h"
-#include "models/qwen3_5/program/moe_resources.h"
+#include "models/common/moe/resources.h"
 #include "ninfer/ops/sum_contributions.h"
 
 #include <cuda_profiler_api.h>
@@ -21,9 +21,10 @@
 
 namespace {
 using namespace ninfer;
-namespace model = ninfer::models::qwen3_5;
-using Clock     = std::chrono::steady_clock;
-using Kind      = ops::ExpertSubsetKind;
+namespace model  = ninfer::models::qwen3_5;
+namespace shared = ninfer::models::moe;
+using Clock      = std::chrono::steady_clock;
+using Kind       = ops::ExpertSubsetKind;
 
 struct Options {
     std::string artifact;
@@ -108,7 +109,7 @@ std::uint16_t bf16(float value) {
 struct Layer {
     artifact::MaterializedArtifact backing;
     ExpertBankSource source;
-    model::execution::MoeParameters parameters;
+    shared::Parameters parameters;
 
     Layer(const Options& options, DeviceContext& device) {
         artifact::Reader reader(options.artifact);
@@ -213,10 +214,9 @@ MemorySpan bytes(const Tensor& tensor, bool pinned = false) {
     return {tensor.data, tensor.bytes(), tensor.device, pinned};
 }
 
-void serial(const Tensor& x, const model::execution::MoeParameters& p,
-            model::execution::MoePartitionView partition, Tensor& residual, MemoryArena& work,
-            model::execution::MoeExecutionView execution, SerialFrame& frame,
-            const ExpertBankSource& source, const ExpertBankDeviceView& bank) {
+void serial(const Tensor& x, const shared::Parameters& p, shared::PartitionView partition,
+            Tensor& residual, MemoryArena& work, shared::ExecutionView execution,
+            SerialFrame& frame, const ExpertBankSource& source, const ExpertBankDeviceView& bank) {
     auto& host = *execution.host;
     ops::topk_softmax_route(
         x, {p.profile.routed.ffn.hidden, p.profile.routed.experts, p.profile.routed.top_k},
@@ -289,10 +289,11 @@ void run(const Options& options) {
     selected.resize(options.gpu_experts);
     std::vector<bool> on_gpu(e);
     for (const auto id : selected) on_gpu[id] = true;
-    model::detail::MoePartition partition({0}, e, selected, device);
-    const auto requirements = model::execution::describe_moe_execution(
-        p.profile, partition.gpu_kind(), options.tokens, options.tokens);
-    model::detail::MoeBridge resources(requirements, topology, team, device);
+    shared::Partition partition({0}, e, selected, device);
+    const auto requirements =
+        shared::describe_execution(p.profile, partition.gpu_kind(), ops::MoeEpilogue::AddResidual,
+                                   options.tokens, options.tokens);
+    shared::Bridge resources(requirements, topology, team, device);
     auto execution = resources.execution_view();
     const auto route_scratch =
         ops::topk_softmax_route_workspace_capacity_bytes({h, e, k}, options.tokens, options.tokens);
@@ -396,8 +397,8 @@ void run(const Options& options) {
             serial(x, p, partition.view(), residual, work, execution, frame, layer.source,
                    cache.view({0}));
         else
-            model::execution::moe(x, p, partition.view(), layer.source, cache.view({0}), residual,
-                                  work, execution);
+            shared::execute(x, p, partition.view(), layer.source, cache.view({0}),
+                            ops::MoeEpilogue::AddResidual, residual, work, execution);
         device.synchronize();
     };
     // Both schedules use the same team, input corpus, partition, transfers, kernels and output.

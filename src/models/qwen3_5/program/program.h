@@ -16,6 +16,10 @@ namespace ninfer {
 struct DeviceContext;
 }
 
+namespace ninfer::models::moe {
+struct Plan;
+}
+
 namespace ninfer::models::qwen3_5 {
 namespace execution {
 class Parameters;
@@ -24,7 +28,6 @@ struct ModelProfile;
 
 namespace detail {
 struct SequencePlanImpl;
-struct MoePlan;
 struct SequencePlannerImpl;
 struct RequestBasePlanImpl;
 struct ResumeStateImpl;
@@ -96,7 +99,7 @@ private:
 
     friend SequencePlanner make_sequence_planner(std::shared_ptr<const execution::ModelProfile>,
                                                  DeviceContext&, const EngineOptions&,
-                                                 std::shared_ptr<const detail::MoePlan>);
+                                                 std::shared_ptr<const moe::Plan>);
 };
 
 class RequestBasePlan {
@@ -503,7 +506,7 @@ private:
 
 [[nodiscard]] SequencePlanner make_sequence_planner(std::shared_ptr<const execution::ModelProfile>,
                                                     DeviceContext&, const EngineOptions&,
-                                                    std::shared_ptr<const detail::MoePlan> = {});
+                                                    std::shared_ptr<const moe::Plan> = {});
 
 [[nodiscard]] SequencePlanner make_sequence_planner(const execution::Parameters&, DeviceContext&,
                                                     const EngineOptions&);

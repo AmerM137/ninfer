@@ -3,8 +3,6 @@
 #include "core/weight_view.h"
 #include "ninfer/ops/linear_split.h"
 
-#include <bit>
-#include <cmath>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -12,46 +10,6 @@
 
 namespace ninfer::models::qwen3_5::execution {
 namespace {
-
-struct ExpertUse {
-    ops::LinearPolicy policy = ops::LinearPolicy::AllowA4;
-    std::optional<float> divisor;
-    bool missing_divisor  = false;
-    bool unequal_divisors = false;
-
-    void include(const ops::WeightInput& input) {
-        if (!ops::valid_linear_policy(input.policy)) {
-            throw std::invalid_argument("expert has invalid activation policy");
-        }
-        if (input.policy == ops::LinearPolicy::A16Only || policy == ops::LinearPolicy::A16Only) {
-            policy = ops::LinearPolicy::A16Only;
-        } else if (input.policy == ops::LinearPolicy::AllowA8) {
-            policy = ops::LinearPolicy::AllowA8;
-        }
-        if (!input.activation_input_divisor) {
-            missing_divisor = true;
-            return;
-        }
-        const float value = *input.activation_input_divisor;
-        if (!std::isfinite(value) || value <= 0) {
-            throw std::invalid_argument("expert activation divisor must be finite and positive");
-        }
-        if (divisor) {
-            unequal_divisors |=
-                std::bit_cast<std::uint32_t>(*divisor) != std::bit_cast<std::uint32_t>(value);
-        } else {
-            divisor = value;
-        }
-    }
-
-    std::optional<float> calibration(QType format) const {
-        if (format != QType::NVFP4) { return std::nullopt; }
-        if (ops::allows_a4(policy) && (missing_divisor || unequal_divisors)) {
-            throw std::invalid_argument("NVFP4 expert A4 requires a common activation divisor");
-        }
-        return unequal_divisors || missing_divisor ? std::nullopt : divisor;
-    }
-};
 
 template <class Function>
 auto with_context(const std::string& context, Function&& function) {
@@ -109,16 +67,16 @@ public:
         return moe(std::get<MoeWeights>(w.ffn));
     }
 
-    MoeParameters moe(const MoeWeights& w) const {
+    moe::Parameters moe(const MoeWeights& w) const {
         return with_context(model_.weight(w.router).name, [&] {
             const auto& source = model_.expert_banks()[w.bank.index];
-            ExpertUse gate_up, down;
+            ops::ExpertInputUsage gate_up, down;
             for (const auto& expert : w.experts) {
                 gate_up.include(model_.input(expert.gate));
                 gate_up.include(model_.input(expert.up));
                 down.include(model_.input(expert.down));
             }
-            MoeParameters out;
+            moe::Parameters out;
             const std::array control{model_.input(w.router), model_.input(w.shared_score)};
             out.control = ops::prepare_linear_weight(control).weight;
             out.shared  = {ops::prepare_linear_swiglu_weight(model_.input(w.shared.gate),
@@ -128,11 +86,11 @@ public:
                 ops::routed_swiglu_profile(
                     source.gate_up, source.down,
                     dimension(std::get<MoeConfig>(model_.config().text.ffn).num_experts_per_tok),
-                    gate_up.policy, down.policy),
+                    gate_up.policy(), down.policy()),
                 ops::swiglu_profile(out.shared)};
             out.bank                = w.bank;
-            out.activation_divisors = {gate_up.calibration(source.gate_up.layout.format),
-                                       down.calibration(source.down.layout.format)};
+            out.activation_divisors = {gate_up.activation_divisor(source.gate_up.layout.format),
+                                       down.activation_divisor(source.down.layout.format)};
             if (source.gate_up.parent->device.type() == DeviceType::CUDA) {
                 out.resident = device_expert_bank(source.gate_up, source.down);
             }

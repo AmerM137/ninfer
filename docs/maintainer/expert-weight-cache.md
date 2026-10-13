@@ -189,12 +189,14 @@ Program 提供 scratch 和执行 view，负责发布、acquire/release 及 bridg
 固定 profile 的 CUDA Graph 可以重放新的路由、mask 和
 索引内容；更新必须发生在旧消费者结束之后。shared 始终驻留 GPU，不进入动态 expert 集合。
 
-`execution/moe` 的单层执行借用 `MoeExecutionView`。`MoePartition` 从本层已就绪 GPU ID
+`models/common/moe` 的单层执行借用 `moe::ExecutionView`。`moe::Partition` 从本层已就绪 GPU ID
 快照建立互补 mask 与 cache keys，CPU/GPU 在本次调用消费同一快照。mask 在计算流更新，
-pinned staging 在 DMA 完成前不复用。`MoeBridge` 持有 CPU team、普通 Host scratch、
+pinned staging 在 DMA 完成前不复用。`moe::Bridge` 持有 CPU team、普通 Host scratch、
 pinned/Device frame，以及独立的 bridge stream/events。资源查询分别返回两端 frame 和
 scratch 上界，可对多个 profile 取最大值；GPU scratch 由调用者提供，route/routed 顺序复用。
 纯 GPU 分工不建立 CPU team 或 bridge，完整融合调用显式接受 resident/indexed bank。
+公共执行支持 `Write` 和 `AddResidual`；前者不读取旧输出，后者在最终舍入前加入已有
+BF16 输出。Qwen3.5 使用后者，HC 架构可消费前者的独立 block 输出。
 
 调用方先用 cache `prepare/progress` 发布 required。混合调用先在计算流提交 route，
 回传 hidden 和连续的 IDs/coefficients，再提交 GPU routed/shared。小 T 的复制直接按计算流
@@ -228,7 +230,9 @@ Host backing 的子集。MTP、router、shared、Vision 和 draft 始终留在 G
 不强制启用 offload。优先级影响目标集合，实际 GPU 分工由已就绪副本决定。
 `moe.cpu_workers=0` 自动选择物理核并为控制线程留核；非零指定团队规模。
 
-`MoeResources` 由 Program 持有。扣除固定资源、KV、workspace、bridge/masks 和索引后，
+`moe::Resources` 由 Program 持有。公共 plan 按实际 MoE 调用顺序组织，bank ID 与模型层号
+独立。模型提供 Main/MTP 的 bank 放置与优先级；混合计算阈值及参考 CPU 团队规模作为
+计算 profile 的策略输入，缓存规划不固定任何模型几何。扣除固定资源、KV、workspace、bridge/masks 和索引后，
 剩余容量 C 分成固定区 R 和流式窗口。启动时联合求解均衡的固定额度及窗口容量：每层完整
 bank 为 W_l，固定 expert 为 R_l，每个窗口必须容纳 `max_l(W_l-R_l)`。不先扣除两个完整 bank。
 规划枚举完整 expert 的额度边界，并利用取整余量；固定集合取各层优先级前缀，数量和地址终身稳定。

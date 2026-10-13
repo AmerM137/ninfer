@@ -1,7 +1,7 @@
 #include "models/qwen3_5/execution/attention.h"
 #include "models/qwen3_5/execution/dense_mlp.h"
 #include "models/qwen3_5/execution/gdn.h"
-#include "models/qwen3_5/execution/moe.h"
+#include "models/common/moe/execution.h"
 #include "models/qwen3_5/execution/mtp.h"
 #include "models/qwen3_5/program/planning/graph_profiles.h"
 #include "models/qwen3_5/program/internal.h"
@@ -365,18 +365,17 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                                                      execution::DenseMlpUse::Text));
             } else {
                 const auto& p = std::get<execution::MoeLayerProfile>(block.ffn);
-                auto bytes    = execution::moe_workspace_bytes(p.math, first, last);
+                auto bytes =
+                    moe::workspace_bytes(p.math, ops::MoeEpilogue::AddResidual, first, last);
                 if (plan.moe) {
-                    const auto index =
-                        static_cast<std::size_t>(&block - profile.text.layers.data());
-                    const auto& layer = plan.moe->layers.at(index);
+                    const auto& layer = plan.moe->layer(p.bank);
                     const auto end    = std::min(last, layer.hybrid_max_tokens);
                     if (first <= end) {
                         // The masked route also bounds the no-GPU-assignment route.
-                        bytes =
-                            std::max(bytes, execution::describe_moe_execution(
-                                                p.math, ops::ExpertSubsetKind::MaskOnes, first, end)
-                                                .gpu_workspace_bytes);
+                        bytes = std::max(bytes, moe::describe_execution(
+                                                    p.math, ops::ExpertSubsetKind::MaskOnes,
+                                                    ops::MoeEpilogue::AddResidual, first, end)
+                                                    .gpu_workspace_bytes);
                     }
                 }
                 scratch(layout, bytes);
@@ -390,9 +389,9 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
             scratch(layout, execution::dense_mlp_workspace_bytes(*dense, first, last,
                                                                  execution::DenseMlpUse::Mtp));
         } else {
-            scratch(layout,
-                    execution::moe_workspace_bytes(
-                        std::get<execution::MoeLayerProfile>(profile.mtp->ffn).math, first, last));
+            scratch(layout, moe::workspace_bytes(
+                                std::get<execution::MoeLayerProfile>(profile.mtp->ffn).math,
+                                ops::MoeEpilogue::AddResidual, first, last));
         }
     };
     const auto proposal_scratch = [&](WorkspaceLayoutBuilder& layout, std::int32_t columns) {
@@ -920,7 +919,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
 std::unique_ptr<qwen3_5::detail::SequencePlannerImpl>
 make_sequence_planner_impl(std::shared_ptr<const execution::ModelProfile> profile,
                            DeviceContext& device, const EngineOptions& options,
-                           std::shared_ptr<const MoePlan> moe) {
+                           std::shared_ptr<const moe::Plan> moe) {
     validate_target_options(*profile, device, options);
     SequencePlanningInputs inputs{
         .profile         = std::move(profile),

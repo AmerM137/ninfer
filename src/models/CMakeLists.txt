@@ -13,6 +13,12 @@ target_include_directories(ninfer_model_runtime PRIVATE
 target_include_directories(ninfer_model_runtime SYSTEM PRIVATE
   ${PROJECT_SOURCE_DIR}/third_party/xgrammar/3rdparty/picojson)
 
+target_sources(ninfer_model_loading PRIVATE common/moe/weights.cpp)
+target_sources(ninfer_model_runtime PRIVATE
+  common/moe/plan.cpp
+  common/moe/execution.cpp
+  common/moe/resources.cpp)
+
 include(qwen3_5/loading_sources.cmake)
 include(qwen3_5/frontend_sources.cmake)
 include(qwen3_5/execution_sources.cmake)

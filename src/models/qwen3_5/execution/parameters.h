@@ -1,7 +1,7 @@
 #pragma once
 
 #include "models/qwen3_5/execution/dense_mlp.h"
-#include "models/qwen3_5/execution/moe.h"
+#include "models/common/moe/execution.h"
 #include "models/qwen3_5/model.h"
 #include "ninfer/ops/weight_input.h"
 
@@ -24,7 +24,7 @@ using LinearParameters = ops::SingleProjectionWeight;
     return static_cast<std::int32_t>(value);
 }
 
-using FfnParameters = std::variant<DenseParameters, MoeParameters>;
+using FfnParameters = std::variant<DenseParameters, moe::Parameters>;
 
 struct AttentionParameters {
     ops::ProjectionWeights projection;

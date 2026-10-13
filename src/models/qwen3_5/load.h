@@ -34,7 +34,7 @@ public:
     [[nodiscard]] artifact::MaterializationPlan placement(Device cuda, Device main_experts) const;
     [[nodiscard]] const ModelWeights& weights() const;
     [[nodiscard]] const FrontendResources& resources() const;
-    [[nodiscard]] std::span<const ExpertBankDescription> expert_banks() const;
+    [[nodiscard]] std::span<const moe::BankDescription> expert_banks() const;
     [[nodiscard]] const artifact::ParameterReference& parameter(WeightId id) const;
     [[nodiscard]] std::span<const WeightUse> uses(WeightId id) const;
 

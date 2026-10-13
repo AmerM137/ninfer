@@ -14,7 +14,7 @@ struct LoadPlan::Impl {
     std::vector<loading::PendingWeight> pending;
     const artifact::Reader* reader = nullptr;
     artifact::PreparedResources prepared_resources;
-    std::vector<ExpertBankDescription> expert_banks;
+    std::vector<moe::BankDescription> expert_banks;
     FrontendResources resources;
     InstanceInfo info;
     std::vector<WeightParent> geometry_parents;
@@ -47,9 +47,7 @@ const ModelWeights& LoadPlan::weights() const { return impl_->weights; }
 
 const FrontendResources& LoadPlan::resources() const { return impl_->resources; }
 
-std::span<const ExpertBankDescription> LoadPlan::expert_banks() const {
-    return impl_->expert_banks;
-}
+std::span<const moe::BankDescription> LoadPlan::expert_banks() const { return impl_->expert_banks; }
 
 const artifact::ParameterReference& LoadPlan::parameter(WeightId id) const {
     return impl_->pending.at(id.index).reference;
@@ -148,7 +146,10 @@ Placement describe_placement(const Data& data, Device cuda, Device expert_device
     }
     Placement out;
     out.weights.assign(data.pending.size(), cuda);
-    for (const auto& bank : data.expert_banks) out.banks.push_back(bank.mtp ? cuda : expert_device);
+    out.banks.assign(data.expert_banks.size(), cuda);
+    for (const auto& layer : data.weights.text.layers)
+        if (const auto* parameters = std::get_if<MoeWeights>(&layer.ffn))
+            out.banks[parameters->bank.index] = expert_device;
     const auto place = [&](const BlockWeights& layer) {
         if (const auto* moe = std::get_if<MoeWeights>(&layer.ffn)) {
             for (const auto& expert : moe->experts) {
@@ -192,7 +193,7 @@ std::unique_ptr<Model> materialize_model(ResolvedLoadPlan&& plan, DeviceContext&
     auto backing = artifact::materialize(*data->reader, std::move(plan.materialization_),
                                          device.transfer_view(), observer);
     auto bound   = loading::resolve_weights(std::move(data->pending), backing, plan.devices_);
-    auto banks   = bind_expert_weights(data->expert_banks, backing, plan.bank_devices_);
+    auto banks   = moe::bind_banks(data->expert_banks, backing, plan.bank_devices_);
     return std::unique_ptr<Model>(new Model(
         std::move(data->config), data->options, std::move(data->weights), std::move(bound),
         std::move(banks), std::move(data->resources), std::move(data->info), std::move(backing)));

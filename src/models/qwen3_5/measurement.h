@@ -4,16 +4,15 @@
 
 #include <string>
 
-namespace ninfer::models::qwen3_5 {
-
-namespace detail {
-struct MoePlan;
+namespace ninfer::models::moe {
+struct Plan;
 }
+
+namespace ninfer::models::qwen3_5 {
 
 // Measurement applicability, independent of checkpoint names, object IDs, payload values and
 // device addresses. This key never selects or admits an execution implementation.
-[[nodiscard]] std::string prefill_signature(const Model& model,
-                                            const detail::MoePlan* moe = nullptr,
-                                            std::uint32_t chunk        = 0);
+[[nodiscard]] std::string prefill_signature(const Model& model, const moe::Plan* moe = nullptr,
+                                            std::uint32_t chunk = 0);
 
 } // namespace ninfer::models::qwen3_5

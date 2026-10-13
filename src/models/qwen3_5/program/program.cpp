@@ -305,7 +305,7 @@ SequencePlanner make_sequence_planner(const execution::Parameters& parameters,
 
 SequencePlanner make_sequence_planner(std::shared_ptr<const execution::ModelProfile> profile,
                                       DeviceContext& device, const EngineOptions& options,
-                                      std::shared_ptr<const detail::MoePlan> moe) {
+                                      std::shared_ptr<const moe::Plan> moe) {
     return SequencePlanner(
         detail::make_sequence_planner_impl(std::move(profile), device, options, std::move(moe)));
 }

@@ -222,12 +222,13 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
             cudaMemsetAsync(sampling_config.data, 0, sampling_config.bytes(), device.stream()));
     }
     if (plan.moe) {
-        std::vector<const execution::MoeParameters*> layers;
+        std::vector<const moe::Parameters*> layers;
         for (const auto& block : parameters.text.layers) {
-            layers.push_back(std::get_if<execution::MoeParameters>(&block.ffn));
+            if (const auto* layer = std::get_if<moe::Parameters>(&block.ffn))
+                layers.push_back(layer);
         }
-        moe = std::make_unique<MoeResources>(plan.moe, layers, parameters.model.expert_banks(),
-                                             device);
+        moe = std::make_unique<moe::Resources>(plan.moe, layers, parameters.model.expert_banks(),
+                                               device);
     }
     device.synchronize();
     if (use_cuda_graph) {
@@ -461,7 +462,7 @@ MemorySummary ProgramImpl::memory_summary() const {
             summary.fixed_experts_per_layer.push_back(layer.fixed_experts);
             summary.target_experts_per_layer.push_back(layer.cache_experts);
             summary.ready_experts_per_layer.push_back(
-                layer.experts ? usage.ready_experts_per_bank.at(layer.bank.index) : 0);
+                usage.ready_experts_per_bank.at(layer.spec.bank.index));
         }
         summary.bridge_device_bytes = plan.bridge.device_frame_bytes;
         summary.bridge_pinned_bytes = plan.bridge.pinned_frame_bytes;

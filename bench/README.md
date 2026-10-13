@@ -1397,7 +1397,7 @@ for example Flash Next `--bank mtp/layers/0/moe/experts --experts 512 --resident
 ## Single-layer mixed MoE execution
 
 `ninfer_qwen3_5_moe_execution_bench` materializes one selected 35B layer's native expert parents,
-control and shared weights. Its production model entry includes route, actual ExpertCache use,
+control and shared weights. Its shared MoE execution entry includes route, actual ExpertCache use,
 D2H, CPU/GPU contributions, H2D and residual merge. This is a layer microbenchmark, not Engine
 generation. `--gpu-experts N` assigns logical IDs `[0,N)` by default; `--gpu-selection shuffled`
 selects the first N IDs of a deterministic shuffled permutation. The remaining routed assignments
