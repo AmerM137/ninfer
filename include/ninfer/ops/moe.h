@@ -28,6 +28,8 @@ struct RoutedSwiGLUProfile {
     std::int32_t experts = 0, top_k = 0;
 };
 
+// NVFP4 A4 calibration divisors for x and the FP32 SiLU(gate)*up product, respectively.
+// Matrix divisors remain independently addressed by logical expert in the bank.
 struct ExpertActivationDivisors {
     std::optional<float> gate_up, down;
 };

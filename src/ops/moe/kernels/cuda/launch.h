@@ -11,7 +11,8 @@ struct SwiGLUShape {
     static constexpr int score_rows   = (E + 4) / 4 * 4;
 };
 
-using SwiGLUH2048I512E256K8 = SwiGLUShape<2048, 512, 256, 8>;
+using SwiGLUH2048I512E256K8  = SwiGLUShape<2048, 512, 256, 8>;
+using SwiGLUH2560I640E512K10 = SwiGLUShape<2560, 640, 512, 10>;
 
 enum class RouterAlgorithm : std::uint8_t { Vector, TokenTile, Mma };
 

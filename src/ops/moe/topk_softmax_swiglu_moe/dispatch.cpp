@@ -6,6 +6,8 @@ namespace ninfer::ops::detail::moe_complete {
 const ShapePolicy& resolve_shape(const MoeProfile& profile) {
     validate_moe_profile(profile);
     switch (profile.routed.ffn.down_type) {
+    case QType::NVFP4:
+        return nvfp4_h2560_i640_e512_k10();
     case QType::Q5_G64_FP16:
         return q4_q5_h2048_i512_e256_k8();
     case QType::Q6_G64_FP16:

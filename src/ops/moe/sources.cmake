@@ -1,5 +1,9 @@
 target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/weights.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/topk_softmax_route/bf16/shapes/h2560_e512_k10.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/routed_swiglu/cuda/nvfp4/shapes/h2560_i640_e512_k10/dispatch.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/topk_softmax_swiglu_moe/nvfp4/shapes/h2560_i640_e512_k10/dispatch.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/kernels/cuda/nvfp4/shared.cu"
   "${CMAKE_CURRENT_LIST_DIR}/operands.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/kernels/cuda/route.cu"
   "${CMAKE_CURRENT_LIST_DIR}/kernels/cuda/token_swiglu.cu"
@@ -19,3 +23,7 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/routed_swiglu/cuda/q8_q8/shapes/h2048_i512_e256_k8/dispatch.cpp"
 )
 include("${CMAKE_CURRENT_LIST_DIR}/routed_swiglu/cpu/sources.cmake")
+
+target_sources(ninfer_nvfp4_non_rdc PRIVATE
+  "${CMAKE_CURRENT_LIST_DIR}/kernels/cuda/nvfp4/launch.cu"
+)

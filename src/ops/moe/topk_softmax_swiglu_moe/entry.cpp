@@ -3,6 +3,7 @@
 #include "ops/moe/operands.h"
 #include "ops/moe/topk_softmax_swiglu_moe/dispatch.h"
 #include "ops/moe/workspace.h"
+#include "ops/moe/kernels/cuda/nvfp4/workspace.h"
 
 namespace ninfer::ops {
 namespace {
@@ -13,6 +14,7 @@ struct CallStorage {
     Tensor shared;
     detail::RouteStorage route;
     detail::ExpertStorage experts;
+    detail::moe_nvfp4::Storage nvfp4;
 };
 
 template <class Arena>
@@ -22,7 +24,12 @@ CallStorage allocate(Arena& arena, const impl::Plan& plan, int tokens, int top_k
     out.routes = detail::allocate_routes(arena, top_k, tokens);
     out.shared = arena.alloc(DType::FP32, {tokens});
     // Router scratch is independent of expert activations, including during PDL overlap.
-    out.route   = detail::allocate_route(arena, plan.router, tokens);
+    out.route =
+        detail::allocate_route(arena, plan.router, tokens, plan.nvfp4.gate_columns ? 512 : 256);
+    if (plan.nvfp4.gate_columns) {
+        out.nvfp4 = detail::moe_nvfp4::allocate(arena, plan.nvfp4, tokens, true, true);
+        return out;
+    }
     out.experts = plan.grouped
                       ? detail::allocate_grouped(arena, tokens, plan.group, true, split_activation)
                       : detail::allocate_token(arena, tokens, true);
@@ -76,6 +83,14 @@ void topk_softmax_swiglu_moe(const Tensor& x, const MoeProfile& profile, const M
         const auto storage =
             allocate(workspace, plan, count, p.top_k, p.ffn.gate_up_type == QType::Q8_G32_FP16);
         const ScaledSwiGLUTerm shared{weights.shared, storage.shared};
+        if (plan.nvfp4.gate_columns) {
+            detail::moe_nvfp4::launch_control_shared(input, weights, storage.routes, storage.shared,
+                                                     storage.route.scores, storage.nvfp4,
+                                                     execution);
+            detail::moe_nvfp4::launch(input, weights.routed, storage.routes, {}, &shared, mode,
+                                      output, plan.nvfp4, storage.nvfp4, execution, true);
+            continue;
+        }
         const MoeExecutionHints shared_prefetch{weights.shared.down.weight.qdata,
                                                 std::size_t(p.ffn.hidden) *
                                                     profile.shared.intermediate};

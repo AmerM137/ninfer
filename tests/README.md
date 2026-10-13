@@ -195,7 +195,10 @@ NINFER_TEST_ARTIFACT=$PWD/out/qwen3_8_27b_nvfp4.ninfer \
   ctest --test-dir build -R ninfer_qwen3_5_score_real_test --output-on-failure
 ```
 
-`ninfer_moe_test` qualifies routing, complete MoE and routed SwiGLU.
+`ninfer_moe_test` qualifies the integer routing, complete MoE and routed SwiGLU profiles.
+`ninfer_moe_nvfp4_test` qualifies NVFP4 experts with BF16 control/shared, including A4 and decode
+A16, independent FP64 formulas, per-expert divisors, affine/indexed banks, masks, changed Graph
+contents, private route boundaries and workspace guards.
 `ninfer_sum_contributions_test` covers FP32 partial summation with optional BF16 residual.
 Their independent FP64 oracles start from represented inputs and decoded logical weights. The MoE
 suite covers the resident codec profiles, FP32/BF16 outputs, residual modes, expert masks, strided/indexed
@@ -220,7 +223,7 @@ transitions through the real cache schedule. The compact Graph calibration stora
 All/None/partial contributions against the same oracle while reusing one bank window.
 
 ```bash
-ctest --test-dir build -R '^ninfer_moe(_cpu(_avx2|_fma)?)?_test$' --output-on-failure
+ctest --test-dir build -R '^ninfer_moe(_nvfp4|_cpu(_avx2|_fma)?)?_test$' --output-on-failure
 ctest --test-dir build -R '^ninfer_moe_execution_test$' --output-on-failure
 ```
 

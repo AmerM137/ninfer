@@ -151,10 +151,10 @@ void token_extent(int tokens, Function&& launch) {
 }
 } // namespace
 
-void launch_route(const Tensor& x, const Weight& control, const ExpertRoutes& routes,
-                  const Tensor& shared, const RouterPlan& plan, const RouteStorage& storage,
-                  const MoeExecutionHints& hints, CudaExecutionView execution) {
-    using S             = SwiGLUH2048I512E256K8;
+template <class S>
+void launch_route_shape(const Tensor& x, const Weight& control, const ExpertRoutes& routes,
+                        const Tensor& shared, const RouterPlan& plan, const RouteStorage& storage,
+                        const MoeExecutionHints& hints, CudaExecutionView execution) {
     const auto* input   = static_cast<const __nv_bfloat16*>(x.data);
     const auto* weights = static_cast<const __nv_bfloat16*>(control.qdata);
     const auto stream   = execution.stream();
@@ -163,10 +163,14 @@ void launch_route(const Tensor& x, const Weight& control, const ExpertRoutes& ro
         router_vector<S>
             <<<S::control_rows, 256, 0, stream>>>(input, weights, storage.scores, hints);
     } else if (plan.algorithm == RouterAlgorithm::TokenTile) {
-        token_extent(tokens, [&]<int T>() {
-            router_token_tile<S, T><<<S::control_rows * 4, 128, 0, stream>>>(
-                input, weights, storage.scores, plan.programmatic);
-        });
+        if constexpr (S::hidden == 2048) {
+            token_extent(tokens, [&]<int T>() {
+                router_token_tile<S, T><<<S::control_rows * 4, 128, 0, stream>>>(
+                    input, weights, storage.scores, plan.programmatic);
+            });
+        } else {
+            throw std::logic_error("router token tile is unsupported for this shape");
+        }
     } else {
         router_mma_kernel<S>
             <<<dim3((S::control_rows + 15) / 16, (tokens + 63) / 64), 256, 0, stream>>>(
@@ -197,4 +201,15 @@ void launch_route(const Tensor& x, const Weight& control, const ExpertRoutes& ro
     }
 }
 
+void launch_route(const Tensor& x, const Weight& control, const ExpertRoutes& routes,
+                  const Tensor& shared, const RouterPlan& plan, const RouteStorage& storage,
+                  const MoeExecutionHints& hints, CudaExecutionView execution) {
+    if (control.k == 2560) {
+        launch_route_shape<SwiGLUH2560I640E512K10>(x, control, routes, shared, plan, storage, hints,
+                                                   execution);
+    } else {
+        launch_route_shape<SwiGLUH2048I512E256K8>(x, control, routes, shared, plan, storage, hints,
+                                                  execution);
+    }
+}
 } // namespace ninfer::ops::detail

@@ -18,6 +18,10 @@ struct MatrixBytes {
 MatrixBytes matrix_bytes(QType type, int rows, int columns) {
     const auto elements = std::size_t(rows) * columns;
     switch (type) {
+    case QType::BF16:
+        return {elements * 2, 0, 0};
+    case QType::NVFP4:
+        return {elements / 2, 0, elements / 16};
     case QType::Q4_G64_FP16:
         return {elements / 2, 0, elements / 32};
     case QType::Q5_G64_FP16:
@@ -33,13 +37,24 @@ MatrixBytes matrix_bytes(QType type, int rows, int columns) {
 } // namespace
 
 void validate_route_profile(const RouteProfile& p) {
-    require(p.hidden == 2048 && p.experts == 256 && p.top_k == 8,
+    require((p.hidden == 2048 && p.experts == 256 && p.top_k == 8) ||
+                (p.hidden == 2560 && p.experts == 512 && p.top_k == 10),
             "topk softmax route: unsupported geometry");
 }
 
 void validate_expert_profile(const RoutedSwiGLUProfile& p) {
     validate_route_profile({p.ffn.hidden, p.experts, p.top_k});
     const auto& f = p.ffn;
+    if (f.hidden == 2560) {
+        require(f.intermediate == 640 && f.gate_up_type == QType::NVFP4 &&
+                    f.down_type == QType::NVFP4 &&
+                    f.gate_up_layout == QuantLayout::BlockScaleK16M128x4 &&
+                    f.down_layout == QuantLayout::BlockScaleK16M128x4 &&
+                    f.gate_up_policy == LinearPolicy::AllowA4 &&
+                    f.down_policy == LinearPolicy::AllowA4,
+                "routed SwiGLU: unsupported NVFP4 profile");
+        return;
+    }
     require(f.intermediate == 512 && f.gate_up_layout == QuantLayout::RowSplit &&
                 f.down_layout == QuantLayout::RowSplit && valid_linear_policy(f.gate_up_policy) &&
                 valid_linear_policy(f.down_policy),
@@ -51,6 +66,15 @@ void validate_expert_profile(const RoutedSwiGLUProfile& p) {
 }
 
 void validate_shared_profile(const SwiGLUProfile& p, int hidden) {
+    if (hidden == 2560) {
+        require(p.hidden == hidden && p.intermediate == 640 && p.gate_up_type == QType::BF16 &&
+                    p.down_type == QType::BF16 && p.gate_up_layout == QuantLayout::Contiguous &&
+                    p.down_layout == QuantLayout::Contiguous &&
+                    p.gate_up_policy == LinearPolicy::A16Only &&
+                    p.down_policy == LinearPolicy::A16Only,
+                "shared SwiGLU: unsupported BF16 profile");
+        return;
+    }
     require(p.hidden == hidden && p.intermediate == 512 && p.gate_up_type == QType::Q8_G32_FP16 &&
                 p.down_type == QType::Q8_G32_FP16 && p.gate_up_layout == QuantLayout::RowSplit &&
                 p.down_layout == QuantLayout::RowSplit && valid_linear_policy(p.gate_up_policy) &&
@@ -158,10 +182,21 @@ void MoeOperands::experts(const CudaSwiGLUExperts& w, const RoutedSwiGLUProfile&
         require(!divisor || (std::isfinite(*divisor) && *divisor > 0),
                 "MoE: activation divisor must be finite and positive");
     }
+    if (p.ffn.gate_up_type == QType::NVFP4) {
+        require(w.activation_divisors.gate_up && w.activation_divisors.down,
+                "MoE: NVFP4 A4 requires both activation divisors");
+    }
     const auto matrix = [&](const ExpertMatrixDeviceView& view, QType type, int n, int k) {
         const auto bytes = matrix_bytes(type, n, k);
-        require(!view.divisors && view.divisor_stride == 0,
-                "MoE: integer weight bank has no matrix divisors");
+        if (type == QType::NVFP4) {
+            require(operand::aligned(view.divisors, alignof(float)) &&
+                        view.divisor_stride <= (SIZE_MAX / sizeof(float) - 1) / (p.experts - 1),
+                    "MoE: invalid NVFP4 matrix divisors");
+            read(view.divisors, ((p.experts - 1) * view.divisor_stride + 1) * sizeof(float));
+        } else {
+            require(!view.divisors && view.divisor_stride == 0,
+                    "MoE: integer weight bank has no matrix divisors");
+        }
         if (view.offsets) {
             require(operand::aligned(view.offsets, 8), "MoE: unaligned expert offsets");
             read(view.offsets, std::size_t(p.experts) * 8);
@@ -199,12 +234,16 @@ void MoeOperands::experts(const CudaSwiGLUExperts& w, const RoutedSwiGLUProfile&
 
 void MoeOperands::matrix(const Weight& w, int rows, int columns, QType type) {
     operand::device(w.device, device_, op_, "shared weight");
-    require(w.qtype == type && w.layout == QuantLayout::RowSplit && w.n == rows && w.k == columns &&
-                w.ndim == 2 && w.shape[0] == rows && w.shape[1] == columns && w.shape[2] == 1 &&
-                w.shape[3] == 1 && w.padded_shape[0] == rows && w.padded_shape[1] == columns &&
-                w.group_size == 32 && w.group == 32 && w.scale_dtype == DType::FP16 && !w.qhigh &&
-                operand::aligned(w.qdata, 16) && operand::aligned(w.scales, 16),
+    require(w.qtype == type && w.n == rows && w.k == columns && w.ndim == 2 && w.shape[0] == rows &&
+                w.shape[1] == columns && w.shape[2] == 1 && w.shape[3] == 1 &&
+                w.padded_shape[0] == rows && w.padded_shape[1] == columns && !w.qhigh &&
+                operand::aligned(w.qdata, 16),
             "MoE: invalid shared matrix");
+    require(type == QType::BF16
+                ? w.layout == QuantLayout::Contiguous && !w.scales
+                : w.layout == QuantLayout::RowSplit && w.group_size == 32 && w.group == 32 &&
+                      w.scale_dtype == DType::FP16 && operand::aligned(w.scales, 16),
+            "MoE: invalid shared matrix encoding");
     const auto bytes = matrix_bytes(type, rows, columns);
     require(w.payload_bytes >= bytes.codes + bytes.scales, "MoE: truncated shared matrix");
     read(w.qdata, bytes.codes);

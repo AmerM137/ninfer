@@ -3,22 +3,34 @@
 #include "ops/moe/operands.h"
 #include "ops/moe/routed_swiglu/cuda/dispatch.h"
 #include "ops/moe/workspace.h"
+#include "ops/moe/kernels/cuda/nvfp4/workspace.h"
 
 namespace ninfer::ops {
 namespace {
 namespace impl = detail::moe_routed;
 
+struct CallStorage {
+    detail::ExpertStorage integer;
+    detail::moe_nvfp4::Storage nvfp4;
+};
+
 template <class Arena>
-detail::ExpertStorage allocate(Arena& arena, const impl::ShapePolicy& shape, int tokens,
-                               ExpertSubsetKind subset, bool shared, bool split_activation) {
+CallStorage allocate(Arena& arena, const impl::ShapePolicy& shape, int tokens,
+                     ExpertSubsetKind subset, bool shared, bool split_activation) {
+    const auto plan = shape.select(tokens, shared);
+    if (plan.nvfp4.gate_columns) {
+        CallStorage out;
+        out.nvfp4 = detail::moe_nvfp4::allocate(arena, plan.nvfp4, tokens,
+                                                subset != ExpertSubsetKind::None, shared);
+        return out;
+    }
     if (subset == ExpertSubsetKind::None) {
         if (!shared) { return {}; }
-        return detail::allocate_shared(arena, tokens);
+        return {.integer = detail::allocate_shared(arena, tokens)};
     }
-    const auto plan = shape.select(tokens, shared);
-    return plan.grouped
-               ? detail::allocate_grouped(arena, tokens, plan.group, shared, split_activation)
-               : detail::allocate_token(arena, tokens, shared);
+    return {.integer = plan.grouped ? detail::allocate_grouped(arena, tokens, plan.group, shared,
+                                                               split_activation)
+                                    : detail::allocate_token(arena, tokens, shared)};
 }
 
 std::size_t capacity(const RoutedSwiGLUProfile& profile, const SwiGLUProfile* shared,
@@ -80,14 +92,20 @@ void execute(const Tensor& x, const RoutedSwiGLUProfile& profile, const CudaSwiG
             term = ScaledSwiGLUTerm{shared->weights, shared->coefficients.slice(0, offset, count)};
         }
         auto scope         = workspace.scope();
-        const auto storage = allocate(workspace, shape, count, subset.kind, shared != nullptr,
+        const auto buffers = allocate(workspace, shape, count, subset.kind, shared != nullptr,
                                       profile.ffn.gate_up_type == QType::Q8_G32_FP16);
+        const auto plan    = shape.select(count, shared != nullptr);
+        if (plan.nvfp4.gate_columns) {
+            detail::moe_nvfp4::launch(input, experts, selection, subset, term ? &*term : nullptr,
+                                      mode, output, plan.nvfp4, buffers.nvfp4, execution);
+            continue;
+        }
+        const auto& storage = buffers.integer;
         if (subset.kind == ExpertSubsetKind::None) {
             detail::launch_shared_swiglu(input, *term, mode, output, storage,
                                          impl::select_shared(count), execution);
             continue;
         }
-        const auto plan = shape.select(count, shared != nullptr);
         if (plan.grouped) {
             detail::launch_group_count(selection, subset, storage.groups, execution);
             detail::launch_group_scan(selection, plan.group, storage.groups, execution);

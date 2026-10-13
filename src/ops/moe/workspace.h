@@ -25,10 +25,9 @@ std::size_t interval_capacity(int first, int last, std::span<const int> boundari
 }
 
 template <class Arena>
-RouteStorage allocate_route(Arena& arena, const RouterPlan& plan, int tokens) {
-    using S = SwiGLUH2048I512E256K8;
+RouteStorage allocate_route(Arena& arena, const RouterPlan& plan, int tokens, int experts = 256) {
     const int rows =
-        plan.algorithm == RouterAlgorithm::TokenTile ? S::control_rows * 4 : S::score_rows;
+        plan.algorithm == RouterAlgorithm::TokenTile ? (experts + 1) * 4 : (experts + 4) / 4 * 4;
     auto scores = arena.alloc(DType::FP32, {rows, tokens});
     return {static_cast<float*>(scores.data)};
 }
