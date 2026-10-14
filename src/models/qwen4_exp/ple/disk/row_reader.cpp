@@ -1,4 +1,4 @@
-#include "models/qwen4_exp/ple/row_reader.h"
+#include "models/qwen4_exp/ple/disk/row_reader.h"
 
 #include "core/buffer.h"
 #include "core/io/read_queue.h"
@@ -11,7 +11,7 @@
 #include <stdexcept>
 #include <system_error>
 
-namespace ninfer::models::qwen4_exp::ple_detail {
+namespace ninfer::models::qwen4_exp::ple::disk {
 namespace {
 
 constexpr std::uint32_t none = std::numeric_limits<std::uint32_t>::max();
@@ -74,7 +74,7 @@ private:
 
 struct CacheEntry {
     std::uint32_t row = none;
-    std::array<std::byte, kPleRowBytes> bytes;
+    std::array<std::byte, kRowBytes> bytes;
 };
 
 struct alignas(128) CacheSet {
@@ -93,7 +93,7 @@ struct RowReader::Impl {
     struct Row {
         std::uint32_t id = 0, head = none, parts = 0, active = 0;
         const Nf4Bf16Lut* lut = nullptr;
-        std::array<std::byte, kPleRowBytes> bytes;
+        std::array<std::byte, kRowBytes> bytes;
         std::exception_ptr error;
         bool ready = false, abandoned = false, indexed = false;
     };
@@ -117,7 +117,7 @@ struct RowReader::Impl {
         bool required = false, bound = false;
     };
 
-    const PleTableSource& table;
+    const Table& table;
     std::uint32_t owner_rows, part_capacity, read_bytes = 4096;
     std::vector<Owner> owners;
     std::vector<Target> targets;
@@ -133,15 +133,15 @@ struct RowReader::Impl {
     HostBuffer slab;
     std::vector<MemorySpan> buffers;
     std::vector<io::ReadCompletion> completions;
-    PleReadStats stats;
+    ReadStats stats;
     std::unique_ptr<io::DirectReadQueue> queue;
 
-    Impl(const PleTableSource& table, std::uint32_t count, std::uint32_t per_owner,
-         std::uint32_t depth, std::size_t cache_bytes)
+    Impl(const Table& table, std::uint32_t count, std::uint32_t per_owner, std::uint32_t depth,
+         std::size_t cache_bytes)
         : table(table), owner_rows(per_owner),
           // Further segments start at a V3 file's 4 KiB-aligned payload prefix. Only the
           // first segment can straddle a read page; each later segment is at most 90 bytes.
-          part_capacity(std::min<std::size_t>(kPleRowBytes, table.max_row_segments() + 1)),
+          part_capacity(std::min<std::size_t>(kRowBytes, table.max_row_segments() + 1)),
           owners(count), targets(capacity(std::uint64_t(count) * per_owner)), rows(targets.size()),
           fragments(capacity(rows.size() * part_capacity)), pages(fragments.size()),
           inflight(depth, none), ready_rows(rows.size()), row_index(rows.size()),
@@ -272,7 +272,7 @@ struct RowReader::Impl {
 
     void decode(std::uint32_t id) {
         auto& row = rows[id];
-        std::array<std::uint16_t, kPleRowElements> decoded;
+        std::array<std::uint16_t, kRowElements> decoded;
         if (!row.abandoned && !row.error) {
             try {
                 decode_nf4_row(row.bytes, *row.lut, decoded);
@@ -291,7 +291,7 @@ struct RowReader::Impl {
                 throw std::logic_error("active PLE row was abandoned");
             else
                 std::copy(decoded.begin(), decoded.end(),
-                          owner.output.begin() + std::size_t(t % owner_rows) * kPleRowElements);
+                          owner.output.begin() + std::size_t(t % owner_rows) * kRowElements);
             --owner.pending;
             target.active = false;
         }
@@ -340,8 +340,8 @@ struct RowReader::Impl {
     }
 };
 
-RowReader::RowReader(const PleTableSource& table, std::uint32_t owners,
-                     std::uint32_t rows_per_owner, std::uint32_t io_depth, std::size_t cache_bytes)
+RowReader::RowReader(const Table& table, std::uint32_t owners, std::uint32_t rows_per_owner,
+                     std::uint32_t io_depth, std::size_t cache_bytes)
     : impl_(std::make_unique<Impl>(table, owners, rows_per_owner, io_depth, cache_bytes)) {}
 
 RowReader::~RowReader() = default;
@@ -349,7 +349,7 @@ RowReader::~RowReader() = default;
 void RowReader::begin(std::uint32_t id, std::span<std::uint16_t> output, bool required) {
     auto& p = *impl_;
     if (id >= p.owners.size() || p.owners[id].bound || output.empty() ||
-        output.size() % kPleRowElements || output.size() / kPleRowElements > p.owner_rows)
+        output.size() % kRowElements || output.size() / kRowElements > p.owner_rows)
         throw std::invalid_argument("invalid PLE row output");
     auto& o    = p.owners[id];
     o.output   = output;
@@ -361,7 +361,7 @@ void RowReader::begin(std::uint32_t id, std::span<std::uint16_t> output, bool re
 void RowReader::request(std::uint32_t owner_id, std::uint32_t destination, std::uint32_t row_id) {
     auto& p     = *impl_;
     auto& owner = p.owner(owner_id);
-    if (destination >= owner.output.size() / kPleRowElements || row_id >= p.table.rows())
+    if (destination >= owner.output.size() / kRowElements || row_id >= p.table.parameters().rows)
         throw std::invalid_argument("invalid PLE row request");
     const auto target_id = owner_id * p.owner_rows + destination;
     auto& target         = p.targets[target_id];
@@ -384,7 +384,7 @@ void RowReader::request(std::uint32_t owner_id, std::uint32_t destination, std::
             ++p.stats.cache_hits;
         } else {
             const auto count =
-                artifact::map_file_range(source.object, source.offset, kPleRowBytes, p.segments);
+                artifact::map_file_range(source.object, source.offset, kRowBytes, p.segments);
             std::uint32_t part = 0;
             for (std::size_t s = 0; s < count; ++s) {
                 const auto& segment  = p.segments[s];
@@ -442,9 +442,8 @@ void RowReader::request(std::uint32_t owner_id, std::uint32_t destination, std::
     row.head = target_id;
     owner.targets.push_back(target_id);
     if (row.ready) {
-        decode_nf4_row(
-            row.bytes, *row.lut,
-            owner.output.subspan(std::size_t(destination) * kPleRowElements, kPleRowElements));
+        decode_nf4_row(row.bytes, *row.lut,
+                       owner.output.subspan(std::size_t(destination) * kRowElements, kRowElements));
     } else {
         ++row.active;
         ++owner.pending;
@@ -455,7 +454,7 @@ void RowReader::request(std::uint32_t owner_id, std::uint32_t destination, std::
 void RowReader::cancel(std::uint32_t id, std::uint32_t begin, std::uint32_t end) {
     auto& p     = *impl_;
     auto& owner = p.owner(id);
-    if (begin > end || end > owner.output.size() / kPleRowElements)
+    if (begin > end || end > owner.output.size() / kRowElements)
         throw std::invalid_argument("invalid PLE cancellation range");
     if (begin == end) return;
     for (auto t : owner.targets) {
@@ -532,7 +531,7 @@ bool RowReader::drained(std::uint32_t owner) const { return impl_->owner(owner).
 
 std::exception_ptr RowReader::error(std::uint32_t owner) const { return impl_->owner(owner).error; }
 
-PleReadStats RowReader::stats() const noexcept { return impl_->stats; }
+ReadStats RowReader::stats() const noexcept { return impl_->stats; }
 
 std::size_t RowReader::memory_bytes() const noexcept {
     const auto& p = *impl_;
@@ -547,4 +546,4 @@ std::size_t RowReader::memory_bytes() const noexcept {
                (sizeof(MemorySpan) + sizeof(io::ReadCompletion) + sizeof(std::uint32_t));
 }
 
-} // namespace ninfer::models::qwen4_exp::ple_detail
+} // namespace ninfer::models::qwen4_exp::ple::disk

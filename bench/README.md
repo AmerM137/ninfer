@@ -42,11 +42,11 @@ including each post-call idle interval; `cpu_calls` is that run's call count. Th
 sub-millisecond OS accounting samples as steady CPU cost. Setup and warmup are excluded.
 These are scheduling costs, not CPU arithmetic throughput or model performance.
 
-`ninfer_ple_prepare_bench` measures the Qwen4Exp PLE preparation component using an explicit NF4
-artifact and a raw little-endian U32 token corpus:
+`ninfer_ple_disk_prepare_bench` measures Qwen4Exp disk preparation and its independent upload slots
+using an explicit NF4 artifact and a raw little-endian U32 token corpus:
 
 ```bash
-build/bench/ninfer_ple_prepare_bench /explicit/model.ninfer /explicit/corpus.u32 8 16 6 64 \
+build/bench/ninfer_ple_disk_prepare_bench /explicit/model.ninfer /explicit/corpus.u32 8 16 6 64 \
   --read-budget-mib 64
 ```
 

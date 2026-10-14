@@ -1,4 +1,5 @@
-#include "models/qwen4_exp/ple/gpu.h"
+#include "models/qwen4_exp/ple/upload.h"
+#include "models/qwen4_exp/ple/disk/prepare.h"
 #include "artifact/materializer.h"
 #include "core/buffer.h"
 #include "core/decode_graph.h"
@@ -11,7 +12,7 @@
 
 namespace {
 using namespace ninfer;
-using namespace ninfer::models::qwen4_exp;
+using namespace ninfer::models::qwen4_exp::ple;
 using Clock = std::chrono::steady_clock;
 
 struct Options {
@@ -24,7 +25,7 @@ struct Options {
 Options options(int argc, char** argv) {
     if (argc < 7)
         throw std::invalid_argument(
-            "usage: ninfer_ple_prepare_bench ARTIFACT CORPUS B T ITERATIONS CACHE_MIB "
+            "usage: ninfer_ple_disk_prepare_bench ARTIFACT CORPUS B T ITERATIONS CACHE_MIB "
             "[--read-budget-mib N] [--incremental-us N] [--overlap N] [--dump PATH]");
     Options o{argv[1],
               argv[2],
@@ -74,8 +75,10 @@ void write(std::ostream& out, const T& value) {
 void run(const Options& o) {
     artifact::Reader artifact(o.artifact);
     const auto& binding = artifact.directory().bindings.at("text/layers/1/ple/table");
-    PleTableSource table(artifact, binding,
-                         artifact.directory().component("text").resources.at("ple_hash_controls"));
+    disk::Table table(
+        artifact, load_lookup_parameters(
+                      artifact, binding,
+                      artifact.directory().component("text").resources.at("ple_hash_controls")));
     const auto eos =
         artifact.directory().component("text").config.at("eos_token_id").get<std::int32_t>();
     std::uint32_t base_row = 0;
@@ -102,15 +105,15 @@ void run(const Options& o) {
 
     DeviceContext context;
     const auto positions = o.batch * o.tokens;
-    PleGpuPreparation preparation(table, eos, context,
-                                  {.max_positions = positions,
-                                   .windows       = 2,
-                                   .io_depth      = 128,
-                                   .cache_bytes   = std::size_t(o.cache_mib) * 1024 * 1024});
-    auto& service     = preparation.host();
-    const auto memory = preparation.memory();
+    UploadSlots uploads(context, positions, 2);
+    disk::PrepareService service(table, eos,
+                                 {.max_positions = positions,
+                                  .io_depth      = 128,
+                                  .cache_bytes   = std::size_t(o.cache_mib) * 1024 * 1024},
+                                 uploads.host_slots());
+    const auto memory = uploads.memory();
     std::cerr << "device=" << context.properties().name
-              << " ordinary_host=" << memory.ordinary_host_bytes
+              << " ordinary_host=" << memory.ordinary_host_bytes + service.memory_bytes()
               << " pinned_host=" << memory.pinned_host_bytes << " device_E=" << memory.device_bytes
               << " read_budget=" << o.budget << '\n';
 
@@ -155,7 +158,7 @@ void run(const Options& o) {
             std::cerr << "read budget reached after " << sample << " samples\n";
             break;
         }
-        std::array<PleInputRow, 8> rows;
+        std::array<InputRow, 8> rows;
         std::array<std::span<const std::int32_t>, 8> ids;
         std::array<std::uint32_t, 8> lengths;
         for (std::uint32_t b = 0; b < o.batch; ++b) {
@@ -167,7 +170,7 @@ void run(const Options& o) {
         }
         const auto before = service.stats();
         const auto start  = Clock::now();
-        std::optional<PleTicket> ticket;
+        std::optional<Ticket> ticket;
         until([&] {
             ticket = service.prepare(o.tokens, std::span(rows).first(o.batch));
             return ticket.has_value();
@@ -180,7 +183,7 @@ void run(const Options& o) {
         }
         for (std::uint32_t t = 1; o.incremental_us && t < o.tokens; ++t) {
             std::this_thread::sleep_for(std::chrono::microseconds(o.incremental_us));
-            std::array<PleAppend, 8> append;
+            std::array<Append, 8> append;
             for (std::uint32_t b = 0; b < o.batch; ++b) append[b] = {b, ids[b].subspan(t, 1)};
             service.append(*ticket, std::span(append).first(o.batch));
         }
@@ -189,22 +192,22 @@ void run(const Options& o) {
         until([&] {
             const auto state = service.poll(*ticket);
             if (state.error) std::rethrow_exception(state.error);
-            return state.status == PlePrepareStatus::HostReady;
+            return state.status == disk::PrepareStatus::HostReady;
         });
         const auto host_ready = Clock::now();
-        preparation.upload(*ticket, context.transfer_view());
+        uploads.upload(service.embedding(*ticket), context.transfer_view());
         if (o.work) {
-            const auto e = preparation.embedding(*ticket, context.execution_view())
+            const auto e = uploads.embedding(*ticket, context.execution_view())
                                .reshape({2560, std::int32_t(positions)});
             exposed_time.record_stop();
             ops::linear(e, projection, y, context.execution_view());
-            preparation.record_consumed(*ticket, context.execution_view());
+            uploads.record_consumed(*ticket, context.execution_view());
         }
-        until([&] { return preparation.upload_complete(*ticket); });
+        until([&] { return uploads.upload_complete(*ticket); });
         const auto device_ready = Clock::now();
         const auto after        = service.stats();
         if (!o.dump.empty() && !sample) {
-            const auto tensor = preparation.device_slot(ticket->slot, o.tokens, o.batch);
+            const auto tensor = uploads.device_slot(ticket->slot, o.tokens, o.batch);
             CUDA_CHECK(
                 cudaMemcpy(downloaded.data(), tensor.data, tensor.bytes(), cudaMemcpyDeviceToHost));
             const auto host = service.embedding(*ticket);
@@ -229,7 +232,8 @@ void run(const Options& o) {
             dump.close();
             if (!dump) throw std::runtime_error("qualification dump failed");
         }
-        until([&] { return preparation.try_release(*ticket); });
+        until([&] { return service.poll(*ticket).drained && uploads.try_release(*ticket); });
+        service.release(*ticket);
         std::cout << sample << ',' << o.batch << ',' << o.tokens << ',' << o.cache_mib << ','
                   << ms(start, host_ready) << ',' << ms(start, device_ready) << ','
                   << ms(last_ids, device_ready) << ',' << after.reads - before.reads << ','
@@ -245,7 +249,7 @@ void run(const Options& o) {
 int main(int argc, char** argv) {
     if (argc == 2 && std::string_view(argv[1]) == "--help") {
         std::cout
-            << "ninfer_ple_prepare_bench ARTIFACT CORPUS B T ITERATIONS CACHE_MIB\n"
+            << "ninfer_ple_disk_prepare_bench ARTIFACT CORPUS B T ITERATIONS CACHE_MIB\n"
                "  --read-budget-mib N  Bound PLE requested bytes (default 512 MiB)\n"
                "  --incremental-us N   Append each next token column after this delay\n"
                "  --overlap N          Run N independent real K/V projections, then consume E\n"

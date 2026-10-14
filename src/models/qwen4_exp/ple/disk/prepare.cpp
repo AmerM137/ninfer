@@ -1,22 +1,21 @@
-#include "models/qwen4_exp/ple/prepare.h"
+#include "models/qwen4_exp/ple/disk/prepare.h"
 
 #include "models/qwen4_exp/ple/hash.h"
-#include "models/qwen4_exp/ple/row_reader.h"
 
 #include <algorithm>
 #include <limits>
 #include <mutex>
 #include <stdexcept>
 
-namespace ninfer::models::qwen4_exp {
+namespace ninfer::models::qwen4_exp::ple::disk {
 namespace {
 
-PlePrepareOptions checked_options(PlePrepareOptions options, std::span<const MemorySpan> outputs,
-                                  std::int32_t eos) {
-    if (!options.max_positions || options.max_positions > UINT32_MAX / kPleHeads ||
-        !options.windows || options.windows != outputs.size() || eos < 0)
+PrepareOptions checked_options(PrepareOptions options, std::span<const MemorySpan> outputs,
+                               std::int32_t eos) {
+    if (!options.max_positions || options.max_positions > UINT32_MAX / kHeads || outputs.empty() ||
+        outputs.size() > UINT32_MAX || eos < 0)
         throw std::invalid_argument("invalid PLE preparation capacity");
-    const auto bytes = std::size_t(options.max_positions) * kPleEmbeddingBytes;
+    const auto bytes = std::size_t(options.max_positions) * kEmbeddingBytes;
     for (std::size_t i = 0; i < outputs.size(); ++i) {
         const auto output = outputs[i];
         validate_memory(output);
@@ -40,36 +39,36 @@ void check_ids(std::span<const std::int32_t> ids) {
 
 } // namespace
 
-struct PlePrepareService::Impl {
+struct PrepareService::Impl {
     struct Window {
         MemorySpan output;
         std::vector<std::int32_t> ids;
-        std::array<PleSequenceIdentity, 8> identities{};
+        std::array<SequenceIdentity, 8> identities{};
         std::array<std::uint32_t, 8> known{}, planned{}, valid{};
         std::uint64_t generation = 0;
         std::uint32_t tokens = 0, batch = 0;
-        PlePrepareStatus status = PlePrepareStatus::Preparing;
+        PrepareStatus status = PrepareStatus::Preparing;
         std::exception_ptr error;
         bool allocated = false, released = false, bound = false, required = true, promoted = false;
         bool sealed = false, seal_applied = false, cancelled = false, cancel_applied = false;
         bool drained = true;
     };
 
-    const PleTableSource& table;
+    const Table& table;
     const std::int32_t eos;
-    const PlePrepareOptions options;
+    const PrepareOptions options;
     mutable std::mutex mutex;
     std::vector<Window> windows;
-    ple_detail::RowReader reader;
+    RowReader reader;
     std::vector<std::thread> workers;
     std::exception_ptr fatal;
     bool stopping = false;
 
-    Impl(const PleTableSource& table, std::int32_t eos, PlePrepareOptions options,
+    Impl(const Table& table, std::int32_t eos, PrepareOptions options,
          std::span<const MemorySpan> outputs)
         : table(table), eos(eos), options(checked_options(std::move(options), outputs, eos)),
-          windows(this->options.windows),
-          reader(table, this->options.windows, this->options.max_positions * kPleHeads,
+          windows(outputs.size()),
+          reader(table, outputs.size(), this->options.max_positions * kHeads,
                  this->options.io_depth, this->options.cache_bytes) {
         for (std::size_t i = 0; i < windows.size(); ++i) {
             windows[i].output = outputs[i];
@@ -97,7 +96,7 @@ struct PlePrepareService::Impl {
         cpu_detail::join_workers(workers);
     }
 
-    Window& get(PleTicket ticket) {
+    Window& get(Ticket ticket) {
         if (ticket.slot >= windows.size()) throw std::invalid_argument("invalid PLE ticket slot");
         auto& w = windows[ticket.slot];
         if (!w.allocated || w.released || w.generation != ticket.generation)
@@ -105,8 +104,8 @@ struct PlePrepareService::Impl {
         return w;
     }
 
-    static PleWindowSnapshot snapshot(const Window& w) {
-        return {w.status, w.drained, w.tokens, w.batch, w.valid, w.identities, w.error};
+    static WindowSnapshot snapshot(const Window& w) {
+        return {{w.tokens, w.batch, w.valid, w.identities}, w.status, w.drained, w.error};
     }
 
     bool tick() {
@@ -125,15 +124,15 @@ struct PlePrepareService::Impl {
             if (!w.bound && !w.cancelled) {
                 reader.begin(i,
                              {static_cast<std::uint16_t*>(w.output.data),
-                              std::size_t(w.tokens) * w.batch * kPleEmbeddingElements},
+                              std::size_t(w.tokens) * w.batch * kEmbeddingElements},
                              w.required);
                 w.bound    = true;
                 w.promoted = w.required;
             }
             if (w.cancelled && !w.cancel_applied) {
-                if (w.bound) reader.cancel(i, 0, w.tokens * w.batch * kPleHeads);
+                if (w.bound) reader.cancel(i, 0, w.tokens * w.batch * kHeads);
                 w.cancel_applied = true;
-                w.status         = w.error ? PlePrepareStatus::Failed : PlePrepareStatus::Cancelled;
+                w.status         = w.error ? PrepareStatus::Failed : PrepareStatus::Cancelled;
             }
             if (w.cancelled) continue;
             if (w.required && !w.promoted) {
@@ -144,10 +143,10 @@ struct PlePrepareService::Impl {
                 for (std::uint32_t b = 0; b < w.batch; ++b) {
                     const auto first = b * w.tokens + w.valid[b];
                     const auto end   = (b + 1) * w.tokens;
-                    reader.cancel(i, first * kPleHeads, end * kPleHeads);
+                    reader.cancel(i, first * kHeads, end * kHeads);
                     auto* output = static_cast<std::uint16_t*>(w.output.data);
-                    std::fill(output + std::size_t(first) * kPleEmbeddingElements,
-                              output + std::size_t(end) * kPleEmbeddingElements, 0);
+                    std::fill(output + std::size_t(first) * kEmbeddingElements,
+                              output + std::size_t(end) * kEmbeddingElements, 0);
                 }
                 w.seal_applied = true;
             }
@@ -168,11 +167,11 @@ struct PlePrepareService::Impl {
                                                      : (start == 1 ? w.identities[b].raw_tail[1]
                                                                    : w.identities[b].raw_tail[0]),
                                           start ? ids[start - 1] : w.identities[b].raw_tail[1]};
-                    std::array<std::uint32_t, 32 * kPleHeads> rows;
-                    ple_hash({ids + start, count}, tail, eos, table.controls(),
-                             std::span(rows).first(count * kPleHeads));
-                    for (std::size_t r = 0; r < count * kPleHeads; ++r)
-                        reader.request(i, (b * w.tokens + start) * kPleHeads + r, rows[r]);
+                    std::array<std::uint32_t, 32 * kHeads> rows;
+                    hash_tokens({ids + start, count}, tail, eos, table.parameters().hash,
+                                std::span(rows).first(count * kHeads));
+                    for (std::size_t r = 0; r < count * kHeads; ++r)
+                        reader.request(i, (b * w.tokens + start) * kHeads + r, rows[r]);
                     w.planned[b] += count;
                     budget -= count;
                 }
@@ -185,7 +184,7 @@ struct PlePrepareService::Impl {
             if (!w.allocated) continue;
             if (w.bound && !w.error && reader.error(i)) {
                 w.error     = reader.error(i);
-                w.status    = PlePrepareStatus::Failed;
+                w.status    = PrepareStatus::Failed;
                 w.cancelled = true;
                 more        = true;
             }
@@ -194,7 +193,7 @@ struct PlePrepareService::Impl {
             for (std::uint32_t b = 0; b < w.batch; ++b)
                 planned &= w.planned[b] >= (w.sealed ? w.valid[b] : w.known[b]);
             if (!w.cancelled && w.sealed && planned && !reader.pending(i))
-                w.status = PlePrepareStatus::HostReady;
+                w.status = PrepareStatus::HostReady;
             if (!w.cancelled && !planned) more = true;
             if (stopping && w.drained) {
                 if (w.bound) reader.release(i);
@@ -222,7 +221,7 @@ struct PlePrepareService::Impl {
             for (auto& w : windows) {
                 if (!w.allocated) continue;
                 w.error  = fatal;
-                w.status = PlePrepareStatus::Failed;
+                w.status = PrepareStatus::Failed;
                 // The worker exits here. Outstanding kernel reads only target reader-owned slabs.
                 w.drained = true;
             }
@@ -230,14 +229,14 @@ struct PlePrepareService::Impl {
     }
 };
 
-PlePrepareService::PlePrepareService(const PleTableSource& table, std::int32_t eos,
-                                     PlePrepareOptions options, std::span<const MemorySpan> outputs)
+PrepareService::PrepareService(const Table& table, std::int32_t eos, PrepareOptions options,
+                               std::span<const MemorySpan> outputs)
     : impl_(std::make_unique<Impl>(table, eos, std::move(options), outputs)) {}
 
-PlePrepareService::~PlePrepareService() = default;
+PrepareService::~PrepareService() = default;
 
-std::optional<PleTicket>
-PlePrepareService::prepare(std::uint32_t tokens, std::span<const PleInputRow> rows, bool required) {
+std::optional<Ticket> PrepareService::prepare(std::uint32_t tokens, std::span<const InputRow> rows,
+                                              bool required) {
     auto& p = *impl_;
     std::lock_guard lock(p.mutex);
     if (p.fatal) std::rethrow_exception(p.fatal);
@@ -267,7 +266,7 @@ PlePrepareService::prepare(std::uint32_t tokens, std::span<const PleInputRow> ro
         w.cancelled = w.cancel_applied = false;
         w.required                     = required;
         w.drained                      = false;
-        w.status                       = PlePrepareStatus::Preparing;
+        w.status                       = PrepareStatus::Preparing;
         w.error                        = {};
         w.known = w.planned = w.valid = {};
         w.identities                  = {};
@@ -277,26 +276,26 @@ PlePrepareService::prepare(std::uint32_t tokens, std::span<const PleInputRow> ro
             std::copy(rows[b].ids.begin(), rows[b].ids.end(), w.ids.begin() + b * tokens);
         }
         p.reader.wake();
-        return PleTicket{slot, w.generation};
+        return Ticket{slot, w.generation};
     }
     throw std::logic_error("PLE free slot disappeared");
 }
 
-void PlePrepareService::prioritize(PleTicket ticket) {
+void PrepareService::prioritize(Ticket ticket) {
     auto& p = *impl_;
     std::lock_guard lock(p.mutex);
     auto& w = p.get(ticket);
-    if (w.cancelled || w.status == PlePrepareStatus::Failed)
+    if (w.cancelled || w.status == PrepareStatus::Failed)
         throw std::invalid_argument("terminal PLE window cannot be prioritized");
     w.required = true;
     p.reader.wake();
 }
 
-void PlePrepareService::append(PleTicket ticket, std::span<const PleAppend> rows) {
+void PrepareService::append(Ticket ticket, std::span<const Append> rows) {
     auto& p = *impl_;
     std::lock_guard lock(p.mutex);
     auto& w = p.get(ticket);
-    if (w.sealed || w.cancelled || w.status != PlePrepareStatus::Preparing)
+    if (w.sealed || w.cancelled || w.status != PrepareStatus::Preparing)
         throw std::invalid_argument("PLE window is closed to append");
     std::array<bool, 8> seen{};
     for (const auto& row : rows) {
@@ -314,12 +313,11 @@ void PlePrepareService::append(PleTicket ticket, std::span<const PleAppend> rows
     p.reader.wake();
 }
 
-void PlePrepareService::seal(PleTicket ticket, std::span<const std::uint32_t> valid) {
+void PrepareService::seal(Ticket ticket, std::span<const std::uint32_t> valid) {
     auto& p = *impl_;
     std::lock_guard lock(p.mutex);
     auto& w = p.get(ticket);
-    if (w.sealed || w.cancelled || w.status != PlePrepareStatus::Preparing ||
-        valid.size() != w.batch)
+    if (w.sealed || w.cancelled || w.status != PrepareStatus::Preparing || valid.size() != w.batch)
         throw std::invalid_argument("invalid PLE seal");
     for (std::size_t b = 0; b < valid.size(); ++b)
         if (valid[b] > w.known[b]) throw std::invalid_argument("PLE seal exceeds known IDs");
@@ -328,37 +326,37 @@ void PlePrepareService::seal(PleTicket ticket, std::span<const std::uint32_t> va
     p.reader.wake();
 }
 
-void PlePrepareService::cancel(PleTicket ticket) {
+void PrepareService::cancel(Ticket ticket) {
     auto& p = *impl_;
     std::lock_guard lock(p.mutex);
     auto& w = p.get(ticket);
     if (w.cancelled) return;
     w.cancelled      = true;
-    w.status         = w.error ? PlePrepareStatus::Failed : PlePrepareStatus::Cancelled;
+    w.status         = w.error ? PrepareStatus::Failed : PrepareStatus::Cancelled;
     w.cancel_applied = bool(p.fatal);
     w.drained        = bool(p.fatal);
     p.reader.wake();
 }
 
-PleWindowSnapshot PlePrepareService::poll(PleTicket ticket) const {
+WindowSnapshot PrepareService::poll(Ticket ticket) const {
     std::lock_guard lock(impl_->mutex);
     return Impl::snapshot(impl_->get(ticket));
 }
 
-PleHostEmbedding PlePrepareService::embedding(PleTicket ticket) const {
+HostEmbedding PrepareService::embedding(Ticket ticket) const {
     std::lock_guard lock(impl_->mutex);
     const auto& w = impl_->get(ticket);
-    if (w.cancelled || w.status != PlePrepareStatus::HostReady)
+    if (w.cancelled || w.status != PrepareStatus::HostReady)
         throw std::logic_error("PLE embedding is not HostReady");
-    return {w.output.subspan(0, std::size_t(w.tokens) * w.batch * kPleEmbeddingBytes),
-            Impl::snapshot(w)};
+    return {ticket, w.output.subspan(0, std::size_t(w.tokens) * w.batch * kEmbeddingBytes),
+            Impl::snapshot(w).input};
 }
 
-void PlePrepareService::release(PleTicket ticket) {
+void PrepareService::release(Ticket ticket) {
     auto& p = *impl_;
     std::lock_guard lock(p.mutex);
     auto& w = p.get(ticket);
-    if (w.status == PlePrepareStatus::Preparing || !w.drained ||
+    if (w.status == PrepareStatus::Preparing || !w.drained ||
         (w.cancelled && !w.cancel_applied && !p.fatal))
         throw std::logic_error("PLE window still has Host work");
     w.released = true;
@@ -366,12 +364,12 @@ void PlePrepareService::release(PleTicket ticket) {
     p.reader.wake();
 }
 
-PleReadStats PlePrepareService::stats() const {
+ReadStats PrepareService::stats() const {
     std::lock_guard lock(impl_->mutex);
     return impl_->reader.stats();
 }
 
-std::size_t PlePrepareService::memory_bytes() const noexcept {
+std::size_t PrepareService::memory_bytes() const noexcept {
     const auto& p = *impl_;
     return sizeof(Impl) +
            p.windows.size() * (sizeof(Impl::Window) +
@@ -379,4 +377,4 @@ std::size_t PlePrepareService::memory_bytes() const noexcept {
            p.reader.memory_bytes();
 }
 
-} // namespace ninfer::models::qwen4_exp
+} // namespace ninfer::models::qwen4_exp::ple::disk

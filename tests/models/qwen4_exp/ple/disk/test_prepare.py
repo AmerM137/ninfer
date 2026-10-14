@@ -7,7 +7,7 @@ import subprocess
 import sys
 import tempfile
 
-from test_ple_table import fixture, resegment, Artifact, exact_table
+from test_table import fixture, resegment, Artifact, exact_table
 
 T, B, EOS = 5, 8, 248044
 CONTROLS = (

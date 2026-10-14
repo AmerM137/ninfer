@@ -1,10 +1,19 @@
 #pragma once
 
-#include "models/qwen4_exp/ple/prepare.h"
+#include "models/qwen4_exp/ple/disk/table.h"
 
 #include <exception>
 
-namespace ninfer::models::qwen4_exp::ple_detail {
+namespace ninfer::models::qwen4_exp::ple::disk {
+
+struct ReadStats {
+    std::uint64_t rows         = 0; // Output row demands, including duplicates.
+    std::uint64_t cache_hits   = 0; // Unique rows fetched from the persistent raw cache.
+    std::uint64_t shared_rows  = 0; // Demands reusing a retained row of a live window.
+    std::uint64_t shared_pages = 0; // Fragments joining an already queued/in-flight page.
+    std::uint64_t reads        = 0;
+    std::uint64_t read_bytes   = 0; // Actual returned bytes, including alignment overhead.
+};
 
 // Single-threaded row preparation mechanism. Each owner borrows a contiguous BF16 output;
 // destination row i occupies [160*i,160*(i+1)). Each destination is requested at most once.
@@ -12,7 +21,7 @@ namespace ninfer::models::qwen4_exp::ple_detail {
 // Only wake() is cross-thread. Capacity includes retained rows of all unreleased owners.
 class RowReader {
 public:
-    RowReader(const PleTableSource&, std::uint32_t owners, std::uint32_t rows_per_owner,
+    RowReader(const Table&, std::uint32_t owners, std::uint32_t rows_per_owner,
               std::uint32_t io_depth, std::size_t cache_bytes);
     ~RowReader();
     RowReader(const RowReader&)            = delete;
@@ -31,7 +40,7 @@ public:
     [[nodiscard]] std::size_t pending(std::uint32_t owner) const;
     [[nodiscard]] bool drained(std::uint32_t owner) const;
     [[nodiscard]] std::exception_ptr error(std::uint32_t owner) const;
-    [[nodiscard]] PleReadStats stats() const noexcept;
+    [[nodiscard]] ReadStats stats() const noexcept;
     [[nodiscard]] std::size_t memory_bytes() const noexcept;
 
 private:
@@ -39,4 +48,4 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-} // namespace ninfer::models::qwen4_exp::ple_detail
+} // namespace ninfer::models::qwen4_exp::ple::disk

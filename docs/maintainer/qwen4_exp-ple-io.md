@@ -1,8 +1,8 @@
-# Qwen4Exp PLE：Host hash、NF4 查表与异步 I/O
+# Qwen4Exp PLE：查表准备与磁盘读取
 
-本文定义 PLE Host 准备合同：精确 token hash、NF4→BF16 解码、不可变磁盘 backing、
-有界读取服务，以及交给 Program 的窗口与完成通知。精确 LUT/行解码、文件 backing、
-Host hash、行缓存/去重、增量窗口和 GPU 槽交接已实现，完整模型 Program 接入仍待完成。
+本文定义 PLE 查表的共同输入/输出、当前磁盘准备路径，以及 Host E 到 GPU 的交接。
+精确 LUT/行解码、文件 backing、Host hash、行缓存/去重、增量窗口和上传槽已实现，
+完整模型 Program 接入仍待完成。内存表与显存表的准备路径尚未实现。
 独立 SSD 实验是选型依据；生产组件的实测入口见 [Benchmarks](../../bench/README.md)。
 
 [模型与权重](qwen4_exp-model.md)维护实例几何与量化选择；
@@ -24,14 +24,31 @@ V3 `.ninfer` 文件集合内，按需取行；不要求整表驻留 RAM/VRAM，�
 
 | 所有者 | 责任 |
 |---|---|
-| Artifact / Model | 验证并持有只读文件 backing、冻结的文件区间映射、shard 描述、divisors、hash controls 和派生 LUT |
+| Artifact / Model | 绑定逻辑 shard、格式/布局、divisors 和 hash controls；当前磁盘路径另持有只读文件 backing、冻结区间映射和派生 LUT |
 | Core Host 数值辅助 | 从明确的 divisor 构建精确 LUT，从紧凑行字节解码 BF16 words；不持有请求或文件状态 |
 | 模型 Host hash | 从原始 IDs、两枚 raw tail 和控制值产生有序全局行号 |
-| Program | 拥有读取服务、可变 cache/queues/buffers、CUDA 槽、ticket、预取和完整 unit 的提交边界 |
+| Program | 组合磁盘准备服务与上传槽，拥有可变 cache/queues/buffers、ticket、预取和完整 unit 的提交边界 |
 | I/O worker | 推进其 Host 读取、解码、缓存和完成队列，不提交 CUDA，不修改请求 ledger、frontier 或 StateImage |
 
 文件 I/O 不进入数学 Op 或 CUDA Graph。GPU Op 只收到就绪的 E 或 K/V，不消费文件路径、
 fd 或 artifact 对象 ID。E 是 lookup 的激活输出；CPU 解码不改变持久权重的数值格式或布局。
+
+代码位于 `src/models/qwen4_exp/ple/`，命名空间为 `qwen4_exp::ple`：
+
+- `parameters.*` 定义 `LookupParameters` 并绑定逻辑表及 hash controls；绑定读取 metadata，
+  不打开 direct-I/O backing，不物化表。`hash.*` 只依赖这些参数。
+- `input.h` 定义输入身份、窗口、ticket 和就绪的 `HostEmbedding`。它不包含磁盘状态或
+  CUDA 完成事件；`InputWindow` 不决定数据准备在哪个平台执行。
+- `disk/` 拥有 `Table`、`RowReader` 和 `PrepareService`，包括 NF4 LUT、文件寻址、行/页
+  去重、原始行缓存、I/O worker、磁盘选项和统计。`HostReady` 是这条路径的状态。
+- `upload.*` 的 `UploadSlots` 独立管理 pinned/Device E、H2D 和最后消费者完成。
+  它不创建准备服务，不读取表，不判断请求是否取消。
+
+权重格式、物理布局、驻留位置和计算位置分别描述。后续内存表无需经过磁盘页队列，
+显存表可通过 GPU lookup 直接产生 Device E，无需模拟 HostReady/H2D；相同 NF4 表仍须
+满足下述精确 BF16 出口。驻留与执行流程由加载/Program 规划选择，不引入统一的逐行虚接口。
+GPU lookup 数学归 Op 层，模型保留调用和状态编排。现有 Gate、Conv 和 StateExtract
+不依赖表的驻留位置，K/V 投影继续使用 Linear。
 
 ## 2. token hash 的精确语义
 
@@ -116,8 +133,9 @@ divisor。对于全局行 g，`shard=g//2500012`、`row=g%2500012`；对象内�
 本实例每行 90 B，每 4 KiB 数据页容纳 45 行，末页为 37 行，divisor 在完整数据页之后。
 
 `prepare_file_backing` 验证对象几何、layout、encoded size、文件归属和范围，冻结 V3
-逻辑区间到真实文件区间的映射。`PleTableSource` 按 Binding parts 顺序定义全局行段，
-要求每段引用完整的 160 列 NF4 parent，并拥有各段 LUT 和 hash controls。
+逻辑区间到真实文件区间的映射。`load_lookup_parameters` 按 Binding parts 顺序定义全局
+行段，要求每段引用完整的 160 列 NF4 parent，读取 divisors 和 hash controls。
+`disk::Table` 消费这些参数及同一 Reader，拥有参数、文件 backing 和各段 LUT。
 启动只读取所需目录、文件头、280 B controls 和 128 个 divisors，不扫描或 materialize
 **27.126954 GiB** 的整表。具体模型 binder 接入时核对 config 声明的 shard 几何。
 
@@ -158,9 +176,10 @@ seal 冻结有效长度；全部有效 E 完成且无效尾列置零 → 发布 
 maps 按启动容量分配。首版起始配置为 **64 MiB 原始行缓存、128 个在途读、两个完整
 窗口槽**，允许在预算内调整；这些不是模型数学常数。
 
-`PlePrepareService` 借用不可变 `PleTableSource` 和调用者提供的 Host 输出。单 worker
-使用内部 `RowReader` 推进固定容量的行/页索引、共享读取和 CPU 解码；控制操作与 E 写入
-通过短的有界临界区排序，等待磁盘或新 IDs 时不持锁。Cache 为四路原始行缓存、轮转替换。
+`disk::PrepareService` 借用不可变 `disk::Table` 和调用者提供的 Host 输出，每个输出对应
+一个窗口槽；输出可为普通 Host 内存，需异步上传时使用 `UploadSlots::host_slots()`。
+单 worker 使用 `disk::RowReader` 推进固定容量的行/页索引、共享读取和 CPU 解码；控制操作
+与 E 写入通过短的有界临界区排序，等待磁盘或新 IDs 时不持锁。Cache 为四路原始行缓存、轮转替换。
 取消会立即撤销不再有消费者的未提交页；在途页完成后退役，仍有其他窗口需要的页继续共享。
 必需窗口优先于预取窗口，`prioritize` 用于调用方将预取窗口提升为当前必需输入。
 
@@ -184,9 +203,9 @@ maps 按启动容量分配。首版起始配置为 **64 MiB 原始行缓存、12
 | prepare | 固定物理 T/B 和每行 identity，B=1..8、T>0；初始 IDs 可以只有 anchor 或一段前缀。成功后立即拥有必要输入副本；无槽返回不可立即准备，不表示 I/O 失败 |
 | append | 只作用于尚未 seal 的 Preparing ticket；每次调用的 batch rows 互异，每行从已知前缀后连续追加且不超过 T。返回前复制新 IDs，不能改写既有 IDs |
 | seal | 接受 B 个最终有效长度，满足 `0<=n[b]<=known_columns[b]<=T`；之后不可追加。被截去候选表示不再参与本窗口验证，不表示最终接受前缀 |
-| poll / embedding | poll 不同步 GPU；只有 seal 且全部有效 E 完成后才可获得 HostReady 的 borrowed pinned embedding。具体失败原因交给 Program |
+| poll / embedding | poll 不同步 GPU；只有 seal 且全部有效 E 完成后才可获得 borrowed HostEmbedding，包含 ticket、E span 和 InputWindow。具体失败原因交给 Program |
 | cancel / drained | 丢弃未提交任务并排空该 ticket 的 Host writers；drained 只说明没有 I/O/CPU writer 引用，不证明 H2D 或 GPU 消费已经结束 |
-| release | 正常或失败/取消路径均须证明该代次全部 Host/CUDA 引用退役；Preparing 须先 cancel。调用立即使 ticket 失效，worker 回收后槽重新可用；使用 GPU owner 时统一调用其 `try_release` |
+| release | 正常或失败/取消路径均须证明该代次全部 Host/CUDA 引用退役；Preparing 须先 cancel。Program 确认 Host drained 及上传槽 `try_release` 成功后，调用准备服务的 release；它立即使 ticket 失效，worker 回收后槽重新可用 |
 
 每次 append 即可发起相应行读取，不必等全部草稿产生。seal 截去的尾列必须置零，晚到
 读结果不得再写这些 E 区域；HostReady 之前不发起 H2D。普通已知窗口可以 prepare 后
@@ -229,11 +248,22 @@ ticket 身份后，在 transfer stream 排入 H2D，再 record 当前 slot/gener
 不代表未来 SSD 完成，不能先等空 event 再由 Host 补依赖。
 Copy/event 入队后即可排入 GPU wait，生产路径不必像微测量一样在 Host 等 H2D 完成。
 
-`PleGpuPreparation` 拥有固定 pinned/Device E 槽和 `PlePrepareService`。`upload` 排入
-复制与 record；`embedding` 建立消费 stream 的 wait；最后消费者之后调用
-`record_consumed`。`try_release` 同时核对 Host drain、上传与消费者完成。
-`upload_complete` 只查询物理传输完成，取消后仍可查询；取得可消费视图仍须通过
-`embedding` 的窗口状态检查。`device_slot` 为启动时构建每槽 graph 提供稳定地址。
+`UploadSlots` 只拥有固定 pinned/Device E 槽，`disk::PrepareService` 借用它提供的 Host
+输出。Program 先创建上传槽，再创建准备服务；销毁时先结束准备服务的 Host writers，
+再排空并销毁上传槽。两者消费同一个 slot/generation，窗口数量来自实际输出槽数。
+
+准备服务的 `embedding(ticket)` 检查窗口仍为 HostReady，返回 `HostEmbedding`；
+`uploads.upload(host_embedding, transfer)` 校验 pinned 来源并排入复制与 record。
+`uploads.embedding(ticket, consumer)` 建立消费 stream 的 wait；最后消费者之后调用
+`record_consumed`。消费前判断该输入是否仍应执行属于 Program，上传层不修改取消状态。
+每个代次最多上传一次；旧代次不能访问、覆盖或释放后来代次的 CUDA 存储。
+
+回收时，Program 先检查准备服务已终结且 Host drained，再调用上传槽的 `try_release`。
+后者只检查该代次上传和消费者已完成；未上传或上传后取消且未取得 consumer 的窗口
+不需要伪造消费操作。成功后才调用准备服务的 `release`，允许 worker 回收并重新使用
+Host 槽。CUDA 提交失败会排空已提交的相关 stream 后抛出；Program 负责取消并回收窗口。
+`upload_complete` 只查询物理传输完成，取消后仍可查询；`device_slot` 为启动时构建每槽
+graph 提供稳定地址。内存准备路径也可使用这一上传合同。
 
 Program 等待当前 GPU unit 时仍需推进 HostReady 和 transfer 提交，不能一直阻塞在
 整个 unit 的 `device.synchronize()` 上，让已就绪的下一窗口无法上传。推进可位于

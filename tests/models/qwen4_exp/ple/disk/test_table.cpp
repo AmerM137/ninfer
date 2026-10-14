@@ -1,4 +1,4 @@
-#include "models/qwen4_exp/ple/table.h"
+#include "models/qwen4_exp/ple/disk/table.h"
 #include "core/buffer.h"
 #include "core/io/read_queue.h"
 
@@ -15,7 +15,7 @@ void write(const T& value) {
 void run(const char* path) {
     using namespace ninfer;
     using namespace ninfer::artifact;
-    using models::qwen4_exp::PleTableSource;
+    using namespace models::qwen4_exp::ple;
     std::vector<std::uint32_t> starts;
     auto source = [&] {
         Reader reader(path);
@@ -25,16 +25,17 @@ void run(const char* path) {
             starts.push_back(begin);
             begin += reader.geometry(part.object).shape[0];
         }
-        return PleTableSource(
-            reader, binding,
-            reader.directory().component("text").resources.at("ple_hash_controls"));
+        return disk::Table(
+            reader, load_lookup_parameters(
+                        reader, binding,
+                        reader.directory().component("text").resources.at("ple_hash_controls")));
     }();
     // Reader is gone. Preserve a borrowed row/LUT across an owner move.
     const auto first = source.row(0);
     auto table       = std::move(source);
     if (first.lut != table.row(0).lut) throw std::runtime_error("move invalidated PLE LUT");
-    write(table.rows());
-    const auto& controls = table.controls();
+    write(table.parameters().rows);
+    const auto& controls = table.parameters().hash;
     for (const auto value : controls.multipliers) write(value);
     for (const auto value : controls.vocab_sizes) write(value);
     for (const auto value : controls.offsets) write(value);

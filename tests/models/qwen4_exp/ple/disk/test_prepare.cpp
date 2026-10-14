@@ -1,6 +1,6 @@
-#include "models/qwen4_exp/ple/gpu.h"
+#include "models/qwen4_exp/ple/upload.h"
 #include "models/qwen4_exp/ple/hash.h"
-#include "models/qwen4_exp/ple/row_reader.h"
+#include "models/qwen4_exp/ple/disk/prepare.h"
 #include "core/buffer.h"
 #include "core/decode_graph.h"
 #include "core/transfer.h"
@@ -13,7 +13,7 @@
 
 namespace {
 using namespace ninfer;
-using namespace ninfer::models::qwen4_exp;
+using namespace ninfer::models::qwen4_exp::ple;
 bool fail_event_record = false;
 
 void require(bool value, const char* message) {
@@ -53,7 +53,7 @@ struct Input {
     std::uint32_t tokens = read<std::uint32_t>(), batch = read<std::uint32_t>();
     std::int32_t eos = read<std::int32_t>();
     std::array<std::vector<std::int32_t>, 8> ids;
-    std::array<PleInputRow, 8> rows;
+    std::array<InputRow, 8> rows;
     std::array<std::uint32_t, 8> valid{};
 
     Input() {
@@ -74,8 +74,8 @@ struct Input {
     std::size_t bytes() const { return std::size_t(tokens) * batch * 5120; }
 };
 
-PleTicket prepare(PlePrepareService& service, const Input& input) {
-    std::optional<PleTicket> ticket;
+Ticket prepare(disk::PrepareService& service, const Input& input) {
+    std::optional<Ticket> ticket;
     until([&] {
         ticket = service.prepare(input.tokens, input.inputs());
         return ticket.has_value();
@@ -83,18 +83,18 @@ PleTicket prepare(PlePrepareService& service, const Input& input) {
     return *ticket;
 }
 
-void ready(PlePrepareService& service, PleTicket ticket) {
+void ready(disk::PrepareService& service, Ticket ticket) {
     until([&] {
         const auto s = service.poll(ticket);
         if (s.error) std::rethrow_exception(s.error);
-        return s.status == PlePrepareStatus::HostReady && s.drained;
+        return s.status == disk::PrepareStatus::HostReady && s.drained;
     });
 }
 
-void row_reads(const PleTableSource& source) {
+void row_reads(const disk::Table& source) {
     std::array<std::uint16_t, 160 * 8> a, b{};
     a.fill(0xbeef);
-    ple_detail::RowReader reader(source, 2, 8, 4, 0);
+    disk::RowReader reader(source, 2, 8, 4, 0);
     reader.begin(0, a, false);
     reader.begin(1, b, true);
     reader.request(0, 0, 44);
@@ -117,7 +117,7 @@ void row_reads(const PleTableSource& source) {
     emit(b.data(), 320);
     reader.release(1);
 
-    ple_detail::RowReader cancellation(source, 2, 8, 1, 0);
+    disk::RowReader cancellation(source, 2, 8, 1, 0);
     cancellation.begin(0, a, false);
     cancellation.begin(1, b, true);
     cancellation.request(0, 0, 0);
@@ -132,7 +132,7 @@ void row_reads(const PleTableSource& source) {
     cancellation.release(0);
     cancellation.release(1);
 
-    ple_detail::RowReader cached(source, 1, 8, 4, 512);
+    disk::RowReader cached(source, 1, 8, 4, 512);
     const auto one = [&] {
         cached.begin(0, b, true);
         cached.request(0, 0, 44);
@@ -160,14 +160,14 @@ void row_reads(const PleTableSource& source) {
     emit(b.data(), 320);
 }
 
-void hashes(const PleTableSource& source, const Input& input) {
+void hashes(const disk::Table& source, const Input& input) {
     for (const auto& row : input.inputs()) {
         std::vector<std::uint32_t> full(input.tokens * 16), split(full.size());
-        ple_hash(row.ids, row.identity.raw_tail, input.eos, source.controls(), full);
+        hash_tokens(row.ids, row.identity.raw_tail, input.eos, source.parameters().hash, full);
         auto tail = row.identity.raw_tail;
         for (std::uint32_t t = 0; t < input.tokens; ++t) {
-            ple_hash(row.ids.subspan(t, 1), tail, input.eos, source.controls(),
-                     std::span(split).subspan(t * 16, 16));
+            hash_tokens(row.ids.subspan(t, 1), tail, input.eos, source.parameters().hash,
+                        std::span(split).subspan(t * 16, 16));
             tail = {tail[1], row.ids[t]};
         }
         require(full == split, "chunked hash changed row IDs");
@@ -175,17 +175,14 @@ void hashes(const PleTableSource& source, const Input& input) {
     }
 }
 
-void host(const PleTableSource& source, const Input& input, bool failure) {
+void host(const disk::Table& source, const Input& input, bool failure) {
     HostBuffer first(input.bytes()), second(input.bytes());
     const std::array outputs{first.span(), second.span()};
-    PlePrepareService service(source, input.eos,
-                              {.max_positions = input.tokens * input.batch,
-                               .windows       = 2,
-                               .io_depth      = 4,
-                               .cache_bytes   = 512},
-                              outputs);
+    disk::PrepareService service(
+        source, input.eos,
+        {.max_positions = input.tokens * input.batch, .io_depth = 4, .cache_bytes = 512}, outputs);
     if (!failure) {
-        const std::array empty{PleInputRow{input.rows[0].identity, {}}};
+        const std::array empty{InputRow{input.rows[0].identity, {}}};
         const auto cancelled = service.prepare(1, empty);
         require(cancelled.has_value(), "initial window admission failed");
         service.cancel(*cancelled);
@@ -199,7 +196,7 @@ void host(const PleTableSource& source, const Input& input, bool failure) {
         service.seal(full, input.lengths());
         until([&] {
             const auto s = service.poll(full);
-            return s.status == PlePrepareStatus::Failed && s.drained;
+            return s.status == disk::PrepareStatus::Failed && s.drained;
         });
         require(bool(service.poll(full).error), "failed window lost its error");
         rejects([&] { (void)service.embedding(full); });
@@ -209,7 +206,7 @@ void host(const PleTableSource& source, const Input& input, bool failure) {
     auto incremental = input.rows;
     for (std::uint32_t b = 0; b < input.batch; ++b)
         incremental[b].ids = incremental[b].ids.first(1);
-    std::optional<PleTicket> next;
+    std::optional<Ticket> next;
     until([&] {
         next = service.prepare(input.tokens, std::span(incremental).first(input.batch), false);
         return next.has_value();
@@ -219,12 +216,12 @@ void host(const PleTableSource& source, const Input& input, bool failure) {
     rejects([&] { (void)service.embedding(full); });
     service.prioritize(*next);
     for (std::uint32_t t = 1; t < input.tokens; ++t) {
-        std::array<PleAppend, 8> append;
+        std::array<Append, 8> append;
         for (std::uint32_t b = 0; b < input.batch; ++b)
             append[b] = {b, input.rows[b].ids.subspan(t, 1)};
         service.append(*next, std::span(append).first(input.batch));
     }
-    require(service.poll(*next).status == PlePrepareStatus::Preparing,
+    require(service.poll(*next).status == disk::PrepareStatus::Preparing,
             "unsealed window published E");
     service.seal(full, input.lengths());
     service.seal(*next, input.lengths());
@@ -246,7 +243,7 @@ void host(const PleTableSource& source, const Input& input, bool failure) {
     service.cancel(cancelled);
     until([&] {
         const auto s = service.poll(cancelled);
-        return s.status == PlePrepareStatus::Cancelled && s.drained;
+        return s.status == disk::PrepareStatus::Cancelled && s.drained;
     });
     service.cancel(cancelled);
     require(service.poll(cancelled).drained, "repeated cancel restarted retirement");
@@ -254,8 +251,8 @@ void host(const PleTableSource& source, const Input& input, bool failure) {
     service.release(*next);
 
     const auto reads = service.stats().reads;
-    const std::array empty{PleInputRow{input.rows[0].identity, {}}};
-    std::optional<PleTicket> zero;
+    const std::array empty{InputRow{input.rows[0].identity, {}}};
+    std::optional<Ticket> zero;
     until([&] {
         zero = service.prepare(1, empty);
         return zero.has_value();
@@ -294,14 +291,22 @@ private:
     std::atomic<bool> open_{false};
 };
 
-void gpu(const PleTableSource& source, const Input& input) {
+void gpu(const disk::Table& source, const Input& input) {
     DeviceContext context;
-    PleGpuPreparation preparation(source, input.eos, context,
-                                  {.max_positions = input.tokens * input.batch,
-                                   .windows       = 2,
-                                   .io_depth      = 4,
-                                   .cache_bytes   = 512});
-    auto& service = preparation.host();
+    UploadSlots uploads(context, input.tokens * input.batch, 2);
+    disk::PrepareService service(
+        source, input.eos,
+        {.max_positions = input.tokens * input.batch, .io_depth = 4, .cache_bytes = 512},
+        uploads.host_slots());
+    const auto try_release = [&](Ticket ticket) {
+        const auto state = service.poll(ticket);
+        if (state.status == disk::PrepareStatus::Preparing || !state.drained ||
+            !uploads.try_release(ticket)) {
+            return false;
+        }
+        service.release(ticket);
+        return true;
+    };
     DeviceBuffer copied(context.device(), input.bytes());
     std::vector<std::uint16_t> actual(input.bytes() / 2);
     const auto ticket = prepare(service, input);
@@ -309,22 +314,22 @@ void gpu(const PleTableSource& source, const Input& input) {
     ready(service, ticket);
     {
         StreamGate transfer(context.transfer_stream()), consumer(context.stream());
-        preparation.upload(ticket, context.transfer_view());
-        const auto e = preparation.embedding(ticket, context.execution_view());
+        uploads.upload(service.embedding(ticket), context.transfer_view());
+        const auto e = uploads.embedding(ticket, context.execution_view());
         copy_bytes_async(copied.span(), {e.data, e.bytes(), e.device}, context.execution_view());
-        preparation.record_consumed(ticket, context.execution_view());
+        uploads.record_consumed(ticket, context.execution_view());
         service.cancel(ticket);
         until([&] {
             const auto s = service.poll(ticket);
-            return s.status == PlePrepareStatus::Cancelled && s.drained;
+            return s.status == disk::PrepareStatus::Cancelled && s.drained;
         });
-        require(!preparation.try_release(ticket), "pending H2D released its pinned source");
-        rejects([&] { (void)preparation.embedding(ticket, context.execution_view()); });
+        require(!try_release(ticket), "pending H2D released its pinned source");
+        rejects([&] { (void)service.embedding(ticket); });
         transfer.open();
-        until([&] { return preparation.upload_complete(ticket); });
-        require(!preparation.try_release(ticket), "pending consumer released Device E");
+        until([&] { return uploads.upload_complete(ticket); });
+        require(!try_release(ticket), "pending consumer released Device E");
         consumer.open();
-        until([&] { return preparation.try_release(ticket); });
+        until([&] { return try_release(ticket); });
     }
     copied.copy_to_host(actual.data(), input.bytes());
     emit(actual.data(), input.bytes());
@@ -336,20 +341,23 @@ void gpu(const PleTableSource& source, const Input& input) {
         bool rejected = false;
         try {
             fail_event_record = !consumer_failure;
-            preparation.upload(failed, context.transfer_view());
-            const auto e = preparation.embedding(failed, context.execution_view());
+            uploads.upload(service.embedding(failed), context.transfer_view());
+            const auto e = uploads.embedding(failed, context.execution_view());
             copy_bytes_async(copied.span(), {e.data, e.bytes(), e.device},
                              context.execution_view());
             fail_event_record = true;
-            preparation.record_consumed(failed, context.execution_view());
-        } catch (const std::runtime_error&) { rejected = true; }
+            uploads.record_consumed(failed, context.execution_view());
+        } catch (const std::runtime_error&) {
+            rejected = true;
+            service.cancel(failed);
+        }
         require(rejected && !fail_event_record, "CUDA event failure was not reported");
-        until([&] { return preparation.try_release(failed); });
+        until([&] { return try_release(failed); });
     }
 
     const auto again = prepare(service, input);
     service.seal(again, input.lengths());
-    const auto fixed = preparation.device_slot(again.slot, input.tokens, input.batch);
+    const auto fixed = uploads.device_slot(again.slot, input.tokens, input.batch);
     DecodeGraphDefinition definition;
     definition.capture(context.stream(), [&] {
         copy_bytes_async(copied.span(), {fixed.data, fixed.bytes(), fixed.device},
@@ -358,12 +366,12 @@ void gpu(const PleTableSource& source, const Input& input) {
     DecodeGraphExecutable graph;
     graph.instantiate(definition);
     ready(service, again);
-    preparation.upload(again, context.transfer_view());
-    const auto e = preparation.embedding(again, context.execution_view());
+    uploads.upload(service.embedding(again), context.transfer_view());
+    const auto e = uploads.embedding(again, context.execution_view());
     require(e.data == fixed.data, "Device E changed its captured address");
     graph.launch(context.stream());
-    preparation.record_consumed(again, context.execution_view());
-    until([&] { return preparation.try_release(again); });
+    uploads.record_consumed(again, context.execution_view());
+    until([&] { return try_release(again); });
     copied.copy_to_host(actual.data(), input.bytes());
     emit(actual.data(), input.bytes());
 }
@@ -394,9 +402,11 @@ int main(int argc, char** argv) {
         Input input;
         auto source = [&] {
             artifact::Reader reader(argv[1]);
-            return PleTableSource(
-                reader, reader.directory().bindings.at("text/layers/1/ple/table"),
-                reader.directory().component("text").resources.at("ple_hash_controls"));
+            return disk::Table(
+                reader,
+                load_lookup_parameters(
+                    reader, reader.directory().bindings.at("text/layers/1/ple/table"),
+                    reader.directory().component("text").resources.at("ple_hash_controls")));
         }();
         if (mode == "--failure")
             host(source, input, true);

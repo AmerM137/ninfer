@@ -8,7 +8,7 @@ import subprocess
 import sys
 import tempfile
 
-ROOT = Path(__file__).resolve().parents[3]
+ROOT = Path(__file__).resolve().parents[5]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tests"))
 from nf4_reference import fp32, table as exact_table
@@ -161,7 +161,7 @@ def resegment(source, destination):
 
 if __name__ == "__main__":
     if len(sys.argv) != 2:
-        raise SystemExit("usage: test_ple_table.py <test executable>")
+        raise SystemExit("usage: test_table.py <test executable>")
     executable = sys.argv[1]
     with tempfile.TemporaryDirectory(prefix="ninfer-ple-table-") as directory:
         path = Path(directory) / "fixture.ninfer"
