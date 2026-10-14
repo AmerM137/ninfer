@@ -866,7 +866,39 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
         // Definitions remain per execution profile, but only one executable is instantiated for
         // each reachable node-topology class. These bounds cover the largest profile installed in
         // each class and the driver/module state materialized while qualifying all definitions.
-        if (impl->speculative_backend == SpeculativeBackend::None) {
+        if (impl->moe) {
+            // One shared target per exact B: mixer, steady and routed segments. Draft
+            // topology classes own only their prefix/suffix, not another target copy.
+            const auto& profile = *impl->profile;
+            auto per_batch      = checked_add(
+                5ULL * kMiB,
+                checked_mul(384ULL * 1024, profile.text.layers.size(), "MoE target graphs"),
+                "MoE target graph allowance");
+            const bool masked = impl->speculative_backend == SpeculativeBackend::DFlash ||
+                                impl->speculative_backend == SpeculativeBackend::DFlash2;
+            if (masked) {
+                const auto profiles = dflash_graph_profiles(impl->speculative_backend,
+                                                            impl->capacity, impl->draft_window);
+                const auto prefix   = checked_add(
+                    2ULL * kMiB,
+                    checked_mul(512ULL * 1024, profile.draft->layers.size(), "draft graph layers"),
+                    "draft graph prefix");
+                per_batch = checked_add(per_batch,
+                                        graph_topology_allowance(
+                                            profiles, [&](GraphExecutionProfile) { return prefix; },
+                                            "segmented draft graph allowance"),
+                                        "segmented graph allowance");
+            }
+            impl->graph_allowance_bytes =
+                checked_mul(per_batch, impl->max_concurrency, "MoE exact-b graph allowance");
+            if (impl->capacity > 4096 && impl->speculative_backend != SpeculativeBackend::None) {
+                // Long-context kernels also materialize shared driver/code storage.
+                // This is a Program cost rather than another copy for every batch size.
+                impl->graph_allowance_bytes =
+                    checked_add(impl->graph_allowance_bytes, (masked ? 128ULL : 70ULL) * kMiB,
+                                "MoE long-context graph allowance");
+            }
+        } else if (impl->speculative_backend == SpeculativeBackend::None) {
             impl->graph_allowance_bytes = checked_mul(12ULL * kMiB, impl->max_concurrency,
                                                       "ordinary exact-b graph allowance");
         } else if (impl->speculative_backend == SpeculativeBackend::Mtp) {

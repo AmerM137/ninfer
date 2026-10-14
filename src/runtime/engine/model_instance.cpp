@@ -131,10 +131,6 @@ StartupPlan plan_startup(const models::qwen3_5::LoadPlan& source,
         throw std::invalid_argument(
             "VRAM budget cannot hold this model and its execution resources");
     }
-    if (options.use_cuda_graph) {
-        throw std::invalid_argument(
-            "MoE offload currently requires eager execution (--no-cuda-graph)");
-    }
     const auto host = source.placement(device.device(), Device::cpu());
     if (host.device_capacity_bytes >= budget - headroom) {
         throw std::invalid_argument("VRAM budget cannot hold fixed model weights");

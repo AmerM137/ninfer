@@ -9,6 +9,7 @@
 #include "ninfer/ops/gdn_replay.h"
 #include "ninfer/ops/sampling.h"
 #include "core/decode_graph.h"
+#include "models/qwen3_5/program/text_graph.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 
 #include "models/qwen3_5/program/planning/startup.h"
@@ -127,11 +128,13 @@ struct DecodeGraphProfile {
     std::uint32_t max_execution_frontier = 0;
     std::uint32_t topology_class         = 0;
     DecodeGraphDefinition definition;
+    std::unique_ptr<execution::TextGraphDefinition> text;
 };
 
 struct DecodeGraphTopology {
     std::uint32_t topology_class = 0;
     DecodeGraphExecutable executable;
+    std::unique_ptr<execution::TextGraphExecutable> text;
     std::optional<std::size_t> installed_profile;
 };
 
@@ -139,7 +142,7 @@ struct DecodeGraphFamily {
     std::vector<DecodeGraphProfile> profiles;
     std::vector<DecodeGraphTopology> topologies;
     DecodeGraphProfile& select(std::uint32_t batch_size, std::uint32_t frontier);
-    DecodeGraphExecutable& install(DecodeGraphProfile& profile);
+    DecodeGraphTopology& install(DecodeGraphProfile& profile);
 };
 
 // A Forward stage publishes these IDs before target execution finishes. Program owns the

@@ -233,7 +233,8 @@ The official artifacts provide the following capabilities, with optional compone
   tools, local response state, token counting, and usage accounting.
 
 The 35B-A3B target additionally supports DFlash with draft windows from one to fifteen for Text and
-image/video Vision prompts. Qwen3.8-27B artifacts with the DFlash2 companion weights support
+image/video Vision prompts, plus CPU/GPU MoE expert offload with CUDA Graph decode under a
+[GPU memory budget](docs/cli.md). Qwen3.8-27B artifacts with the DFlash2 companion weights support
 `--spec dflash2 --draft-tokens 7` for the same Text/Vision Engine path, with draft counts 1..15
 and either full or optimized proposal heads.
 
@@ -242,7 +243,7 @@ The product boundary remains intentionally small:
 - one RTX 5090 and one resident model per Engine;
 - one to eight resident execution lanes with bounded FIFO ingress;
 - resource-pressure preemption with snapshot or token-replay recovery;
-- no priority/QoS, weight offload, multi-GPU, or distributed serving;
+- no priority/QoS, multi-GPU, or distributed serving;
 - one shared startup-fixed KV pool across active requests and retained prefixes;
 - model architectures and format/shape combinations use explicitly implemented native paths;
 - parsed tool calls are returned to the client; NInfer does not execute tools;

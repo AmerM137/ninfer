@@ -8,6 +8,7 @@
 #include "ninfer/ops/target_logprobs.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -242,11 +243,19 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
 }
 
 ProgramImpl::~ProgramImpl() noexcept {
-    moe.reset();
-    if (device.transfer_stream() != nullptr) {
-        (void)cudaStreamSynchronize(device.transfer_stream());
+    if (moe) {
+        try {
+            moe->synchronize();
+        } catch (const std::exception& error) {
+            std::fprintf(stderr, "MoE teardown synchronization: %s\n", error.what());
+        }
     }
-    if (device.stream() != nullptr) { (void)cudaStreamSynchronize(device.stream()); }
+    if (device.transfer_stream() != nullptr) (void)cudaStreamSynchronize(device.transfer_stream());
+    if (device.stream() != nullptr) (void)cudaStreamSynchronize(device.stream());
+    ordinary_graphs            = {};
+    speculative_forward_graphs = {};
+    speculative_finish_graphs  = {};
+    moe.reset();
 }
 
 std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,

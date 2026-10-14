@@ -199,7 +199,9 @@ checks, signed code domains, scale extremes and tiny-BF16 cancellation around th
 multi-layer fixed-cache and streaming-window schedule against the same independent complete-MoE oracle. It uses registered native Host banks and the real ExpertCache,
 covering Write/AddResidual outputs, absent CPU-only replicas, explicit region replacement,
 All/None/partial partitions, bank IDs independent of traversal order, variable frame reuse through
-T=1024, delayed bridge progress, failed acquisition and asynchronous teardown.
+T=1024, delayed bridge progress, failed acquisition and asynchronous teardown. Eager and segmented
+Graph handoffs use the same oracle; Graph cases also cover expert relocation and streaming-window
+transitions through the real cache schedule.
 
 ```bash
 ctest --test-dir build -R '^ninfer_moe(_cpu(_avx2|_fma)?)?_test$' --output-on-failure
@@ -214,10 +216,11 @@ NINFER_TEST_ARTIFACT=$PWD/out/qwen3_6_35b_a3b.ninfer \
 ```
 
 `ninfer_qwen3_5_moe_offload_real_test` uses the same artifact with a 16 GiB Device budget and
-eager execution. It covers MTP, prefix reuse, Vision, per-layer expert priorities,
+segmented CUDA Graph execution (`NINFER_TEST_EAGER=1` selects eager). It covers MTP, prefix reuse, Vision, per-layer expert priorities,
 eight resident rows, and stable small-T cache reuse. The DFlash and
 preemption real tests also accept `NINFER_TEST_EAGER=1`; combine it with
-`NINFER_VRAM_BUDGET_MIB` to exercise offload. CausalScoring always uses eager execution.
+`NINFER_VRAM_BUDGET_MIB` to exercise eager offload, or set only the budget for Graph offload.
+CausalScoring always uses eager execution.
 
 Without `NINFER_TEST_ARTIFACT`, CTest marks these real Engine tests as skipped. Real-artifact targets
 carry the `real` label and `RUN_SERIAL` so CTest runs them alone. Run directly invoked GPU

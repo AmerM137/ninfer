@@ -60,24 +60,26 @@ void DecodeGraphDefinition::capture(cudaStream_t stream, const std::function<voi
     nvtx::ScopedRange capture_range(nvtx::Name::CudaGraphCapture, nvtx::Category::Graph);
     reset();
 
-    CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+    DecodeGraphCapture capture(stream);
+    body();
+    *this = capture.finish();
+}
 
-    try {
-        body();
-    } catch (...) {
-        discard_capture(stream);
-        throw;
-    }
+DecodeGraphCapture::DecodeGraphCapture(cudaStream_t stream) : stream_(stream) {
+    CUDA_CHECK(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeThreadLocal));
+}
 
-    cudaGraph_t graph = nullptr;
+DecodeGraphCapture::~DecodeGraphCapture() {
+    if (stream_) discard_capture(stream_);
+}
 
-    cudaError_t err = cudaStreamEndCapture(stream, &graph);
-    if (err != cudaSuccess) {
-        destroy_graph(graph);
-        CUDA_CHECK(err);
-    }
-
-    graph_ = graph;
+DecodeGraphDefinition DecodeGraphCapture::finish() {
+    if (!stream_) throw std::logic_error("CUDA Graph capture is already finished");
+    DecodeGraphDefinition definition;
+    const auto error = cudaStreamEndCapture(stream_, &definition.graph_);
+    stream_          = nullptr;
+    CUDA_CHECK(error);
+    return definition;
 }
 
 bool DecodeGraphDefinition::ready() const noexcept { return graph_ != nullptr; }

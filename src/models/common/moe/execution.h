@@ -61,6 +61,43 @@ struct ExecutionView {
     std::optional<HostExecutionView> host;
 };
 
+struct Frame {
+    Tensor host_input;
+    ops::ExpertRoutes device_routes, host_routes;
+    MemorySpan device_route_bytes, host_route_bytes;
+    Tensor shared, gpu_partial, device_cpu_partial, host_partial;
+};
+
+// Borrowed operands and stable bridge storage for one layer invocation. Preparing a
+// call does not acquire weights, enqueue work, or inspect route/mask contents.
+struct PreparedExecution {
+    const Parameters& parameters;
+    PartitionView partition;
+    const ExpertBankSource& source;
+    const ExpertBankDeviceView& bank;
+    ops::MoeEpilogue epilogue;
+    std::int32_t tokens;
+    ExecutionView execution;
+    Frame frame;
+    ExecutionRequirements requirements;
+};
+
+[[nodiscard]] PreparedExecution prepare_execution(const Parameters&, PartitionView,
+                                                  const ExpertBankSource&,
+                                                  const ExpertBankDeviceView&, ops::MoeEpilogue,
+                                                  std::int32_t tokens, ExecutionView);
+
+// Capture orders input D2H before GPU experts and records a Host-observable input event.
+enum class GpuSubmission { Eager, Capture };
+void enqueue_gpu(const Tensor& hidden, const PreparedExecution&, Tensor& output, MemoryArena&,
+                 GpuSubmission, const ops::MoeExecutionHints& = {});
+// Host input must be ready. Returns false without a collective when all routes hit the GPU.
+[[nodiscard]] bool compute_cpu(const PreparedExecution&);
+void enqueue_finish(const PreparedExecution&, Tensor& output, bool cpu_work);
+// Wait for the input event, compute the complement, then enqueue output completion.
+// All-GPU calls have already produced output and return false without a Host wait.
+[[nodiscard]] bool complete(const PreparedExecution&, Tensor& output);
+
 // BF16 hidden and output are disjoint contiguous [H,T]. Write does not read old output;
 // AddResidual adds it before final rounding. Required GPU keys have
 // already been published and are retained by the caller through the last GPU consumer.

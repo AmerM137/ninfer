@@ -62,6 +62,17 @@ private:
 // Layer parameters and immutable sources outlive this owner; traversals have one Host caller.
 class Resources {
 public:
+    // Startup warmup exercises the real schedule without binding the serving caller.
+    class Preparation {
+    public:
+        explicit Preparation(Resources&);
+        ~Preparation();
+        Preparation(const Preparation&)            = delete;
+        Preparation& operator=(const Preparation&) = delete;
+    private:
+        Resources& owner_;
+    };
+
     Resources(std::shared_ptr<const Plan>, std::span<const Parameters* const> layers,
               std::span<const ExpertBankSource> sources, const DeviceContext&);
     ~Resources();
@@ -71,6 +82,15 @@ public:
     // Retain the activity through the traversal; GPU-only streaming does not wake the team.
     [[nodiscard]] std::optional<CpuExecutionView::ActiveScope> begin(std::int32_t tokens);
     void before_layer(ExpertBankId bank);
+    [[nodiscard]] bool settled() const noexcept;
+    // Immutable bindings for capture. No cache acquisition or submission is performed.
+    [[nodiscard]] PreparedExecution describe_layer(ExpertBankId bank, std::int32_t tokens,
+                                                   ops::ExpertSubsetKind kind);
+    [[nodiscard]] PreparedExecution prepare_layer(ExpertBankId bank);
+    void gpu_submitted(ExpertBankId bank);
+    void finish_layer(bool cpu_work) noexcept;
+    void abort_layer(ExpertBankId bank);
+    void restore_cache_after_preparation();
     // The plan fixes each layer's Write/AddResidual semantics.
     void execute(ExpertBankId bank, const Tensor& hidden, Tensor& output, MemoryArena& workspace,
                  const ops::MoeExecutionHints& hints);

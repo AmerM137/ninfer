@@ -11,7 +11,7 @@
 
 namespace {
 
-ninfer::EngineOptions engine_options(const char* artifact, bool offload = false) {
+ninfer::EngineOptions engine_options(const char* artifact) {
     ninfer::EngineOptions options;
     options.artifact_path                     = artifact;
     options.max_context                       = 4096;
@@ -21,7 +21,7 @@ ninfer::EngineOptions engine_options(const char* artifact, bool offload = false)
     options.speculative.draft_tokens          = 3;
     options.speculative.proposal_head         = ninfer::ProposalHead::Optimized;
     options.enable_vision                     = true;
-    options.use_cuda_graph                    = !offload;
+    options.use_cuda_graph                    = std::getenv("NINFER_TEST_EAGER") == nullptr;
     options.context_cache.host_capacity_bytes = 0;
     return options;
 }
@@ -251,7 +251,7 @@ int exercise_maximum_configuration(const char* artifact) {
 }
 
 int exercise_expert_priority(const char* artifact) {
-    auto options            = engine_options(artifact, true);
+    auto options            = engine_options(artifact);
     options.speculative     = {};
     options.enable_vision   = false;
     options.max_concurrency = 8;
@@ -310,7 +310,7 @@ int main(int argc, char** argv) {
         }
 
         {
-            ninfer::Engine engine(engine_options(artifact, offload));
+            ninfer::Engine engine(engine_options(artifact));
             if (const int result = verify_loaded_product(engine); result != 0) { return result; }
             const auto before         = engine.memory_summary();
             const auto expected_chunk = offload ? 4096U : 1024U;

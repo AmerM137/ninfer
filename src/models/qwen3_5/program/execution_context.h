@@ -25,6 +25,8 @@
 
 namespace ninfer::models::qwen3_5::execution {
 
+class TextGraphRun;
+
 using qwen3_5::PreparedPromptData;
 using detail::DFlashPersistentState;
 using qwen3_5::PromptModality;
@@ -51,6 +53,7 @@ struct ExecutionCore {
     std::uint32_t prefill_chunk;
     ProposalHead proposal_head;
     moe::Resources* moe;
+    TextGraphRun* text_graph = nullptr;
 };
 
 struct PrefillContext {

@@ -30,14 +30,17 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
         }
 
         qwen3_5::OrdinaryDecodeState& ordinary = state.frame;
-        CUDA_CHECK(cudaMemcpyAsync(ordinary.ingress.data, &state.host_ingress,
-                                   sizeof(qwen3_5::OrdinaryDecodeIngress), cudaMemcpyHostToDevice,
-                                   state.execution.cuda.stream()));
+        if (emit_forward_gpu(state.execution.text_graph)) {
+            CUDA_CHECK(cudaMemcpyAsync(ordinary.ingress.data, &state.host_ingress,
+                                       sizeof(qwen3_5::OrdinaryDecodeIngress),
+                                       cudaMemcpyHostToDevice, state.execution.cuda.stream()));
+        }
 
         TextContext card(state.execution.device, state.execution.parameters, state.execution.work,
                          state.text_cache, state.execution.linear_attention, state.execution.io,
                          state.execution.prefill_hidden, state.execution.prefill_chunk, 0, {},
                          nullptr, state.execution.moe);
+        card.set_graph_run(state.execution.text_graph);
 
         Tensor tokens             = ordinary.tokens.slice(0, 0, batch_size);
         Tensor cache_positions    = ordinary.cache_positions.slice(0, 0, batch_size);
@@ -51,15 +54,17 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
 
         card.ordinary_decode_batch(tokens, cache_positions, rope_positions, kv_rows, state_sources,
                                    state_destinations, envelope, hidden, logits);
-        ops::scatter(hidden, state_destinations, state.continuation_hidden_store,
-                     state.execution.cuda);
-        ops::sample(logits, sampled,
-                    dimension(state.execution.parameters.model.resources().public_token_count),
-                    ordinary.sampling, cache_positions, ops::kSamplePurposeDecode,
-                    state.execution.work, state.execution.cuda);
-        CUDA_CHECK(cudaMemcpyAsync(&state.host_egress, ordinary.egress.data,
-                                   sizeof(qwen3_5::OrdinaryDecodeEgress), cudaMemcpyDeviceToHost,
-                                   state.execution.cuda.stream()));
+        if (emit_forward_gpu(state.execution.text_graph)) {
+            ops::scatter(hidden, state_destinations, state.continuation_hidden_store,
+                         state.execution.cuda);
+            ops::sample(logits, sampled,
+                        dimension(state.execution.parameters.model.resources().public_token_count),
+                        ordinary.sampling, cache_positions, ops::kSamplePurposeDecode,
+                        state.execution.work, state.execution.cuda);
+            CUDA_CHECK(cudaMemcpyAsync(&state.host_egress, ordinary.egress.data,
+                                       sizeof(qwen3_5::OrdinaryDecodeEgress),
+                                       cudaMemcpyDeviceToHost, state.execution.cuda.stream()));
+        }
     };
 }
 
@@ -258,11 +263,16 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_ordinary_batch(
         submit_range.emplace(nvtx::Name::DecodeOrdinarySubmit, nvtx::Category::Decode,
                              static_cast<std::uint64_t>(lanes.size()));
         DecodeGraphExecutable* executable = nullptr;
+        std::optional<execution::TextGraphRun> text_replay;
         ops::CausalAttentionExecutionEnvelope envelope{maximum_frontier + 1, maximum_frontier + 1};
         if (use_cuda_graph) {
             DecodeGraphProfile& profile =
                 ordinary_graphs.select(static_cast<std::uint32_t>(lanes.size()), maximum_frontier);
-            executable = &ordinary_graphs.install(profile);
+            auto& topology = ordinary_graphs.install(profile);
+            if (topology.text)
+                text_replay.emplace(*topology.text, device.execution_view());
+            else
+                executable = &topology.executable;
             envelope   = {profile.min_execution_frontier + 1, profile.max_execution_frontier + 1};
         }
 
@@ -295,6 +305,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_ordinary_batch(
             *ordinary_host_egress,
             state_images->continuation_hidden_store()};
 
+        if (text_replay) schedule_state.execution.text_graph = &*text_replay;
         mark_workspace_usage(workspace_plan.ordinary_round);
         execution::ordinary_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
                                          envelope, executable);
@@ -395,15 +406,19 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
         submit_range.emplace(nvtx::Name::DecodeMtpSubmit, nvtx::Category::Mtp,
                              static_cast<std::uint64_t>(lanes.size()));
         DecodeGraphExecutable* forward = nullptr;
+        execution::TextGraphExecutable* text_forward = nullptr;
         DecodeGraphExecutable* finish  = nullptr;
         execution::MtpCausalAttentionEnvelopes envelopes =
             mtp_causal_attention_envelopes(maximum_frontier, draft_window, capacity);
         if (use_cuda_graph) {
             const auto batch = static_cast<std::uint32_t>(lanes.size());
             auto& profile    = speculative_forward_graphs.select(batch, maximum_frontier);
-            forward          = &speculative_forward_graphs.install(profile);
-            finish           = &speculative_finish_graphs.install(
-                speculative_finish_graphs.select(batch, maximum_frontier));
+            auto& topology   = speculative_forward_graphs.install(profile);
+            text_forward     = topology.text.get();
+            if (!text_forward) forward = &topology.executable;
+            finish = &speculative_finish_graphs
+                          .install(speculative_finish_graphs.select(batch, maximum_frontier))
+                          .executable;
             envelopes = mtp_causal_attention_envelopes(profile.max_execution_frontier, draft_window,
                                                        capacity);
         }
@@ -460,13 +475,23 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
 
         mark_workspace_usage(workspace_plan.mtp_round);
         const auto batch = static_cast<std::int32_t>(lanes.size());
+        const std::function<void()> prepare_masks = [&] {
+            for (std::size_t row = 0; row < lanes.size(); ++row) {
+                const auto extent =
+                    static_cast<std::size_t>(mtp_host_ingress->current_extents[row]);
+                (void)fill_grammar_mask(masks, row,
+                                        {active_sequence(lanes[row]).mtp_drafts.data(), extent});
+            }
+        };
+        std::optional<execution::TextGraphRun> text_replay;
+        if (text_forward) {
+            text_replay.emplace(*text_forward, device.execution_view(), &prepare_masks);
+            schedule_state.execution.text_graph = &*text_replay;
+        }
         execution::mtp_decode_batch(schedule_state, batch, draft_window, envelopes, forward,
                                     execution::SpeculativePhase::Forward);
-        for (std::size_t row = 0; row < lanes.size(); ++row) {
-            const auto extent = static_cast<std::size_t>(mtp_host_ingress->current_extents[row]);
-            (void)fill_grammar_mask(masks, row,
-                                    {active_sequence(lanes[row]).mtp_drafts.data(), extent});
-        }
+        if (!text_replay) prepare_masks();
+        schedule_state.execution.text_graph = nullptr;
         execution::mtp_decode_batch(schedule_state, batch, draft_window, envelopes, finish,
                                     execution::SpeculativePhase::Finish);
         submit_range.reset();
@@ -604,15 +629,19 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
             constrained |= masks && masks->constrained(row);
         }
         DecodeGraphExecutable* forward       = nullptr;
+        execution::TextGraphExecutable* text_forward = nullptr;
         DecodeGraphExecutable* finish        = nullptr;
         execution::DFlashEnvelopes envelopes = dflash_envelopes(maximum_frontier, draft_window);
         ops::CausalAttentionExecutionEnvelope target_envelope{1, maximum_target_tokens};
         if (use_cuda_graph) {
             const auto batch = static_cast<std::uint32_t>(lanes.size());
             auto& profile    = speculative_forward_graphs.select(batch, maximum_frontier);
-            forward          = &speculative_forward_graphs.install(profile);
-            finish           = &speculative_finish_graphs.install(
-                speculative_finish_graphs.select(batch, maximum_frontier));
+            auto& topology   = speculative_forward_graphs.install(profile);
+            text_forward     = topology.text.get();
+            if (!text_forward) forward = &topology.executable;
+            finish = &speculative_finish_graphs
+                          .install(speculative_finish_graphs.select(batch, maximum_frontier))
+                          .executable;
             envelopes       = dflash_envelopes(profile.max_execution_frontier, draft_window);
             target_envelope = {
                 1, static_cast<std::uint32_t>(std::min<std::uint64_t>(
@@ -671,22 +700,31 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
 
         mark_workspace_usage(workspace_plan.dflash_round);
         const auto batch = static_cast<std::int32_t>(lanes.size());
+        const std::function<void()> prepare_masks = [&] {
+            if (constrained) {
+                // The forward graph signals draft readiness before running the target model.
+                timing.begin_constraint_wait();
+                dflash_draft_handoff->ready.synchronize();
+                timing.end_constraint_wait();
+                timing.resume_submit();
+                for (std::size_t row = 0; row < lanes.size(); ++row) {
+                    const auto extent =
+                        static_cast<std::size_t>(dflash_host_ingress->proposal_extents[row]);
+                    (void)fill_grammar_mask(
+                        masks, row, schedule_state.host_drafts.subspan(row * draft_window, extent));
+                }
+            }
+        };
+        std::optional<execution::TextGraphRun> text_replay;
+        if (text_forward) {
+            text_replay.emplace(*text_forward, device.execution_view(), &prepare_masks);
+            schedule_state.execution.text_graph = &*text_replay;
+        }
         execution::dflash_decode_batch(schedule_state, batch, draft_window, envelopes,
                                        target_envelope, forward,
                                        execution::SpeculativePhase::Forward);
-        if (constrained) {
-            // The forward graph signals draft readiness before running the target model.
-            timing.begin_constraint_wait();
-            dflash_draft_handoff->ready.synchronize();
-            timing.end_constraint_wait();
-            timing.resume_submit();
-            for (std::size_t row = 0; row < lanes.size(); ++row) {
-                const auto extent =
-                    static_cast<std::size_t>(dflash_host_ingress->proposal_extents[row]);
-                (void)fill_grammar_mask(
-                    masks, row, schedule_state.host_drafts.subspan(row * draft_window, extent));
-            }
-        }
+        if (!text_replay) prepare_masks();
+        schedule_state.execution.text_graph = nullptr;
         execution::dflash_decode_batch(schedule_state, batch, draft_window, envelopes,
                                        target_envelope, finish,
                                        execution::SpeculativePhase::Finish);

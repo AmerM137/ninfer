@@ -28,6 +28,8 @@ class Resources;
 
 namespace ninfer::models::qwen3_5::execution {
 
+class TextGraphRun;
+
 using Phase = qwen3_5::TextPhase;
 
 enum class GdnStateAction : std::uint8_t {
@@ -78,6 +80,8 @@ public:
                 qwen3_5::PagedKVCacheView mtp_kv          = qwen3_5::PagedKVCacheView(),
                 const qwen3_5::PagedKVCache* batch_mtp_kv = nullptr, moe::Resources* moe = nullptr);
     ~TextContext();
+
+    void set_graph_run(TextGraphRun* graphs) noexcept { graphs_ = graphs; }
 
     TextContext(const TextContext&)            = delete;
     TextContext& operator=(const TextContext&) = delete;
@@ -211,6 +215,7 @@ private:
     prefill_impl(std::span<const int> ids, const TextPrefill* text_prefill,
                  const MultimodalPrefill* multimodal, Tap& tap, bool finalize_at_end);
     moe::Resources* moe_;
+    TextGraphRun* graphs_ = nullptr;
     DeviceContext& ctx_;
     CudaExecutionView execution_;
     const Parameters& parameters_;

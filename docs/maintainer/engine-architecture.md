@@ -194,7 +194,7 @@ worker 轮询；退出后恢复有限自旋与休眠。它不提交工作，也�
 
 两种执行器共享启动确认、初始化失败清理和线程回收机制。CPU 团队不调用 CUDA，也不持有
 传输槽、模型状态或权重副本。Engine/Scoring 的控制线程继续拥有各自的工作循环。
-CPU 团队用于 eager MoE 混合执行；每个 Program 持有固定团队和交接缓冲。
+CPU 团队用于 MoE 混合执行；每个 Program 持有固定团队和交接缓冲。
 MoE 按实际 token 列数选择混合计算或整层流式 GPU 计算，prefill、Replay、decode、
 control 与 verification 共用这个选择。权重副本不属于请求 StateImage，不随回滚或暂停恢复。
 
@@ -369,6 +369,11 @@ Op 拥有声明执行范围内的 Graph 更新兼容性，Program 在启动时�
 Speculative unit 使用 Forward、Finish 两段 Graph，CPU 在两段之间准备约束 mask，并可与 target
 forward 重叠；两段共享同一个资源预留和提交边界。
 长度档位限制资源范围；Program 不复制 Attention Op 私有 kernel 的分派边界。
+
+MoE offload 使用分段 GPU Graph，控制线程负责 CPU contribution、缓存快照及传输交接。
+稳定缓存合并 mixer 与 MoE GPU 提交；恢复和流式加载时分开，保留 mixer 与上传重叠。
+Graph 只记录 GPU 工作，warmup 不绑定运行期控制线程；结束异步工作后先销毁 Graph，
+再释放其引用的 bridge 和 events。具体依赖见 [Expert 权重缓存](expert-weight-cache.md)。
 
 Source 排序使用硬件与实际绑定对应的传输成本、prefill 成本；缺省值用于没有匹配测量的配置。
 实际 reservation 和 stores 决定物理可行性。

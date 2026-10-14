@@ -6,11 +6,12 @@ download an artifact using the [project README](../README.md) before following t
 The examples use Qwen3.8-27B NVFP4 with FP8 KV storage.
 
 For Qwen3.6-35B-A3B, `NINFER_VRAM_BUDGET_MIB` caps the Engine's GPU allocation budget. If the
-model cannot remain fully on GPU, Main MoE experts use CPU/GPU eager execution:
+model cannot remain fully on GPU, Main MoE experts use CPU/GPU execution with segmented CUDA
+Graph decode:
 
 ```bash
 NINFER_VRAM_BUDGET_MIB=16384 ./build/apps/ninfer out/qwen3_6_35b_a3b.ninfer \
-  --no-cuda-graph --prompt "Explain how a compiler works." --max-context 8192 --max-new 128
+  --prompt "Explain how a compiler works." --max-context 8192 --max-new 128
 ```
 
 `--prefill-chunk N` sets a fixed positive multiple of 128. When omitted, the default is 1024 for

@@ -41,7 +41,7 @@ void instantiate_graph_family(DecodeGraphFamily& family, const char* label, Devi
 
     for (std::size_t i = 0; i < family.profiles.size(); ++i) {
         DecodeGraphProfile& profile = family.profiles[i];
-        if (!profile.definition.ready()) {
+        if (!profile.text && !profile.definition.ready()) {
             throw std::logic_error(std::string(label) + " CUDA Graph definition is empty");
         }
         const auto existing =
@@ -54,17 +54,37 @@ void instantiate_graph_family(DecodeGraphFamily& family, const char* label, Devi
         family.topologies.emplace_back();
         DecodeGraphTopology& topology = family.topologies.back();
         topology.topology_class       = profile.topology_class;
-        topology.executable.instantiate(profile.definition);
+        if (profile.text) {
+            const execution::TextGraphExecutable* shared = nullptr;
+            for (const auto& other : family.topologies) {
+                if (other.text &&
+                    family.profiles[*other.installed_profile].batch_size == profile.batch_size) {
+                    shared = other.text.get();
+                    break;
+                }
+            }
+            topology.text = std::make_unique<execution::TextGraphExecutable>(*profile.text, shared);
+        } else {
+            topology.executable.instantiate(profile.definition);
+        }
         topology.installed_profile = i;
     }
 
     const auto install_and_upload = [&](DecodeGraphTopology& topology, std::size_t profile_index) {
         DecodeGraphProfile& profile = family.profiles[profile_index];
         if (topology.installed_profile != profile_index) {
-            topology.executable.update(profile.definition);
+            if (profile.text)
+                topology.text->update(*profile.text);
+            else
+                topology.executable.update(profile.definition);
             topology.installed_profile = profile_index;
         }
-        topology.executable.upload(device.stream());
+        if (topology.text) {
+            topology.text->activate(*profile.text);
+            topology.text->upload(device.stream());
+        } else {
+            topology.executable.upload(device.stream());
+        }
         device.synchronize();
     };
 
@@ -104,7 +124,7 @@ DecodeGraphProfile& DecodeGraphFamily::select(std::uint32_t batch_size, std::uin
     return *it;
 }
 
-DecodeGraphExecutable& DecodeGraphFamily::install(DecodeGraphProfile& profile) {
+DecodeGraphTopology& DecodeGraphFamily::install(DecodeGraphProfile& profile) {
     const auto it =
         std::find_if(topologies.begin(), topologies.end(), [&](const DecodeGraphTopology& t) {
             return t.topology_class == profile.topology_class;
@@ -112,14 +132,20 @@ DecodeGraphExecutable& DecodeGraphFamily::install(DecodeGraphProfile& profile) {
     if (it == topologies.end()) { throw std::logic_error("CUDA Graph topology is unavailable"); }
     const auto index = static_cast<std::size_t>(&profile - profiles.data());
     if (it->installed_profile != index) {
-        it->executable.update(profile.definition);
+        if (profile.text)
+            it->text->update(*profile.text);
+        else
+            it->executable.update(profile.definition);
         it->installed_profile = index;
     }
-    return it->executable;
+    if (it->text) it->text->activate(*profile.text);
+    return *it;
 }
 
 void ProgramImpl::prepare_graphs() {
     if (!use_cuda_graph) { return; }
+    std::optional<moe::Resources::Preparation> preparation;
+    if (moe) preparation.emplace(*moe);
     nvtx::ScopedRange prepare_range(nvtx::Name::CudaGraphPrepare, nvtx::Category::Graph);
 
     std::array<StateImageHandle, kMaximumConcurrency> capture_states{};
@@ -317,6 +343,18 @@ void ProgramImpl::prepare_graphs() {
                                         moe.get()};
     };
 
+    const auto text_definition = [&](const DecodeGraphFamily& family, std::uint32_t batch) {
+        const execution::TextGraphDefinition* shared = nullptr;
+        for (const auto& profile : family.profiles) {
+            if (profile.batch_size == batch && profile.text) {
+                shared = profile.text.get();
+                break;
+            }
+        }
+        return std::make_unique<execution::TextGraphDefinition>(parameters.text.layers.size(),
+                                                                shared);
+    };
+
     if (speculative_backend == SpeculativeBackend::None) {
         const auto ordinary_profiles = ordinary_graph_profiles(capacity);
         validate_graph_profiles(ordinary_profiles, capacity - 1, "ordinary");
@@ -344,9 +382,16 @@ void ProgramImpl::prepare_graphs() {
                     planned.topology_class * ordinary_batch_limit + (batch_size - 1U);
                 const ops::CausalAttentionExecutionEnvelope envelope{planned.min + 1,
                                                                      planned.max + 1};
+                std::optional<execution::TextGraphRun> recording;
+                if (moe) {
+                    profile.text = text_definition(ordinary_graphs, batch_size);
+                    recording.emplace(*profile.text, device.execution_view());
+                    ordinary_state.execution.text_graph = &*recording;
+                }
                 execution::capture_ordinary_decode_batch(ordinary_state,
                                                          static_cast<std::int32_t>(batch_size),
                                                          envelope, profile.definition);
+                ordinary_state.execution.text_graph = nullptr;
             }
         }
     }
@@ -357,7 +402,23 @@ void ProgramImpl::prepare_graphs() {
             const auto& profile = ordinary_graphs.profiles[*topology.installed_profile];
             prepare_representative(profile.min_execution_frontier, profile.batch_size);
             device.synchronize();
-            topology.executable.launch(device.stream());
+            if (topology.text) {
+                execution::TextGraphRun replay(*topology.text, device.execution_view());
+                auto core       = execution_core();
+                core.text_graph = &replay;
+                execution::OrdinaryBatchContext state{core,
+                                                      decoder->text_kv,
+                                                      *io.ordinary,
+                                                      *ordinary_host_ingress,
+                                                      *ordinary_host_egress,
+                                                      state_images->continuation_hidden_store()};
+                execution::ordinary_decode_batch(
+                    state, profile.batch_size,
+                    {profile.min_execution_frontier + 1, profile.max_execution_frontier + 1},
+                    nullptr);
+            } else {
+                topology.executable.launch(device.stream());
+            }
             device.synchronize();
         }
     }
@@ -398,15 +459,20 @@ void ProgramImpl::prepare_graphs() {
                        capacity, static_cast<std::uint64_t>(frontier) + draft_window + 1ULL))};
         };
         const auto run = [&](SpeculativePhase phase, std::int32_t batch, std::uint32_t frontier,
-                             DecodeGraphExecutable* executable) {
+                             DecodeGraphExecutable* executable,
+                             execution::TextGraphExecutable* text = nullptr) {
+            std::optional<execution::TextGraphRun> replay;
+            if (text) replay.emplace(*text, device.execution_view());
             if (mtp) {
                 auto state = mtp_context();
+                if (replay) state.execution.text_graph = &*replay;
                 execution::mtp_decode_batch(
                     state, batch, draft_window,
                     mtp_causal_attention_envelopes(frontier, draft_window, capacity), executable,
                     phase);
             } else {
                 auto state = dflash_context();
+                if (replay) state.execution.text_graph = &*replay;
                 execution::dflash_decode_batch(state, batch, draft_window,
                                                dflash_envelopes(frontier, draft_window),
                                                target_envelope(frontier), executable, phase);
@@ -415,14 +481,21 @@ void ProgramImpl::prepare_graphs() {
         const auto capture = [&](SpeculativePhase phase, DecodeGraphProfile& profile) {
             const auto batch    = static_cast<std::int32_t>(profile.batch_size);
             const auto frontier = profile.max_execution_frontier;
+            std::optional<execution::TextGraphRun> recording;
+            if (moe && phase == SpeculativePhase::Forward) {
+                profile.text = text_definition(speculative_forward_graphs, profile.batch_size);
+                recording.emplace(*profile.text, device.execution_view());
+            }
             if (mtp) {
                 auto state = mtp_context();
+                if (recording) state.execution.text_graph = &*recording;
                 execution::capture_mtp_decode_batch(
                     state, batch, draft_window,
                     mtp_causal_attention_envelopes(frontier, draft_window, capacity),
                     profile.definition, phase);
             } else {
                 auto state = dflash_context();
+                if (recording) state.execution.text_graph = &*recording;
                 execution::capture_dflash_decode_batch(
                     state, batch, draft_window, dflash_envelopes(frontier, draft_window),
                     target_envelope(frontier), profile.definition, phase);
@@ -459,17 +532,23 @@ void ProgramImpl::prepare_graphs() {
         // Warm complete transactions: finish consumes persistent outputs of its paired forward.
         for (auto& topology : speculative_forward_graphs.topologies) {
             auto& forward     = speculative_forward_graphs.profiles[*topology.installed_profile];
+            speculative_forward_graphs.install(forward);
             auto& finish      = speculative_finish_graphs.select(forward.batch_size,
                                                                  forward.min_execution_frontier);
             auto& finish_exec = speculative_finish_graphs.install(finish);
             prepare_representative(forward.min_execution_frontier, forward.batch_size);
             device.synchronize();
-            topology.executable.launch(device.stream());
-            finish_exec.launch(device.stream());
+            if (topology.text)
+                run(SpeculativePhase::Forward, forward.batch_size, forward.max_execution_frontier,
+                    nullptr, topology.text.get());
+            else
+                topology.executable.launch(device.stream());
+            finish_exec.executable.launch(device.stream());
             device.synchronize();
         }
     }
 
+    if (moe) moe->restore_cache_after_preparation();
     clear_stable_controls();
     state_images->zero_all(device.stream());
     if (dflash) {

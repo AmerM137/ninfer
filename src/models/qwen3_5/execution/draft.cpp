@@ -573,7 +573,7 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
         state.execution.work.reset();
         qwen3_5::DFlashDecodeState& frame = state.frame;
         const std::int32_t width          = static_cast<std::int32_t>(k) + 1;
-        if (phase == SpeculativePhase::Forward) {
+        if (phase == SpeculativePhase::Forward && emit_forward_gpu(state.execution.text_graph)) {
             CUDA_CHECK(cudaMemcpyAsync(frame.ingress.data, &state.host_ingress,
                                        sizeof(qwen3_5::DFlashDecodeIngress), cudaMemcpyHostToDevice,
                                        state.execution.cuda.stream()));
@@ -603,7 +603,7 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
         Tensor licensed_counts    = frame.licensed_counts.slice(0, 0, batch_size);
         Tensor accepted           = frame.accepted_drafts.slice(0, 0, batch_size);
 
-        if (phase == SpeculativePhase::Forward) {
+        if (phase == SpeculativePhase::Forward && emit_forward_gpu(state.execution.text_graph)) {
             state.execution.work.reset();
             Tensor compact_features = state.execution.work.alloc(
                 DType::BF16,
@@ -637,6 +637,7 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                          state.text_cache, state.execution.linear_attention, state.execution.io,
                          state.execution.prefill_hidden, state.execution.prefill_chunk, 0, {},
                          nullptr, state.execution.moe);
+        card.set_graph_run(state.execution.text_graph);
         DFlashFeatureSink sink =
             batch_feature_sink_impl(state, active_lanes, valid_columns, width, batch_size);
         {

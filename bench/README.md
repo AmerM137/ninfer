@@ -1403,6 +1403,11 @@ generation. `--gpu-experts N` assigns logical IDs `[0,N)` by default; `--gpu-sel
 selects the first N IDs of a deterministic shuffled permutation. The remaining routed assignments
 use CPU.
 
+`--execution eager|graph` selects submission for the production parallel schedule (default eager).
+Graph mode captures the GPU front for each fixed corpus input and performs the CPU handoff and
+conditional completion outside the graph. Capture/upload are excluded from timing; the serial
+comparison remains eager. The header records the selected execution mode.
+
 ```bash
 build/bench/ninfer_qwen3_5_moe_execution_bench \
   --artifact out/qwen3_6_35b_a3b.ninfer --layer 0 --tokens 128 --gpu-experts 128 \

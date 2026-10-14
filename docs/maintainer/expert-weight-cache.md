@@ -4,7 +4,7 @@
 数学与量化布局由 [artifact 格式](artifact-container.md)和各 Op 合同拥有；
 执行与生命周期由 [Engine 架构](engine-architecture.md)拥有。
 
-Engine 支持常驻 GPU，以及受显存预算约束的 eager MoE 混合执行。CPU `routed_swiglu`
+Engine 支持常驻 GPU，以及受显存预算约束的 MoE 混合执行。CPU `routed_swiglu`
 支持 Q4 GU + Q5/Q6 down，直接消费 Host bank 并产生 FP32 分项。GPU 使用同一组
 logical expert ID，既可以计算固定子集，也可以消费补齐后的整层 bank。
 
@@ -264,7 +264,20 @@ MemorySummary 报告池容量、固定区、窗口总容量与数量、实际占
 受 context 剩余长度限制。测量签名包含优先级、各层缓存额度、团队、池容量和 chunk，
 不把常驻模型的重算成本标定直接套给 offload。
 
-常驻执行保留 CUDA Graph。当前混合执行要求 `use_cuda_graph=false`；MTP 的 Main
-verification 和 DFlash 的 target 使用相同调度，MTP 自身及 draft 延续常驻路径。
+常驻执行使用整段 CUDA Graph；混合执行支持分段 Graph，也保留 eager 提交。
+稳定小 T 将 mixer 与 MoE GPU 前段合并；窗口流式加载或额外缓存恢复期间分开提交，
+在 mixer 之后取得快照和加入权重就绪依赖。CPU 等待图中的输入就绪 external event，
+与 GPU routed/shared 并行计算；本轮没有 CPU contribution 时跳过 collective 和回传。
+捕获路径把输入 D2H 排在 GPU experts 前，避免独立拷贝分支被延后；较大 T 的结果 H2D
+仍使用 bridge stream。Eager 保留较大 T 的输入拷贝分支。
+缓存交接和预取留在图外，lease 释放排在最后一个 GPU 权重消费者之后。
+
+MTP 的 Main verification 和 DFlash 的 target 使用同一分段调度；MTP 自身及 draft
+延续常驻 Graph。相同 exact-B 的 target executable 在 draft 的不同拓扑间共享，
+每次选择 profile 同时安装对应 target envelope；MoE 段不随 context 档位复制。
+约束 mask 在首个 target GPU 段提交后准备。Graph 实例与 bridge/masks
+均由 Program 持有，Graph allowance 先于 expert cache 从预算中扣除；销毁时先结束设备
+工作并释放 Graph，再释放其引用的事件和存储。Prefill、Replay 延续 eager 提交，MoE
+计算策略仍只依据实际 T。
 
 测试与实测入口分别见 [Tests](../../tests/README.md) 和 [Benchmarks](../../bench/README.md)。

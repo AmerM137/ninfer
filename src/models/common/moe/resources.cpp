@@ -64,14 +64,10 @@ void Partition::update(std::span<const ExpertKey> ready, CudaExecutionView execu
 }
 
 PartitionView Partition::view() const {
-    PartitionView result{bank_, experts_, kind_, {}, {}};
-    if (kind_ == ops::ExpertSubsetKind::MaskOnes) {
-        result.host_mask =
-            Tensor(const_cast<void*>(mask_.data()), Device::cpu(), DType::I32, {experts_});
-        result.device_mask = Tensor(const_cast<void*>(device_mask_.data()), device_mask_.device(),
-                                    DType::I32, {experts_});
-    }
-    return result;
+    return {bank_, experts_, kind_,
+            Tensor(const_cast<void*>(device_mask_.data()), device_mask_.device(), DType::I32,
+                   {experts_}),
+            Tensor(const_cast<void*>(mask_.data()), Device::cpu(), DType::I32, {experts_})};
 }
 
 struct Bridge::Host {
@@ -169,6 +165,7 @@ struct Resources::Impl {
     std::size_t active_step     = SIZE_MAX;
     bool cache_settled          = true;
     bool streaming              = false;
+    bool preparing              = false;
     bool keep_cpu_active        = false;
 
     Impl(std::shared_ptr<const Plan> plan, std::span<const Parameters* const> parameters,
@@ -311,12 +308,14 @@ Resources::~Resources() = default;
 std::optional<CpuExecutionView::ActiveScope> Resources::begin(std::int32_t tokens) {
     auto& state       = *impl_;
     const auto thread = std::this_thread::get_id();
-    if (!state.caller) {
-        if (!state.plan->caller_cpus.empty())
-            bind_current_thread(state.topology, state.plan->caller_cpus);
-        state.caller = thread;
-    } else if (*state.caller != thread) {
-        throw std::logic_error("MoE schedule has more than one control thread");
+    if (!state.preparing) {
+        if (!state.caller) {
+            if (!state.plan->caller_cpus.empty())
+                bind_current_thread(state.topology, state.plan->caller_cpus);
+            state.caller = thread;
+        } else if (*state.caller != thread) {
+            throw std::logic_error("MoE schedule has more than one control thread");
+        }
     }
     if (tokens <= 0) throw std::invalid_argument("MoE traversal requires positive token count");
     // Keep a frequent CPU contributor awake across GPU layers. Sparse CPU use should not
@@ -362,15 +361,39 @@ void Resources::before_layer(ExpertBankId bank) {
     impl_->progress_cache();
 }
 
-void Resources::execute(ExpertBankId bank, const Tensor& hidden, Tensor& output,
-                        MemoryArena& workspace, const ops::MoeExecutionHints& hints) {
-    auto& state          = *impl_;
-    const auto index     = state.plan->layer_index(bank);
-    const auto& p        = *state.parameters.at(index);
-    const auto& selected = state.plan->layers.at(index);
-    auto& layer          = state.layers.at(index);
-    if (hidden.ne[1] != state.tokens) throw std::logic_error("MoE traversal token count changed");
-    if (selected.requires_full_bank(state.tokens)) {
+Resources::Preparation::Preparation(Resources& owner) : owner_(owner) {
+    if (owner_.impl_->preparing || owner_.impl_->caller)
+        throw std::logic_error("MoE preparation must precede runtime execution");
+    owner_.impl_->preparing = true;
+}
+
+Resources::Preparation::~Preparation() {
+    auto& state           = *owner_.impl_;
+    state.preparing       = false;
+    state.keep_cpu_active = false;
+    state.observed_layers = state.cpu_layers = 0;
+}
+
+bool Resources::settled() const noexcept { return impl_->cache_settled; }
+
+PreparedExecution Resources::describe_layer(ExpertBankId bank, std::int32_t tokens,
+                                            ops::ExpertSubsetKind kind) {
+    auto& state        = *impl_;
+    const auto index   = state.plan->layer_index(bank);
+    auto partition     = state.layers[index].partition->view();
+    partition.gpu_kind = kind;
+    return prepare_execution(*state.parameters[index], partition, state.sources[bank.index],
+                             state.cache.view(bank), state.plan->layers[index].spec.epilogue,
+                             tokens, state.bridge.execution_view());
+}
+
+PreparedExecution Resources::prepare_layer(ExpertBankId bank) {
+    auto& state      = *impl_;
+    const auto index = state.plan->layer_index(bank);
+    auto& layer      = state.layers[index];
+    if (state.tokens <= 0) throw std::logic_error("MoE traversal has not started");
+    auto kind = ops::ExpertSubsetKind::All;
+    if (state.plan->layers[index].requires_full_bank(state.tokens)) {
         while (!layer.use) {
             layer.use = state.cache.acquire(layer.keys, state.cuda);
             if (layer.use) break;
@@ -378,29 +401,53 @@ void Resources::execute(ExpertBankId bank, const Tensor& hidden, Tensor& output,
             if (!progress.required_published && progress.submitted_batches) continue;
             state.cache.wait_for_progress();
         }
-        try {
-            moe::execute(hidden, p, state.cache.view(p.bank), selected.spec.epilogue, output,
-                         workspace, state.cuda, hints);
-        } catch (...) {
-            state.release(layer);
-            throw;
-        }
     } else {
         state.snapshot(index);
-        try {
-            state.cpu_layers +=
-                moe::execute(hidden, p, layer.partition->view(), state.sources[p.bank.index],
-                             state.cache.view(p.bank), selected.spec.epilogue, output, workspace,
-                             state.bridge.execution_view(), hints);
-        } catch (...) {
-            state.release(layer);
-            throw;
-        }
+        kind = layer.partition->gpu_kind();
     }
-    ++state.observed_layers;
-    if (!state.cache_settled) state.release(layer);
+    return describe_layer(bank, state.tokens, kind);
+}
+
+void Resources::gpu_submitted(ExpertBankId bank) {
+    auto& state      = *impl_;
+    const auto index = state.plan->layer_index(bank);
+    if (!state.cache_settled) state.release(state.layers[index]);
     state.prepare_step(index + 1);
     state.progress_cache();
+}
+
+void Resources::finish_layer(bool cpu_work) noexcept {
+    ++impl_->observed_layers;
+    impl_->cpu_layers += cpu_work;
+}
+
+void Resources::abort_layer(ExpertBankId bank) {
+    impl_->release(impl_->layers[impl_->plan->layer_index(bank)]);
+    synchronize();
+}
+
+void Resources::restore_cache_after_preparation() {
+    if (!impl_->preparing) throw std::logic_error("MoE cache preparation is not active");
+    const auto activity = begin(1);
+    while (!impl_->cache_settled) {
+        impl_->progress_cache();
+        if (!impl_->cache_settled) impl_->cache.wait_for_progress();
+    }
+    synchronize();
+}
+
+void Resources::execute(ExpertBankId bank, const Tensor& hidden, Tensor& output,
+                        MemoryArena& workspace, const ops::MoeExecutionHints& hints) {
+    if (hidden.ne[1] != impl_->tokens) throw std::logic_error("MoE traversal token count changed");
+    const auto call = prepare_layer(bank);
+    try {
+        enqueue_gpu(hidden, call, output, workspace, GpuSubmission::Eager, hints);
+        gpu_submitted(bank);
+        finish_layer(complete(call, output));
+    } catch (...) {
+        abort_layer(bank);
+        throw;
+    }
 }
 
 void Resources::synchronize() const { impl_->synchronize(); }

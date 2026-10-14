@@ -1,4 +1,5 @@
 #include "models/common/moe/resources.h"
+#include "core/decode_graph.h"
 #include "models/common/moe/plan.h"
 #include "ops/moe/fixture.h"
 
@@ -48,6 +49,7 @@ struct Call {
     GuardedDeviceBuffer output;
     Tensor destination;
     std::vector<double> expected;
+    DecodeGraphExecutable graph;
 
     Call(moe::Fixture& fixture, int tokens, int pattern, Epilogue epilogue = Epilogue::AddResidual)
         : batch(fixture.batch(tokens, pattern)), device(batch), output(batch.residual.size() * 2),
@@ -66,8 +68,8 @@ struct Call {
     }
 };
 
-int qualify(QType down, const DeviceContext& device, const CpuTopology& topology,
-            Epilogue epilogue) {
+int qualify(QType down, const DeviceContext& device, const CpuTopology& topology, Epilogue epilogue,
+            bool graph) {
     moe::Fixture fixture(QType::Q4_G64_FP16, down);
     moe::HostBank native(fixture);
     native.register_upload(device.device());
@@ -112,8 +114,24 @@ int qualify(QType down, const DeviceContext& device, const CpuTopology& topology
             if (!use) throw std::logic_error("GPU assignment was not published");
         }
         try {
-            shared::execute(call.device.x, parameters, partition.view(), sources[0],
-                            cache.view({0}), epilogue, call.destination, workspace, execution);
+            if (graph) {
+                const auto prepared = shared::prepare_execution(
+                    parameters, partition.view(), sources[0], cache.view({0}), epilogue,
+                    call.device.x.ne[1], execution);
+                if (!call.graph.ready()) {
+                    DecodeGraphDefinition definition;
+                    definition.capture(execution.cuda.stream(), [&] {
+                        shared::enqueue_gpu(call.device.x, prepared, call.destination, workspace,
+                                            shared::GpuSubmission::Capture);
+                    });
+                    call.graph.instantiate(definition);
+                }
+                call.graph.launch(execution.cuda.stream());
+                (void)shared::complete(prepared, call.destination);
+            } else {
+                shared::execute(call.device.x, parameters, partition.view(), sources[0],
+                                cache.view({0}), epilogue, call.destination, workspace, execution);
+            }
         } catch (...) {
             if (use) cache.release(*use, execution.cuda);
             throw;
@@ -159,6 +177,13 @@ int qualify(QType down, const DeviceContext& device, const CpuTopology& topology
     require(offsets(cache, {0})[half.front()] != old,
             "explicit placement did not change the indexed address");
     failures += relocated.verify("reloaded cached mixed");
+    if (graph) {
+        auto& replay = *calls[3];
+        replay.output.copy_from_host(replay.batch.residual.data(), replay.output.bytes());
+        run(replay, mixed);
+        resources.synchronize();
+        failures += replay.verify("same Graph after expert relocation");
+    }
 
     Call cpu_only(fixture, 8, 0, epilogue);
     run(cpu_only, none);
@@ -315,7 +340,8 @@ void qualify_allocation() {
 }
 
 int qualify_schedule(const DeviceContext& device, const CpuTopology& topology,
-                     std::uint32_t bank_capacity, bool one_large_layer = false) {
+                     std::uint32_t bank_capacity, bool one_large_layer = false,
+                     bool graph = false) {
     moe::Fixture a(QType::Q4_G64_FP16, QType::Q5_G64_FP16),
         b(QType::Q4_G64_FP16, QType::Q6_G64_FP16);
     moe::HostBank ha(a), hb(b);
@@ -388,8 +414,22 @@ int qualify_schedule(const DeviceContext& device, const CpuTopology& topology,
             const auto cpu_activity = resources.begin(tokens);
             for (std::size_t i = 0; i < calls.size(); ++i) {
                 resources.before_layer(order[i]);
-                resources.execute(order[i], calls[i]->device.x, calls[i]->destination, workspace,
-                                  {});
+                if (graph) {
+                    auto& call          = *calls[i];
+                    const auto prepared = resources.prepare_layer(order[i]);
+                    DecodeGraphDefinition definition;
+                    definition.capture(device.stream(), [&] {
+                        shared::enqueue_gpu(call.device.x, prepared, call.destination, workspace,
+                                            shared::GpuSubmission::Capture);
+                    });
+                    call.graph.instantiate(definition);
+                    call.graph.launch(device.stream());
+                    resources.gpu_submitted(order[i]);
+                    resources.finish_layer(shared::complete(prepared, call.destination));
+                } else {
+                    resources.execute(order[i], calls[i]->device.x, calls[i]->destination,
+                                      workspace, {});
+                }
             }
         }
         resources.synchronize();
@@ -414,13 +454,16 @@ int main() {
         int failures = 0;
         for (const auto down : {QType::Q5_G64_FP16, QType::Q6_G64_FP16}) {
             for (const auto epilogue : {Epilogue::Write, Epilogue::AddResidual})
-                failures += qualify(down, device, topology, epilogue);
+                for (bool graph : {false, true})
+                    failures += qualify(down, device, topology, epilogue, graph);
         }
         failures += qualify_schedule(device, topology, 1);
         failures += qualify_schedule(device, topology, 2);
         failures += qualify_schedule(device, topology, 3);
         failures += qualify_schedule(device, topology, 4);
         failures += qualify_schedule(device, topology, 2, true);
+        failures += qualify_schedule(device, topology, 1, false, true);
+        failures += qualify_schedule(device, topology, 2, false, true);
         std::cout << (failures ? "FAIL" : "OK") << " cached mixed MoE execution\n";
         return failures ? 1 : 0;
     } catch (const std::exception& error) {

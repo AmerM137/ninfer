@@ -1,5 +1,6 @@
 #include "artifact/views.h"
 #include "core/transfer.h"
+#include "core/decode_graph.h"
 #include "models/qwen3_5/load.h"
 #include "models/common/moe/resources.h"
 #include "ninfer/ops/sum_contributions.h"
@@ -31,7 +32,7 @@ struct Options {
     int layer = 0, tokens = 1, gpu_experts = 128, workers = 16, caller_cpu = -1;
     int samples = 240, gap_us = 0;
     std::string distribution = "independent", schedule = "both";
-    std::string gpu_selection = "ordered";
+    std::string gpu_selection = "ordered", execution = "eager";
     bool profile = false, keep_active = false;
 };
 
@@ -60,6 +61,8 @@ Options parse(int argc, char** argv) {
             result.tokens = number(value());
         else if (argument == "--gpu-experts")
             result.gpu_experts = number(value());
+        else if (argument == "--execution")
+            result.execution = value();
         else if (argument == "--gpu-selection")
             result.gpu_selection = value();
         else if (argument == "--workers")
@@ -81,12 +84,13 @@ Options parse(int argc, char** argv) {
         else
             throw std::invalid_argument(
                 "--artifact PATH [--layer N] [--tokens T] [--gpu-experts N] [--workers N] "
-                "[--gpu-selection ordered|shuffled] "
+                "[--gpu-selection ordered|shuffled] [--execution eager|graph] "
                 "[--caller-cpu N] [--samples N] [--gap-us N] "
                 "[--distribution same|independent] [--schedule parallel|serial|both] "
                 "[--keep-active] [--profile]");
     }
-    if (result.artifact.empty() || !result.tokens || !result.workers || !result.samples ||
+    if ((result.execution != "eager" && result.execution != "graph") || result.artifact.empty() ||
+        !result.tokens || !result.workers || !result.samples ||
         (result.gpu_selection != "ordered" && result.gpu_selection != "shuffled") ||
         (result.distribution != "same" && result.distribution != "independent") ||
         (result.schedule != "parallel" && result.schedule != "serial" &&
@@ -361,7 +365,7 @@ void run(const Options& options) {
               << " gu_policy=" << static_cast<int>(p.profile.routed.ffn.gate_up_policy)
               << " down_policy=" << static_cast<int>(p.profile.routed.ffn.down_policy)
               << " tokens=" << options.tokens << " gpu_experts=" << options.gpu_experts
-              << " gpu_selection=" << options.gpu_selection
+              << " execution=" << options.execution << " gpu_selection=" << options.gpu_selection
               << " workers=" << team.worker_cpus.size() << " caller_cpu=" << options.caller_cpu
               << " distribution=" << options.distribution << " samples=" << options.samples
               << " gap_us=" << options.gap_us << " keep_active=" << options.keep_active << '\n';
@@ -391,12 +395,32 @@ void run(const Options& options) {
               << " cpu_work_batches=" << cpu_batches << " corpus_batches=" << inputs.size() << '\n';
     auto use = cache.acquire(partition.gpu_keys(), execution.cuda);
     if (!use) throw std::logic_error("benchmark GPU assignment not published");
+    const auto prepared =
+        shared::prepare_execution(p, partition.view(), layer.source, cache.view({0}),
+                                  ops::MoeEpilogue::AddResidual, options.tokens, execution);
+    std::vector<DecodeGraphExecutable> graphs;
+    if (options.execution == "graph") {
+        graphs.resize(inputs.size());
+        for (std::size_t i = 0; i < inputs.size(); ++i) {
+            Tensor x(inputs[i].span(), DType::BF16, {h, options.tokens});
+            DecodeGraphDefinition definition;
+            definition.capture(execution.cuda.stream(), [&] {
+                shared::enqueue_gpu(x, prepared, residual, work, shared::GpuSubmission::Capture);
+            });
+            graphs[i].instantiate(definition);
+            graphs[i].upload(execution.cuda.stream());
+        }
+        device.synchronize();
+    }
     const auto call = [&](int sample, bool serialized) {
         Tensor x(inputs[sample % inputs.size()].span(), DType::BF16, {h, options.tokens});
         if (serialized)
             serial(x, p, partition.view(), residual, work, execution, frame, layer.source,
                    cache.view({0}));
-        else
+        else if (!graphs.empty()) {
+            graphs[sample % graphs.size()].launch(execution.cuda.stream());
+            (void)shared::complete(prepared, residual);
+        } else
             shared::execute(x, p, partition.view(), layer.source, cache.view({0}),
                             ops::MoeEpilogue::AddResidual, residual, work, execution);
         device.synchronize();
