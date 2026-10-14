@@ -1151,8 +1151,8 @@ computation when interpreting the gap. Logical FLOP/s counts only the requested 
 The complete call uses empty external read-ahead hints; next-projection cache warming and its
 downstream effect are covered by Engine measurements.
 
-`ninfer_moe_nvfp4_bench` measures the H2560/I640/E512/top-10 NVFP4 profile through the same public
-interfaces. `--operation routed|routed-shared|complete|route` selects the semantic scope; outputs
+`ninfer_moe_block_scaled_bench` measures H2560/I640/E512/top-10 through the same public
+interfaces. `--format nvfp4|fp8` selects NVFP4 or block-FP8 weights (default: `nvfp4`). `--operation routed|routed-shared|complete|route` selects the semantic scope; outputs
 are BF16 Write. It uses the graph-body timing and 256 MiB cold-cache eviction described above.
 `--tokens` is a comma-separated list of total columns (`T*B`); `independent`, `same`, and `mixed`
 select uniform distinct top-10 routes, one shared top-10 set, or six shared experts plus four
@@ -1160,10 +1160,10 @@ independently sampled tail experts. All 512 experts have distinct physical backi
 construction makes the complete entry produce the same selected routes as the routed entry.
 
 ```bash
-./build/bench/ninfer_moe_nvfp4_bench --operation routed \
+./build/bench/ninfer_moe_block_scaled_bench --format nvfp4 --operation routed \
   --tokens 1,8,16,32,64,128,256,512,1024,2048,4096 --distribution all --cache both
-./build/bench/ninfer_moe_nvfp4_bench --operation complete \
-  --tokens 1024,2048,4096 --repeat 50 > /tmp/moe-nvfp4.csv
+./build/bench/ninfer_moe_block_scaled_bench --format fp8 --operation complete \
+  --tokens 1024,2048,4096 --repeat 50 > /tmp/moe-fp8.csv
 ```
 
 CSV reports median/P95/min, complete workspace, and useful matrix FLOP/s. For routed/complete

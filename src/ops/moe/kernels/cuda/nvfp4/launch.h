@@ -1,55 +1,16 @@
 #pragma once
 
-#include "ninfer/ops/moe.h"
+#include "ops/moe/kernels/cuda/block_scaled/launch.h"
 
 namespace ninfer::ops::detail::moe_nvfp4 {
+using moe_block_scaled::Plan;
+using moe_block_scaled::Storage;
 
-inline constexpr int kHidden = 2560, kIntermediate = 640, kExperts = 512, kTopK = 10;
-inline constexpr int kScoreRows = (kExperts + 4) / 4 * 4;
-
-struct Plan {
-    int gate_columns = 0, down_columns = 0;
-    bool vector                = false;
-    bool atomic_output         = false;
-    bool single_block_grouping = false;
-
-    int job_columns() const { return gate_columns > down_columns ? gate_columns : down_columns; }
-};
-
-struct Groups {
-    int* counts;
-    int* offsets;
-    int* cursors;
-    int* job_experts;
-    int* job_columns;
-    int* jobs;
-    int* assignments;
-    int* inverse;
-};
-
-struct Storage {
-    std::uint8_t* input_codes    = nullptr;
-    std::uint8_t* input_scales   = nullptr;
-    std::uint8_t* product_codes  = nullptr;
-    std::uint8_t* product_scales = nullptr;
-    float* contributions         = nullptr;
-    float* vector_activation     = nullptr;
-    float* routed_sum            = nullptr;
-    void* shared_activation      = nullptr;
-    Groups groups{};
-};
-
-// The complete entry prepares shared activations and, when allocated, route counts first.
-void launch(const Tensor& x, const CudaSwiGLUExperts& experts, const ExpertRoutes& routes,
-            ExpertSubset subset, const ScaledSwiGLUTerm* shared, MoeEpilogue mode,
-            Tensor& destination, const Plan& plan, const Storage& storage,
-            CudaExecutionView execution, bool shared_prepared = false);
-void launch_shared(const Tensor& x, const ScaledSwiGLUTerm& shared, const ExpertRoutes& routes,
-                   MoeEpilogue mode, Tensor& destination, const Storage& storage,
-                   CudaExecutionView execution, bool prepared = false);
-
-void launch_control_shared(const Tensor& x, const MoeWeights& weights, const ExpertRoutes& routes,
-                           const Tensor& shared, float* scores, const Storage& storage,
-                           CudaExecutionView execution);
-
+void launch_input(const Tensor& x, const CudaSwiGLUExperts& experts, const Storage& storage,
+                  CudaExecutionView execution, bool clear_counts);
+void launch_experts(const Tensor& x, const CudaSwiGLUExperts& experts, const ExpertRoutes& routes,
+                    const Plan& plan, const Storage& storage, CudaExecutionView execution);
+void launch_vector(const Tensor& x, const CudaSwiGLUExperts& experts, const ExpertRoutes& routes,
+                   ExpertSubset subset, bool shared, MoeEpilogue mode, Tensor& destination,
+                   const Storage& storage, CudaExecutionView execution);
 } // namespace ninfer::ops::detail::moe_nvfp4

@@ -1,9 +1,10 @@
 #pragma once
 
 #include "ops/moe/kernels/cuda/nvfp4/mma.cuh"
-#include "ops/moe/kernels/cuda/nvfp4/output.cuh"
+#include "ops/moe/kernels/cuda/block_scaled/output.cuh"
 
 namespace ninfer::ops::detail::moe_nvfp4 {
+using namespace moe_block_scaled;
 
 __device__ __forceinline__ bool includes(ExpertSubsetKind kind, const int* mask, int expert) {
     return kind == ExpertSubsetKind::All || mask[expert] == (kind == ExpertSubsetKind::MaskOnes);

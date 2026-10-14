@@ -5,7 +5,6 @@
 
 #include <numeric>
 #include <random>
-#include <set>
 #include <sstream>
 #include <string>
 
@@ -16,6 +15,7 @@ constexpr int H = 2560, I = 640, E = 512, TopK = 10;
 
 struct Options {
     std::vector<int> tokens{1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096};
+    std::string format       = "nvfp4";
     std::string distribution = "all", operation = "routed", cache = "both";
     int warmup = 5, repeat = 30;
 };
@@ -26,13 +26,16 @@ Options parse(int argc, char** argv) {
         const std::string key = argv[a];
         if (key == "--help") {
             std::puts(
-                "--tokens M[,M...] --distribution independent|same|mixed|all --operation "
+                "--format nvfp4|fp8 --tokens M[,M...] --distribution independent|same|mixed|all "
+                "--operation "
                 "routed|routed-shared|complete|route --cache cold|warm|both --warmup N --repeat N");
             std::exit(0);
         }
         if (++a == argc) { throw std::invalid_argument("missing option value"); }
         const std::string value = argv[a];
-        if (key == "--tokens") {
+        if (key == "--format") {
+            o.format = value;
+        } else if (key == "--tokens") {
             o.tokens.clear();
             std::stringstream input(value);
             std::string part;
@@ -51,7 +54,7 @@ Options parse(int argc, char** argv) {
             throw std::invalid_argument("unknown option: " + key);
         }
     }
-    if (o.tokens.empty() ||
+    if ((o.format != "nvfp4" && o.format != "fp8") || o.tokens.empty() ||
         std::any_of(o.tokens.begin(), o.tokens.end(), [](int x) { return x <= 0; }) ||
         o.warmup < 0 || o.repeat <= 0 ||
         (o.distribution != "all" && o.distribution != "independent" && o.distribution != "same" &&
@@ -72,30 +75,54 @@ __global__ void fill_scales(std::uint8_t* bytes, std::size_t size) {
     }
 }
 
+__global__ void fill_fp8(std::uint8_t* codes, std::size_t bytes, __nv_bfloat16* scales,
+                         std::size_t groups, unsigned seed) {
+    for (std::size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < bytes;
+         i += gridDim.x * blockDim.x) {
+        unsigned code = bench::fixture::bits(i, seed) & 255;
+        if ((code & 127) == 127) { --code; }
+        codes[i] = code;
+    }
+    for (std::size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < groups;
+         i += gridDim.x * blockDim.x) {
+        scales[i] = __float2bfloat16_rn((1 + (i * 7 + seed) % 13) * .0000083F);
+    }
+}
+
 struct Bank {
     DeviceBuffer codes, scales, divisors;
-    int n, k;
+    bool fp8;
+    std::size_t code_bytes, scale_bytes;
 
-    Bank(int rows, int columns, unsigned seed)
-        : codes(bench::make_buffer(std::size_t(E) * rows * columns / 2)),
-          scales(bench::make_buffer(std::size_t(E) * rows * columns / 16)),
-          divisors(bench::make_buffer(E * 4)), n(rows), k(columns) {
-        CUDA_CHECK(bench::fixture::fill_bytes(codes.data(), codes.size(), seed));
-        fill_scales<<<2048, 256>>>(static_cast<std::uint8_t*>(scales.data()), scales.size());
-        CUDA_CHECK(cudaGetLastError());
-        std::vector<float> dw(E);
-        for (int e = 0; e < E; ++e) { dw[e] = (rows == 2 * I ? 6.0F : 3.0F) + (e % 8) * .5F; }
-        divisors.copy_from_host(dw.data(), divisors.size());
+    Bank(int rows, int columns, unsigned seed, bool is_fp8)
+        : codes(bench::make_buffer(std::size_t(E) * rows * columns / (is_fp8 ? 1 : 2))),
+          scales(bench::make_buffer(
+              std::size_t(E) * (is_fp8 ? rows / 128 * (columns / 128) * 2 : rows * columns / 16))),
+          divisors(bench::make_buffer(is_fp8 ? 0 : E * 4)), fp8(is_fp8),
+          code_bytes(codes.size() / E), scale_bytes(scales.size() / E) {
+        if (fp8) {
+            fill_fp8<<<2048, 256>>>(static_cast<std::uint8_t*>(codes.data()), codes.size(),
+                                    static_cast<__nv_bfloat16*>(scales.data()), scales.size() / 2,
+                                    seed);
+            CUDA_CHECK(cudaGetLastError());
+        } else {
+            CUDA_CHECK(bench::fixture::fill_bytes(codes.data(), codes.size(), seed));
+            fill_scales<<<2048, 256>>>(static_cast<std::uint8_t*>(scales.data()), scales.size());
+            CUDA_CHECK(cudaGetLastError());
+            std::vector<float> dw(E);
+            for (int e = 0; e < E; ++e) { dw[e] = (rows == 2 * I ? 6.0F : 3.0F) + (e % 8) * .5F; }
+            divisors.copy_from_host(dw.data(), divisors.size());
+        }
     }
 
     ExpertMatrixDeviceView view() const {
         ExpertMatrixDeviceView v;
         v.codes          = static_cast<const std::byte*>(codes.data());
         v.scales         = static_cast<const std::byte*>(scales.data());
-        v.code_stride    = std::size_t(n) * k / 2;
-        v.scale_stride   = std::size_t(n) * k / 16;
+        v.code_stride    = code_bytes;
+        v.scale_stride   = scale_bytes;
         v.divisors       = static_cast<const float*>(divisors.data());
-        v.divisor_stride = 1;
+        v.divisor_stride = fp8 ? 0 : 1;
         return v;
     }
 };
@@ -114,7 +141,8 @@ Weight dense(const DeviceBuffer& b, int n, int k) {
 }
 
 struct Fixture {
-    Bank gu{2 * I, H, 811}, down{H, I, 919};
+    Bank gu, down;
+    const bool fp8;
     DeviceBuffer control     = bench::make_buffer(std::size_t(E + 1) * H * 2);
     DeviceBuffer shared_gu   = bench::make_bf16(2 * I * H, 991, -.012F, .012F);
     DeviceBuffer shared_down = bench::make_bf16(H * I, 1011, -.025F, .025F);
@@ -122,19 +150,23 @@ struct Fixture {
     ops::MoeWeights weights;
     ops::MoeProfile profile;
 
-    Fixture() {
+    explicit Fixture(bool is_fp8)
+        : gu(2 * I, H, 811, is_fp8), down(H, I, 919, is_fp8), fp8(is_fp8) {
         std::vector<std::uint16_t> router(std::size_t(E + 1) * H);
         for (int e = 0; e <= E; ++e) { router[std::size_t(e) * H + e] = bench::f32_to_bf16(2); }
         control.copy_from_host(router.data(), control.size());
-        weights = {dense(control, E + 1, H),
-                   {{gu.view(), down.view(), E, control.device()}, {719.7991333F, 313.927002F}},
-                   {{dense(shared_gu, 2 * I, H)}, {dense(shared_down, H, I)}}};
-        profile = {{{H, I, QType::NVFP4, QType::NVFP4, QuantLayout::BlockScaleK16M128x4,
-                     QuantLayout::BlockScaleK16M128x4, ops::LinearPolicy::AllowA4,
-                     ops::LinearPolicy::AllowA4},
-                    E,
-                    TopK},
-                   ops::swiglu_profile(weights.shared)};
+        const auto activation_divisors =
+            fp8 ? ops::ExpertActivationDivisors{}
+                : ops::ExpertActivationDivisors{719.7991333F, 313.927002F};
+        weights         = {dense(control, E + 1, H),
+                           {{gu.view(), down.view(), E, control.device()}, activation_divisors},
+                           {{dense(shared_gu, 2 * I, H)}, {dense(shared_down, H, I)}}};
+        const auto type = fp8 ? QType::FP8_E4M3FN_BLOCK128X128_BF16 : QType::NVFP4;
+        const auto layout =
+            fp8 ? QuantLayout::BlockScaleM128K128 : QuantLayout::BlockScaleK16M128x4;
+        const auto policy = fp8 ? ops::LinearPolicy::AllowA8 : ops::LinearPolicy::AllowA4;
+        profile           = {{{H, I, type, type, layout, layout, policy, policy}, E, TopK},
+                             ops::swiglu_profile(weights.shared)};
         CUDA_CHECK(cudaDeviceSynchronize());
     }
 };
@@ -228,12 +260,13 @@ struct Workload {
 int main(int argc, char** argv) {
     try {
         const auto options = parse(argc, argv);
-        Fixture fixture;
+        Fixture fixture(options.format == "fp8");
         cudaStream_t stream;
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
         const auto execution = bench::device_context().execution_view(stream);
-        std::puts("operation,distribution,M,unique,cache,median_us,p95_us,min_us,workspace_MiB,"
-                  "useful_TFLOPs,unique_weight_GBps");
+        std::puts(
+            "format,operation,distribution,M,unique,cache,median_us,p95_us,min_us,workspace_MiB,"
+            "useful_TFLOPs,unique_weight_GBps");
         for (const std::string distribution : {"independent", "same", "mixed"}) {
             if (options.distribution != "all" && options.distribution != distribution) { continue; }
             for (int m : options.tokens) {
@@ -258,12 +291,17 @@ int main(int argc, char** argv) {
                         flops += 6.0 * H * I * m;
                     }
                     if (options.operation == "complete") { flops += 2.0 * H * (E + 1) * m; }
-                    const double bytes = options.operation == "route"
-                                             ? 2.0 * H * (E + 1)
-                                             : double(state.unique) * (3.0 * H * I * 9 / 16 + 8);
-                    std::printf("%s,%s,%d,%d,%s,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
-                                options.operation.c_str(), distribution.c_str(), m, state.unique,
-                                cache.c_str(), stats.median_us, stats.p95_us, stats.min_us,
+                    const double bytes =
+                        options.operation == "route"
+                            ? 2.0 * H * (E + 1)
+                            : double(state.unique) *
+                                  (fixture.gu.code_bytes + fixture.gu.scale_bytes +
+                                   fixture.down.code_bytes + fixture.down.scale_bytes +
+                                   (fixture.fp8 ? 0 : 8));
+                    std::printf("%s,%s,%s,%d,%d,%s,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
+                                options.format.c_str(), options.operation.c_str(),
+                                distribution.c_str(), m, state.unique, cache.c_str(),
+                                stats.median_us, stats.p95_us, stats.min_us,
                                 state.workspace_bytes / 1048576.0, flops / stats.median_us / 1e6,
                                 bytes / stats.median_us / 1e3);
                     std::fflush(stdout);

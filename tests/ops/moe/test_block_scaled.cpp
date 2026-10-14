@@ -7,21 +7,24 @@
 #include <numeric>
 #include <tuple>
 
-namespace ninfer::test::moe_nvfp4 {
+namespace ninfer::test::moe_block_scaled {
 namespace {
 constexpr int H = 2560, I = 640, E = 512, TopK = 10;
 // Two activation quantizations with a nonlinear product between them. The FP64 oracle
 // retains the original BF16 input and decoded weights; no private quantization is imitated.
 constexpr ReductionCriterion kA4{0.25, 1e-7, 0.35};
+constexpr ReductionCriterion kA8{0.08, 1e-7, 0.12};
 constexpr ReductionCriterion kA16{0.012, 1e-6, 0.008};
 // Same BF16/FP32 routing budget as the integer MoE suite; probabilities have unit scale.
 constexpr ReductionCriterion kRoute{3e-5, 5e-6, 0};
-const ops::MoeProfile profile{
-    {{H, I, QType::NVFP4, QType::NVFP4, QuantLayout::BlockScaleK16M128x4,
-      QuantLayout::BlockScaleK16M128x4, ops::LinearPolicy::AllowA4, ops::LinearPolicy::AllowA4},
-     E,
-     TopK},
-    {H, I, QType::BF16, QType::BF16, QuantLayout::Contiguous, QuantLayout::Contiguous}};
+
+ops::MoeProfile make_profile(bool fp8) {
+    const auto type   = fp8 ? QType::FP8_E4M3FN_BLOCK128X128_BF16 : QType::NVFP4;
+    const auto layout = fp8 ? QuantLayout::BlockScaleM128K128 : QuantLayout::BlockScaleK16M128x4;
+    const auto policy = fp8 ? ops::LinearPolicy::AllowA8 : ops::LinearPolicy::AllowA4;
+    return {{{H, I, type, type, layout, layout, policy, policy}, E, TopK},
+            {H, I, QType::BF16, QType::BF16, QuantLayout::Contiguous, QuantLayout::Contiguous}};
+}
 
 Weight dense(const DeviceBuffer& buffer, int rows, int columns) {
     Weight w;
@@ -38,30 +41,71 @@ Weight dense(const DeviceBuffer& buffer, int rows, int columns) {
 
 struct Matrix {
     int n, k;
+    bool fp8;
+    std::size_t code_bytes, scale_bytes;
     std::vector<std::vector<std::uint8_t>> payload;
     std::vector<std::vector<float>> decoded;
     DeviceBuffer data, offsets, divisors;
     std::vector<float> dw;
     std::size_t stride, scale_offset;
 
-    Matrix(int rows, int columns, unsigned seed)
-        : n(rows), k(columns), offsets(cuda_environment().context.device(), E * 8),
-          divisors(cuda_environment().context.device(), E * 4) {
+    Matrix(int rows, int columns, unsigned seed, bool is_fp8)
+        : n(rows), k(columns), fp8(is_fp8), offsets(cuda_environment().context.device(), E * 8),
+          divisors(cuda_environment().context.device(), is_fp8 ? 0 : E * 4) {
         for (int slot = 0; slot < 2; ++slot) {
-            auto p = quantized_weight::make_patterned_weight(
-                QType::NVFP4, n, k, seed + slot,
-                {.weight_scale_divisor = 1, .input_scale_divisor = 1});
-            for (std::size_t b = 0; b < p.code_plane_bytes; ++b) {
-                p.payload[b] = quantized_weight::detail::mix64(b + seed + slot * 998123ULL) & 255;
-            }
-            scale_offset = p.scale_plane_offset;
+            std::vector<std::uint8_t> bytes;
             std::vector<float> values(std::size_t(n) * k);
-            for (int r = 0; r < n; ++r) {
-                for (int c = 0; c < k; ++c) {
-                    values[std::size_t(r) * k + c] = quantized_weight::logical_weight_fp64(p, r, c);
+            if (fp8) {
+                code_bytes   = std::size_t(n) * k;
+                scale_bytes  = std::size_t(n / 128) * (k / 128) * 2;
+                scale_offset = code_bytes;
+                bytes.resize(code_bytes + scale_bytes);
+                for (std::size_t b = 0; b < code_bytes; ++b) {
+                    unsigned code =
+                        quantized_weight::detail::mix64(b + seed + slot * 998123ULL) & 255;
+                    if ((code & 127) == 127) { --code; }
+                    bytes[b] = code;
                 }
+                for (int nr = 0; nr < n / 128; ++nr) {
+                    for (int kc = 0; kc < k / 128; ++kc) {
+                        const int index = nr * (k / 128) + kc;
+                        const float scale =
+                            (n == 2 * I && nr == 0)
+                                ? 0
+                                : (1 + (nr * 3 + kc * 7 + seed + slot) % 13) * 0.0000083F;
+                        quantized_weight::detail::store_u16_le(bytes, scale_offset + index * 2,
+                                                               f32_to_bf16(scale));
+                    }
+                }
+                for (int r = 0; r < n; ++r) {
+                    for (int c = 0; c < k; ++c) {
+                        const auto index = std::size_t(r) * k + c;
+                        const auto scale = quantized_weight::detail::load_u16_le(
+                            bytes, scale_offset + ((r / 128) * (k / 128) + c / 128) * 2);
+                        values[index] = quantized_weight::detail::decode_e4m3fn(bytes[index]) *
+                                        quantized_weight::detail::bf16_to_f32(scale);
+                    }
+                }
+            } else {
+                auto p = quantized_weight::make_patterned_weight(
+                    QType::NVFP4, n, k, seed + slot,
+                    {.weight_scale_divisor = 1, .input_scale_divisor = 1});
+                for (std::size_t b = 0; b < p.code_plane_bytes; ++b) {
+                    p.payload[b] =
+                        quantized_weight::detail::mix64(b + seed + slot * 998123ULL) & 255;
+                }
+                code_bytes   = p.code_plane_bytes;
+                scale_bytes  = p.scale_plane_bytes;
+                scale_offset = p.scale_plane_offset;
+                for (int r = 0; r < n; ++r) {
+                    for (int c = 0; c < k; ++c) {
+                        values[std::size_t(r) * k + c] =
+                            quantized_weight::logical_weight_fp64(p, r, c);
+                    }
+                }
+                bytes = std::move(p.payload);
             }
-            payload.push_back(std::move(p.payload));
+            payload.push_back(std::move(bytes));
             decoded.push_back(std::move(values));
         }
         stride = (payload[0].size() + 255) / 256 * 256;
@@ -70,8 +114,10 @@ struct Matrix {
             data.copy_from_host(payload[slot].data(), payload[slot].size(), slot * stride);
         }
         dw.resize(E);
-        for (int e = 0; e < E; ++e) { dw[e] = (seed == 101 ? 6.0F : 3.0F) + (e % 8) * 0.5F; }
-        divisors.copy_from_host(dw.data(), divisors.size());
+        for (int e = 0; e < E; ++e) {
+            dw[e] = fp8 ? 1.0F : (seed == 101 ? 6.0F : 3.0F) + (e % 8) * 0.5F;
+        }
+        if (!fp8) { divisors.copy_from_host(dw.data(), divisors.size()); }
         publish({}, ops::ExpertSubsetKind::All, false);
     }
 
@@ -94,7 +140,7 @@ struct Matrix {
         result.offsets         = static_cast<const std::uint64_t*>(offsets.data());
         result.indexed_storage = data.span();
         result.divisors        = static_cast<const float*>(divisors.data());
-        result.divisor_stride  = 1;
+        result.divisor_stride  = fp8 ? 0 : 1;
         return result;
     }
 };
@@ -126,7 +172,9 @@ std::vector<double> ffn(std::span<const float> x, const std::vector<float>& gu,
 }
 
 struct Fixture {
-    Matrix gu{2 * I, H, 101}, down{H, I, 211};
+    const bool fp8;
+    const ops::MoeProfile profile;
+    Matrix gu, down;
     std::vector<std::vector<float>> x;
     std::vector<float> control, shared_gu, shared_down;
     DeviceBuffer control_d, shared_gu_d, shared_down_d;
@@ -135,8 +183,9 @@ struct Fixture {
     std::vector<std::vector<double>> shared_values;
     std::array<std::vector<double>, 3> logits;
 
-    Fixture()
-        : control(random_values(std::size_t(E + 1) * H, 303, .0004F)),
+    explicit Fixture(bool is_fp8)
+        : fp8(is_fp8), profile(make_profile(is_fp8)), gu(2 * I, H, 101, is_fp8),
+          down(H, I, 211, is_fp8), control(random_values(std::size_t(E + 1) * H, 303, .0004F)),
           shared_gu(random_values(std::size_t(2 * I) * H, 404, .012F)),
           shared_down(random_values(std::size_t(H) * I, 505, .025F)) {
         for (int p = 0; p < 3; ++p) {
@@ -149,7 +198,7 @@ struct Fixture {
                 }
                 round_to_bf16(x.back());
             }
-            for (int k = 0; k < 32; ++k) { x.back()[k] = 0; }
+            for (int k = 0; k < (fp8 ? 128 : 32); ++k) { x.back()[k] = 0; }
             // Deliberate zero groups and a last-K coordinate expose stage/scale-tail errors.
             x.back()[H - 1] = p == 2 ? 3.5F : .875F;
             shared_values.push_back(ffn(x.back(), shared_gu, shared_down, 1, 1));
@@ -172,7 +221,9 @@ struct Fixture {
         shared_gu_d   = to_device_bf16(shared_gu);
         shared_down_d = to_device_bf16(shared_down);
         weights       = {dense(control_d, E + 1, H),
-                         {{gu.view(), down.view(), E, control_d.device()}, {719.7991333F, 313.927002F}},
+                         {{gu.view(), down.view(), E, control_d.device()},
+                    fp8 ? ops::ExpertActivationDivisors{}
+                              : ops::ExpertActivationDivisors{719.7991333F, 313.927002F}},
                          {{dense(shared_gu_d, 2 * I, H)}, {dense(shared_down_d, H, I)}}};
     }
 
@@ -194,6 +245,7 @@ struct Fixture {
 
 int run(Fixture& f, CudaExecutionView execution, int tokens, ops::ExpertSubsetKind kind,
         bool shared, bool complete, DType dtype, ops::MoeEpilogue mode, bool graph) {
+    const auto& profile = f.profile;
     std::vector<float> x(std::size_t(tokens) * H), residual = random_values(x.size(), 906, .002F);
     std::vector<int> ids(tokens * TopK), mask(E);
     std::vector<float> alpha(ids.size()), beta(tokens);
@@ -320,11 +372,14 @@ int run(Fixture& f, CudaExecutionView execution, int tokens, ops::ExpertSubsetKi
             actual.assign(values.begin(), values.end());
         }
         const std::string label =
-            std::string(complete ? "complete" : "routed") + " nvfp4 M=" + std::to_string(tokens) +
-            " subset=" + std::to_string(int(kind)) + " shared=" + std::to_string(shared) +
-            " replay=" + std::to_string(replay);
-        failures += verify_reduction(
-            label, actual, ref, kind == ops::ExpertSubsetKind::None || tokens == 1 ? kA16 : kA4);
+            std::string(complete ? "complete" : "routed") + (f.fp8 ? " fp8 M=" : " nvfp4 M=") +
+            std::to_string(tokens) + " subset=" + std::to_string(int(kind)) +
+            " shared=" + std::to_string(shared) + " replay=" + std::to_string(replay);
+        failures += verify_reduction(label, actual, ref,
+                                     kind == ops::ExpertSubsetKind::None ||
+                                             (tokens == 1 || (f.fp8 && tokens == 2))
+                                         ? kA16
+                                         : (f.fp8 ? kA8 : kA4));
         failures +=
             scratch.verify_guards(label + " scratch") + result.verify_guards(label + " output");
         if (arena.used() || arena.peak_used() != bytes) {
@@ -423,12 +478,12 @@ int route_cases(Fixture& f, CudaExecutionView execution) {
 }
 
 int affine_cases(Fixture& f, CudaExecutionView execution) {
-    auto gu_codes    = DeviceBuffer(execution.device(), std::size_t(E) * 2 * I * H / 2);
-    auto gu_scales   = DeviceBuffer(execution.device(), std::size_t(E) * 2 * I * H / 16);
-    auto down_codes  = DeviceBuffer(execution.device(), std::size_t(E) * H * I / 2);
-    auto down_scales = DeviceBuffer(execution.device(), std::size_t(E) * H * I / 16);
+    auto gu_codes    = DeviceBuffer(execution.device(), E * f.gu.code_bytes);
+    auto gu_scales   = DeviceBuffer(execution.device(), E * f.gu.scale_bytes);
+    auto down_codes  = DeviceBuffer(execution.device(), E * f.down.code_bytes);
+    auto down_scales = DeviceBuffer(execution.device(), E * f.down.scale_bytes);
     const auto copy  = [&](Matrix& from, DeviceBuffer& codes, DeviceBuffer& scales) {
-        const auto cb = std::size_t(from.n) * from.k / 2, sb = cb / 8;
+        const auto cb = from.code_bytes, sb = from.scale_bytes;
         for (int e = 0; e < E; ++e) {
             const auto* source =
                 static_cast<const std::byte*>(from.data.data()) + (e & 1) * from.stride;
@@ -463,49 +518,66 @@ int affine_cases(Fixture& f, CudaExecutionView execution) {
 }
 
 } // namespace
-} // namespace ninfer::test::moe_nvfp4
+} // namespace ninfer::test::moe_block_scaled
 
-int main() {
+int main(int argc, char** argv) {
     using namespace ninfer;
     using namespace ninfer::test;
-    using namespace ninfer::test::moe_nvfp4;
+    using namespace ninfer::test::moe_block_scaled;
+    if (argc > 2 ||
+        (argc == 2 && std::string(argv[1]) != "fp8" && std::string(argv[1]) != "nvfp4")) {
+        std::cerr << "usage: ninfer_moe_block_scaled_test [nvfp4|fp8]\n";
+        return 1;
+    }
     if (cuda_unavailable()) { return 77; }
     try {
         cudaStream_t stream;
         cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "stream");
         const auto execution = cuda_environment().context.execution_view(stream);
-        Fixture fixture;
-        int failures = route_cases(fixture, execution) + affine_cases(fixture, execution);
-        using ops::ExpertSubsetKind;
-        using ops::MoeEpilogue;
-        for (int m : {1,  2,  3,   7,   8,   9,   15,  16,   17,   18,   32,   63,  64,
-                      65, 66, 127, 128, 129, 130, 513, 1024, 3583, 3584, 3585, 4097}) {
-            failures += run(fixture, execution, m, ExpertSubsetKind::All, false, false, DType::FP32,
-                            MoeEpilogue::Write, false);
-        }
-        for (auto subset :
-             {ExpertSubsetKind::None, ExpertSubsetKind::MaskOnes, ExpertSubsetKind::MaskZeros}) {
-            failures += run(fixture, execution, 17, subset, true, false, DType::BF16,
-                            MoeEpilogue::AddResidual, true);
-        }
-        for (auto subset : {ExpertSubsetKind::MaskOnes, ExpertSubsetKind::MaskZeros}) {
-            failures += run(fixture, execution, 129, subset, false, false, DType::FP32,
+        int failures         = 0;
+        for (bool fp8 : {false, true}) {
+            if (argc == 2 && std::string(argv[1]) != (fp8 ? "fp8" : "nvfp4")) { continue; }
+            Fixture fixture(fp8);
+            failures += affine_cases(fixture, execution);
+            if (!fp8) { failures += route_cases(fixture, execution); }
+            using ops::ExpertSubsetKind;
+            using ops::MoeEpilogue;
+            for (int m : {1,   2,   3,   7,   8,   9,    15,   16,   17,   18,  31,  32,
+                          33,  34,  63,  64,  65,  66,   127,  128,  129,  130, 255, 256,
+                          257, 258, 511, 512, 513, 1024, 3583, 3584, 3585, 4097}) {
+                failures += run(fixture, execution, m, ExpertSubsetKind::All, false, false,
+                                DType::FP32, MoeEpilogue::Write, false);
+            }
+            for (auto subset : {ExpertSubsetKind::None, ExpertSubsetKind::MaskOnes,
+                                ExpertSubsetKind::MaskZeros}) {
+                failures += run(fixture, execution, 17, subset, true, false, DType::BF16,
+                                MoeEpilogue::AddResidual, true);
+            }
+            for (auto subset : {ExpertSubsetKind::MaskOnes, ExpertSubsetKind::MaskZeros}) {
+                failures += run(fixture, execution, 129, subset, false, false, DType::FP32,
+                                MoeEpilogue::Write, true);
+                failures += run(fixture, execution, 1, subset, true, false, DType::BF16,
+                                MoeEpilogue::AddResidual, true);
+            }
+            failures += run(fixture, execution, 1, ExpertSubsetKind::None, true, false, DType::FP32,
                             MoeEpilogue::Write, true);
-            failures += run(fixture, execution, 1, subset, true, false, DType::BF16,
-                            MoeEpilogue::AddResidual, true);
-        }
-        failures += run(fixture, execution, 1, ExpertSubsetKind::None, true, false, DType::FP32,
-                        MoeEpilogue::Write, true);
-        for (int m : {1, 65}) {
-            failures += run(fixture, execution, m, ExpertSubsetKind::None, false, false,
-                            DType::FP32, MoeEpilogue::Write, true);
-        }
-        for (int m : {1, 2, 7, 8, 9, 65, 1024, 4096}) {
-            failures += run(fixture, execution, m, ExpertSubsetKind::All, true, true, DType::BF16,
-                            MoeEpilogue::Write, true);
+            for (int m : {1, 65}) {
+                failures += run(fixture, execution, m, ExpertSubsetKind::None, false, false,
+                                DType::FP32, MoeEpilogue::Write, true);
+            }
+            failures += run(fixture, execution, 2048, ExpertSubsetKind::None, true, false,
+                            DType::FP32, MoeEpilogue::Write, false);
+            if (fp8) {
+                failures += run(fixture, execution, 2, ExpertSubsetKind::MaskZeros, true, false,
+                                DType::BF16, MoeEpilogue::AddResidual, true);
+            }
+            for (int m : {1, 2, 7, 8, 9, 65, 1024, 2047, 2048, 4096}) {
+                failures += run(fixture, execution, m, ExpertSubsetKind::All, true, true,
+                                DType::BF16, MoeEpilogue::Write, true);
+            }
         }
         cuda_check(cudaStreamDestroy(stream), "destroy stream");
-        std::cout << (failures ? "FAIL" : "OK") << " NVFP4 MoE contracts\n";
+        std::cout << (failures ? "FAIL" : "OK") << " block-scaled MoE contracts\n";
         return failures ? 1 : 0;
     } catch (const std::exception& e) {
         std::cerr << e.what() << '\n';

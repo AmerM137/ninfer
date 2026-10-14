@@ -3,7 +3,7 @@
 #include "ops/moe/operands.h"
 #include "ops/moe/routed_swiglu/cuda/dispatch.h"
 #include "ops/moe/workspace.h"
-#include "ops/moe/kernels/cuda/nvfp4/workspace.h"
+#include "ops/moe/kernels/cuda/block_scaled/workspace.h"
 
 namespace ninfer::ops {
 namespace {
@@ -11,17 +11,17 @@ namespace impl = detail::moe_routed;
 
 struct CallStorage {
     detail::ExpertStorage integer;
-    detail::moe_nvfp4::Storage nvfp4;
+    detail::moe_block_scaled::Storage block_scaled;
 };
 
 template <class Arena>
 CallStorage allocate(Arena& arena, const impl::ShapePolicy& shape, int tokens,
                      ExpertSubsetKind subset, bool shared, bool split_activation) {
     const auto plan = shape.select(tokens, shared);
-    if (plan.nvfp4.gate_columns) {
+    if (plan.block_scaled.gate_columns) {
         CallStorage out;
-        out.nvfp4 = detail::moe_nvfp4::allocate(arena, plan.nvfp4, tokens,
-                                                subset != ExpertSubsetKind::None, shared);
+        out.block_scaled = detail::moe_block_scaled::allocate(
+            arena, plan.block_scaled, tokens, subset != ExpertSubsetKind::None, shared);
         return out;
     }
     if (subset == ExpertSubsetKind::None) {
@@ -95,9 +95,10 @@ void execute(const Tensor& x, const RoutedSwiGLUProfile& profile, const CudaSwiG
         const auto buffers = allocate(workspace, shape, count, subset.kind, shared != nullptr,
                                       profile.ffn.gate_up_type == QType::Q8_G32_FP16);
         const auto plan    = shape.select(count, shared != nullptr);
-        if (plan.nvfp4.gate_columns) {
-            detail::moe_nvfp4::launch(input, experts, selection, subset, term ? &*term : nullptr,
-                                      mode, output, plan.nvfp4, buffers.nvfp4, execution);
+        if (plan.block_scaled.gate_columns) {
+            detail::moe_block_scaled::launch(input, experts, selection, subset,
+                                             term ? &*term : nullptr, mode, output,
+                                             plan.block_scaled, buffers.block_scaled, execution);
             continue;
         }
         const auto& storage = buffers.integer;

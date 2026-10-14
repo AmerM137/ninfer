@@ -1,9 +1,9 @@
-#include "ops/moe/kernels/cuda/nvfp4/output.cuh"
+#include "ops/moe/kernels/cuda/block_scaled/output.cuh"
 #include "ops/common/cuda/mma.cuh"
 #include "ops/common/cuda/pipeline.cuh"
 #include "ops/moe/kernels/cuda/topk.cuh"
 
-namespace ninfer::ops::detail::moe_nvfp4 {
+namespace ninfer::ops::detail::moe_block_scaled {
 namespace {
 using namespace common;
 
@@ -283,4 +283,4 @@ void launch_control_shared(const Tensor& x, const MoeWeights& weights, const Exp
     }
     CUDA_CHECK(cudaGetLastError());
 }
-} // namespace ninfer::ops::detail::moe_nvfp4
+} // namespace ninfer::ops::detail::moe_block_scaled

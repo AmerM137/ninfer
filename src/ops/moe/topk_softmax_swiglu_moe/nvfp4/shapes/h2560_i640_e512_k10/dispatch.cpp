@@ -6,8 +6,12 @@ Plan select(int tokens) {
     Plan plan;
     plan.router.algorithm = tokens == 1 ? RouterAlgorithm::Vector : RouterAlgorithm::Mma;
     const int columns     = tokens <= 16 ? 8 : tokens <= 128 ? 32 : 64;
-    plan.nvfp4            = {tokens >= 3584 ? 128 : columns, columns, tokens == 1, tokens >= 128,
-                  tokens <= 64};
+    plan.block_scaled     = {.format                = QType::NVFP4,
+                             .gate_columns          = tokens >= 3584 ? 128 : columns,
+                             .down_columns          = columns,
+                             .vector                = tokens == 1,
+                             .atomic_output         = tokens >= 128,
+                             .single_block_grouping = tokens <= 64};
     return plan;
 }
 } // namespace

@@ -196,9 +196,11 @@ NINFER_TEST_ARTIFACT=$PWD/out/qwen3_8_27b_nvfp4.ninfer \
 ```
 
 `ninfer_moe_test` qualifies the integer routing, complete MoE and routed SwiGLU profiles.
-`ninfer_moe_nvfp4_test` qualifies NVFP4 experts with BF16 control/shared, including A4 and decode
-A16, independent FP64 formulas, per-expert divisors, affine/indexed banks, masks, changed Graph
-contents, private route boundaries and workspace guards.
+`ninfer_moe_block_scaled_test` qualifies NVFP4 A4 and block-FP8 A8/G128 experts with BF16
+control/shared and small-token A16 routes. It uses independent FP64 formulas and encoded-weight
+decoders, covering per-expert divisors, K128 scales, zero groups, affine/indexed banks, masks,
+changed Graph contents, private route boundaries and workspace guards. Optional `nvfp4` or `fp8`
+arguments select one format; CTest runs both.
 `ninfer_sum_contributions_test` covers FP32 partial summation with optional BF16 residual.
 Their independent FP64 oracles start from represented inputs and decoded logical weights. The MoE
 suite covers the resident codec profiles, FP32/BF16 outputs, residual modes, expert masks, strided/indexed

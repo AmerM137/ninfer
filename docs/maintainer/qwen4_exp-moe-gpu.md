@@ -1,7 +1,7 @@
 # Qwen4Exp MoE GPU 计算设计
 
-本文定义 Qwen3.8-Flash-Next 的 GPU MoE 计算。Main NVFP4、BF16 router/shared 已在
-现有 MoE 入口实现；MTP block-FP8 的 A8 计算仍为后续工作。
+本文定义 Qwen3.8-Flash-Next 的 GPU MoE 计算。Main NVFP4 A4、MTP block-FP8 A8/G128、
+BF16 router/shared 已在现有 MoE 入口实现。Expert streaming 与完整 Program 接入另行推进。
 
 权重、binding 和驻留由[模型与权重](qwen4_exp-model.md)定义；表示值和地址分别沿用
 [数值格式](tensor-formats.md)、[存储布局](storage-layouts.md)。本设计扩展现有
@@ -439,10 +439,14 @@ p_b[n,m] = sum_{k=128*b}^{128*b+127} decode(q_w[n,k]) * decode(q_a[m,k])
 y[n,m]   = sum_b p_b[n,m] * s_w[n/128,b] * s_a[m,b]
 ```
 
-直接使用已有 `common::mma_fp8_e4m3` 的原生 E4M3 MMA。当前 primitive 使用单位硬件
+使用 `common::mma_fp8_e4m3` 的原生 E4M3 MMA。当前 primitive 使用单位硬件
 scale；每个 K128 block 以四个 K32 MMA step 形成 FP32 partial，再在 FP32 中乘真实
 `s_w*s_a` 并累计到最终 accumulator。每块重置 partial，不能先跨 K128 累加 raw dot
 再统一缩放，也不能将任意 BF16/FP32 scale 替换成 UE8M0 scale。
+
+当前内核使用 K128 双缓冲和绕过 L1 的 `cp.async`，每个 n8 fragment 的 partial 在
+当前 K128 内完成并缩放，不保留整张 tile 的第二套 accumulator。GU/down 的列宽由
+各 Op 的 shape policy 独立选择，共享 job 表，较窄的 down 消费其子 tile。
 
 GU 的 K=2560 对应 20 个 blocks，down 的 K=640 对应 5 个 blocks；gate/up 两半的
 weight scales 可以不同，各自恢复后再计算 product。GU epilogue 必须在同一 CTA 内得到
@@ -460,6 +464,7 @@ A16 在主路径可测量后加入小 M sweep，比较完整 route/quantize/GU/d
 它可使用直接 SIMT，或解码后的小 tile BF16 MMA；只保留有明确获益的区间，不开展大 M
 A16 实现和调优，也不将其作为 A4/A8 数学验证的 oracle。
 
+当前 Main 在 M=1、MTP 在 M≤2 使用直接 A16；其余走 A4/A8。
 直接路径从 routes 取 expert，GU 完成 dot、缩放和 SiLU/product；down 按 token/output-row
 tile 合并 K 项贡献，避免 grouped 路径的大型 expert-output scratch。SIMT 可直接消费
 FP32 product。若候选采用 BF16 MMA，product 的私有表示要通过同一数学标准；不预设
@@ -476,12 +481,12 @@ GU → down 首版保留 kernel 边界：down 需要完整 640 维 product，一
 一部分，不能用跨 CTA 自旋模拟完成屏障。为“单 kernel”把整个 expert 放进一个 CTA
 会限制并行度、扩大 shared/register 工作集，只有后续证据支持才增加这种机制。
 
-直接路径的 down 在一个输出 tile 内归约 K 项。Main 小批量 grouped 路径由 down 写
+直接路径的 down 在一个输出 tile 内归约 K 项。Main/MTP 小批量 grouped 路径由 down 写
 FP32 `V[H,R_selected]`，再根据 inverse 和原系数按 token 求和；较大批量在 down epilogue
 乘 route coefficient，直接 atomic-add 到 FP32 `[H,M]`。该 buffer 的清零并入输入量化，
 不需要 inverse map。Shared 在最终 FP32 汇合点加入，最后写 destination。
 
-完整 partial 方案在 M=4096 时需要 **400 MiB**，一次写加一次读为 **800 MiB**；Main
+完整 partial 方案在 M=4096 时需要 **400 MiB**，一次写加一次读为 **800 MiB**；Main/MTP
 已选择的 atomic 出口只需 **40 MiB** accumulator。两种主路径的紧凑激活 payload 如下，
 实际 query 另计对齐、shared、路由、
 编组和已选择的 tile 所需 padding：
@@ -494,7 +499,7 @@ FP32 `V[H,R_selected]`，再根据 inverse 和原系数按 token 求和；较大
 Xq 在全部 GU jobs 后可复用，Hq 在全部 down jobs 后可复用；query 与执行按这些寿命规划。
 一次调用只分配选定 profile 的激活表示，不同时预留 A16、A4、A8 buffers。
 
-出口的选择保持以下取舍；MTP 实现时也按这些成本比较：
+两种格式的出口保留以下取舍：
 
 - FP32 partial + gather 是最初完整实现，归约顺序清楚，容易验证 mask/shared 行为。
 - 若 partial 流量显著限制完整 Op，比较 down 的 coefficient epilogue 直接 atomic-add
@@ -564,9 +569,9 @@ shared/control、launch、解码、量化和 reduction；热 L2 也不适用这�
 新增 `h2560_i640_e512_k10` 的 NVFP4/block-FP8 policies，以及 H2560/E512/K10 router policy。
 完整 Op 与独立 routed Op 共享计算模板，不共享私有阈值。
 
-CUDA kernel 库保留现有整数实现，`nvfp4/` 承担 A4 grouped MMA、小 M A16、紧凑分组、
-BF16 control/shared 融合及其 scratch。NVFP4 scratch 不进入整数 kernel 的描述符。
-MTP 的 block-FP8 数学按实际复用边界扩展，当前不增加空目录或未执行的 backend。
+CUDA kernel 库保留现有整数实现。`block_scaled/` 统一维护紧凑分组、scratch、BF16
+control/shared 与 FP32 输出汇合；`nvfp4/`、`fp8/` 分别维护编码、原生 MMA 和小 M A16。
+两种浮点格式的 scratch 不进入整数 kernel 的描述符，没有新增公开 Op 或模型专用入口。
 
 `operands.cpp` 统一负责格式字节数、divisor、profile 和 shared 的校验；新 profile 显式
 进入自己的 shape policy。独立 routed 与完整入口分别维护调优选择，共用 kernel 模板。
@@ -577,18 +582,18 @@ MTP 的 block-FP8 数学按实际复用边界扩展，当前不增加空目录�
 调用它。Block-FP8 scale addressing 是新计算能力，不能冒充已有 row-FP8。
 新增 FP32-fragment NVFP4 编码与 G128 FP8 编码放在 `ops/common/quant/` 既有格式文件中；
 MMA scale 应用、assignment 寻址和 GU epilogue 属于 MoE kernel 库。
-NVFP4 编译单元按现有 `ninfer_nvfp4_non_rdc` 边界注册。
+两种原生低精度 MMA 的编译单元按现有 `ninfer_nvfp4_non_rdc` 边界注册。
 
 ## 10. 实施顺序
 
 | 步骤 | 交付与重点 |
 |---|---|
-| G1：接口与数值准备 | 固定新 profile 的 policy、bank/divisor 校验和 workspace 规则；准备独立解码/完整数学 oracle 和 BF16 route/shared。MTP recipe/Use 许可已完成；A4/G16 与 A8/G128 数值工具随其首个消费路径完成，不先实现全套 A16。 |
+| G1：接口与数值准备（已实现） | 固定新 profile 的 policy、bank/divisor 校验和 workspace 规则；准备独立解码/完整数学 oracle 和 BF16 route/shared。MTP recipe/Use 许可已完成；A4/G16 与 A8/G128 数值工具随其首个消费路径完成，不先实现全套 A16。 |
 | G2：Main A4 主路径（已实现） | 紧凑 grouping、一次 X 量化、NVFP4 MMA GU + SiLU/product + H 量化、NVFP4 down 和最终归约，贯通三个公开入口、subset 与 Graph。A4 路线功能覆盖全部正 M；先在 M=1024/4096 验证数学和完整 Op 的 roofline。 |
 | G3：Main 各负载优化（已实现） | 保留 decode A16、按 M 选择的窄/宽 A4，以及不同宽度的 GU/down；control/shared、top-k/count 融合和大批量 FP32 atomic 出口已实现。调优覆盖分散、热点、混合分布及 cold/warm，生产分派不读取实际路由。 |
-| G4：MTP A8 主路径 | 在同一接口/maps/shared 基础上实现动态 G128 X、原生 FP8 MMA 的 K128 partial 缩放、128 维 product epilogue 编码及 A8 down。独立资格验证，覆盖小 M、prompt 初始化和 Graph。 |
-| G5：MTP 各负载优化 | 测量 A8 窄/宽 tile、128 维融合 epilogue 的资源成本和完整出口；小 M 比较 A16，按收益保留。共用适合的计算体，独立确定 MTP 阈值，不照搬 Main 的 winner。 |
-| G6：收尾 | 通过公共入口检查实际生产 routes、Graph 新内容 replay、精度、容量和性能曲线；全量编译，整理源码/测试/bench，更新完成状态。 |
+| G4：MTP A8 主路径（已实现） | 在同一接口/maps/shared 基础上实现动态 G128 X、原生 FP8 MMA 的 K128 partial 缩放、128 维 product epilogue 编码及 A8 down。独立资格验证，覆盖小 M、prompt 初始化和 Graph。 |
+| G5：MTP 各负载优化（已实现） | 测量 A8 窄/宽 tile、128 维融合 epilogue 的资源成本和完整出口；小 M 比较 A16，按收益保留。共用适合的计算体，独立确定 MTP 阈值，不照搬 Main 的 winner。 |
+| G6：收尾（已完成） | 通过公共入口检查实际生产 routes、Graph 新内容 replay、精度、容量和性能曲线；全量编译，整理源码/测试/bench，更新完成状态。 |
 
 G1 是必要准备；G2/G4 各自产出可独立调用的低精度主路径，G3/G5 完成其负载优化。
 数学验证通过才比较性能；A16 未获胜就不进入生产 dispatch。各阶段不要求临时 stage

@@ -32,6 +32,6 @@ foreach(isa IN ITEMS avx2 fma)
     ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1" RESOURCE_LOCK cpu_team)
 endforeach()
 
-ninfer_add_op_test(ninfer_moe_nvfp4_test
-  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_nvfp4.cpp"
+ninfer_add_op_test(ninfer_moe_block_scaled_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_block_scaled.cpp"
   LIBRARIES ninfer_ops)

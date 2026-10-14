@@ -30,6 +30,7 @@ struct RoutedSwiGLUProfile {
 
 // NVFP4 A4 calibration divisors for x and the FP32 SiLU(gate)*up product, respectively.
 // Matrix divisors remain independently addressed by logical expert in the bank.
+// Block-FP8 weights and their dynamic activation groups have no tensor divisors.
 struct ExpertActivationDivisors {
     std::optional<float> gate_up, down;
 };

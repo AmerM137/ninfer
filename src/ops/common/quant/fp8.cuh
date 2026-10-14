@@ -12,6 +12,18 @@ namespace ninfer::ops::common {
 
 inline constexpr float kFp8E4M3MaxFinite = 448.0F;
 
+// Dynamic E4M3 activation groups retain their scale in FP32.
+__device__ __forceinline__ float fp8_fp32_scale(float absmax) {
+    return __fdiv_rn(absmax, kFp8E4M3MaxFinite);
+}
+
+__device__ __forceinline__ std::uint16_t fp8_quant_fp32_pair(float2 value, float scale) {
+    if (scale == 0.0F) { return 0; }
+    return __nv_cvt_float2_to_fp8x2(
+        make_float2(__fdiv_rn(value.x, scale), __fdiv_rn(value.y, scale)), __NV_SATFINITE,
+        __NV_E4M3);
+}
+
 __device__ __forceinline__ unsigned fp8_e4m3x2_to_bf16x2_bits(unsigned packed) {
 #if __CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 2)
     // PTX 9.2 exposes the native pair widening on the project's sm_120a target.

@@ -7,6 +7,7 @@
 #include "ops/common/quant/nvfp4.cuh"
 
 namespace ninfer::ops::detail::moe_nvfp4 {
+using namespace moe_block_scaled;
 using namespace common;
 
 template <int Columns, int Stages, bool Gate>
