@@ -122,20 +122,21 @@ M=\left\lceil K_{main}/P\right\rceil
 
 ### 3.3 Automatic capacity
 
-Automatic policy 在权重加载后，以当前可用显存 \(F\) 和要求保留的 headroom \(R\) 解析一次 \(M\)。
+Automatic policy 在权重加载、Graph 校准资源销毁后，以预算内剩余显存 \(F\)、规划余量 \(R\)
+和 Graph 重建估计 \(G\) 解析 \(M\)。驱动保留开销已反映在 \(F\) 中，不再重复扣除。
 模型 planner 根据已绑定参数和选定执行域提供 affine `SequenceCapacityCurve`：
 
 \[
 B(M)=B_{min}+(M-M_{min})B_{step}
 \]
 
-其中 \(B(M)\) 是该 Main capacity 对应的完整 runtime Device reservation，包含：
+其中 \(B(M)\) 是该 Main capacity 对应的显式 runtime Device backing，包含：
 
 - Main 与 selected backend typed pools；
 - active/checkpoint State storage；
 - block tables 与固定 persistent state；
 - unified workspace；
-- CUDA Graph allowance。
+- 启用 offload 时的 MoE backing。
 
 Automatic 选择：
 
@@ -145,14 +146,15 @@ M=
 M_{max},
 M_{min}+
 \left\lfloor
-\frac{F-R-B_{min}}{B_{step}}
+\frac{F-R-G-B_{min}}{B_{step}}
 \right\rfloor
 \right)
 \]
 
-并要求 \(F\ge R+B_{min}\)。当 \(M_{min}=M_{max}\) 时直接取该单点。Target 用同一生产 layout builder
+并要求 \(F\ge R+G+B_{min}\)。当 \(M_{min}=M_{max}\) 时直接取该单点。Target 用同一生产 layout builder
 生成 \(B_{min}\)、\(B_{step}\) 和最终 layout，并验证 capacity curve；resolver 不复制模型维度公式，也不靠
-allocation probing 猜测容量。
+allocation probing 猜测显式布局大小。MoE offload 的自动策略先保留一条完整上下文，再将剩余预算
+用于 expert cache；Graph 变体改变时重新校准，见[引擎架构](engine-architecture.md#7-物理执行与-cuda-graph)。
 
 最终公开的 Main KV capacity 为 \(M\,P\) token-equivalents。Page rounding 只增加 physical padding，
 不会扩大单 sequence 的 logical ceiling \(S\)。

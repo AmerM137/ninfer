@@ -88,7 +88,14 @@ CudaHostRegistration& CudaHostRegistration::operator=(CudaHostRegistration&& oth
 
 DeviceBuffer::DeviceBuffer(Device device, std::size_t bytes) : bytes_(bytes), device_(device) {
     CudaDeviceScope scope(device);
-    if (bytes != 0) { check(cudaMalloc(&data_, bytes), "cudaMalloc"); }
+    if (bytes != 0) {
+        const auto error = cudaMalloc(&data_, bytes);
+        if (error == cudaErrorMemoryAllocation) {
+            (void)cudaGetLastError();
+            throw DeviceAllocationError("cudaMalloc", bytes);
+        }
+        check(error, "cudaMalloc");
+    }
 }
 
 DeviceBuffer::~DeviceBuffer() { release_device(data_, device_); }

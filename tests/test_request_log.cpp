@@ -125,7 +125,8 @@ int main() {
     memory.available_after_weights_bytes     = 1700;
     memory.available_after_startup_bytes     = 180;
     memory.planned_slack_bytes               = 100;
-    memory.cuda_graph_allowance_bytes        = 600;
+    memory.cuda_graph                        = ninfer::GraphMemorySummary{600, -30, 800, 200};
+    memory.startup_retained_bytes            = 1000;
     memory.kv_payload_bytes                  = 400;
     memory.host_context_capacity_bytes       = 64ULL << 20;
     memory.host_context_occupied_bytes       = 12ULL << 20;
@@ -226,8 +227,13 @@ int main() {
                   server.at("memory").at("vision_workspace").at("handoff_capacity_bytes") == 200 &&
                   server.at("memory").at("vision_workspace").at("handoff_peak_bytes") == 150,
               "Vision workspace layout missing");
-    failures += check(server.at("memory").at("cuda_graph_allowance_bytes") == 600,
-                      "CUDA Graph allowance missing");
+    failures += check(server.at("memory").at("cuda_graph_rebuild_estimate_bytes") == 600,
+                      "CUDA Graph rebuild estimate missing");
+    failures += check(server.at("memory").at("cuda_graph_prepare_increment_bytes") == -30 &&
+                          server.at("memory").at("cuda_graph_calibration_increment_bytes") == 800 &&
+                          server.at("memory").at("cuda_graph_calibration_retained_bytes") == 200 &&
+                          server.at("memory").at("startup_retained_bytes") == 1000,
+                      "signed Graph and startup deltas missing");
     failures += check(server.at("memory").at("runtime_reservation_bytes") == 1600 &&
                           server.at("memory").at("available_after_weights_bytes") == 1700 &&
                           server.at("memory").at("available_after_startup_bytes") == 180 &&

@@ -260,6 +260,8 @@ public:
     ProgramImpl(const execution::Parameters&, const SequencePlanImpl&, DeviceContext&,
                 const StartupObserver&);
     ~ProgramImpl() noexcept;
+    void initialize_graphs();
+    void release_graphs();
     [[nodiscard]] RequestBasePlan plan_request(PreparedPromptData&&,
                                                const runtime::ResolvedExecutionOptions&);
     [[nodiscard]] std::vector<float> causal_score(PreparedPromptData&&, std::uint32_t first_target);
@@ -354,7 +356,7 @@ public:
     const bool use_cuda_graph;
     const bool causal_scoring;
     const std::size_t kv_payload_bytes;
-    const std::size_t graph_allowance_bytes;
+    std::optional<GraphMemorySummary> graph_memory;
     const WorkspacePlan workspace_plan;
 
     DeviceBuffer persistent;

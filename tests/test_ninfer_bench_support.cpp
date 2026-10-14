@@ -320,8 +320,9 @@ qb::BenchEnvironment sample_environment() {
         .handoff_active_bytes    = 0,
         .handoff_peak_bytes      = 20000000ULL,
     };
-    env.memory.cuda_graph_allowance_bytes = 150000000ULL;
-    env.memory.kv_payload_bytes           = 123456ULL;
+    env.memory.cuda_graph = ninfer::GraphMemorySummary{150000000ULL, 170000000, 149999900, -100};
+    env.memory.startup_retained_bytes = -200;
+    env.memory.kv_payload_bytes       = 123456ULL;
 
     env.memory.moe = ninfer::MoeMemorySummary{
         .cache_bytes              = 4096,
@@ -365,7 +366,7 @@ int test_report_contract() {
         return fail(std::string("invalid benchmark JSON: ") + error.what());
     }
 
-    failures += expect(report.at("schema_version") == 23, "report schema v23");
+    failures += expect(report.at("schema_version") == 24, "report schema v24");
     const auto& moe = report.at("memory").at("moe");
     failures += expect(moe.at("used_bytes") == 4096 && moe.at("target_bytes") == 4096 &&
                            moe.at("ready_bytes") == 3072 && moe.at("prefetched_bytes") == 1024 &&
@@ -394,8 +395,14 @@ int test_report_contract() {
         report.at("memory").at("vision_workspace").at("general_capacity_bytes") == 75000000ULL &&
             report.at("memory").at("vision_workspace").at("handoff_capacity_bytes") == 25000000ULL,
         "Vision workspace layout");
-    failures += expect(report.at("memory").at("cuda_graph_allowance_bytes") == 150000000ULL,
-                       "CUDA Graph allowance");
+    failures += expect(report.at("memory").at("cuda_graph_rebuild_estimate_bytes") == 150000000ULL,
+                       "CUDA Graph rebuild estimate");
+    failures +=
+        expect(report.at("memory").at("cuda_graph_prepare_increment_bytes") == 170000000 &&
+                   report.at("memory").at("cuda_graph_calibration_increment_bytes") == 149999900 &&
+                   report.at("memory").at("cuda_graph_calibration_retained_bytes") == -100 &&
+                   report.at("memory").at("startup_retained_bytes") == -200,
+               "signed Graph calibration and startup deltas");
     failures += expect(report.at("memory").at("kv_payload_bytes") == 123456ULL, "KV payload");
     failures += expect(report.at("config").at("proposal_head") == "optimized", "proposal head");
     failures += expect(report.at("config").at("decode_graph_prime").at("output_tokens") == 13,
@@ -460,9 +467,9 @@ int test_human_and_csv_reports() {
     for (const std::string_view field :
          {"model_name", "artifact_path", "proposal_head", "kv_payload_bytes",
           "load_host_to_device_bytes", "workspace_general_capacity_bytes",
-          "vision_handoff_capacity_bytes", "cuda_graph_allowance_bytes", "workspace_peak_bytes",
-          "workspace_allocator_peak_bytes", "spec_acceptance_rate", "decode_output_tok_s_mean",
-          "decode_engine_tok_s_mean", "total_seconds_mean"}) {
+          "vision_handoff_capacity_bytes", "cuda_graph_rebuild_estimate_bytes",
+          "workspace_peak_bytes", "workspace_allocator_peak_bytes", "spec_acceptance_rate",
+          "decode_output_tok_s_mean", "decode_engine_tok_s_mean", "total_seconds_mean"}) {
         failures += expect(csv.find(field) != std::string::npos,
                            std::string("CSV field ") + std::string(field));
     }

@@ -66,6 +66,9 @@ PhasePresentation phase_presentation(StartupPhase phase) noexcept {
         return {"pinning host context", "host context pinned", PhaseVisibility::Info, true, false};
     case StartupPhase::CudaGraphPrepare:
         return {"preparing CUDA graphs", "CUDA graphs ready", PhaseVisibility::Info, false, false};
+    case StartupPhase::CudaGraphCalibration:
+        return {"calibrating CUDA graph memory", "CUDA graph memory calibrated",
+                PhaseVisibility::Info, false, false};
     case StartupPhase::EngineFinalize:
         return {"finalizing engine", "engine finalized", PhaseVisibility::Debug, false, false};
     }

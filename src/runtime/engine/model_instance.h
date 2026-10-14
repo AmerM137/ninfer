@@ -20,6 +20,8 @@ struct ModelInstance {
     models::qwen3_5::Frontend frontend;
     KvCapacityResolution kv_capacity_resolution;
     std::size_t device_budget_bytes = 0;
+    std::optional<GraphMemorySummary> cuda_graph;
+    std::int64_t startup_retained_bytes = 0;
     const std::uint32_t capacity;
     std::unique_ptr<models::qwen3_5::Program> program;
 

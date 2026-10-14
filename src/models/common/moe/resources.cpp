@@ -137,6 +137,21 @@ void Bridge::synchronize() const {
     }
 }
 
+namespace {
+ExpertCacheRequirements storage_requirements(const Plan& plan,
+                                             std::span<const ExpertBankSource> sources,
+                                             ResourcePurpose purpose) {
+    if (purpose == ResourcePurpose::Execution) return plan.cache;
+    auto config           = plan.cache.config;
+    config.fixed_bytes    = 0;
+    config.capacity_bytes = 0;
+    for (const auto& bank : plan.cache.banks)
+        if (!bank.resident)
+            config.capacity_bytes = std::max(config.capacity_bytes, bank.entry_bytes * bank.count);
+    return describe_expert_cache(sources, config);
+}
+} // namespace
+
 struct Resources::Impl {
     struct Layer {
         std::unique_ptr<Partition> partition;
@@ -152,7 +167,10 @@ struct Resources::Impl {
     CudaExecutionView cuda;
     CudaStream upload_stream;
     CudaExecutionView upload;
+    ResourcePurpose purpose;
+    ExpertCacheRequirements storage;
     ExpertCache cache;
+    ExpertBankId calibration_bank;
     Bridge bridge;
     std::vector<Layer> layers;
     std::vector<ExpertKey> extra_keys;
@@ -169,11 +187,16 @@ struct Resources::Impl {
     bool keep_cpu_active        = false;
 
     Impl(std::shared_ptr<const Plan> plan, std::span<const Parameters* const> parameters,
-         std::span<const ExpertBankSource> sources, const DeviceContext& device)
+         std::span<const ExpertBankSource> sources, const DeviceContext& device,
+         ResourcePurpose purpose)
         : plan(std::move(plan)), parameters(parameters.begin(), parameters.end()), sources(sources),
           device(device), cuda(device.execution_view()), upload_stream(device),
-          upload(device.execution_view(upload_stream.stream())),
-          cache(sources, this->plan->cache, device, upload, this->plan->fixed_layout),
+          upload(device.execution_view(upload_stream.stream())), purpose(purpose),
+          storage(storage_requirements(*this->plan, sources, purpose)),
+          cache(sources, storage, device, upload,
+                purpose == ResourcePurpose::Execution
+                    ? std::span<const ExpertPlacement>(this->plan->fixed_layout)
+                    : std::span<const ExpertPlacement>{}),
           bridge(this->plan->bridge, topology, this->plan->team, device),
           layers(parameters.size()) {
         if (parameters.size() != this->plan->layers.size())
@@ -195,6 +218,7 @@ struct Resources::Impl {
             for (std::uint32_t n = 0; n < layer.cache_experts; ++n)
                 targets.push_back({layer.spec.bank, layer.spec.priority[n]});
         }
+        if (purpose == ResourcePurpose::GraphCalibration) return;
         sort_keys(targets);
         for (const auto& placement : this->plan->extra_layout) extra_keys.push_back(placement.key);
         cache.replace(extra_region(), this->plan->extra_layout);
@@ -300,8 +324,9 @@ struct Resources::Impl {
 
 Resources::Resources(std::shared_ptr<const Plan> plan,
                      std::span<const Parameters* const> parameters,
-                     std::span<const ExpertBankSource> sources, const DeviceContext& device)
-    : impl_(std::make_unique<Impl>(std::move(plan), parameters, sources, device)) {}
+                     std::span<const ExpertBankSource> sources, const DeviceContext& device,
+                     ResourcePurpose purpose)
+    : impl_(std::make_unique<Impl>(std::move(plan), parameters, sources, device, purpose)) {}
 
 Resources::~Resources() = default;
 
@@ -318,6 +343,10 @@ std::optional<CpuExecutionView::ActiveScope> Resources::begin(std::int32_t token
         }
     }
     if (tokens <= 0) throw std::invalid_argument("MoE traversal requires positive token count");
+    if (calibrating()) {
+        state.tokens = tokens;
+        return std::nullopt;
+    }
     // Keep a frequent CPU contributor awake across GPU layers. Sparse CPU use should not
     // keep the entire team polling; the two thresholds avoid toggling on every token.
     if (state.tokens != tokens || state.observed_layers != state.layers.size()) {
@@ -357,6 +386,7 @@ std::optional<CpuExecutionView::ActiveScope> Resources::begin(std::int32_t token
 }
 
 void Resources::before_layer(ExpertBankId bank) {
+    if (calibrating()) return;
     impl_->prepare_step(impl_->plan->layer_index(bank));
     impl_->progress_cache();
 }
@@ -392,6 +422,16 @@ PreparedExecution Resources::prepare_layer(ExpertBankId bank) {
     const auto index = state.plan->layer_index(bank);
     auto& layer      = state.layers[index];
     if (state.tokens <= 0) throw std::logic_error("MoE traversal has not started");
+    if (calibrating()) {
+        const auto& selected = state.plan->layers[index];
+        const auto count     = selected.cache_experts;
+        const auto kind      = selected.requires_full_bank(state.tokens) ||
+                                  count == std::uint32_t(selected.spec.profile.routed.experts)
+                                   ? ops::ExpertSubsetKind::All
+                               : count ? ops::ExpertSubsetKind::MaskOnes
+                                       : ops::ExpertSubsetKind::None;
+        return prepare_calibration_layer(bank, kind);
+    }
     auto kind = ops::ExpertSubsetKind::All;
     if (state.plan->layers[index].requires_full_bank(state.tokens)) {
         while (!layer.use) {
@@ -408,9 +448,53 @@ PreparedExecution Resources::prepare_layer(ExpertBankId bank) {
     return describe_layer(bank, state.tokens, kind);
 }
 
+bool Resources::calibrating() const noexcept {
+    return impl_->purpose == ResourcePurpose::GraphCalibration;
+}
+
+PreparedExecution Resources::prepare_calibration_layer(ExpertBankId bank,
+                                                       ops::ExpertSubsetKind kind) {
+    auto& state = *impl_;
+    if (!calibrating() || !state.preparing || state.tokens <= 0)
+        throw std::logic_error("MoE calibration has not begun");
+    const auto index = state.plan->layer_index(bank);
+    auto& layer      = state.layers[index];
+    state.release_snapshots();
+    state.synchronize();
+    if (kind != ops::ExpertSubsetKind::None && state.calibration_bank != bank) {
+        const auto& layout = state.storage.banks[bank.index];
+        std::vector<ExpertPlacement> entries;
+        entries.reserve(layout.count);
+        for (std::uint32_t i = 0; i < layout.count; ++i)
+            entries.push_back({{bank, i}, i * layout.entry_bytes});
+        state.cache.replace({0, state.storage.config.capacity_bytes, 256}, entries);
+        state.cache.prepare({layer.keys});
+        while (!state.cache.progress({SIZE_MAX, SIZE_MAX}).required_published)
+            state.cache.wait_for_progress();
+        state.calibration_bank = bank;
+    }
+    const auto count =
+        kind == ops::ExpertSubsetKind::All ? layer.keys.size()
+        : kind == ops::ExpertSubsetKind::None
+            ? 0
+            : std::clamp<std::size_t>(state.plan->layers[index].cache_experts, 1,
+                                      std::max<std::size_t>(1, layer.keys.size() - 1));
+    const auto keys = std::span(layer.keys).first(count);
+    layer.partition->update(keys, state.cuda);
+    if (count) {
+        layer.use = state.cache.acquire(keys, state.cuda);
+        if (!layer.use) throw std::logic_error("calibration bank is not ready");
+    }
+    return describe_layer(bank, state.tokens, kind);
+}
+
 void Resources::gpu_submitted(ExpertBankId bank) {
     auto& state      = *impl_;
     const auto index = state.plan->layer_index(bank);
+    if (calibrating()) {
+        state.release(state.layers[index]);
+        return;
+    }
     if (!state.cache_settled) state.release(state.layers[index]);
     state.prepare_step(index + 1);
     state.progress_cache();
@@ -428,6 +512,10 @@ void Resources::abort_layer(ExpertBankId bank) {
 
 void Resources::restore_cache_after_preparation() {
     if (!impl_->preparing) throw std::logic_error("MoE cache preparation is not active");
+    if (calibrating()) {
+        synchronize();
+        return;
+    }
     const auto activity = begin(1);
     while (!impl_->cache_settled) {
         impl_->progress_cache();

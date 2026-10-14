@@ -34,6 +34,26 @@ void upload(DecodeGraphExecutable& executable, cudaStream_t stream) {
 }
 } // namespace
 
+MoeGraphPlan plan_moe_graph(const moe::Plan& schedule, ExpertBankId bank, std::int32_t tokens) {
+    const auto& plan   = schedule.layer(bank);
+    const auto experts = std::uint32_t(plan.spec.profile.routed.experts);
+    using Kind         = ops::ExpertSubsetKind;
+    MoeGraphPlan out;
+    if (plan.requires_full_bank(tokens)) {
+        out.subsets[moe_graph_index(Kind::All)] = true;
+    } else {
+        out.subsets[moe_graph_index(Kind::All)]  = plan.cache_experts == experts;
+        out.subsets[moe_graph_index(Kind::None)] = plan.fixed_experts == 0;
+        out.subsets[moe_graph_index(Kind::MaskOnes)] =
+            plan.cache_experts > 0 && plan.fixed_experts < experts;
+    }
+    if (!plan.requires_full_bank(tokens) || plan.stream_layout.empty())
+        out.steady = plan.cache_experts == 0         ? Kind::None
+                     : plan.cache_experts == experts ? Kind::All
+                                                     : Kind::MaskOnes;
+    return out;
+}
+
 TextGraphDefinition::TextGraphDefinition(std::size_t count, const TextGraphDefinition* shared)
     : layers(count) {
     for (std::size_t i = 0; i < count; ++i)
@@ -42,6 +62,7 @@ TextGraphDefinition::TextGraphDefinition(std::size_t count, const TextGraphDefin
 
 struct TextGraphExecutable::Target {
     struct Layer {
+        MoeGraphPlan plan;
         DecodeGraphExecutable mixer, steady, feature;
         std::array<DecodeGraphExecutable, 3> moe;
     };
@@ -54,6 +75,7 @@ struct TextGraphExecutable::Target {
         for (std::size_t i = 0; i < layers.size(); ++i) {
             const auto& source = definition.layers[i];
             auto& target       = layers[i];
+            target.plan        = source.plan;
             instantiate(target.mixer, source.mixer);
             instantiate(target.steady, source.steady);
             instantiate(target.feature, source.feature);
@@ -149,29 +171,17 @@ void TextGraphRun::capture_layer(std::size_t layer, moe::Resources& resources, E
                                  const std::function<void(const moe::PreparedExecution&)>& gpu_moe,
                                  const std::function<void()>& feature) {
     auto& definition   = definition_->layers.at(layer);
-    const auto& plan   = resources.plan().layer(bank);
-    const auto experts = std::uint32_t(plan.spec.profile.routed.experts);
+    definition.plan    = plan_moe_graph(resources.plan(), bank, tokens);
     definition.mixer.capture(cuda_.stream(), mixer);
     using Kind = ops::ExpertSubsetKind;
-    std::array<bool, 3> reachable{};
-    if (plan.requires_full_bank(tokens)) {
-        reachable[moe_graph_index(Kind::All)] = true;
-    } else {
-        reachable[moe_graph_index(Kind::All)]  = plan.cache_experts == experts;
-        reachable[moe_graph_index(Kind::None)] = plan.fixed_experts == 0;
-        reachable[moe_graph_index(Kind::MaskOnes)] =
-            plan.cache_experts > 0 && plan.fixed_experts < experts;
-    }
     for (auto kind : {Kind::All, Kind::None, Kind::MaskOnes}) {
         auto& part = definition.moe->subsets[moe_graph_index(kind)];
-        if (!reachable[moe_graph_index(kind)] || part.ready()) continue;
+        if (!definition.plan.subsets[moe_graph_index(kind)] || part.ready()) continue;
         const auto call = resources.describe_layer(bank, tokens, kind);
         part.capture(cuda_.stream(), [&] { gpu_moe(call); });
     }
-    if (!plan.requires_full_bank(tokens) || plan.stream_layout.empty()) {
-        const auto kind = plan.cache_experts == 0         ? Kind::None
-                          : plan.cache_experts == experts ? Kind::All
-                                                          : Kind::MaskOnes;
+    if (definition.plan.steady) {
+        const auto kind = *definition.plan.steady;
         const auto call = resources.describe_layer(bank, tokens, kind);
         definition.steady.capture(cuda_.stream(), [&] {
             mixer();
@@ -185,6 +195,28 @@ void TextGraphRun::replay_layer(std::size_t layer, moe::Resources& resources, Ex
                                 Tensor& output) {
     resources.before_layer(bank);
     auto& stages        = executable_->target_->layers.at(layer);
+    if (resources.calibrating()) {
+        stages.mixer.launch(cuda_.stream());
+        const auto run = [&](ops::ExpertSubsetKind kind, DecodeGraphExecutable& graph) {
+            const auto call = resources.prepare_calibration_layer(bank, kind);
+            try {
+                graph.launch(cuda_.stream());
+                resources.gpu_submitted(bank);
+                resources.finish_layer(moe::complete(call, output));
+            } catch (...) {
+                resources.abort_layer(bank);
+                throw;
+            }
+        };
+        for (auto kind : {ops::ExpertSubsetKind::All, ops::ExpertSubsetKind::None,
+                          ops::ExpertSubsetKind::MaskOnes}) {
+            const auto index = moe_graph_index(kind);
+            if (stages.plan.subsets[index]) run(kind, stages.moe[index]);
+        }
+        if (stages.plan.steady) run(*stages.plan.steady, stages.steady);
+        if (stages.feature.ready()) stages.feature.launch(cuda_.stream());
+        return;
+    }
     const bool combined = resources.settled() && stages.steady.ready();
     if (!combined) stages.mixer.launch(cuda_.stream());
     const auto call = resources.prepare_layer(bank);

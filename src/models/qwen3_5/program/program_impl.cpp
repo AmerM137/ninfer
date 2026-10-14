@@ -33,8 +33,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
       kv_storage(plan.kv_storage), proposal_head(plan.proposal_head),
       vision_enabled(plan.features.vision), use_cuda_graph(plan.use_cuda_graph),
       causal_scoring(plan.causal_scoring), kv_payload_bytes(plan.persistent.kv_payload_bytes),
-      graph_allowance_bytes(plan.graph_allowance_bytes), workspace_plan(plan.workspace),
-      persistent(device.device(), plan.persistent.bytes),
+      workspace_plan(plan.workspace), persistent(device.device(), plan.persistent.bytes),
       workspace_storage(device.device(), plan.workspace.capacity),
       work(workspace_storage.span().subspan(0, plan.workspace.general_capacity)),
       round_host(plan.causal_scoring
@@ -228,18 +227,38 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
             if (const auto* layer = std::get_if<moe::Parameters>(&block.ffn))
                 layers.push_back(layer);
         }
-        moe = std::make_unique<moe::Resources>(plan.moe, layers, parameters.model.expert_banks(),
-                                               device);
+        moe = std::make_unique<moe::Resources>(
+            plan.moe, layers, parameters.model.expert_banks(), device,
+            plan.graph_probe ? moe::ResourcePurpose::GraphCalibration
+                             : moe::ResourcePurpose::Execution);
     }
     device.synchronize();
-    if (use_cuda_graph) {
-        StartupPhaseScope graph_phase(startup_observer, StartupPhase::CudaGraphPrepare);
-        prepare_graphs();
-        graph_phase.complete();
-    }
+
     work.reset();
     work.reset_peak();
     workspace_logical_peak_bytes = 0;
+}
+
+void ProgramImpl::initialize_graphs() {
+    if (!use_cuda_graph) return;
+    device.synchronize();
+    const auto before = device_memory_snapshot(device.device());
+    prepare_graphs();
+    device.synchronize();
+    graph_memory = GraphMemorySummary{.preparation_increment_bytes = device_memory_growth(
+                                          before, device_memory_snapshot(device.device()))};
+    work.reset();
+    work.reset_peak();
+    workspace_logical_peak_bytes = 0;
+}
+
+void ProgramImpl::release_graphs() {
+    if (moe) moe->synchronize();
+    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream()));
+    device.synchronize();
+    ordinary_graphs            = {};
+    speculative_forward_graphs = {};
+    speculative_finish_graphs  = {};
 }
 
 ProgramImpl::~ProgramImpl() noexcept {
@@ -518,7 +537,7 @@ MemorySummary ProgramImpl::memory_summary() const {
         };
     }
     out.workspace_logical_peak_bytes = workspace_logical_peak_bytes;
-    out.cuda_graph_allowance_bytes   = graph_allowance_bytes;
+    out.cuda_graph                   = graph_memory;
     out.kv_payload_bytes             = kv_payload_bytes;
     if (host_state_images) { out.host_state_occupied_slots = host_state_images->occupied(); }
     if (host_kv_arena) { out.host_kv_occupied_bytes = host_kv_arena->occupied_bytes(); }

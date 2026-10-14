@@ -1,8 +1,10 @@
 #include "core/device.h"
+#include "core/buffer.h"
 
 #include <cuda_runtime.h>
 
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -91,6 +93,17 @@ int main(int argc, char** argv) {
         std::cerr << "ctx.device().index() expected 0, got " << ctx.device().index() << '\n';
     }
     failures += check_context(ctx, "ctx");
+    // WSL can admit allocations larger than physical VRAM. Exceed addressable storage instead.
+    constexpr auto impossible_bytes = std::numeric_limits<std::size_t>::max() / 2 + 1;
+    try {
+        ninfer::DeviceBuffer impossible(ctx.device(), impossible_bytes);
+        failures += fail("oversized Device allocation did not fail");
+    } catch (const ninfer::DeviceAllocationError& error) {
+        if (error.requested_bytes() != impossible_bytes)
+            failures += fail("Device allocation error lost the requested size");
+    }
+    if (cudaPeekAtLastError() != cudaSuccess)
+        failures += fail("handled allocation failure left a CUDA error pending");
     int* device_value = nullptr;
     int* host_value   = nullptr;
     CUDA_CHECK(cudaMalloc(&device_value, sizeof(int)));

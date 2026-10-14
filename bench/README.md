@@ -1336,13 +1336,13 @@ are the row profiles the entry admits: `--channels 8192` gives (2048, 2048, 4096
 
 Table, JSON, and CSV reports identify the architecture, model instance, artifact, Engine configuration,
 load summary, memory capacity, KV payload, workspace peak, phase throughput, and speculative
-statistics. JSON schema version 23 records the public value objects directly:
+statistics. JSON schema version 24 records the public value objects directly:
 
 - `config`: constraint type, source/file, literal choices and mixed-request selection, alongside execution settings;
 - `load`: architecture, public name, actual formats, prefill signature, load/upload time,
   file/H2D/staging bytes and Device/Host object counts;
 - `memory`: weights/sequence/unified-workspace arenas, the optional non-additive Vision layout,
-  planned context, KV storage, CUDA Graph allowance, KV payload, Device budget and optional MoE
+  planned context, KV storage, CUDA Graph rebuild estimate and preparation increment, KV payload, Device budget and optional MoE
   Host/cache/bridge resources; MoE `uploaded_bytes` here is the startup snapshot;
 - `repetition_wall_seconds`: each concurrent repetition's submit-to-completion interval;
 - each request sample's `timings`: prepare, Vision, prefill, decode, and total seconds;

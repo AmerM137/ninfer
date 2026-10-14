@@ -13,11 +13,20 @@
 
 namespace ninfer::models::qwen3_5::execution {
 
+struct MoeGraphPlan {
+    std::array<bool, 3> subsets{};
+    std::optional<ops::ExpertSubsetKind> steady;
+    friend bool operator==(const MoeGraphPlan&, const MoeGraphPlan&) = default;
+};
+
+[[nodiscard]] MoeGraphPlan plan_moe_graph(const moe::Plan&, ExpertBankId, std::int32_t tokens);
+
 struct MoeGraphDefinitions {
     std::array<DecodeGraphDefinition, 3> subsets;
 };
 
 struct TextLayerGraphDefinition {
+    MoeGraphPlan plan;
     DecodeGraphDefinition mixer, steady, feature;
     std::shared_ptr<MoeGraphDefinitions> moe;
 };

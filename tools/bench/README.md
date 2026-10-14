@@ -130,7 +130,7 @@ Each raw report must satisfy the current [`ninfer_bench_report` contract](../../
 The flattened summary and schema-v4 matrix manifest carry native facts from the report:
 architecture, public name, actual formats, prefill signature, artifact,
 load/read/upload/staging values, Engine memory arenas including the non-additive Vision layout
-inside the unified workspace and CUDA Graph allowance, per-test planned logical and
+inside the unified workspace and measured CUDA Graph memory deltas, per-test planned logical and
 allocator-observed workspace peaks, KV capacity and
 payload, configured proposal head and graph mode, phase timings and throughput, and speculative
 rounds/drafts/acceptance/fallbacks. The matrix manifest is descriptive and records the commands and
@@ -159,7 +159,7 @@ The serial runner writes `run.jsonl`, `summary.csv`, `summary.md`, and per-serve
 category summaries. The output directory is supplied explicitly with `--output`.
 
 Its schema-v8 result and flattened summaries retain the KV dtype, actual `prefill_signature`, request Host
-exposure, and decode Host/Device-wait time per round received from the schema-v27 serving records.
+exposure, and decode Host/Device-wait time per round received from the schema-v28 serving records.
 Request exposure is a latency distribution value and is never summed across concurrent requests;
 worker aggregation uses the serving `throughput.host_work` interval deltas. The stochastic route pins its complete
 temperature/top-p/top-k/min-p/presence/frequency profile explicitly, so model-default changes do

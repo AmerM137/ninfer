@@ -116,9 +116,12 @@ Program 将具体状态和物理可行性通过原生合同提供给 runtime。�
 Binder 按架构/config 解析所选功能的逻辑需求，`LoadPlan` 不决定位置。
 `resolve_load` 建立显式放置与 Host/Device 容量，Materializer 按原编码建立稳定 backing。
 同一物理 parent 在各位置分别去重；CPU/GPU 双端需求可由同一次有界 I/O 分发。
-Engine 在大权重读取前消费无地址的 `ModelProfile`，联合规划固定权重、KV/State、workspace、
-Graph allowance 及 MoE 资源。全量 GPU 放置可行时使用 resident 路径；受预算限制的 MoE
-使用 Host 来源及 Program 所有的 GPU 副本，见[Expert 权重缓存](expert-weight-cache.md)。
+Engine 在大权重读取前消费无地址的 `ModelProfile`，规划固定权重与必要的 KV/State、workspace、
+MoE backing。权重加载后以少量物理 KV 页校准完整的 Graph 集合，保留实际 context、batch、
+speculative 配置与拓扑共享关系；临时 Host context cache 为零。校准资源销毁后重新取得可用显存，
+扣除 Graph 重建估计，再确定正式 KV 与 expert cache 容量。静态容量曲线只计算显式 backing。
+全量 GPU 候选不可行时，受支持的 MoE 使用 Host 来源及 Program 所有的 GPU 副本，
+两个候选不同时持有模型，见[Expert 权重缓存](expert-weight-cache.md)。
 `NINFER_VRAM_BUDGET_MIB` 限定引擎 Device 预算，实际可用显存构成另一上限。
 ModelInstance 持有 Model、const Parameters、Frontend 与 Program；Parameters 持有与最终
 容量计划相同的不可变执行 profile。纯逻辑加载不要求建立执行 profile。
@@ -372,6 +375,16 @@ forward 重叠；两段共享同一个资源预留和提交边界。
 
 MoE offload 使用分段 GPU Graph，控制线程负责 CPU contribution、缓存快照及传输交接。
 稳定缓存合并 mixer 与 MoE GPU 提交；恢复和流式加载时分开，保留 mixer 与上传重叠。
+Graph 校准记录准备前、准备完成、仅销毁 Graph 后的显存快照。释放后仍保留的驱动开销
+已进入新的可用显存基准，不能与重建估计重复扣费。差值使用有符号数；允许重建增量为零。
+`MemorySummary.cuda_graph` 分别报告校准增长、校准释放后的保留量、重建估计和正式准备增长；
+`startup_retained_bytes` 记录正式 Program 分配前、扣除已拥有权重后的总增长。
+这些差值包含 CUDA 延迟加载和驱动缓存，不作为纯 Graph allocation 的精确归因。
+`runtime_reservation_bytes` 仅包含显式 Program backing。
+正式准备的增长单独报告，以实际总占用是否满足 Device 预算判断启动，不要求它小于估计值。
+统一 headroom 是容量规划缓冲，不按拓扑类重复预留。正式分配不足时最多进行一次容量纠偏重建；
+只调整自动 KV 或可选 expert cache，保持显式容量与执行功能。Device 分配不足可以回收，
+执行错误与 Host 内存分配失败不作为缩减 GPU 容量的理由。
 Graph 只记录 GPU 工作，warmup 不绑定运行期控制线程；结束异步工作后先销毁 Graph，
 再释放其引用的 bridge 和 events。具体依赖见 [Expert 权重缓存](expert-weight-cache.md)。
 

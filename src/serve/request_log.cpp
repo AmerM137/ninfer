@@ -580,6 +580,7 @@ std::string format_server_start_json(
              {"server_overrides", overrides_json(options.sampling_overrides)},
              {"omitted_seed", "random"},
              {"greedy", options.greedy}};
+    const auto graph = memory.cuda_graph.value_or(ninfer::GraphMemorySummary{});
     record["memory"] =
         Json{{"weights", arena_json(memory.weights)},
              {"device_budget_bytes", memory.device_budget_bytes},
@@ -594,7 +595,11 @@ std::string format_server_start_json(
              {"available_after_startup_bytes", memory.available_after_startup_bytes},
              {"kv_capacity_headroom_bytes", memory.kv_capacity_headroom_bytes},
              {"planned_slack_bytes", memory.planned_slack_bytes},
-             {"cuda_graph_allowance_bytes", memory.cuda_graph_allowance_bytes},
+             {"cuda_graph_rebuild_estimate_bytes", graph.rebuild_estimate_bytes},
+             {"cuda_graph_prepare_increment_bytes", graph.preparation_increment_bytes},
+             {"cuda_graph_calibration_increment_bytes", graph.calibration_increment_bytes},
+             {"cuda_graph_calibration_retained_bytes", graph.calibration_retained_bytes},
+             {"startup_retained_bytes", memory.startup_retained_bytes},
              {"kv_payload_bytes", memory.kv_payload_bytes},
              {"host_context_capacity_bytes", memory.host_context_capacity_bytes},
              {"host_context_occupied_bytes", memory.host_context_occupied_bytes},

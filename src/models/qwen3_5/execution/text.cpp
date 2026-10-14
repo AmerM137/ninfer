@@ -1158,7 +1158,7 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
             } else {
                 graphs_->replay_layer(layer, *moe_, routed->bank, x);
             }
-        } catch (const std::exception& error) {
+        } catch (const DeviceAllocationError&) { throw; } catch (const std::exception& error) {
             throw std::runtime_error("text/layers/" + std::to_string(layer) +
                                      (prefill ? " prefill" : " verify") +
                                      " columns=" + std::to_string(x.ne[1]) + ": " + error.what());

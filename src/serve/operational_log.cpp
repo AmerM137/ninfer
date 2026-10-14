@@ -460,13 +460,19 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
                       product::format_pretty_bytes(media.live_capacity_bytes));
     }
 
-    logger_->debug("memory ledger | after weights {} | after startup {} | headroom {} | slack {} | "
-                   "CUDA graphs {}",
-                   product::format_pretty_bytes(memory.available_after_weights_bytes),
-                   product::format_pretty_bytes(memory.available_after_startup_bytes),
-                   product::format_pretty_bytes(memory.kv_capacity_headroom_bytes),
-                   product::format_pretty_bytes(memory.planned_slack_bytes),
-                   product::format_pretty_bytes(memory.cuda_graph_allowance_bytes));
+    const auto graph = memory.cuda_graph.value_or(ninfer::GraphMemorySummary{});
+    logger_->debug(
+        "memory ledger | after weights {} | after startup {} | headroom {} | slack {} | "
+        "graph rebuild estimate {} | graph preparation increment {} B | "
+        "graph calibration increment {} B | graph calibration retained {} B | startup retained {} "
+        "B",
+        product::format_pretty_bytes(memory.available_after_weights_bytes),
+        product::format_pretty_bytes(memory.available_after_startup_bytes),
+        product::format_pretty_bytes(memory.kv_capacity_headroom_bytes),
+        product::format_pretty_bytes(memory.planned_slack_bytes),
+        product::format_pretty_bytes(graph.rebuild_estimate_bytes),
+        graph.preparation_increment_bytes, graph.calibration_increment_bytes,
+        graph.calibration_retained_bytes, memory.startup_retained_bytes);
     logger_->debug("context cost | transfer {} | prefill {} | hardware {} | prefill signature {}",
                    ninfer::context_cost_preset_source_name(context_cost.transfer_source),
                    ninfer::context_cost_preset_source_name(context_cost.prefill_source),

@@ -3,7 +3,6 @@
 #include "models/qwen3_5/execution/gdn.h"
 #include "models/common/moe/execution.h"
 #include "models/qwen3_5/execution/mtp.h"
-#include "models/qwen3_5/program/planning/graph_profiles.h"
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/program/planning/startup.h"
 #include "models/qwen3_5/execution/vision.h"
@@ -36,7 +35,6 @@ namespace {
 using execution::dimension;
 namespace workspace = execution::workspace;
 
-constexpr std::size_t kMiB        = 1024ULL * 1024ULL;
 constexpr std::size_t kArenaAlign = 256ULL;
 
 enum class GdnWorkspacePath : std::uint8_t {
@@ -68,30 +66,6 @@ std::int32_t checked_i32(std::uint64_t value, const char* label) {
 std::uint32_t page_count(std::uint32_t capacity) {
     if (capacity == 0) { throw std::invalid_argument("Paged KV capacity must be positive"); }
     return 1U + (capacity - 1U) / static_cast<std::uint32_t>(kPagedKVPageSize);
-}
-
-template <class ProfileAllowance>
-std::size_t graph_topology_allowance(const std::vector<GraphExecutionProfile>& profiles,
-                                     ProfileAllowance&& profile_allowance, const char* label) {
-    std::vector<std::pair<std::uint32_t, std::size_t>> classes;
-    for (const GraphExecutionProfile profile : profiles) {
-        const std::size_t allowance = profile_allowance(profile);
-        const auto existing = std::find_if(classes.begin(), classes.end(), [&](const auto& entry) {
-            return entry.first == profile.topology_class;
-        });
-        if (existing == classes.end()) {
-            classes.emplace_back(profile.topology_class, allowance);
-        } else {
-            existing->second = std::max(existing->second, allowance);
-        }
-    }
-
-    std::size_t total = 0;
-    for (const auto& [topology_class, allowance] : classes) {
-        (void)topology_class;
-        total = checked_add(total, allowance, label);
-    }
-    return total;
 }
 
 TensorLayout add_tensor(LayoutBuilder& builder, DType dtype,
@@ -862,86 +836,11 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                         "Host context default overflow");
     }
     impl->workspace = build_workspace_plan(*impl);
-    if (impl->use_cuda_graph) {
-        // Definitions remain per execution profile, but only one executable is instantiated for
-        // each reachable node-topology class. These bounds cover the largest profile installed in
-        // each class and the driver/module state materialized while qualifying all definitions.
-        if (impl->moe) {
-            // One shared target per exact B: mixer, steady and routed segments. Draft
-            // topology classes own only their prefix/suffix, not another target copy.
-            const auto& profile = *impl->profile;
-            auto per_batch      = checked_add(
-                5ULL * kMiB,
-                checked_mul(384ULL * 1024, profile.text.layers.size(), "MoE target graphs"),
-                "MoE target graph allowance");
-            const bool masked = impl->speculative_backend == SpeculativeBackend::DFlash ||
-                                impl->speculative_backend == SpeculativeBackend::DFlash2;
-            if (masked) {
-                const auto profiles = dflash_graph_profiles(impl->speculative_backend,
-                                                            impl->capacity, impl->draft_window);
-                const auto prefix   = checked_add(
-                    2ULL * kMiB,
-                    checked_mul(512ULL * 1024, profile.draft->layers.size(), "draft graph layers"),
-                    "draft graph prefix");
-                per_batch = checked_add(per_batch,
-                                        graph_topology_allowance(
-                                            profiles, [&](GraphExecutionProfile) { return prefix; },
-                                            "segmented draft graph allowance"),
-                                        "segmented graph allowance");
-            }
-            impl->graph_allowance_bytes =
-                checked_mul(per_batch, impl->max_concurrency, "MoE exact-b graph allowance");
-            if (impl->capacity > 4096 && impl->speculative_backend != SpeculativeBackend::None) {
-                // Long-context kernels also materialize shared driver/code storage.
-                // This is a Program cost rather than another copy for every batch size.
-                impl->graph_allowance_bytes =
-                    checked_add(impl->graph_allowance_bytes, (masked ? 128ULL : 70ULL) * kMiB,
-                                "MoE long-context graph allowance");
-            }
-        } else if (impl->speculative_backend == SpeculativeBackend::None) {
-            impl->graph_allowance_bytes = checked_mul(12ULL * kMiB, impl->max_concurrency,
-                                                      "ordinary exact-b graph allowance");
-        } else if (impl->speculative_backend == SpeculativeBackend::Mtp) {
-            const auto profiles = mtp_graph_profiles(impl->capacity, impl->draft_window);
-            const std::size_t per_batch_allowance = graph_topology_allowance(
-                profiles,
-                [&](GraphExecutionProfile profile) {
-                    const std::uint64_t final_visible = std::min<std::uint64_t>(
-                        impl->capacity,
-                        static_cast<std::uint64_t>(profile.max) + 2ULL * impl->draft_window);
-                    return (final_visible <= 4096 ? 12ULL : 82ULL) * kMiB;
-                },
-                "MTP graph allowance");
-            impl->graph_allowance_bytes = checked_mul(per_batch_allowance, impl->max_concurrency,
-                                                      "MTP exact-b graph allowance");
-        } else {
-            const auto profiles = dflash_graph_profiles(impl->speculative_backend, impl->capacity,
-                                                        impl->draft_window);
-            const auto per_batch_allowance = graph_topology_allowance(
-                profiles,
-                [&](GraphExecutionProfile profile) {
-                    const std::uint64_t final_visible = std::min<std::uint64_t>(
-                        impl->capacity,
-                        static_cast<std::uint64_t>(profile.max) + impl->draft_window + 1ULL);
-                    // Long profiles also materialize driver execution storage; that shared
-                    // cost does not shrink with the number of graph executables.
-                    return (final_visible <= 4096 ? 64ULL : 192ULL) * kMiB;
-                },
-                "DFlash graph allowance");
-            // Forward retains the draft's topology classes; finish has one small executable
-            // per exact B, independently of context length.
-            impl->graph_allowance_bytes =
-                checked_mul(per_batch_allowance + 8ULL * kMiB, impl->max_concurrency,
-                            "DFlash exact-b graph allowance");
-        }
-    }
-
-    impl->device_reservation_bytes = checked_add(
-        checked_add(impl->persistent.bytes, impl->workspace.capacity, "sequence memory plan"),
-        impl->graph_allowance_bytes, "sequence graph allowance");
+    impl->device_reservation_bytes =
+        checked_add(impl->persistent.bytes, impl->workspace.capacity, "sequence device capacity");
     if (impl->moe) {
         impl->device_reservation_bytes = checked_add(
-            impl->device_reservation_bytes, impl->moe->device_bytes, "MoE device reservation");
+            impl->device_reservation_bytes, impl->moe->device_bytes, "MoE device capacity");
     }
     return impl;
 }
@@ -998,6 +897,17 @@ make_sequence_planner_impl(std::shared_ptr<const execution::ModelProfile> profil
             adjacent->device_reservation_bytes - planner->minimum->device_reservation_bytes;
     }
     return planner;
+}
+
+std::unique_ptr<SequencePlanImpl>
+make_graph_probe_plan(std::shared_ptr<const execution::ModelProfile> profile, DeviceContext& device,
+                      const EngineOptions& options, std::shared_ptr<const moe::Plan> moe) {
+    auto planner = make_sequence_planner_impl(std::move(profile), device, options, std::move(moe));
+    auto inputs  = std::move(planner->inputs);
+    inputs.context_cache.host_capacity_bytes = 0;
+    auto plan         = build_sequence_candidate(inputs, inputs.max_concurrency);
+    plan->graph_probe = true;
+    return plan;
 }
 
 std::unique_ptr<SequencePlanImpl>

@@ -1,4 +1,6 @@
 #include "runtime/engine/model_instance.h"
+#include "runtime/engine/startup_memory.h"
+#include "models/qwen3_5/program/graph_preparation.h"
 
 #include "artifact/formats.h"
 #include "artifact/reader.h"
@@ -65,16 +67,8 @@ void validate_options(const EngineOptions& options) {
     }
 }
 
-std::size_t current_free_device_bytes() {
-    std::size_t free_bytes  = 0;
-    std::size_t total_bytes = 0;
-    CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
-    return free_bytes;
-}
-
-std::size_t device_budget() {
-    const auto available = current_free_device_bytes();
-    const char* value    = std::getenv("NINFER_VRAM_BUDGET_MIB");
+std::size_t device_budget(std::size_t available) {
+    const char* value = std::getenv("NINFER_VRAM_BUDGET_MIB");
     if (!value) return available;
     const std::string_view text(value);
     std::uint64_t mib = 0;
@@ -94,82 +88,196 @@ struct StartupPlan {
     std::shared_ptr<const models::moe::Plan> moe;
 };
 
-StartupPlan plan_startup(const models::qwen3_5::LoadPlan& source,
-                         std::shared_ptr<const models::qwen3_5::execution::ModelProfile> profile,
-                         DeviceContext& device, const EngineOptions& options, std::size_t budget) {
-    namespace model     = models::qwen3_5;
-    const auto resident = source.placement(device.device(), device.device());
-    // Driver/module allocations are outside the explicit tensor layouts.
-    const auto headroom =
-        std::max<std::size_t>(256ULL * 1024 * 1024, options.kv_capacity.automatic_headroom_bytes);
-    if (budget <= headroom)
-        throw std::invalid_argument("VRAM budget is smaller than runtime headroom");
+struct WeightPlacement {
+    std::size_t resident_bytes = 0, fixed_bytes = 0;
+    std::optional<models::moe::Plan> offload;
+    std::vector<ExpertBankCacheSpec> banks;
+};
+
+WeightPlacement describe_placement(const models::qwen3_5::LoadPlan& source,
+                                   const models::qwen3_5::execution::ModelProfile& profile,
+                                   Device device, const EngineOptions& options) {
+    WeightPlacement out;
+    out.resident_bytes = source.placement(device, device).device_capacity_bytes;
+    auto offload       = models::qwen3_5::detail::describe_moe_plan(source, profile, options.moe);
+    if (source.config().text.architecture != models::Architecture::Qwen3_5Moe) return out;
+    out.fixed_bytes = source.placement(device, Device::cpu()).device_capacity_bytes;
+    out.offload     = std::move(offload);
+    for (const auto& bank : source.expert_banks())
+        out.banks.push_back({bank.gate_up.layout, bank.down.layout, true});
+    for (const auto& layer : out.offload->layers) out.banks[layer.spec.bank.index].resident = false;
+    return out;
+}
+
+std::optional<StartupPlan>
+plan_execution(const WeightPlacement& weights,
+               std::shared_ptr<const models::qwen3_5::execution::ModelProfile> profile,
+               DeviceContext& device, const EngineOptions& options, bool host_experts,
+               std::size_t available) {
+    namespace model  = models::qwen3_5;
+    auto trial       = options;
+    const auto chunk = options.prefill_chunk ? options.prefill_chunk : host_experts ? 4096U : 1024U;
+    trial.prefill_chunk             = chunk;
     auto policy                     = options.kv_capacity;
     policy.automatic_headroom_bytes = 0;
-    const auto resident_chunk       = options.prefill_chunk ? options.prefill_chunk : 1024U;
-    auto trial                      = options;
-    trial.prefill_chunk             = resident_chunk;
-    auto planner                    = model::make_sequence_planner(profile, device, trial);
-    const auto& curve               = planner.capacity_curve();
-    const auto required_pages =
-        policy.mode == KvCapacityMode::Explicit
-            ? static_cast<std::uint32_t>(
-                  (std::uint64_t(policy.explicit_tokens) + curve.main_page_tokens - 1) /
-                  curve.main_page_tokens)
-            : curve.minimum_main_page_groups;
-    const auto minimum = curve.reservation_bytes(required_pages);
-    auto assignment    = model::detail::describe_moe_plan(source, *profile, options.moe);
-    if (resident.device_capacity_bytes <= budget - headroom &&
-        minimum <= budget - headroom - resident.device_capacity_bytes) {
-        auto resolution =
-            resolve_kv_capacity(policy, curve, budget - headroom - resident.device_capacity_bytes);
-        resolution.automatic_headroom_bytes = headroom;
-        auto sequence = std::move(planner).finalize(resolution.main_page_groups);
-        return {std::move(sequence), resolution, false, resident_chunk, {}};
+    auto prototype = host_experts ? std::make_shared<models::moe::Plan>(*weights.offload) : nullptr;
+    auto planner   = model::make_sequence_planner(profile, device, trial, prototype);
+    const auto curve = planner.capacity_curve();
+    const auto pages = policy.mode == KvCapacityMode::Explicit
+                           ? static_cast<std::uint32_t>((std::uint64_t(policy.explicit_tokens) +
+                                                         curve.main_page_tokens - 1) /
+                                                        curve.main_page_tokens)
+                           : curve.minimum_main_page_groups;
+    if (curve.reservation_bytes(pages) > available) return std::nullopt;
+    if (!host_experts) {
+        auto resolution = resolve_kv_capacity(policy, curve, available);
+        return StartupPlan{
+            std::move(planner).finalize(resolution.main_page_groups), resolution, false, chunk, {}};
     }
-    if (source.config().text.architecture != models::Architecture::Qwen3_5Moe) {
-        throw std::invalid_argument(
-            "VRAM budget cannot hold this model and its execution resources");
-    }
-    const auto host = source.placement(device.device(), Device::cpu());
-    if (host.device_capacity_bytes >= budget - headroom) {
-        throw std::invalid_argument("VRAM budget cannot hold fixed model weights");
-    }
-    const auto runtime_budget = budget - headroom - host.device_capacity_bytes;
-    const auto chunk          = options.prefill_chunk ? options.prefill_chunk : 4096U;
-    trial.prefill_chunk       = chunk;
-    auto prototype            = std::make_shared<models::moe::Plan>(std::move(assignment));
-    auto initial              = model::make_sequence_planner(profile, device, trial, prototype);
-    auto limited              = policy;
-    if (limited.mode == KvCapacityMode::Automatic) {
-        limited = KvCapacityPolicy::explicit_capacity(initial.capacity_curve().resolved_tokens(
-            initial.capacity_curve().minimum_main_page_groups));
-    }
-    const auto& initial_curve = initial.capacity_curve();
-    const auto pages          = static_cast<std::uint32_t>(
-        (std::uint64_t(limited.explicit_tokens) + initial_curve.main_page_tokens - 1) /
-        initial_curve.main_page_tokens);
-    if (initial_curve.reservation_bytes(pages) >= runtime_budget) {
-        throw std::invalid_argument("VRAM budget cannot hold MoE execution resources");
-    }
-    auto base             = resolve_kv_capacity(limited, initial_curve, runtime_budget);
+    auto limited          = KvCapacityPolicy::explicit_capacity(curve.resolved_tokens(pages));
+    auto base             = resolve_kv_capacity(limited, curve, available);
     const auto max_tokens = static_cast<std::int32_t>(
         std::max(std::min(chunk, options.max_context),
                  options.max_concurrency * (options.speculative.draft_tokens + 1)));
     CpuTopology topology;
-    auto placement = model::detail::resolve_moe_plan(
-        source, *profile, runtime_budget - base.runtime_reservation_bytes, options.moe, max_tokens,
-        topology);
-    if (!placement) {
-        throw std::invalid_argument("VRAM budget cannot hold MoE execution resources");
-    }
-    auto moe        = std::make_shared<models::moe::Plan>(std::move(*placement));
-    auto final      = model::make_sequence_planner(profile, device, trial, moe);
-    auto resolution = resolve_kv_capacity(limited, final.capacity_curve(), runtime_budget);
+    auto placement = models::moe::resolve_plan(*weights.offload, weights.banks,
+                                               available - base.runtime_reservation_bytes,
+                                               max_tokens, topology, options.moe.cpu_workers);
+    if (!placement) return std::nullopt;
+    auto moe   = std::make_shared<models::moe::Plan>(std::move(*placement));
+    auto final = model::make_sequence_planner(profile, device, trial, moe);
+    if (final.capacity_curve().reservation_bytes(pages) > available) return std::nullopt;
+    auto resolution = resolve_kv_capacity(limited, final.capacity_curve(), available);
     resolution.mode = policy.mode;
-    resolution.automatic_headroom_bytes = headroom;
-    return {std::move(final).finalize(resolution.main_page_groups), resolution, true, chunk,
-            std::move(moe)};
+    return StartupPlan{std::move(final).finalize(resolution.main_page_groups), resolution, true,
+                       chunk, std::move(moe)};
+}
+
+struct CalibratedPlan {
+    StartupPlan startup;
+    GraphMemorySummary graph;
+};
+
+std::optional<CalibratedPlan>
+calibrate_plan(const WeightPlacement& weights, ModelInstance& instance, DeviceContext& device,
+               const EngineOptions& options, const StartupMemoryBudget& budget,
+               StartupPlan candidate, std::vector<models::qwen3_5::GraphCalibration>& measured,
+               std::size_t minimum_rebuild = 0) {
+    namespace model = models::qwen3_5;
+    for (;;) {
+        auto probe_options          = options;
+        probe_options.prefill_chunk = candidate.chunk;
+        const auto key = model::describe_graph_preparation(probe_options, candidate.moe.get());
+        auto found     = std::find_if(measured.begin(), measured.end(),
+                                      [&](const auto& item) { return item.plan == key; });
+        if (found == measured.end()) {
+            measured.push_back(
+                model::calibrate_graphs(instance.parameters, device, probe_options, candidate.moe));
+            found = std::prev(measured.end());
+        }
+        const auto graph_bytes = std::max(found->rebuild_bytes, minimum_rebuild);
+        const GraphMemorySummary graph{
+            .rebuild_estimate_bytes      = graph_bytes,
+            .calibration_increment_bytes = found->preparation_increment_bytes,
+            .calibration_retained_bytes  = found->retained_increment_bytes,
+        };
+        const auto available = budget.available(device_memory_snapshot(device.device()));
+        if (graph_bytes > available) return std::nullopt;
+        auto next = plan_execution(weights, instance.parameters.profile, device, options,
+                                   candidate.host_experts, available - graph_bytes);
+        if (!next) return std::nullopt;
+        const auto next_key = model::describe_graph_preparation(probe_options, next->moe.get());
+        if (next_key == key) return CalibratedPlan{std::move(*next), graph};
+        const bool revisited = std::any_of(measured.begin(), measured.end(),
+                                           [&](const auto& item) { return item.plan == next_key; });
+        if (revisited && candidate.sequence.device_reservation_bytes() <= available - graph_bytes) {
+            // At a variant boundary choose the feasible measured side, then fill that interval.
+            auto low  = candidate.sequence.device_reservation_bytes();
+            auto high = available - graph_bytes;
+            while (low < high) {
+                const auto middle = low + (high - low + 1) / 2;
+                auto trial = plan_execution(weights, instance.parameters.profile, device, options,
+                                            candidate.host_experts, middle);
+                if (trial &&
+                    model::describe_graph_preparation(probe_options, trial->moe.get()) == key) {
+                    low       = middle;
+                    candidate = std::move(*trial);
+                } else
+                    high = middle - 1;
+            }
+            return CalibratedPlan{std::move(candidate), graph};
+        }
+        candidate = std::move(*next);
+    }
+}
+
+std::optional<CalibratedPlan>
+prepare_program(const WeightPlacement& weights, ModelInstance& instance, DeviceContext& device,
+                EngineOptions& options, const StartupMemoryBudget& budget, CalibratedPlan plan,
+                std::vector<models::qwen3_5::GraphCalibration>& measured, unsigned& attempts) {
+    namespace model = models::qwen3_5;
+    while (attempts < 2) {
+        ++attempts;
+        auto& startup             = plan.startup;
+        const auto explicit_bytes = startup.sequence.device_reservation_bytes();
+        const auto host_bytes     = startup.sequence.host_capacity_bytes();
+        const auto retained =
+            budget.retained(device_memory_snapshot(device.device()),
+                            instance.model->storage_stats().device_capacity_bytes);
+        if (explicit_bytes != startup.capacity.runtime_reservation_bytes ||
+            startup.sequence.kv_capacity() != startup.capacity.resolved_tokens)
+            throw std::logic_error("resolved capacity differs from the finalized Program plan");
+        std::optional<DeviceMemorySnapshot> ready;
+        try {
+            StartupPhaseScope phase(options.startup_observer, StartupPhase::ProgramInitialize);
+            instance.program = model::create_program(
+                instance.parameters, std::move(startup.sequence), device, options.startup_observer);
+            device.synchronize();
+            ready = device_memory_snapshot(device.device());
+            if (budget.fits(*ready)) {
+                options.prefill_chunk                                    = startup.chunk;
+                options.context_cache.host_capacity_bytes                = host_bytes;
+                instance.kv_capacity_resolution                          = startup.capacity;
+                instance.kv_capacity_resolution.automatic_headroom_bytes = budget.headroom();
+                instance.device_budget_bytes                             = budget.limit();
+                instance.startup_retained_bytes                          = retained;
+                instance.cuda_graph = instance.program->memory_summary().cuda_graph;
+                if (instance.cuda_graph) {
+                    plan.graph.preparation_increment_bytes =
+                        instance.cuda_graph->preparation_increment_bytes;
+                    instance.cuda_graph = plan.graph;
+                }
+                phase.complete();
+                return plan;
+            }
+        } catch (const DeviceAllocationError&) {
+            // A failed preparation invalidates its observation; the next probe measures it again.
+            auto probe_options          = options;
+            probe_options.prefill_chunk = startup.chunk;
+            const auto key = model::describe_graph_preparation(probe_options, startup.moe.get());
+            std::erase_if(measured, [&](const auto& entry) { return entry.plan == key; });
+        }
+        instance.program.reset();
+        device.synchronize();
+        if (attempts == 2) return std::nullopt;
+        const auto after_cleanup = device_memory_snapshot(device.device());
+        const auto available     = budget.available(after_cleanup);
+        const auto recovered     = ready ? device_memory_growth(after_cleanup, *ready) -
+                                           static_cast<std::int64_t>(explicit_bytes)
+                                         : 0;
+        const auto reserve =
+            std::max(plan.graph.rebuild_estimate_bytes,
+                     static_cast<std::size_t>(std::max<std::int64_t>(0, recovered)));
+        if (reserve > available) return std::nullopt;
+        auto candidate = plan_execution(weights, instance.parameters.profile, device, options,
+                                        startup.host_experts, available - reserve);
+        if (!candidate) return std::nullopt;
+        auto corrected = calibrate_plan(weights, instance, device, options, budget,
+                                        std::move(*candidate), measured, reserve);
+        if (!corrected) return std::nullopt;
+        plan = std::move(*corrected);
+    }
+    return std::nullopt;
 }
 
 } // namespace
@@ -225,52 +333,97 @@ ModelInstance::~ModelInstance() = default;
 
 ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) {
     validate_options(options);
-    const auto start  = Clock::now();
-    const auto budget = device_budget();
+    const auto start   = Clock::now();
+    const auto initial = device_memory_snapshot(device.device());
+    const auto limit   = device_budget(initial.free_bytes);
+    const auto headroom =
+        std::max<std::size_t>(256ULL * 1024 * 1024, options.kv_capacity.automatic_headroom_bytes);
+    StartupMemoryBudget budget(initial, limit, headroom);
     StartupPhaseScope inspect(options.startup_observer, StartupPhase::ArtifactInspect);
     artifact::Reader reader(options.artifact_path);
     inspect.complete();
     StartupPhaseScope binding(options.startup_observer, StartupPhase::TargetPlan);
-    auto plan             = models::qwen3_5::plan_load(reader, models::load_options(options));
-    auto profile          = models::qwen3_5::execution::describe_model(plan);
-    auto startup          = plan_startup(plan, profile, device, options, budget);
-    options.prefill_chunk = startup.chunk;
+    auto source        = models::qwen3_5::plan_load(reader, models::load_options(options));
+    auto profile       = models::qwen3_5::execution::describe_model(source);
+    const auto weights = describe_placement(source, *profile, device.device(), options);
+    const auto initial_available = budget.available(initial);
+    auto candidate               = weights.resident_bytes <= initial_available
+                                       ? plan_execution(weights, profile, device, options, false,
+                                                        initial_available - weights.resident_bytes)
+                                       : std::nullopt;
+    bool host_experts            = !candidate.has_value();
+    if (host_experts && weights.offload && weights.fixed_bytes <= initial_available)
+        candidate = plan_execution(weights, profile, device, options, true,
+                                   initial_available - weights.fixed_bytes);
+    if (!candidate)
+        throw std::invalid_argument(
+            "Device budget cannot hold model weights and required execution resources");
     binding.complete();
-    auto model = models::qwen3_5::materialize_model(
-        models::qwen3_5::resolve_load(std::move(plan), device.device(),
-                                      startup.host_experts ? Device::cpu() : device.device()),
-        device, &options.startup_observer);
-    device.synchronize();
-    StartupPhaseScope frontend(options.startup_observer, StartupPhase::FrontendInitialize);
-    auto instance = std::make_unique<ModelInstance>(std::move(model), options, std::move(profile));
-    frontend.complete();
-    StartupPhaseScope planning(options.startup_observer, StartupPhase::TargetFinalize);
-    const auto signature =
-        models::qwen3_5::prefill_signature(*instance->model, startup.moe.get(), startup.chunk);
+    std::unique_ptr<ModelInstance> instance;
+    std::optional<CalibratedPlan> calibrated;
+    std::vector<models::qwen3_5::GraphCalibration> measured;
+    unsigned preparation_attempts       = 0;
+    std::size_t available_after_weights = 0;
+    LoadSummary summary;
+    for (;;) {
+        auto model = models::qwen3_5::materialize_model(
+            models::qwen3_5::resolve_load(std::move(source), device.device(),
+                                          host_experts ? Device::cpu() : device.device()),
+            device, &options.startup_observer);
+        device.synchronize();
+        available_after_weights = device_memory_snapshot(device.device()).free_bytes;
+        const auto& stats       = model->storage_stats();
+        summary.upload_seconds += stats.upload_seconds;
+        summary.artifact_bytes_read += stats.read_bytes;
+        summary.host_to_device_bytes += stats.h2d_bytes;
+        summary.peak_staging_bytes = std::max(summary.peak_staging_bytes, stats.peak_staging_bytes);
+        {
+            StartupPhaseScope phase(options.startup_observer, StartupPhase::FrontendInitialize);
+            instance = std::make_unique<ModelInstance>(std::move(model), options, profile);
+            phase.complete();
+        }
+        try {
+            {
+                StartupPhaseScope phase(options.startup_observer, StartupPhase::TargetFinalize);
+                calibrated = calibrate_plan(weights, *instance, device, options, budget,
+                                            std::move(*candidate), measured);
+                if (calibrated) phase.complete();
+            }
+            if (calibrated)
+                calibrated =
+                    prepare_program(weights, *instance, device, options, budget,
+                                    std::move(*calibrated), measured, preparation_attempts);
+        } catch (const DeviceAllocationError&) {
+            if (host_experts || !weights.offload) throw;
+            calibrated.reset();
+        }
+        if (calibrated) break;
+        instance.reset();
+        device.synchronize();
+        if (host_experts || !weights.offload || preparation_attempts == 2)
+            throw std::invalid_argument(
+                "Device budget cannot hold the calibrated runtime and requested KV capacity");
+        host_experts         = true;
+        const auto available = budget.available(device_memory_snapshot(device.device()));
+        if (weights.fixed_bytes > available)
+            throw std::invalid_argument("Device budget cannot hold fixed model weights");
+        candidate = plan_execution(weights, profile, device, options, true,
+                                   available - weights.fixed_bytes);
+        if (!candidate)
+            throw std::invalid_argument("Device budget cannot hold MoE execution resources");
+        source = models::qwen3_5::plan_load(reader, models::load_options(options));
+    }
+    instance->kv_capacity_resolution.available_after_weights_bytes = available_after_weights;
+    instance->kv_capacity_resolution.available_after_startup_bytes =
+        device_memory_snapshot(device.device()).free_bytes;
+    const auto signature = models::qwen3_5::prefill_signature(
+        *instance->model, calibrated->startup.moe.get(), options.prefill_chunk);
     auto context_cost = resolve_context_machine_cost(
         {.hardware_class = context_cost_hardware_class(
              device.properties().name, device.properties().major, device.properties().minor),
          .prefill_signature = signature},
         options.context_cost.preset_path);
-    auto resolution                          = startup.capacity;
-    auto sequence                            = std::move(startup.sequence);
-    resolution.available_after_weights_bytes = current_free_device_bytes();
-    if (sequence.device_reservation_bytes() != resolution.runtime_reservation_bytes ||
-        sequence.kv_capacity() != resolution.resolved_tokens) {
-        throw std::logic_error("resolved KV capacity does not match the finalized Program plan");
-    }
-    options.context_cache.host_capacity_bytes = sequence.host_capacity_bytes();
-    instance->kv_capacity_resolution          = resolution;
-    instance->device_budget_bytes             = budget;
-    planning.complete();
-    StartupPhaseScope program(options.startup_observer, StartupPhase::ProgramInitialize);
-    instance->program = models::qwen3_5::create_program(instance->parameters, std::move(sequence),
-                                                        device, options.startup_observer);
-    device.synchronize();
-    program.complete();
-    instance->kv_capacity_resolution.available_after_startup_bytes = current_free_device_bytes();
-    const auto& stats = instance->model->storage_stats();
-    LoadSummary summary;
+    const auto& stats    = instance->model->storage_stats();
     summary.architecture = models::architecture_name(instance->model->config().text.architecture);
     summary.model_name   = instance->model->info().name;
     summary.prefill_signature = signature;
@@ -281,14 +434,10 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
         }
     }
     summary.weight_formats.assign(formats.begin(), formats.end());
-    summary.load_seconds         = std::chrono::duration<double>(Clock::now() - start).count();
-    summary.upload_seconds       = stats.upload_seconds;
-    summary.artifact_bytes_read  = stats.read_bytes;
-    summary.host_to_device_bytes = stats.h2d_bytes;
-    summary.peak_staging_bytes   = stats.peak_staging_bytes;
-    summary.device_object_count  = stats.device_object_count;
-    summary.host_object_count    = stats.host_object_count;
-    summary.context_cost         = std::move(context_cost.summary);
+    summary.load_seconds        = std::chrono::duration<double>(Clock::now() - start).count();
+    summary.device_object_count = stats.device_object_count;
+    summary.host_object_count   = stats.host_object_count;
+    summary.context_cost        = std::move(context_cost.summary);
     return {std::move(instance), std::move(summary), std::move(context_cost.model)};
 }
 

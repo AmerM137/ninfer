@@ -1790,7 +1790,7 @@ int verify_loaded_product(const ninfer::Engine& engine) {
         vision->handoff_capacity_bytes == 0 ||
         vision->handoff_capacity_bytes >
             memory.workspace.capacity_bytes - vision->handoff_offset_bytes ||
-        vision->handoff_active_bytes != 0 || memory.cuda_graph_allowance_bytes == 0) {
+        vision->handoff_active_bytes != 0 || !memory.cuda_graph.has_value()) {
         std::cerr << "Engine construction has incomplete materialized backing\n";
         return 1;
     }
@@ -1935,7 +1935,8 @@ int exercise_attention_integration(const char* artifact) {
     std::cout << "attention integration KV=" << setting("NINFER_TEST_KV_DTYPE", "bf16")
               << " backend=" << backend_name << " B=" << batch
               << " workspace_peak=" << memory.workspace_logical_peak_bytes
-              << " graph_allowance=" << memory.cuda_graph_allowance_bytes
+              << " graph_rebuild_estimate="
+              << memory.cuda_graph.value_or(ninfer::GraphMemorySummary{}).rebuild_estimate_bytes
               << " appended=" << appended
               << " append_prefill_ms=" << reused.timings.prefill_seconds * 1000 << '\n';
     return 0;

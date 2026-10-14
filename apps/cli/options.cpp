@@ -107,9 +107,9 @@ std::string usage_text(const char* argv0) {
            "CPU expert offload.\n"
            "--thinking-budget caps model-origin thinking tokens; inserted control tokens count "
            "toward --max-new.\n"
-           "--kv-capacity auto leaves " +
+           "--kv-capacity auto uses " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
-           " MiB of sizing headroom.\n"
+           " MiB as a startup planning margin.\n"
            "Sampling defaults come from the loaded model and thinking mode; flags override "
            "individual fields.\n";
 }

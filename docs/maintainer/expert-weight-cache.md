@@ -276,7 +276,10 @@ MTP 的 Main verification 和 DFlash 的 target 使用同一分段调度；MTP �
 延续常驻 Graph。相同 exact-B 的 target executable 在 draft 的不同拓扑间共享，
 每次选择 profile 同时安装对应 target envelope；MoE 段不随 context 档位复制。
 约束 mask 在首个 target GPU 段提交后准备。Graph 实例与 bridge/masks
-均由 Program 持有，Graph allowance 先于 expert cache 从预算中扣除；销毁时先结束设备
+均由 Program 持有。启动校准借用已加载的 Host bank，以单层窗口承载权重，但按候选正式计划
+捕获 All/None/MaskOnes 和 steady 段；CPU/GPU 计算仍使用同一组执行原语。
+expert ID 与 offset 改变不要求重新校准，计算变体集合改变时校准对应集合。
+销毁临时资源后扣除重建估计，再确定 expert cache 额度；销毁时先结束设备
 工作并释放 Graph，再释放其引用的事件和存储。Prefill、Replay 延续 eager 提交，MoE
 计算策略仍只依据实际 T。
 

@@ -18,9 +18,6 @@ namespace detail {
                                                                      std::size_t layer);
 [[nodiscard]] moe::Plan describe_moe_plan(const LoadPlan&, const execution::ModelProfile&,
                                           const MoeOptions& = {});
-[[nodiscard]] std::optional<moe::Plan>
-resolve_moe_plan(const LoadPlan&, const execution::ModelProfile&, std::size_t device_bytes,
-                 const MoeOptions&, std::int32_t max_tokens, const CpuTopology&);
 
 } // namespace detail
 } // namespace ninfer::models::qwen3_5

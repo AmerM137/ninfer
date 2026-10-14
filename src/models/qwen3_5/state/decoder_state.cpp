@@ -23,10 +23,6 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
     const PagedKVStorageLayout layer_storage = paged_kv_storage_layout(storage, head_dim);
 
     const std::uint32_t logical_pages = page_count(capacity);
-    if (physical_page_groups < logical_pages) {
-        throw std::invalid_argument("Paged KV physical pages are below logical capacity");
-    }
-
     KVPageGeometry geometry;
     geometry.planes.reserve(static_cast<std::size_t>(layers) * layer_storage.planes_per_layer());
     for (std::uint32_t layer = 0; layer < layers; ++layer) {

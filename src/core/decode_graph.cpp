@@ -10,6 +10,14 @@
 namespace ninfer {
 namespace {
 
+void check_graph(cudaError_t error, const char* operation) {
+    if (error == cudaErrorMemoryAllocation) {
+        (void)cudaGetLastError();
+        throw DeviceAllocationError(operation);
+    }
+    cuda_check(error, operation, __FILE__, __LINE__);
+}
+
 void log_cuda_error(const char* op, cudaError_t err) noexcept {
     if (err != cudaSuccess) {
         std::fprintf(stderr, "CUDA cleanup failed during %s: %s: %s\n", op, cudaGetErrorName(err),
@@ -66,7 +74,8 @@ void DecodeGraphDefinition::capture(cudaStream_t stream, const std::function<voi
 }
 
 DecodeGraphCapture::DecodeGraphCapture(cudaStream_t stream) : stream_(stream) {
-    CUDA_CHECK(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeThreadLocal));
+    check_graph(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeThreadLocal),
+                "cudaStreamBeginCapture");
 }
 
 DecodeGraphCapture::~DecodeGraphCapture() {
@@ -78,7 +87,7 @@ DecodeGraphDefinition DecodeGraphCapture::finish() {
     DecodeGraphDefinition definition;
     const auto error = cudaStreamEndCapture(stream_, &definition.graph_);
     stream_          = nullptr;
-    CUDA_CHECK(error);
+    check_graph(error, "cudaStreamEndCapture");
     return definition;
 }
 
@@ -113,7 +122,7 @@ void DecodeGraphExecutable::instantiate(const DecodeGraphDefinition& definition)
     const cudaError_t err = cudaGraphInstantiate(&exec, definition.graph_, 0);
     if (err != cudaSuccess) {
         destroy_graph_exec(exec);
-        CUDA_CHECK(err);
+        check_graph(err, "cudaGraphInstantiate");
     }
     exec_ = exec;
 }
@@ -126,6 +135,7 @@ void DecodeGraphExecutable::update(const DecodeGraphDefinition& definition) {
 
     cudaGraphExecUpdateResultInfo result{};
     const cudaError_t err = cudaGraphExecUpdate(exec_, definition.graph_, &result);
+    if (err == cudaErrorMemoryAllocation) check_graph(err, "cudaGraphExecUpdate");
     if (err != cudaSuccess || result.result != cudaGraphExecUpdateSuccess) {
         throw std::runtime_error(
             "CUDA Graph executable update failed: " + std::string(cudaGetErrorName(err)) +
@@ -136,14 +146,14 @@ void DecodeGraphExecutable::update(const DecodeGraphDefinition& definition) {
 void DecodeGraphExecutable::upload(cudaStream_t stream) {
     nvtx::ScopedRange upload_range(nvtx::Name::CudaGraphUpload, nvtx::Category::Graph);
     if (!ready()) { throw std::logic_error("cannot upload an empty CUDA Graph executable"); }
-    CUDA_CHECK(cudaGraphUpload(exec_, stream));
+    check_graph(cudaGraphUpload(exec_, stream), "cudaGraphUpload");
 }
 
 void DecodeGraphExecutable::launch(cudaStream_t stream) {
     // This range executes for every replay; ranges in the captured body execute only at capture.
     nvtx::ScopedRange launch_range(nvtx::Name::CudaGraphLaunch, nvtx::Category::Graph);
     if (!ready()) { throw std::logic_error("cannot launch an empty CUDA Graph executable"); }
-    CUDA_CHECK(cudaGraphLaunch(exec_, stream));
+    check_graph(cudaGraphLaunch(exec_, stream), "cudaGraphLaunch");
 }
 
 bool DecodeGraphExecutable::ready() const noexcept { return exec_ != nullptr; }

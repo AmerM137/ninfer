@@ -1,4 +1,5 @@
 #include "models/qwen3_5/program/internal.h"
+#include "core/startup.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 #include "models/qwen3_5/program/planning/startup.h"
 #include "models/qwen3_5/program/program_impl.h"
@@ -322,6 +323,11 @@ std::unique_ptr<Program> create_program(const execution::Parameters& parameters,
     }
     auto impl =
         std::make_unique<detail::ProgramImpl>(parameters, *plan.impl_, device, startup_observer);
+    if (plan.impl_->use_cuda_graph) {
+        StartupPhaseScope phase(startup_observer, StartupPhase::CudaGraphPrepare);
+        impl->initialize_graphs();
+        phase.complete();
+    }
     plan.impl_.reset();
     return std::unique_ptr<Program>(new Program(std::move(impl)));
 }

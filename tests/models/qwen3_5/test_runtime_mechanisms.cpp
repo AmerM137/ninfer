@@ -75,6 +75,17 @@ void test_decoder_layout() {
     expect(!bf16.mtp_kv.has_value(), "disabled MTP omits KV storage");
     expect(bf16.kv_payload_bytes() == bf16.text_kv.payload_bytes(), "BF16 KV payload accounting");
 
+    auto probe_spec                      = decoder_spec(ninfer::KvCacheStorage::BFloat16, true);
+    probe_spec.text_physical_page_groups = 1;
+    probe_spec.mtp_physical_page_groups  = 1;
+    ninfer::LayoutBuilder probe_builder;
+    const auto probe = q36::plan_decoder_state(probe_builder, probe_spec);
+    expect(probe.text_kv.execution_tables.spec.logical_page_capacity == 3 &&
+               probe.text_kv.pages.spec.page_group_count == 1 &&
+               probe.mtp_kv->execution_tables.spec.logical_page_capacity == 3 &&
+               probe.mtp_kv->pages.spec.page_group_count == 1,
+           "Graph calibration keeps logical context while reducing physical KV storage");
+
     ninfer::LayoutBuilder int8_builder;
     const q36::DecoderStateLayout int8 = q36::plan_decoder_state(
         int8_builder, decoder_spec(ninfer::KvCacheStorage::Int8Group64, true));

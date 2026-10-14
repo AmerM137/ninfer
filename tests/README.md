@@ -201,7 +201,8 @@ covering Write/AddResidual outputs, absent CPU-only replicas, explicit region re
 All/None/partial partitions, bank IDs independent of traversal order, variable frame reuse through
 T=1024, delayed bridge progress, failed acquisition and asynchronous teardown. Eager and segmented
 Graph handoffs use the same oracle; Graph cases also cover expert relocation and streaming-window
-transitions through the real cache schedule.
+transitions through the real cache schedule. The compact Graph calibration storage also runs
+All/None/partial contributions against the same oracle while reusing one bank window.
 
 ```bash
 ctest --test-dir build -R '^ninfer_moe(_cpu(_avx2|_fma)?)?_test$' --output-on-failure

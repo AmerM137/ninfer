@@ -82,7 +82,7 @@ int verify_loaded_product(const ninfer::Engine& engine) {
             memory.workspace.capacity_bytes - vision->handoff_offset_bytes ||
         vision->handoff_active_bytes != 0 || vision->handoff_peak_bytes != 0 ||
         memory.workspace_logical_peak_bytes != 0 ||
-        (memory.cuda_graph_allowance_bytes != 0) != engine.options().use_cuda_graph) {
+        (memory.cuda_graph.has_value()) != engine.options().use_cuda_graph) {
         std::cerr << "35B Engine construction has an invalid memory summary\n";
         return 1;
     }
@@ -213,7 +213,7 @@ int exercise_maximum_configuration(const char* artifact) {
         vision->handoff_capacity_bytes == 0 ||
         vision->handoff_capacity_bytes >
             memory.workspace.capacity_bytes - vision->handoff_offset_bytes ||
-        vision->handoff_active_bytes != 0 || memory.cuda_graph_allowance_bytes == 0) {
+        vision->handoff_active_bytes != 0 || !memory.cuda_graph.has_value()) {
         std::cerr << "35B maximum configuration does not match the planned 256K layout: context="
                   << memory.max_context << " kv_payload=" << memory.kv_payload_bytes
                   << " sequence=" << memory.sequence.capacity_bytes

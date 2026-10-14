@@ -252,6 +252,8 @@ public:
         std::scoped_lock lock(execution_mutex_);
         MemorySummary out                      = instance_.program->memory_summary();
         out.device_budget_bytes                = instance_.device_budget_bytes;
+        out.startup_retained_bytes             = instance_.startup_retained_bytes;
+        out.cuda_graph                         = instance_.cuda_graph;
         const KvCapacityResolution& resolution = instance_.kv_capacity_resolution;
         out.kv_capacity_mode                   = resolution.mode;
         out.kv_capacity_page_groups            = resolution.main_page_groups;

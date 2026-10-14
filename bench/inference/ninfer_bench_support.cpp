@@ -670,9 +670,10 @@ std::string format_table(const BenchEnvironment& env, const std::vector<TestResu
         << (env.memory.vision_workspace
                 ? format_bytes(env.memory.vision_workspace->handoff_capacity_bytes)
                 : "disabled")
-        << " (within workspace), graph allowance "
-        << format_bytes(env.memory.cuda_graph_allowance_bytes) << ", KV payload "
-        << format_bytes(env.memory.kv_payload_bytes) << '\n'
+        << " (within workspace), graph rebuild estimate "
+        << format_bytes(
+               env.memory.cuda_graph.value_or(ninfer::GraphMemorySummary{}).rebuild_estimate_bytes)
+        << ", KV payload " << format_bytes(env.memory.kv_payload_bytes) << '\n'
         << "  corpus:     " << env.corpus_path << " (" << env.corpus_tokens << " tokens)\n"
         << "  config:     max_context=" << env.max_context << " prefill_chunk=" << env.prefill_chunk
         << " concurrency=" << env.concurrency << " constraint=" << constraint_name(env.constraint)
@@ -729,6 +730,7 @@ std::string format_table(const BenchEnvironment& env, const std::vector<TestResu
 
 std::string format_json(const BenchEnvironment& env, const std::string& command,
                         const std::vector<TestResult>& results) {
+    const auto graph = env.memory.cuda_graph.value_or(ninfer::GraphMemorySummary{});
     std::ostringstream formats;
     formats << '[';
     for (std::size_t i = 0; i < env.load.weight_formats.size(); ++i) {
@@ -822,7 +824,14 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << ",\n"
         << "    \"kv_capacity_headroom_bytes\": " << env.memory.kv_capacity_headroom_bytes << ",\n"
         << "    \"planned_slack_bytes\": " << env.memory.planned_slack_bytes << ",\n"
-        << "    \"cuda_graph_allowance_bytes\": " << env.memory.cuda_graph_allowance_bytes << ",\n"
+        << "    \"cuda_graph_rebuild_estimate_bytes\": " << graph.rebuild_estimate_bytes << ",\n"
+        << "    \"cuda_graph_prepare_increment_bytes\": " << graph.preparation_increment_bytes
+        << ",\n"
+        << "    \"cuda_graph_calibration_increment_bytes\": " << graph.calibration_increment_bytes
+        << ",\n"
+        << "    \"cuda_graph_calibration_retained_bytes\": " << graph.calibration_retained_bytes
+        << ",\n"
+        << "    \"startup_retained_bytes\": " << env.memory.startup_retained_bytes << ",\n"
         << "    \"kv_payload_bytes\": " << env.memory.kv_payload_bytes << "\n"
         << "  },\n"
         << "  \"config\": {\n"
@@ -933,6 +942,7 @@ std::string csv_field(std::string_view value) {
 } // namespace
 
 std::string format_csv(const BenchEnvironment& env, const std::vector<TestResult>& results) {
+    const auto graph = env.memory.cuda_graph.value_or(ninfer::GraphMemorySummary{});
     std::ostringstream out;
     out << "label,kind,n_prompt,n_gen,architecture,prefill_signature,model_name,artifact_path,max_"
            "context,prefill_chunk,concurrency,constraint_type,constraint_file,constraint_source,"
@@ -942,7 +952,9 @@ std::string format_csv(const BenchEnvironment& env, const std::vector<TestResult
            "proposal_head,decode_path,kv_cache,kv_payload_bytes,load_host_to_device_bytes,"
            "weights_capacity_bytes,sequence_capacity_bytes,workspace_capacity_bytes,"
            "workspace_general_capacity_bytes,vision_handoff_capacity_bytes,"
-           "cuda_graph_allowance_bytes,"
+           "cuda_graph_rebuild_estimate_bytes,cuda_graph_prepare_increment_bytes,"
+           "cuda_graph_calibration_increment_bytes,cuda_graph_calibration_retained_bytes,"
+           "startup_retained_bytes,"
            "workspace_peak_bytes,workspace_allocator_peak_bytes,expert_upload_bytes,"
            "spec_rounds,spec_fallback_steps,spec_acceptance_rate,"
            "repetitions,prefill_tok_s_mean,prefill_tok_s_stddev,decode_output_tok_s_mean,"
@@ -985,9 +997,11 @@ std::string format_csv(const BenchEnvironment& env, const std::vector<TestResult
             << (env.memory.vision_workspace
                     ? std::to_string(env.memory.vision_workspace->handoff_capacity_bytes)
                     : std::string())
-            << ',' << env.memory.cuda_graph_allowance_bytes << ',' << result.workspace_peak_bytes
-            << ',' << result.workspace_allocator_peak_bytes << ',' << result.expert_upload_bytes
-            << ',' << spec.rounds << ',' << spec.fallback_steps << ',' << acceptance << ','
+            << ',' << graph.rebuild_estimate_bytes << ',' << graph.preparation_increment_bytes
+            << ',' << graph.calibration_increment_bytes << ',' << graph.calibration_retained_bytes
+            << ',' << env.memory.startup_retained_bytes << ',' << result.workspace_peak_bytes << ','
+            << result.workspace_allocator_peak_bytes << ',' << result.expert_upload_bytes << ','
+            << spec.rounds << ',' << spec.fallback_steps << ',' << acceptance << ','
             << result.reps.size() / result.concurrency << ',' << mean(prefill_tok_s_series(result))
             << ',' << stddev(prefill_tok_s_series(result)) << ','
             << mean(decode_output_tok_s_series(result)) << ','

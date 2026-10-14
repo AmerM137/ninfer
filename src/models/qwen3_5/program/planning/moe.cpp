@@ -50,12 +50,4 @@ moe::Plan describe_moe_plan(const LoadPlan& source, const execution::ModelProfil
     return moe::describe_plan(bank_specs(source), layers);
 }
 
-std::optional<moe::Plan> resolve_moe_plan(const LoadPlan& source,
-                                          const execution::ModelProfile& profile,
-                                          std::size_t available, const MoeOptions& options,
-                                          std::int32_t max_tokens, const CpuTopology& topology) {
-    return moe::resolve_plan(describe_moe_plan(source, profile, options), bank_specs(source),
-                             available, max_tokens, topology, options.cpu_workers);
-}
-
 } // namespace ninfer::models::qwen3_5::detail

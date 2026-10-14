@@ -340,8 +340,8 @@ void qualify_allocation() {
 }
 
 int qualify_schedule(const DeviceContext& device, const CpuTopology& topology,
-                     std::uint32_t bank_capacity, bool one_large_layer = false,
-                     bool graph = false) {
+                     std::uint32_t bank_capacity, bool one_large_layer = false, bool graph = false,
+                     bool calibration = false) {
     moe::Fixture a(QType::Q4_G64_FP16, QType::Q5_G64_FP16),
         b(QType::Q4_G64_FP16, QType::Q6_G64_FP16);
     moe::HostBank ha(a), hb(b);
@@ -398,8 +398,12 @@ int qualify_schedule(const DeviceContext& device, const CpuTopology& topology,
     require(shared::plan_cache(*plan), "schedule fixture has insufficient capacity");
     plan->team = plan_cpu_team(topology.info(),
                                std::min<std::size_t>(4, cpu_worker_order(topology.info()).size()));
-    shared::Resources resources(plan, inputs, sources, device);
-    require(resources.cache_usage().ready_cache_bytes == plan->target_bytes,
+    shared::Resources resources(plan, inputs, sources, device,
+                                calibration ? shared::ResourcePurpose::GraphCalibration
+                                            : shared::ResourcePurpose::Execution);
+    std::optional<shared::Resources::Preparation> preparation;
+    if (calibration) preparation.emplace(resources);
+    require(resources.cache_usage().ready_cache_bytes == (calibration ? 0 : plan->target_bytes),
             "startup returned before the initial expert cache became ready");
     GuardedDeviceBuffer storage(plan->bridge.gpu_workspace_bytes);
     MemoryArena workspace(storage.span());
@@ -416,7 +420,12 @@ int qualify_schedule(const DeviceContext& device, const CpuTopology& topology,
                 resources.before_layer(order[i]);
                 if (graph) {
                     auto& call          = *calls[i];
-                    const auto prepared = resources.prepare_layer(order[i]);
+                    const auto prepared = calibration && tokens <= 8
+                                              ? resources.prepare_calibration_layer(
+                                                    order[i], i % 3 == 0   ? Kind::All
+                                                              : i % 3 == 1 ? Kind::None
+                                                                           : Kind::MaskOnes)
+                                              : resources.prepare_layer(order[i]);
                     DecodeGraphDefinition definition;
                     definition.capture(device.stream(), [&] {
                         shared::enqueue_gpu(call.device.x, prepared, call.destination, workspace,
@@ -436,7 +445,7 @@ int qualify_schedule(const DeviceContext& device, const CpuTopology& topology,
         for (auto& call : calls)
             failures += call->verify("scheduled MoE T=" + std::to_string(tokens));
         const auto usage = resources.cache_usage();
-        require(usage.used_bytes <= config.capacity_bytes &&
+        require(usage.used_bytes <= (calibration ? largest_bank : config.capacity_bytes) &&
                     usage.ready_cache_bytes <= usage.used_bytes,
                 "schedule exceeded its physical capacity");
     }
@@ -464,6 +473,7 @@ int main() {
         failures += qualify_schedule(device, topology, 2, true);
         failures += qualify_schedule(device, topology, 1, false, true);
         failures += qualify_schedule(device, topology, 2, false, true);
+        failures += qualify_schedule(device, topology, 3, false, true, true);
         std::cout << (failures ? "FAIL" : "OK") << " cached mixed MoE execution\n";
         return failures ? 1 : 0;
     } catch (const std::exception& error) {

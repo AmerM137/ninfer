@@ -40,7 +40,7 @@ CONTEXT_CORE = ((512, 512), (2048, 512), (8192, 512))
 CONTEXT_FULL_EXTRA = ((32768, 256), (65536, 128))
 PRIMARY_KS = (0, 3, 5)
 SWEEP_KS = (0, 1, 2, 3, 4, 5)
-REPORT_SCHEMA_VERSION = 23
+REPORT_SCHEMA_VERSION = 24
 REPORT_ARTIFACT_TYPE = "ninfer_bench_report"
 REPORT_TOOL = "ninfer_bench"
 
@@ -317,7 +317,15 @@ def report_rows(report_path: Path, case: BenchCase) -> list[dict[str, Any]]:
                 "general_capacity_bytes", workspace_memory.get("capacity_bytes")
             ),
             "vision_handoff_capacity_bytes": vision_workspace.get("handoff_capacity_bytes"),
-            "cuda_graph_allowance_bytes": memory.get("cuda_graph_allowance_bytes"),
+            "cuda_graph_rebuild_estimate_bytes": memory.get("cuda_graph_rebuild_estimate_bytes"),
+            "cuda_graph_prepare_increment_bytes": memory.get("cuda_graph_prepare_increment_bytes"),
+            "cuda_graph_calibration_increment_bytes": memory.get(
+                "cuda_graph_calibration_increment_bytes"
+            ),
+            "cuda_graph_calibration_retained_bytes": memory.get(
+                "cuda_graph_calibration_retained_bytes"
+            ),
+            "startup_retained_bytes": memory.get("startup_retained_bytes"),
             "workspace_peak_bytes": test.get("workspace_peak_bytes"),
             "workspace_allocator_peak_bytes": test.get("workspace_allocator_peak_bytes"),
             "prefill_tok_s_mean": test.get("prefill_tok_s_mean"),

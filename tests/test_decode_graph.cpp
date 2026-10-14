@@ -114,6 +114,24 @@ int main() {
         executable.launch(device.stream());
         device.synchronize();
         failures += expect_value(storage.data(), 0x22222222U, "updated graph launch");
+        try {
+            ninfer::DecodeGraphDefinition abandoned;
+            abandoned.capture(device.stream(), [&] {
+                CUDA_CHECK(
+                    cudaMemsetAsync(storage.data(), 0x44, sizeof(std::uint32_t), device.stream()));
+                throw ninfer::DeviceAllocationError("startup test");
+            });
+            ++failures;
+        } catch (const ninfer::DeviceAllocationError&) {}
+        ninfer::DecodeGraphDefinition recovered;
+        recovered.capture(device.stream(), [&] {
+            CUDA_CHECK(
+                cudaMemsetAsync(storage.data(), 0x55, sizeof(std::uint32_t), device.stream()));
+        });
+        executable.instantiate(recovered);
+        executable.launch(device.stream());
+        device.synchronize();
+        failures += expect_value(storage.data(), 0x55555555U, "capture after failed preparation");
         failures += check_external_event(device);
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

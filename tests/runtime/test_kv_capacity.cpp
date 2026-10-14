@@ -1,4 +1,5 @@
 #include "runtime/engine/kv_capacity.h"
+#include "runtime/engine/startup_memory.h"
 
 #include <iostream>
 #include <stdexcept>
@@ -50,6 +51,22 @@ int main() {
     } catch (const std::invalid_argument&) { insufficient_rejected = true; }
     failures += check(insufficient_rejected,
                       "automatic KV capacity accepted less than the minimum reservation");
+
+    // The probe left 200 bytes in the driver; the new free snapshot already includes it.
+    const ninfer::runtime::StartupMemoryBudget budget({10000, 12000}, 8000, 500);
+    failures += check(budget.available({7800, 12000}) == 5300,
+                      "startup retained allocation was not charged exactly once");
+    failures += check(budget.available({9800, 12000}) == 7300,
+                      "destroyed candidate backing was not returned to the budget");
+    failures += check(budget.retained({7800, 12000}, 2000) == 200,
+                      "owned weights were included in opaque retained storage");
+    failures += check(ninfer::device_memory_growth({8000, 12000}, {8100, 12000}) == -100,
+                      "negative memory growth wrapped to a large unsigned estimate");
+    failures += check(budget.fits({2100, 12000}) && !budget.fits({1900, 12000}),
+                      "actual startup footprint did not obey the Device budget");
+    const ninfer::runtime::StartupMemoryBudget physical({3000, 12000}, 8000, 500);
+    failures += check(physical.available({2000, 12000}) == 1500,
+                      "physical availability did not bound the configured budget");
 
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;

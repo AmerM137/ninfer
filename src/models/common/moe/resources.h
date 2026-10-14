@@ -11,6 +11,7 @@
 namespace ninfer::models::moe {
 
 struct Plan;
+enum class ResourcePurpose { Execution, GraphCalibration };
 
 // A layer snapshot shared by CPU and GPU. Updates and consumers use one compute stream.
 class Partition {
@@ -74,7 +75,8 @@ public:
     };
 
     Resources(std::shared_ptr<const Plan>, std::span<const Parameters* const> layers,
-              std::span<const ExpertBankSource> sources, const DeviceContext&);
+              std::span<const ExpertBankSource> sources, const DeviceContext&,
+              ResourcePurpose = ResourcePurpose::Execution);
     ~Resources();
     Resources(const Resources&)            = delete;
     Resources& operator=(const Resources&) = delete;
@@ -87,6 +89,9 @@ public:
     [[nodiscard]] PreparedExecution describe_layer(ExpertBankId bank, std::int32_t tokens,
                                                    ops::ExpertSubsetKind kind);
     [[nodiscard]] PreparedExecution prepare_layer(ExpertBankId bank);
+    [[nodiscard]] bool calibrating() const noexcept;
+    // Calibration retains the candidate's execution variants but streams one full bank.
+    [[nodiscard]] PreparedExecution prepare_calibration_layer(ExpertBankId, ops::ExpertSubsetKind);
     void gpu_submitted(ExpertBankId bank);
     void finish_layer(bool cpu_work) noexcept;
     void abort_layer(ExpertBankId bank);

@@ -72,8 +72,9 @@ Main KV 页为 64 token；每种 KV 的物理字节数由其层数、几何和�
 
 Main KV 容量曲线的页数下界为 `max(ceil(max_context / 64), C)`，上界为
 `C × ceil(max_context / 64)`。下界分别满足单请求独占最大上下文和 C 个最小页的几何要求。Native 同时
-计算所选后端、state、workspace 和 Graph 的布局；显式或自动容量都要落在这条曲线内并满足可用
-显存。容量并不平均切给每个 lane。
+计算所选后端、state、workspace 和 MoE backing 的布局；Graph 重建开销在权重加载后校准，
+按[启动生命周期](engine-architecture.md#25-实例生命周期与固定执行)从剩余显存中单独扣除。
+显式或自动容量都要落在这条曲线内并满足预算。容量并不平均切给每个 lane。
 
 Host 缺省容量为 `8 GiB + 8 × 当前模型 Host StateImage 大小`。它是一个共享 backing，State 与
 KV 的分项占用用于观测，不能再次相加成额外配额。传输目标从预留时就计费，发布只改变其状态，

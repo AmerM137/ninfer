@@ -148,9 +148,9 @@ std::string serve_usage_text(const char* argv0) {
            "       --vision enables media and loads the fixed Vision GPU allocations\n"
            "       --prefill-chunk requires a positive multiple of 128; defaults to 1024, or "
            "4096 with CPU expert offload\n"
-           "       --kv-capacity auto leaves " +
+           "       --kv-capacity auto uses " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
-           " MiB of sizing headroom\n"
+           " MiB as a startup planning margin\n"
            "       --no-prefix-reuse disables cross-request history; request pause/replay "
            "resources remain available\n"
            "       context defaults: device-state=max-concurrency; Host budget is resolved from "

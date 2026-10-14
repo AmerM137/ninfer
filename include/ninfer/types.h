@@ -92,6 +92,7 @@ enum class StartupPhase : std::uint8_t {
     ProgramInitialize,
     HostContextPin,
     CudaGraphPrepare,
+    CudaGraphCalibration,
     EngineFinalize,
 };
 
@@ -957,6 +958,14 @@ struct MoeMemorySummary {
     std::uint64_t prefetched_bytes  = 0;
 };
 
+struct GraphMemorySummary {
+    std::size_t rebuild_estimate_bytes = 0;
+    // Signed free-memory deltas; calibration holds its backing while releasing graphs.
+    std::int64_t preparation_increment_bytes = 0;
+    std::int64_t calibration_increment_bytes = 0;
+    std::int64_t calibration_retained_bytes  = 0;
+};
+
 struct MemorySummary {
     int device                      = 0;
     std::uint32_t max_context       = 0;
@@ -974,14 +983,17 @@ struct MemorySummary {
     std::optional<VisionWorkspaceMemorySummary> vision_workspace;
     std::size_t minimum_runtime_reservation_bytes = 0;
     std::size_t kv_capacity_increment_bytes       = 0;
-    std::size_t runtime_reservation_bytes         = 0;
-    std::size_t available_after_weights_bytes     = 0;
-    std::size_t available_after_startup_bytes     = 0;
-    std::size_t kv_capacity_headroom_bytes        = 0;
-    std::size_t planned_slack_bytes               = 0;
-    std::size_t workspace_logical_peak_bytes      = 0;
-    std::size_t cuda_graph_allowance_bytes        = 0;
-    std::size_t kv_payload_bytes                  = 0;
+    // Explicit Program backing, excluding Graphs.
+    std::size_t runtime_reservation_bytes     = 0;
+    std::size_t available_after_weights_bytes = 0;
+    std::size_t available_after_startup_bytes = 0;
+    std::size_t kv_capacity_headroom_bytes    = 0;
+    std::size_t planned_slack_bytes           = 0;
+    std::size_t workspace_logical_peak_bytes  = 0;
+    std::optional<GraphMemorySummary> cuda_graph;
+    // Growth before final Program backing, minus owned weights.
+    std::int64_t startup_retained_bytes = 0;
+    std::size_t kv_payload_bytes        = 0;
     // One shared physical Host context backing. Reserved bytes are included in occupied bytes;
     // State/KV occupancy below is a breakdown and must not be added to this ledger again.
     std::size_t host_context_capacity_bytes = 0;
