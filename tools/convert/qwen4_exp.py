@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from math import prod, isfinite
+from pathlib import Path
 
 import torch
 
@@ -557,11 +558,17 @@ def build_model(
             layer_types=["indexed_attention"],
         )
         records["mtp"] = {"config": m, "target": "text"}
+    overrides = {
+        "chat_template.jinja": Path(__file__).resolve().parents[1]
+        / "chat_templates"
+        / "qwen3_8_flash_next.jinja",
+        **(resource_overrides or {}),
+    }
     refs, res, count, special = load_resources(
         base.root,
         vocab_size=cfg["vocab_size"],
         vision_config=records.get("vision", {}).get("config"),
-        overrides=resource_overrides,
+        overrides=overrides,
     )
     for c, values in refs.items():
         records[c]["resources"] = values

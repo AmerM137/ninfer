@@ -96,6 +96,10 @@ OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 python3 -m tools.convert \
   --out out/qwen3_8_flash_next.ninfer
 ```
 
+The Qwen4Exp adapter selects the dedicated
+[`qwen3_8_flash_next.jinja`](../tools/chat_templates/qwen3_8_flash_next.jinja) by default;
+`--resource chat_template.jinja=PATH` explicitly replaces it. The 27B template is independent.
+
 The Qwen4Exp adapter supports Text, Vision and MTP conversion. Engine execution, DFlash and
 indexed proposal are not yet connected for this architecture. CUDA self-quantization compiles
 the SM120 encoder on first use and requires a CUDA toolkit, C++ compiler and Ninja.
@@ -386,7 +390,8 @@ checks divisor consistency within that matrix; block-FP8 writes complete 128-row
 
 Text includes `tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja` and
 `generation_config.json`. Vision adds its image and video processor configs. Resources come from
-`--model`; `--resource ROLE=PATH` replaces a selected resource:
+`--model`, except that Qwen4Exp defaults to the maintained Flash Next chat template.
+`--resource ROLE=PATH` replaces a selected resource:
 
 ```text
 --resource chat_template.jinja=/path/to/chat_template.jinja
@@ -397,7 +402,11 @@ The official conversion examples select these maintained templates:
 | Model | Template | Defaults |
 |---|---|---|
 | Qwen3.6 Dense/MoE | [qwen3_6.jinja](../tools/chat_templates/qwen3_6.jinja) | thinking on; closed-turn reasoning omitted |
-| Qwen3.8 | [qwen3_8.jinja](../tools/chat_templates/qwen3_8.jinja) | thinking on; effort `xhigh`; closed-turn reasoning retained |
+| Qwen3.8 27B | [qwen3_8.jinja](../tools/chat_templates/qwen3_8.jinja) | thinking on; effort `xhigh`; closed-turn reasoning retained |
+| Qwen3.8 Flash Next | [qwen3_8_flash_next.jinja](../tools/chat_templates/qwen3_8_flash_next.jinja) | thinking on; effort `xhigh`; closed-turn reasoning retained |
+
+The Flash Next template maps `minimal` to `low`, `high`/`max` to `xhigh`, and `none` to disabled
+thinking. Final-assistant continuation preserves its content, including trailing whitespace.
 
 Use your own Jinja file to change the artifact's default template. A startup
 [`--chat-template FILE`](cli.md#text-input) overrides the stored template.
