@@ -8,10 +8,16 @@ ninfer_add_op_test(ninfer_moe_test
           "${CMAKE_CURRENT_LIST_DIR}/test_mixed.cpp"
   LIBRARIES ninfer_ops)
 
-ninfer_add_op_test(ninfer_moe_cpu_test
-  SOURCES "${CMAKE_CURRENT_LIST_DIR}/cpu/test_routed.cpp"
+ninfer_add_op_test(ninfer_moe_cpu_groupwise_int_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/cpu/test_groupwise_int.cpp"
   LIBRARIES ninfer_moe_cpu)
-set_tests_properties(ninfer_moe_cpu_test PROPERTIES
+set_tests_properties(ninfer_moe_cpu_groupwise_int_test PROPERTIES
+  ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1" RESOURCE_LOCK cpu_team)
+
+ninfer_add_op_test(ninfer_moe_cpu_nvfp4_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/cpu/test_nvfp4.cpp"
+  LIBRARIES ninfer_moe_cpu)
+set_tests_properties(ninfer_moe_cpu_nvfp4_test PROPERTIES
   ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1" RESOURCE_LOCK cpu_team)
 
 # Qualify every compiled arithmetic route through the public CPU entry. Restricted
@@ -25,10 +31,15 @@ foreach(isa IN ITEMS avx2 fma)
     NINFER_MOE_CPU_${isa_upper}_ONLY)
   target_link_libraries(ninfer_moe_cpu_${isa}_qualification PUBLIC ninfer_core PRIVATE
     ninfer_moe_cpu_avx2 ninfer_moe_cpu_avx512 ninfer_moe_cpu_avx512_bf16)
-  ninfer_add_op_test(ninfer_moe_cpu_${isa}_test
-    SOURCES "${CMAKE_CURRENT_LIST_DIR}/cpu/test_routed.cpp"
+  ninfer_add_op_test(ninfer_moe_cpu_groupwise_int_${isa}_test
+    SOURCES "${CMAKE_CURRENT_LIST_DIR}/cpu/test_groupwise_int.cpp"
     LIBRARIES ninfer_moe_cpu_${isa}_qualification)
-  set_tests_properties(ninfer_moe_cpu_${isa}_test PROPERTIES
+  set_tests_properties(ninfer_moe_cpu_groupwise_int_${isa}_test PROPERTIES
+    ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1" RESOURCE_LOCK cpu_team)
+  ninfer_add_op_test(ninfer_moe_cpu_nvfp4_${isa}_test
+    SOURCES "${CMAKE_CURRENT_LIST_DIR}/cpu/test_nvfp4.cpp"
+    LIBRARIES ninfer_moe_cpu_${isa}_qualification)
+  set_tests_properties(ninfer_moe_cpu_nvfp4_${isa}_test PROPERTIES
     ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1" RESOURCE_LOCK cpu_team)
 endforeach()
 

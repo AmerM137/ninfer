@@ -1,9 +1,9 @@
 #include "ops/moe/kernels/cuda/block_scaled/output.cuh"
 #include "ops/common/cuda/mma.cuh"
 #include "ops/common/cuda/pipeline.cuh"
-#include "ops/moe/kernels/cuda/topk.cuh"
+#include "ops/moe/kernels/cuda/routing/topk.cuh"
 
-namespace ninfer::ops::detail::moe_block_scaled {
+namespace ninfer::ops::detail::moe_cuda::block_scaled {
 namespace {
 using namespace common;
 
@@ -205,8 +205,9 @@ __global__ void route_selection(const float* scores, int* ids, float* alpha, flo
         __syncthreads();
     }
     if (token < tokens) {
-        select_experts<SwiGLUH2560I640E512K10>(scores + token * kScoreRows, ids + token * kTopK,
-                                               alpha + token * kTopK, beta + token, logits[warp]);
+        routing::select_experts<SwiGLUH2560I640E512K10>(scores + token * kScoreRows,
+                                                        ids + token * kTopK, alpha + token * kTopK,
+                                                        beta + token, logits[warp]);
         if constexpr (Count) {
             __syncwarp();
             if (lane < kTopK) { atomicAdd(local + ids[token * kTopK + lane], 1); }
@@ -222,7 +223,7 @@ __global__ void route_selection(const float* scores, int* ids, float* alpha, flo
 } // namespace
 
 void launch_shared(const Tensor& x, const ScaledSwiGLUTerm& shared, const ExpertRoutes& routes,
-                   MoeEpilogue mode, Tensor& destination, const Storage& storage,
+                   MoeEpilogue mode, Tensor& destination, const Storage& storage, const Plan& plan,
                    CudaExecutionView execution, bool prepared) {
     const auto stream = execution.stream();
     const auto* input = static_cast<const __nv_bfloat16*>(x.data);
@@ -232,7 +233,7 @@ void launch_shared(const Tensor& x, const ScaledSwiGLUTerm& shared, const Expert
     const auto* beta         = static_cast<const float*>(shared.coefficients.data);
     const int tokens         = x.ne[1];
     with_output(destination, mode, [&](auto output) {
-        if (tokens < 8) {
+        if (plan.shared_algorithm == SharedAlgorithm::Vector) {
             if (!prepared) {
                 shared_vector<true><<<dim3(kIntermediate / 4, tokens), 128, 0, stream>>>(
                     input, gu, storage, coefficients, beta, output);
@@ -255,12 +256,12 @@ void launch_shared(const Tensor& x, const ScaledSwiGLUTerm& shared, const Expert
 
 void launch_control_shared(const Tensor& x, const MoeWeights& weights, const ExpertRoutes& routes,
                            const Tensor& shared, float* scores, const Storage& storage,
-                           CudaExecutionView execution) {
+                           const Plan& plan, CudaExecutionView execution) {
     const auto stream   = execution.stream();
     const auto* input   = static_cast<const __nv_bfloat16*>(x.data);
     const auto* gu      = static_cast<const __nv_bfloat16*>(weights.shared.gate_up.weight.qdata);
     const auto* control = static_cast<const __nv_bfloat16*>(weights.control.qdata);
-    if (x.ne[1] < 8) {
+    if (plan.shared_algorithm == SharedAlgorithm::Vector) {
         shared_vector<true>
             <<<dim3(kIntermediate / 4 + (kExperts + 4) / 4, x.ne[1]), 128, 0, stream>>>(
                 input, gu, storage, nullptr, nullptr, FloatContribution{}, control, scores);
@@ -283,4 +284,4 @@ void launch_control_shared(const Tensor& x, const MoeWeights& weights, const Exp
     }
     CUDA_CHECK(cudaGetLastError());
 }
-} // namespace ninfer::ops::detail::moe_block_scaled
+} // namespace ninfer::ops::detail::moe_cuda::block_scaled

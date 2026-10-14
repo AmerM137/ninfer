@@ -2,10 +2,12 @@
 
 #include "ninfer/ops/moe.h"
 
-namespace ninfer::ops::detail::moe_block_scaled {
+namespace ninfer::ops::detail::moe_cuda::block_scaled {
 
 inline constexpr int kHidden = 2560, kIntermediate = 640, kExperts = 512, kTopK = 10;
 inline constexpr int kScoreRows = (kExperts + 4) / 4 * 4;
+
+enum class SharedAlgorithm { Vector, Mma };
 
 struct Plan {
     QType format     = QType::NVFP4;
@@ -13,6 +15,9 @@ struct Plan {
     bool vector                = false;
     bool atomic_output         = false;
     bool single_block_grouping = false;
+
+    SharedAlgorithm shared_algorithm = SharedAlgorithm::Vector;
+    int queued_ctas_per_sm           = 0;
 
     int job_columns() const { return gate_columns > down_columns ? gate_columns : down_columns; }
 };
@@ -46,11 +51,11 @@ void launch(const Tensor& x, const CudaSwiGLUExperts& experts, const ExpertRoute
             Tensor& destination, const Plan& plan, const Storage& storage,
             CudaExecutionView execution, bool shared_prepared = false);
 void launch_shared(const Tensor& x, const ScaledSwiGLUTerm& shared, const ExpertRoutes& routes,
-                   MoeEpilogue mode, Tensor& destination, const Storage& storage,
+                   MoeEpilogue mode, Tensor& destination, const Storage& storage, const Plan& plan,
                    CudaExecutionView execution, bool prepared = false);
 
 void launch_control_shared(const Tensor& x, const MoeWeights& weights, const ExpertRoutes& routes,
                            const Tensor& shared, float* scores, const Storage& storage,
-                           CudaExecutionView execution);
+                           const Plan& plan, CudaExecutionView execution);
 
-} // namespace ninfer::ops::detail::moe_block_scaled
+} // namespace ninfer::ops::detail::moe_cuda::block_scaled

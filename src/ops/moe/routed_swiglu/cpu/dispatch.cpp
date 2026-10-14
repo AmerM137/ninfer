@@ -23,22 +23,38 @@ Isa select_isa(CpuFeatures features) {
     return Isa::Avx2;
 }
 
-const ShapePolicy& resolve_shape(const RoutedSwiGLUProfile& p) {
-    const auto& f = p.ffn;
-    if (f.hidden != 2048 || f.intermediate != 512 || p.experts != 256 || p.top_k != 8 ||
-        f.gate_up_type != QType::Q4_G64_FP16 || f.gate_up_layout != QuantLayout::RowSplit ||
-        f.down_layout != QuantLayout::RowSplit || !valid_linear_policy(f.gate_up_policy) ||
-        !valid_linear_policy(f.down_policy)) {
-        throw std::invalid_argument("routed_swiglu CPU: unsupported profile");
+const ShapePolicy& shape_dispatch(const RoutedSwiGLUProfile& profile) {
+    const auto& ffn = profile.ffn;
+    if (!valid_linear_policy(ffn.gate_up_policy) || !valid_linear_policy(ffn.down_policy)) {
+        throw std::invalid_argument("routed_swiglu CPU: invalid linear policy");
     }
-    switch (f.down_type) {
-    case QType::Q5_G64_FP16:
-        return q4_q5_h2048_i512_e256_k8();
-    case QType::Q6_G64_FP16:
-        return q4_q6_h2048_i512_e256_k8();
+    switch (ffn.gate_up_type) {
+    case QType::Q4_G64_FP16:
+        if (ffn.hidden == 2048 && ffn.intermediate == 512 && profile.experts == 256 &&
+            profile.top_k == 8 && ffn.gate_up_layout == QuantLayout::RowSplit &&
+            ffn.down_layout == QuantLayout::RowSplit) {
+            switch (ffn.down_type) {
+            case QType::Q5_G64_FP16:
+                return q4_q5_h2048_i512_e256_k8();
+            case QType::Q6_G64_FP16:
+                return q4_q6_h2048_i512_e256_k8();
+            default:
+                break;
+            }
+        }
+        break;
+    case QType::NVFP4:
+        if (ffn.hidden == 2560 && ffn.intermediate == 640 && profile.experts == 512 &&
+            profile.top_k == 10 && ffn.down_type == QType::NVFP4 &&
+            ffn.gate_up_layout == QuantLayout::BlockScaleK16M128x4 &&
+            ffn.down_layout == QuantLayout::BlockScaleK16M128x4) {
+            return nvfp4_h2560_i640_e512_k10();
+        }
+        break;
     default:
-        throw std::invalid_argument("routed_swiglu CPU: unsupported down format");
+        break;
     }
+    throw std::invalid_argument("routed_swiglu CPU: unsupported profile");
 }
 
 void validate_capacity(ExpertSubsetKind subset, int first, int last) {

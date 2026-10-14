@@ -1173,13 +1173,18 @@ measured DRAM bandwidth. Use profiler traffic when constructing a kernel or comp
 
 `ninfer_moe_cpu_bench` measures the complete synchronous CPU `routed_swiglu` call, including
 validation, grouping, decoding, arithmetic and worker publication/join. Setup and CPU/GPU transfers
-are excluded. Native Host banks stay alive for the whole run. `repeat` reuses a fixed subset;
+are excluded. `--format q4-q5|q4-q6|nvfp4` selects the native format and geometry. Native Host
+banks stay alive for the whole run. `repeat` reuses a fixed subset;
 `stream` rotates selected experts across prefaulted banks (by default at least four times reported
 LLC in actually selected weights). `same`, `skew` and `independent` vary reuse within each call.
+Full contributions route across the complete expert domain; partial CPU contributions use one
+masked half. NVFP4 supports zero through ten selected CPU experts per token.
 
 ```bash
 ./build/bench/ninfer_moe_cpu_bench --format q4-q5 --workers 15 --caller-cpu 31 \
   --tokens 1,8,72 --active 1,8 --cache stream --distribution same --samples 240 --read-reference
+./build/bench/ninfer_moe_cpu_bench --format nvfp4 --workers 16 --caller-cpu 31 \
+  --tokens 1,8,72,256 --active 1,4,10 --cache stream --distribution independent --samples 51 --read-reference
 ```
 
 Output includes min/median/p95/max wall time, useful encoded-weight GiB/s, logical GFLOP/s,
@@ -1191,6 +1196,8 @@ allows workers to park after their bounded spin interval.
 includes repeated weight reads, but is not a hardware traffic counter. `--read-reference` times
 the same bank/column grouping and row ownership with decode and arithmetic removed. Its median
 is an access-pattern reference, not a strict roofline or an end-to-end offload result.
+The tile-read model and matching access-pattern reference apply only to the integer formats;
+their CSV fields are `NA` for NVFP4, whose scales use the native swizzle.
 That option also reports sustained sequential read GB/s over the complete native-bank corpus,
 using the same worker team. Unique encoded bytes divided by this bandwidth give a compulsory-read
 memory roofline reference for a streaming call; repeated tile reads may hit cache and must not all

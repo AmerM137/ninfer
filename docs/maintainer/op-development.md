@@ -324,7 +324,7 @@ matching admission or launch predicate. An Op never infers it from model identit
   shared-memory storage;
 - `quant/`: packed-format decoding, encoding and explicit scale/rounding profiles;
 - `host/`: operand checks, represented-weight validation and launch resource configuration;
-- `cpu/`: ISA-specific vector conversions, reductions and packed integer decoding; included only
+- `cpu/`: ISA-specific vector conversions, reductions and packed-weight decoding; included only
   by compilation units built for that ISA.
 
 Keep small companion facilities together: vector types with conversions, cache policy and swizzles

@@ -9,10 +9,11 @@
 
 namespace ninfer::ops {
 namespace {
-namespace impl    = detail::moe_routed_cpu;
-namespace kernel  = detail::moe_cpu;
-namespace operand = common::operand;
-constexpr auto op = "routed_swiglu CPU";
+namespace impl            = detail::moe_routed_cpu;
+namespace kernel          = detail::moe_cpu;
+namespace operand         = common::operand;
+constexpr int max_experts = 512;
+constexpr auto op         = "routed_swiglu CPU";
 
 void require(bool condition, const char* message) {
     if (!condition) { throw std::invalid_argument(message); }
@@ -20,10 +21,10 @@ void require(bool condition, const char* message) {
 
 class Operands {
 public:
-    Operands(const Tensor& x, Tensor& out, MemoryArena& workspace, std::size_t capacity) {
-        operand::tensor(x, DType::BF16, {kernel::hidden, x.ne[1]}, 2, op, "x", Device::cpu());
-        operand::tensor(out, DType::FP32, {kernel::hidden, x.ne[1]}, 4, op, "destination",
-                        Device::cpu());
+    Operands(const Tensor& x, Tensor& out, MemoryArena& workspace, std::size_t capacity,
+             int hidden) {
+        operand::tensor(x, DType::BF16, {hidden, x.ne[1]}, 2, op, "x", Device::cpu());
+        operand::tensor(out, DType::FP32, {hidden, x.ne[1]}, 4, op, "destination", Device::cpu());
         operand::device(workspace.device(), Device::cpu(), op, "workspace");
         require(capacity <= workspace.capacity() - workspace.used(),
                 "routed_swiglu CPU: insufficient workspace");
@@ -45,26 +46,36 @@ public:
         read(value.data, value.bytes());
     }
 
-    kernel::MatrixBank bank(const WeightBankView& bank, QType type, int rows, int columns,
-                            const std::array<bool, kernel::experts>& selected) const {
+    void bank(const WeightBankView& bank, QType type, QuantLayout format_layout, int rows,
+              int columns, int count, const std::array<bool, max_experts>& selected) const {
         require(bank.parent && bank.parent->data, "routed_swiglu CPU: missing weight bank");
         operand::device(bank.parent->device, Device::cpu(), op, "weight bank");
-        const auto& layout    = bank.layout;
-        const auto& geometry  = bank.parent->geometry;
-        const auto elements   = std::size_t(rows) * columns;
-        const auto high_bytes = type == QType::Q4_G64_FP16   ? 0
-                                : type == QType::Q5_G64_FP16 ? elements / 8
-                                                             : elements / 4;
-        require(layout.format == type && layout.layout == QuantLayout::RowSplit &&
-                    layout.region.count == kernel::experts && layout.region.rows == rows &&
-                    layout.columns == columns && geometry.group_size == 64 &&
-                    geometry.padded_columns == columns && geometry.scale_block_rows == 1 &&
-                    !layout.has_divisors && layout.codes.expert_bytes == elements / 2 &&
+        const auto& layout       = bank.layout;
+        const auto& geometry     = bank.parent->geometry;
+        const auto elements      = std::size_t(rows) * columns;
+        const bool nvfp4         = type == QType::NVFP4;
+        const auto native_layout = layout.layout == QuantLayout::BatchedBlockScaleK16M128x4
+                                       ? QuantLayout::BlockScaleK16M128x4
+                                       : layout.layout;
+        const auto high_bytes    = type == QType::Q5_G64_FP16   ? elements / 8
+                                   : type == QType::Q6_G64_FP16 ? elements / 4
+                                                                : 0;
+        require(layout.format == type && native_layout == format_layout &&
+                    layout.region.count == unsigned(count) &&
+                    layout.region.rows == unsigned(rows) && layout.columns == unsigned(columns),
+                "routed_swiglu CPU: weight bank differs from the profile");
+        require(geometry.group_size == (nvfp4 ? 16 : 64) &&
+                    geometry.padded_columns == unsigned(columns) &&
+                    geometry.scale_block_rows == 1 && layout.has_divisors == nvfp4,
+                "routed_swiglu CPU: invalid weight geometry");
+        require(layout.codes.expert_bytes == elements / 2 &&
                     layout.high.expert_bytes == high_bytes &&
-                    layout.scales.expert_bytes == elements / 32 &&
+                    layout.scales.expert_bytes == elements / (nvfp4 ? 16 : 32) &&
                     layout == describe_weight_bank(geometry, layout.region),
-                "routed_swiglu CPU: bank differs from its native profile");
-        for (int expert = 0; expert < kernel::experts; ++expert) {
+                "routed_swiglu CPU: invalid native weight planes");
+        require(bank.parent->weight_divisors.size() == geometry.divisor_count,
+                "routed_swiglu CPU: invalid divisor storage");
+        for (int expert = 0; expert < count; ++expert) {
             if (!selected[expert]) { continue; }
             for (const auto& plane : {layout.codes, layout.high, layout.scales}) {
                 if (!plane.expert_bytes) { continue; }
@@ -73,13 +84,14 @@ public:
                         "routed_swiglu CPU: weight plane must be 16-byte aligned");
                 read(memory.data, memory.bytes);
             }
+            if (nvfp4) {
+                const auto* divisor = bank.parent->weight_divisors.data() + layout.divisor_begin +
+                                      expert * layout.divisor_stride;
+                require(std::isfinite(*divisor) && *divisor > 0,
+                        "routed_swiglu CPU: invalid expert divisor");
+                read(divisor, sizeof(float));
+            }
         }
-        return {{static_cast<const std::uint8_t*>(bank.plane(layout.codes, 0).data),
-                 static_cast<const std::uint8_t*>(bank.plane(layout.high, 0).data),
-                 static_cast<const std::uint16_t*>(bank.plane(layout.scales, 0).data)},
-                layout.codes.expert_stride,
-                layout.high.expert_stride,
-                layout.scales.expert_stride};
     }
 
 private:
@@ -98,19 +110,19 @@ private:
 std::size_t routed_swiglu_workspace_capacity_bytes(const RoutedSwiGLUProfile& profile,
                                                    ExpertSubsetKind subset, std::int32_t first,
                                                    std::int32_t last) {
-    const auto& shape = impl::resolve_shape(profile);
+    const auto& shape = impl::shape_dispatch(profile);
     impl::validate_capacity(subset, first, last);
-    return impl::capacity(shape, subset, last);
+    return subset == ExpertSubsetKind::None ? 0 : shape.capacity(last);
 }
 
 void routed_swiglu(const Tensor& x, const RoutedSwiGLUProfile& profile,
                    const CpuSwiGLUExperts& experts, const ExpertRoutes& routes, ExpertSubset subset,
                    Tensor& destination, MemoryArena& workspace, CpuExecutionView execution) {
-    const auto& shape = impl::resolve_shape(profile);
+    const auto& shape = impl::shape_dispatch(profile);
     const int tokens  = x.ne[1];
     impl::validate_capacity(subset.kind, tokens, tokens);
-    const auto capacity = impl::capacity(shape, subset.kind, tokens);
-    const Operands operands(x, destination, workspace, capacity);
+    const auto capacity = subset.kind == ExpertSubsetKind::None ? 0 : shape.capacity(tokens);
+    const Operands operands(x, destination, workspace, capacity, profile.ffn.hidden);
     if (subset.kind == ExpertSubsetKind::None) {
         std::memset(destination.data, 0, destination.bytes());
         return;
@@ -128,7 +140,7 @@ void routed_swiglu(const Tensor& x, const RoutedSwiGLUProfile& profile,
     }
     const auto* ids          = static_cast<const std::int32_t*>(routes.ids.data);
     const auto* coefficients = static_cast<const float*>(routes.coefficients.data);
-    std::array<bool, kernel::experts> selected{};
+    std::array<bool, max_experts> selected{};
     bool has_work = false;
     for (int t = 0; t < tokens; ++t) {
         const auto offset = std::size_t(t) * profile.top_k;
@@ -150,27 +162,20 @@ void routed_swiglu(const Tensor& x, const RoutedSwiGLUProfile& profile,
         std::memset(destination.data, 0, destination.bytes());
         return;
     }
-    const auto gate_up = operands.bank(experts.gate_up, profile.ffn.gate_up_type,
-                                       2 * profile.ffn.intermediate, profile.ffn.hidden, selected);
-    const auto down    = operands.bank(experts.down, profile.ffn.down_type, profile.ffn.hidden,
-                                       profile.ffn.intermediate, selected);
-    const auto plan    = shape.select(execution.features());
-    auto scope         = workspace.scope();
-    kernel::Work work{static_cast<const std::uint16_t*>(x.data),
-                      ids,
-                      coefficients,
-                      gate_up,
-                      down,
-                      subset.kind,
-                      mask,
-                      static_cast<float*>(destination.data),
-                      tokens,
-                      shape.token_block,
-                      plan.max_columns,
-                      shape.down_bits,
-                      impl::allocate(workspace, shape, tokens)};
-    if (plan.prepare_first) { kernel::prepare_chunk(work, 0, std::min(tokens, shape.token_block)); }
-    execution.run(plan.run, &work);
+    operands.bank(experts.gate_up, profile.ffn.gate_up_type, profile.ffn.gate_up_layout,
+                  2 * profile.ffn.intermediate, profile.ffn.hidden, profile.experts, selected);
+    operands.bank(experts.down, profile.ffn.down_type, profile.ffn.down_layout, profile.ffn.hidden,
+                  profile.ffn.intermediate, profile.experts, selected);
+    auto scope = workspace.scope();
+    const kernel::Invocation args{.input        = static_cast<const std::uint16_t*>(x.data),
+                                  .ids          = ids,
+                                  .coefficients = coefficients,
+                                  .experts      = experts,
+                                  .subset       = subset.kind,
+                                  .mask         = mask,
+                                  .output       = static_cast<float*>(destination.data),
+                                  .tokens       = tokens};
+    shape.launch(args, workspace, execution);
 }
 
 } // namespace ninfer::ops

@@ -4,9 +4,10 @@
 数学与量化布局由 [artifact 格式](artifact-container.md)和各 Op 合同拥有；
 执行与生命周期由 [Engine 架构](engine-architecture.md)拥有。
 
-Engine 支持常驻 GPU，以及受显存预算约束的 MoE 混合执行。CPU `routed_swiglu`
-支持 Q4 GU + Q5/Q6 down，直接消费 Host bank 并产生 FP32 分项。GPU 使用同一组
-logical expert ID，既可以计算固定子集，也可以消费补齐后的整层 bank。
+Engine 支持常驻 GPU，以及受显存预算约束的 MoE 混合执行。CPU `routed_swiglu` Op
+支持 Q4 GU + Q5/Q6 down 及 NVFP4 GU/down，直接消费 Host bank 并产生 FP32 分项。
+GPU 使用同一组 logical expert ID，既可以计算固定子集，也可以消费补齐后的整层 bank。
+Qwen4Exp 的模型接入仍待完成。
 
 ## 来源与身份
 
@@ -177,11 +178,12 @@ Host 的 release 不代表 GPU 已完成读取。CUDA 提交失败后停止接�
   它与独立 Op 共用 kernel 机制，保有自己的格式/shape 分派和调优策略；全 GPU Main/MTP
   通过这一入口执行。
 
-当前 CUDA 数学支持 35B 的 Q4+Q5、Q4+Q6 和 Q8+Q8 expert profile，shared 为 Q8。
-CPU 支持 Q4+Q5、Q4+Q6，输入为 BF16，SiLU 与 down 输入保持 FP32，不量化激活。
-NVFP4/Block-FP8 的来源与寻址可描述，不表示这些 expert 数学已实现。
+CUDA 数学支持 35B 的整数 expert profiles，以及 [Qwen4Exp GPU MoE](qwen4_exp-moe-gpu.md)
+的 NVFP4、block-FP8 profiles。CPU 支持 Q4+Q5、Q4+Q6 和 Main NVFP4，输入为 BF16，
+SiLU 与 down 输入保持 FP32，不量化激活；CPU block-FP8 尚未实现。
 `CudaSwiGLUExperts` 借用 affine 或 indexed GPU bank；`CpuSwiGLUExperts` 借用完整原生 Host bank，
-直接按各 plane 的偏移和步长消费。activation divisor 属于 Use，matrix divisor 属于权重表示，二者不互相替代。
+直接按各 plane 的偏移和步长消费，NVFP4 使用每个 expert 自己的 matrix divisor。
+CPU 权重接口不携带 activation divisor。GPU activation divisor 属于 Use，matrix divisor 属于权重表示，二者不互相替代。
 融合 GU/down 分别取相关 Use 的 activation policy 交集；NVFP4 A4 需要共同的正值 activation divisor。
 
 Op 不分配长期资源或上传权重；CUDA 分支消费 Device 路由，CPU 分支同步消费 Host 路由。

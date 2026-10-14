@@ -3,10 +3,10 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/operands.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/kernels/cuda/block_scaled/launch.cu"
   "${CMAKE_CURRENT_LIST_DIR}/kernels/cuda/block_scaled/shared.cu"
-  "${CMAKE_CURRENT_LIST_DIR}/kernels/cuda/grouped_swiglu.cu"
-  "${CMAKE_CURRENT_LIST_DIR}/kernels/cuda/grouping.cu"
-  "${CMAKE_CURRENT_LIST_DIR}/kernels/cuda/route.cu"
-  "${CMAKE_CURRENT_LIST_DIR}/kernels/cuda/token_swiglu.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/kernels/cuda/groupwise_int/grouped_swiglu.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/kernels/cuda/groupwise_int/grouping.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/kernels/cuda/routing/route.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/kernels/cuda/groupwise_int/token_swiglu.cu"
   "${CMAKE_CURRENT_LIST_DIR}/topk_softmax_route/bf16/shapes/h2048_e256_k8.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/topk_softmax_route/bf16/shapes/h2560_e512_k10.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/topk_softmax_route/entry.cpp"
@@ -28,6 +28,6 @@ target_sources(ninfer_ops PRIVATE
 include("${CMAKE_CURRENT_LIST_DIR}/routed_swiglu/cpu/sources.cmake")
 
 target_sources(ninfer_nvfp4_non_rdc PRIVATE
-  "${CMAKE_CURRENT_LIST_DIR}/kernels/cuda/nvfp4/launch.cu"
-  "${CMAKE_CURRENT_LIST_DIR}/kernels/cuda/fp8/launch.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/kernels/cuda/block_scaled/nvfp4/launch.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/kernels/cuda/block_scaled/fp8/launch.cu"
 )

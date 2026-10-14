@@ -207,12 +207,18 @@ suite covers the resident codec profiles, FP32/BF16 outputs, residual modes, exp
 banks, empty GPU assignments, Graph relocation and workspace guards. The complete MoE retains
 its existing numerical samples and criteria.
 
-`ninfer_moe_cpu_test` qualifies Q4+Q5/Q6 CPU routed SwiGLU against decoded-input FP64 mathematics,
+`ninfer_moe_cpu_groupwise_int_test` qualifies Q4+Q5/Q6 CPU routed SwiGLU against decoded-input
+FP64 mathematics,
 using an FP32 forward-error budget for dot products, SiLU, multiplication and weighted reduction.
-`ninfer_moe_cpu_avx2_test` and `ninfer_moe_cpu_fma_test` use the same public entry and oracle with
+`ninfer_moe_cpu_groupwise_int_avx2_test` and `ninfer_moe_cpu_groupwise_int_fma_test` use the same
+public entry and oracle with
 restricted test-only dispatch. All three run with CUDA devices hidden. They cover mask/None
 semantics, arbitrary token tails through T=72, affine and strided parent banks, workspace and alias
 checks, signed code domains, scale extremes and tiny-BF16 cancellation around the BF16-dot guard.
+`ninfer_moe_cpu_nvfp4_test` and its `_avx2`/`_fma` variants qualify native NVFP4 banks against
+independent FP64 mathematics, including scale swizzles, per-expert divisors, masked metadata,
+column and chunk tails, full-precision products and tiny inputs. These CPU tests do not load
+model files or use GPU memory.
 `ninfer_moe_test` also qualifies complementary CPU/GPU subsets plus GPU shared/residual composition.
 
 `ninfer_moe_execution_test` qualifies the shared single-layer execution and the Program-owned
@@ -225,7 +231,7 @@ transitions through the real cache schedule. The compact Graph calibration stora
 All/None/partial contributions against the same oracle while reusing one bank window.
 
 ```bash
-ctest --test-dir build -R '^ninfer_moe(_nvfp4|_cpu(_avx2|_fma)?)?_test$' --output-on-failure
+ctest --test-dir build -R '^ninfer_moe(_block_scaled|_cpu_(groupwise_int|nvfp4)(_avx2|_fma)?)?_test$' --output-on-failure
 ctest --test-dir build -R '^ninfer_moe_execution_test$' --output-on-failure
 ```
 

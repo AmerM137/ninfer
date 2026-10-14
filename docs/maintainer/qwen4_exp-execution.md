@@ -359,13 +359,17 @@ lead 规划，不假定与 Main 相同。最终容量、Host reservation、迁�
 | Paged KV 机制 | `tokens_per_row=1/4` 的共同逻辑页及 Host/Device plane 布局、传输和相应覆盖语义已有通用实现；模型 pool/StateImage 接入仍待完成 |
 | PLE GPU 局部能力 | `ple_gate`、`ple_conv_add`、`ple_conv_add_norm`、`ple_state_extract` 已实现；Gate 直接消费合并 K/V view，写 BF16 U 和正式 N records |
 | Main/MTP GPU MoE | NVFP4 A4、block-FP8 A8/G128、小批量 A16、BF16 router/shared、完整与子集入口及固定 Graph replay 已实现 |
+| Main CPU MoE | CPU `routed_swiglu` 直接读取 NVFP4 bank；BF16 输入、FP32 contribution、expert subset、逐 expert divisor 与有界 workspace 已实现 |
 | PLE 准备组件 | 精确 hash/NF4 解码、磁盘 backing、行/页去重与缓存、增量窗口、取消和 GPU 双槽交接已实现，并通过真实权重查表及 K/V Linear 消费验证；完整 Program 编排尚未接入 |
 
 真实剩余工作如下；已完成项不再作为重新开展独立调优活动的前置任务。
 
 1. **PLE Program 编排。** 将已有准备组件及 GPU Ops 接入输入 IDs
    handoff、预取、Main Graph 分段、取消与完整 unit 的资源退役。接口见 PLE I/O。
-2. **Expert streaming。** Main/MTP GPU 数学已实现，见 [GPU MoE 设计](qwen4_exp-moe-gpu.md)。
+2. **Expert streaming。** Main/MTP GPU 数学和 Main CPU contribution 已实现，见 [GPU MoE 设计](qwen4_exp-moe-gpu.md)
+   与 [MoE 接口](../../include/ninfer/ops/moe.h)。CPU 执行沿用固定 `CpuExecutor`，不进行 A4 激活量化，
+   不读取 A4 activation calibration；GU/down 分别读取各 expert 的 matrix divisor。
+   CPU FP8 contribution 尚未实现。
    接入 cache lease/eviction、计算前 readiness、
    搬运粒度和重叠。
    GPU 计算保持固定 Graph 拓扑；驻留调度由 Program 处理。PLE 与 expert

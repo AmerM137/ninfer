@@ -17,6 +17,29 @@ inline __m512 load_bf16(const std::uint16_t* source) noexcept {
 
 inline float reduce_sum(__m512 values) noexcept { return _mm512_reduce_add_ps(values); }
 
+inline __m512 decode_nvfp4(const std::uint8_t* codes, std::uint8_t scale) noexcept {
+    std::uint64_t packed;
+    std::memcpy(&packed, codes, sizeof(packed));
+    const auto words = _mm_cvtepu8_epi16(_mm_cvtsi64_si128(packed));
+    const auto bytes =
+        _mm_or_si128(_mm_and_si128(words, _mm_set1_epi16(15)),
+                     _mm_and_si128(_mm_slli_epi16(words, 4), _mm_set1_epi16(0x0f00)));
+    return _mm512_permutexvar_ps(_mm512_cvtepu8_epi32(bytes),
+                                 _mm512_load_ps(nvfp4_tables.fp32[scale].data()));
+}
+
+inline __m512i decode_nvfp4_bf16(const std::uint8_t* codes, std::uint8_t first_scale,
+                                 std::uint8_t second_scale) noexcept {
+    auto indices = _mm512_cvtepu8_epi16(avx2::unpack_u4(codes));
+    indices      = _mm512_mask_add_epi16(indices, 0xffff0000U, indices, _mm512_set1_epi16(16));
+    const auto first =
+        _mm256_load_si256(reinterpret_cast<const __m256i*>(nvfp4_tables.bf16[first_scale].data()));
+    const auto second =
+        _mm256_load_si256(reinterpret_cast<const __m256i*>(nvfp4_tables.bf16[second_scale].data()));
+    const auto table = _mm512_inserti64x4(_mm512_castsi256_si512(first), second, 1);
+    return _mm512_permutexvar_epi16(indices, table);
+}
+
 // 16 packed bytes -> 32 exact BF16 signed Q4 codes, without group scales.
 inline __m512i decode_signed_q4_bf16(const std::uint8_t* source) noexcept {
     const auto unpacked                                  = avx2::unpack_u4(source);
@@ -27,6 +50,23 @@ inline __m512i decode_signed_q4_bf16(const std::uint8_t* source) noexcept {
         0x40c0, 0x40e0, 0xc100, 0xc0e0, 0xc0c0, 0xc0a0, 0xc080, 0xc040, 0xc000, 0xbf80};
     return _mm512_permutexvar_epi16(indexes, _mm512_load_si512(table));
 }
+
+struct F32 {
+    using Float                = __m512;
+    static constexpr int lanes = 16;
+
+    static Float zero() noexcept { return _mm512_setzero_ps(); }
+
+    static Float load(const float* p) noexcept { return _mm512_loadu_ps(p); }
+
+    static void store(float* p, Float v) noexcept { _mm512_storeu_ps(p, v); }
+
+    static Float bf16(const std::uint16_t* p) noexcept { return load_bf16(p); }
+
+    static Float fma(Float a, Float b, Float c) noexcept { return _mm512_fmadd_ps(a, b, c); }
+
+    static float sum(Float v) noexcept { return reduce_sum(v); }
+};
 
 template <int Bits>
 inline __m512 decode_signed_q(const std::uint8_t* code, const std::uint8_t* high) noexcept {

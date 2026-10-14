@@ -1,9 +1,9 @@
 #pragma once
 
-#include "ops/moe/kernels/cuda/expert.cuh"
+#include "ops/moe/kernels/cuda/output.cuh"
 #include "ops/moe/kernels/cuda/block_scaled/launch.h"
 
-namespace ninfer::ops::detail::moe_block_scaled {
+namespace ninfer::ops::detail::moe_cuda::block_scaled {
 
 __device__ __forceinline__ float routed_value(int token, int row, const Storage& storage,
                                               const float* coefficients) {
@@ -23,4 +23,4 @@ __device__ __forceinline__ float routed_value(int token, int row, const Storage&
     return value;
 }
 
-} // namespace ninfer::ops::detail::moe_block_scaled
+} // namespace ninfer::ops::detail::moe_cuda::block_scaled

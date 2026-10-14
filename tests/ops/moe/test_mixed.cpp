@@ -16,7 +16,7 @@ int test_mixed(Fixture& fixture, CudaExecutionView execution) {
     }
     HostBank native(fixture);
     const auto source = native.source();
-    const ops::CpuSwiGLUExperts cpu_weights{source.gate_up, source.down, {}};
+    const ops::CpuSwiGLUExperts cpu_weights{source.gate_up, source.down};
     int failures = 0;
     for (int tokens : {1, 9, 72}) {
         auto batch = fixture.batch(tokens);

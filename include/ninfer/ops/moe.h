@@ -58,7 +58,6 @@ struct CudaSwiGLUExperts {
 
 struct CpuSwiGLUExperts {
     WeightBankView gate_up, down;
-    ExpertActivationDivisors activation_divisors;
 };
 
 struct SwiGLUWeights {
@@ -161,6 +160,7 @@ void routed_swiglu(const Tensor& x, const RoutedSwiGLUProfile& profile,
 // introduced. The caller retains banks, tensors and scratch until synchronous return. No hidden
 // allocation, transfer or thread creation occurs. Shared experts and residual addition are
 // separate computations. Requires an AVX2/FMA/F16C worker team for nonempty contributions.
+// NVFP4 consumes the native swizzled scales and each expert's matrix divisor directly.
 // Capacity covers the inclusive token interval from a 256-byte-aligned local cursor; it is
 // independent of worker count and excludes destination storage. None requires no scratch.
 [[nodiscard]] std::size_t routed_swiglu_workspace_capacity_bytes(const RoutedSwiGLUProfile& profile,

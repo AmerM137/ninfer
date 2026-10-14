@@ -2,7 +2,7 @@
 
 #include "ops/moe/kernels/cuda/block_scaled/launch.h"
 
-namespace ninfer::ops::detail::moe_block_scaled {
+namespace ninfer::ops::detail::moe_cuda::block_scaled {
 
 template <class Arena>
 Storage allocate(Arena& arena, const Plan& plan, int tokens, bool routed, bool shared) {
@@ -50,4 +50,4 @@ Storage allocate(Arena& arena, const Plan& plan, int tokens, bool routed, bool s
     return out;
 }
 
-} // namespace ninfer::ops::detail::moe_block_scaled
+} // namespace ninfer::ops::detail::moe_cuda::block_scaled

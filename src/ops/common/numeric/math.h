@@ -1,6 +1,7 @@
 #pragma once
 
 #include <type_traits>
+#include <cmath>
 
 #if defined(__CUDACC__)
 #    define NINFER_KERNEL_HD __host__ __device__
@@ -9,6 +10,12 @@
 #endif
 
 namespace ninfer::ops::common {
+
+// Host FP32 SiLU without exp overflow for large negative finite inputs.
+inline float silu_stable(float value) noexcept {
+    const float exponential = std::exp(-std::abs(value));
+    return value >= 0 ? value / (1.0F + exponential) : (value * exponential) / (1.0F + exponential);
+}
 
 inline constexpr float kLog2E = 1.4426950408889634F;
 

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ops/common/quant/nvfp4.h"
 #include "ops/common/numeric/convert.cuh"
 #include "ops/common/quant/fp8.cuh"
 
@@ -8,12 +9,6 @@
 #include <cstdint>
 
 namespace ninfer::ops::common {
-
-// Byte offset of a group scale in the BlockScaleK16M128x4 representation.
-__device__ __forceinline__ std::int64_t nvfp4_scale_byte_offset(int row, int group, int k) {
-    return static_cast<std::int64_t>((row / 128) * (k / 64) + group / 4) * 512 + (row & 31) * 16 +
-           ((row & 127) >> 5) * 4 + (group & 3);
-}
 
 __device__ __forceinline__ float2 decode_nvfp4_e2m1x2(std::uint8_t storage) {
     __nv_fp4x2_e2m1 value;

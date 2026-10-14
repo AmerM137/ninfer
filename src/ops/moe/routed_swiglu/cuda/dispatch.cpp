@@ -3,7 +3,7 @@
 
 namespace ninfer::ops::detail::moe_routed {
 
-const ShapePolicy& resolve_shape(const RoutedSwiGLUProfile& profile) {
+const ShapePolicy& shape_dispatch(const RoutedSwiGLUProfile& profile) {
     validate_expert_profile(profile);
     switch (profile.ffn.down_type) {
     case QType::FP8_E4M3FN_BLOCK128X128_BF16:
@@ -14,13 +14,11 @@ const ShapePolicy& resolve_shape(const RoutedSwiGLUProfile& profile) {
         return q4_q5_h2048_i512_e256_k8();
     case QType::Q6_G64_FP16:
         return q4_q6_h2048_i512_e256_k8();
-    default:
+    case QType::Q8_G32_FP16:
         return q8_q8_h2048_i512_e256_k8();
+    default:
+        throw std::invalid_argument("unsupported MoE expert format");
     }
-}
-
-SharedPlan select_shared(int tokens) {
-    return {{1, tokens == 1 ? 1 : 4, tokens == 1, false}, tokens >= 16 ? 64 : 0};
 }
 
 } // namespace ninfer::ops::detail::moe_routed

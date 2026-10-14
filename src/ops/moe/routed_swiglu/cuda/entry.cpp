@@ -3,49 +3,53 @@
 #include "ops/moe/operands.h"
 #include "ops/moe/routed_swiglu/cuda/dispatch.h"
 #include "ops/moe/workspace.h"
+#include "ops/moe/kernels/cuda/groupwise_int/workspace.h"
 #include "ops/moe/kernels/cuda/block_scaled/workspace.h"
 
 namespace ninfer::ops {
 namespace {
-namespace impl = detail::moe_routed;
+namespace kernel       = detail::moe_cuda;
+namespace integer      = kernel::groupwise_int;
+namespace block_scaled = kernel::block_scaled;
+namespace impl         = detail::moe_routed;
 
 struct CallStorage {
-    detail::ExpertStorage integer;
-    detail::moe_block_scaled::Storage block_scaled;
+    integer::ExpertStorage integer;
+    block_scaled::Storage block_scaled;
 };
 
 template <class Arena>
-CallStorage allocate(Arena& arena, const impl::ShapePolicy& shape, int tokens,
-                     ExpertSubsetKind subset, bool shared, bool split_activation) {
-    const auto plan = shape.select(tokens, shared);
-    if (plan.block_scaled.gate_columns) {
+CallStorage allocate(Arena& arena, const impl::Plan& plan, int tokens, ExpertSubsetKind subset,
+                     bool shared, bool split_activation) {
+    if (plan.implementation == kernel::ExpertImplementation::BlockScaled) {
         CallStorage out;
-        out.block_scaled = detail::moe_block_scaled::allocate(
-            arena, plan.block_scaled, tokens, subset != ExpertSubsetKind::None, shared);
+        out.block_scaled = block_scaled::allocate(arena, plan.block_scaled, tokens,
+                                                  subset != ExpertSubsetKind::None, shared);
         return out;
     }
     if (subset == ExpertSubsetKind::None) {
         if (!shared) { return {}; }
-        return {.integer = detail::allocate_shared(arena, tokens)};
+        return {.integer = integer::allocate_shared(arena, tokens)};
     }
-    return {.integer = plan.grouped ? detail::allocate_grouped(arena, tokens, plan.group, shared,
-                                                               split_activation)
-                                    : detail::allocate_token(arena, tokens, shared)};
+    return {.integer = plan.integer.grouped
+                           ? integer::allocate_grouped(arena, tokens, plan.integer.group, shared,
+                                                       split_activation)
+                           : integer::allocate_token(arena, tokens, shared)};
 }
 
 std::size_t capacity(const RoutedSwiGLUProfile& profile, const SwiGLUProfile* shared,
                      ExpertSubsetKind subset, DType type, MoeEpilogue mode, int first, int last) {
-    const auto& shape = impl::resolve_shape(profile);
+    const auto& shape = impl::shape_dispatch(profile);
     detail::validate_interval(first, last);
     detail::validate_subset_kind(subset);
     detail::validate_output(type, mode);
     if (shared) { detail::validate_shared_profile(*shared, profile.ffn.hidden); }
     const auto boundaries =
         subset == ExpertSubsetKind::None ? std::span<const int>{} : shape.allocation_boundaries;
-    return detail::interval_capacity(first, last, boundaries, [&](int tokens) {
+    return detail::interval_capacity(first, last, boundaries, impl::kSliceTokens, [&](int tokens) {
         WorkspaceLayoutBuilder layout;
-        (void)allocate(layout, shape, tokens, subset, shared != nullptr,
-                       profile.ffn.gate_up_type == QType::Q8_G32_FP16);
+        (void)allocate(layout, shape.select(tokens, shared != nullptr), tokens, subset,
+                       shared != nullptr, profile.ffn.gate_up_type == QType::Q8_G32_FP16);
         return layout.peak_bytes(1);
     });
 }
@@ -54,7 +58,7 @@ void execute(const Tensor& x, const RoutedSwiGLUProfile& profile, const CudaSwiG
              const ExpertRoutes& routes, ExpertSubset subset, const ScaledSwiGLUTerm* shared,
              MoeEpilogue mode, Tensor& destination, MemoryArena& workspace,
              CudaExecutionView execution) {
-    const auto& shape = impl::resolve_shape(profile);
+    const auto& shape = impl::shape_dispatch(profile);
     detail::MoeOperands operands("routed_swiglu", execution);
     const int tokens = operands.input(x, profile.ffn.hidden);
     operands.output(destination, profile.ffn.hidden, tokens, mode);
@@ -74,12 +78,12 @@ void execute(const Tensor& x, const RoutedSwiGLUProfile& profile, const CudaSwiG
     operands.finish();
     nvtx::ScopedRange range(nvtx::Name::RoutedSwiGLU, nvtx::Category::Moe, tokens);
     if (subset.kind == ExpertSubsetKind::None && !shared) {
-        if (mode == MoeEpilogue::Write) { detail::launch_zero(destination, execution); }
+        if (mode == MoeEpilogue::Write) { kernel::launch_zero(destination, execution); }
         return;
     }
-    for (std::int64_t start = 0; start < tokens; start += detail::kMoeSliceTokens) {
+    for (std::int64_t start = 0; start < tokens; start += impl::kSliceTokens) {
         const int offset = static_cast<int>(start);
-        const int count  = std::min(tokens - offset, detail::kMoeSliceTokens);
+        const int count  = std::min(tokens - offset, impl::kSliceTokens);
         const auto input = x.slice(1, offset, count);
         auto output      = destination.slice(1, offset, count);
         const ExpertRoutes selection =
@@ -92,37 +96,36 @@ void execute(const Tensor& x, const RoutedSwiGLUProfile& profile, const CudaSwiG
             term = ScaledSwiGLUTerm{shared->weights, shared->coefficients.slice(0, offset, count)};
         }
         auto scope         = workspace.scope();
-        const auto buffers = allocate(workspace, shape, count, subset.kind, shared != nullptr,
-                                      profile.ffn.gate_up_type == QType::Q8_G32_FP16);
         const auto plan    = shape.select(count, shared != nullptr);
-        if (plan.block_scaled.gate_columns) {
-            detail::moe_block_scaled::launch(input, experts, selection, subset,
-                                             term ? &*term : nullptr, mode, output,
-                                             plan.block_scaled, buffers.block_scaled, execution);
+        const auto buffers = allocate(workspace, plan, count, subset.kind, shared != nullptr,
+                                      profile.ffn.gate_up_type == QType::Q8_G32_FP16);
+        if (plan.implementation == kernel::ExpertImplementation::BlockScaled) {
+            block_scaled::launch(input, experts, selection, subset, term ? &*term : nullptr, mode,
+                                 output, plan.block_scaled, buffers.block_scaled, execution);
             continue;
         }
         const auto& storage = buffers.integer;
         if (subset.kind == ExpertSubsetKind::None) {
-            detail::launch_shared_swiglu(input, *term, mode, output, storage,
-                                         impl::select_shared(count), execution);
+            integer::launch_shared_swiglu(input, *term, mode, output, storage, plan.integer.shared,
+                                          execution);
             continue;
         }
-        if (plan.grouped) {
-            detail::launch_group_count(selection, subset, storage.groups, execution);
-            detail::launch_group_scan(selection, plan.group, storage.groups, execution);
-            if (plan.group.adaptive) {
-                detail::launch_token_swiglu(input, profile, experts, selection, subset,
-                                            term ? &*term : nullptr, mode, output, plan.token,
-                                            storage, {}, execution, true);
+        if (plan.integer.grouped) {
+            integer::launch_group_count(selection, subset, storage.groups, execution);
+            integer::launch_group_scan(selection, plan.integer.group, storage.groups, execution);
+            if (plan.integer.group.adaptive) {
+                integer::launch_token_swiglu(input, profile, experts, selection, subset,
+                                             term ? &*term : nullptr, mode, output,
+                                             plan.integer.token, storage, {}, execution, true);
             }
-            detail::launch_group_index(selection, storage.groups, execution);
-            detail::launch_grouped_swiglu(input, profile, experts, selection,
-                                          term ? &*term : nullptr, mode, output, plan.group,
-                                          storage, execution);
+            integer::launch_group_index(selection, storage.groups, execution);
+            integer::launch_grouped_swiglu(input, profile, experts, selection,
+                                           term ? &*term : nullptr, mode, output,
+                                           plan.integer.group, storage, execution);
         } else {
-            detail::launch_token_swiglu(input, profile, experts, selection, subset,
-                                        term ? &*term : nullptr, mode, output, plan.token, storage,
-                                        {}, execution);
+            integer::launch_token_swiglu(input, profile, experts, selection, subset,
+                                         term ? &*term : nullptr, mode, output, plan.integer.token,
+                                         storage, {}, execution);
         }
     }
 }

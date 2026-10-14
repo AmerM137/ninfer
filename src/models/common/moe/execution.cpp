@@ -262,8 +262,7 @@ bool compute_cpu(const PreparedExecution& call) {
     MemoryArena scratch(host.workspace.alloc_bytes(call.requirements.cpu_workspace_bytes));
     auto destination = frame.host_partial;
     nvtx::ScopedRange cpu(nvtx::Name::MoeCpu, nvtx::Category::Moe);
-    ops::routed_swiglu(frame.host_input, p.profile.routed,
-                       {call.source.gate_up, call.source.down, p.activation_divisors},
+    ops::routed_swiglu(frame.host_input, p.profile.routed, {call.source.gate_up, call.source.down},
                        frame.host_routes, call.partition.cpu(), destination, scratch, host.cpu);
     return true;
 }

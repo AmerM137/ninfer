@@ -1,12 +1,21 @@
 #pragma once
 
 #include <cuda_runtime.h>
+#include <cstddef>
 
 namespace ninfer::ops {
 enum class Cache { ca, cg };
 }
 
 namespace ninfer::ops::common {
+
+__device__ __forceinline__ void prefetch_l2(const void* data, std::size_t bytes,
+                                            std::size_t offset) {
+    if (data && offset < bytes) {
+        const auto* address = static_cast<const char*>(data) + offset;
+        asm volatile("prefetch.global.L2 [%0];" ::"l"(address));
+    }
+}
 
 template <class V, class T>
 __device__ __forceinline__ V load_vec(const T* ptr) {

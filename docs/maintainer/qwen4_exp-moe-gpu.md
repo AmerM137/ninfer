@@ -25,8 +25,8 @@ Expert 上传、CPU 计算分工及 Program 编排继续由
    routed 归约在 FP32 中汇合，最终写 BF16。先保留清楚的 GU → down 依赖。
 
 Main 现可独立调用完整 GPU MoE，也可用既有 routes/mask 计算一个 GPU 子集，
-为后续混合执行提供 FP32 contribution。它不包含 CPU NVFP4/FP8 数学、动态上传调度，
-也不代表完整 Qwen4Exp 模型已经接入。
+为后续混合执行提供 FP32 contribution。CPU NVFP4 routed contribution 已有独立实现；本文不包含
+CPU FP8 数学、动态上传调度，也不代表完整 Qwen4Exp 模型已经接入。
 
 ## 2. 几何和数学
 

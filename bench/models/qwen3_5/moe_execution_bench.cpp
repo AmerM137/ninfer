@@ -237,9 +237,9 @@ void serial(const Tensor& x, const shared::Parameters& p, shared::PartitionView 
                           std::any_of(ids, ids + std::size_t(p.profile.routed.top_k) * x.ne[1],
                                       [&](auto id) { return mask[id] == 0; });
     if (cpu_work) {
-        ops::routed_swiglu(frame.x_host, p.profile.routed,
-                           {source.gate_up, source.down, p.activation_divisors}, frame.cpu_routes,
-                           partition.cpu(), frame.cpu_host, host.workspace, host.cpu);
+        ops::routed_swiglu(frame.x_host, p.profile.routed, {source.gate_up, source.down},
+                           frame.cpu_routes, partition.cpu(), frame.cpu_host, host.workspace,
+                           host.cpu);
         copy_bytes_async(bytes(frame.cpu_device), bytes(frame.cpu_host, true), host.transfer);
         host.partial_ready.record(host.transfer.stream());
         host.partial_ready.wait(execution.cuda.stream());
