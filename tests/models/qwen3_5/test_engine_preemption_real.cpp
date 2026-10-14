@@ -255,8 +255,9 @@ public:
                     first.scheduling.snapshot_restores == 0 &&
                     first.scheduling.replayed_tokens == 0,
                 "post-output pressure recovery leaked into the first-output snapshot");
-        std::uint64_t first_d2h = 0, first_h2d = 0;
-        for (const auto& resource : first.context_transfers) {
+        std::uint64_t first_d2h = first.context_transfers.state[0].bytes,
+                      first_h2d = first.context_transfers.state[1].bytes;
+        for (const auto& resource : first.context_transfers.kv) {
             first_d2h += resource[0].bytes;
             first_h2d += resource[1].bytes;
         }
@@ -285,8 +286,9 @@ void settled(const ninfer::RuntimeStats& stats, const ninfer::MemorySummary& mem
                 stats.materializing_requests == 0 && stats.capture_pending_requests == 0 &&
                 stats.terminal_pending_requests == 0,
             "completed recovery left live scheduling membership");
-    require(stats.device_state_occupied_slots == 0 && stats.device_main_kv_occupied_pages == 0 &&
-                stats.device_backend_kv_occupied_pages == 0 &&
+    require(stats.device_state_occupied_slots == 0 &&
+                std::all_of(stats.kv_pools.begin(), stats.kv_pools.end(),
+                            [](const auto& pool) { return pool.occupied_page_groups == 0; }) &&
                 stats.host_context_occupied_bytes == 0 && stats.host_context_reserved_bytes == 0 &&
                 memory.host_context_occupied_bytes == 0 && memory.host_context_reserved_bytes == 0,
             "completed recovery retained physical resources with history disabled");

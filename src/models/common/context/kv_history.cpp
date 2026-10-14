@@ -82,11 +82,10 @@ KVBinding::KVBinding(KVBinding&& other) noexcept
     : store_(std::exchange(other.store_, nullptr)), history_(std::move(other.history_)),
       source_(std::move(other.source_)), reservation_(std::move(other.reservation_)),
       row_(std::move(other.row_)), restores_(std::move(other.restores_)),
-      restore_destinations_(std::move(other.restore_destinations_)),
       tail_destination_(std::exchange(other.tail_destination_, std::nullopt)),
       tail_source_(other.tail_source_), tail_pinned_(std::exchange(other.tail_pinned_, false)),
       restores_published_(other.restores_published_), write_tail_(other.write_tail_),
-      frontier_(other.frontier_) {}
+      frontier_(other.frontier_), mapping_enqueued_(other.mapping_enqueued_) {}
 
 bool KVBinding::blocks_writer(KVHistoryHandle history) const noexcept {
     return store_ && tail_destination_ && store_->valid(history) &&
@@ -95,6 +94,9 @@ bool KVBinding::blocks_writer(KVHistoryHandle history) const noexcept {
 
 DeviceKVPageHandle KVBinding::tail_source() const {
     if (!store_ || !tail_pinned_) throw std::logic_error("KV tail source is not ready");
+    for (const auto& restore : restores_) {
+        if (restore.page() == tail_source_) return restore.device();
+    }
     return store_->pages().physical(tail_source_);
 }
 
@@ -105,22 +107,46 @@ DeviceKVPageHandle KVBinding::tail_destination() const {
 
 void KVBinding::publish_restores() {
     if (!store_ || restores_published_) throw std::logic_error("KV restores already published");
-    for (auto page : restores_) store_->pages().publish_device_replica(page);
+    for (auto& restore : restores_) restore.publish();
+    restores_.clear();
     restores_published_ = true;
 }
 
 void KVBinding::prepare_tail_copy() {
-    if (!store_ || !restores_published_)
-        throw std::logic_error("KV restore must precede tail copy");
+    if (!store_) throw std::logic_error("KV binding already consumed");
     if (tail_destination_ && !tail_pinned_) {
         store_->pages().pin_source(tail_source_);
         tail_pinned_ = true;
     }
 }
 
-KVHistory KVBinding::commit(cudaStream_t stream) {
+LogicalKVPageStore& KVBinding::pages() const noexcept { return store_->pages(); }
+
+void KVBinding::enqueue_mapping(cudaStream_t stream) {
+    if (!store_ || mapping_enqueued_) throw std::logic_error("KV mapping is not reservable");
+    auto& handles = store_->publish_;
+    handles.clear();
+    const auto& history = store_->require(this->history());
+    for (std::uint32_t i = 0; i < page_count(frontier_); ++i) {
+        const auto page = store_->membership(history, i);
+        if (tail_destination_ && i + 1 == page_count(frontier_)) {
+            handles.push_back(tail_destination());
+        } else if (const auto restore =
+                       std::find_if(restores_.begin(), restores_.end(),
+                                    [&](const auto& value) { return value.page() == page; });
+                   restore != restores_.end()) {
+            handles.push_back(restore->device());
+        } else {
+            handles.push_back(store_->pages().physical(page));
+        }
+    }
+    store_->tables_->publish(row_->handle(), 0, handles, stream);
+    mapping_enqueued_ = true;
+}
+
+KVHistory KVBinding::commit() {
     if (!store_) throw std::logic_error("KV binding already consumed");
-    return store_->commit(*this, stream);
+    return store_->commit(*this);
 }
 
 KVHistoryStore::KVHistoryStore(LogicalKVPageStore& pages, KVExecutionTablePool& tables,
@@ -323,7 +349,8 @@ void KVHistoryStore::truncate_membership(History& history, std::uint32_t count) 
         const bool host = pages_->host_resident(page);
         if (!pages_->release_reference(page))
             throw std::logic_error("KV history still has an unowned reader");
-        if (host && pages_->history_references(page) == 0) host_releases.push_back(page);
+        if (host && pages_->history_references(page) == 0 && pages_->source_pins(page) == 0)
+            host_releases.push_back(page);
     }
     history.directory  = std::move(directory);
     history.page_count = count;
@@ -453,13 +480,10 @@ KVBinding KVHistoryStore::prepare_binding(const KVPrefixRef* source, std::uint32
     binding.row_.emplace(tables_->acquire(execution_row));
     const auto& history = require(binding.history());
     binding.restores_.reserve(demand.restore_pages);
-    binding.restore_destinations_.reserve(demand.restore_pages);
     for (std::uint32_t i = 0; i < page_count(frontier); ++i) {
         auto page = membership(history, i);
         if (pages_->device_covers(page, coverage(frontier, i))) continue;
-        binding.restore_destinations_.push_back(
-            pages_->reserve_device_replica(page, binding.reservation_));
-        binding.restores_.push_back(page);
+        binding.restores_.push_back(pages_->reserve_device_replica(page, binding.reservation_));
     }
     if (demand.tail_copies) {
         binding.tail_source_ = membership(history, page_count(frontier) - 1);
@@ -474,9 +498,7 @@ void KVHistoryStore::abort(KVBinding& binding) noexcept {
         if (binding.tail_pinned_) pages_->unpin_source(binding.tail_source_);
         if (binding.tail_destination_)
             pages_->abort_transfer_destination(*binding.tail_destination_, binding.reservation_);
-        if (!binding.restores_published_)
-            for (auto page : binding.restores_)
-                pages_->abort_device_replica(page, binding.reservation_);
+        binding.restores_.clear();
         binding.store_ = nullptr;
         binding.row_.reset();
         binding.reservation_.release();
@@ -485,8 +507,8 @@ void KVHistoryStore::abort(KVBinding& binding) noexcept {
     } catch (...) { std::terminate(); }
 }
 
-KVHistory KVHistoryStore::commit(KVBinding& binding, cudaStream_t stream) {
-    if (!binding.restores_published_ || !binding.row_)
+KVHistory KVHistoryStore::commit(KVBinding& binding) {
+    if (!binding.restores_published_ || !binding.row_ || !binding.mapping_enqueued_)
         throw std::logic_error("KV binding has unfinished replicas");
     auto& history = require(binding.history());
     binding.source_.reset();
@@ -519,10 +541,6 @@ KVHistory KVHistoryStore::commit(KVBinding& binding, cudaStream_t stream) {
         pages_->prepare_write(tail, writer(binding.history()), history.frontier % kPageTokens,
                               history.frontier % kPageTokens);
     }
-    publish_.clear();
-    for (std::uint32_t i = 0; i < history.page_count; ++i)
-        publish_.push_back(pages_->physical(membership(history, i)));
-    tables_->publish(binding.row_->handle(), 0, publish_, stream);
     history.row.emplace(std::move(*binding.row_));
     binding.row_.reset();
     history.reservation = std::move(binding.reservation_);

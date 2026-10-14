@@ -15,13 +15,11 @@ std::int32_t checked_i32(std::uint32_t value, const char* label);
 
 std::uint32_t kv_pages_for_frontier(std::uint32_t frontier) noexcept;
 
-std::size_t context_resource_index(runtime::ContextResourceClass resource);
-
 runtime::ContextTransferRequirement
 state_transfer_requirement(TransferWork work, runtime::ContextTransferDirection direction);
 
 runtime::ContextTransferRequirement
-kv_transfer_requirement(runtime::ContextResourceClass resource,
+kv_transfer_requirement(runtime::ContextTransferResource resource,
                         runtime::ContextTransferDirection direction, std::uint32_t pages,
                         TransferWork work);
 

@@ -45,60 +45,48 @@ std::optional<CheckpointHandle> ProgramImpl::detach_checkpoint(SequenceState& st
     return handle;
 }
 
-bool ProgramImpl::prepare_backup(ContextTransaction& tx, CheckpointState& record,
-                                 bool shared_device) {
-    if (!host_context_arena) { return false; }
-    // Both copies already present cost no transfer. A source still read by another resident stays
-    // resident; the paused record is an evictable reference, never a permanent Device pin.
-    tx.preserve_state_device =
+bool ProgramImpl::prepare_backup(context::MigrationBatch& migration, CheckpointState& record,
+                                 bool shared_device, bool& preserve_state_device) {
+    if (!host_context_arena) return false;
+    preserve_state_device =
         shared_device && state_store->source_pins(record.continuation().image) != 0;
     if (!state_store->host_resident(record.continuation().image)) {
         auto transfer = state_store->reserve_device_to_host(record.continuation().image);
-        if (transfer) { tx.state_transfer.emplace(std::move(*transfer)); }
-        if (!tx.state_transfer) { return false; }
+        if (!transfer) return false;
+        migration.add_state_copy(std::move(*transfer), preserve_state_device);
     }
     const auto collect = [&](context::KVHistoryStore& histories, context::LogicalKVPageStore& pages,
-                             context::KVHistoryHandle address,
-                             runtime::ContextResourceClass resource) {
-        KVTransfer transfer;
-        transfer.pages       = &pages;
-        transfer.resource    = resource;
-        transfer.drop_device = true;
+                             context::KVHistoryHandle address, runtime::KvPoolId pool) {
+        std::vector<context::LogicalKVPageHandle> logical;
         for (std::uint32_t i = 0; i < histories.mapped_pages(address); ++i) {
             const auto page = histories.logical_page(address, i);
             if (!pages.device_resident(page) ||
-                (shared_device && pages.active_history_references(page))) {
+                (shared_device && pages.active_history_references(page)))
                 continue;
-            }
             if (pages.host_replica_current(page)) {
-                if (!pages.drop_device_replica(page)) { return false; }
+                if (!pages.drop_device_replica(page)) return false;
             } else {
-                transfer.logical.push_back(page);
+                logical.push_back(page);
             }
         }
-        if (!transfer.logical.empty()) {
+        if (!logical.empty()) {
             auto destination =
-                host_kv_extents ? host_kv_extents->prepare(pages, transfer.logical) : std::nullopt;
-            if (destination) { transfer.host_destination.emplace(std::move(*destination)); }
-            if (!transfer.host_destination) { return false; }
-            transfer.physical = host_kv_extents->device_sources(*transfer.host_destination);
+                host_kv_extents ? host_kv_extents->prepare(pages, logical) : std::nullopt;
+            if (!destination) return false;
+            migration.add_backup(pool, pages, std::move(logical), std::move(*destination), true);
         }
-        tx.kv_transfers.push_back(std::move(transfer));
         return true;
     };
-    if (!collect(*text_kv_histories, *text_kv_pages, record.history().text,
-                 runtime::ContextResourceClass::MainKV)) {
+    if (!collect(*text_kv_histories, *text_kv_pages, record.history().text, kTextKvPool))
         return false;
-    }
-    return !record.history().backend ||
-           collect(*backend_kv_histories, *backend_kv_pages, *record.history().backend,
-                   runtime::ContextResourceClass::BackendKV);
+    return !record.history().backend || collect(*backend_kv_histories, *backend_kv_pages,
+                                                *record.history().backend, kBackendKvPool);
 }
 
 bool ProgramImpl::start_pause(SequenceHandle handle, bool save_snapshot,
                               runtime::ExecutionTiming* observation) {
     runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Submit, observation);
-    if (context_transaction_ || pending_transaction_) { return false; }
+    if (context_operation_ || pending_transaction_) { return false; }
     if (!valid_sequence(handle)) { throw std::logic_error("pause has a stale sequence"); }
     const auto lane = ContractAccess::lane(handle).value;
     auto& state     = sequences[lane];
@@ -107,6 +95,7 @@ bool ProgramImpl::start_pause(SequenceHandle handle, bool save_snapshot,
         control.lifecycle != Lifecycle::Replaying) {
         throw std::logic_error("pause requires a committed boundary");
     }
+    // Prefill may leave its hidden-tail publication queued on the compute stream.
     timing.begin_wait();
     device.synchronize();
     timing.end_wait();
@@ -133,6 +122,8 @@ bool ProgramImpl::start_pause(SequenceHandle handle, bool save_snapshot,
                 state, state.continuation.metadata.execution_frontier,
                 backend_kv_cache() ? state.continuation.metadata.execution_frontier : 0);
             enqueue_dflash_context_append(lanes, begin, count);
+            // Normalization uses the shared draft ingress and execution rows. Retire this
+            // mathematical unit before another resident can overwrite its Host staging.
             timing.begin_wait();
             device.synchronize();
             timing.end_wait();
@@ -179,32 +170,31 @@ bool ProgramImpl::start_pause(SequenceHandle handle, bool save_snapshot,
     state.lane            = lane;
     control               = {};
     control.lifecycle     = Lifecycle::Pausing;
-    ContextTransaction tx;
-    tx.kind  = ContextOperationKind::Pause;
-    tx.lane  = lane;
-    tx.epoch = lane_epochs[lane];
-    tx.paused.emplace(ResumeState(std::move(saved)));
-    if (tx.paused->has_snapshot()) {
-        auto& snapshot = checkpoint(*tx.paused->impl_->snapshot);
-        if (!prepare_backup(tx, snapshot, true)) {
-            tx.state_transfer.reset();
-            tx.kv_transfers.clear();
-            if (!revoke_snapshot(*tx.paused)) {
-                throw std::logic_error("failed pause snapshot could not be released");
+    context_operation_.emplace(*migration_context_, host_kv_extents.get(),
+                               PauseOperation{lane, ResumeState(std::move(saved))});
+    auto& tx        = std::get<PauseOperation>(context_operation_->action);
+    auto& migration = context_operation_->migration;
+    try {
+        if (tx.paused.has_snapshot()) {
+            auto& snapshot = checkpoint(*tx.paused.impl_->snapshot);
+            if (!prepare_backup(migration, snapshot, true, tx.preserve_state_device)) {
+                migration.reset_plan();
+                tx.discard_snapshot = true;
             }
         }
+        migration.submit();
+        return true;
+    } catch (...) {
+        abort_context();
+        throw;
     }
-    context_transaction_.emplace(std::move(tx));
-    auto& active = *context_transaction_;
-    if (active.state_transfer) { enqueue_state_backup(active); }
-    enqueue_context_transfers(active);
-    return true;
 }
 
-ResumeState ProgramImpl::complete_pause(ContextTransaction& tx) {
-    if (!tx.paused) { throw std::logic_error("pause operation lost its durable request"); }
-    if (tx.paused->has_snapshot()) {
-        const auto& record = checkpoint(*tx.paused->impl_->snapshot);
+ResumeState ProgramImpl::complete_pause(PauseOperation& tx) {
+    if (tx.discard_snapshot && !revoke_snapshot(tx.paused))
+        throw std::logic_error("failed pause snapshot could not be released");
+    if (tx.paused.has_snapshot()) {
+        const auto& record = checkpoint(*tx.paused.impl_->snapshot);
         if (!tx.preserve_state_device &&
             state_store->device_resident(record.continuation().image) &&
             !state_store->drop_device_replica(record.continuation().image)) {
@@ -215,6 +205,6 @@ ResumeState ProgramImpl::complete_pause(ContextTransaction& tx) {
     sequences[tx.lane]      = {};
     sequences[tx.lane].lane = tx.lane;
     invalidate_lane(tx.lane);
-    return std::move(*tx.paused);
+    return std::move(tx.paused);
 }
 } // namespace ninfer::models::qwen3_5::detail

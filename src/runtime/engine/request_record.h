@@ -28,19 +28,19 @@ enum class RequestEngineHostPhase : std::uint8_t {
 };
 
 struct RequestHostTiming {
-    std::uint64_t queue_wait_ns                   = 0;
-    std::uint64_t engine_boundary_exposed_ns      = 0;
-    std::uint64_t program_submit_exposed_ns       = 0;
-    std::uint64_t program_post_exposed_ns         = 0;
-    std::uint64_t engine_commit_output_exposed_ns = 0;
-    std::uint64_t engine_maintenance_exposed_ns   = 0;
-    std::uint64_t device_wait_exposed_ns          = 0;
+    std::uint64_t queue_wait_ns                    = 0;
+    std::uint64_t engine_boundary_exposed_ns       = 0;
+    std::uint64_t program_submit_exposed_ns        = 0;
+    std::uint64_t program_post_exposed_ns          = 0;
+    std::uint64_t engine_commit_output_exposed_ns  = 0;
+    std::uint64_t engine_maintenance_exposed_ns    = 0;
+    std::uint64_t device_wait_exposed_ns           = 0;
     std::uint64_t constraint_draft_wait_exposed_ns = 0;
-    std::uint64_t decode_host_exposed_ns          = 0;
-    std::uint64_t decode_device_wait_exposed_ns   = 0;
-    std::uint64_t prefill_units                   = 0;
-    std::uint64_t decode_rounds                   = 0;
-    std::uint64_t control_units                   = 0;
+    std::uint64_t decode_host_exposed_ns           = 0;
+    std::uint64_t decode_device_wait_exposed_ns    = 0;
+    std::uint64_t prefill_units                    = 0;
+    std::uint64_t decode_rounds                    = 0;
+    std::uint64_t control_units                    = 0;
 
     void expose_engine(RequestEngineHostPhase phase, std::uint64_t elapsed_ns,
                        bool decode_member) noexcept {
@@ -217,7 +217,9 @@ struct RequestRecord {
     std::uint64_t initial_binding_ns = 0;
     GenerationWorkTiming prefill_work;
     GenerationWorkTiming replay_work;
-    std::array<std::array<GenerationTransferTiming, 3>, 3> context_transfers{};
+    std::array<std::array<GenerationTransferTiming, 3>,
+               ModelContract::Program::ContextResources::pool_capacity + 1>
+        context_transfers{};
     std::optional<GenerationFirstOutputTiming> first_output_timing;
     SpeculativeStats speculative_stats;
 

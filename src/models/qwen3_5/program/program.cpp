@@ -139,8 +139,11 @@ PrefixShortlistKey Program::checkpoint_key(CheckpointHandle h, std::uint32_t f) 
     return impl_->checkpoint_key(h, f);
 }
 
-runtime::ContextResourceUsage
-Program::checkpoint_footprint(std::span<const CheckpointHandle> handles) const {
+std::span<const runtime::KvPoolDescriptor> Program::kv_pools() const noexcept {
+    return impl_->kv_pools;
+}
+
+ContextResources Program::checkpoint_footprint(std::span<const CheckpointHandle> handles) const {
     return impl_->checkpoint_footprint(handles);
 }
 
@@ -179,7 +182,7 @@ bool Program::revoke_snapshot(ResumeState& paused) noexcept {
     return impl_->revoke_snapshot(paused);
 }
 
-runtime::ContextResourceUsage Program::snapshot_resources(const ResumeState& paused) const {
+ContextResources Program::snapshot_resources(const ResumeState& paused) const {
     return impl_->snapshot_resources(paused);
 }
 
@@ -196,11 +199,11 @@ std::size_t Program::release_redundant_host(std::span<const CheckpointHandle> ex
     return impl_->release_redundant_host(excluded, pending_backup);
 }
 
-runtime::ResourceReservation Program::reserve_units(std::span<const ExecutionUnit> units) {
+ResourceReservation Program::reserve_units(std::span<const ExecutionUnit> units) {
     return impl_->reserve_units(units);
 }
 
-bool Program::reclaim_capture_reservation(runtime::ContextResourceUsage shortage) {
+bool Program::reclaim_capture_reservation(ContextResources shortage) {
     return impl_->reclaim_capture_reservation(shortage);
 }
 
@@ -228,13 +231,13 @@ bool Program::start_demote(const ContextDemotion& plan) { return impl_->start_de
 
 ContextReclaimPlan Program::plan_reclaim(std::span<const CheckpointHandle> allowed,
                                          std::span<const CheckpointHandle> excluded,
-                                         runtime::ContextResourceUsage shortage) const {
+                                         ContextResources shortage) const {
     return impl_->plan_reclaim(allowed, excluded, shortage);
 }
 
 std::vector<ContextRelease> Program::plan_releases(std::span<const CheckpointHandle> allowed,
                                                    std::span<const CheckpointHandle> excluded,
-                                                   runtime::ContextResourceUsage shortage) const {
+                                                   ContextResources shortage) const {
     return impl_->plan_releases(allowed, excluded, shortage);
 }
 
@@ -254,7 +257,7 @@ bool Program::recovery_pending(SequenceHandle sequence) const noexcept {
     return impl_->recovery_pending(sequence);
 }
 
-bool Program::has_context_transaction() const noexcept { return impl_->has_context_transaction(); }
+bool Program::has_context_operation() const noexcept { return impl_->has_context_operation(); }
 
 PrefillProgress Program::advance_prefill(SequenceHandle h, runtime::ExecutionTiming* t,
                                          runtime::TokenMaskProvider* m) {

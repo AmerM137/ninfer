@@ -76,24 +76,13 @@ bool report_has_activity(const ThroughputReport& report) {
            report.current.materialization_state_forks !=
                report.previous.materialization_state_forks ||
            report.current.state_restores != report.previous.state_restores ||
-           report.current.state_d2h_count != report.previous.state_d2h_count ||
-           report.current.state_h2d_count != report.previous.state_h2d_count ||
-           report.current.state_d2d_count != report.previous.state_d2d_count ||
-           report.current.main_kv_d2h_pages != report.previous.main_kv_d2h_pages ||
-           report.current.main_kv_h2d_pages != report.previous.main_kv_h2d_pages ||
-           report.current.main_kv_d2d_pages != report.previous.main_kv_d2d_pages ||
-           report.current.backend_kv_d2h_pages != report.previous.backend_kv_d2h_pages ||
-           report.current.backend_kv_h2d_pages != report.previous.backend_kv_h2d_pages ||
-           report.current.backend_kv_d2d_pages != report.previous.backend_kv_d2d_pages ||
+           report.current.context_transfers != report.previous.context_transfers ||
            report.current.pressure_spill_pages != report.previous.pressure_spill_pages ||
            report.current.partial_tail_cow_pages != report.previous.partial_tail_cow_pages ||
            report.current.device_state_occupied_slots !=
                report.previous.device_state_occupied_slots ||
            report.current.host_state_occupied_slots != report.previous.host_state_occupied_slots ||
-           report.current.device_main_kv_occupied_pages !=
-               report.previous.device_main_kv_occupied_pages ||
-           report.current.device_backend_kv_occupied_pages !=
-               report.previous.device_backend_kv_occupied_pages ||
+           report.current.kv_pools != report.previous.kv_pools ||
            report.current.host_kv_occupied_bytes != report.previous.host_kv_occupied_bytes ||
            report.current.host_context_occupied_bytes !=
                report.previous.host_context_occupied_bytes ||

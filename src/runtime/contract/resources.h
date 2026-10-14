@@ -2,26 +2,76 @@
 
 #include "runtime/contract/request.h"
 #include "core/transfer_work.h"
+#include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <optional>
+#include <string_view>
+
+namespace ninfer {
+struct KVPageGeometry;
+}
 
 namespace ninfer::runtime {
 
 enum class CheckpointRole : std::uint8_t { InputReplay, LongAnchor, SharedPrefix, Continuation };
 
-// Physical quantities are sampled from stores, never a scheduler-owned occupancy ledger.
-struct ContextResourceUsage {
-    std::uint32_t state_slots                                                   = 0;
-    std::uint32_t main_kv_pages                                                 = 0;
-    std::uint32_t backend_kv_pages                                              = 0;
-    std::size_t host_bytes                                                      = 0;
-    friend bool operator==(ContextResourceUsage, ContextResourceUsage) noexcept = default;
+struct KvPoolId {
+    std::uint16_t index                                           = 0;
+    friend constexpr bool operator==(KvPoolId, KvPoolId) noexcept = default;
 };
 
+// Pool IDs are contiguous and fixed for a Program's lifetime. Labels are diagnostic only.
+struct KvPoolDescriptor {
+    KvPoolId id;
+    std::string_view label;
+    const KVPageGeometry* geometry   = nullptr;
+    std::uint32_t device_page_groups = 0;
+    std::size_t device_page_bytes    = 0;
+    std::size_t host_page_stride     = 0;
+};
+
+// Physical quantities are sampled from stores. Each architecture declares its pool capacity;
+// inactive pools have zero capacity. Page groups from different pools never offset each other.
+template <std::size_t PoolCapacity>
+struct ContextResources {
+    static constexpr std::size_t pool_capacity = PoolCapacity;
+    std::uint32_t state_slots                  = 0;
+    std::array<std::uint32_t, PoolCapacity> kv_page_groups{};
+    std::size_t host_bytes = 0;
+
+    [[nodiscard]] std::optional<KvPoolId> first_kv_deficit() const noexcept {
+        for (std::size_t i = 0; i < PoolCapacity; ++i) {
+            if (kv_page_groups[i]) return KvPoolId{static_cast<std::uint16_t>(i)};
+        }
+        return std::nullopt;
+    }
+
+    [[nodiscard]] std::uint64_t useful(const ContextResources& shortage) const noexcept {
+        if (shortage.state_slots) return std::min(state_slots, shortage.state_slots);
+        if (const auto pool = shortage.first_kv_deficit()) {
+            return std::min(kv_page_groups[pool->index], shortage.kv_page_groups[pool->index]);
+        }
+        return std::min(host_bytes, shortage.host_bytes);
+    }
+
+    [[nodiscard]] std::array<std::uint64_t, PoolCapacity + 2> quantities() const noexcept {
+        std::array<std::uint64_t, PoolCapacity + 2> result{};
+        result[0] = state_slots;
+        for (std::size_t i = 0; i < PoolCapacity; ++i) result[i + 1] = kv_page_groups[i];
+        result.back() = host_bytes;
+        return result;
+    }
+
+    friend bool operator==(const ContextResources&, const ContextResources&) noexcept = default;
+};
+
+template <class Resources>
 struct ResourceReservation {
     bool reserved = false;
-    ContextResourceUsage shortage;
+    Resources shortage;
 
     explicit operator bool() const noexcept { return reserved; }
 };
@@ -63,10 +113,17 @@ struct PrefillWork {
     return result;
 }
 
-enum class ContextResourceClass : std::uint8_t {
-    State,
-    MainKV,
-    BackendKV,
+struct ContextTransferResource {
+    std::optional<KvPoolId> pool;
+
+    [[nodiscard]] constexpr bool is_state() const noexcept { return !pool; }
+
+    [[nodiscard]] constexpr std::size_t index() const noexcept {
+        return pool ? 1U + pool->index : 0;
+    }
+
+    friend constexpr bool operator==(ContextTransferResource,
+                                     ContextTransferResource) noexcept = default;
 };
 
 enum class ContextTransferDirection : std::uint8_t {
@@ -76,19 +133,19 @@ enum class ContextTransferDirection : std::uint8_t {
 };
 
 struct ContextTransferObservation {
-    ContextResourceClass resource      = ContextResourceClass::State;
+    ContextTransferResource resource;
     ContextTransferDirection direction = ContextTransferDirection::DeviceToHost;
-    std::uint64_t units                = 0; // State images for State; bytes for typed KV.
-    std::uint32_t page_count           = 0;
+    std::uint32_t image_count          = 0;
+    std::uint32_t page_groups          = 0;
     TransferWork work;
     std::uint64_t elapsed_ns = 0;
 };
 
 struct ContextTransferRequirement {
-    ContextResourceClass resource      = ContextResourceClass::State;
+    ContextTransferResource resource;
     ContextTransferDirection direction = ContextTransferDirection::DeviceToHost;
-    std::uint64_t units                = 0;
-    std::uint32_t page_count           = 0;
+    std::uint32_t image_count          = 0;
+    std::uint32_t page_groups          = 0;
     TransferWork work;
 
     [[nodiscard]] friend constexpr bool operator==(ContextTransferRequirement,
@@ -104,28 +161,28 @@ struct ContextOperationCounts {
 };
 
 struct SequenceCapacityCurve {
-    std::uint32_t main_page_tokens                   = 0;
-    std::uint32_t minimum_main_page_groups           = 0;
-    std::uint32_t maximum_main_page_groups           = 0;
-    std::size_t minimum_device_reservation_bytes     = 0;
-    std::size_t bytes_per_additional_main_page_group = 0;
+    std::uint32_t primary_page_tokens                   = 0;
+    std::uint32_t minimum_primary_page_groups           = 0;
+    std::uint32_t maximum_primary_page_groups           = 0;
+    std::size_t minimum_device_reservation_bytes        = 0;
+    std::size_t bytes_per_additional_primary_page_group = 0;
 
-    [[nodiscard]] std::size_t reservation_bytes(std::uint32_t main_page_groups) const;
-    [[nodiscard]] std::uint32_t resolved_tokens(std::uint32_t main_page_groups) const;
+    [[nodiscard]] std::size_t reservation_bytes(std::uint32_t primary_page_groups) const;
+    [[nodiscard]] std::uint32_t resolved_tokens(std::uint32_t primary_page_groups) const;
 };
 
 struct KvCapacityResolution {
-    KvCapacityMode mode                              = KvCapacityMode::Explicit;
-    std::uint32_t main_page_groups                   = 0;
-    std::uint32_t maximum_main_page_groups           = 0;
-    std::uint32_t resolved_tokens                    = 0;
-    std::size_t minimum_runtime_reservation_bytes    = 0;
-    std::size_t bytes_per_additional_main_page_group = 0;
-    std::size_t runtime_reservation_bytes            = 0;
-    std::size_t available_after_weights_bytes        = 0;
-    std::size_t available_after_startup_bytes        = 0;
-    std::size_t automatic_headroom_bytes             = 0;
-    std::size_t planned_slack_bytes                  = 0;
+    KvCapacityMode mode                                 = KvCapacityMode::Explicit;
+    std::uint32_t primary_page_groups                   = 0;
+    std::uint32_t maximum_primary_page_groups           = 0;
+    std::uint32_t resolved_tokens                       = 0;
+    std::size_t minimum_runtime_reservation_bytes       = 0;
+    std::size_t bytes_per_additional_primary_page_group = 0;
+    std::size_t runtime_reservation_bytes               = 0;
+    std::size_t available_after_weights_bytes           = 0;
+    std::size_t available_after_startup_bytes           = 0;
+    std::size_t automatic_headroom_bytes                = 0;
+    std::size_t planned_slack_bytes                     = 0;
 };
 
 } // namespace ninfer::runtime

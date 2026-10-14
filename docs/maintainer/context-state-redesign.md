@@ -1,7 +1,8 @@
 # 续算状态与上下文快照重构设计
 
-状态：S1、S2 已完成，S3–S4 待实施。固定状态、续算 metadata、KV 前缀引用与完整快照已迁移；
-异步迁移任务和 Runtime 资源合同继续按后续步骤推进，再进入 Qwen4Exp 的加载与执行资源阶段。
+状态：S1–S3 已完成，S4 待实施。固定状态、续算 metadata、KV 前缀引用、完整快照、异步迁移
+和按 pool ID 表达的 Runtime 资源合同已落地。S4 统一进行性能对比与最终验收，再进入 Qwen4Exp
+的加载与执行资源阶段。
 本文描述目标设计和实施顺序；当前已实现合同以
 [Engine 架构](engine-architecture.md)、[上下文缓存](resource-scheduling-and-context-cache.md)
 和 [Paged KV](paged-kv-cache.md) 为准。
@@ -318,11 +319,11 @@ QSA selection、GDN/PLE 实际 records、候选特征窗口和 I/O ticket 是执
 
 ### S3：异步迁移与 Runtime 资源合同
 
-- [ ] 建立直接持有预留、读者和完成依赖的迁移任务，完成发布、取消及延迟回收。
-- [ ] 迁移各 pool 的资源需求、物理占用、释放查询和真实传输报价，清理混合单位字段。
-- [ ] 迁移 bind、pause、restore、demote 和 capture 的物理操作，保留原生 bridge/接续。
-- [ ] 完成 source planning、reclaim、恢复许可、cost 消费端及相关工具的接口更新。
-- [ ] 移除大事务中被资源持有对象替代的标记和手工清理分支。
+- [x] 建立直接持有预留、读者和完成依赖的迁移任务，完成发布、取消及延迟回收。
+- [x] 迁移各 pool 的资源需求、物理占用、释放查询和真实传输报价，清理混合单位字段。
+- [x] 迁移 bind、pause、restore、demote 和 capture 的物理操作，保留原生 bridge/接续。
+- [x] 完成 source planning、reclaim、恢复许可、cost 消费端及相关工具的接口更新。
+- [x] 移除大事务中被资源持有对象替代的标记和手工清理分支。
 
 产出：公共层完成 State/KV 副本迁移和物理资源结算；原生流程只组合明确资源动作与模型动作，
 Runtime 根据真实 pool 需求运行既有策略。并发引用和在途取消有完整的所有权闭环。

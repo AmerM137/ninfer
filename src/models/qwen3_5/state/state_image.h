@@ -54,6 +54,9 @@ public:
     [[nodiscard]] CyclicKVCacheView* dflash_local() noexcept;
     [[nodiscard]] const CyclicKVCacheView* dflash_local() const noexcept;
     [[nodiscard]] TransferWork dflash_local_transfer_work() const;
+
+    [[nodiscard]] LayoutRegion dflash_local_group() const { return dflash_group_.value(); }
+
     void copy_dflash_local(std::int32_t source, std::int32_t destination,
                            CudaExecutionView execution) const;
 
@@ -65,9 +68,8 @@ private:
     std::optional<LayoutRegion> dflash_group_;
 };
 
-using StateImageStore    = context::StateImageStore;
-using StateImageHandle   = StateImageStore::Handle;
-using StateImageTransfer = StateImageStore::Transfer;
+using StateImageStore  = context::StateImageStore;
+using StateImageHandle = StateImageStore::Handle;
 
 struct ContinuationMetadata {
     std::uint32_t execution_frontier      = 0;

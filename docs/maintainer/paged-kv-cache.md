@@ -69,7 +69,7 @@ DFlash / DFlash2:
     Draft Full, when the selected draft config contains full-attention layers
 ```
 
-Speculative backends 在一个 Engine 内互斥，因此当前最多有两个 growing pools。官方 DFlash2
+Qwen3_5 的 speculative backends 在一个 Engine 内互斥，因此该架构当前最多有两个 growing pools。公共资源合同使用启动固定的 pool ID，并不限制模型的 pool 数量。官方 DFlash2
 配置的五层全部是 local attention，只需要 Main growing pool，其 draft context 使用 cyclic storage。
 
 | Pool | 内容 | 逻辑 frontier |
@@ -418,6 +418,11 @@ Host arena 是有界 variable-size allocator。State 与不同 KV layouts 竞争
 配额。申请必须满足 alignment 和连续 extent geometry；`free_bytes` 只是占用摘要，不是可分配性的
 充分证明。共享 Host extent 按实际 allocation 计一次，pending destination 在 publication 前已经占用容量。
 
+每个复制读者持有具体副本的 epoch 与 coverage。Host 与 Device 读者分别保护实际来源；移除最后
+一个 history/checkpoint 引用不会回收仍被复制读取的 bytes。Host extent 可在其他成员退役时分裂，
+被读的页范围保持原地址，新的成员 capability 不影响已提交 DMA。Host 副本替换持有独立目的
+claim，发布前不能取得指向旧副本的新 Host 读者。
+
 ### 5.4 Replica transfer
 
 Device COW 与 D2H/H2D transfer 复制页组的全部 plane payload，按各 plane 的实际行数、bytes 和
@@ -425,7 +430,9 @@ offset 搬运原 words。不同密度的 plane 不单独分配、保留或回收
 合并成更少的 transfer runs。
 Core 按已绑定的 plane geometry 选择 2D copy：短 PageMajor run 可以合并等宽、等间距的 planes，
 HeadMajor 可以选择 page 或 head 作为提交外层。只在减少调用数且 pitch 合法时使用合并路径；
-Host layout 与 payload 不变。Native 从 Core 返回值记录实际搬运字节和调用数。
+Host layout 与 payload 不变。迁移批次在目的位置确定后形成真实 Host/Device runs，Core 的同一
+几何规则给出计划与实际提交工作量；迁移观测记录实际字节和 copy operations。来源选择时尚无
+目的物理 ID，只按已知 Host runs 给出名义连续传输估计，不能将它当作实际提交次数。
 一个 replacement replica 的 publication 顺序为：
 
 ```text
@@ -490,10 +497,10 @@ logical pages 或 frontier；暂停后恢复可以租用另一行。
 
 ```text
 reserve complete binding
-  -> restore missing replicas
-  -> copy conflicting partial tail
-  -> consume explicitly transferred source ownership
-  -> publish mapping and adopt writer
+  -> enqueue restore, conflicting-tail COW and reserved-row mapping
+  -> wait for this batch's completion event
+  -> publish replicas and consume transferred source ownership
+  -> adopt writer
 ```
 
 已有只读前缀可以保留在被接管的 history 上。即使首个 unit 不追加 token，绑定仍取得 partial
@@ -706,6 +713,7 @@ consumer，且 replay in-flight期间不得改写同一 row。
 | 统一 Host backing、typed KV layout 与 allocation | `src/core/host_context_arena.*`, `src/core/host_kv_arena.*` |
 | logical pages、replicas 与 references | `src/models/common/context/logical_kv_store.*` |
 | history、前缀引用、写入与绑定 | `src/models/common/context/kv_history.*` |
+| State/KV 异步迁移与完成依赖 | `src/models/common/context/migration.*` |
 | StateImage 布局、逻辑身份与副本事务 | `src/core/state_image.*`, `src/models/common/context/state_store.*`；架构声明字段与类型化视图 |
 | 完整快照与记录 lease | `src/models/common/context/snapshot.h`, `checkpoint_store.h` |
 | 原生 checkpoint 生命周期 | `src/models/qwen3_5/program/storage/checkpoints.cpp`, `sequence.cpp` |

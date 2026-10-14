@@ -76,6 +76,14 @@ Main KV 容量曲线的页数下界为 `max(ceil(max_context / 64), C)`，上界
 按[启动生命周期](engine-architecture.md#25-实例生命周期与固定执行)从剩余显存中单独扣除。
 显式或自动容量都要落在这条曲线内并满足预算。容量并不平均切给每个 lane。
 
+Program 的 pool 目录在启动时固定，`KvPoolId` 标识具体 pool；目录给出几何、Device 容量与
+Host page stride，名称仅用于诊断。模型内部保留 Text/MTP/Draft Full 角色；Runtime 的需求、
+缺口、占用和释放量使用 `ContextResources<N>`：State slots、按 pool ID 索引的 KV page groups、
+Host allocated bytes。`N` 由原生架构声明，普通执行查询不分配动态容器。
+回收每次针对一个具体缺口；另一个 pool 的空闲页不能满足它。现有容量曲线和恢复许可策略保留。
+传输需求与观测另外记录 image count、page groups、payload bytes、copy operations；前两项
+是内容范围，Host allocated bytes 包含分配对齐，payload bytes 是实际 DMA 量。
+
 Host 缺省容量为 `8 GiB + 8 × 当前模型 Host StateImage 大小`。它是一个共享 backing，State 与
 KV 的分项占用用于观测，不能再次相加成额外配额。传输目标从预留时就计费，发布只改变其状态，
 不减少占用。State 副本和传输目的直接持有 Host allocation，capture 预留的 allocation

@@ -1,4 +1,6 @@
 #include "core/device.h"
+#include "models/common/context/migration.h"
+#include <algorithm>
 #include "models/qwen3_5/state/state_image.h"
 
 #include <cuda_runtime.h>
@@ -191,7 +193,8 @@ void test_state_store(ninfer::DeviceContext& device) {
         device.synchronize();
         images.freeze(*shared);
         images.retain_checkpoint_reference(*shared);
-        auto transfer = images.begin_device_to_host(*shared, device.transfer_view());
+        auto transfer = images.reserve_device_to_host(*shared);
+        if (transfer) transfer->enqueue(device.transfer_view());
         expect(transfer && images.release_checkpoint_owner(*shared) && images.valid(*shared),
                "submitted State transfer retains a retired checkpoint source");
         CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream()));
@@ -245,7 +248,8 @@ void test_state_store(ninfer::DeviceContext& device) {
     expect(host_backing.occupied_bytes() == 0 && images.source_pins(*host_source) == 0 &&
                images.residency(*host_source) == store::StateReplicaResidency::DeviceOnly,
            "cancelled State transfer releases its actual Host extent and retains source state");
-    auto d2h = images.begin_device_to_host(*host_source, device.transfer_view());
+    auto d2h = images.reserve_device_to_host(*host_source);
+    if (d2h) d2h->enqueue(device.transfer_view());
     expect(d2h.has_value() &&
                images.residency(*host_source) == store::StateReplicaResidency::DeviceOnly,
            "incomplete State D2H does not publish a Host replica");
@@ -270,11 +274,14 @@ void test_state_store(ninfer::DeviceContext& device) {
     const auto fork_one = images.reserve_logical_destination();
     const auto fork_two = images.reserve_logical_destination();
     expect(fork_one && fork_two, "concurrent Host State forks reserve logical destinations");
-    auto h2d_one = images.begin_host_to_device(*host_source, *fork_one, device.transfer_view());
-    auto h2d_two = images.begin_host_to_device(*host_source, *fork_two, device.transfer_view());
+    auto h2d_one = images.reserve_host_to_device(*host_source, *fork_one);
+    if (h2d_one) h2d_one->enqueue(device.transfer_view());
+    auto h2d_two = images.reserve_host_to_device(*host_source, *fork_two);
+    if (h2d_two) h2d_two->enqueue(device.transfer_view());
     expect(h2d_one && h2d_two && images.source_pins(*host_source) == 2,
            "immutable Host State source supports multiple fork pins");
-    auto h2d_source = images.begin_host_to_device(*host_source, device.transfer_view());
+    auto h2d_source = images.reserve_host_to_device(*host_source);
+    if (h2d_source) h2d_source->enqueue(device.transfer_view());
     expect(h2d_source && images.source_pins(*host_source) == 3,
            "Host replica remains shared while restoring its own Device replica");
     CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream()));
@@ -304,6 +311,54 @@ void test_state_store(ninfer::DeviceContext& device) {
            "State Host/Device replica ownership closes without leaked slots");
 }
 
+void test_migration_state_fields(ninfer::DeviceContext& device) {
+    using namespace ninfer;
+    LayoutBuilder backing_layout;
+    StateImageBuilder schema;
+    (void)schema.add(DType::FP32, {4}, 1, "recurrent");
+    const auto local = schema.add(DType::BF16, {8}, 2, "local_kv");
+    (void)schema.add(DType::I32, {3}, 1, "tail");
+    const auto group  = schema.group(local, local);
+    const auto layout = schema.finish(backing_layout, 2);
+    DeviceBuffer backing(device.device(), backing_layout.finish());
+    StateImageStorage storage(backing.span(), layout);
+    store::StateImageStore states(storage, nullptr, 2);
+    store::MigrationContext executor(device, 0);
+    const auto source = states.reserve_destination().value();
+    std::vector<std::byte> words(storage.image_bytes());
+    for (std::size_t i = 0; i < words.size(); ++i) words[i] = std::byte((i * 29 + 13) & 0xff);
+    CUDA_CHECK(cudaMemcpy(storage.image(states.physical_slot(source)).data, words.data(),
+                          words.size(), cudaMemcpyHostToDevice));
+    states.complete_initialization(source);
+    states.freeze(source);
+    for (bool clear : {false, true}) {
+        const auto destination = states.reserve_destination().value();
+        std::vector<std::byte> expected(words.size(), std::byte{0x55});
+        const auto image = storage.image(states.physical_slot(destination));
+        CUDA_CHECK(
+            cudaMemcpy(image.data, expected.data(), expected.size(), cudaMemcpyHostToDevice));
+        store::MigrationBatch migration(executor, nullptr);
+        migration.own_state(states, destination);
+        if (clear) {
+            migration.clear_state(storage, states);
+            std::fill(expected.begin(), expected.end(), std::byte{0});
+        } else {
+            migration.add_state_group(states, storage, source, group);
+            std::copy_n(words.begin() + group.offset, group.bytes, expected.begin() + group.offset);
+        }
+        migration.submit();
+        migration.drain();
+        migration.publish();
+        std::vector<std::byte> observed(words.size());
+        CUDA_CHECK(
+            cudaMemcpy(observed.data(), image.data, observed.size(), cudaMemcpyDeviceToHost));
+        expect(observed == expected,
+               "migration changed bytes outside its State field group or clear extent");
+    }
+    expect(states.release(source) && states.occupied() == 0,
+           "State field migration retained a reservation");
+}
+
 } // namespace
 
 int main() {
@@ -318,6 +373,7 @@ int main() {
     try {
         ninfer::DeviceContext device(0);
         test_state_store(device);
+        test_migration_state_fields(device);
         device.synchronize();
     } catch (const std::exception& error) {
         std::cerr << "FAIL: unexpected exception: " << error.what() << '\n';

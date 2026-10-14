@@ -244,6 +244,7 @@ public:
     // One run assumes contiguous Host records and contiguous Device page IDs. Before Device
     // allocation, sum this work over known Host runs as a nominal transfer estimate.
     [[nodiscard]] TransferWork host_transfer_run_work(std::uint32_t pages) const;
+    [[nodiscard]] TransferWork host_transfer_work(std::span<const DeviceKVPageHandle> pages) const;
     [[nodiscard]] TransferWork device_copy_work(std::uint32_t pages) const;
 
     TransferWork copy_to_host(std::span<const DeviceKVPageHandle> source,

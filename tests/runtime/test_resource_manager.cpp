@@ -12,7 +12,7 @@
 
 namespace {
 
-using Usage = ninfer::runtime::ContextResourceUsage;
+using Usage = ninfer::runtime::ContextResources<3>;
 using Key   = std::vector<std::uint32_t>;
 using Role  = ninfer::runtime::CheckpointRole;
 
@@ -66,6 +66,8 @@ struct Source {
 // Concrete immutable contents and their Host aliases, without cache policy or an allocator.
 // The production stores have separate tests for actual allocation and transfer lifetimes.
 struct Program {
+    using ContextResources = Usage;
+
     struct Content {
         Key tokens;
         std::vector<std::size_t> host_blocks;
@@ -76,6 +78,7 @@ struct Program {
         bool release_blocked     = false;
         bool demotion_blocked    = false;
         std::uint32_t main_pages = 1;
+        std::array<std::uint32_t, 2> other_pool_pages{};
         std::optional<std::uint32_t> demotion_page_limit;
         std::optional<std::size_t> demotion_bytes;
         Role role = Role::SharedPrefix;
@@ -143,7 +146,9 @@ struct Program {
             const auto& content = contents.at(handle.index);
             require(content.alive, "cache queried a released checkpoint");
             result.state_slots += content.device_state;
-            result.main_kv_pages += content.main_pages;
+            result.kv_page_groups[0] += content.main_pages;
+            result.kv_page_groups[1] += content.other_pool_pages[0];
+            result.kv_page_groups[2] += content.other_pool_pages[1];
             for (const auto block : content.host_blocks) {
                 if (std::find(unique.begin(), unique.end(), block) == unique.end()) {
                     unique.push_back(block);
@@ -178,10 +183,9 @@ struct Program {
     }
 
     [[nodiscard]] PhysicalUsage physical_usage() const {
-        PhysicalUsage result{.capacity = {.state_slots      = 64,
-                                          .main_kv_pages    = main_capacity,
-                                          .backend_kv_pages = 1024,
-                                          .host_bytes       = host_capacity}};
+        PhysicalUsage result{.capacity = {.state_slots    = 64,
+                                          .kv_page_groups = {main_capacity, 1024, 1024},
+                                          .host_bytes     = host_capacity}};
         for (std::size_t block = 0; block < blocks.size(); ++block) {
             if (blocks[block].external_reference ||
                 std::any_of(contents.begin(), contents.end(),
@@ -256,7 +260,7 @@ struct Program {
         return source;
     }
 
-    [[nodiscard]] bool has_context_transaction() const { return transfer_in_progress; }
+    [[nodiscard]] bool has_context_operation() const { return transfer_in_progress; }
 
     bool release_redundant_host(std::span<const Handle>) { return false; }
 
@@ -324,21 +328,21 @@ struct Program {
             Usage released;
             if (shortage.state_slots && content.device_state) {
                 released.state_slots = 1;
-            } else if (!shortage.state_slots && shortage.main_kv_pages) {
-                released.main_kv_pages =
-                    std::min({shortage.main_kv_pages, content.main_pages,
+            } else if (!shortage.state_slots && shortage.kv_page_groups[0]) {
+                released.kv_page_groups[0] =
+                    std::min({shortage.kv_page_groups[0], content.main_pages,
                               content.demotion_page_limit.value_or(content.main_pages)});
             }
-            const auto units = released.state_slots + released.main_kv_pages;
+            const auto units = released.state_slots + released.kv_page_groups[0];
             if (!units) { continue; }
             result.push_back(
                 {handle,
                  *content.demotion_bytes * units,
                  {handle},
                  released,
-                 released.main_kv_pages
+                 released.kv_page_groups[0]
                      ? std::vector<std::pair<Handle, std::uint32_t>>{{handle,
-                                                                      released.main_kv_pages}}
+                                                                      released.kv_page_groups[0]}}
                      : std::vector<std::pair<Handle, std::uint32_t>>{}});
         }
         return result;
@@ -346,11 +350,11 @@ struct Program {
 
     [[nodiscard]] std::optional<Demotion> combined_demotion(std::span<const Demotion> ordered,
                                                             Usage shortage) const {
-        if (ordered.empty() || shortage.state_slots || !shortage.main_kv_pages) {
+        if (ordered.empty() || shortage.state_slots || !shortage.kv_page_groups[0]) {
             return std::nullopt;
         }
         Demotion combined{ordered.front().handle, 0, {}, {}};
-        auto remaining   = shortage.main_kv_pages;
+        auto remaining   = shortage.kv_page_groups[0];
         const auto usage = physical_usage();
         auto host_left   = usage.capacity.host_bytes - usage.occupied.host_bytes;
         // The fixture supplies disjoint, explicit page quantities. Physical aliases,
@@ -364,7 +368,7 @@ struct Program {
                 if (take) {
                     combined.main_parts.emplace_back(handle, take);
                     combined.sources.push_back(handle);
-                    combined.released.main_kv_pages += take;
+                    combined.released.kv_page_groups[0] += take;
                     combined.host_bytes += take * bytes;
                     remaining -= take;
                     host_left -= take * bytes;
@@ -380,7 +384,7 @@ struct Program {
 
     [[nodiscard]] bool covers_release(std::span<const Demotion> ordered,
                                       std::span<const Handle> removed, Usage shortage) const {
-        if (shortage.state_slots || shortage.host_bytes || !shortage.main_kv_pages) {
+        if (shortage.state_slots || shortage.host_bytes || !shortage.kv_page_groups[0]) {
             return false;
         }
         std::vector<std::uint32_t> covered(contents.size());
@@ -420,13 +424,12 @@ struct Program {
             for (const auto handle : sources) {
                 const auto& content = contents.at(handle.index);
                 released.state_slots += content.device_state;
-                released.main_kv_pages += content.main_pages;
+                released.kv_page_groups[0] += content.main_pages;
+                released.kv_page_groups[1] += content.other_pool_pages[0];
+                released.kv_page_groups[2] += content.other_pool_pages[1];
             }
             released.host_bytes = host_bytes_released(sources);
-            const bool useful   = shortage.state_slots        ? released.state_slots != 0
-                                  : shortage.main_kv_pages    ? released.main_kv_pages != 0
-                                  : shortage.backend_kv_pages ? false
-                                                              : released.host_bytes != 0;
+            const bool useful   = released.useful(shortage) != 0;
             if (!useful) { return; }
             if (std::none_of(result.begin(), result.end(),
                              [&](const auto& action) { return action.sources == sources; })) {
@@ -1060,6 +1063,21 @@ void test_forked_hot_records_do_not_bypass_the_soft_capacity_target() {
             "equal-adoption parent and child bypassed the per-resource protection soft target");
 }
 
+void test_reclaim_targets_the_requested_pool() {
+    Fixture f(64);
+    const auto text                                     = f.program.add({1});
+    const auto third                                    = f.program.add({2});
+    f.program.contents[text.index].main_pages           = 100;
+    f.program.contents[third.index].main_pages          = 0;
+    f.program.contents[third.index].other_pool_pages[1] = 2;
+    f.publish(text);
+    f.publish(third);
+    require(f.cache.reclaim(f.program, {.kv_page_groups = {0, 0, 1}}) ==
+                    ninfer::runtime::ReclaimProgress::Changed &&
+                f.program.valid_checkpoint(text) && !f.program.valid_checkpoint(third),
+            "pages in another pool satisfied the third pool's deficit");
+}
+
 void test_large_hotspot_is_preserved_per_resource_pool() {
     Fixture f(64);
     f.program.main_capacity = 100;
@@ -1213,15 +1231,15 @@ void test_reclaim_cursor_can_demote_remaining_pages_of_the_same_history() {
     content.demotion_bytes = 4;
     f.publish(history);
     auto cursor = f.cache.begin_reclaim(f.program);
-    require(f.cache.reclaim(f.program, {.main_kv_pages = 2}, {}, cursor) ==
+    require(f.cache.reclaim(f.program, {.kv_page_groups = {2}}, {}, cursor) ==
                     ninfer::runtime::ReclaimProgress::Changed &&
                 content.main_pages == 3,
             "first finite demotion did not release only its required pages");
-    require(f.cache.reclaim(f.program, {.main_kv_pages = 3}, {}, cursor) ==
+    require(f.cache.reclaim(f.program, {.kv_page_groups = {3}}, {}, cursor) ==
                     ninfer::runtime::ReclaimProgress::Changed &&
                 content.main_pages == 0 && f.program.physical_usage().occupied.host_bytes == 20,
             "later shortage could not demote the remaining pages of the same history");
-    require(f.cache.reclaim(f.program, {.main_kv_pages = 1}, {}, cursor) ==
+    require(f.cache.reclaim(f.program, {.kv_page_groups = {1}}, {}, cursor) ==
                     ninfer::runtime::ReclaimProgress::Blocked &&
                 content.alive && f.program.demoted.size() == 2,
             "already migrated physical content was copied or deleted again");
@@ -1569,7 +1587,7 @@ void test_adjacent_kv_demotions_share_one_submission() {
     f.program.contents[second.index].demotion_bytes = 4;
     f.publish(first);
     f.publish(second);
-    require(f.cache.reclaim(f.program, {.main_kv_pages = 4}) ==
+    require(f.cache.reclaim(f.program, {.kv_page_groups = {4}}) ==
                     ninfer::runtime::ReclaimProgress::Changed &&
                 f.program.demotion_submissions ==
                     std::vector<std::vector<Handle>>{{first, second}} &&
@@ -1592,7 +1610,7 @@ void test_kv_demotion_batch_stops_at_an_intervening_delete() {
     f.publish(removable);
     f.publish(later);
     f.publish(survivor);
-    require(f.cache.reclaim(f.program, {.main_kv_pages = 3}) ==
+    require(f.cache.reclaim(f.program, {.kv_page_groups = {3}}) ==
                     ninfer::runtime::ReclaimProgress::Changed &&
                 f.program.demotion_submissions == std::vector<std::vector<Handle>>{{first}} &&
                 f.program.contents[later.index].main_pages == 1 && f.program.released.empty(),
@@ -1612,7 +1630,7 @@ void test_redundant_delete_does_not_split_a_kv_batch_and_remains_a_fallback() {
         f.publish(first);
         f.publish(second);
         f.publish(survivor);
-        require(f.cache.reclaim(f.program, {.main_kv_pages = 2}) ==
+        require(f.cache.reclaim(f.program, {.kv_page_groups = {2}}) ==
                     ninfer::runtime::ReclaimProgress::Changed,
                 "redundant-delete fixture failed to make legitimate reclamation progress");
         if (!reject_transfer) {
@@ -1645,7 +1663,7 @@ void test_partially_covered_delete_still_stops_a_kv_batch() {
     f.publish(first);
     f.publish(second);
     f.publish(survivor);
-    require(f.cache.reclaim(f.program, {.main_kv_pages = 3}) ==
+    require(f.cache.reclaim(f.program, {.kv_page_groups = {3}}) ==
                     ninfer::runtime::ReclaimProgress::Changed &&
                 f.program.demotion_submissions == std::vector<std::vector<Handle>>{{first}} &&
                 f.program.contents[first.index].main_pages == 1 &&
@@ -1662,7 +1680,7 @@ void test_kv_demotion_batch_preserves_host_and_outer_permission_limits() {
         bounded.program.contents[handle.index].demotion_bytes = 4;
         bounded.publish(handle);
     }
-    require(bounded.cache.reclaim(bounded.program, {.main_kv_pages = 4}) ==
+    require(bounded.cache.reclaim(bounded.program, {.kv_page_groups = {4}}) ==
                     ninfer::runtime::ReclaimProgress::Changed &&
                 bounded.program.demotion_submissions ==
                     std::vector<std::vector<Handle>>{{first, second}} &&
@@ -1692,7 +1710,7 @@ void test_kv_demotion_batch_preserves_host_and_outer_permission_limits() {
     const auto admission =
         protected_owner.cache.capture_admission(protected_owner.program, 0, incoming, 1000, false);
     auto cursor = protected_owner.cache.begin_reclaim(protected_owner.program, admission);
-    require(protected_owner.cache.reclaim(protected_owner.program, {.main_kv_pages = 2}, {},
+    require(protected_owner.cache.reclaim(protected_owner.program, {.kv_page_groups = {2}}, {},
                                           cursor) == ninfer::runtime::ReclaimProgress::Changed &&
                 protected_owner.program.demotion_submissions.size() == 1 &&
                 protected_owner.program.demotion_submissions.front().size() == 1 &&
@@ -1716,7 +1734,7 @@ void test_failed_kv_demotion_batch_falls_back_without_host_deletion() {
     f.publish(first);
     f.publish(second);
     f.publish(host);
-    require(f.cache.reclaim(f.program, {.main_kv_pages = 2}) ==
+    require(f.cache.reclaim(f.program, {.kv_page_groups = {2}}) ==
                     ninfer::runtime::ReclaimProgress::Changed &&
                 f.program.demotion_submissions == std::vector<std::vector<Handle>>{{first}} &&
                 f.program.contents[second.index].main_pages == 1 &&
@@ -1921,6 +1939,7 @@ int main() {
         test_reclaim_respects_native_lease_and_stops_host_eviction_at_capacity();
         test_explicit_anchor_updates_remain_bounded_across_requests();
         test_forked_hot_records_do_not_bypass_the_soft_capacity_target();
+        test_reclaim_targets_the_requested_pool();
         test_large_hotspot_is_preserved_per_resource_pool();
         test_one_off_fanout_competes_with_repeated_continuation();
         test_reclaim_cursor_keeps_order_across_hits_and_transfers();

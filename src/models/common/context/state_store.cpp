@@ -5,6 +5,111 @@
 
 namespace ninfer::models::context {
 
+StateImageStore::ReadLease::~ReadLease() { reset(); }
+
+StateImageStore::ReadLease::ReadLease(ReadLease&& other) noexcept
+    : store_(std::exchange(other.store_, nullptr)), image_(other.image_), epoch_(other.epoch_) {}
+
+StateImageStore::ReadLease& StateImageStore::ReadLease::operator=(ReadLease&& other) noexcept {
+    if (this != &other) {
+        reset();
+        store_ = std::exchange(other.store_, nullptr);
+        image_ = other.image_;
+        epoch_ = other.epoch_;
+    }
+    return *this;
+}
+
+void StateImageStore::ReadLease::reset() noexcept {
+    if (!store_) return;
+    auto* store = std::exchange(store_, nullptr);
+    auto& image = store->require(image_);
+    if (!image.source_pins || image.content_epoch != epoch_) std::terminate();
+    --image.source_pins;
+    store->retire_released_owner(image_);
+}
+
+std::int32_t StateImageStore::ReadLease::device_slot() const {
+    if (!store_ || store_->content_epoch(image_) != epoch_)
+        throw std::logic_error("StateImage reader has no current content");
+    return store_->physical_slot(image_);
+}
+
+StateImageStore::ReadLease StateImageStore::read(Handle handle) {
+    auto& object = require(handle);
+    if (object.role != StateImageRole::CheckpointImmutable ||
+        object.source_pins == std::numeric_limits<std::uint32_t>::max())
+        throw std::logic_error("StateImage is not readable as an immutable replica");
+    ++object.source_pins;
+    return ReadLease(*this, handle, object.content_epoch);
+}
+
+StateImageStore::Destination::Destination(StateImageStore& store, Handle image)
+    : store_(&store), image_(image) {
+    if (store.role(image) != StateImageRole::ReservedDestination)
+        throw std::logic_error("StateImage destination is not reserved");
+}
+
+StateImageStore::Destination::~Destination() {
+    if (!store_) return;
+    if (write_source_.valid()) store_->abort_write(write_source_, image_);
+    if (!store_->release(image_)) std::terminate();
+}
+
+StateImageStore::Destination::Destination(Destination&& other) noexcept
+    : store_(std::exchange(other.store_, nullptr)), image_(other.image_),
+      write_source_(other.write_source_) {}
+
+StateImageSelectors StateImageStore::Destination::begin_write(Handle source) {
+    const auto selectors = store_->begin_write(source, image_);
+    write_source_        = source;
+    return selectors;
+}
+
+StateImageStore::Handle StateImageStore::Destination::release() noexcept {
+    store_ = nullptr;
+    return std::exchange(image_, Handle{});
+}
+
+StateImageStore::Transfer::Transfer(StateImageStore& owner, std::uint64_t id,
+                                    StateTransferDirection direction, ReadLease source,
+                                    Handle destination) noexcept
+    : owner_(&owner), id_(id), direction_(direction), source_(std::move(source)),
+      destination_(destination) {}
+
+StateImageStore::Transfer::~Transfer() {
+    if (owner_) owner_->abort_transfer(std::move(*this));
+}
+
+StateImageStore::Transfer::Transfer(Transfer&& other) noexcept
+    : owner_(std::exchange(other.owner_, nullptr)), id_(std::exchange(other.id_, 0)),
+      direction_(other.direction_), source_(std::move(other.source_)),
+      destination_(other.destination_),
+      device_slot_(std::exchange(other.device_slot_, std::nullopt)),
+      host_slot_(std::move(other.host_slot_)) {}
+
+TransferWork StateImageStore::Transfer::work() const {
+    if (!owner_) throw std::logic_error("StateImage copy already consumed");
+    owner_->validate_transfer(*this);
+    return owner_->device_->layout().transfer_work();
+}
+
+void StateImageStore::Transfer::enqueue(CudaExecutionView execution) const {
+    if (!owner_) throw std::logic_error("StateImage copy already consumed");
+    owner_->validate_transfer(*this);
+    if (direction_ == StateTransferDirection::DeviceToHost) {
+        owner_->device_->copy_to_host(source_.device_slot(), host_slot_->span(), execution);
+    } else {
+        const auto& source = owner_->require(source_.image());
+        owner_->device_->copy_from_host(source.host_slot->span(), *device_slot_, execution);
+    }
+}
+
+void StateImageStore::Transfer::publish(bool keep_source_replica) {
+    if (!owner_) throw std::logic_error("StateImage copy already consumed");
+    owner_->publish_transfer(std::move(*this), keep_source_replica);
+}
+
 StateImageStore::StateImageStore(StateImageStorage& device, HostContextArena* host,
                                  std::uint32_t logical_capacity)
     : device_(&device), host_(host), objects_(logical_capacity), free_objects_(logical_capacity),
@@ -41,10 +146,8 @@ std::uint32_t StateImageStore::device_capacity() const noexcept {
 }
 
 std::uint32_t StateImageStore::host_occupied() const noexcept {
-    std::uint32_t count = 0;
-    for (const auto& object : objects_) {
-        count += object.host_slot.has_value() + object.pending_host_slot.has_value();
-    }
+    std::uint32_t count = pending_host_images_;
+    for (const auto& object : objects_) { count += object.host_slot.has_value(); }
     return count;
 }
 
@@ -319,167 +422,85 @@ StateImageStore::reserve_device_to_host(Handle source, HostContextAllocation res
     if (!reserved.reserved() || reserved.bytes() != device_->image_bytes()) {
         throw std::invalid_argument("StateImage Host reservation has incompatible geometry");
     }
-    const std::uint64_t transfer = next_transfer();
-    object.pending_host_slot.emplace(std::move(reserved));
-    object.transfer_id        = transfer;
+    const auto id = next_transfer();
+    Transfer transfer(*this, id, StateTransferDirection::DeviceToHost, read(source), source);
+    transfer.host_slot_.emplace(std::move(reserved));
+    ++pending_host_images_;
+    object.transfer_id        = id;
     object.destination_pinned = true;
-    ++object.source_pins;
-    return Transfer(*this, transfer, StateTransferDirection::DeviceToHost, source, source);
-}
-
-void StateImageStore::enqueue_device_to_host(const Transfer& transfer,
-                                             CudaExecutionView execution) {
-    validate_transfer(transfer);
-    Object& object = require(transfer.source_);
-    if (transfer.direction_ != StateTransferDirection::DeviceToHost || host_ == nullptr ||
-        !object.device_slot || !object.pending_host_slot) {
-        throw std::logic_error("StateImage Device-to-Host transfer is not enqueueable");
-    }
-    device_->copy_to_host(*object.device_slot, object.pending_host_slot->span(), execution);
-}
-
-std::optional<StateImageStore::Transfer>
-StateImageStore::begin_device_to_host(Handle source, CudaExecutionView execution) {
-    std::optional<Transfer> transfer = reserve_device_to_host(source);
-    if (!transfer) { return std::nullopt; }
-    try {
-        enqueue_device_to_host(*transfer, execution);
-    } catch (...) {
-        abort_transfer(std::move(*transfer));
-        throw;
-    }
     return transfer;
 }
 
-std::optional<StateImageStore::Transfer>
-StateImageStore::begin_host_to_device(Handle source, CudaExecutionView execution) {
-    Object& object = require(source);
-    if (host_ == nullptr || object.role != StateImageRole::CheckpointImmutable ||
-        !object.host_slot || object.device_slot || has_pending_replica(object) ||
-        object.source_pins == std::numeric_limits<std::uint32_t>::max()) {
-        return std::nullopt;
-    }
-    const std::optional<std::int32_t> target = take_device_slot();
-    if (!target) { return std::nullopt; }
-    const std::uint64_t transfer = next_transfer();
-    object.pending_device_slot   = *target;
-    object.transfer_id           = transfer;
-    object.destination_pinned    = true;
-    ++object.source_pins;
-    try {
-        device_->copy_from_host(object.host_slot->span(), *target, execution);
-    } catch (...) {
-        --object.source_pins;
-        object.destination_pinned = false;
-        object.transfer_id        = 0;
-        object.pending_device_slot.reset();
-        return_device_slot(*target);
-        throw;
-    }
-    return Transfer(*this, transfer, StateTransferDirection::HostToDevice, source, source);
+std::optional<StateImageStore::Transfer> StateImageStore::reserve_host_to_device(Handle source) {
+    return reserve_host_to_device(source, source);
 }
 
 std::optional<StateImageStore::Transfer>
-StateImageStore::begin_host_to_device(Handle source, Handle destination,
-                                      CudaExecutionView execution) {
-    Object& source_object      = require(source);
-    Object& destination_object = require(destination);
-    if (host_ == nullptr || source == destination ||
-        source_object.role != StateImageRole::CheckpointImmutable || !source_object.host_slot ||
-        source_object.source_pins == std::numeric_limits<std::uint32_t>::max() ||
-        destination_object.role != StateImageRole::ReservedDestination ||
-        destination_object.device_slot || destination_object.host_slot ||
-        has_pending_replica(destination_object) || destination_object.source_pins != 0 ||
-        destination_object.destination_pinned) {
+StateImageStore::reserve_host_to_device(Handle source, Handle destination) {
+    auto& from = require(source);
+    auto& to   = require(destination);
+    if (!from.host_slot || from.role != StateImageRole::CheckpointImmutable ||
+        from.source_pins == std::numeric_limits<std::uint32_t>::max() || to.device_slot ||
+        has_pending_replica(to) || to.destination_pinned ||
+        (source != destination &&
+         (to.role != StateImageRole::ReservedDestination || to.source_pins || to.host_slot)))
         return std::nullopt;
-    }
-    const std::optional<std::int32_t> target = take_device_slot();
-    if (!target) { return std::nullopt; }
-    const std::uint64_t transfer           = next_transfer();
-    destination_object.pending_device_slot = *target;
-    destination_object.transfer_id         = transfer;
-    destination_object.destination_pinned  = true;
-    destination_object.content_epoch       = source_object.content_epoch;
-    ++source_object.source_pins;
-    try {
-        device_->copy_from_host(source_object.host_slot->span(), *target, execution);
-    } catch (...) {
-        --source_object.source_pins;
-        destination_object.pending_device_slot.reset();
-        destination_object.transfer_id        = 0;
-        destination_object.destination_pinned = false;
-        destination_object.role               = StateImageRole::ReservedDestination;
-        destination_object.content_epoch      = 0;
-        return_device_slot(*target);
-        throw;
-    }
-    return Transfer(*this, transfer, StateTransferDirection::HostToDevice, source, destination);
+    const auto slot = take_device_slot();
+    if (!slot) return std::nullopt;
+    const auto id = next_transfer();
+    Transfer transfer(*this, id, StateTransferDirection::HostToDevice, read(source), destination);
+    transfer.device_slot_ = *slot;
+    to.transfer_id        = id;
+    to.destination_pinned = true;
+    to.content_epoch      = from.content_epoch;
+    return transfer;
 }
 
 void StateImageStore::publish_transfer(Transfer&& transfer, bool keep_source_replica) {
     validate_transfer(transfer);
-    const Handle source_handle = transfer.source_;
-    Object& source             = require(transfer.source_);
-    Object& destination        = require(transfer.destination_);
+    const auto source_handle = transfer.source_.image();
+    auto& source             = require(source_handle);
+    auto& destination        = require(transfer.destination_);
+    if (source.content_epoch != transfer.source_.epoch())
+        throw std::logic_error("StateImage source changed during migration");
+    if (!keep_source_replica && source_handle == transfer.destination_ && source.source_pins != 1)
+        throw std::logic_error("StateImage source replica still has readers");
     if (transfer.direction_ == StateTransferDirection::DeviceToHost) {
-        if (!source.pending_host_slot) {
-            throw std::logic_error("StateImage Host destination publication failed");
-        }
-        if (!keep_source_replica && source.source_pins != 1) {
-            throw std::logic_error("StateImage Device replica still has readers");
-        }
-        source.pending_host_slot->publish();
-        source.host_slot = std::move(source.pending_host_slot);
-        source.pending_host_slot.reset();
+        transfer.host_slot_->publish();
+        source.host_slot.emplace(std::move(*transfer.host_slot_));
+        transfer.host_slot_.reset();
+        --pending_host_images_;
         if (!keep_source_replica) {
             return_device_slot(*source.device_slot);
             source.device_slot.reset();
         }
     } else {
-        if (!keep_source_replica && transfer.source_ == transfer.destination_ &&
-            source.source_pins != 1) {
-            throw std::logic_error("StateImage Host replica still has readers");
-        }
-        destination.device_slot = destination.pending_device_slot;
-        destination.pending_device_slot.reset();
-        if (!keep_source_replica && transfer.source_ == transfer.destination_) {
+        destination.device_slot = std::exchange(transfer.device_slot_, std::nullopt);
+        if (!keep_source_replica && source_handle == transfer.destination_)
             source.host_slot.reset();
-        }
     }
-    --source.source_pins;
     destination.destination_pinned = false;
     destination.transfer_id        = 0;
     consume(transfer);
-    retire_released_owner(source_handle);
+    transfer.source_.reset();
 }
 
 void StateImageStore::abort_transfer(Transfer&& transfer) noexcept {
-    if (!valid_transfer(transfer)) {
-        consume(transfer);
-        return;
+    if (!valid_transfer(transfer)) std::terminate();
+    auto& destination = objects_[transfer.destination_.index_];
+    if (transfer.host_slot_) {
+        transfer.host_slot_.reset();
+        --pending_host_images_;
     }
-    const Handle source_handle = transfer.source_;
-    Object& source             = objects_[transfer.source_.index_];
-    Object& destination        = objects_[transfer.destination_.index_];
-    if (source.source_pins != 0) { --source.source_pins; }
-    if (transfer.direction_ == StateTransferDirection::DeviceToHost) {
-        source.pending_host_slot.reset();
-        source.destination_pinned = false;
-        source.transfer_id        = 0;
-    } else {
-        if (destination.pending_device_slot) {
-            return_device_slot(*destination.pending_device_slot);
-        }
-        destination.pending_device_slot.reset();
-        destination.destination_pinned = false;
-        destination.transfer_id        = 0;
-        if (transfer.source_ != transfer.destination_) {
-            destination.role          = StateImageRole::ReservedDestination;
-            destination.content_epoch = 0;
-        }
+    if (transfer.device_slot_) {
+        return_device_slot(*transfer.device_slot_);
+        transfer.device_slot_.reset();
     }
+    destination.destination_pinned = false;
+    destination.transfer_id        = 0;
+    if (transfer.source_.image() != transfer.destination_) destination.content_epoch = 0;
     consume(transfer);
-    retire_released_owner(source_handle);
+    transfer.source_.reset();
 }
 
 bool StateImageStore::release(Handle handle) noexcept {
@@ -523,8 +544,7 @@ void StateImageStore::retire_released_owner(Handle handle) noexcept {
 }
 
 bool StateImageStore::has_pending_replica(const Object& object) noexcept {
-    return object.pending_device_slot.has_value() || object.pending_host_slot.has_value() ||
-           object.transfer_id != 0;
+    return object.transfer_id != 0;
 }
 
 std::optional<StateImageStore::Handle> StateImageStore::allocate(StateImageRole role,
@@ -570,7 +590,7 @@ const StateImageStore::Object& StateImageStore::require(Handle handle) const {
 }
 
 bool StateImageStore::valid_transfer(const Transfer& transfer) const noexcept {
-    if (transfer.owner_ != this || transfer.id_ == 0 || !valid(transfer.source_) ||
+    if (transfer.owner_ != this || transfer.id_ == 0 || !valid(transfer.source_.image()) ||
         !valid(transfer.destination_)) {
         return false;
     }

@@ -91,13 +91,11 @@ public:
 
     [[nodiscard]] KVHistoryHandle history() const noexcept { return history_.handle(); }
 
-    [[nodiscard]] std::span<const LogicalKVPageHandle> restores() const noexcept {
+    [[nodiscard]] std::span<const LogicalKVPageStore::Restore> restores() const noexcept {
         return restores_;
     }
 
-    [[nodiscard]] std::span<const DeviceKVPageHandle> restore_destinations() const noexcept {
-        return restore_destinations_;
-    }
+    [[nodiscard]] LogicalKVPageStore& pages() const noexcept;
 
     [[nodiscard]] bool needs_tail_copy() const noexcept { return tail_destination_.has_value(); }
 
@@ -106,7 +104,8 @@ public:
     [[nodiscard]] DeviceKVPageHandle tail_destination() const;
     void publish_restores();
     void prepare_tail_copy();
-    [[nodiscard]] KVHistory commit(cudaStream_t stream);
+    void enqueue_mapping(cudaStream_t stream);
+    [[nodiscard]] KVHistory commit();
 
 private:
     KVHistoryStore* store_ = nullptr;
@@ -114,14 +113,14 @@ private:
     KVPrefixRef source_;
     DeviceKVPageReservation reservation_;
     std::optional<KVExecutionRowLease> row_;
-    std::vector<LogicalKVPageHandle> restores_;
-    std::vector<DeviceKVPageHandle> restore_destinations_;
+    std::vector<LogicalKVPageStore::Restore> restores_;
     std::optional<LogicalKVPageHandle> tail_destination_;
     LogicalKVPageHandle tail_source_;
     bool tail_pinned_        = false;
     bool restores_published_ = false;
     bool write_tail_         = false;
     std::uint32_t frontier_  = 0;
+    bool mapping_enqueued_   = false;
     friend class KVHistoryStore;
 };
 
@@ -230,7 +229,7 @@ private:
                        std::uint32_t old_protected, std::uint32_t new_protected);
     void truncate_membership(History& history, std::uint32_t count);
     void abort(KVBinding& binding) noexcept;
-    [[nodiscard]] KVHistory commit(KVBinding& binding, cudaStream_t stream);
+    [[nodiscard]] KVHistory commit(KVBinding& binding);
     [[nodiscard]] LogicalKVPageHandle membership(const History& history,
                                                  std::uint32_t index) const noexcept;
     [[nodiscard]] LogicalKVPageHandle& directory_slot(Directory& root, std::uint32_t index);

@@ -165,7 +165,7 @@ int main() {
             options.use_cuda_graph                   = false;
             options.context_cache.device_state_slots = 1;
             auto planner     = q35::make_sequence_planner(parameters, device, options);
-            const auto pages = planner.capacity_curve().minimum_main_page_groups;
+            const auto pages = planner.capacity_curve().minimum_primary_page_groups;
             return std::move(planner).finalize(pages).workspace_capacity_bytes();
         };
         // Increasing total context cannot exceed the single Vision item's 16K workspace.

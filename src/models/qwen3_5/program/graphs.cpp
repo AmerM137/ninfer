@@ -178,7 +178,8 @@ void ProgramImpl::prepare_graphs() {
             auto binding = histories.prepare_binding(nullptr, 0, 1, row);
             binding.publish_restores();
             binding.prepare_tail_copy();
-            allocations.push_back(binding.commit(device.stream()));
+            binding.enqueue_mapping(device.stream());
+            allocations.push_back(binding.commit());
             auto& allocation = allocations.back();
             histories.prepare_write(allocation, 0, 1, device.stream());
 

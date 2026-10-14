@@ -20,12 +20,13 @@ namespace ninfer::runtime {
 template <class Model>
 class ResourceManager {
 public:
-    using Program    = typename Model::Program;
-    using Base       = typename Model::RequestBasePlan;
-    using Handle     = typename Model::CheckpointHandle;
-    using Source     = typename Model::SourceCandidate;
-    using SessionKey = typename Model::CacheSessionKey;
-    using OwnerToken = ContinuationOwnerToken;
+    using Program          = typename Model::Program;
+    using ContextResources = typename Program::ContextResources;
+    using Base             = typename Model::RequestBasePlan;
+    using Handle           = typename Model::CheckpointHandle;
+    using Source           = typename Model::SourceCandidate;
+    using SessionKey       = typename Model::CacheSessionKey;
+    using OwnerToken       = ContinuationOwnerToken;
 
     using DemandKey =
         typename decltype(std::declval<const Base&>().prefix_shortlist_key(0))::value_type;
@@ -522,16 +523,16 @@ public:
         return true;
     }
 
-    [[nodiscard]] ReclaimProgress reclaim(Program& program, ContextResourceUsage shortage,
+    [[nodiscard]] ReclaimProgress reclaim(Program& program, ContextResources shortage,
                                           std::span<const Handle> excluded = {}) {
-        if (program.has_context_transaction()) { return ReclaimProgress::Transferring; }
+        if (program.has_context_operation()) { return ReclaimProgress::Transferring; }
         auto cursor = begin_reclaim(program);
         return reclaim(program, shortage, excluded, cursor);
     }
 
-    [[nodiscard]] ReclaimProgress reclaim(Program& program, ContextResourceUsage shortage,
+    [[nodiscard]] ReclaimProgress reclaim(Program& program, ContextResources shortage,
                                           std::span<const Handle> excluded, ReclaimCursor& cursor) {
-        if (program.has_context_transaction()) { return ReclaimProgress::Transferring; }
+        if (program.has_context_operation()) { return ReclaimProgress::Transferring; }
         prune(program);
         if (shortage.host_bytes && program.release_redundant_host(excluded)) {
             return ReclaimProgress::Changed;
@@ -635,8 +636,7 @@ public:
                     auto builder           = plans.begin_kv_batch(shortage);
                     std::size_t components = 0;
                     std::uint64_t released = 0;
-                    const auto needed =
-                        shortage.main_kv_pages ? shortage.main_kv_pages : shortage.backend_kv_pages;
+                    const auto needed = shortage.kv_page_groups[shortage.first_kv_deficit()->index];
                     for (std::size_t next = index; next < actions.size() && released < needed;
                          ++next) {
                         const auto& candidate = actions[next];
@@ -658,7 +658,7 @@ public:
                             if (admits(program, batch->sources, facts, cursor.admission, cursor,
                                        evaluation, true) &&
                                 program.start_demote(*batch)) {
-                                return program.has_context_transaction()
+                                return program.has_context_operation()
                                            ? ReclaimProgress::Transferring
                                            : ReclaimProgress::Changed;
                             }
@@ -677,8 +677,8 @@ public:
                 if (!current || *current != action.host_victims) { continue; }
                 commit_release(program, action.host_victims, cursor, action.rank.loss);
                 if (program.start_demote(plan)) {
-                    return program.has_context_transaction() ? ReclaimProgress::Transferring
-                                                             : ReclaimProgress::Changed;
+                    return program.has_context_operation() ? ReclaimProgress::Transferring
+                                                           : ReclaimProgress::Changed;
                 }
                 if (!action.host_victims.empty()) { return ReclaimProgress::Changed; }
                 continue;
@@ -1010,15 +1010,8 @@ private:
         return cursor;
     }
 
-    static std::uint64_t useful(ContextResourceUsage released, ContextResourceUsage shortage) {
-        if (shortage.state_slots) { return std::min(released.state_slots, shortage.state_slots); }
-        if (shortage.main_kv_pages) {
-            return std::min(released.main_kv_pages, shortage.main_kv_pages);
-        }
-        if (shortage.backend_kv_pages) {
-            return std::min(released.backend_kv_pages, shortage.backend_kv_pages);
-        }
-        return std::min(released.host_bytes, shortage.host_bytes);
+    static std::uint64_t useful(ContextResources released, ContextResources shortage) {
+        return released.useful(shortage);
     }
 
     [[nodiscard]] std::vector<Handle> surviving(Program& program,
@@ -1040,7 +1033,7 @@ private:
     }
 
     using NativeReclaimPlan = decltype(std::declval<Program&>().plan_reclaim(
-        std::span<const Handle>{}, std::span<const Handle>{}, ContextResourceUsage{}));
+        std::span<const Handle>{}, std::span<const Handle>{}, ContextResources{}));
 
     // These facts live only until this synchronous evaluation mutates resources or yields.
     // The fixed victim cursor may outlive them; newly published points still count as fallback.
@@ -1374,17 +1367,15 @@ private:
     }
 
     void balance_reused(Program& program) {
-        const auto amounts = [](ContextResourceUsage r) {
-            return std::array<std::uint64_t, 4>{r.state_slots, r.main_kv_pages, r.backend_kv_pages,
-                                                r.host_bytes};
-        };
+        const auto amounts = [](const ContextResources& r) { return r.quantities(); };
+        using Quantities   = decltype(ContextResources{}.quantities());
 
         struct ProtectedEntry {
             CacheRetentionPriority* priority;
             std::uint64_t* retained_at;
             std::uint64_t ordinal;
             std::vector<Handle> handles;
-            std::optional<std::array<std::uint64_t, 4>> footprint;
+            std::optional<Quantities> footprint;
         };
 
         std::vector<ProtectedEntry> entries;

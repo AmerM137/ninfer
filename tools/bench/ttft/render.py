@@ -566,7 +566,10 @@ def _runtime_markdown(summary: dict[str, Any]) -> list[str]:
         lines.extend(_table(
             ("Case", "Sample", "Resource", "Direction", "Bytes", "Seconds"),
             ((row["case"], row["sample"], resource, direction, values["bytes"], seconds(values["seconds"]))
-             for row in available for resource, directions in row["transfers"].items()
+             for row in available for resource, directions in {
+                 "state": row["transfers"]["state"],
+                 **{f"kv_pool_{pool}": values for pool, values in row["transfers"]["kv_pools"].items()},
+             }.items()
              for direction, values in directions.items()),
         ))
         lines.extend([
@@ -578,7 +581,10 @@ def _runtime_markdown(summary: dict[str, Any]) -> list[str]:
         lines.extend(_table(
             ("Case", "Sample", "Resource", "Sampled max", "Last sample"),
             ((row["case"], row["sample"], resource, value["sampled_max"], value["last"])
-             for row in available for resource, value in row["occupancy"].items()),
+             for row in available for resource, value in {
+                 **{key: value for key, value in row["occupancy"].items() if key != "kv_pools"},
+                 **{f"kv_pool_{pool}": value for pool, value in row["occupancy"]["kv_pools"].items()},
+             }.items()),
         ))
         lines.extend(["", *_table(
             ("Case", "Sample", "Host allocator peak occupied bytes"),
@@ -844,8 +850,11 @@ def render_csv(summary: dict[str, Any]) -> str:
 
 
 def render_request_analysis_csv(summary: dict[str, Any]) -> str:
-    fields = ("case", "profile_label", "sample", "request_role", "outcome", "constructed",
-              "wire_request_id", "engine_request_id", *request_timing_analysis({}), "raw")
+    fields = ["case", "profile_label", "sample", "request_role", "outcome", "constructed",
+              "wire_request_id", "engine_request_id", *request_timing_analysis({})]
+    fields.extend(sorted({key for row in summary["request_timing_analysis"] for key in row
+                          if key not in fields and key != "raw"}))
+    fields.append("raw")
     stream = io.StringIO(newline="")
     writer = csv.DictWriter(stream, fieldnames=fields)
     writer.writeheader()

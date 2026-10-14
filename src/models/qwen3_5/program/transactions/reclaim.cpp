@@ -88,7 +88,7 @@ struct PhysicalPoolFacts {
 // A read-only inventory of actual prefix holders. It does not retain content or infer
 // ownership from copies of C++ pointers; the stores answer release queries directly.
 struct PhysicalFacts {
-    PhysicalFacts(const ProgramImpl& program, runtime::ContextResourceUsage shortage)
+    PhysicalFacts(const ProgramImpl& program, ContextResources shortage)
         : host_kv(program.host_kv_extents && program.host_kv_extents->occupied()) {
         const auto prepare = [&](PhysicalPoolFacts& pool, bool is_main) {
             pool.history_store =
@@ -111,10 +111,12 @@ struct PhysicalFacts {
                     found->checkpoints.push_back(index);
             }
         };
-        if (shortage.host_bytes || (!shortage.state_slots && shortage.main_kv_pages))
+        if (shortage.host_bytes ||
+            (!shortage.state_slots && shortage.kv_page_groups[kTextKvPool.index]))
             prepare(main, true);
         if (shortage.host_bytes ||
-            (!shortage.state_slots && !shortage.main_kv_pages && shortage.backend_kv_pages))
+            (!shortage.state_slots && !shortage.kv_page_groups[kTextKvPool.index] &&
+             shortage.kv_page_groups[kBackendKvPool.index]))
             prepare(backend, false);
     }
 
@@ -125,7 +127,7 @@ struct PhysicalFacts {
 std::vector<PhysicalOwners> physical_owner_sets(const ProgramImpl& program, PhysicalFacts& facts,
                                                 std::span<const CheckpointHandle> allowed,
                                                 std::span<const CheckpointHandle> excluded,
-                                                runtime::ContextResourceUsage shortage) {
+                                                ContextResources shortage) {
     std::vector<bool> eligible(program.checkpoints.size(), false);
     for (const auto handle : allowed) {
         if (program.valid_checkpoint(handle) && !program.checkpoints[handle.index].pins &&
@@ -250,8 +252,11 @@ std::vector<PhysicalOwners> physical_owner_sets(const ProgramImpl& program, Phys
             }
         }
     };
-    if (host || (!shortage.state_slots && shortage.main_kv_pages)) { collect_pages(true); }
-    if (host || (!shortage.state_slots && !shortage.main_kv_pages && shortage.backend_kv_pages)) {
+    if (host || (!shortage.state_slots && shortage.kv_page_groups[kTextKvPool.index])) {
+        collect_pages(true);
+    }
+    if (host || (!shortage.state_slots && !shortage.kv_page_groups[kTextKvPool.index] &&
+                 shortage.kv_page_groups[kBackendKvPool.index])) {
         collect_pages(false);
     }
     std::vector<PhysicalOwners> result;
@@ -294,10 +299,11 @@ struct ReleaseScratch {
     std::vector<Image> images;
 };
 
-std::optional<runtime::ContextResourceUsage>
-released_resources(const ProgramImpl& program, std::span<const CheckpointHandle> handles,
-                   runtime::ContextResourceUsage shortage, ReleaseScratch& scratch,
-                   ReleasedPages& released_pages) {
+std::optional<ContextResources> released_resources(const ProgramImpl& program,
+                                                   std::span<const CheckpointHandle> handles,
+                                                   ContextResources shortage,
+                                                   ReleaseScratch& scratch,
+                                                   ReleasedPages& released_pages) {
     scratch.main.clear();
     scratch.backend.clear();
     scratch.records.clear();
@@ -319,7 +325,7 @@ released_resources(const ProgramImpl& program, std::span<const CheckpointHandle>
         scratch.main.push_back(&record.text_prefix());
         if (const auto* prefix = record.backend_prefix()) scratch.backend.push_back(prefix);
     }
-    runtime::ContextResourceUsage result;
+    ContextResources result;
     for (const auto& image : scratch.images) {
         if (image.count != program.state_store->checkpoint_references(image.handle) ||
             !program.state_store->can_release_after_checkpoint_references(image.handle,
@@ -333,12 +339,14 @@ released_resources(const ProgramImpl& program, std::span<const CheckpointHandle>
     const auto count = [&](const context::KVHistoryStore& histories,
                            const context::LogicalKVPageStore& pages, const auto& removed, bool main,
                            std::size_t stride) {
-        const bool device = main ? shortage.main_kv_pages != 0 : shortage.backend_kv_pages != 0;
+        const bool device = main ? shortage.kv_page_groups[kTextKvPool.index] != 0
+                                 : shortage.kv_page_groups[kBackendKvPool.index] != 0;
         if (!shortage.host_bytes && !device) return;
         for (auto page : histories.released_pages(removed)) {
             if (shortage.host_bytes && pages.host_resident(page)) result.host_bytes += stride;
             if (device && pages.device_resident(page)) {
-                ++(main ? result.main_kv_pages : result.backend_kv_pages);
+                ++(main ? result.kv_page_groups[kTextKvPool.index]
+                        : result.kv_page_groups[kBackendKvPool.index]);
                 released_pages.pages.push_back(page);
             }
         }
@@ -356,8 +364,8 @@ released_resources(const ProgramImpl& program, std::span<const CheckpointHandle>
 // A quote carries content identities and complete optional holders. It holds no execution
 // lease: start_demote revalidates it before acquiring real destinations.
 struct DemotionPlan {
-    const ProgramImpl* owner               = nullptr;
-    runtime::ContextResourceClass resource = runtime::ContextResourceClass::State;
+    const ProgramImpl* owner                  = nullptr;
+    runtime::ContextTransferResource resource = runtime::ContextTransferResource{};
     std::vector<CheckpointHandle> allowed;
     std::vector<CheckpointHandle> excluded;
     std::optional<StateDemotion> state;
@@ -378,11 +386,11 @@ std::uint32_t ProgramImpl::checkpoint_recovery_frontier(CheckpointHandle retaine
 }
 
 struct ReclaimPlan {
-    ReclaimPlan(const ProgramImpl& program, runtime::ContextResourceUsage requested)
+    ReclaimPlan(const ProgramImpl& program, ContextResources requested)
         : owner(&program), shortage(requested), facts(program, requested) {}
 
     const ProgramImpl* owner;
-    runtime::ContextResourceUsage shortage;
+    ContextResources shortage;
     PhysicalFacts facts;
     mutable std::unordered_map<std::uint64_t, bool> prefixes;
 
@@ -408,7 +416,7 @@ struct ReclaimPlan {
 struct ReleasePlan {
     std::shared_ptr<const ReclaimPlan> evaluation;
     std::vector<CheckpointHandle> sources;
-    runtime::ContextResourceUsage released;
+    ContextResources released;
     ReleasedPages pages;
 };
 
@@ -473,21 +481,23 @@ ProgramImpl::checkpoint_recovery_loss(std::span<const CheckpointHandle> removed,
 std::optional<ContextDemotion> quote_demotion(const ProgramImpl& program,
                                               const PhysicalOwners& owners,
                                               std::span<const CheckpointHandle> excluded,
-                                              runtime::ContextResourceUsage shortage) {
+                                              ContextResources shortage) {
     if (shortage.host_bytes ||
-        (!shortage.state_slots && !shortage.main_kv_pages && !shortage.backend_kv_pages)) {
+        (!shortage.state_slots && !shortage.kv_page_groups[kTextKvPool.index] &&
+         !shortage.kv_page_groups[kBackendKvPool.index])) {
         return std::nullopt;
     }
-    const auto resource = shortage.state_slots     ? runtime::ContextResourceClass::State
-                          : shortage.main_kv_pages ? runtime::ContextResourceClass::MainKV
-                                                   : runtime::ContextResourceClass::BackendKV;
+    const auto resource = shortage.state_slots ? runtime::ContextTransferResource{}
+                          : shortage.kv_page_groups[kTextKvPool.index]
+                              ? runtime::ContextTransferResource{kTextKvPool}
+                              : runtime::ContextTransferResource{kBackendKvPool};
     auto plan           = std::make_shared<DemotionPlan>();
     plan->owner         = &program;
     plan->resource      = resource;
     plan->allowed       = owners.sources;
     plan->excluded.assign(excluded.begin(), excluded.end());
     ContextDemotion candidate;
-    if (resource == runtime::ContextResourceClass::State) {
+    if (resource == runtime::ContextTransferResource{}) {
         for (const auto state : owners.states) {
             if (program.state_store->role(state) != context::StateImageRole::CheckpointImmutable ||
                 !program.state_store->can_release_after_checkpoint_references(
@@ -503,17 +513,18 @@ std::optional<ContextDemotion> quote_demotion(const ProgramImpl& program,
         }
         if (!plan->state) { return std::nullopt; }
     } else {
-        const auto& pages = resource == runtime::ContextResourceClass::MainKV
-                                ? *program.text_kv_pages
-                                : *program.backend_kv_pages;
-        const auto& objects =
-            resource == runtime::ContextResourceClass::MainKV ? owners.main : owners.backend;
-        const auto needed = resource == runtime::ContextResourceClass::MainKV
-                                ? shortage.main_kv_pages
-                                : shortage.backend_kv_pages;
-        const auto stride = resource == runtime::ContextResourceClass::MainKV
-                                ? program.text_host_kv_page_stride
-                                : program.backend_host_kv_page_stride;
+        const auto& pages   = resource == runtime::ContextTransferResource{kTextKvPool}
+                                  ? *program.text_kv_pages
+                                  : *program.backend_kv_pages;
+        const auto& objects = resource == runtime::ContextTransferResource{kTextKvPool}
+                                  ? owners.main
+                                  : owners.backend;
+        const auto needed   = resource == runtime::ContextTransferResource{kTextKvPool}
+                                  ? shortage.kv_page_groups[kTextKvPool.index]
+                                  : shortage.kv_page_groups[kBackendKvPool.index];
+        const auto stride   = resource == runtime::ContextTransferResource{kTextKvPool}
+                                  ? program.text_host_kv_page_stride
+                                  : program.backend_host_kv_page_stride;
         for (const auto& object : objects) {
             const auto page = object.handle;
             if (pages.active_history_references(page) || pages.source_pins(page) ||
@@ -527,8 +538,9 @@ std::optional<ContextDemotion> quote_demotion(const ProgramImpl& program,
             if (plan->pages.size() == needed) { break; }
         }
         if (plan->pages.empty()) { return std::nullopt; }
-        (resource == runtime::ContextResourceClass::MainKV ? candidate.released.main_kv_pages
-                                                           : candidate.released.backend_kv_pages) =
+        (resource == runtime::ContextTransferResource{kTextKvPool}
+             ? candidate.released.kv_page_groups[kTextKvPool.index]
+             : candidate.released.kv_page_groups[kBackendKvPool.index]) =
             static_cast<std::uint32_t>(plan->pages.size());
     }
     candidate.sources = owners.sources;
@@ -544,11 +556,13 @@ std::optional<ContextRelease> quote_release(const std::shared_ptr<ReclaimPlan>& 
         released_resources(*evaluation->owner, sources, evaluation->shortage, scratch, plan->pages);
     if (!released) { return std::nullopt; }
     const auto shortage = evaluation->shortage;
-    const auto useful   = shortage.host_bytes         ? released->host_bytes
-                          : shortage.state_slots      ? released->state_slots
-                          : shortage.main_kv_pages    ? released->main_kv_pages
-                          : shortage.backend_kv_pages ? released->backend_kv_pages
-                                                      : 0;
+    const auto useful   = shortage.host_bytes    ? released->host_bytes
+                          : shortage.state_slots ? released->state_slots
+                          : shortage.kv_page_groups[kTextKvPool.index]
+                              ? released->kv_page_groups[kTextKvPool.index]
+                          : shortage.kv_page_groups[kBackendKvPool.index]
+                              ? released->kv_page_groups[kBackendKvPool.index]
+                              : 0;
     if (!useful) { return std::nullopt; }
     plan->evaluation = evaluation;
     plan->sources.assign(sources.begin(), sources.end());
@@ -556,9 +570,9 @@ std::optional<ContextRelease> quote_release(const std::shared_ptr<ReclaimPlan>& 
     return ContextRelease{plan->sources, *released, std::move(plan)};
 }
 
-std::optional<runtime::ContextResourceUsage>
+std::optional<ContextResources>
 ProgramImpl::checkpoint_release_resources(std::span<const CheckpointHandle> handles,
-                                          runtime::ContextResourceUsage shortage) const {
+                                          ContextResources shortage) const {
     ReleaseScratch scratch;
     ReleasedPages pages;
     return released_resources(*this, handles, shortage, scratch, pages);
@@ -566,9 +580,9 @@ ProgramImpl::checkpoint_release_resources(std::span<const CheckpointHandle> hand
 
 ContextReclaimPlan ProgramImpl::plan_reclaim(std::span<const CheckpointHandle> allowed,
                                              std::span<const CheckpointHandle> excluded,
-                                             runtime::ContextResourceUsage shortage) const {
+                                             ContextResources shortage) const {
     ContextReclaimPlan result;
-    if (context_transaction_) { return result; }
+    if (context_operation_) { return result; }
     result.impl_ = std::make_shared<ReclaimPlan>(*this, shortage);
     const auto owners =
         physical_owner_sets(*this, result.impl_->facts, allowed, excluded, shortage);
@@ -584,11 +598,10 @@ ContextReclaimPlan ProgramImpl::plan_reclaim(std::span<const CheckpointHandle> a
     return result;
 }
 
-std::vector<ContextRelease>
-ProgramImpl::plan_releases(std::span<const CheckpointHandle> allowed,
-                           std::span<const CheckpointHandle> excluded,
-                           runtime::ContextResourceUsage shortage) const {
-    if (context_transaction_) { return {}; }
+std::vector<ContextRelease> ProgramImpl::plan_releases(std::span<const CheckpointHandle> allowed,
+                                                       std::span<const CheckpointHandle> excluded,
+                                                       ContextResources shortage) const {
+    if (context_operation_) { return {}; }
     auto evaluation   = std::make_shared<ReclaimPlan>(*this, shortage);
     const auto owners = physical_owner_sets(*this, evaluation->facts, allowed, excluded, shortage);
     ReleaseScratch scratch;
@@ -602,34 +615,36 @@ ProgramImpl::plan_releases(std::span<const CheckpointHandle> allowed,
 }
 
 struct DemotionBatch {
-    DemotionBatch(std::shared_ptr<const ReclaimPlan> evaluation,
-                  runtime::ContextResourceUsage requested)
+    DemotionBatch(std::shared_ptr<const ReclaimPlan> evaluation, ContextResources requested)
         : evaluation(std::move(evaluation)), shortage(requested) {
         if (!this->evaluation || shortage.state_slots || shortage.host_bytes ||
-            (!shortage.main_kv_pages && !shortage.backend_kv_pages)) {
+            (!shortage.kv_page_groups[kTextKvPool.index] &&
+             !shortage.kv_page_groups[kBackendKvPool.index])) {
             valid = false;
             return;
         }
         const auto original = this->evaluation->shortage;
-        resource            = shortage.main_kv_pages ? runtime::ContextResourceClass::MainKV
-                                                     : runtime::ContextResourceClass::BackendKV;
+        resource            = shortage.kv_page_groups[kTextKvPool.index]
+                                  ? runtime::ContextTransferResource{kTextKvPool}
+                                  : runtime::ContextTransferResource{kBackendKvPool};
         valid               = !original.state_slots && !original.host_bytes &&
-                (resource == runtime::ContextResourceClass::MainKV
-                     ? original.main_kv_pages != 0
-                     : !original.main_kv_pages && original.backend_kv_pages != 0);
+                (resource == runtime::ContextTransferResource{kTextKvPool}
+                     ? original.kv_page_groups[kTextKvPool.index] != 0
+                     : !original.kv_page_groups[kTextKvPool.index] &&
+                           original.kv_page_groups[kBackendKvPool.index] != 0);
     }
 
     std::shared_ptr<const ReclaimPlan> evaluation;
-    runtime::ContextResourceUsage shortage;
-    runtime::ContextResourceClass resource = runtime::ContextResourceClass::MainKV;
-    bool valid                             = true;
+    ContextResources shortage;
+    runtime::ContextTransferResource resource = runtime::ContextTransferResource{kTextKvPool};
+    bool valid                                = true;
     std::vector<std::shared_ptr<const DemotionPlan>> components;
     std::vector<const PageDemotion*> ordered;
     std::vector<std::uint32_t> group_ends;
     std::unordered_map<std::uint32_t, const PageDemotion*> selected;
 
     const context::LogicalKVPageStore& page_store() const {
-        return resource == runtime::ContextResourceClass::MainKV
+        return resource == runtime::ContextTransferResource{kTextKvPool}
                    ? *evaluation->owner->text_kv_pages
                    : *evaluation->owner->backend_kv_pages;
     }
@@ -637,7 +652,7 @@ struct DemotionBatch {
     bool append(const ContextDemotion& quote) {
         if (!valid) { return false; }
         const auto& program = *evaluation->owner;
-        if (program.has_context_transaction() || !quote.impl || quote.impl->owner != &program ||
+        if (program.has_context_operation() || !quote.impl || quote.impl->owner != &program ||
             quote.impl->state || quote.impl->resource != resource || quote.impl->pages.empty() ||
             quote.sources != quote.impl->allowed ||
             (!components.empty() && components.front()->excluded != quote.impl->excluded)) {
@@ -696,13 +711,14 @@ struct DemotionBatch {
         }
         const auto requested = quote.impl->evaluation->shortage;
         if (requested.state_slots || requested.host_bytes ||
-            (resource == runtime::ContextResourceClass::MainKV
-                 ? !requested.main_kv_pages
-                 : requested.main_kv_pages || !requested.backend_kv_pages)) {
+            (resource == runtime::ContextTransferResource{kTextKvPool}
+                 ? !requested.kv_page_groups[kTextKvPool.index]
+                 : requested.kv_page_groups[kTextKvPool.index] ||
+                       !requested.kv_page_groups[kBackendKvPool.index])) {
             return false;
         }
         const auto& program = *evaluation->owner;
-        if (program.has_context_transaction()) { return false; }
+        if (program.has_context_operation()) { return false; }
         for (const auto source : quote.sources) {
             if (!program.valid_checkpoint(source) || program.checkpoints[source.index].pins) {
                 return false;
@@ -717,14 +733,14 @@ struct DemotionBatch {
     }
 
     std::optional<ContextDemotion> finish() const {
-        if (!valid || ordered.empty() || evaluation->owner->has_context_transaction()) {
+        if (!valid || ordered.empty() || evaluation->owner->has_context_operation()) {
             return std::nullopt;
         }
         const auto& program  = *evaluation->owner;
-        const auto needed    = resource == runtime::ContextResourceClass::MainKV
-                                   ? shortage.main_kv_pages
-                                   : shortage.backend_kv_pages;
-        const auto stride    = resource == runtime::ContextResourceClass::MainKV
+        const auto needed    = resource == runtime::ContextTransferResource{kTextKvPool}
+                                   ? shortage.kv_page_groups[kTextKvPool.index]
+                                   : shortage.kv_page_groups[kBackendKvPool.index];
+        const auto stride    = resource == runtime::ContextTransferResource{kTextKvPool}
                                    ? program.text_host_kv_page_stride
                                    : program.backend_host_kv_page_stride;
         const auto usage     = program.physical_usage();
@@ -752,17 +768,17 @@ struct DemotionBatch {
                   [](auto a, auto b) { return a.index < b.index; });
         plan->allowed.erase(std::unique(plan->allowed.begin(), plan->allowed.end()),
                             plan->allowed.end());
-        result.sources = plan->allowed;
-        (resource == runtime::ContextResourceClass::MainKV ? result.released.main_kv_pages
-                                                           : result.released.backend_kv_pages) =
-            count;
-        result.impl = std::move(plan);
+        result.sources                                               = plan->allowed;
+        (resource == runtime::ContextTransferResource{kTextKvPool}
+             ? result.released.kv_page_groups[kTextKvPool.index]
+             : result.released.kv_page_groups[kBackendKvPool.index]) = count;
+        result.impl                                                  = std::move(plan);
         return result;
     }
 };
 
 bool ProgramImpl::start_demote(const ContextDemotion& quote) {
-    if (!quote.impl || quote.impl->owner != this || context_transaction_) { return false; }
+    if (!quote.impl || quote.impl->owner != this || context_operation_) { return false; }
     const auto& plan = *quote.impl;
     if (quote.sources != plan.allowed) { return false; }
     for (const auto source : plan.allowed) {
@@ -775,7 +791,7 @@ bool ProgramImpl::start_demote(const ContextDemotion& quote) {
     // KV aliases preserve logical positions: fork/view copy a prefix in place, COW creates
     // a new handle, growth appends fresh handles, and truncation only removes a suffix.
     if (plan.state) {
-        if (quote.released != runtime::ContextResourceUsage{.state_slots = 1}) { return false; }
+        if (quote.released != ContextResources{.state_slots = 1}) { return false; }
         const auto& expected = *plan.state;
         std::size_t matched  = 0;
         for (std::uint32_t index = 0; index < checkpoints.size(); ++index) {
@@ -798,12 +814,13 @@ bool ProgramImpl::start_demote(const ContextDemotion& quote) {
             return false;
         }
     } else {
-        const bool main       = plan.resource == runtime::ContextResourceClass::MainKV;
+        const bool main       = plan.resource == runtime::ContextTransferResource{kTextKvPool};
         const auto* pages     = main ? text_kv_pages.get() : backend_kv_pages.get();
         const auto* histories = main ? text_kv_histories.get() : backend_kv_histories.get();
         if (!pages || !histories || plan.pages.empty()) { return false; }
-        runtime::ContextResourceUsage released;
-        (main ? released.main_kv_pages : released.backend_kv_pages) =
+        ContextResources released;
+        (main ? released.kv_page_groups[kTextKvPool.index]
+              : released.kv_page_groups[kBackendKvPool.index]) =
             static_cast<std::uint32_t>(plan.pages.size());
         if (quote.released != released) { return false; }
 
@@ -859,19 +876,19 @@ bool ProgramImpl::start_demote(const ContextDemotion& quote) {
         }
     }
 
-    ContextTransaction transaction;
-    transaction.kind                  = ContextOperationKind::Demote;
-    transaction.preserve_state_device = false;
+    ContextOperation transaction(*migration_context_, host_kv_extents.get(), DemoteOperation{});
+    auto& migration = transaction.migration;
     if (plan.state) {
         if (plan.state->host_resident) {
             return state_store->drop_device_replica(plan.state->handle);
         }
         auto transfer = state_store->reserve_device_to_host(plan.state->handle);
         if (!transfer) { return false; }
-        transaction.state_transfer.emplace(std::move(*transfer));
+        migration.add_state_copy(std::move(*transfer), false);
     } else {
-        auto& pages = plan.resource == runtime::ContextResourceClass::MainKV ? *text_kv_pages
-                                                                             : *backend_kv_pages;
+        auto& pages = plan.resource == runtime::ContextTransferResource{kTextKvPool}
+                          ? *text_kv_pages
+                          : *backend_kv_pages;
         std::vector<context::LogicalKVPageHandle> missing;
         std::size_t begin       = 0;
         const auto append_group = [&](std::size_t end) {
@@ -903,14 +920,10 @@ bool ProgramImpl::start_demote(const ContextDemotion& quote) {
             // All destinations and source leases belong to this local transaction until
             // every component is ready. A failed reservation unwinds without dropping pages.
             if (!destination) { return false; }
-            KVTransfer transfer;
-            transfer.pages       = &pages;
-            transfer.resource    = plan.resource;
-            transfer.drop_device = true;
-            transfer.logical.assign(missing.begin() + offset, missing.begin() + offset + count);
-            transfer.physical = host_kv_extents->device_sources(*destination);
-            transfer.host_destination.emplace(std::move(*destination));
-            transaction.kv_transfers.push_back(std::move(transfer));
+            migration.add_backup(*plan.resource.pool, pages,
+                                 std::vector<context::LogicalKVPageHandle>(
+                                     missing.begin() + offset, missing.begin() + offset + count),
+                                 std::move(*destination), true);
             offset += count;
         }
         // Complete Host replicas already preserve these contents. Once the entire batch is
@@ -920,17 +933,12 @@ bool ProgramImpl::start_demote(const ContextDemotion& quote) {
                 throw std::logic_error("quoted redundant Device page changed during demotion");
             }
         }
-        if (transaction.kv_transfers.empty()) { return true; }
+        if (!migration.spill_page_groups()) return true;
     }
 
-    for (const auto handle : plan.allowed)
-        transaction.carried_pins.push_back(checkpoints.lease(handle));
-    context_transaction_.emplace(std::move(transaction));
+    context_operation_.emplace(std::move(transaction));
     try {
-        context_source_ready_.record(device.stream());
-        context_source_ready_.wait(device.transfer_stream());
-        enqueue_state_backup(*context_transaction_);
-        enqueue_context_transfers(*context_transaction_);
+        context_operation_->migration.submit();
     } catch (...) {
         abort_context();
         throw;
@@ -961,8 +969,7 @@ std::optional<ContextDemotion> ContextDemotionBatch::finish() const {
     return impl_ ? impl_->finish() : std::nullopt;
 }
 
-ContextDemotionBatch
-ContextReclaimPlan::begin_kv_batch(runtime::ContextResourceUsage shortage) const {
+ContextDemotionBatch ContextReclaimPlan::begin_kv_batch(ContextResources shortage) const {
     return ContextDemotionBatch(std::make_unique<detail::DemotionBatch>(impl_, shortage));
 }
 

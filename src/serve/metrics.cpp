@@ -203,12 +203,14 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready) const {
     gauge("device_state_capacity_slots",
           options_.max_concurrency + options_.context_cache.device_state_slots.value(),
           "Total device StateImage slots, including resident lanes.");
-    GAUGE(device_main_kv_occupied_pages, "device_kv_used_pages",
-          "Occupied physical Main KV pages, including retained history.");
-    gauge("device_kv_capacity_pages", memory_.kv_capacity_page_groups,
-          "Main KV pool capacity in pages.");
-    GAUGE(device_backend_kv_occupied_pages, "device_backend_kv_used_pages",
-          "Occupied speculative backend KV pages.");
+    header("device_kv_used_page_groups", "gauge", "Occupied physical KV page groups by pool.");
+    header("device_kv_capacity_page_groups", "gauge", "Physical KV page-group capacity by pool.");
+    for (const auto& pool : stats.kv_pools) {
+        out << "ninfer_device_kv_used_page_groups{pool_id=\"" << pool.id << "\"} "
+            << pool.occupied_page_groups << '\n';
+        out << "ninfer_device_kv_capacity_page_groups{pool_id=\"" << pool.id << "\"} "
+            << pool.capacity_page_groups << '\n';
+    }
     GAUGE(host_context_occupied_bytes, "host_context_used_bytes",
           "Occupied Host backing, including reservations.");
     GAUGE(host_context_reserved_bytes, "host_context_reserved_bytes",
@@ -225,24 +227,21 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready) const {
 #undef COUNTER
 
     header("context_transfer_bytes_total", "counter", "Completed context payload transfers.");
-    const auto transfer_bytes = [&](const char* resource, const char* direction, auto current,
-                                    auto baseline) {
-        out << "ninfer_context_transfer_bytes_total{resource=\"" << resource << "\",direction=\""
-            << direction << "\"} " << current - baseline << '\n';
-    };
-#define TRANSFER(resource, prefix, direction)                                                      \
-    transfer_bytes(resource, #direction, stats.prefix##_##direction##_bytes,                       \
-                   baseline_.prefix##_##direction##_bytes)
-    TRANSFER("state", state, d2h);
-    TRANSFER("state", state, h2d);
-    TRANSFER("state", state, d2d);
-    TRANSFER("main_kv", main_kv, d2h);
-    TRANSFER("main_kv", main_kv, h2d);
-    TRANSFER("main_kv", main_kv, d2d);
-    TRANSFER("backend_kv", backend_kv, d2h);
-    TRANSFER("backend_kv", backend_kv, h2d);
-    TRANSFER("backend_kv", backend_kv, d2d);
-#undef TRANSFER
+    constexpr std::array directions{"d2h", "h2d", "d2d"};
+    for (std::size_t i = 0; i < directions.size(); ++i) {
+        out << "ninfer_context_transfer_bytes_total{resource=\"state\",direction=\""
+            << directions[i] << "\"} "
+            << stats.context_transfers.state[i].bytes - baseline_.context_transfers.state[i].bytes
+            << '\n';
+        for (const auto& pool : stats.kv_pools) {
+            const auto baseline = pool.id < baseline_.context_transfers.kv.size()
+                                      ? baseline_.context_transfers.kv[pool.id][i].bytes
+                                      : 0;
+            out << "ninfer_context_transfer_bytes_total{resource=\"kv\",pool_id=\"" << pool.id
+                << "\",direction=\"" << directions[i] << "\"} "
+                << stats.context_transfers.kv.at(pool.id)[i].bytes - baseline << '\n';
+        }
+    }
     counter("context_transfer_seconds_total", stats.actual_context_transfer_seconds,
             baseline_.actual_context_transfer_seconds,
             "Accumulated context transfer operation time.");

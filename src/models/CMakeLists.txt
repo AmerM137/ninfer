@@ -28,6 +28,7 @@ target_sources(ninfer_model_runtime PRIVATE
   common/context/logical_kv_store.cpp
   common/context/kv_history.cpp
   common/context/work.cpp
+  common/context/migration.cpp
   common/moe/graph.cpp
   common/moe/plan.cpp
   common/moe/execution.cpp

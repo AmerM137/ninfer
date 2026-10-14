@@ -1,5 +1,6 @@
 #pragma once
 
+#include "models/common/context/migration.h"
 #include "models/common/moe/resources.h"
 #include "models/qwen3_5/program/internal.h"
 
@@ -283,8 +284,7 @@ public:
                    std::span<const CheckpointHandle> = {},
                    std::span<const CheckpointHandle> = {}) const;
     [[nodiscard]] PrefixShortlistKey checkpoint_key(CheckpointHandle, std::uint32_t frontier) const;
-    [[nodiscard]] runtime::ContextResourceUsage
-        checkpoint_footprint(std::span<const CheckpointHandle>) const;
+    [[nodiscard]] ContextResources checkpoint_footprint(std::span<const CheckpointHandle>) const;
     [[nodiscard]] CheckpointSummary checkpoint_summary(CheckpointHandle) const;
     [[nodiscard]] CheckpointMetadata checkpoint_metadata(CheckpointHandle) const;
     [[nodiscard]] bool checkpoint_matches(CheckpointHandle, const RequestBasePlan&) const;
@@ -294,12 +294,11 @@ public:
     [[nodiscard]] std::uint64_t checkpoint_recovery_loss(std::span<const CheckpointHandle>,
                                                          std::span<const CheckpointHandle>) const;
     [[nodiscard]] bool can_release_checkpoint(CheckpointHandle) const noexcept;
-    [[nodiscard]] std::optional<runtime::ContextResourceUsage>
-        checkpoint_release_resources(std::span<const CheckpointHandle>,
-                                     runtime::ContextResourceUsage) const;
+    [[nodiscard]] std::optional<ContextResources>
+        checkpoint_release_resources(std::span<const CheckpointHandle>, ContextResources) const;
     [[nodiscard]] bool release_checkpoint(CheckpointHandle) noexcept;
     [[nodiscard]] bool revoke_snapshot(ResumeState&) noexcept;
-    [[nodiscard]] runtime::ContextResourceUsage snapshot_resources(const ResumeState& paused) const;
+    [[nodiscard]] ContextResources snapshot_resources(const ResumeState& paused) const;
     // Exact Host bytes freed by deleting this fixed set, with physical sharing counted once.
     [[nodiscard]] std::size_t
     host_bytes_released(std::span<const CheckpointHandle> checkpoints) const;
@@ -307,8 +306,8 @@ public:
     [[nodiscard]] std::size_t
     release_redundant_host(std::span<const CheckpointHandle> excluded,
                            std::optional<SequenceHandle> pending_backup = std::nullopt);
-    [[nodiscard]] runtime::ResourceReservation reserve_units(std::span<const ExecutionUnit>);
-    [[nodiscard]] bool reclaim_capture_reservation(runtime::ContextResourceUsage shortage);
+    [[nodiscard]] ResourceReservation reserve_units(std::span<const ExecutionUnit>);
+    [[nodiscard]] bool reclaim_capture_reservation(ContextResources shortage);
     void release_units(std::span<const SequenceHandle>) noexcept;
     [[nodiscard]] BindingReservation start_binding(const RequestBasePlan&, runtime::LaneId,
                                                    const SourceCandidate&, ResumeState*,
@@ -319,16 +318,16 @@ public:
     void skip_capture(SequenceHandle);
     [[nodiscard]] ContextReclaimPlan plan_reclaim(std::span<const CheckpointHandle>,
                                                   std::span<const CheckpointHandle>,
-                                                  runtime::ContextResourceUsage) const;
+                                                  ContextResources) const;
     [[nodiscard]] std::vector<ContextRelease> plan_releases(std::span<const CheckpointHandle>,
                                                             std::span<const CheckpointHandle>,
-                                                            runtime::ContextResourceUsage) const;
+                                                            ContextResources) const;
     [[nodiscard]] bool start_demote(const ContextDemotion&);
     [[nodiscard]] bool start_pause(SequenceHandle, bool save_snapshot, runtime::ExecutionTiming*);
     [[nodiscard]] ContextProgress poll_context(runtime::CancellationFlagView);
 
-    [[nodiscard]] bool has_context_transaction() const noexcept {
-        return context_transaction_.has_value();
+    [[nodiscard]] bool has_context_operation() const noexcept {
+        return context_operation_.has_value();
     }
 
     [[nodiscard]] bool context_blocks(SequenceHandle) const noexcept;
@@ -383,6 +382,7 @@ public:
     std::unique_ptr<context::LogicalKVPageStore> backend_kv_pages;
     std::unique_ptr<context::KVHistoryStore> backend_kv_histories;
     std::unique_ptr<context::HostKVExtentStore> host_kv_extents;
+    std::vector<runtime::KvPoolDescriptor> kv_pools;
     std::size_t text_host_kv_page_stride    = 0;
     std::size_t backend_host_kv_page_stride = 0;
     std::unique_ptr<qwen3_5::StateImageViews> state_images;
@@ -436,60 +436,71 @@ public:
     std::optional<PendingTransaction> pending_transaction_;
     std::uint64_t next_transaction_id_ = 1;
 
-    struct KVTransfer {
-        context::LogicalKVPageStore* pages     = nullptr;
-        runtime::ContextResourceClass resource = runtime::ContextResourceClass::MainKV;
-        std::vector<context::LogicalKVPageHandle> logical;
-        std::vector<DeviceKVPageHandle> physical;
-        std::optional<context::HostKVExtentReservation> host_destination;
-        bool restore     = false;
-        bool drop_device = false;
-    };
-
-    struct ContextTransaction {
-        ContextOperationKind kind = ContextOperationKind::Bind;
-        std::uint32_t lane        = 0;
-        std::uint64_t epoch       = 0;
+    struct BindOperation {
+        std::uint32_t lane = 0;
         std::optional<CheckpointHandle> source;
-        std::vector<std::pair<CheckpointHandle, runtime::CheckpointRole>> capture_points;
-        std::vector<CheckpointHandle> carried_points;
         Checkpoints::Lease source_lease;
+        std::vector<CheckpointHandle> carried_points;
         std::vector<Checkpoints::Lease> carried_pins;
         std::vector<std::pair<CheckpointHandle, CheckpointHandle>> carried_clones;
         std::vector<CheckpointHandle> retired_points;
         std::shared_ptr<const RequestBasePlanImpl> base;
-        ResumeState* resume  = nullptr;
-        bool resume_snapshot = false;
-        std::optional<ResumeState> paused;
-        std::optional<StateImageTransfer> state_transfer;
-        std::vector<KVTransfer> kv_transfers;
-        std::optional<context::KVBinding> text_binding;
-        std::optional<context::KVBinding> backend_binding;
-        std::optional<StateImageHandle> reserved_state;
-        bool binding_prepared          = false;
+        ResumeState* resume            = nullptr;
         std::uint32_t reuse_frontier   = 0;
         std::uint32_t backend_frontier = 0;
         UnitDemand first_unit;
         UnitDemand reservation_demand;
         std::optional<RecoveryPermit> recovery;
-        std::vector<runtime::ContextTransferRequirement> transfers;
-        std::vector<runtime::ContextTransferObservation> observations;
-        runtime::ContextOperationCounts operations;
-        bool submitted             = false;
-        bool preserve_state_device = true;
-        bool consume_source        = false;
-        bool take_private          = false;
-        bool split_state           = false;
-        bool backup_state          = false;
-        bool adopted               = false;
-        bool borrow_state          = false;
-        bool source_tail_hidden    = false;
+        StateBindingAction state_action = StateBindingAction::Root;
+        bool consume_source             = false;
+        bool take_private               = false;
+        bool resume_snapshot            = false;
+        bool source_tail_hidden         = false;
     };
 
-    std::optional<ContextTransaction> context_transaction_;
-    CudaCompletionEvent context_source_ready_;
-    CudaCompletionEvent context_completion_;
-    std::array<CudaEventTimer, 3> context_transfer_timers_;
+    struct CaptureOperation {
+        std::uint32_t lane             = 0;
+        std::uint32_t frontier         = 0;
+        std::uint32_t backend_frontier = 0;
+        std::vector<std::pair<CheckpointHandle, runtime::CheckpointRole>> points;
+    };
+
+    struct DemoteOperation {};
+
+    struct PauseOperation {
+        std::uint32_t lane;
+        ResumeState paused;
+        bool preserve_state_device = true;
+        bool discard_snapshot      = false;
+    };
+
+    struct ContextOperation {
+        using Action =
+            std::variant<BindOperation, CaptureOperation, DemoteOperation, PauseOperation>;
+
+        ContextOperation(context::MigrationContext& context, context::HostKVExtentStore* host,
+                         Action action)
+            : migration(context, host), action(std::move(action)) {}
+
+        context::MigrationBatch migration;
+        Action action;
+
+        [[nodiscard]] std::optional<std::uint32_t> lane() const noexcept {
+            return std::visit(
+                [](const auto& value) -> std::optional<std::uint32_t> {
+                    if constexpr (requires { value.lane; }) return value.lane;
+                    return std::nullopt;
+                },
+                action);
+        }
+
+        [[nodiscard]] ContextOperationKind kind() const noexcept {
+            return static_cast<ContextOperationKind>(action.index());
+        }
+    };
+
+    std::optional<context::MigrationContext> migration_context_;
+    std::optional<ContextOperation> context_operation_;
     CudaEventTimer prefill_gpu_timer_;
 
     // Captured transfers and external events reference the buffers and events declared above.
@@ -513,21 +524,15 @@ public:
     [[nodiscard]] std::optional<CheckpointHandle> reserve_checkpoint();
     [[nodiscard]] std::optional<CheckpointHandle> detach_checkpoint(SequenceState&);
     void abort_context() noexcept;
-    void enqueue_context_transfers(ContextTransaction&);
-    void enqueue_state_backup(ContextTransaction&);
-    void copy_local_for_context(ContextTransaction&, std::int32_t source, std::int32_t destination);
-    void copy_context_tail(ContextTransaction&, context::LogicalKVPageStore&,
-                           DeviceKVPageHandle source, DeviceKVPageHandle destination,
-                           runtime::ContextResourceClass);
-    void publish_context_transfers(ContextTransaction&);
-    [[nodiscard]] bool prepare_backup(ContextTransaction&, CheckpointState&, bool shared_device);
-    void install_binding(ContextTransaction&);
-    void prepare_binding(ContextTransaction&);
-    void complete_binding(ContextTransaction&, ContextProgress&);
-    void publish_capture(ContextTransaction&);
+    [[nodiscard]] bool prepare_backup(context::MigrationBatch&, CheckpointState&,
+                                      bool shared_device, bool& preserve_state_device);
+    void install_binding(BindOperation&);
+    void complete_binding(BindOperation&, context::MigrationBatch&, ContextProgress&);
+    void publish_capture(CaptureOperation&, context::MigrationBatch&,
+                         runtime::ContextOperationCounts&);
     [[nodiscard]] bool reserve_capture_destination(std::uint32_t lane, std::uint32_t frontier);
     void prepare_capture_boundary(std::uint32_t lane);
-    [[nodiscard]] ResumeState complete_pause(ContextTransaction&);
+    [[nodiscard]] ResumeState complete_pause(PauseOperation&);
     void install_resume_sampling(SequenceState&, RequestControl&);
     void initialize_prefill(std::uint32_t lane, std::uint32_t base);
     void initialize_captures(std::uint32_t lane, std::uint32_t from, std::uint32_t through);
@@ -558,12 +563,6 @@ public:
     resolve_pending_raw(std::span<const std::uint32_t>, std::span<const std::uint32_t>,
                         std::span<const std::uint8_t>, std::span<const std::uint8_t>,
                         std::span<const std::optional<std::uint32_t>>, runtime::ExecutionTiming*);
-    void start_context_transfer_timer(runtime::ContextResourceClass);
-    void stop_context_transfer_timer(runtime::ContextResourceClass);
-    [[nodiscard]] runtime::ContextTransferObservation
-        context_transfer_observation(runtime::ContextResourceClass,
-                                     runtime::ContextTransferDirection, TransferWork, std::uint32_t,
-                                     std::uint64_t) const;
     [[nodiscard]] runtime::BatchedGeneratedRound decode_raw(std::span<const std::uint32_t>,
                                                             std::span<const runtime::RoundBudget>,
                                                             runtime::ExecutionTiming*,

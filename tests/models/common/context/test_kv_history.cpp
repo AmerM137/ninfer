@@ -1,6 +1,8 @@
 #include "core/device.h"
 #include "models/common/context/host_kv_store.h"
 #include "models/common/context/kv_history.h"
+#include "models/common/context/migration.h"
+#include <atomic>
 #include "models/common/context/snapshot.h"
 #include "models/common/context/checkpoint_store.h"
 
@@ -63,24 +65,25 @@ struct Fixture {
     }
 
     void transfer(context::KVBinding& binding) {
-        for (std::size_t i = 0; i < binding.restores().size(); ++i) {
-            auto replica = pages->host_replica(binding.restores()[i]);
+        for (const auto& restore : binding.restores()) {
+            auto replica = pages->host_replica(restore.page());
+            const std::array destination{restore.device()};
             physical->copy_from_host(host->view(replica.extent).subview(replica.page_offset, 1),
-                                     binding.restore_destinations().subspan(i, 1), device.stream());
+                                     destination, device.stream());
         }
-        device.synchronize();
-        binding.publish_restores();
         binding.prepare_tail_copy();
         if (binding.needs_tail_copy())
             physical->copy_page(binding.tail_source(), binding.tail_destination(), device.stream());
+        binding.enqueue_mapping(device.stream());
         device.synchronize();
+        binding.publish_restores();
     }
 
     context::KVHistory bind(const context::KVPrefixRef* source, std::uint32_t frontier,
                             std::uint32_t peak, int row = 0) {
         auto binding = histories->prepare_binding(source, frontier, peak, row);
         transfer(binding);
-        return binding.commit(device.stream());
+        return binding.commit();
     }
 
     context::KVHistory create(std::uint32_t frontier, int row = 0) {
@@ -396,7 +399,7 @@ void fork_lifetimes(DeviceContext& device) {
             expect(f.pages->occupied() == 3 && f.histories->occupied() == 2,
                    "binding failed to retain its source after owners disappeared");
             if (!cancel) {
-                auto destination = pending.commit(device.stream());
+                auto destination = pending.commit();
                 device.synchronize();
                 auto mapping = read_block_table(*f.tables, 2, 2);
                 expect(mapping[0] == original[0] && mapping[1] != original[1],
@@ -460,7 +463,7 @@ void fork_lifetimes(DeviceContext& device) {
     auto binding = f.histories->prepare_binding(&prefix, 64, 65, 0, true);
     f.transfer(binding);
     prefix.reset();
-    source = binding.commit(device.stream());
+    source = binding.commit();
     expect(f.histories->committed_frontier(source.handle()) == 64,
            "consuming rewind adopted wrong frontier");
     source.reset();
@@ -485,7 +488,7 @@ void shared_tail_writer(DeviceContext& device) {
     expect(binding.blocks_writer(writer.handle()) && !binding.blocks_writer(prefix.history()),
            "tail-copy dependency did not identify the physical page's actual writer");
     f.transfer(binding);
-    auto branch = binding.commit(device.stream());
+    auto branch = binding.commit();
     expect(!binding.blocks_writer(writer.handle()),
            "completed copy kept the original writer blocked");
     writer.reset();
@@ -594,6 +597,183 @@ void prefix_bytes(DeviceContext& device, PagedKVPlaneOrder order, bool compresse
     f.empty();
 }
 
+// A deterministic unfinished producer, so cancellation cannot pass just because a tiny DMA
+// happened to finish before the Host checked its destination reservation.
+class ComputeGate {
+public:
+    explicit ComputeGate(DeviceContext& device) {
+        CUDA_CHECK(cudaLaunchHostFunc(
+            device.stream(),
+            [](void* opaque) {
+                auto& released = static_cast<ComputeGate*>(opaque)->released_;
+                while (!released.load(std::memory_order_acquire)) released.wait(false);
+            },
+            this));
+    }
+
+    ~ComputeGate() {
+        release();
+        (void)cudaDeviceSynchronize();
+    }
+
+    void release() {
+        released_.store(true, std::memory_order_release);
+        released_.notify_all();
+    }
+private:
+    std::atomic<bool> released_{false};
+};
+
+void migration_reader_lifetime(DeviceContext& device) {
+    for (const bool cancel : {false, true}) {
+        Fixture f(device);
+        LayoutBuilder layout;
+        StateImageBuilder schema;
+        (void)schema.add(DType::FP32, {32}, 1, "recurrent");
+        const auto image_layout = schema.finish(layout, 2);
+        DeviceBuffer backing(device.device(), layout.finish());
+        StateImageStorage storage(backing.span(), image_layout);
+        HostContextArena host_state(storage.image_bytes() * 2, storage.image_bytes());
+        context::StateImageStore states(storage, &host_state, 4);
+        const auto image = states.reserve_destination().value();
+        storage.clear(states.physical_slot(image), device.execution_view());
+        states.complete_initialization(image);
+        states.freeze(image);
+        states.retain_checkpoint_reference(image);
+        auto owner         = f.create(128);
+        auto prefix        = f.histories->retain_prefix(owner.handle(), 128);
+        const auto logical = f.logical(owner.handle());
+        owner.reset();
+        context::MigrationContext executor(device, 1);
+        context::MigrationBatch batch(executor, f.host.get());
+        batch.add_state_copy(states.reserve_device_to_host(image).value(), true);
+        batch.add_backup({0}, *f.pages, logical, f.host->prepare(*f.pages, logical).value(), true);
+        ComputeGate gate(device);
+        batch.submit();
+        expect(!batch.ready(), "migration ignored its producing stream");
+        prefix.reset();
+        expect(states.release_checkpoint_owner(image),
+               "last State owner could not exit during DMA");
+        if (cancel) batch.cancel();
+        expect(f.physical->allocated_pages() == 2 && states.device_occupied() == 1 &&
+                   f.arena->reserved_bytes() != 0 && host_state.reserved_bytes() != 0,
+               "last owner or cancellation recycled in-flight storage");
+        gate.release();
+        batch.drain();
+        const auto work = batch.observations();
+        expect(work.size() == 2 && work[0].image_count == 1 && work[1].page_groups == 2 &&
+                   work[0].work.payload_bytes == storage.image_bytes(),
+               "completed cancelled DMA lost its work or mixed quantity units");
+        if (cancel)
+            batch.discard();
+        else
+            batch.publish();
+        expect(states.occupied() == 0 && states.device_occupied() == 0 &&
+                   host_state.occupied_bytes() == 0,
+               "migration left State payload without an owner or reader");
+        f.empty();
+    }
+}
+
+void host_reader_survives_extent_partition(DeviceContext& device) {
+    Fixture f(device);
+    auto owner       = f.create(192);
+    const auto bytes = fill_device_pool(*f.physical, device.stream());
+    device.synchronize();
+    const auto mapping = read_block_table(*f.tables, 0, 3);
+    const auto expected =
+        expected_host_records(*f.physical, std::span(mapping).subspan(1, 1), f.host_layout, bytes);
+    auto prefix        = f.histories->retain_prefix(owner.handle(), 192);
+    const auto logical = f.logical(owner.handle());
+    owner.reset();
+    {
+        auto backup = f.host->prepare(*f.pages, logical).value();
+        auto reader = f.pages->read_device(logical[1], 64);
+        f.physical->copy_to_host(f.host->device_sources(backup), f.host->writable_view(backup),
+                                 device.stream());
+        device.synchronize();
+        (void)f.host->publish(std::move(backup));
+        expect(f.pages->source_pins(logical[1]) == 1,
+               "Host publication consumed another Device reader");
+    }
+    for (auto page : logical)
+        expect(f.pages->drop_device_replica(page), "failed to drop Device source");
+    const auto original = f.pages->host_replica(logical[1]);
+    auto capacity       = f.physical->reserve(1).value();
+    auto restore        = f.pages->reserve_device_replica(logical[1], capacity);
+    const std::array destination{restore.device()};
+    ComputeGate gate(device);
+    CudaCompletionEvent producer(device), done(device);
+    producer.record(device.stream());
+    producer.wait(device.transfer_stream());
+    f.physical->copy_from_host(f.host->view(original.extent).subview(original.page_offset, 1),
+                               destination, device.transfer_stream());
+    done.record(device.transfer_stream());
+    prefix.reset();
+    expect(!done.ready() && f.arena->occupied_bytes() == f.host_layout.page_stride &&
+               f.pages->host_replica(logical[1]).extent != original.extent,
+           "unrelated Host members could not retire around a borrowed byte range");
+    gate.release();
+    done.synchronize();
+    auto allocation = f.host_arena->allocate(f.host_layout, 1).value();
+    auto output     = f.host_arena->writable_view(allocation);
+    std::memset(output.data(), 0, f.host_layout.page_stride);
+    f.physical->copy_to_host(destination, output, device.stream());
+    device.synchronize();
+    expect(std::memcmp(output.data(), expected.data(), expected.size()) == 0,
+           "Host extent partition changed an in-flight reader's bytes");
+    (void)allocation.release();
+    restore.publish();
+    f.empty();
+}
+
+void migration_restore_chain(DeviceContext& device, PagedKVPlaneOrder order) {
+    Fixture f(device, 8, 4, {.device_plane_order = order, .planes = {{DType::BF16, 8, 2, 256}}});
+    auto owner       = f.create(128);
+    const auto bytes = fill_device_pool(*f.physical, device.stream());
+    device.synchronize();
+    const auto original = read_block_table(*f.tables, 0, 2);
+    const auto expected = expected_host_records(*f.physical, original, f.host_layout, bytes);
+    auto prefix         = f.histories->retain_prefix(owner.handle(), 65);
+    auto endpoint       = f.histories->retain_prefix(owner.handle(), 128);
+    const auto logical  = f.logical(owner.handle());
+    owner.reset();
+    (void)f.backup(logical);
+    for (auto page : logical)
+        expect(f.pages->drop_device_replica(page), "failed to offload KV source");
+    context::MigrationContext executor(device, 1);
+    context::MigrationBatch batch(executor, f.host.get());
+    batch.add_binding({0}, f.histories->prepare_binding(&prefix, 65, 66, 1));
+    batch.submit();
+    batch.drain();
+    const auto work = batch.observations();
+    expect(work.size() == 2 &&
+               work[0].direction == runtime::ContextTransferDirection::HostToDevice &&
+               work[0].page_groups == 2 &&
+               work[1].direction == runtime::ContextTransferDirection::DeviceToDevice &&
+               work[1].page_groups == 1,
+           "restoration did not execute its pending-page COW in the same batch");
+    batch.publish();
+    auto restored      = batch.binding({0})->commit();
+    const auto mapping = read_block_table(*f.tables, 1, 2);
+    expect(mapping.size() == 2, "batch did not publish its reserved execution row");
+    auto allocation = f.host_arena->allocate(f.host_layout, 2).value();
+    auto output     = f.host_arena->writable_view(allocation);
+    std::memset(output.data(), 0, 2 * f.host_layout.page_stride);
+    const std::array physical{f.histories->physical_page(restored.handle(), 0),
+                              f.histories->physical_page(restored.handle(), 1)};
+    f.physical->copy_to_host(physical, output, device.stream());
+    device.synchronize();
+    expect(std::memcmp(output.data(), expected.data(), expected.size()) == 0,
+           "chained restore/COW changed physical KV payload");
+    (void)allocation.release();
+    prefix.reset();
+    endpoint.reset();
+    restored.reset();
+    batch.discard();
+    f.empty();
+}
+
 void mixed_snapshot(DeviceContext& device) {
     Fixture f(device, 8, 2,
               {.planes = {{DType::BF16, 8, 2, 256},
@@ -665,17 +845,28 @@ void mixed_snapshot(DeviceContext& device) {
     expect(f.histories->committed_frontier(checkpoints.at(point).prefix(0).history()) == 7 &&
                f.pages->required_columns(membership[0]) / 4 == 1,
            "rejected index row became visible in saved snapshot");
-    (void)f.backup(std::span(membership).first(1));
-    expect(f.pages->drop_device_replica(membership[0]), "mixed row prefix could not offload");
-    auto state_transfer = states.reserve_device_to_host(image).value();
-    states.enqueue_device_to_host(state_transfer, device.execution_view());
-    device.synchronize();
-    states.publish_transfer(std::move(state_transfer), true);
-    expect(states.drop_device_replica(image), "mixed State snapshot could not offload");
-    owner        = f.bind(&checkpoints.at(point).prefix(0), 7, 8);
-    auto restore = states.begin_host_to_device(image, device.execution_view()).value();
-    device.synchronize();
-    states.publish_transfer(std::move(restore), true);
+    context::MigrationContext executor(device, 1);
+    {
+        context::MigrationBatch backup(executor, f.host.get());
+        backup.add_state_copy(states.reserve_device_to_host(image).value(), false);
+        const std::vector pages{membership[0]};
+        backup.add_backup({0}, *f.pages, pages, f.host->prepare(*f.pages, pages).value(), true);
+        backup.submit();
+        backup.drain();
+        backup.publish();
+    }
+    expect(!states.device_resident(image) && !f.pages->device_resident(membership[0]),
+           "mixed State/KV batch failed to demote both replicas");
+    {
+        context::MigrationBatch restore(executor, f.host.get());
+        restore.add_state_copy(states.reserve_host_to_device(image).value(), true);
+        restore.add_binding(
+            {0}, f.histories->prepare_binding(&checkpoints.at(point).prefix(0), 7, 8, 0));
+        restore.submit();
+        restore.drain();
+        restore.publish();
+        owner = restore.binding({0})->commit();
+    }
     raw_view       = storage.field(raw).slice(1, states.physical_slot(image), 1);
     recurrent_view = storage.field(recurrent).slice(1, states.physical_slot(image), 1);
     std::array<std::int32_t, 3> observed_ids{};
@@ -730,6 +921,10 @@ int main() {
         prefix_bytes(device, PagedKVPlaneOrder::PageMajor);
         prefix_bytes(device, PagedKVPlaneOrder::HeadMajor);
         prefix_bytes(device, PagedKVPlaneOrder::PageMajor, true);
+        migration_reader_lifetime(device);
+        host_reader_survives_extent_partition(device);
+        migration_restore_chain(device, PagedKVPlaneOrder::PageMajor);
+        migration_restore_chain(device, PagedKVPlaneOrder::HeadMajor);
         mixed_snapshot(device);
         std::cout << "KV history and snapshot ownership passed\n";
         return 0;

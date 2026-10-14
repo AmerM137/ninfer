@@ -66,14 +66,16 @@ PhysicalUsageSnapshot ProgramImpl::physical_usage() const noexcept {
         out.capacity.state_slots = state_store->device_capacity();
     }
     if (text_kv_pages) {
-        const auto& pool           = text_kv_pages->physical_pool();
-        out.occupied.main_kv_pages = pool.allocated_pages() + pool.reserved_pages();
-        out.capacity.main_kv_pages = pool.capacity_pages();
+        const auto& pool = text_kv_pages->physical_pool();
+        out.occupied.kv_page_groups[kTextKvPool.index] =
+            pool.allocated_pages() + pool.reserved_pages();
+        out.capacity.kv_page_groups[kTextKvPool.index] = pool.capacity_pages();
     }
     if (backend_kv_pages) {
-        const auto& pool              = backend_kv_pages->physical_pool();
-        out.occupied.backend_kv_pages = pool.allocated_pages() + pool.reserved_pages();
-        out.capacity.backend_kv_pages = pool.capacity_pages();
+        const auto& pool = backend_kv_pages->physical_pool();
+        out.occupied.kv_page_groups[kBackendKvPool.index] =
+            pool.allocated_pages() + pool.reserved_pages();
+        out.capacity.kv_page_groups[kBackendKvPool.index] = pool.capacity_pages();
     }
     out.host_state_slots = state_store ? state_store->host_occupied() : 0;
     out.host_kv_bytes    = host_kv_arena ? host_kv_arena->occupied_bytes() : 0;
@@ -96,9 +98,9 @@ PrefixShortlistKey ProgramImpl::checkpoint_key(CheckpointHandle handle,
             record.key.identity_tag};
 }
 
-runtime::ContextResourceUsage
+ContextResources
 ProgramImpl::checkpoint_footprint(std::span<const CheckpointHandle> handles) const {
-    runtime::ContextResourceUsage usage;
+    ContextResources usage;
     std::vector<bool> states(state_store->capacity()), main(text_kv_pages->capacity()),
         backend(backend_kv_pages ? backend_kv_pages->capacity() : 0);
     const auto count = [&](const context::KVPrefixRef& prefix,
@@ -124,11 +126,11 @@ ProgramImpl::checkpoint_footprint(std::span<const CheckpointHandle> handles) con
             if (state_store->host_resident(image))
                 usage.host_bytes += state_images->storage().image_bytes();
         }
-        count(record.text_prefix(), *text_kv_histories, *text_kv_pages, main, usage.main_kv_pages,
-              text_host_kv_page_stride);
+        count(record.text_prefix(), *text_kv_histories, *text_kv_pages, main,
+              usage.kv_page_groups[kTextKvPool.index], text_host_kv_page_stride);
         if (const auto* prefix = record.backend_prefix())
             count(*prefix, *backend_kv_histories, *backend_kv_pages, backend,
-                  usage.backend_kv_pages, backend_host_kv_page_stride);
+                  usage.kv_page_groups[kBackendKvPool.index], backend_host_kv_page_stride);
     }
     return usage;
 }
@@ -170,15 +172,16 @@ CheckpointSummary ProgramImpl::checkpoint_summary(CheckpointHandle handle) const
         }
     };
     scan(*text_kv_histories, *text_kv_pages, record.history().text, record.frontier(),
-         out.evictable_resources.main_kv_pages);
+         out.evictable_resources.kv_page_groups[kTextKvPool.index]);
     if (record.history().backend) {
         scan(*backend_kv_histories, *backend_kv_pages, *record.history().backend,
-             record.backend_frontier(), out.evictable_resources.backend_kv_pages);
+             record.backend_frontier(),
+             out.evictable_resources.kv_page_groups[kBackendKvPool.index]);
     }
     return out;
 }
 
-runtime::ContextResourceUsage ProgramImpl::snapshot_resources(const ResumeState& paused) const {
+ContextResources ProgramImpl::snapshot_resources(const ResumeState& paused) const {
     if (!paused.impl_ || paused.impl_->owner != this || !paused.impl_->snapshot ||
         !valid_checkpoint(*paused.impl_->snapshot)) {
         return {};
@@ -222,7 +225,7 @@ std::size_t ProgramImpl::host_bytes_released(std::span<const CheckpointHandle> h
 }
 
 std::optional<std::size_t> ProgramImpl::pause_host_bytes(SequenceHandle handle) const {
-    if (context_transaction_ || pending_transaction_ || !valid_sequence(handle) ||
+    if (context_operation_ || pending_transaction_ || !valid_sequence(handle) ||
         !host_context_arena) {
         return std::nullopt;
     }

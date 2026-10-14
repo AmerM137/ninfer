@@ -43,14 +43,17 @@ std::optional<Startup::ExecutionPlan> Startup::plan(DeviceContext& device,
     const auto curve = planner.capacity_curve();
     const auto pages = policy.mode == KvCapacityMode::Explicit
                            ? static_cast<std::uint32_t>((std::uint64_t(policy.explicit_tokens) +
-                                                         curve.main_page_tokens - 1) /
-                                                        curve.main_page_tokens)
-                           : curve.minimum_main_page_groups;
+                                                         curve.primary_page_tokens - 1) /
+                                                        curve.primary_page_tokens)
+                           : curve.minimum_primary_page_groups;
     if (curve.reservation_bytes(pages) > available) return std::nullopt;
     if (!host_experts) {
         auto resolution = resolve_kv_capacity(policy, curve, available);
-        return ExecutionPlan{
-            std::move(planner).finalize(resolution.main_page_groups), resolution, false, chunk, {}};
+        return ExecutionPlan{std::move(planner).finalize(resolution.primary_page_groups),
+                             resolution,
+                             false,
+                             chunk,
+                             {}};
     }
     auto limited          = KvCapacityPolicy::explicit_capacity(curve.resolved_tokens(pages));
     auto base             = resolve_kv_capacity(limited, curve, available);
@@ -67,8 +70,8 @@ std::optional<Startup::ExecutionPlan> Startup::plan(DeviceContext& device,
     if (final.capacity_curve().reservation_bytes(pages) > available) return std::nullopt;
     auto resolution = resolve_kv_capacity(limited, final.capacity_curve(), available);
     resolution.mode = policy.mode;
-    return ExecutionPlan{std::move(final).finalize(resolution.main_page_groups), resolution, true,
-                         chunk, std::move(moe)};
+    return ExecutionPlan{std::move(final).finalize(resolution.primary_page_groups), resolution,
+                         true, chunk, std::move(moe)};
 }
 
 std::unique_ptr<Model> Startup::materialize(DeviceContext& device, bool host_experts,

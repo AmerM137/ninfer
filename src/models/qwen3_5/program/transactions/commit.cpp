@@ -549,10 +549,7 @@ AbortResult ProgramImpl::abort(SequenceHandle handle) noexcept {
     try {
         device.synchronize();
     } catch (...) { return out; }
-    if (context_transaction_ && context_transaction_->kind != ContextOperationKind::Demote &&
-        context_transaction_->lane == lane) {
-        abort_context();
-    }
+    if (context_operation_ && context_operation_->lane() == lane) { abort_context(); }
     clear_lane(sequences[lane], requests[lane]);
     out.status = runtime::ConsumeStatus::Consumed;
     return out;

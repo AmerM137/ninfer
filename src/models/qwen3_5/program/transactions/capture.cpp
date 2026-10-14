@@ -20,7 +20,7 @@ CaptureReservation::~CaptureReservation() {
     for (const auto& [handle, role] : points) { owner->checkpoints.cancel(handle); }
 }
 
-bool ProgramImpl::reclaim_capture_reservation(runtime::ContextResourceUsage shortage) {
+bool ProgramImpl::reclaim_capture_reservation(ContextResources shortage) {
     for (auto& request : requests) {
         const auto& ticket = request.capture_reservation;
         if (!ticket) { continue; }
@@ -144,7 +144,7 @@ bool ProgramImpl::capture_is_input(SequenceHandle handle) const {
 }
 
 bool ProgramImpl::start_capture(SequenceHandle handle) {
-    if (context_transaction_ || pending_transaction_) { return false; }
+    if (context_operation_ || pending_transaction_) { return false; }
     if (!valid_sequence(handle)) { throw std::logic_error("capture has a stale lane"); }
     const auto lane = ContractAccess::lane(handle).value;
     auto& request   = requests[lane];
@@ -162,37 +162,29 @@ bool ProgramImpl::start_capture(SequenceHandle handle) {
     }
     if (!reserve_capture_destination(lane, frontier)) { return false; }
     auto ticket = std::move(request.capture_reservation);
-    ContextTransaction tx;
-    tx.kind           = ContextOperationKind::Capture;
-    tx.lane           = lane;
-    tx.epoch          = lane_epochs[lane];
-    tx.capture_points = std::move(ticket->points);
-    tx.reuse_frontier = frontier;
-    tx.backend_frontier =
-        speculative_backend == SpeculativeBackend::Mtp ? frontier - 1U : backend_kv_valid(state);
-    tx.reserved_state     = ticket->state;
-    const bool host_state = ticket->host.has_value();
-    ticket->owner         = nullptr;
-    context_transaction_.emplace(std::move(tx));
-    auto& operation = *context_transaction_;
+    CaptureOperation tx{.lane             = lane,
+                        .frontier         = frontier,
+                        .backend_frontier = speculative_backend == SpeculativeBackend::Mtp
+                                                ? frontier - 1U
+                                                : backend_kv_valid(state),
+                        .points           = std::move(ticket->points)};
+    context_operation_.emplace(*migration_context_, host_kv_extents.get(), std::move(tx));
+    auto& migration = context_operation_->migration;
     try {
+        migration.own_state(*state_store, ticket->state);
+        ticket->owner = nullptr;
         state_store->freeze(state.continuation.image);
-        if (host_state) {
+        if (ticket->host) {
             auto transfer = state_store->reserve_device_to_host(state.continuation.image,
                                                                 std::move(*ticket->host));
             ticket->host.reset();
-            if (!transfer) { throw std::logic_error("capture lost its reserved Host state space"); }
-            operation.state_transfer.emplace(std::move(*transfer));
-        }
-        context_source_ready_.record(device.stream());
-        context_source_ready_.wait(device.transfer_stream());
-        if (operation.state_transfer) {
-            enqueue_state_backup(operation);
+            if (!transfer) throw std::logic_error("capture lost its reserved Host state space");
+            migration.add_state_copy(std::move(*transfer), true);
         } else if (is_masked_draft_backend(speculative_backend)) {
-            copy_local_for_context(operation, state_store->physical_slot(state.continuation.image),
-                                   state_store->physical_slot(*operation.reserved_state));
+            migration.add_state_group(*state_store, state_images->storage(),
+                                      state.continuation.image, state_images->dflash_local_group());
         }
-        enqueue_context_transfers(operation);
+        migration.submit();
         return true;
     } catch (...) {
         abort_context();
@@ -200,36 +192,38 @@ bool ProgramImpl::start_capture(SequenceHandle handle) {
     }
 }
 
-void ProgramImpl::publish_capture(ContextTransaction& tx) {
+void ProgramImpl::publish_capture(CaptureOperation& tx, context::MigrationBatch& migration,
+                                  runtime::ContextOperationCounts& operations) {
     auto& state                          = sequences[tx.lane];
     auto& request                        = requests[tx.lane];
     const auto& group                    = request.capture_groups[request.next_capture];
     const auto source_state              = state.continuation.image;
     Continuation captured                = state.continuation;
-    captured.metadata.execution_frontier = tx.reuse_frontier;
+    captured.metadata.execution_frontier = tx.frontier;
     captured.metadata.backend_kv_valid   = tx.backend_frontier;
     std::vector<context::KVPrefixRef> prefixes;
-    prefixes.push_back(
-        text_kv_histories->retain_prefix(state.kv->text.handle(), tx.reuse_frontier));
+    prefixes.push_back(text_kv_histories->retain_prefix(state.kv->text.handle(), tx.frontier));
     if (state.kv->backend)
         prefixes.push_back(
             backend_kv_histories->retain_prefix(state.kv->backend->handle(), tx.backend_frontier));
     const Snapshot snapshot(*state_store, captured, std::move(prefixes), group.identity);
-    for (const auto& [handle, role] : tx.capture_points)
+    for (const auto& [handle, role] : tx.points)
         checkpoints.publish(handle,
                             CheckpointState{.snapshot = snapshot, .role = role, .key = group.key});
-    if (state_store->residency(*tx.reserved_state) == context::StateReplicaResidency::None) {
-        state_store->split_device_replica_identity(source_state, *tx.reserved_state);
-        state_store->complete_initialization(*tx.reserved_state);
-        state.continuation.image = *tx.reserved_state;
+    if (state_store->residency(migration.state_destination().image()) ==
+        context::StateReplicaResidency::None) {
+        state_store->split_device_replica_identity(source_state,
+                                                   migration.state_destination().image());
+        state_store->complete_initialization(migration.state_destination().image());
+        state.continuation.image = migration.state_destination().image();
         state.pending_write      = {};
     } else {
-        ++tx.operations.state_forks;
-        (void)state_store->begin_write(source_state, *tx.reserved_state);
+        ++operations.state_forks;
+        (void)migration.state_destination().begin_write(source_state);
         state.continuation.image = source_state;
-        state.pending_write      = *tx.reserved_state;
+        state.pending_write      = migration.state_destination().image();
     }
-    tx.reserved_state.reset();
+    (void)migration.state_destination().release();
     skip_capture(sequence_handle(tx.lane));
 }
 

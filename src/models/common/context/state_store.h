@@ -57,21 +57,58 @@ public:
         friend class StateImageStore;
     };
 
-    // The owner must finish any enqueued device access before publication, abort or destruction.
-    // This reservation retains replicas; the enclosing context transaction owns their fence.
+    class ReadLease {
+    public:
+        ReadLease() noexcept = default;
+        ~ReadLease();
+        ReadLease(ReadLease&& other) noexcept;
+        ReadLease& operator=(ReadLease&& other) noexcept;
+        ReadLease(const ReadLease&)            = delete;
+        ReadLease& operator=(const ReadLease&) = delete;
+
+        [[nodiscard]] Handle image() const noexcept { return image_; }
+
+        [[nodiscard]] std::uint64_t epoch() const noexcept { return epoch_; }
+
+        [[nodiscard]] std::int32_t device_slot() const;
+        void reset() noexcept;
+    private:
+        ReadLease(StateImageStore& store, Handle image, std::uint64_t epoch) noexcept
+            : store_(&store), image_(image), epoch_(epoch) {}
+
+        StateImageStore* store_ = nullptr;
+        Handle image_;
+        std::uint64_t epoch_ = 0;
+        friend class StateImageStore;
+    };
+
+    // Owns a new logical image until the native continuation adopts it.
+    class Destination {
+    public:
+        Destination(StateImageStore& store, Handle image);
+        ~Destination();
+        Destination(Destination&& other) noexcept;
+        Destination& operator=(Destination&&)      = delete;
+        Destination(const Destination&)            = delete;
+        Destination& operator=(const Destination&) = delete;
+
+        [[nodiscard]] Handle image() const noexcept { return image_; }
+
+        [[nodiscard]] StateImageSelectors begin_write(Handle source);
+        [[nodiscard]] Handle release() noexcept;
+    private:
+        StateImageStore* store_ = nullptr;
+        Handle image_;
+        Handle write_source_;
+    };
+
+    // Physical reservations and source readership belong to this move-only copy. MigrationBatch
+    // retains it until its completion fence permits publication or rollback.
     class Transfer {
     public:
         Transfer() noexcept = default;
-
-        ~Transfer() {
-            if (owner_ != nullptr) { owner_->abort_transfer(std::move(*this)); }
-        }
-
-        Transfer(Transfer&& other) noexcept
-            : owner_(std::exchange(other.owner_, nullptr)), id_(std::exchange(other.id_, 0)),
-              direction_(other.direction_), source_(other.source_),
-              destination_(other.destination_) {}
-
+        ~Transfer();
+        Transfer(Transfer&& other) noexcept;
         Transfer& operator=(Transfer&&)      = delete;
         Transfer(const Transfer&)            = delete;
         Transfer& operator=(const Transfer&) = delete;
@@ -80,20 +117,23 @@ public:
 
         [[nodiscard]] StateTransferDirection direction() const noexcept { return direction_; }
 
+        [[nodiscard]] TransferWork work() const;
+        void enqueue(CudaExecutionView execution) const;
+        void publish(bool keep_source_replica);
     private:
         Transfer(StateImageStore& owner, std::uint64_t id, StateTransferDirection direction,
-                 Handle source, Handle destination) noexcept
-            : owner_(&owner), id_(id), direction_(direction), source_(source),
-              destination_(destination) {}
-
+                 ReadLease source, Handle destination) noexcept;
         StateImageStore* owner_           = nullptr;
         std::uint64_t id_                 = 0;
         StateTransferDirection direction_ = StateTransferDirection::DeviceToHost;
-        Handle source_;
+        ReadLease source_;
         Handle destination_;
-
+        std::optional<std::int32_t> device_slot_;
+        std::optional<HostContextAllocation> host_slot_;
         friend class StateImageStore;
     };
+
+    [[nodiscard]] ReadLease read(Handle image);
 
     StateImageStore(StateImageStorage& device, HostContextArena* host,
                     std::uint32_t logical_capacity);
@@ -178,16 +218,8 @@ public:
     [[nodiscard]] std::optional<Transfer>
     reserve_device_to_host(Handle source, HostContextAllocation reserved = {});
 
-    void enqueue_device_to_host(const Transfer& transfer, CudaExecutionView execution);
-
-    [[nodiscard]] std::optional<Transfer> begin_device_to_host(Handle source,
-                                                               CudaExecutionView execution);
-
-    [[nodiscard]] std::optional<Transfer> begin_host_to_device(Handle source,
-                                                               CudaExecutionView execution);
-
-    [[nodiscard]] std::optional<Transfer> begin_host_to_device(Handle source, Handle destination,
-                                                               CudaExecutionView execution);
+    [[nodiscard]] std::optional<Transfer> reserve_host_to_device(Handle source);
+    [[nodiscard]] std::optional<Transfer> reserve_host_to_device(Handle source, Handle destination);
 
     void publish_transfer(Transfer&& transfer, bool keep_source_replica);
 
@@ -206,8 +238,6 @@ private:
         std::uint64_t content_epoch = 0;
         std::optional<std::int32_t> device_slot;
         std::optional<HostContextAllocation> host_slot;
-        std::optional<std::int32_t> pending_device_slot;
-        std::optional<HostContextAllocation> pending_host_slot;
         std::uint64_t transfer_id           = 0;
         std::uint32_t checkpoint_references = 0;
         std::uint32_t source_pins           = 0;
@@ -246,10 +276,11 @@ private:
     std::vector<Object> objects_;
     std::vector<std::uint32_t> free_objects_;
     std::vector<std::int32_t> free_device_slots_;
-    std::uint32_t free_object_count_  = 0;
-    std::uint32_t free_device_count_  = 0;
-    std::uint64_t next_content_epoch_ = 0;
-    std::uint64_t next_transfer_id_   = 0;
+    std::uint32_t free_object_count_   = 0;
+    std::uint32_t free_device_count_   = 0;
+    std::uint32_t pending_host_images_ = 0;
+    std::uint64_t next_content_epoch_  = 0;
+    std::uint64_t next_transfer_id_    = 0;
 };
 
 template <class Metadata>

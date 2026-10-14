@@ -98,29 +98,26 @@ ProgramImpl::inspect_source(const RequestBasePlan& base, std::optional<Checkpoin
     const bool keep_source =
         std::find(candidate.private_points.begin(), candidate.private_points.end(), *handle) !=
         candidate.private_points.end();
-    candidate.move_state = consume_source && !keep_source && checkpoints[handle->index].pins == 0 &&
-                           state_references == 1 &&
-                           state_store->source_pins(record.continuation().image) == 0;
-    candidate.split_state = !candidate.move_state &&
-                            occupied_states == state_store->device_capacity() &&
-                            state_store->device_resident(record.continuation().image) &&
-                            state_store->host_resident(record.continuation().image) &&
-                            state_store->source_pins(record.continuation().image) == 0;
-    if (!candidate.move_state && !candidate.split_state &&
-        occupied_states == state_store->device_capacity() &&
-        state_store->device_resident(record.continuation().image) &&
-        state_store->source_pins(record.continuation().image) == 0 &&
-        checkpoints[handle->index].pins == 0) {
-        if (host_context_arena &&
-            host_context_arena->can_allocate(state_images->storage().image_bytes())) {
-            candidate.backup_state = candidate.split_state = true;
-            candidate.transfers.push_back(context::state_transfer_requirement(
-                state_images->storage().layout().transfer_work(),
-                runtime::ContextTransferDirection::DeviceToHost));
-        } else if (consume_source && state_references == 1) {
-            // One physical slot cannot retain its immutable recovery image and a writer.
-            // Consume this optional point while preserving its already computed execution input.
-            candidate.move_state = true;
+    const auto image       = record.continuation().image;
+    candidate.state_action = state_store->device_resident(image) ? StateBindingAction::Fork
+                                                                 : StateBindingAction::Restore;
+    if (consume_source && !keep_source && checkpoints[handle->index].pins == 0 &&
+        state_references == 1 && state_store->source_pins(image) == 0) {
+        candidate.state_action = StateBindingAction::Move;
+    } else if (occupied_states == state_store->device_capacity() &&
+               state_store->device_resident(image) && state_store->source_pins(image) == 0) {
+        if (state_store->host_resident(image)) {
+            candidate.state_action = StateBindingAction::Split;
+        } else if (checkpoints[handle->index].pins == 0) {
+            if (host_context_arena &&
+                host_context_arena->can_allocate(state_images->storage().image_bytes())) {
+                candidate.state_action = StateBindingAction::BackupSplit;
+                candidate.transfers.push_back(context::state_transfer_requirement(
+                    state_images->storage().layout().transfer_work(),
+                    runtime::ContextTransferDirection::DeviceToHost));
+            } else if (consume_source && state_references == 1) {
+                candidate.state_action = StateBindingAction::Move;
+            }
         }
     }
     const auto backend_frontier = speculative_backend == SpeculativeBackend::Mtp
@@ -135,7 +132,8 @@ ProgramImpl::inspect_source(const RequestBasePlan& base, std::optional<Checkpoin
             retired_backend.push_back(prefix);
     };
     for (auto point : candidate.retired_points) retire(point);
-    if (consume_source && (!keep_source || candidate.move_state)) retire(*handle);
+    if (consume_source && (!keep_source || (candidate.state_action == StateBindingAction::Move)))
+        retire(*handle);
     const auto main_binding = text_kv_histories->binding_demand(
         &record.text_prefix(), record.frontier(), std::max(record.frontier(), first.main_frontier),
         retired_main);
@@ -151,7 +149,9 @@ ProgramImpl::inspect_source(const RequestBasePlan& base, std::optional<Checkpoin
         candidate.transfers.push_back(
             context::state_transfer_requirement(state_images->storage().layout().transfer_work(),
                                                 runtime::ContextTransferDirection::HostToDevice));
-    } else if (!candidate.move_state && !candidate.split_state &&
+    } else if (!(candidate.state_action == StateBindingAction::Move) &&
+               candidate.state_action != StateBindingAction::Split &&
+               candidate.state_action != StateBindingAction::BackupSplit &&
                is_masked_draft_backend(speculative_backend)) {
         candidate.transfers.push_back(
             context::state_transfer_requirement(state_images->dflash_local_transfer_work(),
@@ -160,7 +160,7 @@ ProgramImpl::inspect_source(const RequestBasePlan& base, std::optional<Checkpoin
     const auto scan = [&](const context::KVHistoryStore& histories,
                           const context::LogicalKVPageStore& pages,
                           context::KVHistoryHandle address, std::uint32_t frontier,
-                          runtime::ContextResourceClass resource, std::uint32_t tail_copies) {
+                          runtime::ContextTransferResource resource, std::uint32_t tail_copies) {
         const auto count      = context::kv_pages_for_frontier(frontier);
         const auto& physical  = pages.physical_pool();
         std::uint32_t missing = 0, run_pages = 0;
@@ -196,13 +196,13 @@ ProgramImpl::inspect_source(const RequestBasePlan& base, std::optional<Checkpoin
         }
     };
     scan(*text_kv_histories, *text_kv_pages, record.history().text, record.frontier(),
-         runtime::ContextResourceClass::MainKV, main_binding.tail_copies);
+         runtime::ContextTransferResource{kTextKvPool}, main_binding.tail_copies);
     if (record.history().backend) {
         const auto frontier = speculative_backend == SpeculativeBackend::Mtp && record.frontier()
                                   ? record.frontier() - 1U
                                   : record.backend_frontier();
         scan(*backend_kv_histories, *backend_kv_pages, *record.history().backend, frontier,
-             runtime::ContextResourceClass::BackendKV, backend_binding.tail_copies);
+             runtime::ContextTransferResource{kBackendKvPool}, backend_binding.tail_copies);
     }
     return candidate;
 }

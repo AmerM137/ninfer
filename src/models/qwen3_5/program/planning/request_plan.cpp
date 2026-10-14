@@ -266,7 +266,7 @@ UnitDemand ProgramImpl::next_unit(const SequenceState& sequence, const RequestCo
     return demand;
 }
 
-runtime::ResourceReservation ProgramImpl::reserve_units(std::span<const ExecutionUnit> units) {
+ResourceReservation ProgramImpl::reserve_units(std::span<const ExecutionUnit> units) {
     std::array<UnitDemand, kMaximumConcurrency> demands{};
     std::array<UnitDemand, kMaximumConcurrency> coverage{};
     std::array<std::uint32_t, kMaximumConcurrency> old_main{}, old_backend{};
@@ -314,13 +314,14 @@ runtime::ResourceReservation ProgramImpl::reserve_units(std::span<const Executio
     const auto backend_available =
         backend_kv_pages ? backend_kv_pages->physical_pool().available_pages() : 0;
     if (main_needed > main_available || backend_needed > backend_available) {
-        return {.reserved = false,
-                .shortage = {.main_kv_pages = static_cast<std::uint32_t>(
+        return {
+            .reserved = false,
+            .shortage = {.kv_page_groups = {
+                             static_cast<std::uint32_t>(
                                  main_needed > main_available ? main_needed - main_available : 0),
-                             .backend_kv_pages =
-                                 static_cast<std::uint32_t>(backend_needed > backend_available
-                                                                ? backend_needed - backend_available
-                                                                : 0)}};
+                             static_cast<std::uint32_t>(backend_needed > backend_available
+                                                            ? backend_needed - backend_available
+                                                            : 0)}}};
     }
     std::array<bool, kMaximumConcurrency> added{};
     try {

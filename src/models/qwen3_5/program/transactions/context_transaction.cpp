@@ -1,257 +1,107 @@
 #include "models/qwen3_5/program/program_impl.h"
-#include "models/common/context/work.h"
-#include "core/device.h"
 
-#include <algorithm>
-#include <array>
 #include <stdexcept>
+#include <type_traits>
 
 namespace ninfer::models::qwen3_5::detail {
 
 bool ProgramImpl::context_blocks(SequenceHandle sequence) const noexcept {
-    if (!context_transaction_ || !valid_sequence(sequence)) return false;
-    const auto& tx    = *context_transaction_;
+    if (!context_operation_ || !valid_sequence(sequence)) return false;
+    if (!std::holds_alternative<BindOperation>(context_operation_->action)) return false;
     const auto& state = sequences[ContractAccess::lane(sequence).value];
-    if (tx.kind != ContextOperationKind::Bind || !state.kv) return false;
-    return (tx.text_binding && tx.text_binding->blocks_writer(state.kv->text.handle())) ||
-           (tx.backend_binding && state.kv->backend &&
-            tx.backend_binding->blocks_writer(state.kv->backend->handle()));
-}
-
-void ProgramImpl::enqueue_state_backup(ContextTransaction& tx) {
-    if (!tx.state_transfer) { return; }
-    tx.transfers.push_back(
-        context::state_transfer_requirement(state_images->storage().layout().transfer_work(),
-                                            runtime::ContextTransferDirection::DeviceToHost));
-    start_context_transfer_timer(runtime::ContextResourceClass::State);
-    state_store->enqueue_device_to_host(*tx.state_transfer, device.transfer_view());
-    stop_context_transfer_timer(runtime::ContextResourceClass::State);
-}
-
-void ProgramImpl::copy_local_for_context(ContextTransaction& tx, std::int32_t source,
-                                         std::int32_t destination) {
-    tx.transfers.push_back(
-        context::state_transfer_requirement(state_images->dflash_local_transfer_work(),
-                                            runtime::ContextTransferDirection::DeviceToDevice));
-    start_context_transfer_timer(runtime::ContextResourceClass::State);
-    state_images->copy_dflash_local(source, destination, device.transfer_view());
-    stop_context_transfer_timer(runtime::ContextResourceClass::State);
-}
-
-void ProgramImpl::copy_context_tail(ContextTransaction& tx, context::LogicalKVPageStore& pages,
-                                    DeviceKVPageHandle source, DeviceKVPageHandle destination,
-                                    runtime::ContextResourceClass resource) {
-    start_context_transfer_timer(resource);
-    const auto work =
-        pages.physical_pool().copy_page(source, destination, device.transfer_stream());
-    stop_context_transfer_timer(resource);
-    tx.transfers.push_back(context::kv_transfer_requirement(
-        resource, runtime::ContextTransferDirection::DeviceToDevice, 1, work));
-    ++tx.operations.partial_tail_cow_pages;
-}
-
-void ProgramImpl::enqueue_context_transfers(ContextTransaction& tx) {
-    for (const auto resource :
-         {runtime::ContextResourceClass::MainKV, runtime::ContextResourceClass::BackendKV}) {
-        bool started = false;
-        bool restore = false;
-        TransferWork total;
-        std::uint32_t page_count = 0;
-        for (auto& transfer : tx.kv_transfers) {
-            if (transfer.resource != resource || transfer.logical.empty()) { continue; }
-            if (!started) {
-                start_context_transfer_timer(resource);
-                restore = transfer.restore;
-                started = true;
-            } else if (restore != transfer.restore) {
-                throw std::logic_error("one transfer batch mixes directions within a typed pool");
-            }
-            TransferWork work;
-            if (transfer.restore) {
-                std::size_t begin = 0;
-                while (begin < transfer.logical.size()) {
-                    const auto first = transfer.pages->host_replica(transfer.logical[begin]);
-                    std::size_t end  = begin + 1;
-                    while (end < transfer.logical.size()) {
-                        const auto next = transfer.pages->host_replica(transfer.logical[end]);
-                        if (next.extent != first.extent ||
-                            next.page_offset != first.page_offset + end - begin) {
-                            break;
-                        }
-                        ++end;
-                    }
-                    const auto host =
-                        host_kv_extents->view(first.extent)
-                            .subview(first.page_offset, static_cast<std::uint32_t>(end - begin));
-                    const auto destination = std::span<const DeviceKVPageHandle>(transfer.physical)
-                                                 .subspan(begin, end - begin);
-                    const auto part = transfer.pages->physical_pool().copy_from_host(
-                        host, destination, device.transfer_stream());
-                    work.payload_bytes += part.payload_bytes;
-                    work.copy_operations += part.copy_operations;
-                    begin = end;
-                }
-            } else if (transfer.host_destination) {
-                const auto host = host_kv_extents->writable_view(*transfer.host_destination);
-                work = transfer.pages->physical_pool().copy_to_host(transfer.physical, host,
-                                                                    device.transfer_stream());
-                if (tx.kind == ContextOperationKind::Pause ||
-                    tx.kind == ContextOperationKind::Demote) {
-                    tx.operations.pressure_spill_pages += transfer.physical.size();
-                }
-            }
-            total.payload_bytes += work.payload_bytes;
-            total.copy_operations += work.copy_operations;
-            page_count += static_cast<std::uint32_t>(transfer.logical.size());
-        }
-        if (!started) { continue; }
-        stop_context_transfer_timer(resource);
-        tx.transfers.push_back({.resource   = resource,
-                                .direction  = restore
-                                                  ? runtime::ContextTransferDirection::HostToDevice
-                                                  : runtime::ContextTransferDirection::DeviceToHost,
-                                .units      = total.payload_bytes,
-                                .page_count = page_count,
-                                .work       = total});
-    }
-    tx.submitted = !tx.transfers.empty();
-    if (tx.submitted) { context_completion_.record(device.transfer_stream()); }
-}
-
-void ProgramImpl::publish_context_transfers(ContextTransaction& tx) {
-    if (tx.state_transfer) {
-        state_store->publish_transfer(std::move(*tx.state_transfer), tx.preserve_state_device);
-        tx.state_transfer.reset();
-    }
-    for (auto& transfer : tx.kv_transfers) {
-        if (transfer.restore) {
-            transfer.logical.clear();
-        } else if (transfer.host_destination) {
-            (void)host_kv_extents->publish(std::move(*transfer.host_destination));
-            transfer.host_destination.reset();
-        }
-        if (transfer.drop_device) {
-            for (const auto page : transfer.logical) {
-                if (!transfer.pages->drop_device_replica(page)) {
-                    throw std::logic_error("published Host copy still has a Device reader");
-                }
-            }
-        }
-    }
-    if (tx.text_binding) tx.text_binding->publish_restores();
-    if (tx.backend_binding) tx.backend_binding->publish_restores();
+    if (!state.kv) return false;
+    auto& migration     = context_operation_->migration;
+    const auto* text    = migration.binding(kTextKvPool);
+    const auto* backend = migration.binding(kBackendKvPool);
+    return (text && text->blocks_writer(state.kv->text.handle())) ||
+           (backend && state.kv->backend && backend->blocks_writer(state.kv->backend->handle()));
 }
 
 ContextProgress ProgramImpl::poll_context(runtime::CancellationFlagView cancellation) {
-    if (!context_transaction_) { throw std::logic_error("there is no context operation"); }
-    auto& tx = *context_transaction_;
-    ContextProgress out{.kind = tx.kind};
-    // Bind has two transfer phases. Advance both in this call when their real events
-    // are already complete; an unready event yields without synchronizing or spinning.
-    for (std::uint32_t phase = 0; phase < 2; ++phase) {
-        if (tx.submitted && !context_completion_.ready()) { return out; }
-        for (const auto& transfer : tx.transfers) {
-            tx.observations.push_back(context_transfer_observation(
-                transfer.resource, transfer.direction, transfer.work, transfer.page_count,
-                transfer.resource == runtime::ContextResourceClass::State ? transfer.units : 0));
-        }
-        tx.transfers.clear();
-        if (tx.kind == ContextOperationKind::Pause && tx.paused && tx.paused->impl_) {
-            out.request_timings     = tx.paused->impl_->control.timings;
-            out.request_speculative = tx.paused->impl_->control.speculative_stats;
-        }
-        if (cancellation.requested()) {
-            out.transfers  = std::move(tx.observations);
-            out.operations = tx.operations;
-            abort_context();
-            out.complete = true;
-            return out;
-        }
-        if (!tx.binding_prepared) {
-            publish_context_transfers(tx);
-            if (tx.kind == ContextOperationKind::Bind) {
-                prepare_binding(tx);
-                tx.binding_prepared = true;
-                out.advanced        = true;
-                continue;
-            }
-        }
-        if (tx.kind == ContextOperationKind::Bind) {
-            complete_binding(tx, out);
-        } else if (tx.kind == ContextOperationKind::Capture) {
-            // Capture publication is implemented with the matching state/KV reservation in
-            // capture.cpp.
-            out.captured_checkpoints.reserve(tx.capture_points.size());
-            publish_capture(tx);
-            for (const auto& [handle, role] : tx.capture_points) {
-                out.captured_checkpoints.push_back(handle);
-            }
-        } else if (tx.kind == ContextOperationKind::Pause) {
-            out.paused.emplace(complete_pause(tx));
-        }
-        tx.source_lease.reset();
-        tx.carried_pins.clear();
-        out.complete = out.published = true;
-        out.transfers                = std::move(tx.observations);
-        out.operations               = tx.operations;
-        context_transaction_.reset();
+    if (!context_operation_) throw std::logic_error("there is no context operation");
+    auto& operation = *context_operation_;
+    auto& migration = operation.migration;
+    ContextProgress out{.kind = operation.kind()};
+    // The slot, affected lane and all reservations remain occupied while a cancelled batch drains.
+    if (cancellation.requested()) migration.cancel();
+    if (!migration.ready()) return out;
+    out.transfers                         = migration.observations();
+    out.operations.pressure_spill_pages   = migration.spill_page_groups();
+    out.operations.partial_tail_cow_pages = migration.tail_copy_page_groups();
+    for (const auto& transfer : out.transfers)
+        if (transfer.resource.is_state() &&
+            transfer.direction == runtime::ContextTransferDirection::HostToDevice)
+            out.operations.state_restores += transfer.image_count;
+    if (auto* pause = std::get_if<PauseOperation>(&operation.action)) {
+        out.request_timings     = pause->paused.impl_->control.timings;
+        out.request_speculative = pause->paused.impl_->control.speculative_stats;
+    }
+    if (migration.cancelled()) {
+        abort_context();
+        out.complete = true;
         return out;
     }
+    migration.publish();
+    std::visit(
+        [&](auto& action) {
+            using Action = std::decay_t<decltype(action)>;
+            if constexpr (std::is_same_v<Action, BindOperation>) {
+                complete_binding(action, migration, out);
+            } else if constexpr (std::is_same_v<Action, CaptureOperation>) {
+                out.captured_checkpoints.reserve(action.points.size());
+                publish_capture(action, migration, out.operations);
+                for (const auto& [handle, role] : action.points)
+                    out.captured_checkpoints.push_back(handle);
+            } else if constexpr (std::is_same_v<Action, PauseOperation>) {
+                out.paused.emplace(complete_pause(action));
+            }
+        },
+        operation.action);
+    out.complete = out.published = true;
+    context_operation_.reset();
     return out;
 }
 
 void ProgramImpl::abort_context() noexcept {
-    if (!context_transaction_) return;
-    auto& tx = *context_transaction_;
+    if (!context_operation_) return;
+    auto& operation = *context_operation_;
     try {
-        // Enqueue can fail before publishing its event. Retire every actual transfer before
-        // returning the binding reservations and their source references.
-        (void)cudaStreamSynchronize(device.transfer_stream());
-        if (tx.state_transfer) {
-            state_store->abort_transfer(std::move(*tx.state_transfer));
-            tx.state_transfer.reset();
-        }
-        tx.text_binding.reset();
-        tx.backend_binding.reset();
-        for (auto& transfer : tx.kv_transfers) transfer.host_destination.reset();
-        if (tx.kind == ContextOperationKind::Bind) {
-            auto& state = sequences[tx.lane];
-            if (tx.adopted) {
-                release_sequence_state(state);
-                release_sequence_kv(state);
-                tx.reserved_state.reset();
-            } else if (state.pending_write.valid()) {
-                state_store->abort_write(state.continuation.image, state.write_state());
-            }
-            state.continuation  = {};
-            state.pending_write = {};
-            state.kv.reset();
-            requests[tx.lane] = {};
-            invalidate_lane(tx.lane);
-        }
-        if (tx.kind == ContextOperationKind::Capture) {
-            auto& state = sequences[tx.lane];
-            if (state_store->role(state.continuation.image) ==
-                    context::StateImageRole::CheckpointImmutable &&
-                !state_store->checkpoint_references(state.continuation.image))
-                state_store->make_mutable(state.continuation.image);
-        }
-        if (tx.kind == ContextOperationKind::Pause) {
-            requests[tx.lane] = {};
-            invalidate_lane(tx.lane);
-        }
-        if (tx.reserved_state && !tx.borrow_state) (void)state_store->release(*tx.reserved_state);
-        tx.source_lease.reset();
-        tx.carried_pins.clear();
-        for (const auto& [from, to] : tx.carried_clones) {
-            if (valid_checkpoint(to))
-                (void)release_checkpoint(to);
-            else
-                checkpoints.cancel(to);
-        }
-        for (const auto& [handle, role] : tx.capture_points)
-            if (!valid_checkpoint(handle)) checkpoints.cancel(handle);
-        context_transaction_.reset();
+        // Ordinary cancellation arrives after ready(). Error and shutdown paths may need an
+        // explicit drain, including partial submission before the batch event was recorded.
+        if (!operation.migration.ready()) operation.migration.drain();
+        operation.migration.discard();
+        std::visit(
+            [&](auto& action) {
+                using Action = std::decay_t<decltype(action)>;
+                if constexpr (std::is_same_v<Action, BindOperation>) {
+                    auto& state = sequences[action.lane];
+                    release_sequence_state(state);
+                    release_sequence_kv(state);
+                    requests[action.lane] = {};
+                    invalidate_lane(action.lane);
+                    action.source_lease.reset();
+                    action.carried_pins.clear();
+                    for (const auto& [from, to] : action.carried_clones) {
+                        if (valid_checkpoint(to))
+                            (void)release_checkpoint(to);
+                        else
+                            checkpoints.cancel(to);
+                    }
+                } else if constexpr (std::is_same_v<Action, CaptureOperation>) {
+                    auto& state = sequences[action.lane];
+                    if (state_store->role(state.continuation.image) ==
+                            context::StateImageRole::CheckpointImmutable &&
+                        !state_store->checkpoint_references(state.continuation.image))
+                        state_store->make_mutable(state.continuation.image);
+                    for (const auto& [handle, role] : action.points)
+                        if (!valid_checkpoint(handle)) checkpoints.cancel(handle);
+                } else if constexpr (std::is_same_v<Action, PauseOperation>) {
+                    requests[action.lane] = {};
+                    invalidate_lane(action.lane);
+                }
+            },
+            operation.action);
+        context_operation_.reset();
     } catch (...) { std::terminate(); }
 }
 

@@ -162,11 +162,14 @@ void EngineCore<Instance>::publish_runtime_stats() {
     const Clock::time_point detail_started = Clock::now();
     std::optional<nvtx::ScopedRange> detail_range;
     detail_range.emplace(nvtx::Name::StatsPublication, nvtx::Category::Control);
-    RuntimeStats snapshot                     = cumulative_stats_;
-    const auto physical                       = instance_.program->physical_usage();
-    snapshot.device_state_occupied_slots      = physical.occupied.state_slots;
-    snapshot.device_main_kv_occupied_pages    = physical.occupied.main_kv_pages;
-    snapshot.device_backend_kv_occupied_pages = physical.occupied.backend_kv_pages;
+    auto& snapshot                       = stats_snapshot_;
+    snapshot                             = cumulative_stats_;
+    const auto physical                  = instance_.program->physical_usage();
+    snapshot.device_state_occupied_slots = physical.occupied.state_slots;
+    for (auto& pool : snapshot.kv_pools) {
+        pool.occupied_page_groups = physical.occupied.kv_page_groups[pool.id];
+        pool.capacity_page_groups = physical.capacity.kv_page_groups[pool.id];
+    }
 
     {
         std::lock_guard lock(queue_mutex_);
@@ -215,50 +218,25 @@ void EngineCore<Instance>::record_context_work(
     cumulative_stats_.partial_tail_cow_pages += op.partial_tail_cow_pages;
     for (const auto& transfer : progress.transfers) {
         const auto direction = static_cast<std::size_t>(transfer.direction);
-        std::array<std::uint64_t*, 3> bytes{}, units{};
-        std::array<double*, 3> seconds{};
-        switch (transfer.resource) {
-        case ContextResourceClass::State:
-            bytes   = {&cumulative_stats_.state_d2h_bytes, &cumulative_stats_.state_h2d_bytes,
-                       &cumulative_stats_.state_d2d_bytes};
-            units   = {&cumulative_stats_.state_d2h_count, &cumulative_stats_.state_h2d_count,
-                       &cumulative_stats_.state_d2d_count};
-            seconds = {&cumulative_stats_.state_d2h_seconds, &cumulative_stats_.state_h2d_seconds,
-                       &cumulative_stats_.state_d2d_seconds};
-            break;
-        case ContextResourceClass::MainKV:
-            bytes   = {&cumulative_stats_.main_kv_d2h_bytes, &cumulative_stats_.main_kv_h2d_bytes,
-                       &cumulative_stats_.main_kv_d2d_bytes};
-            units   = {&cumulative_stats_.main_kv_d2h_pages, &cumulative_stats_.main_kv_h2d_pages,
-                       &cumulative_stats_.main_kv_d2d_pages};
-            seconds = {&cumulative_stats_.main_kv_d2h_seconds,
-                       &cumulative_stats_.main_kv_h2d_seconds,
-                       &cumulative_stats_.main_kv_d2d_seconds};
-            break;
-        case ContextResourceClass::BackendKV:
-            bytes   = {&cumulative_stats_.backend_kv_d2h_bytes,
-                       &cumulative_stats_.backend_kv_h2d_bytes,
-                       &cumulative_stats_.backend_kv_d2d_bytes};
-            units   = {&cumulative_stats_.backend_kv_d2h_pages,
-                       &cumulative_stats_.backend_kv_h2d_pages,
-                       &cumulative_stats_.backend_kv_d2d_pages};
-            seconds = {&cumulative_stats_.backend_kv_d2h_seconds,
-                       &cumulative_stats_.backend_kv_h2d_seconds,
-                       &cumulative_stats_.backend_kv_d2d_seconds};
-            break;
-        }
-        *bytes.at(direction) += transfer.work.payload_bytes;
-        *units.at(direction) +=
-            transfer.resource == ContextResourceClass::State ? transfer.units : transfer.page_count;
-        *seconds.at(direction) += transfer.elapsed_ns * 1.0e-9;
+        auto& series =
+            transfer.resource.is_state()
+                ? cumulative_stats_.context_transfers.state
+                : cumulative_stats_.context_transfers.kv.at(transfer.resource.pool->index);
+        auto& total           = series.at(direction);
+        const auto accumulate = [&](GenerationTransferTiming& timing) {
+            timing.bytes += transfer.work.payload_bytes;
+            timing.seconds += transfer.elapsed_ns * 1.0e-9;
+            timing.images += transfer.image_count;
+            timing.page_groups += transfer.page_groups;
+            timing.copy_operations += transfer.work.copy_operations;
+        };
+        accumulate(total);
         cumulative_stats_.actual_context_transfer_seconds += transfer.elapsed_ns * 1.0e-9;
         if (owner) {
             if (!owner->first_output_timing) {
                 auto& observed =
-                    owner->context_transfers.at(static_cast<std::size_t>(transfer.resource))
-                        .at(direction);
-                observed.bytes += transfer.work.payload_bytes;
-                observed.seconds += transfer.elapsed_ns * 1.0e-9;
+                    owner->context_transfers.at(transfer.resource.index()).at(direction);
+                accumulate(observed);
             }
             if (transfer.direction == ContextTransferDirection::DeviceToHost) {
                 owner->device_to_host_bytes += transfer.work.payload_bytes;
@@ -290,7 +268,10 @@ void EngineCore<Instance>::record_first_output(const std::shared_ptr<Request>& r
                      .host_to_device_bytes = request->host_to_device_bytes,
     };
     snapshot.computed_prefill_tokens = request->computed_prompt_tokens;
-    snapshot.context_transfers       = request->context_transfers;
+    snapshot.context_transfers.state = request->context_transfers[0];
+    snapshot.context_transfers.kv.assign(request->context_transfers.begin() + 1,
+                                         request->context_transfers.begin() + 1 +
+                                             instance_.program->kv_pools().size());
 }
 
 template <class Instance>

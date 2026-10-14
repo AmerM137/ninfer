@@ -56,10 +56,6 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
                                                              sizeof(qwen3_5::DFlashDecodeEgress) +
                                                              sizeof(qwen3_5::DFlashPrefillIngress))
                       : std::nullopt),
-      context_source_ready_(device_in), context_completion_(device_in),
-      context_transfer_timers_{CudaEventTimer(device_in, device_in.transfer_stream()),
-                               CudaEventTimer(device_in, device_in.transfer_stream()),
-                               CudaEventTimer(device_in, device_in.transfer_stream())},
       prefill_gpu_timer_(device_in) {
     if (parameters.profile != plan.profile || parameters.model.options() != plan.features) {
         throw std::invalid_argument("Program parameters do not match the frozen sequence plan");
@@ -140,6 +136,20 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
             *backend_kv_pages, backend->execution_tables(), history_capacity,
             backend->execution_tables().logical_page_capacity(), host_kv_extents.get());
     }
+
+    const auto register_pool = [&](runtime::KvPoolId id, std::string_view label,
+                                   const DeviceKVPagePool& pool, std::size_t host_stride) {
+        kv_pools.push_back({id, label, &pool.geometry(), pool.capacity_pages(),
+                            pool.device_copy_work(1).payload_bytes, host_stride});
+    };
+    register_pool(kTextKvPool, "text", text_kv_pages->physical_pool(), text_host_kv_page_stride);
+    if (backend_kv_pages) {
+        register_pool(kBackendKvPool,
+                      speculative_backend == SpeculativeBackend::Mtp ? "mtp" : "draft_full",
+                      backend_kv_pages->physical_pool(), backend_host_kv_page_stride);
+    }
+
+    migration_context_.emplace(device, kv_pools.size());
 
     io = qwen3_5::RoundState(backing, plan.persistent.round);
     if (io.mtp.has_value() != (speculative_backend == SpeculativeBackend::Mtp)) {
@@ -328,7 +338,8 @@ std::vector<float> ProgramImpl::causal_score(qwen::PreparedPromptData&& prompt,
         auto binding = text_kv_histories->prepare_binding(nullptr, 0, predictor_count, 0);
         binding.publish_restores();
         binding.prepare_tail_copy();
-        address.emplace(binding.commit(device.stream()));
+        binding.enqueue_mapping(device.stream());
+        address.emplace(binding.commit());
         text_kv_histories->prepare_write(*address, 0, predictor_count, device.stream());
 
         const std::int32_t state_slot = state_store->physical_slot(*state);
@@ -429,36 +440,6 @@ std::vector<float> ProgramImpl::causal_score(qwen::PreparedPromptData&& prompt,
         } catch (...) {}
         throw;
     }
-}
-
-void ProgramImpl::start_context_transfer_timer(runtime::ContextResourceClass resource) {
-    context_transfer_timers_[context::context_resource_index(resource)].start();
-}
-
-void ProgramImpl::stop_context_transfer_timer(runtime::ContextResourceClass resource) {
-    context_transfer_timers_[context::context_resource_index(resource)].record_stop();
-}
-
-runtime::ContextTransferObservation ProgramImpl::context_transfer_observation(
-    runtime::ContextResourceClass resource, runtime::ContextTransferDirection direction,
-    TransferWork work, std::uint32_t page_count, std::uint64_t state_images) const {
-    const double elapsed_ns =
-        static_cast<double>(
-            context_transfer_timers_[context::context_resource_index(resource)].elapsed_ms()) *
-        1'000'000.0;
-    const std::uint64_t measured_ns =
-        elapsed_ns >= static_cast<double>(std::numeric_limits<std::uint64_t>::max())
-            ? std::numeric_limits<std::uint64_t>::max()
-            : std::max<std::uint64_t>(1, static_cast<std::uint64_t>(elapsed_ns + 0.5));
-    return runtime::ContextTransferObservation{
-        .resource  = resource,
-        .direction = direction,
-        .units =
-            resource == runtime::ContextResourceClass::State ? state_images : work.payload_bytes,
-        .page_count = page_count,
-        .work       = work,
-        .elapsed_ns = measured_ns,
-    };
 }
 
 MemorySummary ProgramImpl::memory_summary() const {

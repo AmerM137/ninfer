@@ -199,8 +199,7 @@ int main(int argc, char** argv) {
             }
         }
         const auto stats = engine.runtime_stats();
-        require(stats.device_backend_kv_occupied_pages == 0 && stats.backend_kv_d2h_bytes == 0 &&
-                    stats.backend_kv_h2d_bytes == 0,
+        require(stats.kv_pools.size() == 1 && stats.context_transfers.kv.size() == 1,
                 "DFlash2 allocated or transferred a full backend KV pool");
         if (k == 15) {
             // One oversized prefill replaces the ring, then decode appends across its wrap point.
@@ -231,8 +230,8 @@ int main(int argc, char** argv) {
         std::cout << "ok K=" << k << " B=" << batch << " graph=" << graph
                   << " optimized=" << optimized << " accepted=" << first.speculative.accepted_tokens
                   << "/" << first.speculative.drafted_tokens
-                  << " state_d2h=" << stats.state_d2h_count
-                  << " state_h2d=" << stats.state_h2d_count << '\n';
+                  << " state_d2h=" << stats.context_transfers.state[0].images
+                  << " state_h2d=" << stats.context_transfers.state[1].images << '\n';
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;

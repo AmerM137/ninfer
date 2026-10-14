@@ -139,7 +139,8 @@ void run(const char* artifact, SpeculativeBackend backend) {
         auto binding = histories.prepare_binding(nullptr, 0, capacity, row);
         binding.publish_restores();
         binding.prepare_tail_copy();
-        auto history = binding.commit(device.stream());
+        binding.enqueue_mapping(device.stream());
+        auto history = binding.commit();
         histories.prepare_write(history, 0, capacity, device.stream());
         return history;
     };

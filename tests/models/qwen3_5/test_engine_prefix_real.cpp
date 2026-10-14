@@ -429,14 +429,14 @@ int exercise_semantic_captures(const char* artifact) {
             result.prompt.prompt_tokens <= configured.prefill_chunk ||
             result.computed_prefill_tokens != result.prompt.prompt_tokens ||
             stats.active_captures_completed != 1 || stats.active_captures_aborted != 0 ||
-            stats.state_d2h_count != 0) {
+            stats.context_transfers.state[0].images != 0) {
             std::cerr << (chat ? "Chat R" : "raw P")
                       << " did not remain the only prefill capture: prompt="
                       << result.prompt.prompt_tokens
                       << " computed=" << result.computed_prefill_tokens
                       << " captures=" << stats.active_captures_completed
                       << " aborted=" << stats.active_captures_aborted
-                      << " state_d2h=" << stats.state_d2h_count << '\n';
+                      << " state_d2h=" << stats.context_transfers.state[0].images << '\n';
             return 1;
         }
     }
@@ -475,12 +475,16 @@ int exercise_host_restore(const char* artifact) {
         engine.generate(engine.prepare_tokens(continuation), options(2, false));
     const ninfer::RuntimeStats after_pressure = engine.runtime_stats();
     if (pressure_result.generated_token_ids.size() != 2 ||
-        after_pressure.state_d2h_count <= before_pressure.state_d2h_count ||
-        after_pressure.main_kv_d2h_pages <= before_pressure.main_kv_d2h_pages ||
-        after_pressure.backend_kv_d2h_pages <= before_pressure.backend_kv_d2h_pages) {
+        after_pressure.context_transfers.state[0].images <=
+            before_pressure.context_transfers.state[0].images ||
+        after_pressure.context_transfers.kv[0][0].page_groups <=
+            before_pressure.context_transfers.kv[0][0].page_groups ||
+        after_pressure.context_transfers.kv[1][0].page_groups <=
+            before_pressure.context_transfers.kv[1][0].page_groups) {
         std::cerr << "Host pressure did not demote the complete MTP checkpoint: state="
-                  << after_pressure.state_d2h_count << " main=" << after_pressure.main_kv_d2h_pages
-                  << " backend=" << after_pressure.backend_kv_d2h_pages << '\n';
+                  << after_pressure.context_transfers.state[0].images
+                  << " main=" << after_pressure.context_transfers.kv[0][0].page_groups
+                  << " backend=" << after_pressure.context_transfers.kv[1][0].page_groups << '\n';
         return 1;
     }
 
@@ -490,22 +494,28 @@ int exercise_host_restore(const char* artifact) {
     if (restored.generated_token_ids.size() != 2 ||
         restored.prefix_reuse_path != ninfer::PrefixReusePath::Checkpoint ||
         restored.reused_prompt_tokens == 0 ||
-        after_restore.state_h2d_count <= after_pressure.state_h2d_count ||
+        after_restore.context_transfers.state[1].images <=
+            after_pressure.context_transfers.state[1].images ||
         restored.reused_prompt_tokens != retained_input.size() ||
-        after_restore.main_kv_h2d_pages <= after_pressure.main_kv_h2d_pages ||
-        after_restore.main_kv_h2d_pages - after_pressure.main_kv_h2d_pages >
-            after_pressure.main_kv_d2h_pages - before_pressure.main_kv_d2h_pages ||
-        after_restore.backend_kv_h2d_pages - after_pressure.backend_kv_h2d_pages >
-            after_pressure.backend_kv_d2h_pages - before_pressure.backend_kv_d2h_pages) {
+        after_restore.context_transfers.kv[0][1].page_groups <=
+            after_pressure.context_transfers.kv[0][1].page_groups ||
+        after_restore.context_transfers.kv[0][1].page_groups -
+                after_pressure.context_transfers.kv[0][1].page_groups >
+            after_pressure.context_transfers.kv[0][0].page_groups -
+                before_pressure.context_transfers.kv[0][0].page_groups ||
+        after_restore.context_transfers.kv[1][1].page_groups -
+                after_pressure.context_transfers.kv[1][1].page_groups >
+            after_pressure.context_transfers.kv[1][0].page_groups -
+                before_pressure.context_transfers.kv[1][0].page_groups) {
         // Deficit-sized eviction can move only E's backend suffix; P does not need to read
         // that suffix back. Native transaction tests separately force a full backend restore.
         std::cerr << "MTP checkpoint did not restore its missing prefix replicas: path="
                   << static_cast<int>(restored.prefix_reuse_path)
                   << " reused=" << restored.reused_prompt_tokens
                   << " outputs=" << restored.generated_token_ids.size()
-                  << " state=" << after_restore.state_h2d_count
-                  << " main=" << after_restore.main_kv_h2d_pages
-                  << " backend=" << after_restore.backend_kv_h2d_pages << '\n';
+                  << " state=" << after_restore.context_transfers.state[1].images
+                  << " main=" << after_restore.context_transfers.kv[0][1].page_groups
+                  << " backend=" << after_restore.context_transfers.kv[1][1].page_groups << '\n';
         return 1;
     }
 
@@ -522,7 +532,6 @@ int exercise_explicit_prefix(const char* artifact) {
     ninfer::RequestOptions request;
     request.execution.requested_output_tokens = 3;
     request.execution.sampling.temperature    = 0.0F;
-    request.stop.include_model_defaults       = false;
 
     std::string description;
     for (std::uint32_t index = 0; index < 120; ++index) { description += "stable-schema "; }
@@ -1316,7 +1325,7 @@ int exercise_agent_continuation(const char* artifact) {
               << " final_reused=" << previous->reused_prompt_tokens
               << " total_reused=" << total_reused << " total_computed=" << total_computed
               << " retained_device_states=" << settled.device_state_occupied_slots
-              << " retained_main_pages=" << settled.device_main_kv_occupied_pages << '\n';
+              << " retained_main_pages=" << settled.kv_pools[0].occupied_page_groups << '\n';
     return 0;
 }
 

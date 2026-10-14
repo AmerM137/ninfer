@@ -691,6 +691,22 @@ TransferWork DeviceKVPagePool::copy_page(DeviceKVPageHandle source, DeviceKVPage
     return device_copy_work(1);
 }
 
+TransferWork DeviceKVPagePool::host_transfer_work(std::span<const DeviceKVPageHandle> pages) const {
+    TransferWork result;
+    for (auto page : pages) (void)physical_index(page);
+    for (std::size_t begin = 0; begin < pages.size();) {
+        auto end = begin + 1;
+        while (end < pages.size() && pages[end].index_ == pages[end - 1].index_ + 1) ++end;
+        const auto work = host_transfer_run_work(static_cast<std::uint32_t>(end - begin));
+        result.payload_bytes += work.payload_bytes;
+        if (work.copy_operations > UINT32_MAX - result.copy_operations)
+            throw std::overflow_error("Host KV transfer operation count exceeds uint32");
+        result.copy_operations += work.copy_operations;
+        begin = end;
+    }
+    return result;
+}
+
 template <bool ToHost>
 TransferWork
 DeviceKVPagePool::copy_host_pages(std::span<const DeviceKVPageHandle> pages,

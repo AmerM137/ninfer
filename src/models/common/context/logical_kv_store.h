@@ -72,6 +72,61 @@ private:
 
 class LogicalKVPageStore {
 public:
+    class ReadLease {
+    public:
+        ReadLease() noexcept = default;
+        ~ReadLease();
+        ReadLease(ReadLease&& other) noexcept;
+        ReadLease& operator=(ReadLease&& other) noexcept;
+        ReadLease(const ReadLease&)            = delete;
+        ReadLease& operator=(const ReadLease&) = delete;
+
+        [[nodiscard]] LogicalKVPageHandle page() const noexcept { return page_; }
+
+        [[nodiscard]] std::uint64_t epoch() const noexcept { return epoch_; }
+
+        [[nodiscard]] std::uint32_t coverage() const noexcept { return coverage_; }
+
+        void reset() noexcept;
+    private:
+        ReadLease(LogicalKVPageStore& store, LogicalKVPageHandle page, std::uint64_t epoch,
+                  std::uint32_t coverage, bool host) noexcept
+            : store_(&store), page_(page), epoch_(epoch), coverage_(coverage), host_(host) {}
+
+        LogicalKVPageStore* store_ = nullptr;
+        LogicalKVPageHandle page_;
+        std::uint64_t epoch_    = 0;
+        std::uint32_t coverage_ = 0;
+        bool host_              = false;
+        friend class LogicalKVPageStore;
+    };
+
+    class Restore {
+    public:
+        ~Restore();
+        Restore(Restore&& other) noexcept;
+        Restore& operator=(Restore&&)      = delete;
+        Restore(const Restore&)            = delete;
+        Restore& operator=(const Restore&) = delete;
+
+        [[nodiscard]] LogicalKVPageHandle page() const noexcept { return source_.page(); }
+
+        [[nodiscard]] DeviceKVPageHandle device() const noexcept { return destination_.handle(); }
+
+        void publish();
+    private:
+        Restore(LogicalKVPageStore& store, ReadLease source, DeviceKVPageLease destination) noexcept
+            : store_(&store), source_(std::move(source)), destination_(std::move(destination)) {}
+
+        LogicalKVPageStore* store_ = nullptr;
+        ReadLease source_;
+        DeviceKVPageLease destination_;
+        friend class LogicalKVPageStore;
+    };
+
+    [[nodiscard]] ReadLease read_device(LogicalKVPageHandle page, std::uint32_t coverage);
+    [[nodiscard]] ReadLease read_host(LogicalKVPageHandle page, std::uint32_t coverage);
+
     LogicalKVPageStore(DeviceKVPagePool& physical, std::uint32_t logical_capacity);
 
     LogicalKVPageStore(const LogicalKVPageStore&)            = delete;
@@ -171,18 +226,13 @@ public:
     }
 
     [[nodiscard]] std::uint32_t source_pins(LogicalKVPageHandle handle) const {
-        return require(handle).source_pins;
+        return require(handle).readers();
     }
 
     [[nodiscard]] bool can_pin_source(LogicalKVPageHandle handle) const noexcept;
 
-    [[nodiscard]] DeviceKVPageHandle reserve_device_replica(LogicalKVPageHandle handle,
-                                                            DeviceKVPageReservation& reservation);
-
-    void publish_device_replica(LogicalKVPageHandle handle);
-
-    void abort_device_replica(LogicalKVPageHandle handle,
-                              DeviceKVPageReservation& reservation) noexcept;
+    [[nodiscard]] Restore reserve_device_replica(LogicalKVPageHandle handle,
+                                                 DeviceKVPageReservation& reservation);
 
     [[nodiscard]] bool drop_device_replica(LogicalKVPageHandle handle) noexcept;
 
@@ -231,11 +281,17 @@ private:
         std::uint64_t writer_identity   = 0;
         std::array<std::uint32_t, kPagedKVPageSize> required{};
         std::array<std::uint32_t, kPagedKVPageSize> protections{};
-        std::uint32_t source_pins = 0;
-        bool destination_pinned   = false;
-        bool occupied             = false;
+        std::uint32_t device_readers = 0;
+        std::uint32_t host_readers   = 0;
+        bool host_transfer_pending   = false;
+
+        [[nodiscard]] std::uint32_t readers() const noexcept {
+            return device_readers + host_readers;
+        }
+
+        bool destination_pinned = false;
+        bool occupied           = false;
         std::optional<DeviceKVPageLease> device_replica;
-        std::optional<DeviceKVPageLease> pending_device_replica;
         std::optional<HostKVPageReplica> host_replica;
         HostKVExtentStore* host_owner = nullptr;
     };
@@ -256,6 +312,7 @@ private:
     }
 
     void release_descriptor(LogicalKVPageHandle handle, Page& page) noexcept;
+    void retire_unowned(LogicalKVPageHandle handle) noexcept;
 
     DeviceKVPagePool* physical_ = nullptr;
     std::vector<Page> pages_;

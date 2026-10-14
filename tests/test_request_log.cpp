@@ -519,10 +519,11 @@ int main() {
                                     .paused_ns       = 123456789},
         .computed_prefill_tokens = 192,
     };
-    auto& first                   = *observed.metrics.first_output_timing;
-    first.context_transfers[0][0] = {.bytes = 9007199254740993ULL, .seconds = 0.010};
-    first.context_transfers[1][1] = {.bytes = 2113536, .seconds = 0.011};
-    first.context_transfers[2][2] = {.bytes = 16384, .seconds = 0.012};
+    auto& first = *observed.metrics.first_output_timing;
+    first.context_transfers.kv.resize(2);
+    first.context_transfers.state[0] = {.bytes = 9007199254740993ULL, .seconds = 0.010};
+    first.context_transfers.kv[0][1] = {.bytes = 2113536, .seconds = 0.011};
+    first.context_transfers.kv[1][2] = {.bytes = 16384, .seconds = 0.012};
     const Json observed_done =
         Json::parse(format_request_done_json("serve-test", 3001, context, observed));
     const auto& first_json = observed_done.at("first_output_timing");
@@ -609,15 +610,32 @@ int main() {
                                                           {"post_seconds", 0.008},
                                                           {"gpu_seconds", 0.009}},
                       "request work timing merged replay, prefill or overlapping GPU intervals");
-    failures += check(first_json.at("context_transfers").at("state").at("d2h") ==
-                              Json{{"bytes", 9007199254740993ULL}, {"seconds", 0.010}} &&
-                          first_json.at("context_transfers").at("main_kv").at("h2d") ==
-                              Json{{"bytes", 2113536}, {"seconds", 0.011}} &&
-                          first_json.at("context_transfers").at("backend_kv").at("d2d") ==
-                              Json{{"bytes", 16384}, {"seconds", 0.012}} &&
-                          first_json.at("context_transfers").at("main_kv").at("d2h") ==
-                              Json{{"bytes", 0}, {"seconds", 0.0}},
-                      "first-output transfer resource, direction or integer precision changed");
+    failures += check(
+        first_json.at("context_transfers").at("state").at("d2h") ==
+                Json{{"images", 0},
+                     {"page_groups", 0},
+                     {"copy_operations", 0},
+                     {"bytes", 9007199254740993ULL},
+                     {"seconds", 0.010}} &&
+            first_json.at("context_transfers").at("kv_pools").at(0).at("transfers").at("h2d") ==
+                Json{{"images", 0},
+                     {"page_groups", 0},
+                     {"copy_operations", 0},
+                     {"bytes", 2113536},
+                     {"seconds", 0.011}} &&
+            first_json.at("context_transfers").at("kv_pools").at(1).at("transfers").at("d2d") ==
+                Json{{"images", 0},
+                     {"page_groups", 0},
+                     {"copy_operations", 0},
+                     {"bytes", 16384},
+                     {"seconds", 0.012}} &&
+            first_json.at("context_transfers").at("kv_pools").at(0).at("transfers").at("d2h") ==
+                Json{{"images", 0},
+                     {"page_groups", 0},
+                     {"copy_operations", 0},
+                     {"bytes", 0},
+                     {"seconds", 0.0}},
+        "first-output transfer resource, direction or integer precision changed");
 
     const OperationalRecord pretty_done = render_request_done(context, outcome);
     failures += check(
@@ -695,60 +713,60 @@ int main() {
                       "client disconnect is not an informational cancellation");
 
     ThroughputReport throughput;
-    throughput.interval_seconds                         = 2.0;
-    throughput.computed_prefill_tokens                  = 100;
-    throughput.committed_decode_tokens                  = 40;
-    throughput.decode_rounds                            = 10;
-    throughput.decode_row_rounds                        = 18;
-    throughput.previous.root_selections                 = 2;
-    throughput.previous.checkpoint_selections           = 3;
-    throughput.previous.preemptions                     = 8;
-    throughput.previous.snapshot_restores               = 4;
-    throughput.previous.replay_restores                 = 2;
-    throughput.previous.replayed_tokens                 = 128;
-    throughput.previous.state_h2d_bytes                 = 100;
-    throughput.current.running_requests                 = 2;
-    throughput.current.prefilling_requests              = 1;
-    throughput.current.decode_ready_requests            = 1;
-    throughput.current.waiting_requests                 = 3;
-    throughput.current.paused_requests                  = 2;
-    throughput.current.replaying_requests               = 1;
-    throughput.current.preemptions                      = 11;
-    throughput.current.snapshot_restores                = 5;
-    throughput.current.replay_restores                  = 4;
-    throughput.current.replayed_tokens                  = 896;
-    throughput.current.materializing_requests           = 1;
-    throughput.current.capture_pending_requests         = 1;
-    throughput.current.terminal_pending_requests        = 1;
-    throughput.current.root_selections                  = 3;
-    throughput.current.checkpoint_selections            = 5;
-    throughput.current.state_h2d_count                  = 1;
-    throughput.current.state_h2d_bytes                  = 132;
-    throughput.current.state_h2d_seconds                = 0.25;
-    throughput.current.device_state_occupied_slots      = 3;
-    throughput.current.host_state_occupied_slots        = 1;
-    throughput.current.host_context_occupied_bytes      = 16ULL << 20;
-    throughput.current.host_context_reserved_bytes      = 4ULL << 20;
-    throughput.current.host_context_peak_occupied_bytes = 20ULL << 20;
-    throughput.current.last_selected_frontier_tokens    = 64;
-    throughput.current.pressure_spill_pages             = 4;
-    throughput.current.host_work                        = {
-                               .engine_boundary_ns            = 1000000,
-                               .program_submit_ns             = 2000000,
-                               .program_post_ns               = 3000000,
-                               .engine_commit_output_ns       = 4000000,
-                               .engine_maintenance_ns         = 5000000,
-                               .device_wait_ns                = 300000000,
-                               .decode_host_ns                = 10000000,
-                               .decode_device_wait_ns         = 200000000,
-                               .prefill_host_ns               = 3000000,
-                               .prefill_device_wait_ns        = 50000000,
-                               .control_host_ns               = 2000000,
-                               .control_device_wait_ns        = 50000000,
-                               .prefill_units                 = 4,
-                               .control_units                 = 1,
-                               .stats_publication_ns          = 250000,
-                               .stats_publication_invocations = 5,
+    throughput.interval_seconds                           = 2.0;
+    throughput.computed_prefill_tokens                    = 100;
+    throughput.committed_decode_tokens                    = 40;
+    throughput.decode_rounds                              = 10;
+    throughput.decode_row_rounds                          = 18;
+    throughput.previous.root_selections                   = 2;
+    throughput.previous.checkpoint_selections             = 3;
+    throughput.previous.preemptions                       = 8;
+    throughput.previous.snapshot_restores                 = 4;
+    throughput.previous.replay_restores                   = 2;
+    throughput.previous.replayed_tokens                   = 128;
+    throughput.previous.context_transfers.state[1].bytes  = 100;
+    throughput.current.running_requests                   = 2;
+    throughput.current.prefilling_requests                = 1;
+    throughput.current.decode_ready_requests              = 1;
+    throughput.current.waiting_requests                   = 3;
+    throughput.current.paused_requests                    = 2;
+    throughput.current.replaying_requests                 = 1;
+    throughput.current.preemptions                        = 11;
+    throughput.current.snapshot_restores                  = 5;
+    throughput.current.replay_restores                    = 4;
+    throughput.current.replayed_tokens                    = 896;
+    throughput.current.materializing_requests             = 1;
+    throughput.current.capture_pending_requests           = 1;
+    throughput.current.terminal_pending_requests          = 1;
+    throughput.current.root_selections                    = 3;
+    throughput.current.checkpoint_selections              = 5;
+    throughput.current.context_transfers.state[1].images  = 1;
+    throughput.current.context_transfers.state[1].bytes   = 132;
+    throughput.current.context_transfers.state[1].seconds = 0.25;
+    throughput.current.device_state_occupied_slots        = 3;
+    throughput.current.host_state_occupied_slots          = 1;
+    throughput.current.host_context_occupied_bytes        = 16ULL << 20;
+    throughput.current.host_context_reserved_bytes        = 4ULL << 20;
+    throughput.current.host_context_peak_occupied_bytes   = 20ULL << 20;
+    throughput.current.last_selected_frontier_tokens      = 64;
+    throughput.current.pressure_spill_pages               = 4;
+    throughput.current.host_work                          = {
+                                 .engine_boundary_ns            = 1000000,
+                                 .program_submit_ns             = 2000000,
+                                 .program_post_ns               = 3000000,
+                                 .engine_commit_output_ns       = 4000000,
+                                 .engine_maintenance_ns         = 5000000,
+                                 .device_wait_ns                = 300000000,
+                                 .decode_host_ns                = 10000000,
+                                 .decode_device_wait_ns         = 200000000,
+                                 .prefill_host_ns               = 3000000,
+                                 .prefill_device_wait_ns        = 50000000,
+                                 .control_host_ns               = 2000000,
+                                 .control_device_wait_ns        = 50000000,
+                                 .prefill_units                 = 4,
+                                 .control_units                 = 1,
+                                 .stats_publication_ns          = 250000,
+                                 .stats_publication_invocations = 5,
     };
     const std::string pretty_throughput = render_throughput(throughput).message;
     failures +=

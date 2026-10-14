@@ -809,8 +809,28 @@ struct GenerationWorkTiming {
 };
 
 struct GenerationTransferTiming {
-    std::uint64_t bytes = 0;
-    double seconds      = 0.0;
+    std::uint64_t bytes                                     = 0;
+    double seconds                                          = 0.0;
+    std::uint64_t images                                    = 0;
+    std::uint64_t page_groups                               = 0;
+    std::uint64_t copy_operations                           = 0;
+    friend bool operator==(const GenerationTransferTiming&,
+                           const GenerationTransferTiming&) = default;
+};
+
+// Directions are D2H, H2D and D2D. KV entries are indexed by the startup pool ID.
+struct ContextTransferStats {
+    std::array<GenerationTransferTiming, 3> state{};
+    std::vector<std::array<GenerationTransferTiming, 3>> kv;
+    friend bool operator==(const ContextTransferStats&, const ContextTransferStats&) = default;
+};
+
+struct ContextKvPoolUsage {
+    std::uint16_t id = 0;
+    std::string label;
+    std::uint32_t occupied_page_groups                                           = 0;
+    std::uint32_t capacity_page_groups                                           = 0;
+    friend bool operator==(const ContextKvPoolUsage&, const ContextKvPoolUsage&) = default;
 };
 
 // Frozen immediately before the first nonempty public output delta is published. This boundary
@@ -825,9 +845,8 @@ struct GenerationFirstOutputTiming {
     GenerationWorkTiming replay;
     GenerationSchedulingStats scheduling;
     std::uint32_t computed_prefill_tokens = 0;
-    // Resources: State, Main KV, Backend KV. Directions: D2H, H2D, D2D.
     // Completed request-owned transfers only; background reclamation remains Engine-wide.
-    std::array<std::array<GenerationTransferTiming, 3>, 3> context_transfers{};
+    ContextTransferStats context_transfers;
 };
 
 struct SpeculativeStats {
@@ -1074,42 +1093,14 @@ struct RuntimeStats {
     std::uint64_t state_forks                 = 0;
     std::uint64_t materialization_state_forks = 0;
     std::uint64_t state_restores              = 0;
-    std::uint64_t state_d2h_count             = 0;
-    std::uint64_t state_h2d_count             = 0;
-    std::uint64_t state_d2d_count             = 0;
-    std::uint64_t state_d2h_bytes             = 0;
-    std::uint64_t state_h2d_bytes             = 0;
-    std::uint64_t state_d2d_bytes             = 0;
-    double state_d2h_seconds                  = 0.0;
-    double state_h2d_seconds                  = 0.0;
-    double state_d2d_seconds                  = 0.0;
+    ContextTransferStats context_transfers;
+    std::vector<ContextKvPoolUsage> kv_pools;
 
-    std::uint64_t main_kv_d2h_pages    = 0;
-    std::uint64_t main_kv_h2d_pages    = 0;
-    std::uint64_t main_kv_d2d_pages    = 0;
-    std::uint64_t main_kv_d2h_bytes    = 0;
-    std::uint64_t main_kv_h2d_bytes    = 0;
-    std::uint64_t main_kv_d2d_bytes    = 0;
-    double main_kv_d2h_seconds         = 0.0;
-    double main_kv_h2d_seconds         = 0.0;
-    double main_kv_d2d_seconds         = 0.0;
-    std::uint64_t backend_kv_d2h_pages = 0;
-    std::uint64_t backend_kv_h2d_pages = 0;
-    std::uint64_t backend_kv_d2d_pages = 0;
-    std::uint64_t backend_kv_d2h_bytes = 0;
-    std::uint64_t backend_kv_h2d_bytes = 0;
-    std::uint64_t backend_kv_d2d_bytes = 0;
-    double backend_kv_d2h_seconds      = 0.0;
-    double backend_kv_h2d_seconds      = 0.0;
-    double backend_kv_d2d_seconds      = 0.0;
-
-    std::uint64_t pressure_spill_pages             = 0;
-    std::uint64_t partial_tail_cow_pages           = 0;
-    std::uint32_t device_state_occupied_slots      = 0;
-    std::uint32_t host_state_occupied_slots        = 0;
-    std::uint32_t device_main_kv_occupied_pages    = 0;
-    std::uint32_t device_backend_kv_occupied_pages = 0;
-    std::size_t host_kv_occupied_bytes             = 0;
+    std::uint64_t pressure_spill_pages        = 0;
+    std::uint64_t partial_tail_cow_pages      = 0;
+    std::uint32_t device_state_occupied_slots = 0;
+    std::uint32_t host_state_occupied_slots   = 0;
+    std::size_t host_kv_occupied_bytes        = 0;
     // Unified physical Host context occupancy. Reserved destinations are included in occupied.
     std::size_t host_context_occupied_bytes = 0;
     std::size_t host_context_reserved_bytes = 0;

@@ -43,6 +43,7 @@ public:
     static constexpr EnginePurpose purpose = EnginePurpose::Generation;
 
     using ModelContract      = typename Instance::ModelContract;
+    using ContextResources   = typename ModelContract::Program::ContextResources;
     using ExecutionUnit      = typename ModelContract::ExecutionUnit;
     using UnitKind           = typename ModelContract::ExecutionUnitKind;
     using Checkpoint         = typename ModelContract::CheckpointHandle;
@@ -87,6 +88,13 @@ public:
             options.max_pending_requests == 0 || pending_timeout_.count() <= 0) {
             throw std::invalid_argument("Engine core bounds are invalid");
         }
+        cumulative_stats_.context_transfers.kv.resize(instance_.program->kv_pools().size());
+        for (const auto& pool : instance_.program->kv_pools()) {
+            cumulative_stats_.kv_pools.push_back(
+                {pool.id.index, std::string(pool.label), 0, pool.device_page_groups});
+        }
+        stats_snapshot_  = cumulative_stats_;
+        published_stats_ = cumulative_stats_;
         paused_.reserve(max_outstanding_);
         std::promise<void> startup;
         std::future<void> started = startup.get_future();
@@ -258,10 +266,10 @@ public:
         out.cuda_graph                         = instance_.cuda_graph;
         const KvCapacityResolution& resolution = instance_.kv_capacity_resolution;
         out.kv_capacity_mode                   = resolution.mode;
-        out.kv_capacity_page_groups            = resolution.main_page_groups;
-        out.kv_capacity_max_page_groups        = resolution.maximum_main_page_groups;
+        out.kv_capacity_page_groups            = resolution.primary_page_groups;
+        out.kv_capacity_max_page_groups        = resolution.maximum_primary_page_groups;
         out.minimum_runtime_reservation_bytes  = resolution.minimum_runtime_reservation_bytes;
-        out.kv_capacity_increment_bytes        = resolution.bytes_per_additional_main_page_group;
+        out.kv_capacity_increment_bytes        = resolution.bytes_per_additional_primary_page_group;
         out.runtime_reservation_bytes          = resolution.runtime_reservation_bytes;
         out.available_after_weights_bytes      = resolution.available_after_weights_bytes;
         out.available_after_startup_bytes      = resolution.available_after_startup_bytes;
@@ -849,7 +857,7 @@ private:
     }
 
     bool settle_terminal_requests(HostPhaseMeasurement& boundary) {
-        if (instance_.program->has_context_transaction()) { return false; }
+        if (instance_.program->has_context_operation()) { return false; }
 
         bool changed = false;
         for (;;) {
@@ -898,7 +906,7 @@ private:
 
     void cancel_active_requests(const std::array<bool, kMaximumConcurrency>& cancelled_at_boundary,
                                 HostPhaseMeasurement& boundary) {
-        if (instance_.program->has_context_transaction()) { return; }
+        if (instance_.program->has_context_operation()) { return; }
         bool changed = false;
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             const auto& request = slots_[lane];
@@ -1217,7 +1225,7 @@ private:
         request->model_state        = next;
         request->capture_pending    = true;
         request->post_capture_state = next;
-        if (instance_.program->has_context_transaction()) { return; }
+        if (instance_.program->has_context_operation()) { return; }
         bool started = instance_.program->start_capture(*request->sequence);
         if (!started) {
             instance_.program->skip_capture(*request->sequence);
@@ -1238,12 +1246,12 @@ private:
                 decision.reset();
                 return true;
             }
-            if (instance_.program->has_context_transaction()) { return false; }
+            if (instance_.program->has_context_operation()) { return false; }
             const auto admission = resources_.capture_admission(
                 *instance_.program, request->continuation_owner, *request->base_plan,
                 capture->frontier,
                 instance_.program->capture_is_input(*request->sequence) &&
-                    !capture->shortage.main_kv_pages && !capture->shortage.backend_kv_pages);
+                    !capture->shortage.first_kv_deficit());
             if (!decision || decision->frontier != capture->frontier) {
                 decision.emplace(
                     CaptureDecision{*request->sequence, capture->frontier,
@@ -1390,7 +1398,7 @@ private:
                              const std::shared_ptr<Request>& owner);
 
     bool progress_context_transaction(HostPhaseMeasurement& boundary) {
-        if (!instance_.program->has_context_transaction()) { return false; }
+        if (!instance_.program->has_context_operation()) { return false; }
         const auto owner = materializing_ ? materializing_->request : context_owner_;
         const auto cancellation =
             owner ? CancellationFlagView{&owner->cancelled} : CancellationFlagView{};
@@ -1514,12 +1522,11 @@ private:
         return true;
     }
 
-    bool reclaim(ContextResourceUsage shortage, bool allow_pause,
+    bool reclaim(ContextResources shortage, bool allow_pause,
                  std::span<const Checkpoint> excluded               = {},
                  typename ResourceManagement::ReclaimCursor* cursor = nullptr,
                  std::optional<std::uint64_t> priority_ticket       = std::nullopt) {
-        if (!shortage.state_slots && !shortage.main_kv_pages && !shortage.backend_kv_pages &&
-            !shortage.host_bytes) {
+        if (!shortage.state_slots && !shortage.first_kv_deficit() && !shortage.host_bytes) {
             return false;
         }
         if (instance_.program->reclaim_capture_reservation(shortage)) {
@@ -1543,10 +1550,7 @@ private:
             const auto handle = *request.suspended->snapshot_handle();
             if (std::find(excluded.begin(), excluded.end(), handle) != excluded.end()) { continue; }
             const auto resources = instance_.program->snapshot_resources(*request.suspended);
-            if (((shortage.state_slots && resources.state_slots) ||
-                 (shortage.main_kv_pages && resources.main_kv_pages) ||
-                 (shortage.backend_kv_pages && resources.backend_kv_pages) ||
-                 (shortage.host_bytes && resources.host_bytes)) &&
+            if (resources.useful(shortage) &&
                 instance_.program->revoke_snapshot(*request.suspended)) {
                 request.recovery_route = GenerationRecoveryRoute::Replay;
                 observe_scheduling(*it, GenerationSchedulingTransition::SnapshotRevoked);
@@ -1567,7 +1571,7 @@ private:
     }
 
     bool pause_resident(std::uint32_t lane) {
-        if (instance_.program->has_context_transaction()) { return false; }
+        if (instance_.program->has_context_operation()) { return false; }
         auto request       = slots_[lane];
         bool save_snapshot = false;
         if (const auto bytes = instance_.program->pause_host_bytes(*request->sequence)) {
@@ -1644,7 +1648,7 @@ private:
     }
 
     bool try_admit_one(bool restoring) {
-        if (instance_.program->has_context_transaction()) { return false; }
+        if (instance_.program->has_context_operation()) { return false; }
         const auto lane = free_lane();
         if (!lane && restoring) {
             if (!paused_.empty() && !has_older_resident(paused_.front()->id)) {
@@ -1720,7 +1724,7 @@ private:
                     resources_.begin_reclaim(*instance_.program, std::nullopt, rights)});
             }
             auto& decision = *admission_decision_;
-            ContextResourceUsage shortage;
+            ContextResources shortage;
             bool deferred = false;
             while (decision.current < decision.sources.size()) {
                 auto& choice            = decision.sources[decision.current];
@@ -1787,7 +1791,7 @@ private:
                     if (reclaim(shortage, restoring && !has_older_resident(request->id), excluded,
                                 &decision.reclaim,
                                 restoring ? std::optional(request->id) : std::nullopt)) {
-                        if (instance_.program->has_context_transaction()) { return true; }
+                        if (instance_.program->has_context_operation()) { return true; }
                         continue;
                     }
                     // Another waiting reference may be the only obstacle to a Move.
@@ -1873,9 +1877,10 @@ private:
             if (resident_empty()) {
                 throw std::logic_error("isolated request cannot reserve its first legal unit after "
                                        "context reclamation: state=" +
-                                       std::to_string(shortage.state_slots) +
-                                       ", main_kv=" + std::to_string(shortage.main_kv_pages) +
-                                       ", backend_kv=" + std::to_string(shortage.backend_kv_pages) +
+                                       std::to_string(shortage.state_slots) + ", kv_pool=" +
+                                       (shortage.first_kv_deficit()
+                                            ? std::to_string(shortage.first_kv_deficit()->index)
+                                            : "none") +
                                        ", host_bytes=" + std::to_string(shortage.host_bytes));
             }
             if (restoring) {
@@ -1993,10 +1998,10 @@ private:
                     runnable_units_[lane] = true;
                     break;
                 }
-                if (instance_.program->has_context_transaction()) { break; }
+                if (instance_.program->has_context_operation()) { break; }
                 if (!cursor) { cursor.emplace(resources_.begin_reclaim(*instance_.program)); }
                 if (reclaim(result.shortage, false, {}, &*cursor)) {
-                    if (!instance_.program->has_context_transaction()) { continue; }
+                    if (!instance_.program->has_context_operation()) { continue; }
                     break;
                 }
                 if (recovering == lane) {
@@ -2015,7 +2020,7 @@ private:
                 break;
             }
         }
-        if (blocked && !instance_.program->has_context_transaction()) {
+        if (blocked && !instance_.program->has_context_operation()) {
             (void)pause_resident(*blocked);
         }
         if (prefill && runnable_units_[*prefill] && !prepare_semantic_capture(slots_[*prefill])) {
@@ -2187,7 +2192,7 @@ private:
             {
                 std::unique_lock lock(queue_mutex_);
                 if (!stopping_ && pending_.empty() && resident_empty() && paused_.empty() &&
-                    !instance_.program->has_context_transaction()) {
+                    !instance_.program->has_context_operation()) {
                     queue_cv_.wait(lock, [&] { return stopping_ || !pending_.empty(); });
                 }
                 if (stopping_) {
@@ -2205,7 +2210,7 @@ private:
                 auto boundary = begin_host_phase();
                 (void)expire_pending_requests();
                 executed = progress_context_transaction(boundary);
-                if (!instance_.program->has_context_transaction()) {
+                if (!instance_.program->has_context_operation()) {
                     for (const auto& request : slots_) {
                         if (request && request->capture_pending) {
                             reserve_active_capture(request, request->post_capture_state);
@@ -2216,7 +2221,7 @@ private:
                 (void)settle_terminal_requests(boundary);
                 cancel_active_requests(snapshot_cancellations(), boundary);
                 for (auto it = paused_.begin();
-                     !instance_.program->has_context_transaction() && it != paused_.end();) {
+                     !instance_.program->has_context_operation() && it != paused_.end();) {
                     const auto request = *it;
                     if (!request->cancelled.load(std::memory_order_acquire)) {
                         ++it;
@@ -2252,9 +2257,9 @@ private:
                         (void)try_admit_one(false);
                     }
                 }
-                if (instance_.program->has_context_transaction()) {
+                if (instance_.program->has_context_operation()) {
                     executed |= progress_context_transaction(boundary);
-                    if (!instance_.program->has_context_transaction()) { reserve_resident_units(); }
+                    if (!instance_.program->has_context_operation()) { reserve_resident_units(); }
                 }
                 const auto cancelled = snapshot_cancellations();
                 auto controls = scheduler_.build_control_membership(slots_, max_concurrency_);
@@ -2302,11 +2307,11 @@ private:
                     run_decode_round(decode, cancelled);
                     executed = true;
                 }
-                if (instance_.program->has_context_transaction()) {
+                if (instance_.program->has_context_operation()) {
                     set_host_work_class(HostWorkClass::Control);
                     auto progress_boundary = begin_host_phase();
                     executed |= progress_context_transaction(progress_boundary);
-                    if (!instance_.program->has_context_transaction()) {
+                    if (!instance_.program->has_context_operation()) {
                         // Control/Decode permits were consumed. Only the still-unexecuted
                         // Prefill/Replay turn can receive a new permit in this round.
                         reserve_resident_units(ReservationScope::Prefill);
@@ -2396,6 +2401,7 @@ private:
     std::array<std::uint32_t, kMaximumConcurrency> current_decode_lanes_{};
     std::size_t current_decode_lane_count_ = 0;
     RuntimeStats cumulative_stats_;
+    RuntimeStats stats_snapshot_;
     RuntimeStats published_stats_;
     bool stopping_ = false;
     bool failed_   = false;

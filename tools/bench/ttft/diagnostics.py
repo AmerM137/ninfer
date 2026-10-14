@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 
-REQUEST_LOG_SCHEMA_VERSION = 28
+REQUEST_LOG_SCHEMA_VERSION = 29
 
 SCHEDULING_FIELDS = (
     "preemptions", "snapshot_restores", "replay_restores", "replayed_tokens",
@@ -21,10 +21,10 @@ MECHANISM_COUNTERS = {
     "replay_restore": "replay_restores",
 }
 
-TRANSFER_RESOURCES = ("state", "main_kv", "backend_kv")
+TRANSFER_RESOURCES = ("state",)
 TRANSFER_DIRECTIONS = ("d2h", "h2d", "d2d")
 OCCUPANCY_FIELDS = (
-    "device_state_slots", "device_main_kv_pages", "device_backend_kv_pages",
+    "device_state_slots",
     "host_state_slots", "host_kv_bytes", "host_context_occupied_bytes",
     "host_context_reserved_bytes",
 )
@@ -141,8 +141,11 @@ def request_timing_analysis(request: dict[str, Any]) -> dict[str, Any]:
         if all(part is not None for part in parts):
             row[f"{work}_program_ms"] = sum(parts)
     transfers = first.get("context_transfers", {})
-    for resource in TRANSFER_RESOURCES:
-        directions = transfers.get(resource, {}) if isinstance(transfers, dict) else {}
+    resources = {"state": transfers.get("state", {})} if isinstance(transfers, dict) else {}
+    for pool in transfers.get("kv_pools", []) if isinstance(transfers, dict) else []:
+        if isinstance(pool, dict) and type(pool.get("pool_id")) is int:
+            resources[f"kv_pool_{pool['pool_id']}"] = pool.get("transfers", {})
+    for resource, directions in resources.items():
         for direction in TRANSFER_DIRECTIONS:
             transfer = directions.get(direction, {}) if isinstance(directions, dict) else {}
             row[f"{resource}_{direction}_ms"] = milliseconds(read_seconds(transfer, "seconds"))
@@ -175,7 +178,12 @@ def _global_runtime_observations(events: Sequence[dict[str, Any]]) -> dict[str, 
         for event in intervals:
             value: Any = event
             for part in path:
-                value = value.get(part) if isinstance(value, dict) else None
+                if isinstance(value, dict):
+                    value = value.get(part)
+                elif isinstance(value, list) and type(part) is int and 0 <= part < len(value):
+                    value = value[part]
+                else:
+                    value = None
             if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
                 return None
             values.append(value)
@@ -185,16 +193,28 @@ def _global_runtime_observations(events: Sequence[dict[str, Any]]) -> dict[str, 
         values = values_at(path)
         return sum(values) if values is not None else None
 
-    transfers = {
-        resource: {
-            direction: {
-                field: total("context_cache", f"{resource}_transfers", direction, field)
-                for field in ("bytes", "seconds", "count" if resource == "state" else "pages")
-            }
-            for direction in TRANSFER_DIRECTIONS
+    fields = ("bytes", "seconds", "images", "page_groups", "copy_operations")
+    def transfer_total(*path):
+        return {direction: {field: total(*path, direction, field) for field in fields}
+                for direction in TRANSFER_DIRECTIONS}
+
+    pools = intervals[0].get("context_cache", {}).get("kv_pools", [])
+    transfers = {"state": transfer_total("context_cache", "state_transfers"), "kv_pools": {}}
+    pool_occupancy = {}
+    for index, pool in enumerate(pools):
+        pool_id = pool.get("pool_id")
+        if type(pool_id) is not int or pool_id != index:
+            return {"status": "unavailable", "reason": "invalid_context_pool_directory"}
+        for event in intervals:
+            directory = event.get("context_cache", {}).get("kv_pools", [])
+            if len(directory) != len(pools) or directory[index].get("pool_id") != pool_id:
+                return {"status": "unavailable", "reason": "changed_context_pool_directory"}
+        transfers["kv_pools"][str(pool_id)] = transfer_total("context_cache", "kv_pools", index, "transfers")
+        values = values_at(("context_cache", "kv_pools", index, "occupied_page_groups"))
+        pool_occupancy[str(pool_id)] = {
+            "sampled_max": max(values) if values is not None else None,
+            "last": values[-1] if values is not None else None,
         }
-        for resource in TRANSFER_RESOURCES
-    }
     host_work = {
         group: {field: total("host_work", group, field) for field in fields}
         for group, fields in (
@@ -207,7 +227,7 @@ def _global_runtime_observations(events: Sequence[dict[str, Any]]) -> dict[str, 
         )
     }
     host_work["device_wait_seconds"] = total("host_work", "device_wait_seconds")
-    occupancy = {}
+    occupancy = {"kv_pools": pool_occupancy}
     for field in OCCUPANCY_FIELDS:
         values = values_at(("context_cache", "occupancy", field))
         occupancy[field] = {

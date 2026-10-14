@@ -326,7 +326,7 @@ Admission 检查由等待队列、容量释放、资源事务完成等事件启�
 
 ### 5.1 上下文事务
 
-Bind、Capture、Demote、Pause 使用同一事务驱动：
+Bind、Capture、Demote、Pause 是独立的原生操作，由一个固定操作槽驱动：
 
 ```text
 选择操作与 source
@@ -336,8 +336,19 @@ Bind、Capture、Demote、Pause 使用同一事务驱动：
   -> Engine / ResourceManager 采用结果
 ```
 
-Program 持有事务期间的物理所有权，返回新 sequence、恢复点、已退役 checkpoint、暂停状态和 transfer
-观测。Source 在所需数据复制与验证完成前有效；abort 清理预留和传输，不发布不完整 destination。
+公共 `MigrationBatch` 持有 State/KV 来源读者、目的 reservation、复制计划、execution row 与完成
+依赖。`MigrationContext` 在启动时准备可复用的事件与计时存储。恢复、尾页 COW 和 mapping 上传
+在同一 stream 顺序提交；未发布的恢复页可以被本批次的 COW 使用，外部消费者只取得已完成结果。
+
+Program 返回新 sequence、恢复点、已退役 checkpoint、暂停状态和实际传输观测。取消先撤销发布
+意图，worker 继续轮询本批次的事件；事件完成后才释放空间和 lane、通知容量变化。取消中的
+批次继续占用唯一操作槽，不阻塞无依赖的 resident。普通取消与资源析构不做 stream 同步；
+部分提交异常和销毁路径显式结束实际设备访问，再退役所持资源。
+
+State 采用方式用 Root、Move、Fork、Restore、Split、BackupSplit 表达。目的 image 由 owning reservation
+管理，采用后才转交 continuation。Pause 在释放活动状态前结束可能尚未完成的 hidden-tail
+publication；DFlash normalization 也保留独立的数学完成边界，其共享 Host ingress 与执行行在
+producer 完成前不能复用。迁移完成不代替 MTP bridge 或模型接续。
 已安全完成的回收或降级可以保留，结果必须与最终实际占用一致。
 
 ### 5.2 模型 unit 事务

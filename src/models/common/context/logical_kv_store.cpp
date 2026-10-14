@@ -16,6 +16,81 @@ std::uint32_t update_coverage(std::array<std::uint32_t, kPagedKVPageSize>& count
 }
 } // namespace
 
+LogicalKVPageStore::ReadLease::~ReadLease() { reset(); }
+
+LogicalKVPageStore::ReadLease::ReadLease(ReadLease&& other) noexcept
+    : store_(std::exchange(other.store_, nullptr)), page_(other.page_), epoch_(other.epoch_),
+      coverage_(other.coverage_), host_(other.host_) {}
+
+LogicalKVPageStore::ReadLease&
+LogicalKVPageStore::ReadLease::operator=(ReadLease&& other) noexcept {
+    if (this != &other) {
+        reset();
+        store_    = std::exchange(other.store_, nullptr);
+        page_     = other.page_;
+        epoch_    = other.epoch_;
+        coverage_ = other.coverage_;
+        host_     = other.host_;
+    }
+    return *this;
+}
+
+void LogicalKVPageStore::ReadLease::reset() noexcept {
+    if (!store_) return;
+    auto* store = std::exchange(store_, nullptr);
+    if (store->content_epoch(page_) != epoch_) std::terminate();
+    if (host_) {
+        auto& page = store->require(page_);
+        if (!page.host_readers) std::terminate();
+        --page.host_readers;
+        store->retire_unowned(page_);
+    } else {
+        store->unpin_source(page_);
+    }
+}
+
+LogicalKVPageStore::ReadLease LogicalKVPageStore::read_device(LogicalKVPageHandle page,
+                                                              std::uint32_t coverage) {
+    if (!device_covers(page, coverage)) throw std::logic_error("KV Device reader lacks coverage");
+    pin_source(page);
+    return ReadLease(*this, page, content_epoch(page), coverage, false);
+}
+
+LogicalKVPageStore::ReadLease LogicalKVPageStore::read_host(LogicalKVPageHandle page,
+                                                            std::uint32_t coverage) {
+    auto& object = require(page);
+    if (!host_covers(page, coverage) || object.host_transfer_pending ||
+        object.readers() == UINT32_MAX)
+        throw std::logic_error("KV Host reader lacks an available replica");
+    ++object.host_readers;
+    return ReadLease(*this, page, content_epoch(page), coverage, true);
+}
+
+LogicalKVPageStore::Restore::~Restore() {
+    if (!store_) return;
+    auto& page = store_->require(source_.page());
+    if (!page.destination_pinned || page.device_replica) std::terminate();
+    page.destination_pinned = false;
+    // destination_ and source_ retire in that order after the copy's enclosing fence.
+}
+
+LogicalKVPageStore::Restore::Restore(Restore&& other) noexcept
+    : store_(std::exchange(other.store_, nullptr)), source_(std::move(other.source_)),
+      destination_(std::move(other.destination_)) {}
+
+void LogicalKVPageStore::Restore::publish() {
+    if (!store_) throw std::logic_error("KV restore already consumed");
+    auto& page = store_->require(source_.page());
+    if (page.device_replica || !page.destination_pinned || page.content_epoch != source_.epoch() ||
+        !store_->host_covers(source_.page(), source_.coverage()))
+        throw std::logic_error("KV source changed before restore publication");
+    page.device_replica.emplace(std::move(destination_));
+    page.device_columns     = source_.coverage();
+    page.destination_pinned = false;
+    store_                  = nullptr;
+    source_.reset();
+}
+
 LogicalKVPageStore::LogicalKVPageStore(DeviceKVPagePool& physical, std::uint32_t logical_capacity)
     : physical_(&physical), pages_(logical_capacity), free_(pages_.size()),
       free_count_(static_cast<std::uint32_t>(pages_.size())) {
@@ -94,9 +169,8 @@ LogicalKVPageStore::materialize_transfer_destination(DeviceKVPageReservation& re
 void LogicalKVPageStore::publish_transfer_destination(LogicalKVPageHandle handle) noexcept {
     if (!valid(handle)) { std::terminate(); }
     Page& page = pages_[handle.index_];
-    if (!page.device_replica || page.pending_device_replica || page.host_replica ||
-        !page.destination_pinned || page.references != 0 || page.writer_identity != 0 ||
-        page.source_pins != 0) {
+    if (!page.device_replica || page.host_replica || !page.destination_pinned ||
+        page.references != 0 || page.writer_identity != 0 || page.readers() != 0) {
         std::terminate();
     }
     page.references         = 1;
@@ -107,9 +181,8 @@ void LogicalKVPageStore::abort_transfer_destination(LogicalKVPageHandle handle,
                                                     DeviceKVPageReservation& reservation) noexcept {
     if (!valid(handle)) { return; }
     Page& page = pages_[handle.index_];
-    if (!page.device_replica || page.pending_device_replica || page.host_replica ||
-        !page.destination_pinned || page.references != 0 || page.writer_identity != 0 ||
-        page.source_pins != 0) {
+    if (!page.device_replica || page.host_replica || !page.destination_pinned ||
+        page.references != 0 || page.writer_identity != 0 || page.readers() != 0) {
         return;
     }
     physical_->dematerialize_one(reservation, std::move(*page.device_replica));
@@ -169,8 +242,8 @@ bool LogicalKVPageStore::can_write(LogicalKVPageHandle handle, std::uint64_t wri
     for (auto i = begin; i < page.required_columns; ++i)
         if (page.required[i] > static_cast<std::uint32_t>(own_coverage == i + 1)) return false;
     return writer != 0 && page.device_replica && page.device_columns >= begin &&
-           page.protected_columns <= begin && page.source_pins == 0 && !page.destination_pinned &&
-           !page.pending_device_replica &&
+           page.protected_columns <= begin && page.readers() == 0 && !page.destination_pinned &&
+
            (page.writer_identity == 0 || page.writer_identity == writer);
 }
 
@@ -197,46 +270,20 @@ bool LogicalKVPageStore::can_pin_source(LogicalKVPageHandle handle) const noexce
     if (!valid(handle)) { return false; }
     const Page& page = pages_[handle.index_];
     return page.device_replica.has_value() && page.writer_identity == 0 &&
-           !page.destination_pinned &&
-           page.source_pins != std::numeric_limits<std::uint32_t>::max();
+           !page.destination_pinned && page.readers() != std::numeric_limits<std::uint32_t>::max();
 }
 
-DeviceKVPageHandle
+LogicalKVPageStore::Restore
 LogicalKVPageStore::reserve_device_replica(LogicalKVPageHandle handle,
                                            DeviceKVPageReservation& reservation) {
-    Page& page = require(handle);
-    if (page.device_replica || page.pending_device_replica || !page.host_replica ||
-        page.destination_pinned || page.source_pins != 0 ||
-        page.host_replica->content_epoch != page.content_epoch ||
-        page.host_replica->committed_columns < page.required_columns) {
+    auto& page = require(handle);
+    if (page.device_replica || page.destination_pinned || !page.host_replica ||
+        !host_covers(handle, page.required_columns))
         throw std::logic_error("logical KV Device restore is not reservable");
-    }
-    page.pending_device_replica.emplace(physical_->materialize_one(reservation));
+    auto source             = read_host(handle, page.host_replica->committed_columns);
+    auto destination        = physical_->materialize_one(reservation);
     page.destination_pinned = true;
-    return page.pending_device_replica->handle();
-}
-
-void LogicalKVPageStore::publish_device_replica(LogicalKVPageHandle handle) {
-    Page& page = require(handle);
-    if (page.device_replica || !page.pending_device_replica || !page.destination_pinned ||
-        !page.host_replica || page.host_replica->content_epoch != page.content_epoch ||
-        page.host_replica->committed_columns < page.required_columns) {
-        throw std::logic_error("logical KV Device restore is not publishable");
-    }
-    page.device_replica = std::move(page.pending_device_replica);
-    page.device_columns = page.host_replica->committed_columns;
-    page.pending_device_replica.reset();
-    page.destination_pinned = false;
-}
-
-void LogicalKVPageStore::abort_device_replica(LogicalKVPageHandle handle,
-                                              DeviceKVPageReservation& reservation) noexcept {
-    if (!valid(handle)) { return; }
-    Page& page = pages_[handle.index_];
-    if (!page.pending_device_replica || !page.destination_pinned) { return; }
-    physical_->dematerialize_one(reservation, std::move(*page.pending_device_replica));
-    page.pending_device_replica.reset();
-    page.destination_pinned = false;
+    return Restore(*this, std::move(source), std::move(destination));
 }
 
 bool LogicalKVPageStore::drop_device_replica(LogicalKVPageHandle handle) noexcept {
@@ -256,9 +303,8 @@ bool LogicalKVPageStore::host_replica_current(LogicalKVPageHandle handle) const 
 bool LogicalKVPageStore::can_drop_device_replica(LogicalKVPageHandle handle) const noexcept {
     if (!valid(handle)) { return false; }
     const Page& page = pages_[handle.index_];
-    return page.device_replica && host_replica_current(handle) && !page.pending_device_replica &&
-           page.writer_identity == 0 && page.active_references == 0 && page.source_pins == 0 &&
-           !page.destination_pinned;
+    return page.device_replica && host_replica_current(handle) && page.writer_identity == 0 &&
+           page.active_references == 0 && page.readers() == 0 && !page.destination_pinned;
 }
 
 void LogicalKVPageStore::retain_active_reference(LogicalKVPageHandle handle) {
@@ -288,16 +334,19 @@ void LogicalKVPageStore::retain_reference(LogicalKVPageHandle handle) {
 
 void LogicalKVPageStore::pin_source(LogicalKVPageHandle handle) {
     Page& page = require(handle);
-    if (page.source_pins == std::numeric_limits<std::uint32_t>::max()) {
+    if (page.readers() == std::numeric_limits<std::uint32_t>::max()) {
         throw std::overflow_error("logical KV source pin count overflow");
     }
-    ++page.source_pins;
+    ++page.device_readers;
 }
 
 void LogicalKVPageStore::unpin_source(LogicalKVPageHandle handle) {
     Page& page = require(handle);
-    if (page.source_pins == 0) { throw std::logic_error("logical KV source is not pinned"); }
-    --page.source_pins;
+    if (page.device_readers == 0) {
+        throw std::logic_error("logical KV Device source is not pinned");
+    }
+    --page.device_readers;
+    retire_unowned(handle);
 }
 
 void LogicalKVPageStore::commit_coverage(LogicalKVPageHandle handle, std::uint32_t columns) {
@@ -313,26 +362,29 @@ void LogicalKVPageStore::commit_coverage(LogicalKVPageHandle handle, std::uint32
 bool LogicalKVPageStore::can_release_reference(LogicalKVPageHandle handle) const noexcept {
     if (!valid(handle)) { return false; }
     const Page& page = pages_[handle.index_];
-    // An unrelated address may drop its alias while a transfer reads the source.
-    // The final address reference remains responsible for keeping that source alive.
-    if (page.references == 0 || page.active_references >= page.references ||
-        (page.source_pins != 0 && page.references == 1) || page.destination_pinned) {
-        return false;
+    return page.references != 0 && page.active_references < page.references;
+}
+
+bool LogicalKVPageStore::release_reference(LogicalKVPageHandle handle) noexcept {
+    if (!can_release_reference(handle)) return false;
+    auto& page = pages_[handle.index_];
+    if (--page.references == 0 && !page.readers() && !page.destination_pinned) {
+        page.device_replica.reset();
+        if (!page.host_replica) release_descriptor(handle, page);
     }
     return true;
 }
 
-bool LogicalKVPageStore::release_reference(LogicalKVPageHandle handle) noexcept {
-    if (!can_release_reference(handle)) { return false; }
-    Page& page = pages_[handle.index_];
-    if (--page.references != 0) { return true; }
+void LogicalKVPageStore::retire_unowned(LogicalKVPageHandle handle) noexcept {
+    auto& page = pages_[handle.index_];
+    if (page.references || page.readers() || page.destination_pinned || page.host_transfer_pending)
+        return;
     page.device_replica.reset();
-    // A Host extent owns its page capability until the extent is released as one atomic
-    // allocation. Keep the zero-reference logical descriptor alive long enough for
-    // HostKVExtentStore to detach that replica; without a Host replica the descriptor can be
-    // reclaimed immediately.
-    if (!page.host_replica) { release_descriptor(handle, page); }
-    return true;
+    if (page.host_replica) {
+        if (!page.host_owner->release_page_replicas(*this, {&handle, 1})) std::terminate();
+    } else {
+        release_descriptor(handle, page);
+    }
 }
 
 bool LogicalKVPageStore::can_attach_host_replica(LogicalKVPageHandle handle, std::uint64_t epoch,
@@ -382,7 +434,7 @@ bool LogicalKVPageStore::detach_host_replica(LogicalKVPageHandle handle,
     }
     page.host_replica.reset();
     page.host_owner = nullptr;
-    if (page.references == 0 && page.source_pins == 0 && !page.device_replica) {
+    if (page.references == 0 && page.readers() == 0 && !page.device_replica) {
         release_descriptor(handle, page);
     }
     return true;
@@ -390,19 +442,19 @@ bool LogicalKVPageStore::detach_host_replica(LogicalKVPageHandle handle,
 
 void LogicalKVPageStore::release_descriptor(LogicalKVPageHandle handle, Page& page) noexcept {
     if (page.active_references != 0) { std::terminate(); }
-    page.committed_columns  = 0;
-    page.device_columns     = 0;
-    page.required_columns   = 0;
-    page.writer_identity    = 0;
-    page.required           = {};
-    page.protections        = {};
-    page.references         = 0;
-    page.active_references  = 0;
-    page.protected_columns  = 0;
-    page.source_pins        = 0;
-    page.destination_pinned = false;
-    page.occupied           = false;
-    page.pending_device_replica.reset();
+    page.committed_columns = 0;
+    page.device_columns    = 0;
+    page.required_columns  = 0;
+    page.writer_identity   = 0;
+    page.required          = {};
+    page.protections       = {};
+    page.references        = 0;
+    page.active_references = 0;
+    page.protected_columns = 0;
+    page.device_readers = page.host_readers = 0;
+    page.host_transfer_pending              = false;
+    page.destination_pinned                 = false;
+    page.occupied                           = false;
     page.host_replica.reset();
     page.host_owner = nullptr;
     if (++page.generation == 0) { ++page.generation; }
