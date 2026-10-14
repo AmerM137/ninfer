@@ -247,7 +247,7 @@ void launch_causal_conv_snapshot(const Tensor& x, const Tensor& weight, Tensor& 
     const std::int32_t C = x.ne[0];
     const std::int32_t T = x.ne[1];
     const std::int64_t slot_stride =
-        static_cast<std::int64_t>(conv_states.ne[0]) * static_cast<std::int64_t>(conv_states.ne[1]);
+        conv_states.nb[2] / static_cast<std::int64_t>(sizeof(__nv_bfloat16));
 
     if (plan.route == CausalConvSnapshotRoute::Decode) {
         constexpr int kBlock = 256;

@@ -32,7 +32,7 @@ using detail::DFlashPersistentState;
 
 struct ExecutionCore {
     ExecutionCore(DeviceContext& device, const execution::Parameters& parameters, MemoryArena& work,
-                  LinearAttentionStatePool& linear_attention,
+                  LinearAttentionStateView& linear_attention,
                   const GdnReplayRecords* replay_records, qwen3_5::RoundState& io,
                   Tensor& prefill_hidden, std::uint32_t prefill_chunk, ProposalHead proposal_head,
                   moe::Resources* moe = nullptr)
@@ -45,7 +45,7 @@ struct ExecutionCore {
     const CudaExecutionView cuda;
     const execution::Parameters& parameters;
     MemoryArena& work;
-    LinearAttentionStatePool& linear_attention;
+    LinearAttentionStateView& linear_attention;
     const GdnReplayRecords* replay_records;
     qwen3_5::RoundState& io;
     Tensor& prefill_hidden;

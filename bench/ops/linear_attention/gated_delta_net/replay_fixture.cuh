@@ -47,8 +47,8 @@ public:
         : profile_(profile), width_(width),
           record_storage_(ninfer::bench::device_context().device(), record_bytes(profile, width)),
           records_(record_storage_.span(), record_layout_),
-          state_storage_(ninfer::bench::device_context().device(), state_bytes(profile)),
-          states_(state_storage_.span(), state_layout_) {
+          state_storage_(ninfer::bench::device_context().device(), image_layout_.storage.bytes),
+          images_(state_storage_.span(), image_layout_), states_(images_, state_layout_) {
         record_storage_.fill(0); // alignment gaps only; represented planes are filled below.
         state_storage_.fill(0);
         CUDA_CHECK(bench::fixture::fill_values(static_cast<__nv_bfloat16*>(records_.conv.data),
@@ -61,13 +61,25 @@ public:
         initialize_record_gates<<<(pairs + 255) / 256, 256>>>(
             static_cast<float*>(records_.gate.data), pairs);
         CUDA_CHECK(cudaGetLastError());
+        const auto first = states_.layer_view(0);
+        DeviceBuffer initial_conv(bench::device_context().device(), first.conv.bytes());
+        DeviceBuffer initial_recurrent(bench::device_context().device(), first.recurrent.bytes());
         for (int layer = 0; layer < profile.layers; ++layer) {
             const auto view = states_.layer_view(layer);
-            CUDA_CHECK(bench::fixture::fill_values(static_cast<__nv_bfloat16*>(view.conv.data),
+            // Preserve the original logical PRNG sequence across slots while changing storage.
+            CUDA_CHECK(bench::fixture::fill_values(static_cast<__nv_bfloat16*>(initial_conv.data()),
                                                    view.conv.numel(), 401U + layer, -.5F, .5F));
-            CUDA_CHECK(bench::fixture::fill_values(static_cast<float*>(view.recurrent.data),
+            CUDA_CHECK(bench::fixture::fill_values(static_cast<float*>(initial_recurrent.data()),
                                                    view.recurrent.numel(), 501U + layer, -.02F,
                                                    .02F));
+            const auto conv_bytes      = view.conv.bytes() / kStateSlots;
+            const auto recurrent_bytes = view.recurrent.bytes() / kStateSlots;
+            CUDA_CHECK(cudaMemcpy2DAsync(view.conv.data, view.conv.nb[2], initial_conv.data(),
+                                         conv_bytes, conv_bytes, kStateSlots,
+                                         cudaMemcpyDeviceToDevice));
+            CUDA_CHECK(cudaMemcpy2DAsync(view.recurrent.data, view.recurrent.nb[3],
+                                         initial_recurrent.data(), recurrent_bytes, recurrent_bytes,
+                                         kStateSlots, cudaMemcpyDeviceToDevice));
         }
         CUDA_CHECK(cudaDeviceSynchronize());
         initial_ = std::make_unique<bench::SavedBuffer>(state_storage_);
@@ -90,17 +102,16 @@ private:
                                                  .value_dim       = kStateDim});
     }
 
-    static LinearAttentionStatePoolLayout make_state_layout(const Profile& profile,
-                                                            LayoutBuilder& builder) {
-        return plan_linear_attention_state_pool(
-            builder, {.layers         = static_cast<std::uint32_t>(profile.layers),
-                      .conv_channels  = profile.conv_channels,
-                      .conv_width     = 3,
-                      .value_heads    = profile.value_heads,
-                      .value_head_dim = kStateDim,
-                      .key_head_dim   = kStateDim,
-                      .slot_count     = kStateSlots,
-                      .conv_dtype     = DType::BF16});
+    static LinearAttentionStateLayout make_state_layout(const Profile& profile,
+                                                        StateImageBuilder& builder) {
+        return plan_linear_attention_state(builder,
+                                           {.layers = static_cast<std::uint32_t>(profile.layers),
+                                            .conv_channels  = profile.conv_channels,
+                                            .conv_width     = 3,
+                                            .value_heads    = profile.value_heads,
+                                            .value_head_dim = kStateDim,
+                                            .key_head_dim   = kStateDim,
+                                            .conv_dtype     = DType::BF16});
     }
 
     static std::size_t record_bytes(const Profile& profile, std::int32_t width) {
@@ -109,22 +120,19 @@ private:
         return builder.finish(256);
     }
 
-    static std::size_t state_bytes(const Profile& profile) {
-        LayoutBuilder builder;
-        (void)make_state_layout(profile, builder);
-        return builder.finish(256);
-    }
-
     Profile profile_;
     std::int32_t width_;
     LayoutBuilder record_builder_;
     GdnReplayRecordLayout record_layout_ = make_record_layout(profile_, width_, record_builder_);
-    LayoutBuilder state_builder_;
-    LinearAttentionStatePoolLayout state_layout_ = make_state_layout(profile_, state_builder_);
+    LayoutBuilder state_backing_builder_;
+    StateImageBuilder state_builder_;
+    LinearAttentionStateLayout state_layout_ = make_state_layout(profile_, state_builder_);
+    StateImageLayout image_layout_ = state_builder_.finish(state_backing_builder_, kStateSlots);
     DeviceBuffer record_storage_;
     GdnReplayRecords records_;
     DeviceBuffer state_storage_;
-    LinearAttentionStatePool states_;
+    StateImageStorage images_;
+    LinearAttentionStateView states_;
     std::unique_ptr<bench::SavedBuffer> initial_;
     ops::GdnReplayFoldPlan fold_plan_{records_, states_.all_layers_view()};
 };

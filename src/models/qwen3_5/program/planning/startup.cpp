@@ -112,6 +112,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                      .mtp_physical_page_groups  = mtp_physical_pages,
                  });
     qwen3_5::StateImageSpec state_image_spec{
+        .slot_count = state_image_slots,
         .linear =
             {
                 .layers        = config.linear_attention_layers,
@@ -120,7 +121,6 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                 .value_heads = (config.gdn ? dimension(config.gdn->linear_num_value_heads) : 0),
                 .value_head_dim = (config.gdn ? dimension(config.gdn->linear_value_head_dim) : 0),
                 .key_head_dim   = (config.gdn ? dimension(config.gdn->linear_key_head_dim) : 0),
-                .slot_count     = state_image_slots,
                 .conv_dtype     = DType::BF16,
             },
         .hidden = dimension(config.hidden_size),
@@ -831,7 +831,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
         // Default Host capacity covers 8 GiB of KV bytes plus eight complete StateImages.
         impl->context_cache.host_capacity_bytes =
             checked_add(8ULL * 1024 * 1024 * 1024,
-                        checked_mul(8, impl->persistent.state_images.host.image_bytes,
+                        checked_mul(8, impl->persistent.state_images.images.image_stride,
                                     "Host context state default overflow"),
                         "Host context default overflow");
     }

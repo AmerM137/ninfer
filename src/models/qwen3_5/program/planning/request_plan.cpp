@@ -215,7 +215,7 @@ UnitDemand ProgramImpl::prefill_unit(std::uint32_t prompt, std::uint32_t cursor,
 UnitDemand ProgramImpl::next_unit(const SequenceState& sequence, const RequestControl& request,
                                   ExecutionUnitKind kind, std::uint32_t tokens) const {
     UnitDemand demand{.kind = kind, .tokens = tokens};
-    const auto frontier = sequence.execution_frontier;
+    const auto frontier = sequence.continuation.metadata.execution_frontier;
     switch (kind) {
     case ExecutionUnitKind::Prefill: {
         if (request.lifecycle != Lifecycle::Prefilling || !request.prefill) {
@@ -259,7 +259,7 @@ UnitDemand ProgramImpl::next_unit(const SequenceState& sequence, const RequestCo
         demand.backend_frontier = backend_kv_cache() ? demand.main_frontier : 0;
         break;
     case ExecutionUnitKind::Normalize:
-        demand.main_frontier    = sequence.text_kv_valid;
+        demand.main_frontier    = sequence.continuation.metadata.text_kv_valid;
         demand.backend_frontier = backend_kv_cache() ? frontier : 0;
         break;
     }
@@ -372,7 +372,7 @@ void ProgramImpl::settle_unit(std::uint32_t lane) noexcept {
     if (request.recovery && request.lifecycle != Lifecycle::Replaying &&
         request.lifecycle != Lifecycle::Pending &&
         (request.lifecycle == Lifecycle::Finishable ||
-         state.execution_frontier > request.recovery->frontier ||
+         state.continuation.metadata.execution_frontier > request.recovery->frontier ||
          state.ledger.size() > request.recovery->ledger_tokens ||
          (request.prefill && request.prefill->cursor > request.recovery->frontier))) {
         request.recovery.reset();
@@ -380,7 +380,7 @@ void ProgramImpl::settle_unit(std::uint32_t lane) noexcept {
     if (state.kv) {
         try {
             text_kv_addresses->settle_growth(
-                state.kv->text, state.text_kv_valid,
+                state.kv->text, state.continuation.metadata.text_kv_valid,
                 request.recovery ? request.recovery->coverage.main_frontier : 0);
             if (state.kv->backend) {
                 backend_kv_addresses->settle_growth(

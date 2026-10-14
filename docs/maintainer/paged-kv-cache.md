@@ -767,7 +767,7 @@ consumer，且 replay in-flight期间不得改写同一 row。
 | 统一 Host backing、typed KV layout 与 allocation | `src/core/host_context_arena.*`, `src/core/host_kv_arena.*` |
 | logical pages、replicas 与 references | `src/models/common/context/logical_kv_store.h` |
 | address spaces、目录与 views | `src/models/common/context/kv_address_space.h` |
-| StateImage 逻辑身份与副本事务 | `src/models/common/context/state_store.h`，由原生 typed pools 实例化 |
+| StateImage 布局、逻辑身份与副本事务 | `src/core/state_image.*`, `src/models/common/context/state_store.*`；架构声明字段与类型化视图 |
 | history 与 checkpoint 生命周期 | `src/models/qwen3_5/program/storage/checkpoints.cpp`, `sequence.cpp` |
 | Host extent membership | `src/models/common/context/host_kv_store.h` |
 | unit 许可与上下文事务 | `src/models/qwen3_5/program/planning/request_plan.cpp`, `transactions/` |

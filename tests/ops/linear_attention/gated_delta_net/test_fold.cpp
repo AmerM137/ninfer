@@ -184,24 +184,25 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
                           cudaMemcpyHostToDevice),
                "upload gate records");
 
-    LayoutBuilder state_builder;
-    const LinearAttentionStatePoolLayout state_layout = plan_linear_attention_state_pool(
+    LayoutBuilder state_backing_builder;
+    StateImageBuilder state_builder;
+    const LinearAttentionStateLayout state_layout = plan_linear_attention_state(
         state_builder, {.layers         = static_cast<std::uint32_t>(profile.layers),
                         .conv_channels  = profile.conv_channels,
                         .conv_width     = 3,
                         .value_heads    = profile.value_heads,
                         .value_head_dim = kStateDim,
                         .key_head_dim   = kStateDim,
-                        .slot_count     = slot_count,
                         .conv_dtype     = DType::BF16});
-    const std::size_t state_bytes = state_builder.finish(256);
+    const auto image_layout       = state_builder.finish(state_backing_builder, slot_count);
+    const std::size_t state_bytes = state_backing_builder.finish(256);
     DeviceBuffer state_storage(ninfer::test::cuda_environment().context.device(),
                                state_bytes + 2 * kGuardBytes);
     state_storage.fill(0xa5);
     void* state_base = offset_pointer(state_storage.data(), kGuardBytes);
     cuda_check(cudaMemset(state_base, 0, state_bytes), "initialize all-layer state");
-    LinearAttentionStatePool state_pool(state_storage.span().subspan(kGuardBytes, state_bytes),
-                                        state_layout);
+    StateImageStorage images(state_storage.span().subspan(kGuardBytes, state_bytes), image_layout);
+    LinearAttentionStateView state_pool(images, state_layout);
 
     DeviceBuffer expected_conv(ninfer::test::cuda_environment().context.device(),
                                static_cast<std::size_t>(profile.layers) * rows * conv_slot_bytes);
@@ -572,20 +573,22 @@ int run_record_fold_rounds(bool q8 = false) {
     record_storage.fill(0xff);
     GdnReplayRecords records(record_storage.span(), record_layout);
 
-    LayoutBuilder state_builder;
-    const LinearAttentionStatePoolLayout state_layout = plan_linear_attention_state_pool(
+    LayoutBuilder state_backing_builder;
+    StateImageBuilder state_builder;
+    const LinearAttentionStateLayout state_layout = plan_linear_attention_state(
         state_builder, {.layers         = static_cast<std::uint32_t>(kProfile.layers),
                         .conv_channels  = kProfile.conv_channels,
                         .conv_width     = 3,
                         .value_heads    = kProfile.value_heads,
                         .value_head_dim = kStateDim,
                         .key_head_dim   = kStateDim,
-                        .slot_count     = kStateSlots,
                         .conv_dtype     = DType::BF16});
+    const auto image_layout = state_builder.finish(state_backing_builder, kStateSlots);
     DeviceBuffer state_storage(ninfer::test::cuda_environment().context.device(),
-                               state_builder.finish(256));
+                               state_backing_builder.finish(256));
     state_storage.fill(0);
-    LinearAttentionStatePool state_pool(state_storage.span(), state_layout);
+    StateImageStorage images(state_storage.span(), image_layout);
+    LinearAttentionStateView state_pool(images, state_layout);
     const ops::GdnReplayFoldPlan fold_plan(records, state_pool.all_layers_view());
 
     const std::size_t recurrent_slot_elements =

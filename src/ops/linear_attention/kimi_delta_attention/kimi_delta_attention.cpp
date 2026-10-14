@@ -162,11 +162,20 @@ BatchGeometry validate_batch_update(const Tensor& q, const Tensor& k, const Tens
     common::operand::contiguous_nonnull(beta, "kimi_delta_attention", "beta", device);
     common::operand::contiguous_nonnull(a_log, "kimi_delta_attention", "A_log", device);
     common::operand::contiguous_nonnull(dt_bias, "kimi_delta_attention", "dt_bias", device);
-    common::operand::contiguous_nonnull(ssm_states, "kimi_delta_attention", "ssm_states", device);
+    common::operand::slotted_tensor(ssm_states, DType::FP32,
+                                    {128, 128, geometry.value_heads, ssm_states.ne[3]}, 3, 16,
+                                    "kimi_delta_attention", "ssm_states", device);
     common::operand::contiguous_nonnull(state_slots, "kimi_delta_attention", "state_slots", device);
     common::operand::contiguous_nonnull(out, "kimi_delta_attention", "out", device);
 
     require_control_parameters(lower_bound, scale);
+    const auto state_blocks = common::operand::blocks(ssm_states, "kimi_delta_attention");
+    for (const Tensor* operand : {&q, &k, &v, &g, &beta, &a_log, &dt_bias, &state_slots, &out}) {
+        if (common::operand::overlaps(state_blocks,
+                                      common::operand::range(*operand, "kimi_delta_attention")))
+            throw std::invalid_argument("kimi_delta_attention: operands overlap state storage");
+    }
+
     return geometry;
 }
 
@@ -248,7 +257,7 @@ void kimi_delta_attention_batch_update(const Tensor& q, const Tensor& k, const T
                                                 scale, states, slots, out, execution.device());
     detail::kimi_delta_attention::launch_batch_update(
         arguments(q, k, v, g, beta, a_log, dt_bias, lower_bound, scale, states, states, out),
-        static_cast<const std::int32_t*>(slots.data), geometry.batch, stream);
+        static_cast<const std::int32_t*>(slots.data), geometry.batch, states.nb[3] / 4, stream);
 }
 
 } // namespace ninfer::ops

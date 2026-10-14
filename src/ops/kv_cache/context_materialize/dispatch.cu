@@ -53,6 +53,8 @@ DeviceLayers make_device_layers(
             static_cast<__nv_bfloat16*>(source.cache.k.data),
             static_cast<__half*>(source.cache.v.data),
             static_cast<std::int32_t>(source.cache.padded_capacity),
+            source.cache.k.nb[3] / 2,
+            source.cache.v.nb[3] / 2,
         };
     }
     return result;

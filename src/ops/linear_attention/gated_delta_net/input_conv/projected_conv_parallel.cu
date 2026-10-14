@@ -16,7 +16,7 @@ __global__ __launch_bounds__(WarpsPerCta * 32) void gdn_projected_conv_parallel_
     const __nv_bfloat16* __restrict__ conv_states, const std::int32_t* __restrict__ initial_slot,
     const std::int32_t* __restrict__ valid_columns, __nv_bfloat16* __restrict__ query,
     __nv_bfloat16* __restrict__ key, __nv_bfloat16* __restrict__ value, std::int32_t tokens,
-    Publish publish) {
+    std::int64_t slot_stride, Publish publish) {
     static_assert((ConvGeometry::channels % 32) == 0);
 
     struct Shared {
@@ -26,14 +26,13 @@ __global__ __launch_bounds__(WarpsPerCta * 32) void gdn_projected_conv_parallel_
 
     __shared__ Shared shared;
 
-    const int warp                     = static_cast<int>(threadIdx.x) >> 5;
-    const int lane                     = static_cast<int>(threadIdx.x) & 31;
-    const int row                      = static_cast<int>(blockIdx.x) * 32 + lane;
-    constexpr std::int64_t kSlotStride = static_cast<std::int64_t>(ConvGeometry::channels) * 3;
-    std::int32_t valid                 = valid_columns == nullptr ? tokens : *valid_columns;
-    valid                              = valid < 0 ? 0 : (valid > tokens ? tokens : valid);
+    const int warp     = static_cast<int>(threadIdx.x) >> 5;
+    const int lane     = static_cast<int>(threadIdx.x) & 31;
+    const int row      = static_cast<int>(blockIdx.x) * 32 + lane;
+    std::int32_t valid = valid_columns == nullptr ? tokens : *valid_columns;
+    valid              = valid < 0 ? 0 : (valid > tokens ? tokens : valid);
     if (warp == 0) {
-        const std::int64_t initial_base = static_cast<std::int64_t>(*initial_slot) * kSlotStride;
+        const std::int64_t initial_base = static_cast<std::int64_t>(*initial_slot) * slot_stride;
 #pragma unroll
         for (int history = 0; history < 3; ++history) {
             shared.initial[history][lane] = __bfloat162float(
@@ -121,7 +120,8 @@ void launch(const Tensor& projected, const Tensor& conv_weight, const Tensor& co
             valid_columns.data == nullptr ? nullptr
                                           : static_cast<const std::int32_t*>(valid_columns.data),
             static_cast<__nv_bfloat16*>(query.data), static_cast<__nv_bfloat16*>(key.data),
-            static_cast<__nv_bfloat16*>(value.data), projected.ne[1], publish);
+            static_cast<__nv_bfloat16*>(value.data), projected.ne[1], conv_states.nb[2] / 2,
+            publish);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -133,9 +133,9 @@ void launch_gdn_projected_conv_parallel_snapshot(const Tensor& projected, const 
                                                  const Tensor& snapshot_base_slot, Tensor& query,
                                                  Tensor& key, Tensor& value, cudaStream_t stream) {
     launch(projected, conv_weight, conv_states, valid_columns, initial_slot, query, key, value,
-           SnapshotHistoryPublish{static_cast<__nv_bfloat16*>(conv_states.data),
-                                  static_cast<const std::int32_t*>(snapshot_base_slot.data),
-                                  ConvGeometry::channels},
+           SnapshotHistoryPublish{
+               static_cast<__nv_bfloat16*>(conv_states.data), conv_states.nb[2] / 2,
+               static_cast<const std::int32_t*>(snapshot_base_slot.data), ConvGeometry::channels},
            stream);
 }
 

@@ -32,12 +32,13 @@ qwen::PreparedPromptData replay_prompt(const RequestBasePlanImpl& base,
     out.token_ids                = sequence.ledger;
     out.token_types.resize(ledger_tokens, 0);
     out.positions.resize(3ULL * ledger_tokens);
-    out.rope_delta = sequence.rope_delta;
+    out.rope_delta = sequence.continuation.metadata.rope_delta;
     for (std::size_t axis = 0; axis < 3; ++axis) {
         std::copy_n(source.positions.begin() + axis * prompt_tokens, prompt_tokens,
                     out.positions.begin() + axis * ledger_tokens);
         for (std::size_t token = prompt_tokens; token < ledger_tokens; ++token) {
-            const std::int64_t position = static_cast<std::int64_t>(token) + sequence.rope_delta;
+            const std::int64_t position =
+                static_cast<std::int64_t>(token) + sequence.continuation.metadata.rope_delta;
             if (position < std::numeric_limits<std::int32_t>::min() ||
                 position > std::numeric_limits<std::int32_t>::max()) {
                 throw std::overflow_error("replay RoPE position exceeds int32");
@@ -148,10 +149,10 @@ ReplayProgress ProgramImpl::advance_replay(SequenceHandle handle,
     };
 
     try {
-        const bool bridge_mtp = speculative_backend == SpeculativeBackend::Mtp &&
-                                request.replay_cursor != 0 &&
-                                sequence.mtp_kv_valid + 1U == request.replay_cursor &&
-                                request.replay_cursor < sequence.ledger.size();
+        const bool bridge_mtp =
+            speculative_backend == SpeculativeBackend::Mtp && request.replay_cursor != 0 &&
+            sequence.continuation.metadata.backend_kv_valid + 1U == request.replay_cursor &&
+            request.replay_cursor < sequence.ledger.size();
         if (request.replay_cursor == request.replay_target && !bridge_mtp) {
             complete_replay();
             settle_unit(lane);
@@ -216,7 +217,7 @@ ReplayProgress ProgramImpl::advance_replay(SequenceHandle handle,
             0,
             sequence.kv->backend ? backend_kv_addresses->bound_row(*sequence.kv->backend) : 0,
             dflash_prefill_host_ingress,
-            sequence.rope_delta};
+            sequence.continuation.metadata.rope_delta};
         context.prefill_gpu_timer = &prefill_gpu_timer_;
         mark_workspace_usage(speculative_backend == SpeculativeBackend::Mtp
                                  ? workspace_plan.mtp_prefill
@@ -259,7 +260,7 @@ ReplayProgress ProgramImpl::advance_replay(SequenceHandle handle,
         }
 
         if (bridge_mtp) {
-            if (!sequence.tail_hidden_valid || !io.mtp) {
+            if (!sequence.continuation.metadata.tail_hidden_valid || !io.mtp) {
                 throw std::logic_error("MTP replay source has no continuation hidden");
             }
             std::array<std::int32_t, 3> rope;
@@ -267,14 +268,16 @@ ReplayProgress ProgramImpl::advance_replay(SequenceHandle handle,
                 const std::int64_t position =
                     cursor <= prompt_tokens
                         ? request.base->prompt->positions[axis * prompt_tokens + cursor - 1U]
-                        : static_cast<std::int64_t>(cursor - 1U) + sequence.rope_delta;
+                        : static_cast<std::int64_t>(cursor - 1U) +
+                              sequence.continuation.metadata.rope_delta;
                 if (position < std::numeric_limits<std::int32_t>::min() ||
                     position > std::numeric_limits<std::int32_t>::max()) {
                     throw std::overflow_error("MTP replay bridge RoPE position exceeds int32");
                 }
                 rope[axis] = static_cast<std::int32_t>(position);
             }
-            const execution::MtpBridgeInput bridge{.previous_hidden = &sequence.tail_hidden,
+            const Tensor previous_hidden = tail_hidden(sequence);
+            const execution::MtpBridgeInput bridge{.previous_hidden = &previous_hidden,
                                                    .position =
                                                        static_cast<std::int32_t>(cursor - 1U),
                                                    .rope_position = rope};
@@ -286,11 +289,11 @@ ReplayProgress ProgramImpl::advance_replay(SequenceHandle handle,
                 CUDA_CHECK(cudaMemcpyAsync(token.data, sequence.ledger.data() + cursor,
                                            sizeof(TokenId), cudaMemcpyHostToDevice,
                                            device.stream()));
-                execution::mtp_bridge_and_propose(context, token, sequence.tail_hidden,
+                execution::mtp_bridge_and_propose(context, token, tail_hidden(sequence),
                                                   bridge.position, rope, false);
             }
-            sequence.mtp_kv_valid = cursor;
-            commit_sequence_kv(sequence, sequence.text_kv_valid, cursor);
+            sequence.continuation.metadata.backend_kv_valid = cursor;
+            commit_sequence_kv(sequence, sequence.continuation.metadata.text_kv_valid, cursor);
             if (count == 0) {
                 timing.begin_wait();
                 device.synchronize();
@@ -322,15 +325,15 @@ ReplayProgress ProgramImpl::advance_replay(SequenceHandle handle,
         if (result.finalized || result.processed_tokens == 0 || result.processed_tokens > count) {
             throw std::logic_error("replay chunk made invalid or sampling progress");
         }
-        const std::uint32_t end = cursor + result.processed_tokens;
-        sequence.text_kv_valid  = end;
+        const std::uint32_t end                      = cursor + result.processed_tokens;
+        sequence.continuation.metadata.text_kv_valid = end;
         if (speculative_backend == SpeculativeBackend::Mtp) {
-            sequence.mtp_kv_valid = skip_mtp_alignment ? end - 1U : end;
+            sequence.continuation.metadata.backend_kv_valid = skip_mtp_alignment ? end - 1U : end;
         } else if (is_masked_draft_backend(speculative_backend)) {
-            sequence.dflash_context_frontier = end;
+            sequence.continuation.metadata.dflash_context_frontier = end;
         }
         commit_sequence_kv(sequence, end, backend_kv_valid(sequence));
-        settle_state_fork(sequence);
+        complete_state_write(sequence);
         timing.resume_submit();
         copy_tail(sequence, prefill_hidden.slice(
                                 1, static_cast<std::int32_t>(result.processed_tokens) - 1, 1));
@@ -339,9 +342,9 @@ ReplayProgress ProgramImpl::advance_replay(SequenceHandle handle,
         timing.end_wait();
         record_vision_time();
         work.reset();
-        sequence.tail_hidden_valid = true;
-        sequence.mtp_draft_count   = 0;
-        request.replay_cursor      = end;
+        sequence.continuation.metadata.tail_hidden_valid = true;
+        sequence.mtp_draft_count                         = 0;
+        request.replay_cursor                            = end;
 
         const bool capture_ready = capture_frontier && end == *capture_frontier;
         if (capture_ready) { request.capture_pending = true; }

@@ -72,20 +72,21 @@ BindingReservation ProgramImpl::start_binding(const RequestBasePlan& base, runti
     if (source &&
         (!valid_checkpoint(*source) ||
          (!own_snapshot && (!checkpoint_matches(*source, base) ||
-                            (resume && checkpoint(*source).frontier > resume->frontier()))))) {
+                            (resume && checkpoint(*source).frontier() > resume->frontier()))))) {
         return {.source_valid = false};
     }
     ContextTransaction transaction;
-    transaction.kind               = ContextOperationKind::Bind;
-    transaction.lane               = lane;
-    transaction.epoch              = lane_epochs[lane];
-    transaction.base               = base.impl_;
-    transaction.resume             = resume;
-    transaction.source             = source;
-    transaction.reuse_frontier     = source ? checkpoint(*source).frontier : 0;
-    transaction.backend_frontier   = source ? checkpoint(*source).backend_frontier : 0;
-    transaction.source_tail_hidden = source && checkpoint(*source).tail_hidden_valid;
-    transaction.resume_snapshot    = own_snapshot;
+    transaction.kind             = ContextOperationKind::Bind;
+    transaction.lane             = lane;
+    transaction.epoch            = lane_epochs[lane];
+    transaction.base             = base.impl_;
+    transaction.resume           = resume;
+    transaction.source           = source;
+    transaction.reuse_frontier   = source ? checkpoint(*source).frontier() : 0;
+    transaction.backend_frontier = source ? checkpoint(*source).backend_frontier() : 0;
+    transaction.source_tail_hidden =
+        source && checkpoint(*source).continuation.metadata.tail_hidden_valid;
+    transaction.resume_snapshot = own_snapshot;
     transaction.retired_points.reserve(candidate.retired_points.size() + 1);
     const auto select_source = [&](const SourceCandidate& actual) {
         transaction.take_private   = candidate.take_private;
@@ -114,19 +115,20 @@ BindingReservation ProgramImpl::start_binding(const RequestBasePlan& base, runti
         transaction.take_private   = candidate.take_private;
         for (const auto point : candidate.private_points) {
             if (valid_checkpoint(point) &&
-                checkpoint(point).frontier <= checkpoint(*source).frontier) {
+                checkpoint(point).frontier() <= checkpoint(*source).frontier()) {
                 transaction.carried_points.push_back(point);
             }
         }
         transaction.borrow_state =
             checkpoints[source->index].pins == 0 &&
-            state_store->checkpoint_references(checkpoint(*source).state) == 1 &&
-            state_store->source_pins(checkpoint(*source).state) == 0;
-        transaction.split_state = !transaction.borrow_state &&
-                                  state_store->device_resident(checkpoint(*source).state) &&
-                                  state_store->host_resident(checkpoint(*source).state) &&
-                                  state_store->source_pins(checkpoint(*source).state) == 0 &&
-                                  state_store->device_occupied() == state_store->device_capacity();
+            state_store->checkpoint_references(checkpoint(*source).continuation.image) == 1 &&
+            state_store->source_pins(checkpoint(*source).continuation.image) == 0;
+        transaction.split_state =
+            !transaction.borrow_state &&
+            state_store->device_resident(checkpoint(*source).continuation.image) &&
+            state_store->host_resident(checkpoint(*source).continuation.image) &&
+            state_store->source_pins(checkpoint(*source).continuation.image) == 0 &&
+            state_store->device_occupied() == state_store->device_capacity();
         const auto& record = checkpoint(*source);
         const auto movable = [&](const context::KVAddressSpaceStore& addresses,
                                  const context::LogicalKVPageStore& pages,
@@ -143,9 +145,9 @@ BindingReservation ProgramImpl::start_binding(const RequestBasePlan& base, runti
             return true;
         };
         transaction.borrow_text =
-            movable(*text_kv_addresses, *text_kv_pages, record.kv->text, record.frontier) &&
+            movable(*text_kv_addresses, *text_kv_pages, record.kv->text, record.frontier()) &&
             (!record.kv->backend || movable(*backend_kv_addresses, *backend_kv_pages,
-                                            *record.kv->backend, record.backend_frontier));
+                                            *record.kv->backend, record.backend_frontier()));
         transaction.borrow_backend = transaction.borrow_text && record.kv->backend.has_value();
     }
     if (!own_snapshot && speculative_backend == SpeculativeBackend::Mtp &&
@@ -231,7 +233,8 @@ BindingReservation ProgramImpl::start_binding(const RequestBasePlan& base, runti
     runtime::ContextResourceUsage shortage;
     const bool needs_state_slot =
         (!transaction.borrow_state && !transaction.split_state) ||
-        (transaction.borrow_state && !state_store->device_resident(checkpoint(*source).state));
+        (transaction.borrow_state &&
+         !state_store->device_resident(checkpoint(*source).continuation.image));
     shortage.state_slots =
         needs_state_slot && usage.occupied.state_slots == usage.capacity.state_slots ? 1U : 0U;
     const auto difference = [](std::uint32_t required, std::uint32_t available) {
@@ -333,16 +336,18 @@ BindingReservation ProgramImpl::start_binding(const RequestBasePlan& base, runti
             tx.binding_history->text    = tx.reserved_kv->text;
             tx.binding_history->backend = tx.reserved_kv->backend;
         }
-        const bool host_state = source && !state_store->device_resident(checkpoint(*source).state);
-        tx.reserved_state     = tx.borrow_state ? std::optional(checkpoint(*source).state)
-                                : (host_state || tx.split_state)
-                                    ? state_store->reserve_logical_destination()
-                                    : state_store->reserve_destination();
+        const bool host_state =
+            source && !state_store->device_resident(checkpoint(*source).continuation.image);
+        tx.reserved_state = tx.borrow_state ? std::optional(checkpoint(*source).continuation.image)
+                            : (host_state || tx.split_state)
+                                ? state_store->reserve_logical_destination()
+                                : state_store->reserve_destination();
         if (!tx.reserved_state) { throw std::logic_error("binding lost its state capacity"); }
         context_source_ready_.record(device.stream());
         context_source_ready_.wait(device.transfer_stream());
         if (tx.backup_state) {
-            auto backup = state_store->reserve_device_to_host(checkpoint(*source).state);
+            auto backup =
+                state_store->reserve_device_to_host(checkpoint(*source).continuation.image);
             if (!backup) {
                 throw std::logic_error("source backup lost its checked Host destination");
             }
@@ -351,15 +356,14 @@ BindingReservation ProgramImpl::start_binding(const RequestBasePlan& base, runti
         }
         if (host_state) {
             tx.transfers.push_back(context::state_transfer_requirement(
-                state_image_transfer_work(state_images->host_layout()),
+                state_images->storage().layout().transfer_work(),
                 runtime::ContextTransferDirection::HostToDevice));
             start_context_transfer_timer(runtime::ContextResourceClass::State);
             auto transfer =
                 tx.borrow_state
-                    ? state_store->begin_host_to_device(*tx.reserved_state,
-                                                        device.transfer_stream())
-                    : state_store->begin_host_fork(checkpoint(*source).state, *tx.reserved_state,
-                                                   device.transfer_stream());
+                    ? state_store->begin_host_to_device(*tx.reserved_state, device.transfer_view())
+                    : state_store->begin_host_to_device(checkpoint(*source).continuation.image,
+                                                        *tx.reserved_state, device.transfer_view());
             if (transfer) { tx.state_transfer.emplace(std::move(*transfer)); }
             if (!tx.state_transfer) {
                 throw std::logic_error("binding could not reserve its Host state fork");
@@ -377,26 +381,33 @@ BindingReservation ProgramImpl::start_binding(const RequestBasePlan& base, runti
 }
 
 void ProgramImpl::install_binding(ContextTransaction& tx) {
-    auto& state        = sequences[tx.lane];
-    auto& request      = requests[tx.lane];
-    const auto binding = state.state;
-    const auto kv      = state.kv;
+    auto& state       = sequences[tx.lane];
+    auto& request     = requests[tx.lane];
+    const auto image  = state.continuation.image;
+    const auto writer = state.pending_write;
+    const auto kv     = state.kv;
     if (tx.resume) {
-        auto& saved           = *tx.resume->impl_;
-        request               = std::move(saved.control);
-        state                 = std::move(saved.sequence);
-        state.kv              = kv;
-        state.state           = binding;
-        state.lane            = tx.lane;
-        state.mtp_draft_count = 0;
+        auto& saved              = *tx.resume->impl_;
+        request                  = std::move(saved.control);
+        state                    = std::move(saved.sequence);
+        state.kv                 = kv;
+        state.continuation.image = image;
+        state.pending_write      = writer;
+        state.lane               = tx.lane;
+        state.mtp_draft_count    = 0;
+        const auto rope_delta    = state.continuation.metadata.rope_delta;
+        state.continuation.metadata =
+            tx.source ? checkpoint(*tx.source).continuation.metadata : ContinuationMetadata{};
+        state.continuation.metadata.rope_delta = rope_delta;
         if (!tx.resume_snapshot) {
-            request.resume_lifecycle      = request.lifecycle;
-            request.lifecycle             = Lifecycle::Replaying;
-            request.replay_target         = saved.frontier;
-            request.replay_cursor         = tx.reuse_frontier;
-            state.text_kv_valid           = tx.reuse_frontier;
-            state.mtp_kv_valid            = tx.backend_frontier;
-            state.dflash_context_frontier = tx.reuse_frontier;
+            request.resume_lifecycle                            = request.lifecycle;
+            request.lifecycle                                   = Lifecycle::Replaying;
+            request.replay_target                               = saved.frontier;
+            request.replay_cursor                               = tx.reuse_frontier;
+            state.continuation.metadata.execution_frontier      = tx.reuse_frontier;
+            state.continuation.metadata.text_kv_valid           = tx.reuse_frontier;
+            state.continuation.metadata.backend_kv_valid        = tx.backend_frontier;
+            state.continuation.metadata.dflash_context_frontier = tx.reuse_frontier;
             initialize_captures(tx.lane, tx.reuse_frontier, request.replay_target);
         }
         // Reconstruct references into the moved durable prefill object.
@@ -409,19 +420,20 @@ void ProgramImpl::install_binding(ContextTransaction& tx) {
         }
         install_resume_sampling(state, request);
     } else {
+        state.continuation.metadata =
+            tx.source ? checkpoint(*tx.source).continuation.metadata : ContinuationMetadata{};
         state.ledger = tx.base->prompt->token_ids;
         state.prefix_identity.assign(*tx.base->prompt);
-        state.prefix_digests          = tx.base->prefix_digests;
-        state.rope_delta              = tx.base->prompt->rope_delta;
-        state.text_kv_valid           = tx.reuse_frontier;
-        state.mtp_kv_valid            = tx.backend_frontier;
-        state.dflash_context_frontier = tx.reuse_frontier;
-        state.tail_hidden_valid       = tx.source_tail_hidden;
-        request.lifecycle             = Lifecycle::Prefilling;
-        request.publish_continuation  = tx.base->summary.publish_continuation;
+        state.prefix_digests                                = tx.base->prefix_digests;
+        state.continuation.metadata.rope_delta              = tx.base->prompt->rope_delta;
+        state.continuation.metadata.text_kv_valid           = tx.reuse_frontier;
+        state.continuation.metadata.backend_kv_valid        = tx.backend_frontier;
+        state.continuation.metadata.dflash_context_frontier = tx.reuse_frontier;
+        state.continuation.metadata.tail_hidden_valid       = tx.source_tail_hidden;
+        request.lifecycle                                   = Lifecycle::Prefilling;
+        request.publish_continuation                        = tx.base->summary.publish_continuation;
         install_sampling(state, request, tx.base->sampling);
     }
-    refresh_state_views(state);
     request.permit   = tx.first_unit;
     request.recovery = tx.recovery;
 }
@@ -478,23 +490,26 @@ void ProgramImpl::prepare_binding(ContextTransaction& tx) {
                 tx.backend_fork, tx.backend_activation, tx.backend_view);
     }
     auto& state = sequences[tx.lane];
-    state.state = {.read  = tx.split_state ? checkpoint(*tx.source).state : *tx.reserved_state,
-                   .write = *tx.reserved_state};
+    state.continuation.image =
+        tx.split_state ? checkpoint(*tx.source).continuation.image : *tx.reserved_state;
+    state.pending_write = {};
     if (tx.source && !tx.borrow_state && !tx.split_state &&
-        state_store->device_resident(checkpoint(*tx.source).state)) {
-        const auto from      = checkpoint(*tx.source).state;
-        const auto selectors = state_store->begin_fork(from, *tx.reserved_state);
+        state_store->device_resident(checkpoint(*tx.source).continuation.image)) {
+        const auto from      = checkpoint(*tx.source).continuation.image;
+        const auto selectors = state_store->begin_write(from, *tx.reserved_state);
         ++tx.operations.state_forks;
-        state.state = {
-            .read         = from,
-            .write        = *tx.reserved_state,
-            .fork_pending = true,
-        };
+        state.continuation.image = from;
+        state.pending_write      = *tx.reserved_state;
         if (is_masked_draft_backend(speculative_backend)) {
             copy_local_for_context(tx, selectors.source, selectors.destination);
         }
+    } else if (tx.source && !tx.borrow_state && !tx.split_state) {
+        // Host restoration populated the final reserved image directly.
+        state_store->complete_initialization(*tx.reserved_state);
     } else if (!tx.source) {
-        state_store->activate_reset(*tx.reserved_state, device.transfer_stream());
+        state_images->storage().clear(state_store->physical_slot(*tx.reserved_state),
+                                      device.transfer_view());
+        state_store->complete_initialization(*tx.reserved_state);
     }
     tx.submitted = !tx.source || !tx.transfers.empty();
     if (tx.submitted) { context_completion_.record(device.transfer_stream()); }
@@ -511,10 +526,10 @@ void ProgramImpl::complete_binding(ContextTransaction& tx, ContextProgress& out)
         if (slot.pins != 1) {
             throw std::logic_error("consumed checkpoint acquired another lease");
         }
-        const auto old_state = slot.value->state;
+        const auto old_state = slot.value->continuation.image;
         if (tx.borrow_state) {
             state_store->release_checkpoint_reference(old_state);
-            state_store->move_checkpoint_to_active(old_state);
+            state_store->make_mutable(old_state);
             ++tx.operations.state_moves;
         } else if (!state_store->release_checkpoint_owner(old_state)) {
             throw std::logic_error("consumed checkpoint state ownership is invalid");
@@ -529,9 +544,11 @@ void ProgramImpl::complete_binding(ContextTransaction& tx, ContextProgress& out)
         tx.borrow_state = false;
     };
     if (tx.split_state) {
-        state_store->split_device_replica_identity(checkpoint(*tx.source).state,
+        state_store->split_device_replica_identity(checkpoint(*tx.source).continuation.image,
                                                    *tx.reserved_state);
-        sequences[tx.lane].state = {.read = *tx.reserved_state, .write = *tx.reserved_state};
+        state_store->complete_initialization(*tx.reserved_state);
+        sequences[tx.lane].continuation.image = *tx.reserved_state;
+        sequences[tx.lane].pending_write      = {};
         ++tx.operations.state_moves;
     }
     // Source metadata has been copied; after this point a failure terminates the adopted
@@ -598,7 +615,7 @@ void ProgramImpl::complete_binding(ContextTransaction& tx, ContextProgress& out)
     for (const auto& [from, to] : tx.carried_clones) {
         auto point = checkpoint(from);
         if (point.kv == tx.source_history) { point.kv = tx.binding_history; }
-        state_store->retain_checkpoint_reference(point.state);
+        state_store->retain_checkpoint_reference(point.continuation.image);
         checkpoints[to.index].value    = std::move(point);
         checkpoints[to.index].reserved = false;
     }
@@ -613,7 +630,6 @@ void ProgramImpl::complete_binding(ContextTransaction& tx, ContextProgress& out)
     }
     tx.reserved_kv.reset();
     refresh_history_requirements(sequences[tx.lane].kv);
-    refresh_state_views(sequences[tx.lane]);
     tx.reserved_state.reset();
     out.private_points      = std::move(tx.carried_points);
     out.retired_checkpoints = std::move(tx.retired_points);

@@ -45,6 +45,8 @@ struct FoldAccess {
     __nv_bfloat16* conv_layer0;
     std::int64_t recurrent_layer_stride;
     std::int64_t conv_layer_stride;
+    std::int64_t recurrent_slot_stride;
+    std::int64_t conv_slot_stride;
     std::int32_t record_capacity;
     std::int32_t width;
     GdnReplayFoldKernelRows rows;
@@ -82,19 +84,16 @@ struct FoldAccess {
 
     __device__ __forceinline__ const float*
     state_read_base(const RecurrentCoordinates& coord) const {
-        const std::int64_t slot_stride =
-            static_cast<std::int64_t>(Geometry::kValueHeads) * kStateDim * kStateDim;
         return recurrent_layer0 + static_cast<std::int64_t>(coord.layer) * recurrent_layer_stride +
-               static_cast<std::int64_t>(rows.row[coord.batch].source_state_slot) * slot_stride +
+               static_cast<std::int64_t>(rows.row[coord.batch].source_state_slot) *
+                   recurrent_slot_stride +
                static_cast<std::int64_t>(coord.value_head) * kStateDim * kStateDim;
     }
 
     __device__ __forceinline__ float* state_write_base(const RecurrentCoordinates& coord) const {
-        const std::int64_t slot_stride =
-            static_cast<std::int64_t>(Geometry::kValueHeads) * kStateDim * kStateDim;
         return recurrent_layer0 + static_cast<std::int64_t>(coord.layer) * recurrent_layer_stride +
                static_cast<std::int64_t>(rows.row[coord.batch].destination_state_slot) *
-                   slot_stride +
+                   recurrent_slot_stride +
                static_cast<std::int64_t>(coord.value_head) * kStateDim * kStateDim;
     }
 
@@ -138,13 +137,12 @@ struct FoldAccess {
         const std::int32_t channel = tile_block * 128 + tid;
         const __nv_bfloat16* source_history =
             conv_layer0 + static_cast<std::int64_t>(coord.layer) * conv_layer_stride +
-            static_cast<std::int64_t>(rows.row[coord.batch].source_state_slot) *
-                (3LL * Geometry::kConvChannels) +
+            static_cast<std::int64_t>(rows.row[coord.batch].source_state_slot) * conv_slot_stride +
             channel;
         __nv_bfloat16* destination_history =
             conv_layer0 + static_cast<std::int64_t>(coord.layer) * conv_layer_stride +
             static_cast<std::int64_t>(rows.row[coord.batch].destination_state_slot) *
-                (3LL * Geometry::kConvChannels) +
+                conv_slot_stride +
             channel;
         const __nv_bfloat16* record =
             conv_record + record_outer(coord) * width * Geometry::kConvChannels + channel;

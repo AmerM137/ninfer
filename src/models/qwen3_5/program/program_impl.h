@@ -76,8 +76,8 @@ struct RequestBasePlanImpl {
 enum class PendingKind : std::uint8_t { None, Begin, Ordinary, Speculative };
 
 struct PendingCandidate {
-    PendingKind kind            = PendingKind::None;
-    std::uint32_t base_E        = 0;
+    PendingKind kind = PendingKind::None;
+    Continuation base;
     std::uint32_t base_S        = 0;
     std::uint32_t prompt_tokens = 0;
     std::uint32_t produced      = 0;
@@ -161,22 +161,20 @@ struct DFlashDraftHandoff {
 
 struct SequenceState {
     std::shared_ptr<KVHistory> kv;
-    ActiveStateBinding state;
-    Tensor tail_hidden;
+    Continuation continuation;
+    StateImageHandle pending_write;
     std::uint32_t lane = 0;
 
-    std::uint32_t execution_frontier = 0;
-    std::uint32_t ledger_frontier    = 0;
+    std::uint32_t ledger_frontier = 0;
     std::vector<TokenId> ledger;
     qwen::ResidentPrefixIdentity prefix_identity;
     qwen::PrefixShortlistDigests prefix_digests;
-    std::int32_t rope_delta               = 0;
-    std::uint32_t text_kv_valid           = 0;
-    std::uint32_t mtp_kv_valid            = 0;
-    std::uint32_t dflash_context_frontier = 0;
     std::array<TokenId, qwen3_5::kMtpDecodeMaximumDrafts> mtp_drafts{};
     std::uint32_t mtp_draft_count = 0;
-    bool tail_hidden_valid        = false;
+
+    [[nodiscard]] StateImageHandle write_state() const noexcept {
+        return pending_write.valid() ? pending_write : continuation.image;
+    }
 };
 
 struct CaptureReservation {
@@ -230,13 +228,17 @@ struct RequestControl {
 struct CheckpointState {
     std::shared_ptr<KVHistory> kv;
     runtime::CheckpointRole role = runtime::CheckpointRole::Continuation;
-    StateImageHandle state;
+    Continuation continuation;
     std::shared_ptr<const PreparedCaptureBacking> identity;
     PrefixShortlistKey key;
-    std::uint32_t frontier         = 0;
-    std::uint32_t backend_frontier = 0;
-    std::int32_t rope_delta        = 0;
-    bool tail_hidden_valid         = false;
+
+    [[nodiscard]] std::uint32_t frontier() const noexcept {
+        return continuation.metadata.execution_frontier;
+    }
+
+    [[nodiscard]] std::uint32_t backend_frontier() const noexcept {
+        return continuation.metadata.backend_kv_valid;
+    }
 };
 
 struct CheckpointSlot {
@@ -374,8 +376,7 @@ public:
     std::unique_ptr<context::HostKVExtentStore> host_kv_extents;
     std::size_t text_host_kv_page_stride    = 0;
     std::size_t backend_host_kv_page_stride = 0;
-    std::unique_ptr<qwen3_5::StateImageDevicePool> state_images;
-    std::unique_ptr<qwen3_5::HostStatePool> host_state_images;
+    std::unique_ptr<qwen3_5::StateImageViews> state_images;
     std::unique_ptr<StateImageStore> state_store;
     std::optional<GdnReplayRecords> replay_records;
     std::optional<ops::GdnReplayFoldPlan> replay_fold;
@@ -538,9 +539,9 @@ public:
     [[nodiscard]] const SequenceState& active_sequence(std::uint32_t lane) const;
     void clear_lane(SequenceState&, RequestControl&) noexcept;
     void clear_execution_failure_lanes(std::span<const std::uint32_t>) noexcept;
-    void refresh_state_views(SequenceState&);
+    [[nodiscard]] Tensor tail_hidden(const SequenceState&) const;
     [[nodiscard]] context::StateImageSelectors state_selectors(const SequenceState&) const;
-    void settle_state_fork(SequenceState&);
+    void complete_state_write(SequenceState&);
     void release_sequence_state(SequenceState&) noexcept;
     void release_sequence_kv(SequenceState&) noexcept;
     void ensure_sequence_kv_mapped(SequenceState&, std::uint32_t main, std::uint32_t backend = 0);

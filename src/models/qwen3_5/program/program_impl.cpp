@@ -74,7 +74,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     }
     const MemorySpan backing = persistent.span();
     decoder      = std::make_unique<qwen3_5::DecoderState>(backing, plan.persistent.decoder);
-    state_images = std::make_unique<StateImageDevicePool>(backing, plan.persistent.state_images);
+    state_images = std::make_unique<StateImageViews>(backing, plan.persistent.state_images);
     if (plan.persistent.replay_records) {
         replay_records.emplace(backing, *plan.persistent.replay_records);
         replay_fold.emplace(*replay_records, state_images->linear().all_layers_view());
@@ -93,7 +93,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         backend_host_kv_page_stride = layout.page_stride;
         if (layout != layouts.front()) { layouts.push_back(std::move(layout)); }
     }
-    std::size_t minimum_stride    = state_images->host_layout().image_bytes;
+    std::size_t minimum_stride    = state_images->storage().image_bytes();
     std::size_t minimum_kv_stride = layouts.front().page_stride;
     for (const auto& layout : layouts) {
         minimum_stride    = std::min(minimum_stride, layout.page_stride);
@@ -105,8 +105,8 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         }
         return static_cast<std::uint32_t>(value);
     };
-    const auto logical_states = checked_count(state_images->slot_count() +
-                                              host_bytes / state_images->host_layout().image_bytes);
+    const auto logical_states = checked_count(state_images->storage().slot_count() +
+                                              host_bytes / state_images->storage().image_bytes());
     // One immutable image can serve private replay, an explicit anchor, a public view and an
     // exact-hit endpoint. Alias descriptors are bounded separately from physical state slots.
     checkpoints.resize(checked_count(4ULL * logical_states + 2ULL * max_concurrency));
@@ -115,8 +115,6 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         StartupPhaseScope phase(startup_observer, StartupPhase::HostContextPin,
                                 StartupProgressUnit::Bytes, host_bytes);
         host_context_arena = std::make_unique<HostContextArena>(host_bytes, minimum_stride);
-        host_state_images =
-            std::make_unique<HostStatePool>(*host_context_arena, state_images->host_layout());
         host_kv_arena      = std::make_unique<HostKVArena>(*host_context_arena, layouts);
         const auto extents = checked_count(host_bytes / minimum_kv_stride);
         if (extents) {
@@ -124,8 +122,8 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         }
         phase.complete(host_bytes, host_bytes);
     }
-    state_store =
-        std::make_unique<StateImageStore>(*state_images, host_state_images.get(), logical_states);
+    state_store              = std::make_unique<StateImageStore>(state_images->storage(),
+                                                                 host_context_arena.get(), logical_states);
     const auto logical_pages = [&](const DeviceKVPagePool& pool) {
         const auto stride = plan_host_kv_page_layout(pool.geometry()).page_stride;
         return checked_count(pool.capacity_pages() + host_bytes / stride);
@@ -327,8 +325,10 @@ std::vector<float> ProgramImpl::causal_score(qwen::PreparedPromptData&& prompt,
     std::uint32_t staged_columns = 0;
 
     try {
-        state = state_store->reserve_reset(device.stream());
+        state = state_store->reserve_destination();
         if (!state) { throw std::bad_alloc(); }
+        state_images->storage().clear(state_store->physical_slot(*state), device.execution_view());
+        state_store->complete_initialization(*state);
         address = text_kv_addresses->create_active(required_pages, 0, device.stream());
         if (!address) { throw std::bad_alloc(); }
         if (text_kv_addresses->bound_row(*address) != 0) {
@@ -539,7 +539,7 @@ MemorySummary ProgramImpl::memory_summary() const {
     out.workspace_logical_peak_bytes = workspace_logical_peak_bytes;
     out.cuda_graph                   = graph_memory;
     out.kv_payload_bytes             = kv_payload_bytes;
-    if (host_state_images) { out.host_state_occupied_slots = host_state_images->occupied(); }
+    out.host_state_occupied_slots    = state_store->host_occupied();
     if (host_kv_arena) { out.host_kv_occupied_bytes = host_kv_arena->occupied_bytes(); }
     if (host_context_arena) {
         out.host_context_capacity_bytes = host_context_arena->capacity_bytes();

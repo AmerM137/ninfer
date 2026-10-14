@@ -8,7 +8,7 @@
 namespace ninfer::models::qwen3_5::detail {
 
 std::optional<CheckpointHandle> ProgramImpl::detach_checkpoint(SequenceState& state) {
-    const auto frontier = state.text_kv_valid;
+    const auto frontier = state.continuation.metadata.text_kv_valid;
     if (!frontier || !state.kv) { return std::nullopt; }
     auto backing     = std::make_shared<PreparedCaptureBacking>();
     backing->digests = state.prefix_digests;
@@ -18,19 +18,20 @@ std::optional<CheckpointHandle> ProgramImpl::detach_checkpoint(SequenceState& st
     backing->prefix_identity.truncate(frontier);
     auto handle = reserve_checkpoint();
     if (!handle) { return std::nullopt; }
-    if (state_store->role(state.state.read) == context::StateImageRole::ActiveMutable) {
-        state_store->freeze(state.state.read);
+    if (state_store->role(state.continuation.image) == context::StateImageRole::ActiveMutable) {
+        state_store->freeze(state.continuation.image);
     }
     // Acquire the new content owner before dropping this request's read lease. That lease may
     // be the only remaining owner after the original cache checkpoint has been evicted.
-    state_store->retain_checkpoint_reference(state.state.read);
-    if (state.state.fork_pending) {
-        const auto source = state.state.read;
-        state_store->abort_fork(source, state.state.write);
-        if (!state_store->release(state.state.write)) {
+    state_store->retain_checkpoint_reference(state.continuation.image);
+    if (state.pending_write.valid()) {
+        const auto source = state.continuation.image;
+        state_store->abort_write(source, state.write_state());
+        if (!state_store->release(state.write_state())) {
             throw std::logic_error("unused fork could not be released");
         }
-        state.state = {.read = source, .write = source};
+        state.continuation.image = source;
+        state.pending_write      = {};
     }
     text_kv_addresses->release_growth(state.kv->text);
     text_kv_addresses->set_checkpoint_requirement(state.kv->text, frontier);
@@ -41,20 +42,20 @@ std::optional<CheckpointHandle> ProgramImpl::detach_checkpoint(SequenceState& st
                                                          backend_kv_valid(state));
         backend_kv_addresses->deactivate(*state.kv->backend);
     }
+    auto captured                        = state.continuation;
+    captured.metadata.execution_frontier = frontier;
+    captured.metadata.backend_kv_valid   = backend_kv_valid(state);
     checkpoints[handle->index].value =
-        CheckpointState{.kv                = state.kv,
-                        .state             = state.state.read,
-                        .identity          = std::move(backing),
-                        .key               = {state.prefix_digests.at(frontier), frontier,
-                                              requests[state.lane].base->prefix_identity_tag},
-                        .frontier          = frontier,
-                        .backend_frontier  = backend_kv_valid(state),
-                        .rope_delta        = state.rope_delta,
-                        .tail_hidden_valid = state.tail_hidden_valid};
+        CheckpointState{.kv           = state.kv,
+                        .continuation = captured,
+                        .identity     = std::move(backing),
+                        .key          = {state.prefix_digests.at(frontier), frontier,
+                                         requests[state.lane].base->prefix_identity_tag}};
     checkpoints[handle->index].reserved = false;
     state.kv.reset();
-    state.state       = {};
-    state.tail_hidden = {};
+    state.continuation.image = {};
+    state.pending_write      = {};
+
     return handle;
 }
 
@@ -63,9 +64,10 @@ bool ProgramImpl::prepare_backup(ContextTransaction& tx, CheckpointState& record
     if (!host_context_arena) { return false; }
     // Both copies already present cost no transfer. A source still read by another resident stays
     // resident; the paused record is an evictable reference, never a permanent Device pin.
-    tx.preserve_state_device = shared_device && state_store->source_pins(record.state) != 0;
-    if (!state_store->host_resident(record.state)) {
-        auto transfer = state_store->reserve_device_to_host(record.state);
+    tx.preserve_state_device =
+        shared_device && state_store->source_pins(record.continuation.image) != 0;
+    if (!state_store->host_resident(record.continuation.image)) {
+        auto transfer = state_store->reserve_device_to_host(record.continuation.image);
         if (transfer) { tx.state_transfer.emplace(std::move(*transfer)); }
         if (!tx.state_transfer) { return false; }
     }
@@ -129,24 +131,30 @@ bool ProgramImpl::start_pause(SequenceHandle handle, bool save_snapshot,
     if (control.permit) { settle_unit(lane); }
     if (control.lifecycle == Lifecycle::Replaying) { save_snapshot = false; }
     if (save_snapshot && is_masked_draft_backend(speculative_backend) &&
-        state.dflash_context_frontier < state.execution_frontier) {
+        state.continuation.metadata.dflash_context_frontier <
+            state.continuation.metadata.execution_frontier) {
         const std::array<ExecutionUnit, 1> units{{handle, ExecutionUnitKind::Normalize, 0}};
         const auto reservation = reserve_units(units);
         if (!reservation) {
             save_snapshot = false;
         } else {
             const std::array<std::uint32_t, 1> lanes{lane};
-            const std::array<std::uint32_t, 1> begin{state.dflash_context_frontier};
-            const std::array<std::uint32_t, 1> count{state.execution_frontier -
-                                                     state.dflash_context_frontier};
-            ensure_sequence_kv_mapped(state, state.execution_frontier,
-                                      backend_kv_cache() ? state.execution_frontier : 0);
+            const std::array<std::uint32_t, 1> begin{
+                state.continuation.metadata.dflash_context_frontier};
+            const std::array<std::uint32_t, 1> count{
+                state.continuation.metadata.execution_frontier -
+                state.continuation.metadata.dflash_context_frontier};
+            ensure_sequence_kv_mapped(
+                state, state.continuation.metadata.execution_frontier,
+                backend_kv_cache() ? state.continuation.metadata.execution_frontier : 0);
             enqueue_dflash_context_append(lanes, begin, count);
             timing.begin_wait();
             device.synchronize();
             timing.end_wait();
-            state.dflash_context_frontier = state.execution_frontier;
-            commit_sequence_kv(state, state.text_kv_valid, backend_kv_valid(state));
+            state.continuation.metadata.dflash_context_frontier =
+                state.continuation.metadata.execution_frontier;
+            commit_sequence_kv(state, state.continuation.metadata.text_kv_valid,
+                               backend_kv_valid(state));
             settle_unit(lane);
         }
     }
@@ -158,9 +166,10 @@ bool ProgramImpl::start_pause(SequenceHandle handle, bool save_snapshot,
     if (control.replay) { control.replay->vision.reset(); }
     auto saved      = std::make_unique<ResumeStateImpl>();
     saved->owner    = this;
-    saved->frontier = control.lifecycle == Lifecycle::Prefilling  ? control.prefill->cursor
-                      : control.lifecycle == Lifecycle::Replaying ? control.replay_target
-                                                                  : state.execution_frontier;
+    saved->frontier = control.lifecycle == Lifecycle::Prefilling ? control.prefill->cursor
+                      : control.lifecycle == Lifecycle::Replaying
+                          ? control.replay_target
+                          : state.continuation.metadata.execution_frontier;
     if (control.lifecycle == Lifecycle::Replaying) {
         control.lifecycle = control.resume_lifecycle;
         control.replay.reset();
@@ -211,8 +220,8 @@ ResumeState ProgramImpl::complete_pause(ContextTransaction& tx) {
     if (!tx.paused) { throw std::logic_error("pause operation lost its durable request"); }
     if (tx.paused->has_snapshot()) {
         const auto& record = checkpoint(*tx.paused->impl_->snapshot);
-        if (!tx.preserve_state_device && state_store->device_resident(record.state) &&
-            !state_store->drop_device_replica(record.state)) {
+        if (!tx.preserve_state_device && state_store->device_resident(record.continuation.image) &&
+            !state_store->drop_device_replica(record.continuation.image)) {
             throw std::logic_error("paused state is still Device-pinned");
         }
     }

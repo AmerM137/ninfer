@@ -55,6 +55,7 @@ make_gdn_conv_output(const Tensor& conv_weight, const Tensor& conv_states,
         {
             static_cast<const __nv_bfloat16*>(conv_weight.data),
             static_cast<const __nv_bfloat16*>(conv_states.data),
+            conv_states.nb[2] / 2,
             static_cast<const std::int32_t*>(initial_slot.data),
             valid_columns.data == nullptr ? nullptr
                                           : static_cast<const std::int32_t*>(valid_columns.data),

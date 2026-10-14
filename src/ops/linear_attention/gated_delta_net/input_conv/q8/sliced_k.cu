@@ -64,7 +64,7 @@ void launch_active_cols_conv_snapshot(const Tensor& x, const Weight& weight,
                                       Tensor& value, Tensor& z, cudaStream_t stream) {
     launch_active_cols_conv<ActiveCols>(
         x, weight, conv_weight, conv_states, valid_columns, initial_slot, query, key, value, z,
-        SnapshotHistoryPublish{static_cast<__nv_bfloat16*>(conv_states.data),
+        SnapshotHistoryPublish{static_cast<__nv_bfloat16*>(conv_states.data), conv_states.nb[2] / 2,
                                static_cast<const std::int32_t*>(snapshot_base_slot.data), 8192},
         stream);
 }

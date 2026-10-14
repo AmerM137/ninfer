@@ -1,3 +1,4 @@
+#include "ops/state_fixture.h"
 #include "ninfer/ops/causal_conv1d_silu.h"
 #include "cuda_fixture.h"
 #include "ops/op_tester.h"
@@ -573,6 +574,8 @@ int snapshot_case(std::int32_t C, std::int32_t T, std::int32_t slots, std::int32
     Tensor tx(x.span(), DType::BF16, {C, T});
     Tensor tw(weight.span(), DType::BF16, {C, 4});
     Tensor tstate(state.span(), DType::BF16, {C, 3, slots});
+    SlottedStateFixture history(tstate, 2);
+    tstate = history.tensor;
     Tensor tslot(slot.span(), DType::I32, {1});
     Tensor tsnapshot_base(snapshot_base.span(), DType::I32, {1});
     Tensor tout(output.span(), DType::BF16, {C, T});
@@ -587,6 +590,8 @@ int snapshot_case(std::int32_t C, std::int32_t T, std::int32_t slots, std::int32
     int failures = 0;
     failures += verify_output(tag + " output", from_device_bf16(output.data(), x_bits.size()),
                               oracle.output);
+    history.copy_back();
+    failures += history.verify_guards("snapshot history");
     failures += verify_bits(tag + " all state slots", state.data(), expected_bits);
     failures += verify_bits(tag + " x preserved", x.data(), x_bits);
     failures += verify_bits(tag + " weight preserved", weight.data(), weight_bits);
@@ -671,6 +676,8 @@ int batched_snapshot_case(std::int32_t C, std::int32_t width,
     Tensor tx(x.span(), DType::BF16, {C, width, batch});
     Tensor tw(weight.span(), DType::BF16, {C, 4});
     Tensor tstate(state.span(), DType::BF16, {C, 3, slots});
+    SlottedStateFixture history(tstate, 2);
+    tstate = history.tensor;
     Tensor tvalid;
     if (masked) { tvalid = Tensor(valid->span(), DType::I32, {batch}); }
     Tensor tinitial(initial.span(), DType::I32, {batch});
@@ -686,6 +693,8 @@ int batched_snapshot_case(std::int32_t C, std::int32_t width,
     int failures = 0;
     failures += verify_output(tag + " output", from_device_bf16(output.data(), x_bits.size()),
                               expected_output);
+    history.copy_back();
+    failures += history.verify_guards("snapshot history");
     failures += verify_bits(tag + " all state slots", state.data(), expected_bits);
     failures += verify_bits(tag + " x preserved", x.data(), x_bits);
     failures += verify_bits(tag + " weight preserved", weight.data(), weight_bits);

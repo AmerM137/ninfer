@@ -1,3 +1,4 @@
+#include "ops/state_fixture.h"
 #include "ninfer/ops/gated_delta_net.h"
 #include "cuda_fixture.h"
 #include "core/buffer.h"
@@ -118,6 +119,8 @@ int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
                             {kStateDim, kStateDim, value_heads, slots});
     Tensor record_states(record_state.span(), DType::FP32,
                          {kStateDim, kStateDim, value_heads, slots});
+    SlottedStateFixture history(record_states, 3);
+    record_states = history.tensor;
     Tensor reference_final_states(reference_final.span(), DType::FP32,
                                   {kStateDim, kStateDim, value_heads, batch});
     Tensor valid;
@@ -275,6 +278,8 @@ int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
         }
     }
 
+    history.copy_back();
+    failures += history.verify_guards("record source");
     const std::vector<float> state_after = from_device<float>(record_state, state_elements);
     if (std::memcmp(state_after.data(), state.data(), state_elements * sizeof(float)) != 0) {
         std::cerr << "replay record modified source state" << suffix << "\n";

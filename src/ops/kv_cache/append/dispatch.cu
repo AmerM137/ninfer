@@ -17,16 +17,18 @@ int select_cyclic_threads(int max_count, int batch) { return max_count * batch <
 
 template <int Capacity, int Threads>
 void launch_cyclic(const Tensor& k, const Tensor& v, const Tensor& positions, const Tensor& counts,
-                   const Tensor& lanes, CyclicKVCacheLayerView cache,
+                   const Tensor& state_slots, CyclicKVCacheLayerView cache,
                    KVCacheAppendPrefixExecutionEnvelope envelope, cudaStream_t stream) {
     constexpr int UnitsPerToken = 128;
     const dim3 grid((envelope.max_count * UnitsPerToken + Threads - 1) / Threads, k.ne[3]);
     prefix_cyclic_kernel<Capacity, Threads><<<grid, Threads, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(k.data), static_cast<const __nv_bfloat16*>(v.data),
         static_cast<const std::int32_t*>(positions.data),
-        static_cast<const std::int32_t*>(counts.data), static_cast<const std::int32_t*>(lanes.data),
+        static_cast<const std::int32_t*>(counts.data),
+        static_cast<const std::int32_t*>(state_slots.data),
         static_cast<__nv_bfloat16*>(cache.k.data), static_cast<__half*>(cache.v.data),
-        envelope.min_count, envelope.max_count, k.ne[2], cache.padded_capacity);
+        envelope.min_count, envelope.max_count, k.ne[2], cache.padded_capacity, cache.k.nb[3] / 2,
+        cache.v.nb[3] / 2);
 }
 
 } // namespace
@@ -56,7 +58,7 @@ void kv_cache_append_prefix_dispatch(const Tensor& k, const Tensor& v, const Ten
 }
 
 void kv_cache_append_prefix_dispatch(const Tensor& k, const Tensor& v, const Tensor& positions,
-                                     const Tensor& counts, const Tensor& lanes,
+                                     const Tensor& counts, const Tensor& state_slots,
                                      CyclicKVCacheLayerView cache,
                                      KVCacheAppendPrefixExecutionEnvelope envelope,
                                      cudaStream_t stream) {
@@ -64,9 +66,11 @@ void kv_cache_append_prefix_dispatch(const Tensor& k, const Tensor& v, const Ten
     const int threads = select_cyclic_threads(envelope.max_count, k.ne[3]);
     const auto launch = [&]<int Capacity>() {
         if (threads == 64)
-            launch_cyclic<Capacity, 64>(k, v, positions, counts, lanes, cache, envelope, stream);
+            launch_cyclic<Capacity, 64>(k, v, positions, counts, state_slots, cache, envelope,
+                                        stream);
         else
-            launch_cyclic<Capacity, 128>(k, v, positions, counts, lanes, cache, envelope, stream);
+            launch_cyclic<Capacity, 128>(k, v, positions, counts, state_slots, cache, envelope,
+                                         stream);
     };
     if (cache.capacity == 2048)
         launch.template operator()<2048>();

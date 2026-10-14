@@ -417,7 +417,7 @@ CyclicKVCacheLayerView make_prefix_cyclic_view(DeviceBuffer& k, DeviceBuffer& v,
         .padded_capacity = static_cast<std::uint32_t>(capacity),
         .num_kv_heads    = kPrefixKvHeads,
         .head_dim        = kPrefixHeadDim,
-        .lane_capacity   = batch,
+        .slot_count      = batch,
     };
 }
 
@@ -691,7 +691,7 @@ void collect_case(Case& data, Mode mode, const char* geometry, KvCacheStorage st
                   double useful_bytes, const Options& options, bench::L2FlushBuffer& flush,
                   CudaExecutionView cuda, std::vector<Result>& results) {
     const auto stream = cuda.stream();
-    const bool empty = mode == Mode::Prefix && options.max_count == 0;
+    const bool empty  = mode == Mode::Prefix && options.max_count == 0;
     bench::TimedGraph graph;
     if (empty) {
         data.launch(cuda);

@@ -1,3 +1,4 @@
+#include "ops/state_fixture.h"
 #include "ninfer/ops/indexing.h"
 #include "cuda_fixture.h"
 #include "core/buffer.h"
@@ -53,13 +54,19 @@ int scatter_case(std::int32_t rows, const std::vector<std::int32_t>& indices,
     Tensor source_tensor(device_source.span(), DType::BF16, {rows, source_columns});
     Tensor indices_tensor(device_indices.span(), DType::I32, {source_columns});
     Tensor destination_tensor(device_destination.span(), DType::BF16, {rows, destination_columns});
+    SlottedStateFixture source_state(source_tensor, 1), destination_state(destination_tensor, 1);
+    source_tensor      = source_state.tensor;
+    destination_tensor = destination_state.tensor;
     ops::scatter(source_tensor, indices_tensor, destination_tensor,
                  ninfer::test::cuda_environment().default_execution);
     cuda_synchronize();
 
     const std::string label =
         "scatter D=" + std::to_string(rows) + " V=" + std::to_string(source_columns);
-    int failures = 0;
+    source_state.copy_back();
+    destination_state.copy_back();
+    int failures = source_state.verify_guards("scatter source") +
+                   destination_state.verify_guards("scatter destination");
     failures += verify_exact(
         label.c_str(), from_device<std::uint16_t>(device_destination.data(), destination.size()),
         expected);
@@ -114,7 +121,7 @@ int extract_case(std::int32_t source_rows, std::int32_t destination_rows,
 
 int continuation_case(int width, int batch) {
     constexpr int rows = 5120, slots = 11;
-    const auto hidden = bit_pattern(static_cast<std::size_t>(rows) * width * batch, 1709U + width);
+    const auto hidden  = bit_pattern(static_cast<std::size_t>(rows) * width * batch, 1709U + width);
     const auto initial = bit_pattern(static_cast<std::size_t>(rows) * slots, 1721U + batch);
     std::vector<std::int32_t> lanes{10, 2, 8, 0, 6, 4, 9, 1};
     lanes.resize(batch);
@@ -148,7 +155,7 @@ int continuation_case(int width, int batch) {
         for (int b = 0; b < batch; ++b) {
             selectors[b] = (phase + 3 * b) % width;
             std::copy_n(hidden.begin() + static_cast<std::size_t>(b * width + selectors[b]) * rows,
-                         rows, expected.begin() + static_cast<std::size_t>(lanes[b]) * rows);
+                        rows, expected.begin() + static_cast<std::size_t>(lanes[b]) * rows);
         }
         CUDA_CHECK(cudaMemcpyAsync(d_selectors.data(), selectors.data(), d_selectors.size(),
                                    cudaMemcpyHostToDevice, context.stream()));
@@ -159,13 +166,52 @@ int continuation_case(int width, int batch) {
         else
             launch();
         context.synchronize();
-        failures += verify_exact("continuation slots", from_device<std::uint16_t>(d_destination.data(), expected.size()), expected);
+        failures += verify_exact("continuation slots",
+                                 from_device<std::uint16_t>(d_destination.data(), expected.size()),
+                                 expected);
     }
-    failures += verify_exact("continuation input unchanged", from_device<std::uint16_t>(d_hidden.data(), hidden.size()), hidden);
-    failures += verify_exact("continuation lanes unchanged", from_device<std::int32_t>(d_lanes, batch), lanes);
+    failures += verify_exact("continuation input unchanged",
+                             from_device<std::uint16_t>(d_hidden.data(), hidden.size()), hidden);
+    failures += verify_exact("continuation lanes unchanged",
+                             from_device<std::int32_t>(d_lanes, batch), lanes);
     failures += d_hidden.verify_guards("continuation input");
     failures += d_selected.verify_guards("continuation selected");
     failures += d_destination.verify_guards("continuation destination");
+    return failures;
+}
+
+int shared_image_case() {
+    StateImageBuilder builder;
+    const auto source_field      = builder.add(DType::BF16, {8}, 1, "source hidden");
+    const auto destination_field = builder.add(DType::BF16, {8}, 1, "destination hidden");
+    LayoutBuilder backing;
+    const auto layout = builder.finish(backing, 4);
+    DeviceBuffer memory(cuda_environment().context.device(), backing.finish());
+    memory.fill(0x5a);
+    StateImageStorage images(memory.span(), layout);
+    Tensor source      = images.field(source_field);
+    Tensor destination = images.field(destination_field);
+    const auto input   = bit_pattern(32, 17);
+    CUDA_CHECK(
+        cudaMemcpy2D(source.data, source.nb[1], input.data(), 16, 16, 4, cudaMemcpyHostToDevice));
+    DeviceBuffer selectors = to_device<std::int32_t>({3, 0});
+    const Tensor indices(selectors.span(), DType::I32, {2});
+    ops::scatter(source.slice(1, 0, 2), indices, destination, cuda_environment().default_execution);
+    cuda_synchronize();
+    std::vector<std::uint16_t> actual(32), preserved(32), expected(32, 0x5a5a);
+    std::copy_n(input.begin(), 8, expected.begin() + 24);
+    std::copy_n(input.begin() + 8, 8, expected.begin());
+    CUDA_CHECK(cudaMemcpy2D(actual.data(), 16, destination.data, destination.nb[1], 16, 4,
+                            cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy2D(preserved.data(), 16, source.data, source.nb[1], 16, 4,
+                            cudaMemcpyDeviceToHost));
+    int failures = verify_exact("shared image destination", actual, expected) +
+                   verify_exact("shared image source", preserved, input);
+    bool rejected = false;
+    try {
+        ops::scatter(source.slice(1, 0, 2), indices, source, cuda_environment().default_execution);
+    } catch (const std::invalid_argument&) { rejected = true; }
+    if (!rejected) ++failures;
     return failures;
 }
 
@@ -183,6 +229,9 @@ int main() {
     failures += continuation_case(5, 3);
     failures += scatter_case(5120, {4, 0, 7, 2}, 9);
     failures += scatter_case(2048, {5, 1, 3}, 7);
+    failures += scatter_case(6, {2, 0}, 4);
+    failures += scatter_case(7, {2, 0}, 4);
+    failures += shared_image_case();
     failures += extract_case(10240, 6144, 4096, 6);
     failures += extract_case(8192, 2048, 2048, 1);
     std::cout << (failures ? "FAIL" : "OK") << " scatter and extract_bf16_features\n";

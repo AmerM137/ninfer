@@ -296,16 +296,20 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
         }
         const PendingCandidate& pending = requests[lane].pending;
         const SequenceState& sequence   = active_sequence(lane);
-        if (sequence.execution_frontier != pending.base_E ||
+        if (sequence.continuation.metadata.execution_frontier !=
+                pending.base.metadata.execution_frontier ||
             sequence.ledger_frontier != pending.base_S ||
             sequence.ledger.size() != pending.base_S ||
             sequence.prefix_identity.size() != pending.base_S ||
             sequence.prefix_digests.size() != pending.base_S ||
-            sequence.text_kv_valid != pending.base_E ||
+            sequence.continuation.metadata.text_kv_valid !=
+                pending.base.metadata.execution_frontier ||
             (speculative_backend == SpeculativeBackend::Mtp &&
-             sequence.mtp_kv_valid != pending.base_E) ||
+             sequence.continuation.metadata.backend_kv_valid !=
+                 pending.base.metadata.execution_frontier) ||
             (is_masked_draft_backend(speculative_backend) &&
-             sequence.dflash_context_frontier != pending.base_E)) {
+             sequence.continuation.metadata.dflash_context_frontier !=
+                 pending.base.metadata.execution_frontier)) {
             throw std::logic_error("speculative pending row is not at its recorded base");
         }
         const std::uint32_t committed = discarded[row] ? 0U : accepted_tokens[row];
@@ -387,8 +391,9 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
             std::size_t append_size = 0;
             for (std::size_t row = 0; row < lanes.size(); ++row) {
                 if (!discarded[row] && terminal[row]) {
-                    append_lanes[append_size]  = lanes[row];
-                    append_starts[append_size] = requests[lanes[row]].pending.base_E;
+                    append_lanes[append_size] = lanes[row];
+                    append_starts[append_size] =
+                        requests[lanes[row]].pending.base.metadata.execution_frontier;
                     append_counts[append_size] = accepted_tokens[row];
                     ++append_size;
                 }
@@ -428,7 +433,7 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
 
             const PendingCandidate pending = request.pending;
             const std::uint32_t committed  = accepted_tokens[row];
-            settle_state_fork(sequence);
+            complete_state_write(sequence);
             const TokenId* token_base =
                 speculative_backend == SpeculativeBackend::Mtp
                     ? mtp_host_egress->licensed_tokens.data() + row * width
@@ -437,13 +442,16 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
             commit_generated_prefix_identity(sequence, pending.base_S,
                                              std::span<const TokenId>(token_base, committed),
                                              prefix_execution_splits[row]);
-            sequence.execution_frontier = pending.base_E + committed;
-            sequence.ledger_frontier    = pending.base_S + committed;
-            sequence.text_kv_valid      = sequence.execution_frontier;
-            sequence.tail_hidden_valid  = true;
+            sequence.continuation.metadata.execution_frontier =
+                pending.base.metadata.execution_frontier + committed;
+            sequence.ledger_frontier = pending.base_S + committed;
+            sequence.continuation.metadata.text_kv_valid =
+                sequence.continuation.metadata.execution_frontier;
+            sequence.continuation.metadata.tail_hidden_valid = true;
 
             if (speculative_backend == SpeculativeBackend::Mtp) {
-                sequence.mtp_kv_valid = sequence.execution_frontier;
+                sequence.continuation.metadata.backend_kv_valid =
+                    sequence.continuation.metadata.execution_frontier;
                 if (terminal[row]) {
                     sequence.mtp_draft_count = 0;
                 } else {
@@ -455,12 +463,15 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
                     }
                 }
             } else {
-                sequence.dflash_context_frontier =
-                    terminal[row] ? sequence.execution_frontier : pending.base_E;
+                sequence.continuation.metadata.dflash_context_frontier =
+                    terminal[row] ? sequence.continuation.metadata.execution_frontier
+                                  : pending.base.metadata.execution_frontier;
             }
 
-            commit_sequence_kv(sequence, sequence.text_kv_valid, backend_kv_valid(sequence));
-            trim_sequence_kv(sequence, sequence.text_kv_valid, backend_kv_valid(sequence));
+            commit_sequence_kv(sequence, sequence.continuation.metadata.text_kv_valid,
+                               backend_kv_valid(sequence));
+            trim_sequence_kv(sequence, sequence.continuation.metadata.text_kv_valid,
+                             backend_kv_valid(sequence));
             if (terminal[row]) {
                 request.lifecycle = Lifecycle::Finishable;
             } else {
@@ -518,7 +529,7 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             staged.initial_mtp_extent,
             0,
             dflash_prefill_host_ingress,
-            sequence.rope_delta};
+            sequence.continuation.metadata.rope_delta};
         schedule_state.prefill_gpu_timer = &prefill_gpu_timer_;
 
         if (staged.mtp_bridge == MtpBridgeMode::BeforeSuffix) {
@@ -527,7 +538,7 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 throw std::logic_error("staged MTP bridge is outside the reusable suffix");
             }
             mark_workspace_usage(workspace_plan.mtp_prefill);
-            const Tensor& previous_hidden = sequence.tail_hidden;
+            const Tensor& previous_hidden = tail_hidden(sequence);
             const execution::MtpBridgeInput bridge{
                 .previous_hidden = &previous_hidden,
                 .position        = context::checked_i32(staged.base - 1, "MTP bridge position"),
@@ -544,8 +555,9 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 execution::mtp_bridge_and_propose(schedule_state, bridge_token, previous_hidden,
                                                   bridge.position, bridge.rope_position, false);
             }
-            sequence.mtp_kv_valid = staged.base;
-            commit_sequence_kv(sequence, sequence.text_kv_valid, sequence.mtp_kv_valid);
+            sequence.continuation.metadata.backend_kv_valid = staged.base;
+            commit_sequence_kv(sequence, sequence.continuation.metadata.text_kv_valid,
+                               sequence.continuation.metadata.backend_kv_valid);
             staged.mtp_bridge = MtpBridgeMode::None;
         }
 
@@ -613,21 +625,24 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 staged.cursor += result.processed_tokens;
                 processed_prompt_tokens += result.processed_tokens;
                 remaining -= result.processed_tokens;
-                final_chunk_tokens     = result.processed_tokens;
-                sequence.text_kv_valid = staged.cursor;
-                if (staged.prepare_mtp) { sequence.mtp_kv_valid = staged.cursor; }
-                if (is_masked_draft_backend(speculative_backend)) {
-                    sequence.dflash_context_frontier = staged.cursor;
+                final_chunk_tokens                           = result.processed_tokens;
+                sequence.continuation.metadata.text_kv_valid = staged.cursor;
+                if (staged.prepare_mtp) {
+                    sequence.continuation.metadata.backend_kv_valid = staged.cursor;
                 }
-                commit_sequence_kv(sequence, sequence.text_kv_valid, backend_kv_valid(sequence));
+                if (is_masked_draft_backend(speculative_backend)) {
+                    sequence.continuation.metadata.dflash_context_frontier = staged.cursor;
+                }
+                commit_sequence_kv(sequence, sequence.continuation.metadata.text_kv_valid,
+                                   backend_kv_valid(sequence));
 
                 // Prompt transitions are canonical immediately. If this was the first write after
                 // an immutable source, close the Fork before potentially freezing a new rewrite.
-                settle_state_fork(sequence);
+                complete_state_write(sequence);
                 copy_tail(sequence,
                           prefill_hidden.slice(
                               1, static_cast<std::int32_t>(result.processed_tokens) - 1, 1));
-                sequence.tail_hidden_valid = true;
+                sequence.continuation.metadata.tail_hidden_valid = true;
                 const bool reached_capture = capture_frontier && staged.cursor == *capture_frontier;
                 if (reached_capture) {
                     if (result.finalized) {
@@ -670,16 +685,16 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                                     1, static_cast<std::int32_t>(final_chunk_tokens) - 1, 1));
         } else {
             mark_workspace_usage(workspace_plan.ordinary_round);
-            if (!sequence.tail_hidden_valid) {
+            if (!sequence.continuation.metadata.tail_hidden_valid) {
                 throw std::logic_error("zero-suffix reuse has no target tail hidden");
             }
             execution::sample_from_hidden(
-                schedule_state, sequence.tail_hidden,
+                schedule_state, tail_hidden(sequence),
                 context::checked_i32(staged.prompt_tokens, "sample position"),
                 ops::kSamplePurposePrefill);
             set_device_i32(io.rope_pos,
                            context::checked_i32(staged.prompt_tokens, "rope position") +
-                               sequence.rope_delta);
+                               sequence.continuation.metadata.rope_delta);
             if (staged.prepare_mtp) {
                 if (staged.mtp_bridge != MtpBridgeMode::AfterExactHit) {
                     throw std::logic_error("zero-suffix MTP reuse has no exact-hit bridge");
@@ -688,12 +703,13 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 const auto bridge_rope =
                     prompt_rope_position(staged.prompt, staged.prompt_tokens - 1);
                 execution::mtp_bridge_and_propose(
-                    schedule_state, io.token, sequence.tail_hidden,
+                    schedule_state, io.token, tail_hidden(sequence),
                     context::checked_i32(staged.prompt_tokens - 1,
                                          "MTP full-prefix bridge position"),
                     bridge_rope, staged.initial_mtp_extent != 0);
-                sequence.mtp_kv_valid = staged.prompt_tokens;
-                commit_sequence_kv(sequence, sequence.text_kv_valid, sequence.mtp_kv_valid);
+                sequence.continuation.metadata.backend_kv_valid = staged.prompt_tokens;
+                commit_sequence_kv(sequence, sequence.continuation.metadata.text_kv_valid,
+                                   sequence.continuation.metadata.backend_kv_valid);
                 staged.mtp_bridge = MtpBridgeMode::None;
             }
         }
@@ -719,22 +735,22 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             throw std::logic_error("candidate token ledger does not match prompt length");
         }
         sequence.ledger.push_back(host_tokens[0]);
-        sequence.prefix_identity.append_generated(1, sequence.rope_delta);
+        sequence.prefix_identity.append_generated(1, sequence.continuation.metadata.rope_delta);
         sequence.prefix_digests.append_generated(std::span<const TokenId>(host_tokens, 1),
-                                                 sequence.rope_delta);
-        sequence.text_kv_valid = prompt_tokens;
+                                                 sequence.continuation.metadata.rope_delta);
+        sequence.continuation.metadata.text_kv_valid = prompt_tokens;
         if (staged.prepare_mtp) {
-            if (sequence.mtp_kv_valid != prompt_tokens) {
+            if (sequence.continuation.metadata.backend_kv_valid != prompt_tokens) {
                 throw std::logic_error("staged MTP prefill did not reach the prompt frontier");
             }
             sequence.mtp_draft_count = staged.initial_mtp_extent;
             std::copy_n(initial_drafts.begin(), staged.initial_mtp_extent,
                         sequence.mtp_drafts.begin());
         } else if (is_masked_draft_backend(speculative_backend) &&
-                   sequence.dflash_context_frontier != prompt_tokens) {
+                   sequence.continuation.metadata.dflash_context_frontier != prompt_tokens) {
             throw std::logic_error("staged DFlash prefill did not reach the prompt frontier");
         }
-        sequence.tail_hidden_valid = true;
+        sequence.continuation.metadata.tail_hidden_valid = true;
         request.timings.vision_seconds += vision_seconds;
         request.timings.prefill_seconds = std::max(0.0, staged.elapsed_seconds - vision_seconds);
         if (staged.vision) { staged.vision->retire_handoff(); }
@@ -744,7 +760,7 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             request.capture_groups[request.next_capture].frontier == prompt_tokens;
         if (!prompt_frontier_capture) { request.prefill.reset(); }
         request.pending   = PendingCandidate{.kind          = PendingKind::Begin,
-                                             .base_E        = 0,
+                                             .base          = sequence.continuation,
                                              .base_S        = 0,
                                              .prompt_tokens = prompt_tokens,
                                              .produced      = 1};

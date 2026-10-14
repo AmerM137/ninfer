@@ -40,6 +40,7 @@ GdnConvEpilogue<Publish> make_epilogue(const Tensor& conv_weight, const Tensor& 
     return {
         static_cast<const __nv_bfloat16*>(conv_weight.data),
         static_cast<const __nv_bfloat16*>(conv_states.data),
+        conv_states.nb[2] / 2,
         static_cast<const std::int32_t*>(initial_slot.data),
         valid_columns.data == nullptr ? nullptr
                                       : static_cast<const std::int32_t*>(valid_columns.data),
@@ -255,17 +256,17 @@ void launch_q4_q5_gdn_input_conv_snapshot(const Tensor& x, const Weight& qk_weig
         launch_conv<PdlOrder::Q4ThenQ5>(
             x, qk_weight, value_z_weight, conv_weight, conv_states, valid_columns, initial_slot,
             query, key, value, z,
-            SnapshotHistoryPublish{static_cast<__nv_bfloat16*>(conv_states.data),
-                                   static_cast<const std::int32_t*>(snapshot_base_slot.data),
-                                   kChannels},
+            SnapshotHistoryPublish{
+                static_cast<__nv_bfloat16*>(conv_states.data), conv_states.nb[2] / 2,
+                static_cast<const std::int32_t*>(snapshot_base_slot.data), kChannels},
             stream);
     } else {
         launch_conv<PdlOrder::Q5ThenQ4>(
             x, qk_weight, value_z_weight, conv_weight, conv_states, valid_columns, initial_slot,
             query, key, value, z,
-            SnapshotHistoryPublish{static_cast<__nv_bfloat16*>(conv_states.data),
-                                   static_cast<const std::int32_t*>(snapshot_base_slot.data),
-                                   kChannels},
+            SnapshotHistoryPublish{
+                static_cast<__nv_bfloat16*>(conv_states.data), conv_states.nb[2] / 2,
+                static_cast<const std::int32_t*>(snapshot_base_slot.data), kChannels},
             stream);
     }
 }

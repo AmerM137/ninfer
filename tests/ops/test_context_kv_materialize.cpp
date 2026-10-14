@@ -1,3 +1,5 @@
+#include "ops/state_fixture.h"
+#include <optional>
 #include "core/weight.h"
 #include "cuda_fixture.h"
 #include "core/buffer.h"
@@ -92,6 +94,7 @@ struct LayerStorage {
     DeviceBuffer norm_device;
     GuardedDeviceBuffer cache_k{cache_elements() * sizeof(std::uint16_t)};
     GuardedDeviceBuffer cache_v{cache_elements() * sizeof(std::uint16_t)};
+    std::optional<SlottedStateFixture> key_state, value_state;
 };
 
 struct Fixture {
@@ -147,9 +150,13 @@ struct Fixture {
                     .padded_capacity = kPaddedCapacity,
                     .num_kv_heads    = kHeads,
                     .head_dim        = kHeadDim,
-                    .lane_capacity   = kLaneCapacity,
+                    .slot_count      = kLaneCapacity,
                 },
             };
+            target.key_state.emplace(views[layer].cache.k, 3);
+            target.value_state.emplace(views[layer].cache.v, 3);
+            views[layer].cache.k = target.key_state->tensor;
+            views[layer].cache.v = target.value_state->tensor;
         }
     }
 
@@ -157,6 +164,8 @@ struct Fixture {
         for (LayerStorage& layer : storage) {
             layer.cache_k.fill(0xa5);
             layer.cache_v.fill(0xa5);
+            layer.key_state->upload();
+            layer.value_state->upload();
         }
     }
 };
@@ -211,6 +220,8 @@ int verify_state_effect(const std::string& label, const Fixture& fixture,
     int failures = 0;
     for (int layer = 0; layer < kLayers; ++layer) {
         const LayerStorage& source = fixture.storage[static_cast<std::size_t>(layer)];
+        source.key_state->copy_back();
+        source.value_state->copy_back();
         const auto cache_k = from_device<std::uint16_t>(source.cache_k.data(), cache_elements());
         const auto cache_v = from_device<std::uint16_t>(source.cache_v.data(), cache_elements());
         int first_bad      = -1;
@@ -396,6 +407,8 @@ int run_case(Fixture& fixture, const std::string& label, int width, int batch,
     failures += verify_exact("context readonly", from_device_bf16(context_device, context.size()),
                              std::vector<double>(context.begin(), context.end()));
     for (const auto& layer : fixture.storage) {
+        failures += layer.key_state->verify_guards(label + " K image");
+        failures += layer.value_state->verify_guards(label + " V image");
         failures += layer.cache_k.verify_guards(label + " K ring");
         failures += layer.cache_v.verify_guards(label + " V ring");
     }

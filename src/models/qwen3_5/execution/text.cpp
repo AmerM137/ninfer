@@ -229,7 +229,7 @@ void DFlashFeatureSink::consume_prefill_chunk(std::int32_t tokens, bool rewrite_
 
 TextContext::TextContext(DeviceContext& ctx, const execution::Parameters& weights,
                          MemoryArena& work, const qwen3_5::PagedKVCache& batch_text_kv,
-                         LinearAttentionStatePool& state, qwen3_5::RoundState& io,
+                         LinearAttentionStateView& state, qwen3_5::RoundState& io,
                          Tensor& prefill_hidden, std::uint32_t prefill_chunk,
                          std::uint32_t text_kv_base, qwen3_5::PagedKVCacheView mtp_kv,
                          const qwen3_5::PagedKVCache* batch_mtp_kv, moe::Resources* moe)

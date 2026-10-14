@@ -1,3 +1,4 @@
+#include "ops/state_fixture.h"
 #include "ninfer/ops/kimi_delta_attention.h"
 #include "cuda_fixture.h"
 #include "core/buffer.h"
@@ -449,6 +450,8 @@ int batch_update_case(const Case& test_case, const std::vector<int>& state_slots
     Tensor dt_bias(device.dt_bias.span(), DType::FP32, {kStateDim, test_case.heads});
     Tensor states_tensor(states.span(), DType::FP32,
                          {kStateDim, kStateDim, test_case.heads, slots});
+    SlottedStateFixture history(states_tensor, 3);
+    states_tensor = history.tensor;
     Tensor state_slots_tensor(device_state_slots.span(), DType::I32, {batch});
     Tensor out_tensor(out.span(), DType::BF16, {kStateDim, test_case.heads, 1, batch});
 
@@ -462,6 +465,8 @@ int batch_update_case(const Case& test_case, const std::vector<int>& state_slots
     int failures =
         verify_reduction(label + " out", from_device_bf16(out.data(), aggregate.v.size()),
                          expected_output, output_criterion());
+    history.copy_back();
+    failures += history.verify_guards("pooled state");
     const std::vector<float> got_states = from_device<float>(states.data(), initial_states.size());
     for (int row = 0; row < batch; ++row) {
         const int slot          = state_slots[static_cast<std::size_t>(row)];

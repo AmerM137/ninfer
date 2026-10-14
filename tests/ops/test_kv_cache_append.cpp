@@ -1,3 +1,4 @@
+#include "ops/state_fixture.h"
 #include "ninfer/ops/kv_cache_append.h"
 #include "cuda_fixture.h"
 #include "core/buffer.h"
@@ -794,15 +795,15 @@ PagedKVBatchLayerView paged_view(GuardedDeviceBuffer& k, GuardedDeviceBuffer& v,
 }
 
 CyclicKVCacheLayerView cyclic_view(GuardedDeviceBuffer& k, GuardedDeviceBuffer& v, int capacity,
-                                   int lane_capacity = 1) {
+                                   int slot_count = 1) {
     return {
-        .k        = Tensor(k.span(), DType::BF16, {kHeadDim, capacity, kKVHeads, lane_capacity}),
-        .v        = Tensor(v.span(), DType::FP16, {kHeadDim, capacity, kKVHeads, lane_capacity}),
+        .k        = Tensor(k.span(), DType::BF16, {kHeadDim, capacity, kKVHeads, slot_count}),
+        .v        = Tensor(v.span(), DType::FP16, {kHeadDim, capacity, kKVHeads, slot_count}),
         .capacity = static_cast<std::uint32_t>(capacity),
         .padded_capacity = static_cast<std::uint32_t>(capacity),
         .num_kv_heads    = kKVHeads,
         .head_dim        = kHeadDim,
-        .lane_capacity   = lane_capacity,
+        .slot_count      = slot_count,
     };
 }
 
@@ -1254,7 +1255,10 @@ public:
             .padded_capacity = static_cast<std::uint32_t>(padded_),
             .num_kv_heads    = kKVHeads,
             .head_dim        = kHeadDim,
-            .lane_capacity   = Lanes};
+            .slot_count      = Lanes};
+        SlottedStateFixture key_state(cache.k, 3), value_state(cache.v, 3);
+        cache.k = key_state.tensor;
+        cache.v = value_state.tensor;
         const ops::KVCacheAppendPrefixExecutionEnvelope envelope{0,
                                                                  static_cast<std::uint32_t>(upper)};
         DeviceContext device;
@@ -1326,6 +1330,9 @@ public:
                 " Wc=" + std::to_string(width) + " B=" + std::to_string(batch) +
                 " upper=" + std::to_string(upper) + " kind=" + std::to_string(kind) +
                 (replay ? " graph " : " eager ") + std::to_string(phase);
+            key_state.copy_back();
+            value_state.copy_back();
+            failures += key_state.verify_guards("cyclic K") + value_state.verify_guards("cyclic V");
             failures += verify_exact(
                 (label + " cache K").c_str(),
                 from_device<std::uint16_t>(cache_k_.data(), expected_k_.size()), expected_k_);

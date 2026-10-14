@@ -60,33 +60,35 @@ const SequenceState& ProgramImpl::active_sequence(std::uint32_t lane) const {
 }
 
 context::StateImageSelectors ProgramImpl::state_selectors(const SequenceState& sequence) const {
-    return {state_store->physical_slot(sequence.state.read),
-            state_store->physical_slot(sequence.state.write)};
+    return {state_store->physical_slot(sequence.continuation.image),
+            state_store->physical_slot(sequence.write_state())};
 }
 
-void ProgramImpl::refresh_state_views(SequenceState& sequence) {
-    sequence.tail_hidden =
-        state_images->continuation_hidden_slot(state_store->physical_slot(sequence.state.read));
+Tensor ProgramImpl::tail_hidden(const SequenceState& sequence) const {
+    return state_images->continuation_hidden_slot(
+        state_store->physical_slot(sequence.continuation.image));
 }
 
-void ProgramImpl::settle_state_fork(SequenceState& sequence) {
-    if (!sequence.state.fork_pending) { return; }
-    state_store->commit_fork(sequence.state.read, sequence.state.write);
-    sequence.state = {.read = sequence.state.write, .write = sequence.state.write};
-    refresh_state_views(sequence);
+void ProgramImpl::complete_state_write(SequenceState& sequence) {
+    const auto destination = sequence.write_state();
+    state_store->complete_write(sequence.continuation.image, destination);
+    sequence.continuation.image = destination;
+    sequence.continuation.metadata.execution_frontier =
+        sequence.continuation.metadata.text_kv_valid;
+    sequence.pending_write = {};
 }
 
 void ProgramImpl::release_sequence_state(SequenceState& sequence) noexcept {
     try {
-        if (sequence.state.fork_pending) {
-            state_store->abort_fork(sequence.state.read, sequence.state.write);
+        if (sequence.pending_write.valid()) {
+            state_store->abort_write(sequence.continuation.image, sequence.write_state());
         }
-        if (state_store->valid(sequence.state.write) &&
-            !state_store->release(sequence.state.write)) {
+        if (state_store->valid(sequence.write_state()) &&
+            !state_store->release(sequence.write_state())) {
             std::terminate();
         }
-        sequence.state       = {};
-        sequence.tail_hidden = {};
+        sequence.continuation.image = {};
+        sequence.pending_write      = {};
     } catch (...) { std::terminate(); }
 }
 
@@ -131,8 +133,12 @@ const PagedKVCache* ProgramImpl::backend_kv_cache() const noexcept {
 }
 
 std::uint32_t ProgramImpl::backend_kv_valid(const SequenceState& state) const noexcept {
-    if (speculative_backend == SpeculativeBackend::Mtp) { return state.mtp_kv_valid; }
-    return speculative_backend == SpeculativeBackend::DFlash ? state.dflash_context_frontier : 0;
+    if (speculative_backend == SpeculativeBackend::Mtp) {
+        return state.continuation.metadata.backend_kv_valid;
+    }
+    return speculative_backend == SpeculativeBackend::DFlash
+               ? state.continuation.metadata.dflash_context_frontier
+               : 0;
 }
 
 void ProgramImpl::ensure_sequence_kv_mapped(SequenceState& state, std::uint32_t main,
@@ -145,6 +151,7 @@ void ProgramImpl::ensure_sequence_kv_mapped(SequenceState& state, std::uint32_t 
 
 void ProgramImpl::commit_sequence_kv(SequenceState& state, std::uint32_t main,
                                      std::uint32_t backend) {
+    state.continuation.metadata.backend_kv_valid = backend;
     text_kv_addresses->commit_frontier(state.kv->text, main);
     if (state.kv->backend) { backend_kv_addresses->commit_frontier(*state.kv->backend, backend); }
 }

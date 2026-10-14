@@ -14,6 +14,7 @@ template <class Publish>
 struct GdnConvEpilogue {
     const __nv_bfloat16* conv_weight;
     const __nv_bfloat16* state_read;
+    std::int64_t slot_stride;
     const std::int32_t* initial_slots;
     const std::int32_t* valid_columns;
     __nv_bfloat16* query;
@@ -32,8 +33,7 @@ struct GdnConvEpilogue {
     __device__ __forceinline__ void store(std::int32_t local_row,
                                           const float (&projected)[Tokens]) const {
         static_assert(Tokens >= 1);
-        const std::int32_t row         = global_row_offset + local_row;
-        const std::int64_t slot_stride = static_cast<std::int64_t>(channels) * 3;
+        const std::int32_t row = global_row_offset + local_row;
         const std::int64_t initial_base =
             static_cast<std::int64_t>(initial_slots[batch_row]) * slot_stride;
         std::int32_t valid = valid_columns == nullptr ? Tokens : valid_columns[batch_row];

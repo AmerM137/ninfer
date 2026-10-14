@@ -13,13 +13,13 @@ bool ProgramImpl::checkpoint_matches(CheckpointHandle handle, const RequestBaseP
         return false;
     }
     const auto& record = checkpoint(handle);
-    if (record.frontier > base.summary().prompt_tokens ||
+    if (record.frontier() > base.summary().prompt_tokens ||
         record.key.identity_tag != base.impl_->prefix_identity_tag || !record.identity ||
-        base.impl_->prefix_digests.at(record.frontier) != record.key.digests) {
+        base.impl_->prefix_digests.at(record.frontier()) != record.key.digests) {
         return false;
     }
     return prefix_matches(*base.impl_->prompt, record.identity->ledger,
-                          record.identity->prefix_identity, record.frontier);
+                          record.identity->prefix_identity, record.frontier());
 }
 
 std::optional<SourceCandidate>
@@ -28,7 +28,7 @@ ProgramImpl::inspect_source(const RequestBasePlan& base, std::optional<Checkpoin
                             std::span<const CheckpointHandle> retired_points) const {
     if (!base.impl_ || (handle && !checkpoint_matches(*handle, base))) { return std::nullopt; }
     SourceCandidate candidate{.checkpoint    = handle,
-                              .reused_tokens = handle ? checkpoint(*handle).frontier : 0};
+                              .reused_tokens = handle ? checkpoint(*handle).frontier() : 0};
     const auto& prompt       = *base.impl_->prompt;
     candidate.remaining_work = runtime::make_prefill_work(
         candidate.reused_tokens, base.summary().prompt_tokens - candidate.reused_tokens, 0, 0,
@@ -56,20 +56,23 @@ ProgramImpl::inspect_source(const RequestBasePlan& base, std::optional<Checkpoin
         return std::find(candidate.retired_points.begin(), candidate.retired_points.end(), point) !=
                candidate.retired_points.end();
     };
-    auto state_references = state_store->checkpoint_references(record.state);
+    auto state_references = state_store->checkpoint_references(record.continuation.image);
     for (const auto point : candidate.retired_points) {
-        if (checkpoint(point).state == record.state) { --state_references; }
+        if (checkpoint(point).continuation.image == record.continuation.image) {
+            --state_references;
+        }
     }
     auto occupied_states = state_store->device_occupied();
     for (std::size_t i = 0; i < candidate.retired_points.size(); ++i) {
-        const auto state = checkpoint(candidate.retired_points[i]).state;
-        if (std::any_of(candidate.retired_points.begin(), candidate.retired_points.begin() + i,
-                        [&](auto point) { return checkpoint(point).state == state; })) {
+        const auto state = checkpoint(candidate.retired_points[i]).continuation.image;
+        if (std::any_of(
+                candidate.retired_points.begin(), candidate.retired_points.begin() + i,
+                [&](auto point) { return checkpoint(point).continuation.image == state; })) {
             continue;
         }
-        const auto references = static_cast<std::uint32_t>(
-            std::count_if(candidate.retired_points.begin(), candidate.retired_points.end(),
-                          [&](auto point) { return checkpoint(point).state == state; }));
+        const auto references = static_cast<std::uint32_t>(std::count_if(
+            candidate.retired_points.begin(), candidate.retired_points.end(),
+            [&](auto point) { return checkpoint(point).continuation.image == state; }));
         if (references == state_store->checkpoint_references(state) &&
             state_store->device_resident(state) &&
             state_store->can_release_after_checkpoint_references(state, references)) {
@@ -83,10 +86,10 @@ ProgramImpl::inspect_source(const RequestBasePlan& base, std::optional<Checkpoin
             continue;
         }
         const auto& kept = checkpoint(point);
-        if (kept.frontier > record.frontier) { continue; }
+        if (kept.frontier() > record.frontier()) { continue; }
         const bool input =
             kept.role == runtime::CheckpointRole::InputReplay &&
-            (kept.frontier == desired || (point == *handle && kept.frontier >= desired));
+            (kept.frontier() == desired || (point == *handle && kept.frontier() >= desired));
         if (input || kept.role == runtime::CheckpointRole::LongAnchor) {
             candidate.private_points.push_back(point);
         }
@@ -95,20 +98,23 @@ ProgramImpl::inspect_source(const RequestBasePlan& base, std::optional<Checkpoin
         std::find(candidate.private_points.begin(), candidate.private_points.end(), *handle) !=
         candidate.private_points.end();
     candidate.move_state = consume_source && !keep_source && checkpoints[handle->index].pins == 0 &&
-                           state_references == 1 && state_store->source_pins(record.state) == 0;
-    candidate.split_state =
-        !candidate.move_state && occupied_states == state_store->device_capacity() &&
-        state_store->device_resident(record.state) && state_store->host_resident(record.state) &&
-        state_store->source_pins(record.state) == 0;
+                           state_references == 1 &&
+                           state_store->source_pins(record.continuation.image) == 0;
+    candidate.split_state = !candidate.move_state &&
+                            occupied_states == state_store->device_capacity() &&
+                            state_store->device_resident(record.continuation.image) &&
+                            state_store->host_resident(record.continuation.image) &&
+                            state_store->source_pins(record.continuation.image) == 0;
     if (!candidate.move_state && !candidate.split_state &&
         occupied_states == state_store->device_capacity() &&
-        state_store->device_resident(record.state) && state_store->source_pins(record.state) == 0 &&
+        state_store->device_resident(record.continuation.image) &&
+        state_store->source_pins(record.continuation.image) == 0 &&
         checkpoints[handle->index].pins == 0) {
         if (host_context_arena &&
-            host_context_arena->can_allocate(state_images->host_layout().image_bytes)) {
+            host_context_arena->can_allocate(state_images->storage().image_bytes())) {
             candidate.backup_state = candidate.split_state = true;
             candidate.transfers.push_back(context::state_transfer_requirement(
-                state_image_transfer_work(state_images->host_layout()),
+                state_images->storage().layout().transfer_work(),
                 runtime::ContextTransferDirection::DeviceToHost));
         } else if (consume_source && state_references == 1) {
             // One physical slot cannot retain its immutable recovery image and a writer.
@@ -129,11 +135,11 @@ ProgramImpl::inspect_source(const RequestBasePlan& base, std::optional<Checkpoin
         return true;
     };
     const auto backend_frontier = speculative_backend == SpeculativeBackend::Mtp
-                                      ? record.frontier - 1U
-                                      : record.backend_frontier;
+                                      ? record.frontier() - 1U
+                                      : record.backend_frontier();
     candidate.move_history =
         consume_source &&
-        movable(*text_kv_addresses, *text_kv_pages, record.kv->text, record.frontier) &&
+        movable(*text_kv_addresses, *text_kv_pages, record.kv->text, record.frontier()) &&
         (!record.kv->backend ||
          movable(*backend_kv_addresses, *backend_kv_pages, *record.kv->backend, backend_frontier));
     if (candidate.move_history) {
@@ -143,22 +149,22 @@ ProgramImpl::inspect_source(const RequestBasePlan& base, std::optional<Checkpoin
                 retires({this, index, slot.generation})) {
                 continue;
             }
-            if (slot.value->frontier > record.frontier ||
-                slot.value->backend_frontier > backend_frontier) {
+            if (slot.value->frontier() > record.frontier() ||
+                slot.value->backend_frontier() > backend_frontier) {
                 candidate.move_history = false;
                 break;
             }
         }
     }
-    if (!state_store->device_resident(record.state)) {
-        candidate.transfers.push_back(context::state_transfer_requirement(
-            state_image_transfer_work(state_images->host_layout()),
-            runtime::ContextTransferDirection::HostToDevice));
+    if (!state_store->device_resident(record.continuation.image)) {
+        candidate.transfers.push_back(
+            context::state_transfer_requirement(state_images->storage().layout().transfer_work(),
+                                                runtime::ContextTransferDirection::HostToDevice));
     } else if (!candidate.move_state && !candidate.split_state &&
                is_masked_draft_backend(speculative_backend)) {
-        candidate.transfers.push_back(context::state_transfer_requirement(
-            dflash_local_transfer_work(state_images->host_layout()),
-            runtime::ContextTransferDirection::DeviceToDevice));
+        candidate.transfers.push_back(
+            context::state_transfer_requirement(state_images->dflash_local_transfer_work(),
+                                                runtime::ContextTransferDirection::DeviceToDevice));
     }
     const auto scan = [&](const context::KVAddressSpaceStore& addresses,
                           const context::LogicalKVPageStore& pages,
@@ -198,12 +204,12 @@ ProgramImpl::inspect_source(const RequestBasePlan& base, std::optional<Checkpoin
                 physical.device_copy_work(1)));
         }
     };
-    scan(*text_kv_addresses, *text_kv_pages, record.kv->text, record.frontier,
+    scan(*text_kv_addresses, *text_kv_pages, record.kv->text, record.frontier(),
          runtime::ContextResourceClass::MainKV);
     if (record.kv->backend) {
-        const auto frontier = speculative_backend == SpeculativeBackend::Mtp && record.frontier
-                                  ? record.frontier - 1U
-                                  : record.backend_frontier;
+        const auto frontier = speculative_backend == SpeculativeBackend::Mtp && record.frontier()
+                                  ? record.frontier() - 1U
+                                  : record.backend_frontier();
         scan(*backend_kv_addresses, *backend_kv_pages, *record.kv->backend, frontier,
              runtime::ContextResourceClass::BackendKV);
     }

@@ -9,7 +9,8 @@ namespace ninfer::ops {
 /**
  * destination[:,indices[i]] = source[:,i].
  *
- * Source [D,V] and destination [D,T] are contiguous BF16; indices [V] is contiguous I32.
+ * Source [D,V] and destination [D,T] are BF16 with contiguous features and explicit,
+ * non-overlapping BF16-aligned column strides. Indices [V] is contiguous I32.
  * Indices lie in [0,T), with no duplicates when deterministic overwrite order is required.
  * Copies BF16 bits exactly and preserves unselected columns. Inputs and destination do not
  * overlap. An empty source does no work. No workspace or other state is used.

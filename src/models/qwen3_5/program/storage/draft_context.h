@@ -9,14 +9,14 @@
 namespace ninfer::models::qwen3_5::detail {
 
 struct DFlashPersistentState {
-    CyclicKVCache& local;
+    CyclicKVCacheView& local;
     std::optional<qwen3_5::PagedKVCache> full;
     Tensor prefill_features;
     Tensor prefill_positions;
     Tensor pending_features;
 
     DFlashPersistentState(MemorySpan backing, const DFlashPersistentLayout& layout,
-                          CyclicKVCache& local_state);
+                          CyclicKVCacheView& local_state);
 
     [[nodiscard]] CyclicKVCacheLayerView local_layer(std::uint32_t layer) const;
     [[nodiscard]] PagedKVBatchLayerView full_batch_layer(std::uint32_t layer) const;

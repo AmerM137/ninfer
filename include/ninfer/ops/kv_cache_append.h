@@ -84,20 +84,21 @@ void kv_cache_append_prefix(const Tensor& k, const Tensor& v, const Tensor& posi
                             PagedKVBatchLayerView cache, CudaExecutionView execution);
 
 /**
- * Append device-selected BF16 prefixes to lane-owned cyclic storage.
+ * Append device-selected BF16 prefixes to StateImage cyclic storage.
  *
  * k/v, positions, counts, and their storage-conversion and mutation contracts match the paged
- * overload; lanes[b] selects the destination lane. The registered profiles have fixed geometry
- * D=128, Hkv=8 and capacity 2048 or 4096. Absolute position p maps to slot p mod capacity.
+ * overload; state_slots[b] selects the destination state slot. The registered profiles have fixed
+ * geometry K/V have dense inner [128,padded_capacity,8] and explicit 16-byte-aligned slot strides
+ * nb[3]. D=128, Hkv=8 and capacity 2048 or 4096. Absolute position p maps to slot p mod capacity.
  * For a nonempty prefix, the caller guarantees that the row's existing live interval ends
  * immediately before positions[0,b]. Advancing it by counts[b] makes every overwritten old slot
  * dead, and one row commits at most the ring capacity. A zero count reads no positions or K/V
  * and changes no cache bytes. Physical T is independent of the committed prefix length.
  * Consequently, no two live writes race for one physical slot. The Op does not own or publish the
- * lane frontier.
+ * state frontier.
  */
 void kv_cache_append_prefix(const Tensor& k, const Tensor& v, const Tensor& positions,
-                            const Tensor& counts, const Tensor& lanes,
+                            const Tensor& counts, const Tensor& state_slots,
                             KVCacheAppendPrefixExecutionEnvelope envelope,
                             CyclicKVCacheLayerView cache, CudaExecutionView execution);
 

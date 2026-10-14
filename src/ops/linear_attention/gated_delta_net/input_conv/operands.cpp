@@ -109,7 +109,8 @@ Batch validate_convolution(const Tensor& x, const WeightOperands& weights,
     require_tensor(convolution, DType::BF16, g.channels(), 4, 1, 16, "convolution weight");
     if (history.ne[2] < (publication == Publication::Snapshot ? batch.columns() : 1))
         throw std::invalid_argument("GDN convolution: insufficient history slots");
-    require_tensor(history, DType::BF16, g.channels(), 3, history.ne[2], 16, "history");
+    common::operand::slotted_tensor(history, DType::BF16, {g.channels(), 3, history.ne[2]}, 2, 16,
+                                    "GDN convolution", "history", x.device);
     require_selector(source_slots, batch.rows, "source slots");
     if (valid_columns.data) require_selector(valid_columns, batch.rows, "valid columns");
     require_tensor(outputs.query, DType::BF16, g.query_rows, batch.tokens, batch.rows, 16, "query");
@@ -136,18 +137,17 @@ void validate_storage(const WeightOperands& weights, std::span<const Tensor* con
                 (tensors[j] == alias_first && tensors[i] == alias_second))
                 continue;
             if (tensors[j]->data &&
-                common::operand::overlaps(
-                    common::operand::range(t.data, t.bytes(), "GDN input"),
-                    common::operand::range(tensors[j]->data, tensors[j]->bytes(), "GDN input")))
+                common::operand::overlaps(common::operand::blocks(t, "GDN input"),
+                                          common::operand::blocks(*tensors[j], "GDN input")))
                 throw std::invalid_argument("GDN input: tensor operands overlap");
         }
         if (common::operand::overlaps(
-                common::operand::range(t.data, t.bytes(), "GDN input"),
+                common::operand::blocks(t, "GDN input"),
                 common::operand::range(scratch.data, scratch.bytes, "GDN input")))
             throw std::invalid_argument("GDN input: tensor overlaps call-local scratch");
         for (const Weight* w : {weights.first, weights.second}) {
             if (w && common::operand::overlaps(
-                         common::operand::range(t.data, t.bytes(), "GDN input"),
+                         common::operand::blocks(t, "GDN input"),
                          common::operand::range(w->payload, w->payload_bytes, "GDN input")))
                 throw std::invalid_argument("GDN input: tensor overlaps weight storage");
         }

@@ -40,16 +40,15 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__
     void sliding_window_attention_split_partial_kernel(
         const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ query_k,
         const __nv_bfloat16* __restrict__ query_v, const std::int32_t* __restrict__ positions,
-        const std::int32_t* __restrict__ valid_columns, const std::int32_t* __restrict__ lanes,
-        const __nv_bfloat16* __restrict__ context_k, const __half* __restrict__ context_v,
-        int padded_context, int window_mask, int max_context, int split_capacity, float scale,
-        float* __restrict__ partial_acc, float* __restrict__ partial_m,
+        const std::int32_t* __restrict__ valid_columns,
+        const std::int32_t* __restrict__ state_slots, const __nv_bfloat16* __restrict__ context_k,
+        const __half* __restrict__ context_v, int padded_context, std::int64_t key_slot_stride,
+        std::int64_t value_slot_stride, int window_mask, int max_context, int split_capacity,
+        float scale, float* __restrict__ partial_acc, float* __restrict__ partial_m,
         float* __restrict__ partial_l, __nv_bfloat16* __restrict__ out) {
     const int batch = static_cast<int>(blockIdx.z);
-    const std::int64_t lane_elements =
-        static_cast<std::int64_t>(kContextQueryHeadDim) * padded_context * kContextQueryKVHeads;
-    context_k += lane_elements * lanes[batch];
-    context_v += lane_elements * lanes[batch];
+    context_k += key_slot_stride * state_slots[batch];
+    context_v += value_slot_stride * state_slots[batch];
     const std::int32_t* batch_positions = positions + static_cast<std::int64_t>(Tokens) * batch;
     SlidingWindowAttentionPolicy policy{
         .positions      = batch_positions,

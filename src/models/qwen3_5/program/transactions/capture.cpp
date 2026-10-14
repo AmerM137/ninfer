@@ -59,7 +59,7 @@ bool ProgramImpl::reserve_capture_destination(std::uint32_t lane, std::uint32_t 
     }
     auto destination = state_store->reserve_destination();
     if (!destination && host_context_arena) {
-        ticket->host = host_context_arena->allocate(state_images->host_layout().image_bytes);
+        ticket->host = host_context_arena->allocate(state_images->storage().image_bytes());
         if (ticket->host) { destination = state_store->reserve_logical_destination(); }
     }
     if (!destination) { return false; }
@@ -129,7 +129,7 @@ std::optional<CapturePreparation> ProgramImpl::prepare_capture(SequenceHandle ha
         CapturePreparation result{.frontier = frontier};
         if (state_store->device_occupied() == state_store->device_capacity()) {
             result.shortage.state_slots = 1;
-            result.host_bytes           = state_images->host_layout().image_bytes;
+            result.host_bytes           = state_images->storage().image_bytes();
         }
         const auto& group = request.capture_groups[request.next_capture];
         const bool private_point =
@@ -199,9 +199,14 @@ bool ProgramImpl::start_capture(SequenceHandle handle) {
     if (!request.capture_pending || request.next_capture >= request.capture_groups.size()) {
         return false;
     }
-    if (state.state.fork_pending || state.state.read != state.state.write) { return false; }
+    if (state.pending_write.valid() || state.continuation.image != state.write_state()) {
+        return false;
+    }
     const auto frontier = request.capture_groups[request.next_capture].frontier;
-    if (frontier != state.text_kv_valid || !state.tail_hidden_valid) { return false; }
+    if (frontier != state.continuation.metadata.text_kv_valid ||
+        !state.continuation.metadata.tail_hidden_valid) {
+        return false;
+    }
     if (!reserve_capture_destination(lane, frontier)) { return false; }
     auto ticket = std::move(request.capture_reservation);
     ContextTransaction tx;
@@ -256,10 +261,11 @@ bool ProgramImpl::start_capture(SequenceHandle handle) {
                     operation.backend_frontier));
             }
         }
-        state_store->freeze(state.state.read);
+        state_store->freeze(state.continuation.image);
         if (host_state) {
+            auto transfer = state_store->reserve_device_to_host(state.continuation.image,
+                                                                std::move(*ticket->host));
             ticket->host.reset();
-            auto transfer = state_store->reserve_device_to_host(state.state.read);
             if (!transfer) { throw std::logic_error("capture lost its reserved Host state space"); }
             operation.state_transfer.emplace(std::move(*transfer));
         }
@@ -268,7 +274,7 @@ bool ProgramImpl::start_capture(SequenceHandle handle) {
         if (operation.state_transfer) {
             enqueue_state_backup(operation);
         } else if (is_masked_draft_backend(speculative_backend)) {
-            copy_local_for_context(operation, state_store->physical_slot(state.state.read),
+            copy_local_for_context(operation, state_store->physical_slot(state.continuation.image),
                                    state_store->physical_slot(*operation.reserved_state));
         }
         const auto copy = [&](context::KVAddressSpaceStore& addresses,
@@ -297,7 +303,7 @@ void ProgramImpl::publish_capture(ContextTransaction& tx) {
     auto& state             = sequences[tx.lane];
     auto& request           = requests[tx.lane];
     const auto& group       = request.capture_groups[request.next_capture];
-    const auto source_state = state.state.read;
+    const auto source_state = state.continuation.image;
     if (tx.text_view) {
         text_kv_addresses->commit_active_prefix_view(std::move(*tx.text_view));
         if (tx.backend_view) {
@@ -306,35 +312,32 @@ void ProgramImpl::publish_capture(ContextTransaction& tx) {
         tx.binding_history->owner = this;
         tx.reserved_kv.reset();
     }
+    Continuation captured                = state.continuation;
+    captured.metadata.execution_frontier = tx.reuse_frontier;
+    captured.metadata.backend_kv_valid   = tx.backend_frontier;
     for (const auto& [handle, role] : tx.capture_points) {
         state_store->retain_checkpoint_reference(source_state);
         checkpoints[handle.index].value = CheckpointState{
-            .kv    = role == runtime::CheckpointRole::SharedPrefix ? tx.binding_history : state.kv,
-            .role  = role,
-            .state = source_state,
-            .identity          = group.identity,
-            .key               = group.key,
-            .frontier          = tx.reuse_frontier,
-            .backend_frontier  = tx.backend_frontier,
-            .rope_delta        = state.rope_delta,
-            .tail_hidden_valid = true};
+            .kv   = role == runtime::CheckpointRole::SharedPrefix ? tx.binding_history : state.kv,
+            .role = role,
+            .continuation = captured,
+            .identity     = group.identity,
+            .key          = group.key};
         checkpoints[handle.index].reserved = false;
     }
     if (state_store->residency(*tx.reserved_state) == context::StateReplicaResidency::None) {
         state_store->split_device_replica_identity(source_state, *tx.reserved_state);
-        state.state = {.read = *tx.reserved_state, .write = *tx.reserved_state};
+        state_store->complete_initialization(*tx.reserved_state);
+        state.continuation.image = *tx.reserved_state;
+        state.pending_write      = {};
     } else {
         ++tx.operations.state_forks;
-        (void)state_store->begin_fork(source_state, *tx.reserved_state);
-        state.state = {
-            .read         = source_state,
-            .write        = *tx.reserved_state,
-            .fork_pending = true,
-        };
+        (void)state_store->begin_write(source_state, *tx.reserved_state);
+        state.continuation.image = source_state;
+        state.pending_write      = *tx.reserved_state;
     }
     tx.reserved_state.reset();
     refresh_history_requirements(state.kv);
-    refresh_state_views(state);
     skip_capture(sequence_handle(tx.lane));
 }
 

@@ -33,8 +33,8 @@ struct PageDemotion {
 };
 
 bool checkpoint_prefix(const CheckpointState& earlier, const CheckpointState& later) {
-    const auto frontier = earlier.frontier;
-    if (frontier > later.frontier || !earlier.identity || !later.identity ||
+    const auto frontier = earlier.frontier();
+    if (frontier > later.frontier() || !earlier.identity || !later.identity ||
         earlier.key.identity_tag != later.key.identity_tag ||
         earlier.identity->digests.at(frontier) != later.identity->digests.at(frontier)) {
         return false;
@@ -259,7 +259,7 @@ std::vector<PhysicalOwners> physical_owner_sets(const ProgramImpl& program, Phys
         for (std::uint32_t index = 0; index < program.checkpoints.size(); ++index) {
             const auto& slot = program.checkpoints[index];
             if (!slot.value) { continue; }
-            const auto state = slot.value->state;
+            const auto state = slot.value->continuation.image;
             if (host ? program.state_store->host_resident(state)
                      : program.state_store->device_resident(state)) {
                 auto& owners  = states[program.state_store->descriptor_index(state)];
@@ -294,7 +294,7 @@ std::vector<PhysicalOwners> physical_owner_sets(const ProgramImpl& program, Phys
             for (const auto owner : history.checkpoints) {
                 const auto& record = *program.checkpoints[owner].value;
                 boundaries.push_back(context::kv_pages_for_frontier(
-                    main_pool ? record.frontier : record.backend_frontier));
+                    main_pool ? record.frontier() : record.backend_frontier()));
             }
             std::sort(boundaries.begin(), boundaries.end());
             boundaries.erase(std::unique(boundaries.begin(), boundaries.end()), boundaries.end());
@@ -304,7 +304,7 @@ std::vector<PhysicalOwners> physical_owner_sets(const ProgramImpl& program, Phys
                 for (const auto owner : history.checkpoints) {
                     const auto& record = *program.checkpoints[owner].value;
                     if (context::kv_pages_for_frontier(
-                            main_pool ? record.frontier : record.backend_frontier) > begin) {
+                            main_pool ? record.frontier() : record.backend_frontier()) > begin) {
                         holders.push_back(owner);
                     }
                 }
@@ -449,15 +449,15 @@ released_resources(const ProgramImpl& program, PhysicalFacts& facts,
         if (std::find(removed.begin(), removed.end(), handle.index) != removed.end()) { continue; }
         removed.push_back(handle.index);
         const auto& record = program.checkpoint(handle);
-        if (!program.state_store->can_release_checkpoint_owner(record.state)) {
+        if (!program.state_store->can_release_checkpoint_owner(record.continuation.image)) {
             return std::nullopt;
         }
         if (state || host) {
             const auto found = std::find_if(states.begin(), states.end(), [&](const auto& entry) {
-                return entry.handle == record.state;
+                return entry.handle == record.continuation.image;
             });
             if (found == states.end()) {
-                states.push_back({record.state, 1});
+                states.push_back({record.continuation.image, 1});
             } else {
                 ++found->count;
             }
@@ -476,7 +476,7 @@ released_resources(const ProgramImpl& program, PhysicalFacts& facts,
                 ++result.state_slots;
             }
             if (host && program.state_store->host_resident(reference.handle)) {
-                result.host_bytes += program.state_images->host_layout().image_bytes;
+                result.host_bytes += program.state_images->storage().image_bytes();
             }
         }
     }
@@ -489,8 +489,8 @@ released_resources(const ProgramImpl& program, PhysicalFacts& facts,
         for (const auto owner : history.checkpoints) {
             if (std::binary_search(removed.begin(), removed.end(), owner)) { continue; }
             const auto& record = *program.checkpoints[owner].value;
-            retained_main      = std::max(retained_main, record.frontier);
-            retained_backend   = std::max(retained_backend, record.backend_frontier);
+            retained_main      = std::max(retained_main, record.frontier());
+            retained_backend   = std::max(retained_backend, record.backend_frontier());
         }
         suffixes.push_back({index, retained_main, retained_backend});
     }
@@ -580,11 +580,11 @@ struct DemotionPlan {
 std::uint32_t ProgramImpl::checkpoint_recovery_frontier(CheckpointHandle retained,
                                                         const RequestBasePlan& base,
                                                         std::uint32_t target) const {
-    if (!valid_checkpoint(retained) || checkpoint(retained).frontier > target ||
+    if (!valid_checkpoint(retained) || checkpoint(retained).frontier() > target ||
         !checkpoint_matches(retained, base)) {
         return 0;
     }
-    return checkpoint(retained).frontier;
+    return checkpoint(retained).frontier();
 }
 
 struct ReclaimPlan {
@@ -599,9 +599,9 @@ struct ReclaimPlan {
     bool prefix(CheckpointHandle earlier, CheckpointHandle later) const {
         const auto& a = owner->checkpoint(earlier);
         const auto& b = owner->checkpoint(later);
-        if (a.frontier > b.frontier || !a.identity || !b.identity ||
+        if (a.frontier() > b.frontier() || !a.identity || !b.identity ||
             a.key.identity_tag != b.key.identity_tag ||
-            a.identity->digests.at(a.frontier) != b.identity->digests.at(a.frontier)) {
+            a.identity->digests.at(a.frontier()) != b.identity->digests.at(a.frontier())) {
             return false;
         }
         if (a.identity == b.identity) { return true; }
@@ -632,7 +632,8 @@ std::uint64_t recovery_loss(const ProgramImpl& program, std::span<const Checkpoi
         }
     }
     std::sort(ordered.begin(), ordered.end(), [&](auto left, auto right) {
-        const auto l = program.checkpoint(left).frontier, r = program.checkpoint(right).frontier;
+        const auto l = program.checkpoint(left).frontier(),
+                   r = program.checkpoint(right).frontier();
         return l != r ? l > r : left.index < right.index;
     });
 
@@ -651,11 +652,11 @@ std::uint64_t recovery_loss(const ProgramImpl& program, std::span<const Checkpoi
                 continue;
             }
             const auto& candidate = program.checkpoint(retained);
-            if (candidate.frontier > fallback && prefix(retained, handle)) {
-                fallback = candidate.frontier;
+            if (candidate.frontier() > fallback && prefix(retained, handle)) {
+                fallback = candidate.frontier();
             }
         }
-        const auto lost    = record.frontier - fallback;
+        const auto lost    = record.frontier() - fallback;
         const auto lineage = std::find_if(lineages.begin(), lineages.end(), [&](const auto& item) {
             return prefix(handle, item.deepest);
         });
@@ -706,7 +707,7 @@ std::optional<ContextDemotion> quote_demotion(const ProgramImpl& program,
             plan->state     = StateDemotion{state, program.state_store->content_epoch(state), host,
                                         owners.sources};
             candidate.released.state_slots = 1;
-            candidate.host_bytes = host ? 0 : program.state_images->host_layout().image_bytes;
+            candidate.host_bytes = host ? 0 : program.state_images->storage().image_bytes();
             break;
         }
         if (!plan->state) { return std::nullopt; }
@@ -1010,7 +1011,7 @@ bool ProgramImpl::start_demote(const ContextDemotion& quote) {
         std::size_t matched  = 0;
         for (std::uint32_t index = 0; index < checkpoints.size(); ++index) {
             const auto& slot = checkpoints[index];
-            if (!slot.value || slot.value->state != expected.handle) { continue; }
+            if (!slot.value || slot.value->continuation.image != expected.handle) { continue; }
             if (matched == expected.references.size() ||
                 expected.references[matched++] != CheckpointHandle{this, index, slot.generation}) {
                 return false;
@@ -1024,7 +1025,7 @@ bool ProgramImpl::start_demote(const ContextDemotion& quote) {
             !state_store->can_release_after_checkpoint_references(
                 expected.handle, state_store->checkpoint_references(expected.handle)) ||
             quote.host_bytes !=
-                (expected.host_resident ? 0 : state_images->host_layout().image_bytes)) {
+                (expected.host_resident ? 0 : state_images->storage().image_bytes())) {
             return false;
         }
     } else {
@@ -1049,10 +1050,10 @@ bool ProgramImpl::start_demote(const ContextDemotion& quote) {
             const auto& slot = checkpoints[index];
             if (!slot.value || (!main && !slot.value->kv->backend)) { continue; }
             const auto& record = *slot.value;
-            holders.push_back(
-                {{this, index, slot.generation},
-                 main ? record.kv->text : *record.kv->backend,
-                 context::kv_pages_for_frontier(main ? record.frontier : record.backend_frontier)});
+            holders.push_back({{this, index, slot.generation},
+                               main ? record.kv->text : *record.kv->backend,
+                               context::kv_pages_for_frontier(main ? record.frontier()
+                                                                   : record.backend_frontier())});
         }
         const auto stride      = main ? text_host_kv_page_stride : backend_host_kv_page_stride;
         std::size_t host_bytes = 0;

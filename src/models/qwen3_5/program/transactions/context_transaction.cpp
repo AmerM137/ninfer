@@ -18,20 +18,20 @@ bool ProgramImpl::context_blocks(SequenceHandle sequence) const noexcept {
 void ProgramImpl::enqueue_state_backup(ContextTransaction& tx) {
     if (!tx.state_transfer) { return; }
     tx.transfers.push_back(
-        context::state_transfer_requirement(state_image_transfer_work(state_images->host_layout()),
+        context::state_transfer_requirement(state_images->storage().layout().transfer_work(),
                                             runtime::ContextTransferDirection::DeviceToHost));
     start_context_transfer_timer(runtime::ContextResourceClass::State);
-    state_store->enqueue_device_to_host(*tx.state_transfer, device.transfer_stream());
+    state_store->enqueue_device_to_host(*tx.state_transfer, device.transfer_view());
     stop_context_transfer_timer(runtime::ContextResourceClass::State);
 }
 
 void ProgramImpl::copy_local_for_context(ContextTransaction& tx, std::int32_t source,
                                          std::int32_t destination) {
     tx.transfers.push_back(
-        context::state_transfer_requirement(dflash_local_transfer_work(state_images->host_layout()),
+        context::state_transfer_requirement(state_images->dflash_local_transfer_work(),
                                             runtime::ContextTransferDirection::DeviceToDevice));
     start_context_transfer_timer(runtime::ContextResourceClass::State);
-    state_images->copy_dflash_local(source, destination, device.transfer_stream());
+    state_images->copy_dflash_local(source, destination, device.transfer_view());
     stop_context_transfer_timer(runtime::ContextResourceClass::State);
 }
 
@@ -251,11 +251,12 @@ void ProgramImpl::abort_context() noexcept {
         }
         if (tx.kind == ContextOperationKind::Bind) {
             // Any already-installed state binding is still private to this unpublished lane.
-            if (sequences[tx.lane].state.fork_pending) {
-                state_store->abort_fork(sequences[tx.lane].state.read,
-                                        sequences[tx.lane].state.write);
+            if (sequences[tx.lane].pending_write.valid()) {
+                state_store->abort_write(sequences[tx.lane].continuation.image,
+                                         sequences[tx.lane].write_state());
             }
-            sequences[tx.lane].state = {};
+            sequences[tx.lane].continuation  = {};
+            sequences[tx.lane].pending_write = {};
             sequences[tx.lane].kv.reset();
             requests[tx.lane] = {};
             invalidate_lane(tx.lane);
@@ -263,10 +264,10 @@ void ProgramImpl::abort_context() noexcept {
         if (tx.kind == ContextOperationKind::Capture) {
             auto& state = sequences[tx.lane];
             refresh_history_requirements(state.kv);
-            if (state_store->role(state.state.read) ==
+            if (state_store->role(state.continuation.image) ==
                     context::StateImageRole::CheckpointImmutable &&
-                !state_store->checkpoint_references(state.state.read)) {
-                state_store->thaw(state.state.read);
+                !state_store->checkpoint_references(state.continuation.image)) {
+                state_store->make_mutable(state.continuation.image);
             }
         }
         if (tx.kind == ContextOperationKind::Pause) {

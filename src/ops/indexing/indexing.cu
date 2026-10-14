@@ -6,45 +6,19 @@
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
+#include <type_traits>
 
 namespace ninfer::ops {
 namespace {
-__global__ void scatter_bf16x8_kernel(const uint4* src, const std::int32_t* indices, uint4* dst,
-                                      std::int32_t vectors_per_column) {
-    const std::int32_t src_col  = static_cast<std::int32_t>(blockIdx.x);
-    const std::int32_t dst_col  = indices[src_col];
-    const std::int64_t src_base = static_cast<std::int64_t>(src_col) * vectors_per_column;
-    const std::int64_t dst_base = static_cast<std::int64_t>(dst_col) * vectors_per_column;
-    for (std::int32_t vector = static_cast<std::int32_t>(threadIdx.x); vector < vectors_per_column;
-         vector += static_cast<std::int32_t>(blockDim.x)) {
-        dst[dst_base + vector] = src[src_base + vector];
-    }
-}
-
-__global__ void scatter_bf16x2_kernel(const __nv_bfloat162* src, const std::int32_t* indices,
-                                      __nv_bfloat162* dst, std::int32_t pairs) {
-    const std::int32_t src_col = static_cast<std::int32_t>(blockIdx.x);
-    const std::int32_t dst_col = indices[src_col];
-
-    const std::int64_t src_base = static_cast<std::int64_t>(src_col) * pairs;
-    const std::int64_t dst_base = static_cast<std::int64_t>(dst_col) * pairs;
-    for (std::int32_t pair = static_cast<std::int32_t>(threadIdx.x); pair < pairs;
-         pair += static_cast<std::int32_t>(blockDim.x)) {
-        dst[dst_base + pair] = src[src_base + pair];
-    }
-}
-
-__global__ void scatter_scalar_kernel(const __nv_bfloat16* src, const std::int32_t* indices,
-                                      __nv_bfloat16* dst, std::int32_t d) {
-    const std::int32_t src_col = static_cast<std::int32_t>(blockIdx.x);
-    const std::int32_t dst_col = indices[src_col];
-
-    const std::int64_t src_base = static_cast<std::int64_t>(src_col) * d;
-    const std::int64_t dst_base = static_cast<std::int64_t>(dst_col) * d;
-    for (std::int32_t row = static_cast<std::int32_t>(threadIdx.x); row < d;
-         row += static_cast<std::int32_t>(blockDim.x)) {
-        dst[dst_base + row] = src[src_base + row];
-    }
+template <class Unit>
+__global__ void scatter_kernel(const Unit* source, const std::int32_t* indices, Unit* destination,
+                               std::int32_t units, std::int64_t source_stride,
+                               std::int64_t destination_stride) {
+    const auto column           = static_cast<std::int32_t>(blockIdx.x);
+    const auto source_base      = column * source_stride;
+    const auto destination_base = indices[column] * destination_stride;
+    for (int unit = threadIdx.x; unit < units; unit += blockDim.x)
+        destination[destination_base + unit] = source[source_base + unit];
 }
 
 inline constexpr int kScatterBatchThreads = 128;
@@ -87,26 +61,22 @@ void launch_scatter(const Tensor& source, const Tensor& indices, Tensor& destina
     const int columns = source.ne[1];
     const int items   = source.ne[0] / Width;
     const auto* map   = static_cast<const std::int32_t*>(indices.data);
-    if constexpr (Width == 8)
-        scatter_bf16x8_kernel<<<columns, 128, 0, stream>>>(
-            static_cast<const uint4*>(source.data), map, static_cast<uint4*>(destination.data),
-            items);
-    else if constexpr (Width == 2)
-        scatter_bf16x2_kernel<<<columns, 256, 0, stream>>>(
-            static_cast<const __nv_bfloat162*>(source.data), map,
-            static_cast<__nv_bfloat162*>(destination.data), items);
-    else
-        scatter_scalar_kernel<<<columns, 256, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(source.data), map,
-            static_cast<__nv_bfloat16*>(destination.data), items);
+    using Unit        = std::conditional_t<Width == 8, uint4,
+                                           std::conditional_t<Width == 2, __nv_bfloat162, __nv_bfloat16>>;
+    scatter_kernel<<<columns, Width == 8 ? 128 : 256, 0, stream>>>(
+        static_cast<const Unit*>(source.data), map, static_cast<Unit*>(destination.data), items,
+        source.nb[1] / static_cast<std::int64_t>(sizeof(Unit)),
+        destination.nb[1] / static_cast<std::int64_t>(sizeof(Unit)));
 }
 
 ScatterLaunch select_scatter(const Tensor& source, const Tensor& destination) {
     if (source.ne[0] % 8 == 0 && common::operand::aligned(source.data, 16) &&
-        common::operand::aligned(destination.data, 16))
+        common::operand::aligned(destination.data, 16) && source.nb[1] % 16 == 0 &&
+        destination.nb[1] % 16 == 0)
         return launch_scatter<8>;
     if (source.ne[0] % 2 == 0 && common::operand::aligned(source.data, 4) &&
-        common::operand::aligned(destination.data, 4))
+        common::operand::aligned(destination.data, 4) && source.nb[1] % 4 == 0 &&
+        destination.nb[1] % 4 == 0)
         return launch_scatter<2>;
     return launch_scatter<1>;
 }
@@ -147,12 +117,18 @@ void scatter(const Tensor& src, const Tensor& indices, Tensor& dst, CudaExecutio
         dst.device != execution.device()) {
         throw std::invalid_argument("scatter: operands must belong to the execution device");
     }
-    if (!src.is_contiguous() || !indices.is_contiguous() || !dst.is_contiguous()) {
-        throw std::invalid_argument("scatter: tensors must be contiguous");
-    }
+    common::operand::slotted_tensor(src, DType::BF16, {src.ne[0], src.ne[1]}, 1, 2, "scatter",
+                                    "source", execution.device());
+    common::operand::slotted_tensor(dst, DType::BF16, {dst.ne[0], dst.ne[1]}, 1, 2, "scatter",
+                                    "destination", execution.device());
+    common::operand::contiguous_nonnull(indices, "scatter", "indices", execution.device());
     if (src.data == nullptr || indices.data == nullptr || dst.data == nullptr) {
         throw std::invalid_argument("scatter: tensor data must be non-null");
     }
+    const auto destination = common::operand::blocks(dst, "scatter");
+    if (common::operand::overlaps(destination, common::operand::blocks(src, "scatter")) ||
+        common::operand::overlaps(destination, common::operand::range(indices, "scatter")))
+        throw std::invalid_argument("scatter: destination overlaps an input");
     select_scatter(src, dst)(src, indices, dst, stream);
     CUDA_CHECK(cudaGetLastError());
 }

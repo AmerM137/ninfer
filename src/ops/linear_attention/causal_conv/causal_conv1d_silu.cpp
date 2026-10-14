@@ -283,7 +283,11 @@ void causal_conv1d_silu_snapshot(const Tensor& x, const Tensor& weight, Tensor& 
     require_out_shape(x, out);
     if (n == 0) { return; }
 
-    require_non_empty_accessible(x, weight, conv_states, out, execution.device());
+    for (const Tensor* tensor : std::initializer_list<const Tensor*>{&x, &weight, &out})
+        common::operand::contiguous_nonnull(*tensor, "causal_conv1d", "operand",
+                                            execution.device());
+    common::operand::slotted_tensor(conv_states, DType::BF16, {x.ne[0], 3, conv_states.ne[2]}, 2, 2,
+                                    "causal_conv1d", "states", execution.device());
     if (masked) {
         common::operand::contiguous_nonnull(valid_columns, "causal_conv1d", "valid_columns",
                                             execution.device());
@@ -292,6 +296,13 @@ void causal_conv1d_silu_snapshot(const Tensor& x, const Tensor& weight, Tensor& 
                                         execution.device());
     common::operand::contiguous_nonnull(snapshot_base_slots, "causal_conv1d", "snapshot_base_slots",
                                         execution.device());
+    const auto state_blocks = common::operand::blocks(conv_states, "causal_conv1d");
+    for (const Tensor* operand : std::initializer_list<const Tensor*>{
+             &x, &weight, &valid_columns, &initial_state_slots, &snapshot_base_slots, &out}) {
+        if (operand->data && common::operand::overlaps(
+                                 state_blocks, common::operand::range(*operand, "causal_conv1d")))
+            throw std::invalid_argument("causal_conv1d: operands overlap snapshot storage");
+    }
     detail::launch_causal_conv_snapshot(
         x, weight, conv_states, valid_columns, initial_state_slots, snapshot_base_slots, out,
         detail::select_causal_conv_snapshot_plan(x.ne[1], batch, masked), stream);

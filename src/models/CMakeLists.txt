@@ -24,6 +24,7 @@ target_include_directories(ninfer_model_runtime SYSTEM PRIVATE
 
 target_sources(ninfer_model_loading PRIVATE common/moe/weights.cpp)
 target_sources(ninfer_model_runtime PRIVATE
+  common/context/state_store.cpp
   common/context/work.cpp
   common/moe/graph.cpp
   common/moe/plan.cpp

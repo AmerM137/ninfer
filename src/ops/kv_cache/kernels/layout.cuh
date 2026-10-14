@@ -85,14 +85,14 @@ __device__ __forceinline__ std::int64_t head_major_offset(int page, int head, in
                                          (page + static_cast<std::int64_t>(physical_pages) * head));
 }
 
-// [feature, ring slot, head, lane]; logical wrapping and physical head stride are distinct.
-template <int Dim, int Heads, int Capacity>
-__device__ __forceinline__ std::int64_t cyclic_offset(int position, int head, int lane,
-                                                      int padded_capacity, int component = 0) {
+// One slot: [feature, ring position, head]. The caller applies the explicit state-slot stride.
+template <int Dim, int Capacity>
+__device__ __forceinline__ std::int64_t cyclic_offset(int position, int head, int padded_capacity,
+                                                      int component = 0) {
     static_assert((Capacity & (Capacity - 1)) == 0);
-    return component + static_cast<std::int64_t>(Dim) *
-                           ((position & (Capacity - 1)) +
-                            static_cast<std::int64_t>(padded_capacity) * (head + Heads * lane));
+    return component +
+           static_cast<std::int64_t>(Dim) *
+               ((position & (Capacity - 1)) + static_cast<std::int64_t>(padded_capacity) * head);
 }
 
 template <class Geometry>

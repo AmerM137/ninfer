@@ -59,12 +59,12 @@ struct CausalConvSplitOutput3 {
 
 struct SnapshotHistoryPublish {
     __nv_bfloat16* state_write;
+    std::int64_t slot_stride;
     const std::int32_t* snapshot_base_slots;
     std::int32_t channels;
 
     __device__ __forceinline__ void publish(std::int32_t token, std::int32_t batch,
                                             std::int32_t row, float s1, float s2, float p) const {
-        const std::int64_t slot_stride = static_cast<std::int64_t>(channels) * 3;
         const std::int64_t base =
             static_cast<std::int64_t>(snapshot_base_slots[batch] + token) * slot_stride;
         state_write[base + row]                  = __float2bfloat16_rn(s1);

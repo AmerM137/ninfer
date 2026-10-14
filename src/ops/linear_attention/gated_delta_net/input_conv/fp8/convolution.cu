@@ -49,7 +49,7 @@ void launch_snapshot_small_t(const Tensor& x, const Weight& weight, const Tensor
                              cudaStream_t stream) {
     launch_small_t<ActiveTokens>(
         x, weight, conv_weight, conv_states, valid_columns, initial_slot, query, key, value, z,
-        SnapshotHistoryPublish{static_cast<__nv_bfloat16*>(conv_states.data),
+        SnapshotHistoryPublish{static_cast<__nv_bfloat16*>(conv_states.data), conv_states.nb[2] / 2,
                                static_cast<const std::int32_t*>(snapshot_base_slot.data),
                                ConvGeometry::channels},
         stream);
@@ -77,9 +77,9 @@ void launch_snapshot_decode(const Tensor& x, const Weight& weight, const Tensor&
         fp8_a16_operands(x, weight),
         make_gdn_conv_output<ConvGeometry, 1>(
             conv_weight, conv_states, valid_columns, initial_slot, query, key, value, z,
-            SnapshotHistoryPublish{static_cast<__nv_bfloat16*>(conv_states.data),
-                                   static_cast<const std::int32_t*>(snapshot_base_slot.data),
-                                   ConvGeometry::channels}),
+            SnapshotHistoryPublish{
+                static_cast<__nv_bfloat16*>(conv_states.data), conv_states.nb[2] / 2,
+                static_cast<const std::int32_t*>(snapshot_base_slot.data), ConvGeometry::channels}),
         GdnConvRowEpilogue<1>{}, stream);
 }
 

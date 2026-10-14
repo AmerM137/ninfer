@@ -29,6 +29,7 @@ add_library(ninfer_core STATIC
   host_kv_arena.cpp
   paged_kv_cache.cpp
   linear_attention_state.cpp
+  state_image.cpp
   layout.cpp
   tensor.cpp
   weight_view.cpp

@@ -35,7 +35,7 @@ void launch_recurrent_batch_update_fixed(const Tensor& q, const Tensor& k, const
                     static_cast<unsigned>(kStateDim / kBlockDv));
     const dim3 block(common::kWarpSize, kNumWarps, 1);
     const std::int64_t state_slot_stride =
-        static_cast<std::int64_t>(kStateDim) * kStateDim * ssm_states.ne[2];
+        ssm_states.nb[3] / static_cast<std::int64_t>(sizeof(float));
     const BatchUpdateAccess access{
         static_cast<const __nv_bfloat16*>(q.data),
         static_cast<const __nv_bfloat16*>(k.data),

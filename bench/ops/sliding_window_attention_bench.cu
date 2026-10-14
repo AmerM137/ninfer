@@ -172,7 +172,7 @@ CyclicKVCacheLayerView make_context_view(DeviceBuffer& k, DeviceBuffer& v, std::
         .padded_capacity = static_cast<std::uint32_t>(window),
         .num_kv_heads    = kKvHeads,
         .head_dim        = kHeadDim,
-        .lane_capacity   = batch,
+        .slot_count      = batch,
     };
 }
 

@@ -150,8 +150,10 @@ void ProgramImpl::prepare_graphs() {
 
     std::array<StateImageHandle, kMaximumConcurrency> capture_states{};
     for (std::uint32_t row = 0; row < max_concurrency; ++row) {
-        std::optional<StateImageHandle> state = state_store->reserve_reset(device.stream());
+        std::optional<StateImageHandle> state = state_store->reserve_destination();
         if (!state) { throw std::bad_alloc(); }
+        state_images->storage().clear(state_store->physical_slot(*state), device.execution_view());
+        state_store->complete_initialization(*state);
         capture_states[row] = *state;
     }
     const auto capture_state_slot = [&](std::uint32_t row) {
@@ -244,7 +246,7 @@ void ProgramImpl::prepare_graphs() {
                                batch_size);
         }
         for (std::uint32_t row = 0; row < batch_size; ++row) {
-            state_images->zero_slot(capture_state_slot(row), device.stream());
+            state_images->storage().clear(capture_state_slot(row), device.execution_view());
             if (dflash) {
                 const Tensor pending =
                     dflash->pending_features.slice(2, static_cast<std::int32_t>(row), 1);
@@ -552,7 +554,7 @@ void ProgramImpl::prepare_graphs() {
 
     if (moe) moe->restore_cache_after_preparation();
     clear_stable_controls();
-    state_images->zero_all(device.stream());
+    state_images->storage().clear_all(device.execution_view());
     if (dflash) {
         CUDA_CHECK(cudaMemsetAsync(dflash->prefill_features.data, 0,
                                    dflash->prefill_features.bytes(), device.stream()));

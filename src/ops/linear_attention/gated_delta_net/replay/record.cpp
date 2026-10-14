@@ -34,8 +34,9 @@ void validate_replay_record(const Tensor& q, const Tensor& k, const Tensor& v, c
                             device);
     common::operand::tensor(g, DType::FP32, {value_heads, width, rows}, 4, kOp, "g", device);
     common::operand::tensor(beta, DType::FP32, {value_heads, width, rows}, 4, kOp, "beta", device);
-    common::operand::tensor(states, DType::FP32, {kStateDim, kStateDim, value_heads, states.ne[3]},
-                            16, kOp, "states", device);
+    common::operand::slotted_tensor(states, DType::FP32,
+                                    {kStateDim, kStateDim, value_heads, states.ne[3]}, 3, 16, kOp,
+                                    "states", device);
     common::operand::tensor(initial_slots, DType::I32, {rows}, 4, kOp, "initial state slots",
                             device);
     if (valid_columns.data != nullptr) {
@@ -63,13 +64,15 @@ void validate_replay_record(const Tensor& q, const Tensor& k, const Tensor& v, c
                                                 &value_record,
                                                 &gate_record,
                                                 &out};
-    std::array<common::operand::Range, 12> ranges{};
+    std::array<common::operand::Blocks, 12> ranges{};
     std::size_t count = 0;
     for (const Tensor* tensor : tensors) {
-        if (tensor->data != nullptr) ranges[count++] = common::operand::range(*tensor, kOp);
+        if (tensor->data != nullptr) ranges[count++] = common::operand::blocks(*tensor, kOp);
     }
-    common::operand::disjoint(std::span(ranges.data(), count),
-                              "gated_delta_net_replay_record: tensors must not overlap");
+    for (std::size_t i = 0; i < count; ++i)
+        for (std::size_t j = 0; j < i; ++j)
+            if (common::operand::overlaps(ranges[i], ranges[j]))
+                throw std::invalid_argument("gated_delta_net_replay_record: tensors overlap");
 }
 
 } // namespace

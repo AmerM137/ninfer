@@ -20,7 +20,7 @@ bool checkpoint_releasable(const ProgramImpl& program, CheckpointHandle handle) 
     return (!last_history || (program.text_kv_addresses->can_release(record.kv->text) &&
                               (!record.kv->backend ||
                                program.backend_kv_addresses->can_release(*record.kv->backend)))) &&
-           program.state_store->can_release_checkpoint_owner(record.state);
+           program.state_store->can_release_checkpoint_owner(record.continuation.image);
 }
 
 bool state_evictable(const StateImageStore& states, StateImageHandle state) {
@@ -51,8 +51,8 @@ void ProgramImpl::refresh_history_requirements(const std::shared_ptr<KVHistory>&
     std::uint32_t main = 0, backend = 0;
     for (const auto& slot : checkpoints) {
         if (!slot.value || slot.value->kv != history) { continue; }
-        main    = std::max(main, slot.value->frontier);
-        backend = std::max(backend, slot.value->backend_frontier);
+        main    = std::max(main, slot.value->frontier());
+        backend = std::max(backend, slot.value->backend_frontier());
     }
     text_kv_addresses->set_checkpoint_requirement(history->text, main);
     if (trim_unused && main && !text_kv_addresses->active(history->text) &&
@@ -102,7 +102,7 @@ bool ProgramImpl::release_checkpoint(CheckpointHandle handle) noexcept {
     auto& record = *slot.value;
     try {
         // Dropping the whole record precedes releasing any last physical replica.
-        const auto state = record.state;
+        const auto state = record.continuation.image;
         const auto kv    = record.kv;
         slot.value.reset();
         slot.reserved = false;
@@ -158,7 +158,7 @@ PhysicalUsageSnapshot ProgramImpl::physical_usage() const noexcept {
 PrefixShortlistKey ProgramImpl::checkpoint_key(CheckpointHandle handle,
                                                std::uint32_t frontier) const {
     const auto& record = checkpoint(handle);
-    if (!frontier || frontier > record.frontier) {
+    if (!frontier || frontier > record.frontier()) {
         throw std::logic_error("checkpoint key is outside coverage");
     }
     return {record.identity->digests.at(frontier), frontier, record.key.identity_tag};
@@ -195,17 +195,17 @@ ProgramImpl::checkpoint_footprint(std::span<const CheckpointHandle> handles) con
     };
     for (const auto handle : handles) {
         const auto& record = checkpoint(handle);
-        auto& visited      = states[state_store->descriptor_index(record.state)];
+        auto& visited      = states[state_store->descriptor_index(record.continuation.image)];
         if (!visited) {
             visited = 1;
-            usage.state_slots += state_store->device_resident(record.state) ? 1U : 0U;
-            if (state_store->host_resident(record.state)) {
-                usage.host_bytes += state_images->host_layout().image_bytes;
+            usage.state_slots += state_store->device_resident(record.continuation.image) ? 1U : 0U;
+            if (state_store->host_resident(record.continuation.image)) {
+                usage.host_bytes += state_images->storage().image_bytes();
             }
         }
         auto& coverage   = histories[record.kv.get()];
-        coverage.main    = std::max(coverage.main, record.frontier);
-        coverage.backend = std::max(coverage.backend, record.backend_frontier);
+        coverage.main    = std::max(coverage.main, record.frontier());
+        coverage.backend = std::max(coverage.backend, record.backend_frontier());
     }
     for (const auto& [history, coverage] : histories) {
         count(*text_kv_addresses, *text_kv_pages, history->text, coverage.main, main,
@@ -220,24 +220,25 @@ ProgramImpl::checkpoint_footprint(std::span<const CheckpointHandle> handles) con
 
 CheckpointMetadata ProgramImpl::checkpoint_metadata(CheckpointHandle handle) const {
     const auto& record = checkpoint(handle);
-    return {.frontier = record.frontier,
+    return {.frontier = record.frontier(),
             .role     = record.role,
-            .leased =
-                checkpoints[handle.index].pins != 0 || state_store->source_pins(record.state) != 0};
+            .leased   = checkpoints[handle.index].pins != 0 ||
+                      state_store->source_pins(record.continuation.image) != 0};
 }
 
 CheckpointSummary ProgramImpl::checkpoint_summary(CheckpointHandle handle) const {
     const auto& record = checkpoint(handle);
-    CheckpointSummary out{.key = record.key, .frontier = record.frontier, .role = record.role};
+    CheckpointSummary out{.key = record.key, .frontier = record.frontier(), .role = record.role};
     const bool unpinned   = checkpoints[handle.index].pins == 0;
     out.leased            = checkpoint_metadata(handle).leased;
     const bool releasable = checkpoint_releasable(*this, handle);
-    if (unpinned && state_evictable(*state_store, record.state)) {
-        out.evictable_resources.state_slots = state_store->device_resident(record.state) ? 1U : 0U;
+    if (unpinned && state_evictable(*state_store, record.continuation.image)) {
+        out.evictable_resources.state_slots =
+            state_store->device_resident(record.continuation.image) ? 1U : 0U;
     }
-    if (releasable && state_store->host_resident(record.state) &&
-        state_evictable(*state_store, record.state)) {
-        out.evictable_resources.host_bytes += state_images->host_layout().image_bytes;
+    if (releasable && state_store->host_resident(record.continuation.image) &&
+        state_evictable(*state_store, record.continuation.image)) {
+        out.evictable_resources.host_bytes += state_images->storage().image_bytes();
     }
     const auto scan = [&](const context::KVAddressSpaceStore& addresses,
                           const context::LogicalKVPageStore& pages,
@@ -253,11 +254,11 @@ CheckpointSummary ProgramImpl::checkpoint_summary(CheckpointHandle handle) const
             }
         }
     };
-    scan(*text_kv_addresses, *text_kv_pages, record.kv->text, record.frontier,
+    scan(*text_kv_addresses, *text_kv_pages, record.kv->text, record.frontier(),
          out.evictable_resources.main_kv_pages);
     if (record.kv->backend) {
-        scan(*backend_kv_addresses, *backend_kv_pages, *record.kv->backend, record.backend_frontier,
-             out.evictable_resources.backend_kv_pages);
+        scan(*backend_kv_addresses, *backend_kv_pages, *record.kv->backend,
+             record.backend_frontier(), out.evictable_resources.backend_kv_pages);
     }
     return out;
 }
@@ -301,8 +302,8 @@ std::size_t ProgramImpl::host_bytes_released(std::span<const CheckpointHandle> h
         if (!checkpoint_releasable(*this, handle)) { return 0; }
         if (!records.insert(handle.index).second) { continue; }
         const auto& record = checkpoint(handle);
-        auto& state        = states[state_store->descriptor_index(record.state)];
-        state.state        = record.state;
+        auto& state        = states[state_store->descriptor_index(record.continuation.image)];
+        state.state        = record.continuation.image;
         ++state.references;
         ++histories[record.kv.get()];
     }
@@ -315,8 +316,8 @@ std::size_t ProgramImpl::host_bytes_released(std::span<const CheckpointHandle> h
             ++owners;
             references = slot.value->kv.use_count();
             if (!records.contains(index)) {
-                retained_main    = std::max(retained_main, slot.value->frontier);
-                retained_backend = std::max(retained_backend, slot.value->backend_frontier);
+                retained_main    = std::max(retained_main, slot.value->frontier());
+                retained_backend = std::max(retained_backend, slot.value->backend_frontier());
             }
         }
         // Active sequences and in-flight history holders keep their directories independently
@@ -334,7 +335,7 @@ std::size_t ProgramImpl::host_bytes_released(std::span<const CheckpointHandle> h
         if (entry.references == state_store->checkpoint_references(entry.state) &&
             state_store->can_release_after_checkpoint_references(entry.state, entry.references) &&
             state_store->host_resident(entry.state)) {
-            bytes += state_images->host_layout().image_bytes;
+            bytes += state_images->storage().image_bytes();
         }
     }
     const auto count = [&](const context::LogicalKVPageStore& pages, const auto& references) {
@@ -367,20 +368,21 @@ std::optional<std::size_t> ProgramImpl::pause_host_bytes(SequenceHandle handle) 
     const auto& control  = requests[lane];
     const auto& sequence = sequences[lane];
     if ((control.lifecycle != Lifecycle::Active && control.lifecycle != Lifecycle::Prefilling) ||
-        !sequence.kv || !state_store->valid(sequence.state.read)) {
+        !sequence.kv || !state_store->valid(sequence.continuation.image)) {
         return std::nullopt;
     }
-    const auto frontier = control.lifecycle == Lifecycle::Prefilling ? control.prefill->cursor
-                                                                     : sequence.execution_frontier;
+    const auto frontier = control.lifecycle == Lifecycle::Prefilling
+                              ? control.prefill->cursor
+                              : sequence.continuation.metadata.execution_frontier;
     if (!frontier) { return std::nullopt; }
     if (control.base->vision_control_plan) {
         for (const auto& item : control.base->vision_control_plan->items) {
             if (item.token_begin < frontier && frontier < item.token_end) { return std::nullopt; }
         }
     }
-    std::size_t bytes = state_store->host_resident(sequence.state.read)
+    std::size_t bytes = state_store->host_resident(sequence.continuation.image)
                             ? 0
-                            : state_images->host_layout().image_bytes;
+                            : state_images->storage().image_bytes();
     const auto count  = [&](const context::KVAddressSpaceStore& addresses,
                            const context::LogicalKVPageStore& pages,
                            context::KVAddressSpaceHandle address, std::uint32_t target) {
@@ -399,10 +401,12 @@ std::optional<std::size_t> ProgramImpl::pause_host_bytes(SequenceHandle handle) 
         // Masked-draft normalization can append accepted features before snapshot capture.
         if (required > mapped) { bytes += static_cast<std::size_t>(required - mapped) * stride; }
     };
-    count(*text_kv_addresses, *text_kv_pages, sequence.kv->text, sequence.text_kv_valid);
+    count(*text_kv_addresses, *text_kv_pages, sequence.kv->text,
+          sequence.continuation.metadata.text_kv_valid);
     if (sequence.kv->backend) {
         const auto backend = is_masked_draft_backend(speculative_backend)
-                                 ? std::max(sequence.execution_frontier, backend_kv_valid(sequence))
+                                 ? std::max(sequence.continuation.metadata.execution_frontier,
+                                            backend_kv_valid(sequence))
                                  : backend_kv_valid(sequence);
         count(*backend_kv_addresses, *backend_kv_pages, *sequence.kv->backend, backend);
     }
@@ -421,7 +425,7 @@ std::size_t ProgramImpl::release_redundant_host(std::span<const CheckpointHandle
         }
     };
     const auto protect = [&](const CheckpointState& record) {
-        states.insert(state_store->descriptor_index(record.state));
+        states.insert(state_store->descriptor_index(record.continuation.image));
         collect(*text_kv_addresses, *text_kv_pages, record.kv->text, main);
         if (record.kv->backend) {
             collect(*backend_kv_addresses, *backend_kv_pages, *record.kv->backend, backend);
@@ -429,7 +433,7 @@ std::size_t ProgramImpl::release_redundant_host(std::span<const CheckpointHandle
     };
     if (pending_backup && valid_sequence(*pending_backup)) {
         const auto& sequence = sequences[ContractAccess::lane(*pending_backup).value];
-        states.insert(state_store->descriptor_index(sequence.state.read));
+        states.insert(state_store->descriptor_index(sequence.continuation.image));
         if (sequence.kv) {
             collect(*text_kv_addresses, *text_kv_pages, sequence.kv->text, main);
             if (sequence.kv->backend) {
@@ -459,8 +463,8 @@ std::size_t ProgramImpl::release_redundant_host(std::span<const CheckpointHandle
     for (const auto& slot : checkpoints) {
         if (!slot.value) { continue; }
         const auto& record = *slot.value;
-        if (states.insert(state_store->descriptor_index(record.state)).second) {
-            (void)state_store->drop_host_replica(record.state);
+        if (states.insert(state_store->descriptor_index(record.continuation.image)).second) {
+            (void)state_store->drop_host_replica(record.continuation.image);
         }
         select(*text_kv_pages, *text_kv_addresses, record.kv->text, main);
         if (record.kv->backend) {

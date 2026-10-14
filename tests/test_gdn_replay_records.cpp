@@ -155,19 +155,21 @@ int main() {
         },
         "record capacity above eight");
 
-    ninfer::LayoutBuilder state_builder;
-    const auto state_layout = ninfer::plan_linear_attention_state_pool(
-        state_builder, {.layers         = 3,
-                        .conv_channels  = 256,
-                        .conv_width     = 3,
-                        .value_heads    = 6,
-                        .value_head_dim = 128,
-                        .key_head_dim   = 128,
-                        .slot_count     = 7,
-                        .conv_dtype     = ninfer::DType::BF16});
-    const std::size_t state_bytes = state_builder.finish(256);
+    ninfer::LayoutBuilder state_backing_builder;
+    ninfer::StateImageBuilder state_builder;
+    const auto state_layout =
+        ninfer::plan_linear_attention_state(state_builder, {.layers         = 3,
+                                                            .conv_channels  = 256,
+                                                            .conv_width     = 3,
+                                                            .value_heads    = 6,
+                                                            .value_head_dim = 128,
+                                                            .key_head_dim   = 128,
+                                                            .conv_dtype     = ninfer::DType::BF16});
+    const auto images             = state_builder.finish(state_backing_builder, 7);
+    const std::size_t state_bytes = state_backing_builder.finish(256);
     ninfer::HostBuffer state_backing(state_bytes);
-    ninfer::LinearAttentionStatePool state(state_backing.span(), state_layout);
+    ninfer::StateImageStorage storage(state_backing.span(), images);
+    ninfer::LinearAttentionStateView state(storage, state_layout);
     const auto all = state.all_layers_view();
     failures +=
         expect(all.conv_layer0.data == state.layer_view(0).conv.data, "conv layer-0 base differs");
@@ -182,7 +184,7 @@ int main() {
                                 static_cast<std::byte*>(state.layer_view(0).recurrent.data),
                             "recurrent layer stride");
     failures +=
-        expect_size(static_cast<std::size_t>(all.spec.slot_count), 7, "all-layer slot count");
+        expect_size(static_cast<std::size_t>(all.conv_layer0.ne[2]), 7, "all-layer slot count");
     failures += expect_size(static_cast<std::size_t>(records.spec.record_capacity), 5,
                             "independent record capacity");
 

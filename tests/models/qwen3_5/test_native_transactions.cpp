@@ -1923,7 +1923,8 @@ void replay_sampling_counts(DeviceContext& device, const q35::execution::Paramet
     const std::array<std::uint32_t, 1> expected_splits{
         static_cast<std::uint32_t>(prompt.size() + 1U + *splits.front())};
 
-    const auto check = [&](std::uint32_t lane, std::string_view phase) {
+    const auto check = [&](std::uint32_t lane, std::uint32_t state_frontier,
+                           std::string_view phase) {
         std::vector<std::int32_t> counts(expected_counts.size());
         const auto source =
             program.token_counts.slice(1, static_cast<std::int32_t>(lane), 1).view({vocabulary});
@@ -1934,7 +1935,8 @@ void replay_sampling_counts(DeviceContext& device, const q35::execution::Paramet
         const auto& sequence     = program.sequences[lane];
         const auto actual_splits = sequence.prefix_identity.execution_frontiers();
         require(sequence.ledger == expected_ledger &&
-                    sequence.execution_frontier == expected_frontier &&
+                    sequence.continuation.metadata.execution_frontier == state_frontier &&
+                    sequence.continuation.metadata.text_kv_valid == state_frontier &&
                     sequence.ledger_frontier == expected_frontier + 1U &&
                     sequence.prefix_identity.size() == expected_ledger.size() &&
                     actual_splits.size() == expected_splits.size() &&
@@ -1942,7 +1944,7 @@ void replay_sampling_counts(DeviceContext& device, const q35::execution::Paramet
                 std::string(phase) +
                     ": replay changed committed ledger, E/S or forced execution split");
     };
-    check(0, "after forced control");
+    check(0, expected_frontier, "after forced control");
     require(program.start_pause(initial, false, nullptr), "sampling-count fixture could not pause");
     auto paused = settle();
     require(paused.paused && !paused.paused->has_snapshot() &&
@@ -1950,14 +1952,14 @@ void replay_sampling_counts(DeviceContext& device, const q35::execution::Paramet
             "sampling-count fixture did not retain its committed replay target");
     const auto resumed = bind(1, &*paused.paused);
     paused.paused.reset();
-    check(1, "after lane rebinding");
+    check(1, 0, "after lane rebinding");
     bool recovered         = false;
     std::uint32_t replayed = 0;
     for (unsigned step = 0; step < 3; ++step) {
         reserve(resumed, q35::ExecutionUnitKind::Replay);
         const auto progress = program.advance_replay(resumed, nullptr);
         replayed += progress.processed_tokens;
-        check(1, "after replay chunk");
+        check(1, replayed, "after replay chunk");
         if (progress.complete) {
             recovered = true;
             break;

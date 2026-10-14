@@ -14,16 +14,15 @@ __global__ void gdn_projected_conv_kernel(
     const __nv_bfloat16* __restrict__ state_read, const std::int32_t* __restrict__ valid_columns,
     const std::int32_t* __restrict__ initial_state_slots, __nv_bfloat16* __restrict__ query,
     __nv_bfloat16* __restrict__ key, __nv_bfloat16* __restrict__ value, std::int32_t width,
-    Publish publish) {
+    std::int64_t slot_stride, Publish publish) {
     static_assert(Channels == QueryRows + KeyRows + ValueRows);
     const std::int32_t row = static_cast<std::int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
     if (row >= Channels) { return; }
     const std::int32_t batch = static_cast<std::int32_t>(blockIdx.y);
     if constexpr (StaticWidth != 0) { width = StaticWidth; }
 
-    std::int32_t valid                 = valid_columns == nullptr ? width : valid_columns[batch];
-    valid                              = valid < 0 ? 0 : (valid > width ? width : valid);
-    constexpr std::int64_t slot_stride = static_cast<std::int64_t>(Channels) * 3;
+    std::int32_t valid = valid_columns == nullptr ? width : valid_columns[batch];
+    valid              = valid < 0 ? 0 : (valid > width ? width : valid);
     const std::int64_t initial_base =
         static_cast<std::int64_t>(initial_state_slots[batch]) * slot_stride;
     float s0       = __bfloat162float(state_read[initial_base + row]);
@@ -83,7 +82,7 @@ void launch(const Tensor& projected, const Tensor& conv_weight, const Tensor& st
                         : static_cast<const std::int32_t*>(valid_columns.data),
                     static_cast<const std::int32_t*>(initial_state_slots.data),
                     static_cast<__nv_bfloat16*>(query.data), static_cast<__nv_bfloat16*>(key.data),
-                    static_cast<__nv_bfloat16*>(value.data), width, publish);
+                    static_cast<__nv_bfloat16*>(value.data), width, state_read.nb[2] / 2, publish);
             CUDA_CHECK(cudaGetLastError());
             return;
         }
@@ -99,7 +98,7 @@ void launch(const Tensor& projected, const Tensor& conv_weight, const Tensor& st
                                           : static_cast<const std::int32_t*>(valid_columns.data),
             static_cast<const std::int32_t*>(initial_state_slots.data),
             static_cast<__nv_bfloat16*>(query.data), static_cast<__nv_bfloat16*>(key.data),
-            static_cast<__nv_bfloat16*>(value.data), width, publish);
+            static_cast<__nv_bfloat16*>(value.data), width, state_read.nb[2] / 2, publish);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -129,12 +128,12 @@ void launch_gdn_projected_conv_snapshot(const Tensor& projected, const Tensor& c
                                         const Tensor& initial_state_slots,
                                         const Tensor& snapshot_base_slots, Tensor& query,
                                         Tensor& key, Tensor& value, cudaStream_t stream) {
-    dispatch(projected, conv_weight, conv_states, valid_columns, initial_state_slots, query, key,
-             value,
-             SnapshotHistoryPublish{static_cast<__nv_bfloat16*>(conv_states.data),
-                                    static_cast<const std::int32_t*>(snapshot_base_slots.data),
-                                    projected.ne[0]},
-             stream);
+    dispatch(
+        projected, conv_weight, conv_states, valid_columns, initial_state_slots, query, key, value,
+        SnapshotHistoryPublish{static_cast<__nv_bfloat16*>(conv_states.data), conv_states.nb[2] / 2,
+                               static_cast<const std::int32_t*>(snapshot_base_slots.data),
+                               projected.ne[0]},
+        stream);
 }
 
 void launch_gdn_projected_conv_record(const Tensor& conv_record, const Tensor& conv_weight,

@@ -1,3 +1,5 @@
+#include "ops/state_fixture.h"
+#include <optional>
 #include "ninfer/ops/sliding_window_attention.h"
 
 #include "core/decode_graph.h"
@@ -53,6 +55,7 @@ struct Cache {
     std::vector<float> k, v;
     std::vector<std::uint16_t> k_bits, v_bits;
     GuardedDeviceBuffer device_k, device_v;
+    std::optional<SlottedStateFixture> key_state, value_state;
 
     std::size_t index(int lane, int head, int position, int d) const {
         return (((static_cast<std::size_t>(lane) * Hkv + head) * padded +
@@ -85,17 +88,22 @@ struct Cache {
     }
 
     CyclicKVCacheLayerView view() {
-        return {.k               = Tensor(device_k.span(), DType::BF16, {D, padded, Hkv, Lanes}),
-                .v               = Tensor(device_v.span(), DType::FP16, {D, padded, Hkv, Lanes}),
+        key_state.emplace(Tensor(device_k.span(), DType::BF16, {D, padded, Hkv, Lanes}), 3);
+        value_state.emplace(Tensor(device_v.span(), DType::FP16, {D, padded, Hkv, Lanes}), 3);
+        return {.k               = key_state->tensor,
+                .v               = value_state->tensor,
                 .capacity        = static_cast<std::uint32_t>(window),
                 .padded_capacity = static_cast<std::uint32_t>(padded),
                 .num_kv_heads    = Hkv,
                 .head_dim        = D,
-                .lane_capacity   = Lanes};
+                .slot_count      = Lanes};
     }
 
     int verify() const {
+        key_state->copy_back();
+        value_state->copy_back();
         int failures =
+            key_state->verify_guards("cyclic K") + value_state->verify_guards("cyclic V") +
             device_k.verify_guards("context K guards") + device_v.verify_guards("context V guards");
         failures +=
             verify_exact("context K unchanged",

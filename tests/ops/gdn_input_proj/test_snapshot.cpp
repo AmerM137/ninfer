@@ -1,3 +1,4 @@
+#include "ops/state_fixture.h"
 #include "core/weight.h"
 #include "cuda_fixture.h"
 #include "core/buffer.h"
@@ -341,6 +342,8 @@ int run_batched_case(std::string_view label, std::int32_t hidden, std::int32_t v
     Tensor x(device_activation.span(), DType::BF16, {hidden, width, batch});
     Tensor conv(device_conv_weight.span(), DType::BF16, {channels, 4});
     Tensor conv_state(state.span(), DType::BF16, {channels, 3, slots});
+    SlottedStateFixture history(conv_state, 2);
+    conv_state = history.tensor;
     Tensor valid;
     if (!valid_columns.empty()) { valid = Tensor(device_valid.span(), DType::I32, {batch}); }
     Tensor initial(device_initial.span(), DType::I32, {batch});
@@ -356,11 +359,12 @@ int run_batched_case(std::string_view label, std::int32_t hidden, std::int32_t v
     launch(x, conv, conv_state, valid, initial, snapshot_base, q, k, v, z_output, workspace);
     cuda_synchronize();
 
-    int failures                                 = 0;
-    const std::vector<double> query_values       = query.values();
-    const std::vector<double> key_values         = key.values();
-    const std::vector<double> value_values       = value.values();
-    const std::vector<double> z_values           = z.values();
+    int failures                           = 0;
+    const std::vector<double> query_values = query.values();
+    const std::vector<double> key_values   = key.values();
+    const std::vector<double> value_values = value.values();
+    const std::vector<double> z_values     = z.values();
+    history.copy_back();
     const std::vector<std::uint16_t> state_after = state.bits();
     std::vector<double> query_actual;
     std::vector<double> query_expected;
@@ -426,6 +430,7 @@ int run_batched_case(std::string_view label, std::int32_t hidden, std::int32_t v
     failures += key.verify_guards(std::string(label) + " key");
     failures += value.verify_guards(std::string(label) + " value");
     failures += z.verify_guards(std::string(label) + " z");
+    failures += history.verify_guards("snapshot history");
     failures += state.verify_guards(std::string(label) + " state");
     failures += query.verify_fully_written(std::string(label) + " query");
     failures += key.verify_fully_written(std::string(label) + " key");
@@ -487,6 +492,8 @@ int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& value_z_we
     Tensor x(device_activation.span(), DType::BF16, {kHidden, tokens});
     Tensor conv(device_conv_weight.span(), DType::BF16, {kChannels, 4});
     Tensor conv_state(state.span(), DType::BF16, {kChannels, 3, slots});
+    SlottedStateFixture history(conv_state, 2);
+    conv_state = history.tensor;
     Tensor initial(device_initial.span(), DType::I32, {1});
     Tensor snapshot_base(device_snapshot_base.span(), DType::I32, {1});
     Tensor q                          = query.tensor();
@@ -520,7 +527,8 @@ int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& value_z_we
                                               token_activation, kHidden);
         },
         full_reference);
-    const std::int32_t sample_count              = snapshot_sample_count(tokens, full_reference);
+    const std::int32_t sample_count = snapshot_sample_count(tokens, full_reference);
+    history.copy_back();
     const std::vector<std::uint16_t> state_after = state.bits();
     const std::string suffix                     = " Q4/Q5 A16 T=" + std::to_string(tokens) +
                                " initial=" + std::to_string(initial_slot) +
@@ -531,6 +539,7 @@ int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& value_z_we
         "snapshot state" + suffix,
         gather_state(state_after, kChannels, kValueRows, tokens, kSnapshotBaseSlot, full_reference),
         oracle.state, kGdnInputProjConvSnapshotA16Tolerance);
+    failures += history.verify_guards("snapshot history");
     failures += state.verify_guards("snapshot state" + suffix);
     failures += verify_state_effects("snapshot state" + suffix, state_before, state_after,
                                      kChannels, tokens, slots, kSnapshotBaseSlot);
@@ -771,6 +780,8 @@ int run_q8_case(DevicePackedWeight& parent, std::int32_t tokens, std::int32_t in
     Tensor x(device_activation.span(), DType::BF16, {kHidden, tokens});
     Tensor conv(device_conv_weight.span(), DType::BF16, {kChannels, 4});
     Tensor conv_state(state.span(), DType::BF16, {kChannels, 3, slots});
+    SlottedStateFixture history(conv_state, 2);
+    conv_state = history.tensor;
     Tensor initial(device_initial.span(), DType::I32, {1});
     Tensor snapshot_base(device_snapshot_base.span(), DType::I32, {1});
     Tensor q                          = query.tensor();
@@ -828,6 +839,7 @@ int run_q8_case(DevicePackedWeight& parent, std::int32_t tokens, std::int32_t in
                 parent.host, row, activation.data() + static_cast<std::size_t>(token) * kHidden,
                 kHidden);
         });
+    history.copy_back();
     const std::vector<std::uint16_t> state_after = state.bits();
     const std::string suffix =
         " Q8 K=" + std::to_string(kHidden) + " A16 T=" + std::to_string(tokens) +
@@ -837,6 +849,7 @@ int run_q8_case(DevicePackedWeight& parent, std::int32_t tokens, std::int32_t in
     failures += compare("snapshot state" + suffix,
                         gather_state(state_after, kChannels, kValueRows, tokens, kSnapshotBaseSlot),
                         oracle.state, kQ8GdnInputProjConvSnapshotA16Tolerance);
+    failures += history.verify_guards("snapshot history");
     failures += state.verify_guards("snapshot state" + suffix);
     failures += verify_state_effects("snapshot state" + suffix, state_before, state_after,
                                      kChannels, tokens, slots, kSnapshotBaseSlot);
@@ -948,6 +961,8 @@ int run_nvfp4_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearP
     Tensor x(device_activation.span(), DType::BF16, {kHidden, tokens});
     Tensor conv(device_conv_weight.span(), DType::BF16, {kChannels, 4});
     Tensor conv_state(state.span(), DType::BF16, {kChannels, 3, slots});
+    SlottedStateFixture history(conv_state, 2);
+    conv_state = history.tensor;
     Tensor initial(device_initial.span(), DType::I32, {1});
     Tensor snapshot_base(device_snapshot_base.span(), DType::I32, {1});
     Tensor q                          = query.tensor();
@@ -981,12 +996,14 @@ int run_nvfp4_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearP
     const std::string suffix =
         std::string(" NVFP4 ") + (a4 ? "A4" : "A16") + " T=" + std::to_string(tokens) +
         " initial=" + std::to_string(initial_slot) + " base=" + std::to_string(kSnapshotBaseSlot);
+    history.copy_back();
     const std::vector<std::uint16_t> state_after = state.bits();
     int failures =
         verify_snapshot_outputs(suffix, query, key, value, kValueRows, tokens, oracle, criterion);
     failures += compare("snapshot state" + suffix,
                         gather_state(state_after, kChannels, kValueRows, tokens, kSnapshotBaseSlot),
                         oracle.state, criterion);
+    failures += history.verify_guards("snapshot history");
     failures += state.verify_guards("snapshot state" + suffix);
     failures += verify_state_effects("snapshot state" + suffix, state_before, state_after,
                                      kChannels, tokens, slots, kSnapshotBaseSlot);
@@ -1097,6 +1114,8 @@ int run_fp8_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearPol
     Tensor x(device_activation.span(), DType::BF16, {kHidden, tokens});
     Tensor conv(device_conv_weight.span(), DType::BF16, {kChannels, 4});
     Tensor conv_state(state.span(), DType::BF16, {kChannels, 3, slots});
+    SlottedStateFixture history(conv_state, 2);
+    conv_state = history.tensor;
     Tensor initial(device_initial.span(), DType::I32, {1});
     Tensor snapshot_base =
         shared_state_selectors ? initial : Tensor(device_snapshot_base.span(), DType::I32, {1});
@@ -1138,6 +1157,7 @@ int run_fp8_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearPol
     const std::string suffix =
         std::string(" FP8 ") + (uses_a8 ? "A8" : "A16") + " T=" + std::to_string(tokens) +
         " initial=" + std::to_string(initial_slot) + " base=" + std::to_string(snapshot_base_slot);
+    history.copy_back();
     const std::vector<std::uint16_t> state_after = state.bits();
     int failures =
         verify_snapshot_outputs(suffix, query, key, value, kValueRows, tokens, oracle, criterion);
@@ -1145,6 +1165,7 @@ int run_fp8_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearPol
         compare("snapshot state" + suffix,
                 gather_state(state_after, kChannels, kValueRows, tokens, snapshot_base_slot),
                 oracle.state, criterion);
+    failures += history.verify_guards("snapshot history");
     failures += state.verify_guards("snapshot state" + suffix);
     failures += verify_state_effects("snapshot state" + suffix, state_before, state_after,
                                      kChannels, tokens, slots, snapshot_base_slot);

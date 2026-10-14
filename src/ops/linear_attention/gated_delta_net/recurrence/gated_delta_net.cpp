@@ -128,7 +128,9 @@ RecurrenceGeometry validate_recurrent_batch_update(
     common::operand::contiguous_nonnull(v, "gated_delta_net", "v", device);
     common::operand::contiguous_nonnull(g, "gated_delta_net", "g", device);
     common::operand::contiguous_nonnull(beta, "gated_delta_net", "beta", device);
-    common::operand::contiguous_nonnull(ssm_states, "gated_delta_net", "ssm_states", device);
+    common::operand::slotted_tensor(ssm_states, DType::FP32,
+                                    {128, 128, geometry.value_heads, ssm_states.ne[3]}, 3, 16,
+                                    "gated_delta_net", "ssm_states", device);
     common::operand::contiguous_nonnull(source_state_slots, "gated_delta_net", "source_state_slots",
                                         device);
     common::operand::contiguous_nonnull(destination_state_slots, "gated_delta_net",
@@ -136,6 +138,14 @@ RecurrenceGeometry validate_recurrent_batch_update(
     common::operand::contiguous_nonnull(out, "gated_delta_net", "out", device);
 
     detail::gated_delta_net::require_scale(scale, "gated_delta_net");
+    const auto state_blocks = common::operand::blocks(ssm_states, "gated_delta_net");
+    for (const Tensor* operand :
+         {&q, &k, &v, &g, &beta, &source_state_slots, &destination_state_slots, &out}) {
+        if (common::operand::overlaps(state_blocks,
+                                      common::operand::range(*operand, "gated_delta_net")))
+            throw std::invalid_argument("gated_delta_net: operands overlap state storage");
+    }
+
     return geometry;
 }
 

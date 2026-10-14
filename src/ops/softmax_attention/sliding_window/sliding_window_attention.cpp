@@ -36,7 +36,7 @@ void validate_context(const CyclicKVCacheLayerView& context, std::uint32_t windo
     common::operand::device(context.device(), device, op, "cache");
     if (context.num_kv_heads != kKVHeads || context.head_dim != kHeadDim ||
         context.capacity != window || context.padded_capacity < context.capacity ||
-        context.lane_capacity <= 0) {
+        context.slot_count <= 0) {
         throw std::invalid_argument(std::string(op) + ": invalid cyclic context");
     }
     if (context.padded_capacity >
@@ -47,12 +47,16 @@ void validate_context(const CyclicKVCacheLayerView& context, std::uint32_t windo
     if (context.k.dtype != DType::BF16 || context.v.dtype != DType::FP16) {
         throw std::invalid_argument(std::string(op) + ": context K/V must be BF16/FP16");
     }
-    common::operand::shape(context.k, {kHeadDim, padded, kKVHeads, context.lane_capacity}, op,
+    common::operand::shape(context.k, {kHeadDim, padded, kKVHeads, context.slot_count}, op,
                            "context k");
-    common::operand::shape(context.v, {kHeadDim, padded, kKVHeads, context.lane_capacity}, op,
+    common::operand::shape(context.v, {kHeadDim, padded, kKVHeads, context.slot_count}, op,
                            "context v");
-    common::operand::contiguous_nonnull(context.k, op, "context k", device);
-    common::operand::contiguous_nonnull(context.v, op, "context v", device);
+    common::operand::slotted_tensor(context.k, DType::BF16,
+                                    {kHeadDim, padded, kKVHeads, context.slot_count}, 3, 16, op,
+                                    "context K", device);
+    common::operand::slotted_tensor(context.v, DType::FP16,
+                                    {kHeadDim, padded, kKVHeads, context.slot_count}, 3, 16, op,
+                                    "context V", device);
 }
 
 struct PartialWorkspace {
@@ -101,7 +105,7 @@ std::size_t sliding_window_attention_workspace_capacity_bytes(
 
 void sliding_window_attention(const Tensor& q, const Tensor& query_k, const Tensor& query_v,
                               const Tensor& positions, const Tensor& valid_columns,
-                              const Tensor& lanes, AttentionHeadGeometry geometry,
+                              const Tensor& state_slots, AttentionHeadGeometry geometry,
                               std::uint32_t window, float scale,
                               const CyclicKVCacheLayerView& context,
                               SlidingWindowAttentionExecutionEnvelope envelope,
@@ -118,9 +122,9 @@ void sliding_window_attention(const Tensor& q, const Tensor& query_k, const Tens
         throw std::invalid_argument("sliding_window_attention: q/k/v/out must be BF16");
     }
     if (positions.dtype != DType::I32 || valid_columns.dtype != DType::I32 ||
-        lanes.dtype != DType::I32) {
+        state_slots.dtype != DType::I32) {
         throw std::invalid_argument(
-            "sliding_window_attention: positions/valid_columns/lanes must be I32");
+            "sliding_window_attention: positions/valid_columns/state_slots must be I32");
     }
     const std::int32_t tokens = q.ne[2];
     const std::int32_t batch  = q.ne[3];
@@ -135,14 +139,14 @@ void sliding_window_attention(const Tensor& q, const Tensor& query_k, const Tens
     common::operand::shape(query_v, {kHeadDim, kKVHeads, tokens, batch}, op, "query v");
     common::operand::shape(positions, {tokens, batch, 1, 1}, op, "positions");
     common::operand::shape(valid_columns, {batch, 1, 1, 1}, op, "valid columns");
-    common::operand::shape(lanes, {batch, 1, 1, 1}, op, "lanes");
+    common::operand::shape(state_slots, {batch, 1, 1, 1}, op, "state_slots");
     common::operand::shape(out, {kHeadDim, kQHeads, tokens, batch}, op, "out");
     common::operand::contiguous_nonnull(q, op, "q", execution.device());
     common::operand::contiguous_nonnull(query_k, op, "query k", execution.device());
     common::operand::contiguous_nonnull(query_v, op, "query v", execution.device());
     common::operand::contiguous_nonnull(positions, op, "positions", execution.device());
     common::operand::contiguous_nonnull(valid_columns, op, "valid columns", execution.device());
-    common::operand::contiguous_nonnull(lanes, op, "lanes", execution.device());
+    common::operand::contiguous_nonnull(state_slots, op, "state_slots", execution.device());
     common::operand::contiguous_nonnull(out, op, "out", execution.device());
     validate_context(context, window, op, execution.device());
     if (envelope.min_context > envelope.max_context ||
@@ -160,9 +164,9 @@ void sliding_window_attention(const Tensor& q, const Tensor& query_k, const Tens
     if (plan.route == detail::SlidingWindowAttentionRoute::SplitKv) {
         partial = allocate_workspace(workspace, tokens, plan.split_capacity, batch);
     }
-    detail::launch_sliding_window_attention(q, query_k, query_v, positions, valid_columns, lanes,
-                                            scale, context, plan, partial.acc, partial.m, partial.l,
-                                            out, stream);
+    detail::launch_sliding_window_attention(q, query_k, query_v, positions, valid_columns,
+                                            state_slots, scale, context, plan, partial.acc,
+                                            partial.m, partial.l, out, stream);
 }
 
 } // namespace ninfer::ops

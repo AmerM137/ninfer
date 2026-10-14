@@ -88,17 +88,17 @@ std::size_t key_scratch_capacity(std::int32_t columns) {
 }
 
 void validate_cache(const CyclicKVCacheLayerView& cache, std::int32_t padded,
-                    std::int32_t lane_capacity, Device device) {
+                    std::int32_t slot_count, Device device) {
     if (cache.capacity != kCapacity ||
         cache.padded_capacity != static_cast<std::uint32_t>(padded) ||
         cache.num_kv_heads != kKVHeads || cache.head_dim != kHeadDim ||
-        cache.lane_capacity != lane_capacity || padded < kCapacity || lane_capacity <= 0) {
+        cache.slot_count != slot_count || padded < kCapacity || slot_count <= 0) {
         throw std::invalid_argument("context_kv_materialize: invalid cyclic cache geometry");
     }
-    require_tensor(cache.k, DType::BF16, kHeadDim, padded, kKVHeads, lane_capacity, 16, "cache K",
-                   device);
-    require_tensor(cache.v, DType::FP16, kHeadDim, padded, kKVHeads, lane_capacity, 16, "cache V",
-                   device);
+    common::operand::slotted_tensor(cache.k, DType::BF16, {kHeadDim, padded, kKVHeads, slot_count},
+                                    3, 16, kOp, "cache K", device);
+    common::operand::slotted_tensor(cache.v, DType::FP16, {kHeadDim, padded, kKVHeads, slot_count},
+                                    3, 16, kOp, "cache V", device);
 }
 
 } // namespace
@@ -148,15 +148,15 @@ void context_kv_materialize(
         static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
         throw std::overflow_error("context_kv_materialize: padded capacity exceeds int32");
     }
-    const std::int32_t padded = static_cast<std::int32_t>(layers.front().cache.padded_capacity);
-    const std::int32_t lane_capacity = layers.front().cache.lane_capacity;
+    const std::int32_t padded     = static_cast<std::int32_t>(layers.front().cache.padded_capacity);
+    const std::int32_t slot_count = layers.front().cache.slot_count;
     for (std::size_t index = 0; index < layers.size(); ++index) {
         const ContextKVMaterializeLayerView& layer = layers[index];
         require_weight(layer.key_weight, "key weight", execution.device());
         require_weight(layer.value_weight, "value weight", execution.device());
         require_tensor(layer.key_norm_weight, DType::BF16, kHeadDim, 1, 1, 1, 4, "key norm weight",
                        execution.device());
-        validate_cache(layer.cache, padded, lane_capacity, execution.device());
+        validate_cache(layer.cache, padded, slot_count, execution.device());
     }
 
     if (envelope.max_count == 0) return;

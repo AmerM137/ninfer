@@ -25,8 +25,7 @@ prefix_copy_cyclic_unit(const __nv_bfloat16* __restrict__ k, const __nv_bfloat16
     const std::int64_t src =
         static_cast<std::int64_t>(d) + static_cast<std::int64_t>(kKVCacheAppendPrefixHeadDim) *
                                            (kv_head + kKVCacheAppendPrefixHeads * token);
-    const std::int64_t dst =
-        kv::cyclic_offset<128, 8, Capacity>(slot, kv_head, 0, padded_capacity, d);
+    const std::int64_t dst = kv::cyclic_offset<128, Capacity>(slot, kv_head, padded_capacity, d);
 
     const int4 key   = *reinterpret_cast<const int4*>(&k[src]);
     const int4 value = common::bf16x8_bits_to_f16x8_bits(*reinterpret_cast<const int4*>(&v[src]));
@@ -62,8 +61,9 @@ template <int Capacity, int Threads>
 __global__ void prefix_cyclic_kernel(
     const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
     const std::int32_t* __restrict__ positions, const std::int32_t* __restrict__ counts,
-    const std::int32_t* __restrict__ lanes, __nv_bfloat16* __restrict__ cache_k,
-    __half* __restrict__ cache_v, int min_count, int max_count, int width, int padded_capacity) {
+    const std::int32_t* __restrict__ state_slots, __nv_bfloat16* __restrict__ cache_k,
+    __half* __restrict__ cache_v, int min_count, int max_count, int width, int padded_capacity,
+    std::int64_t key_slot_stride, std::int64_t value_slot_stride) {
     static_assert(Capacity == 2048 || Capacity == 4096);
     static_assert((Capacity & (Capacity - 1)) == 0);
     constexpr int UnitsPerToken = kKVCacheAppendPrefixHeads * kKVCacheAppendPrefixHeadDim / 8;
@@ -77,13 +77,11 @@ __global__ void prefix_cyclic_kernel(
     constexpr std::int64_t ElementsPerToken =
         kKVCacheAppendPrefixHeadDim * kKVCacheAppendPrefixHeads;
     const std::int64_t input_offset = ElementsPerToken * width * batch;
-    const std::int64_t cache_offset =
-        ElementsPerToken * static_cast<std::int64_t>(padded_capacity) * lanes[batch];
     k += input_offset;
     v += input_offset;
     positions += static_cast<std::int64_t>(width) * batch;
-    cache_k += cache_offset;
-    cache_v += cache_offset;
+    cache_k += key_slot_stride * state_slots[batch];
+    cache_v += value_slot_stride * state_slots[batch];
 
     const int position = positions[token];
     const int slot     = position & (Capacity - 1);

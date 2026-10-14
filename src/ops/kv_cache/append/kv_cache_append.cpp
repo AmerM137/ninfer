@@ -168,13 +168,16 @@ void validate_cyclic_cache(const CyclicKVCacheLayerView& cache,
     const auto padded = static_cast<std::int32_t>(cache.padded_capacity);
     if (cache.k.dtype != DType::BF16 || cache.v.dtype != DType::FP16 || cache.k.ne[0] != kHeadDim ||
         cache.k.ne[1] != padded || cache.k.ne[2] != kKVHeads || cache.v.ne[0] != kHeadDim ||
-        cache.v.ne[1] != padded || cache.v.ne[2] != kKVHeads ||
-        cache.v.ne[3] != cache.lane_capacity || cache.lane_capacity <= 0 ||
-        cache.k.ne[3] != cache.lane_capacity) {
+        cache.v.ne[1] != padded || cache.v.ne[2] != kKVHeads || cache.v.ne[3] != cache.slot_count ||
+        cache.slot_count <= 0 || cache.k.ne[3] != cache.slot_count) {
         throw std::invalid_argument("kv_cache_append_prefix: invalid cyclic cache tensors");
     }
-    require_vector_aligned(cache.k, "cache k", device);
-    require_vector_aligned(cache.v, "cache v", device);
+    common::operand::slotted_tensor(cache.k, DType::BF16,
+                                    {kHeadDim, padded, kKVHeads, cache.slot_count}, 3, 16,
+                                    kPrefixAppendOp, "cache K", device);
+    common::operand::slotted_tensor(cache.v, DType::FP16,
+                                    {kHeadDim, padded, kKVHeads, cache.slot_count}, 3, 16,
+                                    kPrefixAppendOp, "cache V", device);
 }
 
 } // namespace
@@ -219,13 +222,13 @@ void kv_cache_append_prefix(const Tensor& k, const Tensor& v, const Tensor& posi
 }
 
 void kv_cache_append_prefix(const Tensor& k, const Tensor& v, const Tensor& positions,
-                            const Tensor& counts, const Tensor& lanes,
+                            const Tensor& counts, const Tensor& state_slots,
                             KVCacheAppendPrefixExecutionEnvelope envelope,
                             CyclicKVCacheLayerView cache, CudaExecutionView execution) {
     const auto stream = execution.stream();
-    validate_inputs(k, v, positions, counts, lanes, envelope, execution.device());
+    validate_inputs(k, v, positions, counts, state_slots, envelope, execution.device());
     validate_cyclic_cache(cache, envelope, execution.device());
-    detail::kv_cache_append_prefix_dispatch(k, v, positions, counts, lanes, cache, envelope,
+    detail::kv_cache_append_prefix_dispatch(k, v, positions, counts, state_slots, cache, envelope,
                                             stream);
 }
 

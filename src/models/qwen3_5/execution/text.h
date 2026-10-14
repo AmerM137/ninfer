@@ -73,7 +73,7 @@ struct DFlashFeatureSink {
 class TextContext {
 public:
     TextContext(DeviceContext& ctx, const execution::Parameters& weights, MemoryArena& work,
-                const qwen3_5::PagedKVCache& batch_text_kv, LinearAttentionStatePool& state,
+                const qwen3_5::PagedKVCache& batch_text_kv, LinearAttentionStateView& state,
                 qwen3_5::RoundState& io, Tensor& prefill_hidden, std::uint32_t prefill_chunk,
                 std::uint32_t text_kv_base,
                 qwen3_5::PagedKVCacheView mtp_kv          = qwen3_5::PagedKVCacheView(),
@@ -225,7 +225,7 @@ private:
     qwen3_5::PagedKVCacheView mtp_kv_;
     const qwen3_5::PagedKVCache& batch_text_kv_;
     const qwen3_5::PagedKVCache* batch_mtp_kv_ = nullptr;
-    LinearAttentionStatePool& state_;
+    LinearAttentionStateView& state_;
     qwen3_5::RoundState& io_;
     Tensor& prefill_hidden_;
     // Borrowed from Program; every measured chunk retires before this pair is reused.

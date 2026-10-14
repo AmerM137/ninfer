@@ -1,3 +1,4 @@
+#include "ops/state_fixture.h"
 #include "core/weight.h"
 #include "cuda_fixture.h"
 #include "core/buffer.h"
@@ -144,7 +145,11 @@ int run_case(std::string_view label, std::int32_t hidden, std::int32_t value_row
     Tensor x(device_x.span(), DType::BF16, {hidden, width, batch});
     Tensor conv_weight(device_conv_weight.span(), DType::BF16, {channels, 4});
     Tensor snapshot_state_view(snapshot_state.span(), DType::BF16, {channels, 3, slots});
+    SlottedStateFixture snapshot_history(snapshot_state_view, 2);
+    snapshot_state_view = snapshot_history.tensor;
     Tensor record_state_view(record_state.span(), DType::BF16, {channels, 3, source_slots});
+    SlottedStateFixture record_history(record_state_view, 2);
+    record_state_view = record_history.tensor;
     Tensor valid;
     if (!dense) { valid = Tensor(device_valid.span(), DType::I32, {batch}); }
     Tensor initial(device_initial.span(), DType::I32, {batch});
@@ -220,6 +225,10 @@ int run_case(std::string_view label, std::int32_t hidden, std::int32_t value_row
     failures += verify_zero_tail(std::string(label) + " value", record_value.bits(), value_rows,
                                  width, batch, valid_columns);
 
+    snapshot_history.copy_back();
+    record_history.copy_back();
+    failures += snapshot_history.verify_guards("snapshot history");
+    failures += record_history.verify_guards("record history");
     const std::vector<std::uint16_t> snapshot_state_after =
         from_device<std::uint16_t>(snapshot_state, snapshot_before.size());
     const std::vector<std::uint16_t> record_state_after =

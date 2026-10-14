@@ -115,7 +115,7 @@ void launch_q8_gdn_conv_n16384_k2560_snapshot(const Tensor& x, const Weight& wei
                                               Tensor& value, Tensor& z, bool aggregate,
                                               cudaStream_t stream) {
     dispatch(x, weight, conv_weight, states, valid, initial, query, key, value, z,
-             SnapshotHistoryPublish{static_cast<__nv_bfloat16*>(states.data),
+             SnapshotHistoryPublish{static_cast<__nv_bfloat16*>(states.data), states.nb[2] / 2,
                                     static_cast<const std::int32_t*>(bases.data),
                                     ConvGeometry::channels},
              aggregate, stream);

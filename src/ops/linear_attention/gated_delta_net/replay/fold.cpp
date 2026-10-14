@@ -43,47 +43,42 @@ void validate_fold_states(const GdnReplayRecords& records,
     if (state.layers != static_cast<std::uint32_t>(record.layers) ||
         state.conv_channels != record.conv_channels || state.conv_width != 3 ||
         state.value_heads != record.value_heads || state.value_head_dim != kStateDim ||
-        state.key_head_dim != kStateDim || state.slot_count <= 0 ||
+        state.key_head_dim != kStateDim || states.conv_layer0.ne[2] <= 0 ||
         state.conv_dtype != DType::BF16) {
         throw std::invalid_argument(std::string(kOp) + ": state geometry does not match records");
     }
-    common::operand::tensor(states.conv_layer0, DType::BF16,
-                            {record.conv_channels, 3, state.slot_count}, 256, kOp,
-                            "conv state layer 0", records.conv.device);
-    common::operand::tensor(states.recurrent_layer0, DType::FP32,
-                            {kStateDim, kStateDim, record.value_heads, state.slot_count}, 256, kOp,
-                            "recurrent state layer 0", records.conv.device);
+    common::operand::slotted_tensor(states.conv_layer0, DType::BF16,
+                                    {record.conv_channels, 3, states.conv_layer0.ne[2]}, 2, 256,
+                                    kOp, "conv state layer 0", records.conv.device);
+    common::operand::slotted_tensor(
+        states.recurrent_layer0, DType::FP32,
+        {kStateDim, kStateDim, record.value_heads, states.conv_layer0.ne[2]}, 3, 256, kOp,
+        "recurrent state layer 0", records.conv.device);
     if (states.conv_layer_stride_bytes <= 0 || states.recurrent_layer_stride_bytes <= 0 ||
         states.conv_layer_stride_bytes % static_cast<std::int64_t>(sizeof(std::uint16_t)) != 0 ||
         states.recurrent_layer_stride_bytes % static_cast<std::int64_t>(sizeof(float)) != 0 ||
-        static_cast<std::uint64_t>(states.conv_layer_stride_bytes) < states.conv_layer0.bytes() ||
+        static_cast<std::uint64_t>(states.conv_layer_stride_bytes) <
+            states.conv_layer0.slice(2, 0, 1).bytes() ||
         static_cast<std::uint64_t>(states.recurrent_layer_stride_bytes) <
-            states.recurrent_layer0.bytes()) {
+            states.recurrent_layer0.slice(3, 0, 1).bytes()) {
         throw std::invalid_argument(std::string(kOp) + ": invalid state layer stride");
     }
 
     for (std::int32_t layer = 0; layer < record.layers; ++layer) {
-        (void)layer_range(states.conv_layer0, states.conv_layer_stride_bytes, layer,
-                          "gdn_replay_fold conv state");
-        (void)layer_range(states.recurrent_layer0, states.recurrent_layer_stride_bytes, layer,
-                          "gdn_replay_fold recurrent state");
-    }
-    std::int32_t conv_layer      = 0;
-    std::int32_t recurrent_layer = 0;
-    while (conv_layer < record.layers && recurrent_layer < record.layers) {
-        const common::operand::Range conv =
-            layer_range(states.conv_layer0, states.conv_layer_stride_bytes, conv_layer,
-                        "gdn_replay_fold conv state");
-        const common::operand::Range recurrent =
-            layer_range(states.recurrent_layer0, states.recurrent_layer_stride_bytes,
-                        recurrent_layer, "gdn_replay_fold recurrent state");
-        if (common::operand::overlaps(conv, recurrent)) {
-            throw std::invalid_argument("gdn_replay_fold: state layer regions overlap");
-        }
-        if (conv.end <= recurrent.begin) {
-            ++conv_layer;
-        } else {
-            ++recurrent_layer;
+        const auto conv =
+            layer_blocks(states.conv_layer0, states.conv_layer_stride_bytes, layer, kOp);
+        const auto recurrent =
+            layer_blocks(states.recurrent_layer0, states.recurrent_layer_stride_bytes, layer, kOp);
+        for (std::int32_t other = 0; other < record.layers; ++other) {
+            const auto other_conv =
+                layer_blocks(states.conv_layer0, states.conv_layer_stride_bytes, other, kOp);
+            const auto other_recurrent = layer_blocks(
+                states.recurrent_layer0, states.recurrent_layer_stride_bytes, other, kOp);
+            if (common::operand::overlaps(conv, other_recurrent) ||
+                (other < layer && (common::operand::overlaps(conv, other_conv) ||
+                                   common::operand::overlaps(recurrent, other_recurrent)))) {
+                throw std::invalid_argument("gdn_replay_fold: state layers overlap");
+            }
         }
     }
 }
@@ -97,14 +92,13 @@ void require_records_disjoint_from_states(const GdnReplayRecords& records,
         common::operand::range(records.gate, "gdn_replay_fold gate records")};
     for (const common::operand::Range record : record_ranges) {
         for (std::int32_t layer = 0; layer < records.spec.layers; ++layer) {
-            const common::operand::Range conv =
-                layer_range(states.conv_layer0, states.conv_layer_stride_bytes, layer,
-                            "gdn_replay_fold conv state");
-            const common::operand::Range recurrent =
-                layer_range(states.recurrent_layer0, states.recurrent_layer_stride_bytes, layer,
-                            "gdn_replay_fold recurrent state");
-            if (common::operand::overlaps(record, conv) ||
-                common::operand::overlaps(record, recurrent)) {
+            const auto conv = layer_blocks(states.conv_layer0, states.conv_layer_stride_bytes,
+                                           layer, "gdn_replay_fold conv state");
+            const auto recurrent =
+                layer_blocks(states.recurrent_layer0, states.recurrent_layer_stride_bytes, layer,
+                             "gdn_replay_fold recurrent state");
+            if (common::operand::overlaps(conv, record) ||
+                common::operand::overlaps(recurrent, record)) {
                 throw std::invalid_argument("gdn_replay_fold: records overlap state storage");
             }
         }
@@ -120,9 +114,9 @@ validate_fold_rows(const GdnReplayRecords& records, LinearAttentionStateAllLayer
     detail::gated_delta_net::GdnReplayFoldKernelRows packed{};
     for (std::size_t row = 0; row < rows.size(); ++row) {
         if (rows[row].source_state_slot < 0 ||
-            rows[row].source_state_slot >= states.spec.slot_count ||
+            rows[row].source_state_slot >= states.conv_layer0.ne[2] ||
             rows[row].destination_state_slot < 0 ||
-            rows[row].destination_state_slot >= states.spec.slot_count) {
+            rows[row].destination_state_slot >= states.conv_layer0.ne[2]) {
             throw std::invalid_argument("gdn_replay_fold: linear state slot is out of range");
         }
         if (rows[row].commit_columns < 0 || rows[row].commit_columns > records.spec.width) {

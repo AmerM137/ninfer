@@ -108,9 +108,21 @@ Model 拥有 config、绑定、Use、权重 backing 和只读资源。ModelInsta
 
 `models/common` 只提供明确的可复用能力：权重 ID/Use 与绑定、Qwen Frontend/Vision、逻辑上下文
 存储和 MoE 执行。Vision 编码器接收自己的 config、参数、workspace 和 CUDA 执行视图；特征交接
-按请求建立，资源由 Program 持有。StateImage 的数学内容和物理布局由各架构定义，公共
-`StateImageStore<DevicePool, HostPool>` 仅管理逻辑身份、副本、pin 和迁移事务。逻辑 KV 页、Host
-extent 与地址空间管理同样不依赖具体 Text 层。具体层连接、状态推进及 speculative 提交保留原生实现。
+按请求建立，资源由 Program 持有。架构声明 StateImage 的字段、dtype、形状与层数；Core
+`StateImageStorage` 将每个 slot 的完整 image 连续存放，Host 使用相同内部布局。类型化的
+GDN、循环 KV 等视图只表达计算几何，Op 从 Tensor 的实际 slot stride 寻址。
+
+公共 `StateImageStore` 管理逻辑身份、写入预留及 Device/Host 副本，Host 副本直接持有共享
+arena 的 allocation。预留、原生初始化、写入完成与副本物化是不同动作；分支目的在完成写入前
+不成为活动内容。唯一写入者原位推进，共享来源通过独立目的或保留 Host 副本后的 Device 交接
+继续执行。完整复制为一次连续 image 复制，DFlash local 字段组可独立复制。
+
+`Continuation<Metadata>` 将 image 身份与原生续算 metadata 放在一起，供活动执行、候选提交和
+checkpoint 使用；lane 不持有可能随换槽失效的状态 Tensor。Replay 中的 Continuation 记录
+实际已重建的输入位置，恢复目标单独保存在请求控制中；已提交的账本与采样计数保持不变。
+各历史前沿的数学关系仍由模型决定。
+逻辑 KV 页、Host extent 与地址空间管理同样不依赖具体 Text 层。具体层连接、状态推进及
+speculative 提交保留原生实现。
 
 每个 Program 独占：
 

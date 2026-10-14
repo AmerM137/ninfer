@@ -24,7 +24,9 @@ struct GdnReplayFoldRow {
  * to physical record row b; rows are not filtered, compressed, or reordered. The active row count
  * is rows.size() and must be in [1,records.spec.record_capacity].
  *
- * source_state_slot and destination_state_slot are in [0,states.spec.slot_count). A row may be
+ * Each layer has dense inner state; its Tensor carries the slot stride and the view carries
+ * independent layer strides. Distinct fields/layers must not overlap their actual data blocks.
+ * source_state_slot and destination_state_slot are in [0,states.conv_layer0.ne[2]). A row may be
  * in-place. Destinations are distinct and cannot overwrite another active row's source.
  * source_state_slot is the absolute slot used to produce that row's records. commit_columns is in
  * [0,T]. Zero is a

@@ -5,7 +5,7 @@ namespace ninfer::models::qwen3_5::detail {
 
 DFlashPersistentState::DFlashPersistentState(MemorySpan backing,
                                              const DFlashPersistentLayout& layout,
-                                             CyclicKVCache& local_state)
+                                             CyclicKVCacheView& local_state)
     : local(local_state), prefill_features(layout.prefill_features.bind(backing)),
       prefill_positions(layout.prefill_positions.bind(backing)),
       pending_features(layout.pending_features.bind(backing)) {

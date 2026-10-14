@@ -30,7 +30,7 @@ void launch_q8_gdn_input_decode_conv_snapshot(
     constexpr int kRowsPerCta = 8;
     const auto output         = make_gdn_conv_output<GdnConvGeometry<4096>, 1>(
         conv_weight, conv_states, valid_columns, initial_slot, query, key, value, z,
-        SnapshotHistoryPublish{static_cast<__nv_bfloat16*>(conv_states.data),
+        SnapshotHistoryPublish{static_cast<__nv_bfloat16*>(conv_states.data), conv_states.nb[2] / 2,
                                static_cast<const std::int32_t*>(snapshot_base_slot.data), 8192});
     launch_q8_a16_gemv<Q8A16GemvSchedule<kRowsPerCta, 1, 2, 2048>>(
         q8_linear_operands(x, weight), output, GdnConvRowEpilogue<1>{}, stream);

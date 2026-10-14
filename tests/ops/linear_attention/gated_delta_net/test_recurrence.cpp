@@ -1,3 +1,4 @@
+#include "ops/state_fixture.h"
 #include "ninfer/ops/gated_delta_net.h"
 #include "cuda_fixture.h"
 #include "core/buffer.h"
@@ -570,6 +571,8 @@ int batch_update_case(const Case& test_case, const std::vector<int>& source_slot
     Tensor beta(device.beta.span(), DType::FP32, {test_case.value_heads, width, batch});
     Tensor states_tensor(states.span(), DType::FP32,
                          {kStateDim, kStateDim, test_case.value_heads, slots});
+    SlottedStateFixture history(states_tensor, 3);
+    states_tensor = history.tensor;
     Tensor source_slots_tensor(device_source_slots.span(), DType::I32, {batch});
     Tensor destination_slots_tensor(device_destination_slots.span(), DType::I32, {batch});
     Tensor out_tensor(out.span(), DType::BF16, {kStateDim, test_case.value_heads, width, batch});
@@ -582,7 +585,9 @@ int batch_update_case(const Case& test_case, const std::vector<int>& source_slot
         std::string(test_case.name) + " batch update B=" + std::to_string(batch);
     int failures                         = 0;
     const std::vector<double> got_output = from_device_bf16(out.data(), aggregate.v.size());
-    const std::vector<float> got_states  = from_device<float>(states.data(), initial_states.size());
+    history.copy_back();
+    failures += history.verify_guards("recurrent state");
+    const std::vector<float> got_states = from_device<float>(states.data(), initial_states.size());
     for (int row = 0; row < batch; ++row) {
         const auto row_label = label + " row=" + std::to_string(row);
         failures += verify_heads(

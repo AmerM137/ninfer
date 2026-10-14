@@ -136,12 +136,17 @@ void run(const char* artifact, SpeculativeBackend backend) {
     qwen::detail::ProgramImpl program(parameters, *plan, device, {});
 
     auto& states      = *program.state_store;
-    const auto source = states.reserve_reset(device.stream());
-    const auto other  = states.reserve_reset(device.stream());
+    const auto source = states.reserve_destination();
+    const auto other  = states.reserve_destination();
     require(source && other, "fixture state allocation failed");
     const auto source_slot = states.physical_slot(*source);
     const auto other_slot  = states.physical_slot(*other);
-    const auto text        = program.text_kv_addresses->create_active(pages, 1, device.stream());
+    for (const auto handle : {*source, *other}) {
+        program.state_images->storage().clear(states.physical_slot(handle),
+                                              device.execution_view());
+        states.complete_initialization(handle);
+    }
+    const auto text = program.text_kv_addresses->create_active(pages, 1, device.stream());
     require(text.has_value(), "fixture text KV allocation failed");
     AddressOwner text_owner{program.text_kv_addresses.get(), *text};
     program.text_kv_addresses->ensure_mapped_to_tokens(*text, capacity, device.stream());
@@ -209,12 +214,13 @@ void run(const char* artifact, SpeculativeBackend backend) {
     states.freeze(*source);
     const auto destination = states.reserve_destination();
     require(destination.has_value(), "fixture fork destination allocation failed");
-    const auto binding = states.begin_fork(*source, *destination);
-    program.state_images->copy_dflash_local(binding.source, binding.destination, device.stream());
+    const auto binding = states.begin_write(*source, *destination);
+    program.state_images->copy_dflash_local(binding.source, binding.destination,
+                                            device.execution_view());
     context.state_source_slot      = binding.source;
     context.state_destination_slot = binding.destination;
     prefill(23, 23); // Actual chunk is seven tokens, shortened at the capture frontier.
-    states.commit_fork(*source, *destination);
+    states.complete_write(*source, *destination);
     require(local_bytes(program, source_slot) == frozen,
             "prefill mutated the frozen checkpoint after a StateImage fork");
     const auto active = local_bytes(program, binding.destination);
