@@ -1,7 +1,7 @@
 #include "models/qwen3_5/program/program_impl.h"
 
 #include "core/device.h"
-#include "models/qwen3_5/program/context_work.h"
+#include "models/common/context/work.h"
 
 #include <algorithm>
 #include <iterator>
@@ -22,7 +22,7 @@ struct StateDemotion {
 };
 
 struct PageDemotion {
-    LogicalKVPageHandle handle;
+    context::LogicalKVPageHandle handle;
     std::uint32_t position          = 0;
     std::uint64_t content_epoch     = 0;
     std::uint32_t committed_columns = 0;
@@ -47,7 +47,7 @@ bool checkpoint_prefix(const CheckpointState& earlier, const CheckpointState& la
 }
 
 struct PhysicalPage {
-    LogicalKVPageHandle handle;
+    context::LogicalKVPageHandle handle;
     std::uint32_t position = 0;
 };
 
@@ -65,7 +65,7 @@ struct HistoryOwners {
 };
 
 struct PhysicalPageFacts {
-    LogicalKVPageHandle handle;
+    context::LogicalKVPageHandle handle;
     std::uint32_t descriptor = 0;
     std::uint32_t references = 0;
     bool source_pinned       = false;
@@ -80,7 +80,7 @@ struct HistoryPageFacts {
         std::uint32_t position, page;
     };
 
-    KVAddressSpaceHandle address;
+    context::KVAddressSpaceHandle address;
     bool initialized                 = false;
     bool inactive                    = false;
     std::uint32_t committed_frontier = 0;
@@ -89,22 +89,22 @@ struct HistoryPageFacts {
     std::uint32_t blocked            = std::numeric_limits<std::uint32_t>::max();
     // Entries describe progressively longer suffixes, scanned from the end of the address.
     std::vector<std::uint32_t> unique_counts;
-    std::vector<LogicalKVPageHandle> unique_device;
+    std::vector<context::LogicalKVPageHandle> unique_device;
     std::vector<SharedPage> shared;
 };
 
 constexpr auto kNoPhysicalPage = std::numeric_limits<std::uint32_t>::max();
 
 struct PhysicalPoolFacts {
-    const KVAddressSpaceStore* addresses = nullptr;
-    const LogicalKVPageStore* store      = nullptr;
-    bool account_host                    = false;
-    bool account_device                  = false;
+    const context::KVAddressSpaceStore* addresses = nullptr;
+    const context::LogicalKVPageStore* store      = nullptr;
+    bool account_host                             = false;
+    bool account_device                           = false;
     std::vector<PhysicalPageFacts> pages;
     std::vector<std::uint32_t> descriptors;
     std::vector<HistoryPageFacts> histories;
 
-    std::uint32_t page(LogicalKVPageHandle handle) {
+    std::uint32_t page(context::LogicalKVPageHandle handle) {
         if (descriptors.empty()) { descriptors.assign(store->capacity(), kNoPhysicalPage); }
         const auto descriptor = store->descriptor_index(handle);
         auto& index           = descriptors[descriptor];
@@ -131,7 +131,7 @@ struct PhysicalPoolFacts {
             if (account_host || account_device) { history.unique_counts.push_back(0); }
         }
         if (!history.inactive || frontier > history.committed_frontier) { return false; }
-        const auto target = kv_pages_for_frontier(frontier);
+        const auto target = context::kv_pages_for_frontier(frontier);
         if (history.blocked != kNoPhysicalPage && history.blocked >= target) { return false; }
         if (target < history.scanned_begin && account_device &&
             history.unique_device.capacity() == 0) {
@@ -293,8 +293,8 @@ std::vector<PhysicalOwners> physical_owner_sets(const ProgramImpl& program, Phys
             boundaries.push_back(0);
             for (const auto owner : history.checkpoints) {
                 const auto& record = *program.checkpoints[owner].value;
-                boundaries.push_back(
-                    kv_pages_for_frontier(main_pool ? record.frontier : record.backend_frontier));
+                boundaries.push_back(context::kv_pages_for_frontier(
+                    main_pool ? record.frontier : record.backend_frontier));
             }
             std::sort(boundaries.begin(), boundaries.end());
             boundaries.erase(std::unique(boundaries.begin(), boundaries.end()), boundaries.end());
@@ -303,8 +303,8 @@ std::vector<PhysicalOwners> physical_owner_sets(const ProgramImpl& program, Phys
                 std::vector<std::uint32_t> holders;
                 for (const auto owner : history.checkpoints) {
                     const auto& record = *program.checkpoints[owner].value;
-                    if (kv_pages_for_frontier(main_pool ? record.frontier
-                                                        : record.backend_frontier) > begin) {
+                    if (context::kv_pages_for_frontier(
+                            main_pool ? record.frontier : record.backend_frontier) > begin) {
                         holders.push_back(owner);
                     }
                 }
@@ -381,8 +381,8 @@ std::vector<PhysicalOwners> physical_owner_sets(const ProgramImpl& program, Phys
 struct ReleasedPages {
     // These spans borrow stable prefixes of the evaluation's unique-page arrays. Only shared
     // pages need candidate-specific storage after their joint address-reference check.
-    std::vector<std::span<const LogicalKVPageHandle>> unique;
-    std::vector<LogicalKVPageHandle> shared;
+    std::vector<std::span<const context::LogicalKVPageHandle>> unique;
+    std::vector<context::LogicalKVPageHandle> shared;
 
     bool empty() const noexcept { return unique.empty() && shared.empty(); }
 
@@ -511,7 +511,8 @@ released_resources(const ProgramImpl& program, PhysicalFacts& facts,
         for (const auto& suffix : suffixes) {
             const auto& history = pool.histories[suffix.index];
             if (!history.address.valid()) { continue; }
-            const auto target = kv_pages_for_frontier(main_pool ? suffix.main : suffix.backend);
+            const auto target =
+                context::kv_pages_for_frontier(main_pool ? suffix.main : suffix.backend);
             if (account && (pool.account_host || pool.account_device)) {
                 const auto count = history.unique_counts[history.page_count - target];
                 if (host) {
@@ -696,7 +697,7 @@ std::optional<ContextDemotion> quote_demotion(const ProgramImpl& program,
     ContextDemotion candidate;
     if (resource == runtime::ContextResourceClass::State) {
         for (const auto state : owners.states) {
-            if (program.state_store->role(state) != StateImageRole::CheckpointImmutable ||
+            if (program.state_store->role(state) != context::StateImageRole::CheckpointImmutable ||
                 !program.state_store->can_release_after_checkpoint_references(
                     state, program.state_store->checkpoint_references(state))) {
                 continue;
@@ -856,7 +857,7 @@ struct DemotionBatch {
     std::vector<std::uint32_t> group_ends;
     std::unordered_map<std::uint32_t, const PageDemotion*> selected;
 
-    const LogicalKVPageStore& page_store() const {
+    const context::LogicalKVPageStore& page_store() const {
         return resource == runtime::ContextResourceClass::MainKV
                    ? *evaluation->owner->text_kv_pages
                    : *evaluation->owner->backend_kv_pages;
@@ -1016,7 +1017,7 @@ bool ProgramImpl::start_demote(const ContextDemotion& quote) {
             }
         }
         if (matched != expected.references.size() ||
-            state_store->role(expected.handle) != StateImageRole::CheckpointImmutable ||
+            state_store->role(expected.handle) != context::StateImageRole::CheckpointImmutable ||
             !state_store->device_resident(expected.handle) ||
             state_store->content_epoch(expected.handle) != expected.content_epoch ||
             state_store->host_resident(expected.handle) != expected.host_resident ||
@@ -1038,7 +1039,7 @@ bool ProgramImpl::start_demote(const ContextDemotion& quote) {
 
         struct Holder {
             CheckpointHandle checkpoint;
-            KVAddressSpaceHandle address;
+            context::KVAddressSpaceHandle address;
             std::uint32_t pages;
         };
 
@@ -1051,7 +1052,7 @@ bool ProgramImpl::start_demote(const ContextDemotion& quote) {
             holders.push_back(
                 {{this, index, slot.generation},
                  main ? record.kv->text : *record.kv->backend,
-                 kv_pages_for_frontier(main ? record.frontier : record.backend_frontier)});
+                 context::kv_pages_for_frontier(main ? record.frontier : record.backend_frontier)});
         }
         const auto stride      = main ? text_host_kv_page_stride : backend_host_kv_page_stride;
         std::size_t host_bytes = 0;
@@ -1102,7 +1103,7 @@ bool ProgramImpl::start_demote(const ContextDemotion& quote) {
     } else {
         auto& pages = plan.resource == runtime::ContextResourceClass::MainKV ? *text_kv_pages
                                                                              : *backend_kv_pages;
-        std::vector<LogicalKVPageHandle> missing;
+        std::vector<context::LogicalKVPageHandle> missing;
         std::size_t begin       = 0;
         const auto append_group = [&](std::size_t end) {
             for (auto index = end; index != begin; --index) {
@@ -1120,7 +1121,7 @@ bool ProgramImpl::start_demote(const ContextDemotion& quote) {
         std::size_t offset = 0;
         while (offset < missing.size()) {
             auto count = missing.size() - offset;
-            std::optional<HostKVExtentReservation> destination;
+            std::optional<context::HostKVExtentReservation> destination;
             while (count) {
                 auto reservation =
                     host_kv_extents->prepare(pages, std::span(missing).subspan(offset, count));

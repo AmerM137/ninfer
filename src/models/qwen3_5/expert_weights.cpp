@@ -3,9 +3,9 @@
 
 namespace ninfer::models::qwen3_5 {
 
-std::vector<moe::BankDescription>
-describe_expert_weights(const artifact::Reader& reader, ModelWeights& weights,
-                        std::span<const loading::PendingWeight> pending) {
+std::vector<moe::BankDescription> describe_expert_weights(const artifact::Reader& reader,
+                                                          ModelWeights& weights,
+                                                          std::span<const PendingWeight> pending) {
     std::vector<moe::BankDescription> out;
     const auto describe = [&](MoeWeights& parameters) {
         std::vector<moe::ExpertBinding> bindings;

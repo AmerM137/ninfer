@@ -1,5 +1,5 @@
 #include "models/qwen3_5/program/program_impl.h"
-#include "models/qwen3_5/program/context_work.h"
+#include "models/common/context/work.h"
 #include "core/device.h"
 
 #include <algorithm>
@@ -17,8 +17,9 @@ bool ProgramImpl::context_blocks(SequenceHandle sequence) const noexcept {
 
 void ProgramImpl::enqueue_state_backup(ContextTransaction& tx) {
     if (!tx.state_transfer) { return; }
-    tx.transfers.push_back(state_transfer_requirement(
-        state_images->host_layout(), runtime::ContextTransferDirection::DeviceToHost));
+    tx.transfers.push_back(
+        context::state_transfer_requirement(state_image_transfer_work(state_images->host_layout()),
+                                            runtime::ContextTransferDirection::DeviceToHost));
     start_context_transfer_timer(runtime::ContextResourceClass::State);
     state_store->enqueue_device_to_host(*tx.state_transfer, device.transfer_stream());
     stop_context_transfer_timer(runtime::ContextResourceClass::State);
@@ -26,21 +27,22 @@ void ProgramImpl::enqueue_state_backup(ContextTransaction& tx) {
 
 void ProgramImpl::copy_local_for_context(ContextTransaction& tx, std::int32_t source,
                                          std::int32_t destination) {
-    tx.transfers.push_back(state_transfer_requirement(
-        state_images->host_layout(), runtime::ContextTransferDirection::DeviceToDevice, true));
+    tx.transfers.push_back(
+        context::state_transfer_requirement(dflash_local_transfer_work(state_images->host_layout()),
+                                            runtime::ContextTransferDirection::DeviceToDevice));
     start_context_transfer_timer(runtime::ContextResourceClass::State);
     state_images->copy_dflash_local(source, destination, device.transfer_stream());
     stop_context_transfer_timer(runtime::ContextResourceClass::State);
 }
 
-void ProgramImpl::copy_context_tail(ContextTransaction& tx, LogicalKVPageStore& pages,
+void ProgramImpl::copy_context_tail(ContextTransaction& tx, context::LogicalKVPageStore& pages,
                                     DeviceKVPageHandle source, DeviceKVPageHandle destination,
                                     runtime::ContextResourceClass resource) {
     start_context_transfer_timer(resource);
     const auto work =
         pages.physical_pool().copy_page(source, destination, device.transfer_stream());
     stop_context_transfer_timer(resource);
-    tx.transfers.push_back(kv_transfer_requirement(
+    tx.transfers.push_back(context::kv_transfer_requirement(
         resource, runtime::ContextTransferDirection::DeviceToDevice, 1, work));
     ++tx.operations.partial_tail_cow_pages;
 }
@@ -229,8 +231,8 @@ void ProgramImpl::abort_context() noexcept {
             tx.reserved_state.reset();
         }
         if (tx.reserved_kv) {
-            const auto unwind_address = [&](KVAddressSpaceStore& addresses,
-                                            KVAddressSpaceHandle address, bool borrowed,
+            const auto unwind_address = [&](context::KVAddressSpaceStore& addresses,
+                                            context::KVAddressSpaceHandle address, bool borrowed,
                                             std::uint32_t frontier) {
                 if (!borrowed) {
                     if (!addresses.release_after_deactivate(address)) { std::terminate(); }
@@ -261,7 +263,8 @@ void ProgramImpl::abort_context() noexcept {
         if (tx.kind == ContextOperationKind::Capture) {
             auto& state = sequences[tx.lane];
             refresh_history_requirements(state.kv);
-            if (state_store->role(state.state.read) == StateImageRole::CheckpointImmutable &&
+            if (state_store->role(state.state.read) ==
+                    context::StateImageRole::CheckpointImmutable &&
                 !state_store->checkpoint_references(state.state.read)) {
                 state_store->thaw(state.state.read);
             }

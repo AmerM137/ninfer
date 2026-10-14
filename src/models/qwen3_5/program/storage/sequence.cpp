@@ -1,5 +1,5 @@
 #include "models/qwen3_5/program/program_impl.h"
-#include "models/qwen3_5/program/context_work.h"
+#include "models/common/context/work.h"
 #include "core/device.h"
 
 #include <algorithm>
@@ -59,7 +59,7 @@ const SequenceState& ProgramImpl::active_sequence(std::uint32_t lane) const {
     return sequences[lane];
 }
 
-StateImageSelectors ProgramImpl::state_selectors(const SequenceState& sequence) const {
+context::StateImageSelectors ProgramImpl::state_selectors(const SequenceState& sequence) const {
     return {state_store->physical_slot(sequence.state.read),
             state_store->physical_slot(sequence.state.write)};
 }

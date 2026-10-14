@@ -2,7 +2,7 @@
 
 #include "artifact/materializer.h"
 #include "models/qwen3_5/config.h"
-#include "models/qwen3_5/frontend/resources.h"
+#include "models/common/qwen/frontend/resources.h"
 #include "models/qwen3_5/weights.h"
 #include "ninfer/ops/weight_input.h"
 
@@ -41,7 +41,7 @@ public:
 
     [[nodiscard]] std::span<const ExpertBankSource> expert_banks() const noexcept { return banks_; }
 
-    [[nodiscard]] const FrontendResources& resources() const noexcept { return resources_; }
+    [[nodiscard]] const qwen::FrontendResources& resources() const noexcept { return resources_; }
 
     [[nodiscard]] const InstanceInfo& info() const noexcept { return info_; }
 
@@ -53,7 +53,7 @@ private:
     friend std::unique_ptr<Model> materialize_model(ResolvedLoadPlan&&, DeviceContext&,
                                                     const StartupObserver*);
     Model(Config config, LoadOptions options, ModelWeights weights, std::vector<BoundWeight> bound,
-          std::vector<ExpertBankSource> banks, FrontendResources resources, InstanceInfo info,
+          std::vector<ExpertBankSource> banks, qwen::FrontendResources resources, InstanceInfo info,
           artifact::MaterializedArtifact backing);
 
     // Destroy all borrowers before backing. The caller keeps DeviceContext alive through cleanup.
@@ -63,7 +63,7 @@ private:
     ModelWeights weights_;
     std::vector<BoundWeight> bound_;
     std::vector<ExpertBankSource> banks_;
-    FrontendResources resources_;
+    qwen::FrontendResources resources_;
     InstanceInfo info_;
 };
 

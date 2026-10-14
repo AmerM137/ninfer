@@ -1,5 +1,7 @@
 #pragma once
 
+#include "models/common/qwen/vision/parameters.h"
+
 #include "models/qwen3_5/config.h"
 #include "models/load_options.h"
 #include "ninfer/ops/moe.h"
@@ -61,15 +63,6 @@ struct MtpProfile {
     FfnProfile ffn;
 };
 
-struct VisionBlockProfile {
-    ops::LinearProfile qkv, output, fc1, fc2;
-};
-
-struct VisionProfile {
-    ops::LinearProfile patch_embedding, merger_fc1, merger_fc2;
-    std::vector<VisionBlockProfile> layers;
-};
-
 struct DraftBlockProfile {
     ops::LinearProfile output;
     DenseProfile mlp;
@@ -97,7 +90,7 @@ struct ModelProfile {
     std::uint32_t public_tokens;
     TextProfile text;
     std::optional<MtpProfile> mtp;
-    std::optional<VisionProfile> vision;
+    std::optional<qwen::VisionProfile> vision;
     std::optional<DraftProfile> draft;
     std::optional<ProposalProfile> proposal;
 };

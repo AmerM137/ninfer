@@ -36,21 +36,7 @@ public:
 
     Tensor tensor(WeightId id) const {
         const auto& bound = model_.weight(id);
-        return with_context(bound.name, [&] {
-            const auto& view = bound.view;
-            if (view.shape.size() > 4) {
-                throw std::invalid_argument("direct parameter exceeds Tensor rank");
-            }
-            std::array<std::int32_t, 4> axes{1, 1, 1, 1};
-            for (std::size_t i = 0; i < view.shape.size(); ++i) {
-                const auto extent = view.shape[view.shape.size() - 1 - i];
-                if (extent > std::uint64_t(std::numeric_limits<std::int32_t>::max())) {
-                    throw std::invalid_argument("direct parameter exceeds Tensor extent");
-                }
-                axes[i] = static_cast<std::int32_t>(extent);
-            }
-            return weight_tensor(view, {axes[0], axes[1], axes[2], axes[3]});
-        });
+        return with_context(bound.name, [&] { return parameter_tensor(bound); });
     }
 
     DenseParameters dense(const DenseWeights& w) const {
@@ -181,64 +167,8 @@ public:
         return out;
     }
 
-    NormParameters norm(const NormWeights& w) const { return {tensor(w.weight), tensor(w.bias)}; }
-
-    std::optional<Tensor> joined_bias(const std::array<WeightId, 3>& ids) const {
-        WeightView view;
-        std::uint64_t count = 0;
-        for (const auto id : ids) {
-            const auto& input = model_.weight(id).view;
-            count += weight_element_count(input.shape);
-            for (const auto& part : input.parts) {
-                if (!view.parts.empty() && (view.parts.back().parent != part.parent ||
-                                            view.parts.back().end != part.begin)) {
-                    return std::nullopt;
-                }
-                view.parts.push_back(part);
-            }
-        }
-        if (count > std::uint64_t(std::numeric_limits<std::int32_t>::max())) {
-            throw std::invalid_argument("Vision bias exceeds Tensor extent");
-        }
-        view.shape = {count};
-        return weight_tensor(view, {static_cast<std::int32_t>(count)});
-    }
-
-    VisionParameters vision(const VisionWeights& w) const {
-        VisionParameters out;
-        out.patch_embedding      = linear(w.patch_embedding);
-        out.patch_embedding_bias = tensor(w.patch_embedding_bias);
-        out.position_embedding   = tensor(w.position_embedding);
-        out.layers.reserve(w.layers.size());
-        for (std::size_t i = 0; i < w.layers.size(); ++i) {
-            out.layers.push_back(with_context("vision/layers/" + std::to_string(i), [&] {
-                const auto& layer = w.layers[i];
-                const std::array qkv{model_.input(layer.query), model_.input(layer.key),
-                                     model_.input(layer.value)};
-                const std::array ids{layer.query_bias, layer.key_bias, layer.value_bias};
-                const auto bias = joined_bias(ids);
-                if (!bias) {
-                    throw std::invalid_argument(
-                        "Vision QKV bias: this fixed call requires a contiguous bias bank");
-                }
-                return VisionBlockParameters{norm(layer.norm1),
-                                             norm(layer.norm2),
-                                             ops::prepare_linear_weight(qkv),
-                                             *bias,
-                                             linear(layer.output),
-                                             linear(layer.fc1),
-                                             linear(layer.fc2),
-                                             tensor(layer.output_bias),
-                                             tensor(layer.fc1_bias),
-                                             tensor(layer.fc2_bias)};
-            }));
-        }
-        out.merger_norm     = norm(w.merger_norm);
-        out.merger_fc1      = linear(w.merger_fc1);
-        out.merger_fc2      = linear(w.merger_fc2);
-        out.merger_fc1_bias = tensor(w.merger_fc1_bias);
-        out.merger_fc2_bias = tensor(w.merger_fc2_bias);
-        return out;
+    qwen::VisionParameters vision(const qwen::VisionWeights& weights) const {
+        return qwen::prepare_vision(model_.weight_data(), weights);
     }
 
     DynamicConvParameters convolution(const DynamicConvWeights& w) const {

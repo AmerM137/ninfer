@@ -1,5 +1,5 @@
 #include "models/qwen3_5/program/program_impl.h"
-#include "models/qwen3_5/program/context_work.h"
+#include "models/common/context/work.h"
 #include "models/qwen3_5/program/execution_context.h"
 #include "models/qwen3_5/program/planning/graph_profiles.h"
 #include "core/nvtx.h"
@@ -158,12 +158,12 @@ void ProgramImpl::prepare_graphs() {
         return state_store->physical_slot(capture_states.at(row));
     };
 
-    std::vector<KVAddressSpaceHandle> text_capture_allocations;
-    std::vector<KVAddressSpaceHandle> mtp_capture_allocations;
-    std::vector<KVAddressSpaceHandle> dflash_capture_allocations;
+    std::vector<context::KVAddressSpaceHandle> text_capture_allocations;
+    std::vector<context::KVAddressSpaceHandle> mtp_capture_allocations;
+    std::vector<context::KVAddressSpaceHandle> dflash_capture_allocations;
     const auto reserve_capture_rows = [&](qwen3_5::PagedKVCache& cache,
-                                          KVAddressSpaceStore& addresses,
-                                          std::vector<KVAddressSpaceHandle>& allocations,
+                                          context::KVAddressSpaceStore& addresses,
+                                          std::vector<context::KVAddressSpaceHandle>& allocations,
                                           const char* label) {
         DeviceKVPagePool& pool       = cache.page_pool();
         KVExecutionTablePool& tables = cache.execution_tables();
@@ -173,7 +173,7 @@ void ProgramImpl::prepare_graphs() {
         }
         allocations.reserve(max_concurrency);
         for (std::uint32_t row = 0; row < max_concurrency; ++row) {
-            std::optional<KVAddressSpaceHandle> allocation =
+            std::optional<context::KVAddressSpaceHandle> allocation =
                 addresses.create_active(1, static_cast<std::int32_t>(row), device.stream());
             if (!allocation) { throw std::bad_alloc(); }
             allocations.push_back(*allocation);
@@ -217,8 +217,9 @@ void ProgramImpl::prepare_graphs() {
         }
     };
     const auto zero_capture_pages =
-        [&](qwen3_5::PagedKVCache& cache, const KVAddressSpaceStore& addresses,
-            const std::vector<KVAddressSpaceHandle>& allocations, std::uint32_t batch_size) {
+        [&](qwen3_5::PagedKVCache& cache, const context::KVAddressSpaceStore& addresses,
+            const std::vector<context::KVAddressSpaceHandle>& allocations,
+            std::uint32_t batch_size) {
             std::vector<DeviceKVPageHandle> pages;
             pages.reserve(batch_size);
             for (std::uint32_t row = 0; row < batch_size; ++row) {
@@ -250,11 +251,12 @@ void ProgramImpl::prepare_graphs() {
                 CUDA_CHECK(cudaMemsetAsync(pending.data, 0, pending.bytes(), device.stream()));
             }
         }
-        set_device_i32(io.pos, checked_i32(frontier, "graph representative position"));
-        set_device_i32(io.rope_pos, checked_i32(frontier, "graph representative rope position"));
+        set_device_i32(io.pos, context::checked_i32(frontier, "graph representative position"));
+        set_device_i32(io.rope_pos,
+                       context::checked_i32(frontier, "graph representative rope position"));
         if (io.mtp) {
             set_device_i32(io.mtp->position,
-                           checked_i32(frontier, "graph representative MTP position"));
+                           context::checked_i32(frontier, "graph representative MTP position"));
         }
         if (io.dflash_decode) {
             *dflash_host_ingress       = {};
@@ -264,17 +266,17 @@ void ProgramImpl::prepare_graphs() {
             for (std::uint32_t row = 0; row < batch_size; ++row) {
                 dflash_host_ingress->anchors[row] = 0;
                 dflash_host_ingress->execution_frontiers[row] =
-                    checked_i32(frontier, "graph representative DFlash frontier");
+                    context::checked_i32(frontier, "graph representative DFlash frontier");
                 dflash_host_ingress->context_frontiers[row] =
-                    checked_i32(frontier, "graph representative DFlash context frontier");
+                    context::checked_i32(frontier, "graph representative DFlash context frontier");
                 dflash_host_ingress->proposal_valid_columns[row] = static_cast<std::int32_t>(width);
                 dflash_host_ingress->proposal_extents[row] = static_cast<std::int32_t>(extent);
                 dflash_host_ingress->target_valid_columns[row] =
                     static_cast<std::int32_t>(extent + 1U);
                 for (std::uint32_t column = 0; column < width; ++column) {
                     dflash_host_ingress->target_rope_positions[row * width + column] =
-                        checked_i32(frontier + std::min(column, extent),
-                                    "graph representative DFlash target RoPE position");
+                        context::checked_i32(frontier + std::min(column, extent),
+                                             "graph representative DFlash target RoPE position");
                 }
                 dflash_host_ingress->text_kv_table_rows[row]      = static_cast<std::int32_t>(row);
                 dflash_host_ingress->dflash_kv_table_rows[row]    = static_cast<std::int32_t>(row);
@@ -292,9 +294,9 @@ void ProgramImpl::prepare_graphs() {
             for (std::uint32_t row = 0; row < batch_size; ++row) {
                 mtp_host_ingress->anchors[row] = 0;
                 mtp_host_ingress->base_frontiers[row] =
-                    checked_i32(frontier, "graph representative MTP frontier");
+                    context::checked_i32(frontier, "graph representative MTP frontier");
                 mtp_host_ingress->remaining_budgets[row] =
-                    checked_i32(capacity, "graph representative MTP budget");
+                    context::checked_i32(capacity, "graph representative MTP budget");
                 mtp_host_ingress->current_extents[row] = static_cast<std::int32_t>(extent);
                 mtp_host_ingress->target_valid_columns[row] =
                     static_cast<std::int32_t>(extent + 1U);
@@ -303,8 +305,8 @@ void ProgramImpl::prepare_graphs() {
                 }
                 for (std::uint32_t column = 0; column < width; ++column) {
                     mtp_host_ingress->target_rope_positions[row * width + column] =
-                        checked_i32(frontier + std::min(column, extent),
-                                    "graph representative MTP RoPE position");
+                        context::checked_i32(frontier + std::min(column, extent),
+                                             "graph representative MTP RoPE position");
                 }
                 mtp_host_ingress->text_kv_table_rows[row]      = static_cast<std::int32_t>(row);
                 mtp_host_ingress->mtp_kv_table_rows[row]       = static_cast<std::int32_t>(row);
@@ -320,9 +322,9 @@ void ProgramImpl::prepare_graphs() {
             for (std::uint32_t row = 0; row < batch_size; ++row) {
                 ordinary_host_ingress->tokens[row] = 0;
                 ordinary_host_ingress->cache_positions[row] =
-                    checked_i32(frontier, "graph representative ordinary position");
+                    context::checked_i32(frontier, "graph representative ordinary position");
                 ordinary_host_ingress->rope_positions[row] =
-                    checked_i32(frontier, "graph representative ordinary RoPE position");
+                    context::checked_i32(frontier, "graph representative ordinary RoPE position");
                 ordinary_host_ingress->text_kv_table_rows[row] = static_cast<std::int32_t>(row);
                 ordinary_host_ingress->state_source_slots[row] = capture_state_slot(row);
                 ordinary_host_ingress->state_destination_slots[row] = capture_state_slot(row);
@@ -531,7 +533,7 @@ void ProgramImpl::prepare_graphs() {
 
         // Warm complete transactions: finish consumes persistent outputs of its paired forward.
         for (auto& topology : speculative_forward_graphs.topologies) {
-            auto& forward     = speculative_forward_graphs.profiles[*topology.installed_profile];
+            auto& forward = speculative_forward_graphs.profiles[*topology.installed_profile];
             speculative_forward_graphs.install(forward);
             auto& finish      = speculative_finish_graphs.select(forward.batch_size,
                                                                  forward.min_execution_frontier);
@@ -567,9 +569,9 @@ void ProgramImpl::prepare_graphs() {
         }
     }
 
-    const auto release_capture_rows = [](KVAddressSpaceStore& addresses,
-                                         std::vector<KVAddressSpaceHandle>& allocations) {
-        for (const KVAddressSpaceHandle allocation : allocations) {
+    const auto release_capture_rows = [](context::KVAddressSpaceStore& addresses,
+                                         std::vector<context::KVAddressSpaceHandle>& allocations) {
+        for (const context::KVAddressSpaceHandle allocation : allocations) {
             addresses.deactivate(allocation);
             if (!addresses.release(allocation)) {
                 throw std::logic_error("CUDA Graph capture KV address space could not be released");
@@ -585,6 +587,5 @@ void ProgramImpl::prepare_graphs() {
     }
     release_capture_rows(*text_kv_addresses, text_capture_allocations);
 }
-
 
 } // namespace ninfer::models::qwen3_5::detail

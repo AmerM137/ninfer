@@ -67,6 +67,10 @@ Frontend 拥有 tokenizer、chat template、Vision preprocessing、MRoPE prompt 
 owning `PreparedPrompt`；每个请求独占一个 `OutputSession`，解释 stop、thinking/content channel、
 detokenization 及模型私有结构化输出。它还提供能够由模板历史精确重建的输出边界语义。
 
+现有 Qwen 架构共用 `models/common/qwen/frontend`，直接执行产物或启动覆盖指定的模板。
+模型侧明确提供采样默认值、embedding 词表范围和启用的媒体几何；Frontend 不根据架构名称
+推断这些参数。媒体预处理与 Program 消费同一组 `VisionItem`、grid、token span 描述。
+
 Frontend 可以预览一次模型输出的语义效果，Engine 提交后才发布。等待顺序和物理缓存均由下层拥有。
 
 GBNF、JSON、JSON Schema、choice、regex 和工具约束的 compiled grammar 在 Frontend 内按词表共享，matcher 由每请求的 OutputSession 持有。
@@ -98,7 +102,15 @@ ResourceManager 的索引和保留记录不构成第二份物理账本。
 ### 2.4 Model 与 Program
 
 Model 拥有 config、绑定、Use、权重 backing 和只读资源。ModelInstance 的 const Parameters 借用
-这些资源，规划和执行消费同一份参数。
+这些资源，规划和执行消费同一份参数。`ModelInstance<RuntimeTypes>` 使用原生 Model、Parameters
+和 Program 类型；Engine 在构建入口按架构作有限分派，执行循环继续静态调用原生 Program。
+公共 PreparedPrompt 承载共享 Qwen 输入合同，不引用具体 Text 架构。
+
+`models/common` 只提供明确的可复用能力：权重 ID/Use 与绑定、Qwen Frontend/Vision、逻辑上下文
+存储和 MoE 执行。Vision 编码器接收自己的 config、参数、workspace 和 CUDA 执行视图；特征交接
+按请求建立，资源由 Program 持有。StateImage 的数学内容和物理布局由各架构定义，公共
+`StateImageStore<DevicePool, HostPool>` 仅管理逻辑身份、副本、pin 和迁移事务。逻辑 KV 页、Host
+extent 与地址空间管理同样不依赖具体 Text 层。具体层连接、状态推进及 speculative 提交保留原生实现。
 
 每个 Program 独占：
 
@@ -123,6 +135,8 @@ speculative 配置与拓扑共享关系；临时 Host context cache 为零。校
 全量 GPU 候选不可行时，受支持的 MoE 使用 Host 来源及 Program 所有的 GPU 副本，
 两个候选不同时持有模型，见[Expert 权重缓存](expert-weight-cache.md)。
 `NINFER_VRAM_BUDGET_MIB` 限定引擎 Device 预算，实际可用显存构成另一上限。
+Runtime 的 `model_startup.h` 统一预算、候选选择、校准收敛和有界重建；模型侧 `Startup` 提供
+权重放置、容量计划、Frontend 构造和 Graph 校准合同。公共启动流程不解释具体层布局。
 ModelInstance 持有 Model、const Parameters、Frontend 与 Program；Parameters 持有与最终
 容量计划相同的不可变执行 profile。纯逻辑加载不要求建立执行 profile。
 
@@ -375,6 +389,9 @@ forward 重叠；两段共享同一个资源预留和提交边界。
 
 MoE offload 使用分段 GPU Graph，控制线程负责 CPU contribution、缓存快照及传输交接。
 稳定缓存合并 mixer 与 MoE GPU 提交；恢复和流式加载时分开，保留 mixer 与上传重叠。
+`models/common/moe/graph` 负责单层 GPU subset 图及 CPU/cache 交接；调用方提供 mixer、MoE 和
+可选 feature 的 GPU body。Text 与 speculative 的 prefix/suffix、层遍历及跨拓扑共享关系仍由原生
+Program 定义。
 Graph 校准记录准备前、准备完成、仅销毁 Graph 后的显存快照。释放后仍保留的驱动开销
 已进入新的可用显存基准，不能与重建估计重复扣费。差值使用有符号数；允许重建增量为零。
 `MemorySummary.cuda_graph` 分别报告校准增长、校准释放后的保留量、重建估计和正式准备增长；
@@ -408,13 +425,16 @@ continuation 或 checkpoint。
 |---|---|
 | 公共 Engine facade | `include/ninfer/engine.h`, `src/runtime/engine/engine.cpp` |
 | 请求生命周期、调度与观测 | `src/runtime/engine/engine_core.h`, `request_record.h`, `scheduler.h`, `engine_metrics.inl` |
-| 实例构造 | `src/runtime/engine/model_instance.*` |
+| 实例构造与启动策略 | `src/runtime/engine/model_construction.*`, `model_instance.h`, `model_startup.h` |
 | 缓存 owner、索引与成本 | `src/runtime/engine/context_cache/` |
 | 公共请求、执行与资源合同 | `src/runtime/contract/` |
 | 模型 config、绑定与只读数据 | `src/models/qwen3_5/config.*`, `load/`, `model.*` |
 | 原生参数与固定模型调用 | `src/models/qwen3_5/execution/` |
 | Program 规划、存储、上下文及模型事务 | `src/models/qwen3_5/program/` |
-| Frontend 与模型状态布局 | `src/models/qwen3_5/frontend/`, `state/` |
+| Qwen Frontend、Vision 与输入身份 | `src/models/common/qwen/` |
+| 逻辑上下文存储 | `src/models/common/context/` |
+| 原生启动与状态布局 | `src/models/qwen3_5/startup.*`, `state/` |
+| 共享权重绑定与 MoE | `src/models/common/bindings.*`, `weights.*`, `moe/` |
 | Tensor、arenas、graphs、物理 KV 与 raw transfers | `src/core/` |
 | 通用 artifact framing 与 materialization | `src/artifact/` |
 | 闭合计算与状态转移 Ops | `src/ops/`, `include/ninfer/ops/` |

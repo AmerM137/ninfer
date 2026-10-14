@@ -153,7 +153,7 @@ struct Layer {
         parameters.shared  = {ops::prepare_linear_swiglu_weight(input(2), input(3)),
                               ops::prepare_linear_weight(input(4))};
         auto gu_policy = ops::LinearPolicy::AllowA4, down_policy = gu_policy;
-        const auto include = [&](ops::LinearPolicy& policy, model::WeightId id) {
+        const auto include = [&](ops::LinearPolicy& policy, ninfer::models::WeightId id) {
             for (const auto& use : plan.uses(id)) {
                 if (!ops::valid_linear_policy(use.policy)) {
                     throw std::invalid_argument("invalid expert Use");

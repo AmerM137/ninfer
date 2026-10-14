@@ -30,8 +30,8 @@ void require(bool condition, const char* message) {
 // These addresses belong to the fixture, rather than to an admitted Program continuation.
 // Release their page and table leases before Program destroys its backing cache pools.
 struct AddressOwner {
-    qwen::detail::KVAddressSpaceStore* store = nullptr;
-    qwen::detail::KVAddressSpaceHandle handle;
+    ninfer::models::context::KVAddressSpaceStore* store = nullptr;
+    ninfer::models::context::KVAddressSpaceHandle handle;
 
     ~AddressOwner() {
         if (store && !store->release_after_deactivate(handle)) { std::terminate(); }

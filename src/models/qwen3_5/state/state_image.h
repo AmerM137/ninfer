@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/arena.h"
+#include "models/common/context/state_store.h"
 #include "core/cyclic_kv_cache.h"
 #include "core/host_context_arena.h"
 #include "core/layout.h"
@@ -78,6 +79,7 @@ struct HostStateSlotHandle {
  */
 class HostStatePool {
 public:
+    using Handle = HostStateSlotHandle;
     HostStatePool(HostContextArena& arena, StateImageHostLayout layout);
 
     HostStatePool(const HostStatePool&)            = delete;
@@ -172,5 +174,10 @@ private:
     std::optional<CyclicKVCache> dflash_local_;
     StateImageHostLayout host_layout_;
 };
+
+using StateImageStore    = context::StateImageStore<StateImageDevicePool, HostStatePool>;
+using StateImageHandle   = StateImageStore::Handle;
+using StateImageTransfer = StateImageStore::Transfer;
+using ActiveStateBinding = StateImageStore::ActiveBinding;
 
 } // namespace ninfer::models::qwen3_5

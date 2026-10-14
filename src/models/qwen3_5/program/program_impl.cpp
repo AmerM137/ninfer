@@ -1,5 +1,5 @@
 #include "models/qwen3_5/program/program_impl.h"
-#include "models/qwen3_5/program/context_work.h"
+#include "models/common/context/work.h"
 #include "models/qwen3_5/program/execution_context.h"
 #include "core/buffer.h"
 #include "models/qwen3_5/execution/linear.h"
@@ -120,7 +120,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         host_kv_arena      = std::make_unique<HostKVArena>(*host_context_arena, layouts);
         const auto extents = checked_count(host_bytes / minimum_kv_stride);
         if (extents) {
-            host_kv_extents = std::make_unique<HostKVExtentStore>(*host_kv_arena, extents);
+            host_kv_extents = std::make_unique<context::HostKVExtentStore>(*host_kv_arena, extents);
         }
         phase.complete(host_bytes, host_bytes);
     }
@@ -130,15 +130,15 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         const auto stride = plan_host_kv_page_layout(pool.geometry()).page_stride;
         return checked_count(pool.capacity_pages() + host_bytes / stride);
     };
-    text_kv_pages = std::make_unique<LogicalKVPageStore>(
+    text_kv_pages = std::make_unique<context::LogicalKVPageStore>(
         decoder->text_kv.page_pool(), logical_pages(decoder->text_kv.page_pool()));
-    text_kv_addresses = std::make_unique<KVAddressSpaceStore>(
+    text_kv_addresses = std::make_unique<context::KVAddressSpaceStore>(
         *text_kv_pages, decoder->text_kv.execution_tables(), address_capacity,
         decoder->text_kv.execution_tables().logical_page_capacity());
     if (auto* backend = backend_kv_cache()) {
-        backend_kv_pages = std::make_unique<LogicalKVPageStore>(
+        backend_kv_pages = std::make_unique<context::LogicalKVPageStore>(
             backend->page_pool(), logical_pages(backend->page_pool()));
-        backend_kv_addresses = std::make_unique<KVAddressSpaceStore>(
+        backend_kv_addresses = std::make_unique<context::KVAddressSpaceStore>(
             *backend_kv_pages, backend->execution_tables(), address_capacity,
             backend->execution_tables().logical_page_capacity());
     }
@@ -277,7 +277,7 @@ ProgramImpl::~ProgramImpl() noexcept {
     moe.reset();
 }
 
-std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
+std::vector<float> ProgramImpl::causal_score(qwen::PreparedPromptData&& prompt,
                                              std::uint32_t first_target) {
     if (!causal_scoring || !score_hidden || !score_logprobs_host ||
         workspace_plan.causal_score == 0) {
@@ -301,11 +301,11 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
     const auto token_count                     = static_cast<std::uint32_t>(token_count_size);
     const std::uint32_t predictor_count        = token_count - 1U;
     const std::uint32_t scored_predictor_begin = first_target - 1U;
-    const std::uint32_t required_pages         = kv_pages_for_frontier(predictor_count);
+    const std::uint32_t required_pages         = context::kv_pages_for_frontier(predictor_count);
     if (required_pages == 0) { throw std::logic_error("causal score requires KV pages"); }
 
     std::optional<StateImageHandle> state;
-    std::optional<KVAddressSpaceHandle> address;
+    std::optional<context::KVAddressSpaceHandle> address;
     const auto cleanup = [&] {
         bool released = true;
         if (address) {
@@ -437,11 +437,11 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
 }
 
 void ProgramImpl::start_context_transfer_timer(runtime::ContextResourceClass resource) {
-    context_transfer_timers_[context_resource_index(resource)].start();
+    context_transfer_timers_[context::context_resource_index(resource)].start();
 }
 
 void ProgramImpl::stop_context_transfer_timer(runtime::ContextResourceClass resource) {
-    context_transfer_timers_[context_resource_index(resource)].record_stop();
+    context_transfer_timers_[context::context_resource_index(resource)].record_stop();
 }
 
 runtime::ContextTransferObservation ProgramImpl::context_transfer_observation(
@@ -449,7 +449,7 @@ runtime::ContextTransferObservation ProgramImpl::context_transfer_observation(
     TransferWork work, std::uint32_t page_count, std::uint64_t state_images) const {
     const double elapsed_ns =
         static_cast<double>(
-            context_transfer_timers_[context_resource_index(resource)].elapsed_ms()) *
+            context_transfer_timers_[context::context_resource_index(resource)].elapsed_ms()) *
         1'000'000.0;
     const std::uint64_t measured_ns =
         elapsed_ns >= static_cast<double>(std::numeric_limits<std::uint64_t>::max())
@@ -526,7 +526,7 @@ MemorySummary ProgramImpl::memory_summary() const {
     if (workspace_plan.vision) {
         out.vision_workspace = VisionWorkspaceMemorySummary{
             .aggregate_prompt_tokens = static_cast<std::uint32_t>(
-                std::min<std::uint64_t>(capacity, kMaximumPromptVisionTokens)),
+                std::min<std::uint64_t>(capacity, qwen::kMaximumPromptVisionTokens)),
             .max_item_tokens        = workspace_plan.vision->max_merged_tokens,
             .general_capacity_bytes = workspace_plan.vision->general_capacity_bytes,
             .encode_peak_bytes      = workspace_plan.vision->encode_peak_bytes,

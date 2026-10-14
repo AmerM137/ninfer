@@ -11,11 +11,11 @@ struct LoadPlan::Impl {
     Config config;
     LoadOptions options;
     ModelWeights weights;
-    std::vector<loading::PendingWeight> pending;
+    std::vector<PendingWeight> pending;
     const artifact::Reader* reader = nullptr;
     artifact::PreparedResources prepared_resources;
     std::vector<moe::BankDescription> expert_banks;
-    FrontendResources resources;
+    qwen::FrontendResources resources;
     InstanceInfo info;
     std::vector<WeightParent> geometry_parents;
     std::vector<WeightView> geometry_views;
@@ -45,7 +45,7 @@ ops::WeightInput LoadPlan::input(WeightId id) const {
 
 const ModelWeights& LoadPlan::weights() const { return impl_->weights; }
 
-const FrontendResources& LoadPlan::resources() const { return impl_->resources; }
+const qwen::FrontendResources& LoadPlan::resources() const { return impl_->resources; }
 
 std::span<const moe::BankDescription> LoadPlan::expert_banks() const { return impl_->expert_banks; }
 
@@ -64,11 +64,11 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
     out->config  = parse_config(reader.directory(), options);
     artifact::Binder binder(reader);
     out->resources = loading::bind_resources(binder, out->config);
-    loading::Bindings bindings(binder);
+    Bindings bindings(binder);
     const auto& text  = out->config.text;
     out->weights.text = loading::bind_text(bindings, text, options);
     if (out->config.vision) {
-        out->weights.vision = loading::bind_vision(bindings, *out->config.vision, text);
+        out->weights.vision = qwen::bind_vision(bindings, *out->config.vision, text.hidden_size);
     }
     if (out->config.mtp) {
         out->weights.mtp = loading::bind_mtp(bindings, text, out->weights.text);
@@ -192,7 +192,7 @@ std::unique_ptr<Model> materialize_model(ResolvedLoadPlan&& plan, DeviceContext&
     auto data    = std::move(plan.logical_.impl_);
     auto backing = artifact::materialize(*data->reader, std::move(plan.materialization_),
                                          device.transfer_view(), observer);
-    auto bound   = loading::resolve_weights(std::move(data->pending), backing, plan.devices_);
+    auto bound   = resolve_weights(std::move(data->pending), backing, plan.devices_);
     auto banks   = moe::bind_banks(data->expert_banks, backing, plan.bank_devices_);
     return std::unique_ptr<Model>(new Model(
         std::move(data->config), data->options, std::move(data->weights), std::move(bound),

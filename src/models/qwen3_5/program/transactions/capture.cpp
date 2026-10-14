@@ -1,5 +1,5 @@
 #include "models/qwen3_5/program/program_impl.h"
-#include "models/qwen3_5/program/context_work.h"
+#include "models/common/context/work.h"
 #include "core/device.h"
 
 #include <algorithm>
@@ -271,8 +271,9 @@ bool ProgramImpl::start_capture(SequenceHandle handle) {
             copy_local_for_context(operation, state_store->physical_slot(state.state.read),
                                    state_store->physical_slot(*operation.reserved_state));
         }
-        const auto copy = [&](KVAddressSpaceStore& addresses, LogicalKVPageStore& pages,
-                              const auto& view, runtime::ContextResourceClass resource) {
+        const auto copy = [&](context::KVAddressSpaceStore& addresses,
+                              context::LogicalKVPageStore& pages, const auto& view,
+                              runtime::ContextResourceClass resource) {
             if (view && view->needs_tail_copy()) {
                 copy_context_tail(operation, pages, addresses.active_prefix_view_tail_source(*view),
                                   addresses.active_prefix_view_tail_destination(*view), resource);
@@ -319,7 +320,7 @@ void ProgramImpl::publish_capture(ContextTransaction& tx) {
             .tail_hidden_valid = true};
         checkpoints[handle.index].reserved = false;
     }
-    if (state_store->residency(*tx.reserved_state) == StateReplicaResidency::None) {
+    if (state_store->residency(*tx.reserved_state) == context::StateReplicaResidency::None) {
         state_store->split_device_replica_identity(source_state, *tx.reserved_state);
         state.state = {.read = *tx.reserved_state, .write = *tx.reserved_state};
     } else {

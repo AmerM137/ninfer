@@ -1,5 +1,6 @@
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/execution/text.h"
+#include "models/qwen3_5/program/speculative/mtp_alignment.h"
 #include "models/common/moe/resources.h"
 #include "models/qwen3_5/program/text_graph.h"
 #include "models/qwen3_5/execution/attention.h"
@@ -10,9 +11,8 @@
 #include "models/qwen3_5/execution/workspace.h"
 
 #include "core/nvtx.h"
-#include "models/qwen3_5/execution/visual_scatter.h"
-#include "models/qwen3_5/execution/vision.h"
-#include "models/qwen3_5/program/vision_control.h"
+#include "models/common/qwen/vision/prefill.h"
+#include "models/common/qwen/vision/control.h"
 #include "ninfer/ops/argmax.h"
 #include "ninfer/ops/causal_conv1d_silu.h"
 #include "ninfer/ops/embedding.h"
@@ -1232,7 +1232,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
         if (split_rel > 0 && t0 < split_rel && t0 + len > split_rel) { len = split_rel - t0; }
         work_.reset();
 
-        VisionChunk vision_chunk;
+        qwen::VisionChunk vision_chunk;
         const std::uint32_t prompt_t0 = base + static_cast<std::uint32_t>(t0);
         if (multimodal != nullptr) {
             if (multimodal->vision == nullptr) {
@@ -1377,14 +1377,15 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                         work_.alloc(DType::BF16, {dimension(config_.hidden_size), len});
                     ops::embedding(mtp_ids, *embed_, mtp_input_embeddings, execution_);
                     if (vision_chunk.control != nullptr) {
-                        const qwen3_5::MtpVisualOverlap overlap = qwen3_5::shifted_visual_overlap(
-                            vision_chunk.control->scatter_indices, alignment_tokens, mtp_window);
+                        const qwen::VisualEmbeddingSlice overlap = qwen::visual_embedding_slice(
+                            vision_chunk.control->scatter_indices, alignment_tokens,
+                            mtp_window.shifted_embedding_begin, mtp_window.columns);
                         if (!overlap.empty()) {
                             Tensor shifted_indices = workspace::visual_scatter_indices(
                                 work_, static_cast<std::int32_t>(overlap.size()));
-                            qwen3_5::detail::scatter_shifted_visual_embeddings(
-                                mtp_input_embeddings, vision_chunk.embeddings, overlap,
-                                shifted_indices, execution_);
+                            qwen::scatter_visual_embeddings(mtp_input_embeddings,
+                                                            vision_chunk.embeddings, overlap,
+                                                            shifted_indices, execution_);
                         }
                     }
                     mtp_input_embeddings_ptr = &mtp_input_embeddings;
@@ -1481,9 +1482,10 @@ PrefillChunkResult TextContext::prefill_chunk(std::span<const int> full_ids, std
                         finalize_at_end);
 }
 
-PrefillChunkResult TextContext::prefill_chunk(const qwen3_5::PreparedPromptData& input,
+PrefillChunkResult TextContext::prefill_chunk(const qwen::PreparedPromptData& input,
                                               std::uint32_t begin, std::uint32_t nominal_length,
-                                              VisionPrefillSession& vision, bool finalize_at_end) {
+                                              qwen::VisionPrefillSession& vision,
+                                              bool finalize_at_end) {
     if (begin >= input.token_ids.size() || nominal_length == 0 ||
         nominal_length > input.token_ids.size() - begin) {
         throw std::invalid_argument("multimodal prefill chunk is outside the prompt");
@@ -1495,10 +1497,10 @@ PrefillChunkResult TextContext::prefill_chunk(const qwen3_5::PreparedPromptData&
                         finalize_at_end);
 }
 
-PrefillChunkResult TextContext::prefill_chunk(const qwen3_5::PreparedPromptData& input,
+PrefillChunkResult TextContext::prefill_chunk(const qwen::PreparedPromptData& input,
                                               std::uint32_t begin, std::uint32_t nominal_length,
-                                              VisionPrefillSession& vision, bool finalize_at_end,
-                                              DFlashFeatureSink& sink) {
+                                              qwen::VisionPrefillSession& vision,
+                                              bool finalize_at_end, DFlashFeatureSink& sink) {
     if (begin >= input.token_ids.size() || nominal_length == 0 ||
         nominal_length > input.token_ids.size() - begin) {
         throw std::invalid_argument("multimodal prefill chunk is outside the prompt");

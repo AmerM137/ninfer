@@ -11,7 +11,8 @@ ownership contracts are defined in [Engine architecture](../docs/maintainer/engi
   materialization and Python-writer/C++-reader interoperability;
 - `convert/` — source interpretation, Qwen logical mapping, recipe overrides/sharing, optional
   components, resources, proposals and numerical conversion methods;
-- `models/qwen3_5/` — config/binding, frontend, state/context stores, workspace, MTP alignment and
+- `models/common/` — shared Qwen frontend/tools, visual scatter, logical context stores and MoE;
+- `models/qwen3_5/` — native config/binding, state layout, workspace, MTP alignment and
   opt-in real Engine integration;
 - `ops/` — semantic Op qualification with independent mathematical or state-transition oracles;
   Linear and fused Linear suites are separated by their supported weight/activation paths;
@@ -27,7 +28,7 @@ ownership contracts are defined in [Engine architecture](../docs/maintainer/engi
   consumer.
 
 Tests are grouped by observable risk, not by mirroring every source file or class.
-`CMakeLists.txt` includes explicit registrations from `cmake/`, `artifact/`, `models/qwen3_5/`
+`CMakeLists.txt` includes explicit registrations from `cmake/`, `artifact/`, the model directories
 and `ops/`. Registration helpers live in `cmake/NinferTests.cmake`; included manifests keep
 executables and CTest working directories under `build/tests/`.
 `ops/op_tester.h` and `ops/op_check.h` own reusable device/guard and comparison mechanics.
@@ -302,7 +303,7 @@ call/result prefix reuse, and required-tool → JSON continuation with committed
 streaming and mixed strict/basic/free rows. Snapshot/Replay modes force resource pressure and
 validate the completed argument value after recovery; `cancel` interrupts the paused request.
 `NINFER_TEST_TOOL_REPORT` appends schema/output/timing JSONL.
-`python3 tests/models/qwen3_5/test_tool_schema.py` checks the native Qwen grammar and decoder against
+`python3 tests/models/common/qwen/test_tool_schema.py` checks the native Qwen grammar and decoder against
 `jsonschema` (dependencies in `tests/text/requirements.txt`), including string pattern/Unicode-length
 intersections. The JSON Schema oracle also covers finite-value filtering, reference/union siblings,
 closed-object and positional-array intersections, draft-07 tuples, recursive conjunctions,

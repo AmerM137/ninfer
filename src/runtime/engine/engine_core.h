@@ -40,6 +40,8 @@ template <class Instance>
 class EngineCore {
 
 public:
+    static constexpr EnginePurpose purpose = EnginePurpose::Generation;
+
     using ModelContract      = typename Instance::ModelContract;
     using ExecutionUnit      = typename ModelContract::ExecutionUnit;
     using UnitKind           = typename ModelContract::ExecutionUnitKind;

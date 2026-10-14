@@ -86,7 +86,7 @@ GBNF 是直接的 grammar 输入，适合作为底层机制的最小完整使用
 | Sampling / Speculative Ops | 合法候选筛选、概率归一化、p/q 接受、残差与采样结果 |
 | Gateway / CLI | 文件获取、协议字段翻译、协议错误和响应编码 |
 
-通用适配位于 `src/text/`；Qwen 输出语义位于 `src/models/qwen3_5/frontend/`。执行数据合同属于 `src/runtime/contract/`，物理消费者由 Program/Ops 拥有。
+通用适配位于 `src/text/`；Qwen 输出语义位于 `src/models/common/qwen/frontend/`。执行数据合同属于 `src/runtime/contract/`，物理消费者由 Program/Ops 拥有。
 
 ## 3. 请求输入与编译
 

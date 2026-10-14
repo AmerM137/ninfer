@@ -1,6 +1,7 @@
 #pragma once
-#include "models/qwen3_5/program/internal.h"
 
+#include "models/common/qwen/vision/prefill.h"
+#include "models/qwen3_5/program/internal.h"
 
 #include "core/arena.h"
 #include "core/device.h"
@@ -12,7 +13,7 @@
 #include "ninfer/ops/softmax_attention.h"
 #include "ninfer/ops/moe.h"
 #include "models/qwen3_5/state/decoder_state.h"
-#include "models/qwen3_5/frontend/prepared_prompt.h"
+#include "models/common/qwen/frontend/prepared_prompt.h"
 #include "models/qwen3_5/program/round_buffers.h"
 
 #include <array>
@@ -69,8 +70,6 @@ struct DFlashFeatureSink {
     void consume_prefill_chunk(std::int32_t tokens, bool rewrite_checkpoint);
 };
 
-class VisionPrefillSession;
-
 class TextContext {
 public:
     TextContext(DeviceContext& ctx, const execution::Parameters& weights, MemoryArena& work,
@@ -124,13 +123,15 @@ public:
                                                    std::uint32_t begin,
                                                    std::uint32_t nominal_length,
                                                    bool finalize_at_end, DFlashFeatureSink& sink);
-    [[nodiscard]] PrefillChunkResult
-    prefill_chunk(const qwen3_5::PreparedPromptData& input, std::uint32_t begin,
-                  std::uint32_t nominal_length, VisionPrefillSession& vision, bool finalize_at_end);
-    [[nodiscard]] PrefillChunkResult prefill_chunk(const qwen3_5::PreparedPromptData& input,
+    [[nodiscard]] PrefillChunkResult prefill_chunk(const qwen::PreparedPromptData& input,
                                                    std::uint32_t begin,
                                                    std::uint32_t nominal_length,
-                                                   VisionPrefillSession& vision,
+                                                   qwen::VisionPrefillSession& vision,
+                                                   bool finalize_at_end);
+    [[nodiscard]] PrefillChunkResult prefill_chunk(const qwen::PreparedPromptData& input,
+                                                   std::uint32_t begin,
+                                                   std::uint32_t nominal_length,
+                                                   qwen::VisionPrefillSession& vision,
                                                    bool finalize_at_end, DFlashFeatureSink& sink);
     void ordinary_decode_batch(const Tensor& ids, const Tensor& cache_positions,
                                const Tensor& rope_positions, const Tensor& kv_table_rows,
@@ -200,9 +201,9 @@ private:
     struct MultimodalPrefill {
         std::span<const int> token_ids;
         std::span<const std::int32_t> positions;
-        VisionPrefillSession* vision = nullptr;
-        std::uint32_t begin          = 0;
-        std::int32_t rope_delta      = 0;
+        qwen::VisionPrefillSession* vision = nullptr;
+        std::uint32_t begin                = 0;
+        std::int32_t rope_delta            = 0;
     };
 
     struct TextPrefill {

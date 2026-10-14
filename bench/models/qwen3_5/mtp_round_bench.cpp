@@ -1,4 +1,4 @@
-#include "runtime/engine/model_instance.h"
+#include "runtime/engine/model_construction.h"
 
 #include "core/device.h"
 #include "runtime/engine/context_cache/context_cost.h"
@@ -24,7 +24,7 @@
 
 namespace {
 
-namespace qwen = ninfer::models::qwen3_5;
+namespace q35 = ninfer::models::qwen3_5;
 
 struct Options {
     std::filesystem::path artifact = "out/qwen3_6_27b.ninfer";
@@ -95,14 +95,14 @@ struct RoundMeasurement {
     std::uint32_t licensed_tokens = 0;
 };
 
-RoundMeasurement measure_round(qwen::Program& program, ninfer::DeviceContext& device,
-                               qwen::SequenceHandle sequence, std::uint32_t draft_tokens) {
-    const std::array<qwen::SequenceHandle, 1> sequences{sequence};
+RoundMeasurement measure_round(q35::Program& program, ninfer::DeviceContext& device,
+                               q35::SequenceHandle sequence, std::uint32_t draft_tokens) {
+    const std::array<q35::SequenceHandle, 1> sequences{sequence};
     const std::array<ninfer::runtime::RoundBudget, 1> budgets{
         ninfer::runtime::RoundBudget{.generated_tokens_remaining = draft_tokens + 1}};
     // Resource scheduling stays outside the measured decode/commit interval.
-    const std::array<qwen::ExecutionUnit, 1> units{qwen::ExecutionUnit{
-        .sequence = sequence, .kind = qwen::ExecutionUnitKind::Decode, .tokens = draft_tokens + 1}};
+    const std::array<q35::ExecutionUnit, 1> units{q35::ExecutionUnit{
+        .sequence = sequence, .kind = q35::ExecutionUnitKind::Decode, .tokens = draft_tokens + 1}};
     if (!program.reserve_units(units)) {
         throw std::runtime_error("benchmark decode unit could not be reserved");
     }
@@ -146,9 +146,12 @@ int run(const Options& options) {
     engine = ninfer::runtime::normalize_engine_options(std::move(engine));
     ninfer::DeviceContext device(options.device);
     auto constructed = ninfer::runtime::construct_model(engine, device);
-    auto& frontend   = constructed.instance->frontend;
-    auto& program    = constructed.instance->program;
-    auto prompt      = frontend.prepare_tokens(seed, false);
+    auto& instance   = std::get<
+          std::unique_ptr<ninfer::runtime::ModelInstance<ninfer::models::qwen3_5::RuntimeTypes>>>(
+        constructed.instance);
+    auto& frontend = instance->frontend;
+    auto& program  = instance->program;
+    auto prompt    = frontend.prepare_tokens(seed, false);
     ninfer::runtime::ResolvedExecutionOptions execution;
     execution.requested_output_tokens = 1 + measured_rounds * (options.draft_tokens + 1);
     execution.allow_prefix_reuse      = false;
@@ -157,19 +160,19 @@ int run(const Options& options) {
     if (!source || !program->start_binding(request_base, ninfer::runtime::LaneId{0}, *source)) {
         throw std::runtime_error("benchmark root binding could not reserve its first unit");
     }
-    std::optional<qwen::SequenceHandle> started;
+    std::optional<q35::SequenceHandle> started;
     for (;;) {
         auto progress = program->poll_context({});
         if (!progress.complete) { continue; }
-        if (progress.kind != qwen::ContextOperationKind::Bind || !progress.published ||
+        if (progress.kind != q35::ContextOperationKind::Bind || !progress.published ||
             !progress.sequence) {
             throw std::runtime_error("benchmark root binding did not publish a sequence");
         }
         started = progress.sequence;
         break;
     }
-    const std::array<qwen::ExecutionUnit, 1> prefill_unit{
-        qwen::ExecutionUnit{.sequence = *started, .kind = qwen::ExecutionUnitKind::Prefill}};
+    const std::array<q35::ExecutionUnit, 1> prefill_unit{
+        q35::ExecutionUnit{.sequence = *started, .kind = q35::ExecutionUnitKind::Prefill}};
     if (!program->reserve_units(prefill_unit)) {
         throw std::runtime_error("benchmark seed prefill unit could not be reserved");
     }

@@ -24,7 +24,7 @@ namespace {
 
 using namespace ninfer;
 using namespace ninfer::models;
-namespace qwen = ninfer::models::qwen3_5;
+namespace q35 = ninfer::models::qwen3_5;
 using ninfer::test::artifact_fixture::require;
 
 struct Sample {
@@ -32,7 +32,7 @@ struct Sample {
     std::vector<std::byte> bytes;
 };
 
-void check_selection(const qwen::LoadPlan& plan, const LoadOptions& options) {
+void check_selection(const q35::LoadPlan& plan, const LoadOptions& options) {
     const auto& weights = plan.weights();
     require(weights.vision.has_value() == options.vision,
             "Vision demand differs from startup selection");
@@ -45,7 +45,7 @@ void check_selection(const qwen::LoadPlan& plan, const LoadOptions& options) {
             "proposal selection differs");
     require(weights.text.layers.size() == plan.config().text.num_hidden_layers,
             "layer data differs from instance config");
-    const auto check_head = [&](qwen::WeightId head, qwen::WeightUseId use,
+    const auto check_head = [&](ninfer::models::WeightId head, ninfer::models::WeightUseId use,
                                 const std::string& input) {
         require(use.parameter == head && plan.uses(head)[use.use_index].input == input,
                 "shared output head selected the wrong mathematical Use");
@@ -69,7 +69,7 @@ void check_selection(const qwen::LoadPlan& plan, const LoadOptions& options) {
     }
 }
 
-void check_placement(const qwen::ResolvedLoadPlan& plan) {
+void check_placement(const q35::ResolvedLoadPlan& plan) {
     const auto check = [](const auto& objects, std::uint64_t capacity,
                           std::uint64_t alignment = 1) {
         std::set<std::size_t> parents;
@@ -93,7 +93,7 @@ void check_placement(const qwen::ResolvedLoadPlan& plan) {
 }
 
 // Exercise native grouping after Reader destruction, independently of Program selection.
-void check_native_inputs(const qwen::Model& model) {
+void check_native_inputs(const q35::Model& model) {
     const auto split = [](std::span<const ops::WeightInput> inputs, bool two_outputs) {
         const auto weights = ops::prepare_projection_weights(inputs);
         std::vector<std::int32_t> rows;
@@ -102,15 +102,15 @@ void check_native_inputs(const qwen::Model& model) {
         if (two_outputs) rows = {rows[0] + rows[1] + rows[2], rows[3]};
         return ops::linear_split_workspace_capacity_bytes(weights, rows, 1, 1);
     };
-    const auto linear = [&](qwen::WeightId id) {
+    const auto linear = [&](ninfer::models::WeightId id) {
         return ops::prepare_linear_weight(model.input(id));
     };
-    const auto dense = [&](const qwen::DenseWeights& weights) {
+    const auto dense = [&](const q35::DenseWeights& weights) {
         (void)ops::prepare_linear_swiglu_weight(model.input(weights.gate), model.input(weights.up));
         (void)linear(weights.down);
     };
-    const auto block = [&](const qwen::BlockWeights& weights, bool mtp = false) {
-        if (const auto* attention = std::get_if<qwen::AttentionWeights>(&weights.mixer)) {
+    const auto block = [&](const q35::BlockWeights& weights, bool mtp = false) {
+        if (const auto* attention = std::get_if<q35::AttentionWeights>(&weights.mixer)) {
             if (mtp) {
                 const std::array bank{model.input(attention->query), model.input(attention->key),
                                       model.input(attention->gate), model.input(attention->value)};
@@ -125,7 +125,7 @@ void check_native_inputs(const qwen::Model& model) {
             }
             (void)linear(attention->output);
         } else {
-            const auto& gdn = std::get<qwen::GdnWeights>(weights.mixer);
+            const auto& gdn = std::get<q35::GdnWeights>(weights.mixer);
             (void)split(
                 std::array<ops::WeightInput, 4>{{model.input(gdn.query), model.input(gdn.key),
                                                  model.input(gdn.value), model.input(gdn.z)}},
@@ -134,10 +134,10 @@ void check_native_inputs(const qwen::Model& model) {
                                                         model.input(gdn.b_projection));
             (void)linear(gdn.output);
         }
-        if (const auto* mlp = std::get_if<qwen::DenseWeights>(&weights.ffn)) {
+        if (const auto* mlp = std::get_if<q35::DenseWeights>(&weights.ffn)) {
             dense(*mlp);
         } else {
-            const auto& moe  = std::get<qwen::MoeWeights>(weights.ffn);
+            const auto& moe  = std::get<q35::MoeWeights>(weights.ffn);
             const auto& bank = model.expert_banks()[moe.bank.index];
             for (const auto e : {0U, static_cast<unsigned>(moe.experts.size() - 1)}) {
                 const auto gu       = matrix_weight(bank.gate_up, e);
@@ -168,7 +168,7 @@ void check_native_inputs(const qwen::Model& model) {
             const ops::MoeProfile profile{
                 ops::routed_swiglu_profile(
                     bank.gate_up, bank.down,
-                    std::get<qwen::MoeConfig>(model.config().text.ffn).num_experts_per_tok,
+                    std::get<q35::MoeConfig>(model.config().text.ffn).num_experts_per_tok,
                     model.input(moe.experts.front().gate).policy,
                     model.input(moe.experts.front().down).policy),
                 ops::swiglu_profile(shared)};
@@ -283,16 +283,16 @@ int main(int argc, char** argv) {
             return 77;
         }
         std::unique_ptr<DeviceContext> device;
-        std::unique_ptr<qwen::Model> model;
+        std::unique_ptr<q35::Model> model;
         std::map<std::string, std::vector<Sample>> samples;
         std::uint64_t expected_h2d = 0;
         {
             artifact::Reader reader(path);
-            auto logical = qwen::plan_load(reader, options);
+            auto logical = q35::plan_load(reader, options);
             check_selection(logical, options);
             auto plan =
-                qwen::resolve_load(std::move(logical), Device::cuda(0),
-                                   host_experts ? std::optional(Device::cpu()) : std::nullopt);
+                q35::resolve_load(std::move(logical), Device::cuda(0),
+                                  host_experts ? std::optional(Device::cpu()) : std::nullopt);
             check_placement(plan);
             if (host_only) {
                 std::cout << path.filename().string() << ": Host binding passed, architecture="
@@ -324,7 +324,7 @@ int main(int argc, char** argv) {
                 }
             }
             device = std::make_unique<DeviceContext>();
-            model  = qwen::materialize_model(std::move(plan), *device);
+            model  = q35::materialize_model(std::move(plan), *device);
         }
         require(model->storage_stats().h2d_bytes == expected_h2d,
                 "H2D did not cover all selected parent bytes");

@@ -1,6 +1,6 @@
 #include "models/qwen3_5/measurement.h"
 
-#include "models/qwen3_5/frontend/digest.h"
+#include "models/common/qwen/frontend/digest.h"
 #include "models/qwen3_5/program/planning/moe.h"
 
 #include <nlohmann/json.hpp>
@@ -94,7 +94,7 @@ std::string prefill_signature(const Model& model, const moe::Plan* moe, std::uin
         }
         inventory.push_back(std::move(item));
     }
-    return frontend::sha256_hex(frontend::sha256(facts.dump()));
+    return qwen::frontend::sha256_hex(qwen::frontend::sha256(facts.dump()));
 }
 
 } // namespace ninfer::models::qwen3_5

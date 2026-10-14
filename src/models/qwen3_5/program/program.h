@@ -1,8 +1,9 @@
 #pragma once
+
 #include "ninfer/types.h"
 #include "runtime/contract/execution.h"
 #include "runtime/contract/resources.h"
-#include "models/qwen3_5/frontend/prepared_prompt.h"
+#include "models/common/qwen/frontend/prepared_prompt.h"
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -112,7 +113,7 @@ public:
     RequestBasePlan& operator=(const RequestBasePlan&) = delete;
 
     [[nodiscard]] const runtime::RequestPlanSummary& summary() const noexcept;
-    [[nodiscard]] const PreparedContextCache& context_cache() const noexcept;
+    [[nodiscard]] const qwen::PreparedContextCache& context_cache() const noexcept;
     [[nodiscard]] std::vector<std::uint32_t> capture_frontiers() const;
     [[nodiscard]] std::optional<PrefixShortlistKey>
     prefix_shortlist_key(std::uint32_t frontier) const noexcept;
@@ -409,9 +410,9 @@ public:
     Program& operator=(const Program&) = delete;
     Program(Program&&)                 = delete;
     Program& operator=(Program&&)      = delete;
-    [[nodiscard]] RequestBasePlan plan_request(PreparedPrompt&& prompt,
+    [[nodiscard]] RequestBasePlan plan_request(qwen::PreparedPrompt&& prompt,
                                                const runtime::ResolvedExecutionOptions& options);
-    [[nodiscard]] std::vector<float> causal_score(PreparedPrompt&& prompt,
+    [[nodiscard]] std::vector<float> causal_score(qwen::PreparedPrompt&& prompt,
                                                   std::uint32_t first_target);
     [[nodiscard]] std::optional<SourceCandidate>
     inspect_source(const RequestBasePlan& base, std::optional<CheckpointHandle> checkpoint,

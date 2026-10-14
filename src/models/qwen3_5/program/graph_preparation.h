@@ -11,7 +11,7 @@ class Parameters;
 // Within one startup configuration, only MoE residency changes the required graph variants.
 struct GraphPreparationPlan {
     bool segmented = false;
-    std::vector<execution::MoeGraphPlan> layers_by_batch;
+    std::vector<moe::GraphPlan> layers_by_batch;
     friend bool operator==(const GraphPreparationPlan&, const GraphPreparationPlan&) = default;
 };
 

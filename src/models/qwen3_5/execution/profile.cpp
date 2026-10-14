@@ -95,16 +95,8 @@ public:
         return out;
     }
 
-    VisionProfile vision(const VisionWeights& w) const {
-        VisionProfile out{
-            linear(w.patch_embedding), linear(w.merger_fc1), linear(w.merger_fc2), {}};
-        for (const auto& layer : w.layers) {
-            const std::array inputs{plan_.input(layer.query), plan_.input(layer.key),
-                                    plan_.input(layer.value)};
-            out.layers.push_back({ops::describe_linear_weight(inputs), linear(layer.output),
-                                  linear(layer.fc1), linear(layer.fc2)});
-        }
-        return out;
+    qwen::VisionProfile vision(const qwen::VisionWeights& weights) const {
+        return qwen::describe_vision(weights, [&](WeightId id) { return plan_.input(id); });
     }
 
     DraftProfile draft(const DraftWeights& w) const {

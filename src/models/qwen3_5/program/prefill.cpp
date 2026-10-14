@@ -1,5 +1,6 @@
+#include "models/common/qwen/vision/prefill.h"
 #include "models/qwen3_5/program/program_impl.h"
-#include "models/qwen3_5/program/context_work.h"
+#include "models/common/context/work.h"
 #include "models/qwen3_5/program/execution_context.h"
 #include "models/qwen3_5/execution/linear.h"
 #include "core/device.h"
@@ -89,11 +90,10 @@ PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const Tok
     return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, finalize_at_end);
 }
 
-PrefillChunkResult prefill_multimodal_chunk(PrefillContext& state, const PreparedPromptData& prompt,
-                                            VisionPrefillSession& vision,
-                                            std::uint32_t nominal_length,
-                                            std::optional<std::uint32_t> split_frontier,
-                                            bool finalize_at_end) {
+PrefillChunkResult
+prefill_multimodal_chunk(PrefillContext& state, const qwen::PreparedPromptData& prompt,
+                         qwen::VisionPrefillSession& vision, std::uint32_t nominal_length,
+                         std::optional<std::uint32_t> split_frontier, bool finalize_at_end) {
     TextContext card(state.execution.device, state.execution.parameters, state.execution.work,
                      state.text_cache, state.execution.linear_attention, state.execution.io,
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
@@ -113,8 +113,8 @@ PrefillChunkResult prefill_multimodal_chunk(PrefillContext& state, const Prepare
     return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, vision, finalize_at_end);
 }
 
-void mtp_bridge_multimodal(PrefillContext& state, const PreparedPromptData& prompt,
-                           VisionPrefillSession& vision, const MtpBridgeInput& bridge) {
+void mtp_bridge_multimodal(PrefillContext& state, const qwen::PreparedPromptData& prompt,
+                           qwen::VisionPrefillSession& vision, const MtpBridgeInput& bridge) {
     if (!state.mtp_kv.valid() || bridge.previous_hidden == nullptr || state.text_kv_base == 0 ||
         bridge.position < 0 ||
         static_cast<std::uint32_t>(bridge.position) + 1 != state.text_kv_base) {
@@ -129,7 +129,7 @@ void mtp_bridge_multimodal(PrefillContext& state, const PreparedPromptData& prom
     Tensor visual_embedding;
     const Tensor* composed_embedding = nullptr;
     if (prompt.token_types[state.text_kv_base] != 0) {
-        const VisionChunk chunk = vision.prepare_chunk(state.text_kv_base, 1);
+        const qwen::VisionChunk chunk = vision.prepare_chunk(state.text_kv_base, 1);
         if (chunk.control == nullptr) {
             throw std::logic_error("visual MTP bridge has no encoded Vision item");
         }
@@ -177,10 +177,10 @@ namespace ninfer::models::qwen3_5::detail {
 
 namespace {
 
-std::array<std::int32_t, 3> prompt_rope_position(const PreparedPromptData& prompt,
+std::array<std::int32_t, 3> prompt_rope_position(const qwen::PreparedPromptData& prompt,
                                                  std::uint32_t token);
 
-std::array<std::int32_t, 3> prompt_rope_position(const PreparedPromptData& prompt,
+std::array<std::int32_t, 3> prompt_rope_position(const qwen::PreparedPromptData& prompt,
                                                  std::uint32_t token) {
     const std::size_t tokens = prompt.token_ids.size();
     if (token >= tokens || prompt.positions.size() != 3 * tokens) {
@@ -314,7 +314,7 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
                                  (!terminal[row] && committed != pending.produced)))) {
             throw std::logic_error("speculative pending row has an invalid committed prefix");
         }
-        const StateImageSelectors selectors = state_selectors(sequence);
+        const context::StateImageSelectors selectors = state_selectors(sequence);
         fold_rows[row] =
             ops::GdnReplayFoldRow{.source_state_slot      = selectors.source,
                                   .destination_state_slot = selectors.destination,
@@ -326,13 +326,13 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
         needs_hidden_correction = needs_hidden_correction || partial_terminal;
     }
 
-    const auto tail_started = Clock::now();
+    const auto tail_started = context::Clock::now();
     try {
         timing.resume_submit();
         replay_fold->execute(std::span<const ops::GdnReplayFoldRow>(fold_rows.data(), lanes.size()),
                              device.execution_view());
 
-        // Sparse acceptance reads counts. Publish only the prefix licensed by the Frontend.
+        // Sparse acceptance reads counts. Publish only the prefix licensed by the qwen::Frontend.
         if (speculative_backend == SpeculativeBackend::DFlash2) {
             for (std::size_t row = 0; row < lanes.size(); ++row) {
                 if (discarded[row] || !requests[lanes[row]].sampling_host.token_counts) {
@@ -414,7 +414,8 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
         throw;
     }
 
-    const double tail_seconds = std::chrono::duration<double>(Clock::now() - tail_started).count();
+    const double tail_seconds =
+        std::chrono::duration<double>(context::Clock::now() - tail_started).count();
     const std::uint32_t width = draft_window + 1U;
     try {
         for (std::size_t row = 0; row < lanes.size(); ++row) {
@@ -491,9 +492,9 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                                         .reused_prompt_tokens = staged.base,
                                         .prefix_reuse_path    = staged.reuse};
     std::uint32_t processed_prompt_tokens = 0;
-    const auto started                    = Clock::now();
+    const auto started                    = context::Clock::now();
     try {
-        StateImageSelectors selectors = state_selectors(sequence);
+        context::StateImageSelectors selectors = state_selectors(sequence);
         Tensor rewrite_capture_hidden;
         Tensor* rewrite_capture_hidden_ptr = nullptr;
         if (request.next_capture < request.capture_groups.size()) {
@@ -529,7 +530,7 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             const Tensor& previous_hidden = sequence.tail_hidden;
             const execution::MtpBridgeInput bridge{
                 .previous_hidden = &previous_hidden,
-                .position        = checked_i32(staged.base - 1, "MTP bridge position"),
+                .position        = context::checked_i32(staged.base - 1, "MTP bridge position"),
                 .rope_position   = prompt_rope_position(staged.prompt, staged.base - 1),
             };
             if (staged.vision) {
@@ -634,7 +635,7 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                         // Begin token is committed. commit() marks this capture group ready.
                     } else {
                         staged.elapsed_seconds +=
-                            std::chrono::duration<double>(Clock::now() - started).count();
+                            std::chrono::duration<double>(context::Clock::now() - started).count();
 
                         request.capture_pending = true;
                         return runtime::PrefillStepResult{
@@ -654,7 +655,7 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                     throw std::logic_error("staged prefill reached the prompt without sampling");
                 }
                 staged.elapsed_seconds +=
-                    std::chrono::duration<double>(Clock::now() - started).count();
+                    std::chrono::duration<double>(context::Clock::now() - started).count();
                 return runtime::PrefillStepResult{
                     .summary                 = summary,
                     .processed_prompt_tokens = processed_prompt_tokens,
@@ -672,11 +673,13 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             if (!sequence.tail_hidden_valid) {
                 throw std::logic_error("zero-suffix reuse has no target tail hidden");
             }
-            execution::sample_from_hidden(schedule_state, sequence.tail_hidden,
-                                          checked_i32(staged.prompt_tokens, "sample position"),
-                                          ops::kSamplePurposePrefill);
-            set_device_i32(io.rope_pos, checked_i32(staged.prompt_tokens, "rope position") +
-                                            sequence.rope_delta);
+            execution::sample_from_hidden(
+                schedule_state, sequence.tail_hidden,
+                context::checked_i32(staged.prompt_tokens, "sample position"),
+                ops::kSamplePurposePrefill);
+            set_device_i32(io.rope_pos,
+                           context::checked_i32(staged.prompt_tokens, "rope position") +
+                               sequence.rope_delta);
             if (staged.prepare_mtp) {
                 if (staged.mtp_bridge != MtpBridgeMode::AfterExactHit) {
                     throw std::logic_error("zero-suffix MTP reuse has no exact-hit bridge");
@@ -686,7 +689,8 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                     prompt_rope_position(staged.prompt, staged.prompt_tokens - 1);
                 execution::mtp_bridge_and_propose(
                     schedule_state, io.token, sequence.tail_hidden,
-                    checked_i32(staged.prompt_tokens - 1, "MTP full-prefix bridge position"),
+                    context::checked_i32(staged.prompt_tokens - 1,
+                                         "MTP full-prefix bridge position"),
                     bridge_rope, staged.initial_mtp_extent != 0);
                 sequence.mtp_kv_valid = staged.prompt_tokens;
                 commit_sequence_kv(sequence, sequence.text_kv_valid, sequence.mtp_kv_valid);
@@ -704,7 +708,8 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
         timing.begin_wait();
         device.synchronize();
         timing.end_wait();
-        staged.elapsed_seconds += std::chrono::duration<double>(Clock::now() - started).count();
+        staged.elapsed_seconds +=
+            std::chrono::duration<double>(context::Clock::now() - started).count();
         const double vision_seconds = staged.retired_vision_seconds +
                                       (staged.vision ? staged.vision->elapsed_seconds() : 0.0);
         const std::uint32_t prompt_tokens = staged.prompt_tokens;
@@ -762,6 +767,5 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
         throw;
     }
 }
-
 
 } // namespace ninfer::models::qwen3_5::detail

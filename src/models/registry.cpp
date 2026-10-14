@@ -1,9 +1,20 @@
 #include "models/registry.h"
+#include "artifact/schema.h"
 
 #include <stdexcept>
 #include <string>
 
 namespace ninfer::models {
+
+Architecture resolve_architecture(const artifact::Directory& directory) {
+    const auto& config = directory.component("text").config;
+    const auto& names  = config.at("architectures");
+    if (!names.is_array() || names.size() != 1) {
+        throw artifact::ArtifactError("architectures must name one implementation");
+    }
+    return resolve_architecture(artifact::require_id(names[0], "architecture"),
+                                artifact::require_id(config.at("model_type"), "model_type"));
+}
 
 Architecture resolve_architecture(std::string_view architecture, std::string_view model_type) {
     if (architecture == "Qwen3_5ForCausalLM" && model_type == "qwen3_5_text") {

@@ -1,5 +1,6 @@
+#include "models/common/qwen/vision/prefill.h"
 #include "models/qwen3_5/program/program_impl.h"
-#include "models/qwen3_5/program/context_work.h"
+#include "models/common/context/work.h"
 #include "core/device.h"
 
 #include <algorithm>
@@ -38,8 +39,8 @@ void ProgramImpl::initialize_prefill(std::uint32_t lane, std::uint32_t base) {
     if (plan.vision_control_plan) {
         auto& vision        = staged.vision_plan.emplace();
         vision.control_plan = plan.vision_control_plan;
-        vision.control      = std::make_shared<VisionControl>(
-            build_vision_control(staged.prompt, *vision.control_plan, 0));
+        vision.control      = std::make_shared<qwen::VisionControl>(
+            qwen::build_vision_control(staged.prompt, *vision.control_plan, 0));
         for (std::uint32_t i = 0; i < vision.control_plan->items.size(); ++i) {
             const auto& item = vision.control_plan->items[i];
             if (item.token_end <= base) { continue; }
@@ -49,9 +50,10 @@ void ProgramImpl::initialize_prefill(std::uint32_t lane, std::uint32_t base) {
             vision.max_merged_count = std::max(vision.max_merged_count, item.merged_count);
         }
         if (!vision.uses.empty()) {
-            staged.vision = std::make_unique<execution::VisionPrefillSession>(
-                device, parameters, workspace_storage.span(), *workspace_plan.vision, staged.prompt,
-                vision, vision_handoff, vision_handoff_peak_bytes);
+            staged.vision = std::make_unique<qwen::VisionPrefillSession>(
+                device, *parameters.model.config().vision, *parameters.vision,
+                workspace_storage.span(), *workspace_plan.vision, staged.prompt, vision,
+                vision_handoff, vision_handoff_peak_bytes);
         }
     }
 }
@@ -126,16 +128,16 @@ BindingReservation ProgramImpl::start_binding(const RequestBasePlan& base, runti
                                   state_store->source_pins(checkpoint(*source).state) == 0 &&
                                   state_store->device_occupied() == state_store->device_capacity();
         const auto& record = checkpoint(*source);
-        const auto movable = [&](const KVAddressSpaceStore& addresses,
-                                 const LogicalKVPageStore& pages, KVAddressSpaceHandle address,
-                                 std::uint32_t frontier) {
+        const auto movable = [&](const context::KVAddressSpaceStore& addresses,
+                                 const context::LogicalKVPageStore& pages,
+                                 context::KVAddressSpaceHandle address, std::uint32_t frontier) {
             if (addresses.active(address) ||
                 !addresses.can_destructive_truncate_inactive(address, frontier, true)) {
                 return false;
             }
             if (frontier % kPagedKVPageSize) {
                 const auto tail =
-                    addresses.logical_page(address, kv_pages_for_frontier(frontier) - 1U);
+                    addresses.logical_page(address, context::kv_pages_for_frontier(frontier) - 1U);
                 return pages.address_references(tail) == 1 && pages.source_pins(tail) == 0;
             }
             return true;
@@ -180,17 +182,19 @@ BindingReservation ProgramImpl::start_binding(const RequestBasePlan& base, runti
         transaction.reservation_demand = coverage;
     }
     const auto& coverage      = transaction.reservation_demand;
-    const auto main_prefix    = kv_pages_for_frontier(transaction.reuse_frontier);
-    const auto backend_prefix = kv_pages_for_frontier(transaction.backend_frontier);
-    const auto main_growth    = kv_pages_for_frontier(coverage.main_frontier) > main_prefix
-                                    ? kv_pages_for_frontier(coverage.main_frontier) - main_prefix
-                                    : 0U;
-    const auto backend_growth =
-        kv_pages_for_frontier(coverage.backend_frontier) > backend_prefix
-            ? kv_pages_for_frontier(coverage.backend_frontier) - backend_prefix
+    const auto main_prefix    = context::kv_pages_for_frontier(transaction.reuse_frontier);
+    const auto backend_prefix = context::kv_pages_for_frontier(transaction.backend_frontier);
+    const auto main_growth =
+        context::kv_pages_for_frontier(coverage.main_frontier) > main_prefix
+            ? context::kv_pages_for_frontier(coverage.main_frontier) - main_prefix
             : 0U;
-    const auto collect = [&](KVAddressSpaceStore& addresses, LogicalKVPageStore& pages,
-                             KVAddressSpaceHandle address, std::uint32_t count,
+    const auto backend_growth =
+        context::kv_pages_for_frontier(coverage.backend_frontier) > backend_prefix
+            ? context::kv_pages_for_frontier(coverage.backend_frontier) - backend_prefix
+            : 0U;
+    const auto collect = [&](context::KVAddressSpaceStore& addresses,
+                             context::LogicalKVPageStore& pages,
+                             context::KVAddressSpaceHandle address, std::uint32_t count,
                              runtime::ContextResourceClass resource) {
         KVTransfer transfer;
         transfer.pages    = &pages;
@@ -346,8 +350,9 @@ BindingReservation ProgramImpl::start_binding(const RequestBasePlan& base, runti
             enqueue_state_backup(tx);
         }
         if (host_state) {
-            tx.transfers.push_back(state_transfer_requirement(
-                state_images->host_layout(), runtime::ContextTransferDirection::HostToDevice));
+            tx.transfers.push_back(context::state_transfer_requirement(
+                state_image_transfer_work(state_images->host_layout()),
+                runtime::ContextTransferDirection::HostToDevice));
             start_context_transfer_timer(runtime::ContextResourceClass::State);
             auto transfer =
                 tx.borrow_state
@@ -397,10 +402,10 @@ void ProgramImpl::install_binding(ContextTransaction& tx) {
         // Reconstruct references into the moved durable prefill object.
         if (request.prefill && request.prefill->vision_plan &&
             !request.prefill->vision_plan->uses.empty()) {
-            request.prefill->vision = std::make_unique<execution::VisionPrefillSession>(
-                device, parameters, workspace_storage.span(), *workspace_plan.vision,
-                request.prefill->prompt, *request.prefill->vision_plan, vision_handoff,
-                vision_handoff_peak_bytes);
+            request.prefill->vision = std::make_unique<qwen::VisionPrefillSession>(
+                device, *parameters.model.config().vision, *parameters.vision,
+                workspace_storage.span(), *workspace_plan.vision, request.prefill->prompt,
+                *request.prefill->vision_plan, vision_handoff, vision_handoff_peak_bytes);
         }
         install_resume_sampling(state, request);
     } else {
@@ -422,15 +427,17 @@ void ProgramImpl::install_binding(ContextTransaction& tx) {
 }
 
 void ProgramImpl::prepare_binding(ContextTransaction& tx) {
-    const auto prepare = [&](KVAddressSpaceStore& addresses, LogicalKVPageStore& pages,
-                             KVAddressSpaceHandle destination,
-                             std::optional<KVAddressSpaceHandle> source, std::uint32_t prefix,
-                             std::uint32_t target, bool borrowed,
+    const auto prepare = [&](context::KVAddressSpaceStore& addresses,
+                             context::LogicalKVPageStore& pages,
+                             context::KVAddressSpaceHandle destination,
+                             std::optional<context::KVAddressSpaceHandle> source,
+                             std::uint32_t prefix, std::uint32_t target, bool borrowed,
                              std::optional<DeviceKVPageReservation>& hold,
-                             std::optional<KVPrefixForkReservation>& fork,
-                             std::optional<KVActivationReservation>& activation,
-                             std::optional<KVActivePrefixViewReservation>& view) {
-        const auto count = kv_pages_for_frontier(target), prior = kv_pages_for_frontier(prefix);
+                             std::optional<context::KVPrefixForkReservation>& fork,
+                             std::optional<context::KVActivationReservation>& activation,
+                             std::optional<context::KVActivePrefixViewReservation>& view) {
+        const auto count  = context::kv_pages_for_frontier(target),
+                   prior  = context::kv_pages_for_frontier(prefix);
         const auto growth = count > prior ? count - prior : 0U;
         hold.reset();
         if (borrowed) {
@@ -532,19 +539,21 @@ void ProgramImpl::complete_binding(ContextTransaction& tx, ContextProgress& out)
     tx.adopted = true;
     retire_source();
     if (tx.borrow_text) { refresh_history_requirements(tx.binding_history); }
-    const auto prepare_writable = [&](KVAddressSpaceStore& addresses, LogicalKVPageStore& pages,
-                                      KVAddressSpaceHandle address, std::uint32_t frontier) {
-        if (frontier && frontier % kPagedKVPageSize) {
-            const auto tail = addresses.logical_page(address, kv_pages_for_frontier(frontier) - 1U);
-            if (pages.host_resident(tail)) {
-                const std::array<LogicalKVPageHandle, 1> tails{tail};
-                if (!host_kv_extents->release_page_replicas(pages, tails)) {
-                    throw std::logic_error("private tail Host replica is still in use");
+    const auto prepare_writable =
+        [&](context::KVAddressSpaceStore& addresses, context::LogicalKVPageStore& pages,
+            context::KVAddressSpaceHandle address, std::uint32_t frontier) {
+            if (frontier && frontier % kPagedKVPageSize) {
+                const auto tail =
+                    addresses.logical_page(address, context::kv_pages_for_frontier(frontier) - 1U);
+                if (pages.host_resident(tail)) {
+                    const std::array<context::LogicalKVPageHandle, 1> tails{tail};
+                    if (!host_kv_extents->release_page_replicas(pages, tails)) {
+                        throw std::logic_error("private tail Host replica is still in use");
+                    }
                 }
             }
-        }
-        addresses.destructive_truncate_inactive(address, frontier);
-    };
+            addresses.destructive_truncate_inactive(address, frontier);
+        };
     if (tx.borrow_text) {
         prepare_writable(*text_kv_addresses, *text_kv_pages, tx.binding_history->text,
                          tx.reuse_frontier);
@@ -553,11 +562,11 @@ void ProgramImpl::complete_binding(ContextTransaction& tx, ContextProgress& out)
         prepare_writable(*backend_kv_addresses, *backend_kv_pages, *tx.binding_history->backend,
                          tx.backend_frontier);
     }
-    const auto activate_view = [&](KVAddressSpaceStore& addresses,
-                                   std::optional<KVActivePrefixViewReservation>& view,
-                                   KVAddressSpaceHandle destination, std::uint32_t target,
+    const auto activate_view = [&](context::KVAddressSpaceStore& addresses,
+                                   std::optional<context::KVActivePrefixViewReservation>& view,
+                                   context::KVAddressSpaceHandle destination, std::uint32_t target,
                                    std::optional<DeviceKVPageReservation>& hold,
-                                   std::optional<KVActivationReservation>& activation) {
+                                   std::optional<context::KVActivationReservation>& activation) {
         if (!view) { return; }
         addresses.commit_active_prefix_view(std::move(*view));
         view.reset();

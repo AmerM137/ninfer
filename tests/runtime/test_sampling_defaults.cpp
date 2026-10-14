@@ -1,6 +1,6 @@
 #include "runtime/contract/sampling.h"
 
-#include "models/qwen3_5/frontend/frontend.h"
+#include "models/qwen3_5/config.h"
 
 #include <cmath>
 #include <iostream>
@@ -28,7 +28,6 @@ bool throws_invalid(const auto& operation) {
     } catch (const std::invalid_argument&) { return true; }
     return false;
 }
-
 
 } // namespace
 

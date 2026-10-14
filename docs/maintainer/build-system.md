@@ -97,9 +97,11 @@ with `CMAKE_CURRENT_LIST_DIR`; `include()` does not change `CMAKE_CURRENT_SOURCE
   preparation and compile policy are owned by `src/ops/CMakeLists.txt`.
 - Linear separates shared kernel and projection manifests. Format manifests list explicit sources
   and shape filenames with their actual `.cpp`/`.cu` extensions.
-- Models separate loading, frontend, execution and Program source lists while retaining the
-  distinct immutable-loading and mutable-runtime targets. Checkpoints/recipes do not define
-  additional compile owners.
+- Models retain distinct immutable-loading and mutable-runtime targets. Native loading, execution
+  and Program manifests own architecture code; `common/qwen/sources.cmake` owns shared Frontend
+  and Vision sources. Shared bindings and context/MoE mechanisms have explicit target entries.
+  Runtime startup orchestration links model runtime; native startup planners only depend on
+  runtime support/contracts. Checkpoints/recipes do not define additional compile owners.
 - New files require an explicit manifest edit. New families require an explicit parent include.
   There is no recursive glob, directory discovery or generated shape/dispatch registry.
 

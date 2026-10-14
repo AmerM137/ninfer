@@ -1,5 +1,5 @@
 # Immutable loading and mutable execution have separate compile owners.
-add_library(ninfer_model_loading STATIC registry.cpp)
+add_library(ninfer_model_loading STATIC registry.cpp common/bindings.cpp common/weights.cpp)
 target_sources(ninfer_model_loading PRIVATE
   qwen4_exp/ple/parameters.cpp
   qwen4_exp/ple/disk/table.cpp)
@@ -24,11 +24,13 @@ target_include_directories(ninfer_model_runtime SYSTEM PRIVATE
 
 target_sources(ninfer_model_loading PRIVATE common/moe/weights.cpp)
 target_sources(ninfer_model_runtime PRIVATE
+  common/context/work.cpp
+  common/moe/graph.cpp
   common/moe/plan.cpp
   common/moe/execution.cpp
   common/moe/resources.cpp)
 
 include(qwen3_5/loading_sources.cmake)
-include(qwen3_5/frontend_sources.cmake)
+include(common/qwen/sources.cmake)
 include(qwen3_5/execution_sources.cmake)
 include(qwen3_5/program_sources.cmake)

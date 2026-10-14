@@ -1,13 +1,12 @@
 #include "models/qwen3_5/program/internal.h"
 #include "core/startup.h"
-#include "models/qwen3_5/frontend/prepared_prompt.h"
+#include "models/common/qwen/frontend/prepared_prompt.h"
 #include "models/qwen3_5/program/planning/startup.h"
 #include "models/qwen3_5/program/program_impl.h"
 #include <stdexcept>
 #include <utility>
 
 namespace ninfer::models::qwen3_5 {
-
 
 SequencePlan::SequencePlan(std::unique_ptr<detail::SequencePlanImpl> impl) noexcept
     : impl_(std::move(impl)) {}
@@ -75,8 +74,8 @@ const runtime::RequestPlanSummary& RequestBasePlan::summary() const noexcept {
     return impl_ != nullptr ? impl_->summary : empty;
 }
 
-const PreparedContextCache& RequestBasePlan::context_cache() const noexcept {
-    static const PreparedContextCache empty;
+const qwen::PreparedContextCache& RequestBasePlan::context_cache() const noexcept {
+    static const qwen::PreparedContextCache empty;
     return impl_ != nullptr ? impl_->context_cache : empty;
 }
 
@@ -120,13 +119,13 @@ Program::Program(std::unique_ptr<detail::ProgramImpl> impl) noexcept : impl_(std
 
 Program::~Program() noexcept = default;
 
-RequestBasePlan Program::plan_request(PreparedPrompt&& prompt,
+RequestBasePlan Program::plan_request(qwen::PreparedPrompt&& prompt,
                                       const runtime::ResolvedExecutionOptions& options) {
-    return impl_->plan_request(PreparedPromptAccess::take(std::move(prompt)), options);
+    return impl_->plan_request(qwen::PreparedPromptAccess::take(std::move(prompt)), options);
 }
 
-std::vector<float> Program::causal_score(PreparedPrompt&& prompt, std::uint32_t target) {
-    return impl_->causal_score(PreparedPromptAccess::take(std::move(prompt)), target);
+std::vector<float> Program::causal_score(qwen::PreparedPrompt&& prompt, std::uint32_t target) {
+    return impl_->causal_score(qwen::PreparedPromptAccess::take(std::move(prompt)), target);
 }
 
 std::optional<SourceCandidate>

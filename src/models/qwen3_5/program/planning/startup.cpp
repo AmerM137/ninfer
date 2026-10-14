@@ -5,7 +5,7 @@
 #include "models/qwen3_5/execution/mtp.h"
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/program/planning/startup.h"
-#include "models/qwen3_5/execution/vision.h"
+#include "models/common/qwen/vision/vision.h"
 #include "models/qwen3_5/execution/workspace.h"
 #include "core/device.h"
 #include "ninfer/ops/gated_delta_net.h"
@@ -714,9 +714,9 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     out.capacity = out.general_capacity;
     if (plan.features.vision) {
         const std::uint32_t merged = static_cast<std::uint32_t>(
-            std::min<std::uint64_t>(plan.capacity, kMaximumVisionItemTokens));
-        out.vision = execution::VisionContext::plan_workspace(
-            *profile.config.vision, *profile.vision, merged, out.general_capacity);
+            std::min<std::uint64_t>(plan.capacity, qwen::kMaximumVisionItemTokens));
+        out.vision   = qwen::VisionContext::plan_workspace(*profile.config.vision, *profile.vision,
+                                                           merged, out.general_capacity);
         out.capacity = std::max(out.capacity, out.vision->capacity_bytes);
     }
     return out;

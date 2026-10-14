@@ -22,6 +22,8 @@ namespace ninfer::runtime {
 template <class Instance>
 class CausalScoreCore {
 public:
+    static constexpr EnginePurpose purpose = EnginePurpose::CausalScoring;
+
     using ModelContract  = typename Instance::ModelContract;
     using PreparedPrompt = typename ModelContract::PreparedPrompt;
 

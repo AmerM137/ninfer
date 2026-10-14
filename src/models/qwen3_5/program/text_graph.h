@@ -3,7 +3,7 @@
 #include "core/decode_graph.h"
 #include "core/device.h"
 #include "ninfer/ops/moe.h"
-#include "models/common/moe/resources.h"
+#include "models/common/moe/graph.h"
 
 #include <array>
 #include <functional>
@@ -13,29 +13,11 @@
 
 namespace ninfer::models::qwen3_5::execution {
 
-struct MoeGraphPlan {
-    std::array<bool, 3> subsets{};
-    std::optional<ops::ExpertSubsetKind> steady;
-    friend bool operator==(const MoeGraphPlan&, const MoeGraphPlan&) = default;
-};
-
-[[nodiscard]] MoeGraphPlan plan_moe_graph(const moe::Plan&, ExpertBankId, std::int32_t tokens);
-
-struct MoeGraphDefinitions {
-    std::array<DecodeGraphDefinition, 3> subsets;
-};
-
-struct TextLayerGraphDefinition {
-    MoeGraphPlan plan;
-    DecodeGraphDefinition mixer, steady, feature;
-    std::shared_ptr<MoeGraphDefinitions> moe;
-};
-
 // The prefix/suffix contain the surrounding ordinary or speculative forward body.
 // MoE definitions share exact-T bindings across the attention context profiles.
 struct TextGraphDefinition {
     DecodeGraphDefinition prefix, suffix;
-    std::vector<TextLayerGraphDefinition> layers;
+    std::vector<moe::LayerGraphDefinition> layers;
 
     explicit TextGraphDefinition(std::size_t layers, const TextGraphDefinition* shared = nullptr);
 };

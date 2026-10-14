@@ -1,13 +1,18 @@
 #pragma once
-#include "models/qwen3_5/frontend/frontend.h"
+
+#include "models/common/qwen/frontend/frontend.h"
 #include "models/qwen3_5/program/program.h"
+#include "models/qwen3_5/execution/parameters.h"
 
 namespace ninfer::models::qwen3_5 {
 struct RuntimeTypes {
-    using Frontend          = qwen3_5::Frontend;
-    using PreparedPrompt    = qwen3_5::PreparedPrompt;
-    using OutputSession     = qwen3_5::OutputSession;
-    using PublishedOutput   = qwen3_5::PublishedOutput;
+    using Model             = qwen3_5::Model;
+    using Parameters        = execution::Parameters;
+    using Profile           = execution::ModelProfile;
+    using Frontend          = qwen::Frontend;
+    using PreparedPrompt    = qwen::PreparedPrompt;
+    using OutputSession     = qwen::OutputSession;
+    using PublishedOutput   = qwen::PublishedOutput;
     using SequencePlanner   = qwen3_5::SequencePlanner;
     using SequencePlan      = qwen3_5::SequencePlan;
     using RequestBasePlan   = qwen3_5::RequestBasePlan;
@@ -27,6 +32,6 @@ struct RuntimeTypes {
     using FinishResult      = qwen3_5::FinishResult;
     using AbortResult       = qwen3_5::AbortResult;
     using Program           = qwen3_5::Program;
-    using CacheSessionKey   = qwen3_5::PreparedSessionKey;
+    using CacheSessionKey   = qwen::PreparedSessionKey;
 };
 } // namespace ninfer::models::qwen3_5

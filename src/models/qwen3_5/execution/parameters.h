@@ -1,5 +1,7 @@
 #pragma once
 
+#include "models/common/qwen/vision/parameters.h"
+
 #include "models/qwen3_5/execution/dense_mlp.h"
 #include "models/common/moe/execution.h"
 #include "models/qwen3_5/model.h"
@@ -73,27 +75,6 @@ struct MtpParameters {
     LinearParameters output_head;
 };
 
-struct NormParameters {
-    Tensor weight, bias;
-};
-
-struct VisionBlockParameters {
-    NormParameters norm1, norm2;
-    LinearParameters qkv;
-    Tensor qkv_bias;
-    LinearParameters output, fc1, fc2;
-    Tensor output_bias, fc1_bias, fc2_bias;
-};
-
-struct VisionParameters {
-    LinearParameters patch_embedding;
-    Tensor patch_embedding_bias, position_embedding;
-    std::vector<VisionBlockParameters> layers;
-    NormParameters merger_norm;
-    LinearParameters merger_fc1, merger_fc2;
-    Tensor merger_fc1_bias, merger_fc2_bias;
-};
-
 struct DynamicConvParameters {
     Tensor base_kernel;
     LinearParameters kernel_projection;
@@ -142,7 +123,7 @@ public:
     const std::shared_ptr<const ModelProfile> profile;
     TextParameters text;
     std::optional<MtpParameters> mtp;
-    std::optional<VisionParameters> vision;
+    std::optional<qwen::VisionParameters> vision;
     std::optional<DraftParameters> draft;
     std::optional<ProposalParameters> proposal;
 };

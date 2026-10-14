@@ -11,7 +11,7 @@ namespace {
 
 using namespace ninfer;
 using namespace ninfer::models;
-namespace qwen = ninfer::models::qwen3_5;
+namespace q35 = ninfer::models::qwen3_5;
 using namespace ninfer::test::artifact_fixture;
 
 Json added_token(int id, const std::string& content) {
@@ -169,7 +169,7 @@ void logical_data_and_instances() {
         0.4999999999;
     fixture.file.write();
     artifact::Reader reader(fixture.file.entry);
-    auto plan = qwen::plan_load(reader);
+    auto plan = q35::plan_load(reader);
     require(plan.config().text.rope_parameters->partial_rotary_factor == 0.5F &&
                 plan.config().text.rope_parameters->rotary_dim == 4,
             "rotary width was derived before normalizing the PositiveF32 config value");
@@ -179,7 +179,7 @@ void logical_data_and_instances() {
     require(plan.resources().public_token_count == 265 &&
                 plan.resources().tokenizer->encode("<|video_pad|>") == std::vector<int>{264},
             "tokenizer_config added tokens were not included in the public domain");
-    const auto& attention = std::get<qwen::AttentionWeights>(plan.weights().text.layers[0].mixer);
+    const auto& attention = std::get<q35::AttentionWeights>(plan.weights().text.layers[0].mixer);
     const auto& query     = plan.parameter(attention.query);
     const auto& gate      = plan.parameter(attention.gate);
     require(query.binding.parts[0].object == gate.binding.parts[0].object &&
@@ -193,12 +193,12 @@ void logical_data_and_instances() {
             "explicit shared embedding/head did not bind the same parent");
     require(!plan.weights().vision && plan.resources().preprocessor_config_json.empty(),
             "unused Vision was required");
-    rejects([&] { (void)qwen::plan_load(reader, {.vision = true}); },
+    rejects([&] { (void)q35::plan_load(reader, {.vision = true}); },
             "incomplete selected Vision was accepted");
-    rejects([&] { (void)qwen::plan_load(reader, {.speculative = SpeculativeBackend::Mtp}); },
+    rejects([&] { (void)q35::plan_load(reader, {.speculative = SpeculativeBackend::Mtp}); },
             "absent MTP was accepted");
 
-    const auto resolved                   = qwen::resolve_load(std::move(plan), Device::cuda(0));
+    const auto resolved                   = q35::resolve_load(std::move(plan), Device::cuda(0));
     const auto capacity                   = resolved.materialization().device_capacity_bytes;
     fixture.file.root["metadata"]["name"] = "another-training-run-and-recipe";
     fixture.file.root["components"]["text"]["config"]["num_hidden_layers"] = 2;
@@ -226,11 +226,11 @@ void logical_data_and_instances() {
     }
     fixture.file.write();
     artifact::Reader changed(fixture.file.entry);
-    auto expanded = qwen::plan_load(changed);
+    auto expanded = q35::plan_load(changed);
     require(expanded.weights().text.layers.size() == 2 &&
                 expanded.config().text.compact_layer_indices == std::vector<std::uint32_t>{0, 1},
             "config did not drive layer geometry and compact indices");
-    require(qwen::resolve_load(std::move(expanded), Device::cuda(0))
+    require(q35::resolve_load(std::move(expanded), Device::cuda(0))
                     .materialization()
                     .device_capacity_bytes == capacity,
             "cross-layer sharing duplicated parent storage");
@@ -307,7 +307,7 @@ void invalid_model_data() {
         rejects(
             [&] {
                 artifact::Reader reader(fixture.file.entry);
-                (void)qwen::plan_load(reader);
+                (void)q35::plan_load(reader);
             },
             "invalid model data was accepted");
     };

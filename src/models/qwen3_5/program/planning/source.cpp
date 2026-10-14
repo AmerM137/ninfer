@@ -1,5 +1,5 @@
 #include "models/qwen3_5/program/program_impl.h"
-#include "models/qwen3_5/program/context_work.h"
+#include "models/common/context/work.h"
 #include "core/device.h"
 
 #include <algorithm>
@@ -107,20 +107,23 @@ ProgramImpl::inspect_source(const RequestBasePlan& base, std::optional<Checkpoin
         if (host_context_arena &&
             host_context_arena->can_allocate(state_images->host_layout().image_bytes)) {
             candidate.backup_state = candidate.split_state = true;
-            candidate.transfers.push_back(state_transfer_requirement(
-                state_images->host_layout(), runtime::ContextTransferDirection::DeviceToHost));
+            candidate.transfers.push_back(context::state_transfer_requirement(
+                state_image_transfer_work(state_images->host_layout()),
+                runtime::ContextTransferDirection::DeviceToHost));
         } else if (consume_source && state_references == 1) {
             // One physical slot cannot retain its immutable recovery image and a writer.
             // Consume this optional point while preserving its already computed execution input.
             candidate.move_state = true;
         }
     }
-    const auto movable = [&](const KVAddressSpaceStore& addresses, const LogicalKVPageStore& pages,
-                             KVAddressSpaceHandle address, std::uint32_t frontier) {
+    const auto movable = [&](const context::KVAddressSpaceStore& addresses,
+                             const context::LogicalKVPageStore& pages,
+                             context::KVAddressSpaceHandle address, std::uint32_t frontier) {
         if (addresses.active(address) || checkpoints[handle->index].pins) { return false; }
         if (!addresses.can_destructive_truncate_inactive(address, frontier, true)) { return false; }
         if (frontier % kPagedKVPageSize) {
-            const auto tail = addresses.logical_page(address, kv_pages_for_frontier(frontier) - 1U);
+            const auto tail =
+                addresses.logical_page(address, context::kv_pages_for_frontier(frontier) - 1U);
             if (pages.address_references(tail) != 1 || pages.source_pins(tail)) { return false; }
         }
         return true;
@@ -148,17 +151,20 @@ ProgramImpl::inspect_source(const RequestBasePlan& base, std::optional<Checkpoin
         }
     }
     if (!state_store->device_resident(record.state)) {
-        candidate.transfers.push_back(state_transfer_requirement(
-            state_images->host_layout(), runtime::ContextTransferDirection::HostToDevice));
+        candidate.transfers.push_back(context::state_transfer_requirement(
+            state_image_transfer_work(state_images->host_layout()),
+            runtime::ContextTransferDirection::HostToDevice));
     } else if (!candidate.move_state && !candidate.split_state &&
                is_masked_draft_backend(speculative_backend)) {
-        candidate.transfers.push_back(state_transfer_requirement(
-            state_images->host_layout(), runtime::ContextTransferDirection::DeviceToDevice, true));
+        candidate.transfers.push_back(context::state_transfer_requirement(
+            dflash_local_transfer_work(state_images->host_layout()),
+            runtime::ContextTransferDirection::DeviceToDevice));
     }
-    const auto scan = [&](const KVAddressSpaceStore& addresses, const LogicalKVPageStore& pages,
-                          KVAddressSpaceHandle address, std::uint32_t frontier,
+    const auto scan = [&](const context::KVAddressSpaceStore& addresses,
+                          const context::LogicalKVPageStore& pages,
+                          context::KVAddressSpaceHandle address, std::uint32_t frontier,
                           runtime::ContextResourceClass resource) {
-        const auto count      = kv_pages_for_frontier(frontier);
+        const auto count      = context::kv_pages_for_frontier(frontier);
         const auto& physical  = pages.physical_pool();
         std::uint32_t missing = 0, run_pages = 0;
         TransferWork restore_work;
@@ -168,7 +174,7 @@ ProgramImpl::inspect_source(const RequestBasePlan& base, std::optional<Checkpoin
             restore_work.copy_operations += work.copy_operations;
             run_pages = 0;
         };
-        std::optional<HostKVPageReplica> previous;
+        std::optional<context::HostKVPageReplica> previous;
         for (std::uint32_t index = 0; index < count; ++index) {
             const auto page = addresses.logical_page(address, index);
             if (pages.device_resident(page)) { continue; }
@@ -183,13 +189,13 @@ ProgramImpl::inspect_source(const RequestBasePlan& base, std::optional<Checkpoin
         }
         if (missing) {
             finish_run();
-            candidate.transfers.push_back(kv_transfer_requirement(
+            candidate.transfers.push_back(context::kv_transfer_requirement(
                 resource, runtime::ContextTransferDirection::HostToDevice, missing, restore_work));
         }
         if (!candidate.move_history && frontier % kPagedKVPageSize) {
-            candidate.transfers.push_back(
-                kv_transfer_requirement(resource, runtime::ContextTransferDirection::DeviceToDevice,
-                                        1, physical.device_copy_work(1)));
+            candidate.transfers.push_back(context::kv_transfer_requirement(
+                resource, runtime::ContextTransferDirection::DeviceToDevice, 1,
+                physical.device_copy_work(1)));
         }
     };
     scan(*text_kv_addresses, *text_kv_pages, record.kv->text, record.frontier,

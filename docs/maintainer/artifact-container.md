@@ -485,7 +485,7 @@ Frontend 合同拥有，常用上游文件角色可以直接使用原文件名�
 Vision 的 processor 资源可放在 vision.resources 中，启用功能时按依赖取得。
 
 V3 可以在相应资源对象中承载自定义 chat template。资源保存原始字节，模板的识别与渲染由
-当前 [Frontend](../../src/models/qwen3_5/frontend/chat_template.cpp) 的实际能力决定。
+当前 [Frontend](../../src/models/common/qwen/frontend/chat_template.cpp) 的实际能力决定。
 完整 tokenizer 资源共同决定 token 域，固定模型 config 保留自己的权重 vocab_size。
 
 ### 9.2 可选 proposal 输出表示

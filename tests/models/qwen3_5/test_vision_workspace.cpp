@@ -1,12 +1,13 @@
+#include "models/common/qwen/vision/prefill.h"
 #include "core/device.h"
 #include "core/buffer.h"
 #include "models/qwen3_5/load.h"
 #include "models/qwen3_5/execution/parameters.h"
-#include "models/qwen3_5/execution/vision.h"
+#include "models/common/qwen/vision/vision.h"
 #include "models/qwen3_5/program/program.h"
 #include <cstdlib>
 
-#include "models/qwen3_5/frontend/prepared_prompt.h"
+#include "models/common/qwen/frontend/prepared_prompt.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -18,34 +19,35 @@
 
 namespace {
 
-namespace qwen = ninfer::models::qwen3_5;
+namespace q35 = ninfer::models::qwen3_5;
 
 void require(bool condition, const char* message) {
     if (!condition) { throw std::runtime_error(message); }
 }
 
 void test_handoff_lifetime(ninfer::DeviceContext& device,
-                           const qwen::execution::Parameters& parameters) {
+                           const q35::execution::Parameters& parameters) {
     const auto& config     = parameters.model.config().vision.value();
     const auto merge       = static_cast<std::int32_t>(config.spatial_merge_size);
     const auto patches     = static_cast<std::size_t>(merge) * merge;
     const auto make_prompt = [&](std::uint32_t seed) {
-        qwen::PreparedPromptData prompt;
+        ninfer::models::qwen::PreparedPromptData prompt;
         prompt.token_ids.resize(5);
-        prompt.token_types         = {0, static_cast<std::uint8_t>(qwen::PromptModality::Image), 0,
-                                      static_cast<std::uint8_t>(qwen::PromptModality::Image), 0};
-        prompt.prepare.media_items = 2;
-        prompt.prepare.raw_patches = 2 * patches;
+        prompt.token_types = {0, static_cast<std::uint8_t>(ninfer::models::qwen::Modality::Image),
+                              0, static_cast<std::uint8_t>(ninfer::models::qwen::Modality::Image),
+                              0};
+        prompt.prepare.media_items   = 2;
+        prompt.prepare.raw_patches   = 2 * patches;
         prompt.prepare.vision_tokens = 2;
         for (std::size_t item = 0; item != 2; ++item) {
-            prompt.vision_items.push_back(qwen::VisionItem{
-                .modality    = qwen::PromptModality::Image,
+            prompt.vision_items.push_back(ninfer::models::qwen::VisionItem{
+                .modality    = ninfer::models::qwen::Modality::Image,
                 .grid        = {.temporal = 1, .height = merge, .width = merge},
                 .patch_begin = item * patches,
                 .patch_count = patches,
                 .token_spans = {{.begin = 2 * item + 1, .count = 1}},
             });
-            auto payload            = std::make_shared<qwen::PreparedMediaPayload>();
+            auto payload = std::make_shared<ninfer::models::qwen::PreparedMediaPayload>();
             payload->patch_elements = patches * config.patch_width();
             payload->patches        = std::make_unique<std::uint16_t[]>(payload->patch_elements);
             for (auto& value : payload->mutable_span()) {
@@ -59,25 +61,26 @@ void test_handoff_lifetime(ninfer::DeviceContext& device,
     };
     auto prompt_a = make_prompt(1);
     auto prompt_b = make_prompt(3);
-    qwen::detail::VisionPrefillPlan plan;
-    plan.control_plan =
-        std::make_shared<qwen::VisionControlPlan>(qwen::plan_vision_control(prompt_a, config));
-    plan.control = std::make_shared<qwen::VisionControl>(
-        qwen::build_vision_control(prompt_a, *plan.control_plan, 0));
+    ninfer::models::qwen::VisionPrefillPlan plan;
+    plan.control_plan = std::make_shared<ninfer::models::qwen::VisionControlPlan>(
+        ninfer::models::qwen::plan_vision_control(prompt_a, config));
+    plan.control = std::make_shared<ninfer::models::qwen::VisionControl>(
+        ninfer::models::qwen::build_vision_control(prompt_a, *plan.control_plan, 0));
     plan.uses             = {{.begin = 0, .end = 2, .prepared_item_index = 0, .control_index = 0},
                              {.begin = 2, .end = 4, .prepared_item_index = 1, .control_index = 1}};
     plan.max_merged_count = 1;
     const auto workspace_plan =
-        qwen::execution::VisionContext::plan_workspace(config, *parameters.vision, 1, 256);
+        ninfer::models::qwen::VisionContext::plan_workspace(config, *parameters.vision, 1, 256);
     ninfer::DeviceBuffer workspace(device.device(), workspace_plan.capacity_bytes);
     const auto backing = workspace.span();
-    qwen::detail::VisionHandoffState handoff;
+    ninfer::models::qwen::VisionHandoffState handoff;
     std::size_t peak_bytes  = 0;
-    const auto make_session = [&](const qwen::PreparedPromptData& prompt) {
-        return std::make_unique<qwen::execution::VisionPrefillSession>(
-            device, parameters, backing, workspace_plan, prompt, plan, handoff, peak_bytes);
+    const auto make_session = [&](const ninfer::models::qwen::PreparedPromptData& prompt) {
+        return std::make_unique<ninfer::models::qwen::VisionPrefillSession>(
+            device, config, *parameters.vision, backing, workspace_plan, prompt, plan, handoff,
+            peak_bytes);
     };
-    const auto read = [&](const qwen::execution::VisionChunk& chunk) {
+    const auto read = [&](const ninfer::models::qwen::VisionChunk& chunk) {
         require(chunk.control != nullptr, "Vision replay omitted its item");
         std::vector<std::uint16_t> output(chunk.embeddings.bytes() / sizeof(std::uint16_t));
         CUDA_CHECK(cudaMemcpyAsync(output.data(), chunk.embeddings.data, chunk.embeddings.bytes(),
@@ -127,10 +130,10 @@ void test_handoff_lifetime(ninfer::DeviceContext& device,
 } // namespace
 
 int main() {
-    namespace qwen       = ninfer::models::qwen3_5;
+    namespace q35        = ninfer::models::qwen3_5;
     const char* artifact = std::getenv("NINFER_TEST_ARTIFACT");
     if (!artifact || !*artifact) { return 77; }
-    static_assert(ninfer::models::qwen3_5::kMaximumVisionItemTokens == 16384);
+    static_assert(ninfer::models::qwen::kMaximumVisionItemTokens == 16384);
     // The current Vision route fits below 827 MiB, including arena alignment and empty-scratch
     // backing. The context growth check below protects the single-item lifetime bound.
     constexpr std::size_t kWorkspaceCeiling = 827ULL << 20;
@@ -147,8 +150,8 @@ int main() {
         selected.vision        = true;
         selected.speculative   = ninfer::SpeculativeBackend::Mtp;
         selected.proposal_head = ninfer::ProposalHead::Optimized;
-        auto model             = qwen::load_model(artifact, selected, device);
-        const qwen::execution::Parameters parameters(*model);
+        auto model             = q35::load_model(artifact, selected, device);
+        const q35::execution::Parameters parameters(*model);
         const auto capacity = [&](std::uint32_t max_context) {
             ninfer::EngineOptions options;
             options.max_context         = max_context;
@@ -161,7 +164,7 @@ int main() {
             options.enable_vision                    = true;
             options.use_cuda_graph                   = false;
             options.context_cache.device_state_slots = 1;
-            auto planner     = qwen::make_sequence_planner(parameters, device, options);
+            auto planner     = q35::make_sequence_planner(parameters, device, options);
             const auto pages = planner.capacity_curve().minimum_main_page_groups;
             return std::move(planner).finalize(pages).workspace_capacity_bytes();
         };

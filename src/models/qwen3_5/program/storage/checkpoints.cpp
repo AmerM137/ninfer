@@ -1,5 +1,5 @@
 #include "models/qwen3_5/program/program_impl.h"
-#include "models/qwen3_5/program/context_work.h"
+#include "models/common/context/work.h"
 #include "core/device.h"
 
 #include <algorithm>
@@ -24,12 +24,12 @@ bool checkpoint_releasable(const ProgramImpl& program, CheckpointHandle handle) 
 }
 
 bool state_evictable(const StateImageStore& states, StateImageHandle state) {
-    return states.role(state) == StateImageRole::CheckpointImmutable &&
+    return states.role(state) == context::StateImageRole::CheckpointImmutable &&
            states.can_release_after_checkpoint_references(state,
                                                           states.checkpoint_references(state));
 }
 
-bool page_evictable(const LogicalKVPageStore& pages, LogicalKVPageHandle page) {
+bool page_evictable(const context::LogicalKVPageStore& pages, context::LogicalKVPageHandle page) {
     return pages.device_resident(page) && pages.active_address_references(page) == 0 &&
            pages.source_pins(page) == 0 && pages.can_pin_source(page);
 }
@@ -177,10 +177,11 @@ ProgramImpl::checkpoint_footprint(std::span<const CheckpointHandle> handles) con
     };
 
     std::unordered_map<const KVHistory*, Coverage> histories;
-    const auto count = [&](const KVAddressSpaceStore& addresses, const LogicalKVPageStore& pages,
-                           KVAddressSpaceHandle address, std::uint32_t frontier,
+    const auto count = [&](const context::KVAddressSpaceStore& addresses,
+                           const context::LogicalKVPageStore& pages,
+                           context::KVAddressSpaceHandle address, std::uint32_t frontier,
                            std::vector<std::uint8_t>& seen, std::uint32_t& device_pages) {
-        for (std::uint32_t index = 0; index < kv_pages_for_frontier(frontier); ++index) {
+        for (std::uint32_t index = 0; index < context::kv_pages_for_frontier(frontier); ++index) {
             const auto page = addresses.logical_page(address, index);
             auto& visited   = seen[pages.descriptor_index(page)];
             if (visited) { continue; }
@@ -238,10 +239,11 @@ CheckpointSummary ProgramImpl::checkpoint_summary(CheckpointHandle handle) const
         state_evictable(*state_store, record.state)) {
         out.evictable_resources.host_bytes += state_images->host_layout().image_bytes;
     }
-    const auto scan = [&](const KVAddressSpaceStore& addresses, const LogicalKVPageStore& pages,
-                          KVAddressSpaceHandle address, std::uint32_t frontier,
+    const auto scan = [&](const context::KVAddressSpaceStore& addresses,
+                          const context::LogicalKVPageStore& pages,
+                          context::KVAddressSpaceHandle address, std::uint32_t frontier,
                           std::uint32_t& evictable) {
-        for (std::uint32_t index = 0; index < kv_pages_for_frontier(frontier); ++index) {
+        for (std::uint32_t index = 0; index < context::kv_pages_for_frontier(frontier); ++index) {
             const auto page = addresses.logical_page(address, index);
             if (unpinned && page_evictable(pages, page)) { ++evictable; }
             if (releasable && pages.host_resident(page) && pages.source_pins(page) == 0) {
@@ -275,7 +277,7 @@ std::size_t ProgramImpl::host_bytes_released(std::span<const CheckpointHandle> h
     };
 
     struct PageReferences {
-        LogicalKVPageHandle page;
+        context::LogicalKVPageHandle page;
         std::uint32_t references = 0;
     };
 
@@ -283,10 +285,11 @@ std::size_t ProgramImpl::host_bytes_released(std::span<const CheckpointHandle> h
     std::unordered_map<const KVHistory*, std::uint32_t> histories;
     std::unordered_map<std::uint32_t, StateReferences> states;
     std::unordered_map<std::uint32_t, PageReferences> main, backend;
-    const auto collect = [](const KVAddressSpaceStore& addresses, const LogicalKVPageStore& pages,
-                            KVAddressSpaceHandle address, std::uint32_t retained_frontier,
+    const auto collect = [](const context::KVAddressSpaceStore& addresses,
+                            const context::LogicalKVPageStore& pages,
+                            context::KVAddressSpaceHandle address, std::uint32_t retained_frontier,
                             auto& references) {
-        for (std::uint32_t i = kv_pages_for_frontier(retained_frontier);
+        for (std::uint32_t i = context::kv_pages_for_frontier(retained_frontier);
              i < addresses.mapped_pages(address); ++i) {
             const auto page = addresses.logical_page(address, i);
             auto& entry     = references[pages.descriptor_index(page)];
@@ -334,7 +337,7 @@ std::size_t ProgramImpl::host_bytes_released(std::span<const CheckpointHandle> h
             bytes += state_images->host_layout().image_bytes;
         }
     }
-    const auto count = [&](const LogicalKVPageStore& pages, const auto& references) {
+    const auto count = [&](const context::LogicalKVPageStore& pages, const auto& references) {
         for (const auto& [index, entry] : references) {
             if (entry.references != pages.address_references(entry.page)) { continue; }
             // A nonlast reference may retire during a copy; the complete set cannot release
@@ -378,10 +381,11 @@ std::optional<std::size_t> ProgramImpl::pause_host_bytes(SequenceHandle handle) 
     std::size_t bytes = state_store->host_resident(sequence.state.read)
                             ? 0
                             : state_images->host_layout().image_bytes;
-    const auto count  = [&](const KVAddressSpaceStore& addresses, const LogicalKVPageStore& pages,
-                           KVAddressSpaceHandle address, std::uint32_t target) {
+    const auto count  = [&](const context::KVAddressSpaceStore& addresses,
+                           const context::LogicalKVPageStore& pages,
+                           context::KVAddressSpaceHandle address, std::uint32_t target) {
         const auto mapped   = addresses.mapped_pages(address);
-        const auto required = kv_pages_for_frontier(target);
+        const auto required = context::kv_pages_for_frontier(target);
         const auto stride   = (&pages == text_kv_pages.get() ? text_host_kv_page_stride
                                                               : backend_host_kv_page_stride);
         for (std::uint32_t i = 0; i < std::min<std::uint32_t>(mapped, required); ++i) {
@@ -409,8 +413,9 @@ std::size_t ProgramImpl::release_redundant_host(std::span<const CheckpointHandle
                                                 std::optional<SequenceHandle> pending_backup) {
     if (!host_context_arena) { return 0; }
     std::unordered_set<std::uint32_t> states, main, backend;
-    const auto collect = [](const KVAddressSpaceStore& addresses, const LogicalKVPageStore& pages,
-                            KVAddressSpaceHandle address, auto& seen) {
+    const auto collect = [](const context::KVAddressSpaceStore& addresses,
+                            const context::LogicalKVPageStore& pages,
+                            context::KVAddressSpaceHandle address, auto& seen) {
         for (std::uint32_t i = 0; i < addresses.mapped_pages(address); ++i) {
             seen.insert(pages.descriptor_index(addresses.logical_page(address, i)));
         }
@@ -438,9 +443,10 @@ std::size_t ProgramImpl::release_redundant_host(std::span<const CheckpointHandle
     for (const auto& slot : checkpoints) {
         if (slot.value && slot.pins) { protect(*slot.value); }
     }
-    std::vector<HostKVPageReplicaRelease> releases;
-    const auto select = [&](LogicalKVPageStore& pages, const KVAddressSpaceStore& addresses,
-                            KVAddressSpaceHandle address, auto& seen) {
+    std::vector<context::HostKVPageReplicaRelease> releases;
+    const auto select = [&](context::LogicalKVPageStore& pages,
+                            const context::KVAddressSpaceStore& addresses,
+                            context::KVAddressSpaceHandle address, auto& seen) {
         for (std::uint32_t i = 0; i < addresses.mapped_pages(address); ++i) {
             const auto page = addresses.logical_page(address, i);
             if (seen.insert(pages.descriptor_index(page)).second && pages.device_resident(page) &&

@@ -1,5 +1,5 @@
 #include "models/qwen3_5/program/program_impl.h"
-#include "models/qwen3_5/program/context_work.h"
+#include "models/common/context/work.h"
 #include "models/qwen3_5/program/execution_context.h"
 #include "core/device.h"
 #include "ninfer/ops/sampling.h"
@@ -97,11 +97,11 @@ PendingBatch ProgramImpl::decode(std::span<const SequenceHandle> members,
         if (failed_timing != nullptr) { *failed_timing += round.timing; }
         return wrap_pending(lane_span, std::move(round));
     } catch (...) {
-        const Clock::time_point cleanup_started = Clock::now();
+        const context::Clock::time_point cleanup_started = context::Clock::now();
         clear_execution_failure_lanes(lane_span);
         pending_transaction_.reset();
         if (failed_timing != nullptr) {
-            failed_timing->post_host_ns += elapsed_ns(cleanup_started);
+            failed_timing->post_host_ns += context::elapsed_ns(cleanup_started);
         }
         throw;
     }
@@ -194,9 +194,9 @@ runtime::ExecutionTiming ProgramImpl::append_forced_tokens(
         [&](std::uint32_t lane) { return requests[lane].sampling_host.token_counts != nullptr; });
     if (count_forced_tokens) {
         work.reset();
-        Tensor forced_ids =
-            work.alloc(DType::I32, {checked_i32(static_cast<std::uint32_t>(row_major_tokens.size()),
-                                                "forced-token batch exceeds int32")});
+        Tensor forced_ids = work.alloc(
+            DType::I32, {context::checked_i32(static_cast<std::uint32_t>(row_major_tokens.size()),
+                                              "forced-token batch exceeds int32")});
         CUDA_CHECK(cudaMemcpyAsync(forced_ids.data, row_major_tokens.data(), forced_ids.bytes(),
                                    cudaMemcpyHostToDevice, device.stream()));
         for (std::size_t row = 0; row < members.size(); ++row) {
@@ -222,7 +222,7 @@ runtime::ExecutionTiming ProgramImpl::append_forced_tokens(
             const std::uint32_t base_ledger_frontier = sequence.ledger_frontier;
             const std::uint32_t base                 = sequence.execution_frontier;
             const std::uint32_t end                  = base + row_stride;
-            const auto started                       = Clock::now();
+            const auto started                       = context::Clock::now();
 
             ensure_sequence_kv_mapped(sequence, end, backend_kv_cache() ? end : 0U);
             if (is_masked_draft_backend(speculative_backend) &&
@@ -262,8 +262,8 @@ runtime::ExecutionTiming ProgramImpl::append_forced_tokens(
             }
             std::uint32_t cursor = base;
             while (cursor < end) {
-                const std::uint32_t count           = std::min(prefill_chunk, end - cursor);
-                const StateImageSelectors selectors = state_selectors(sequence);
+                const std::uint32_t count = std::min(prefill_chunk, end - cursor);
+                const context::StateImageSelectors selectors = state_selectors(sequence);
                 execution::PrefillContext schedule_state{
                     {device, parameters, work, state_images->linear(),
                      replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
@@ -331,7 +331,7 @@ runtime::ExecutionTiming ProgramImpl::append_forced_tokens(
             trim_sequence_kv(sequence, sequence.text_kv_valid, backend_kv_valid(sequence));
             settle_unit(lane);
             request.timings.decode_seconds +=
-                std::chrono::duration<double>(Clock::now() - started).count();
+                std::chrono::duration<double>(context::Clock::now() - started).count();
         }
         return timing.finish();
     } catch (...) {

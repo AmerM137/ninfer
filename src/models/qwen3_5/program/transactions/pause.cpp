@@ -1,5 +1,5 @@
 #include "models/qwen3_5/program/program_impl.h"
-#include "models/qwen3_5/program/context_work.h"
+#include "models/common/context/work.h"
 #include "core/device.h"
 
 #include <array>
@@ -18,7 +18,7 @@ std::optional<CheckpointHandle> ProgramImpl::detach_checkpoint(SequenceState& st
     backing->prefix_identity.truncate(frontier);
     auto handle = reserve_checkpoint();
     if (!handle) { return std::nullopt; }
-    if (state_store->role(state.state.read) == StateImageRole::ActiveMutable) {
+    if (state_store->role(state.state.read) == context::StateImageRole::ActiveMutable) {
         state_store->freeze(state.state.read);
     }
     // Acquire the new content owner before dropping this request's read lease. That lease may
@@ -69,8 +69,10 @@ bool ProgramImpl::prepare_backup(ContextTransaction& tx, CheckpointState& record
         if (transfer) { tx.state_transfer.emplace(std::move(*transfer)); }
         if (!tx.state_transfer) { return false; }
     }
-    const auto collect = [&](KVAddressSpaceStore& addresses, LogicalKVPageStore& pages,
-                             KVAddressSpaceHandle address, runtime::ContextResourceClass resource) {
+    const auto collect = [&](context::KVAddressSpaceStore& addresses,
+                             context::LogicalKVPageStore& pages,
+                             context::KVAddressSpaceHandle address,
+                             runtime::ContextResourceClass resource) {
         KVTransfer transfer;
         transfer.pages       = &pages;
         transfer.resource    = resource;

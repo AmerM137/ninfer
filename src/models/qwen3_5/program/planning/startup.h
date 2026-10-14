@@ -1,4 +1,6 @@
 #pragma once
+
+#include "models/common/qwen/vision/vision.h"
 #include "models/qwen3_5/program/internal.h"
 
 #include "core/cyclic_kv_cache.h"
@@ -48,16 +50,6 @@ struct PersistentLayout {
     std::size_t kv_payload_bytes = 0;
 };
 
-struct VisionWorkspacePlan {
-    std::int32_t output_hidden         = 0;
-    std::uint32_t max_merged_tokens    = 0;
-    std::size_t general_capacity_bytes = 0;
-    std::size_t encode_peak_bytes      = 0;
-    std::size_t handoff_offset_bytes   = 0;
-    std::size_t handoff_capacity_bytes = 0;
-    std::size_t capacity_bytes         = 0;
-};
-
 struct WorkspacePlan {
     std::size_t text_prefill     = 0;
     std::size_t ordinary_round   = 0;
@@ -67,7 +59,7 @@ struct WorkspacePlan {
     std::size_t dflash_round     = 0;
     std::size_t causal_score     = 0;
     std::size_t general_capacity = 0;
-    std::optional<VisionWorkspacePlan> vision;
+    std::optional<qwen::VisionWorkspacePlan> vision;
     std::size_t capacity = 0;
 };
 

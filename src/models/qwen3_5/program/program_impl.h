@@ -1,4 +1,5 @@
 #pragma once
+
 #include "models/common/moe/resources.h"
 #include "models/qwen3_5/program/internal.h"
 
@@ -10,18 +11,18 @@
 #include "ninfer/ops/sampling.h"
 #include "core/decode_graph.h"
 #include "models/qwen3_5/program/text_graph.h"
-#include "models/qwen3_5/frontend/prepared_prompt.h"
+#include "models/common/qwen/frontend/prepared_prompt.h"
 
 #include "models/qwen3_5/program/planning/startup.h"
 #include "models/qwen3_5/program/storage/draft_context.h"
-#include "models/qwen3_5/program/storage/host_kv_store.h"
-#include "models/qwen3_5/program/storage/kv_address_space.h"
-#include "models/qwen3_5/program/storage/state_store.h"
-#include "models/qwen3_5/program/prefix_identity.h"
+#include "models/common/context/host_kv_store.h"
+#include "models/common/context/kv_address_space.h"
+#include "models/qwen3_5/state/state_image.h"
+#include "models/common/qwen/prefix_identity.h"
 #include "core/host_context_arena.h"
 #include "models/qwen3_5/execution/text.h"
-#include "models/qwen3_5/execution/vision.h"
-#include "models/qwen3_5/program/vision_prefill.h"
+#include "models/common/qwen/vision/vision.h"
+#include "models/common/qwen/vision/prefill.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -37,12 +38,11 @@
 
 namespace ninfer::models::qwen3_5::detail {
 using execution::dimension;
-using PreparedPromptData = qwen3_5::PreparedPromptData;
 
 struct PreparedCaptureBacking {
-    PrefixShortlistDigests digests;
+    qwen::PrefixShortlistDigests digests;
     std::vector<TokenId> ledger;
-    qwen3_5::detail::ResidentPrefixIdentity prefix_identity;
+    qwen::ResidentPrefixIdentity prefix_identity;
 };
 
 struct CaptureGroup {
@@ -59,14 +59,14 @@ enum class MtpBridgeMode : std::uint8_t {
 };
 
 struct RequestBasePlanImpl {
-    std::shared_ptr<const PreparedPromptData> prompt;
+    std::shared_ptr<const qwen::PreparedPromptData> prompt;
     runtime::RequestPlanSummary summary;
-    qwen3_5::PreparedContextCache context_cache;
+    qwen::PreparedContextCache context_cache;
     ops::SamplingConfig sampling;
-    std::shared_ptr<const VisionControlPlan> vision_control_plan;
+    std::shared_ptr<const qwen::VisionControlPlan> vision_control_plan;
     std::vector<CaptureGroup> capture_groups;
     std::shared_ptr<const PreparedCaptureBacking> capture_backing;
-    PrefixShortlistDigests prefix_digests;
+    qwen::PrefixShortlistDigests prefix_digests;
     std::uint32_t prefix_identity_tag = 0;
     bool allow_prefix_reuse           = false;
 
@@ -109,16 +109,16 @@ struct RecoveryPermit {
 };
 
 struct SequenceKVBundle {
-    KVAddressSpaceHandle text;
-    std::optional<KVAddressSpaceHandle> backend;
+    context::KVAddressSpaceHandle text;
+    std::optional<context::KVAddressSpaceHandle> backend;
 };
 
 // One mutable KV directory shared by the internal recovery points of a private history.
 // Independent public/branch views own a different history and share only physical prefix pages.
 struct KVHistory {
     ProgramImpl* owner = nullptr;
-    KVAddressSpaceHandle text;
-    std::optional<KVAddressSpaceHandle> backend;
+    context::KVAddressSpaceHandle text;
+    std::optional<context::KVAddressSpaceHandle> backend;
     ~KVHistory();
 };
 
@@ -168,8 +168,8 @@ struct SequenceState {
     std::uint32_t execution_frontier = 0;
     std::uint32_t ledger_frontier    = 0;
     std::vector<TokenId> ledger;
-    qwen3_5::detail::ResidentPrefixIdentity prefix_identity;
-    qwen3_5::detail::PrefixShortlistDigests prefix_digests;
+    qwen::ResidentPrefixIdentity prefix_identity;
+    qwen::PrefixShortlistDigests prefix_digests;
     std::int32_t rope_delta               = 0;
     std::uint32_t text_kv_valid           = 0;
     std::uint32_t mtp_kv_valid            = 0;
@@ -209,9 +209,9 @@ struct RequestControl {
     bool capture_pending     = false;
 
     struct Prefill {
-        PreparedPromptData prompt;
-        std::optional<VisionPrefillPlan> vision_plan;
-        std::unique_ptr<execution::VisionPrefillSession> vision;
+        qwen::PreparedPromptData prompt;
+        std::optional<qwen::VisionPrefillPlan> vision_plan;
+        std::unique_ptr<qwen::VisionPrefillSession> vision;
         std::uint32_t base               = 0;
         std::uint32_t cursor             = 0;
         std::uint32_t prompt_tokens      = 0;
@@ -262,9 +262,10 @@ public:
     ~ProgramImpl() noexcept;
     void initialize_graphs();
     void release_graphs();
-    [[nodiscard]] RequestBasePlan plan_request(PreparedPromptData&&,
+    [[nodiscard]] RequestBasePlan plan_request(qwen::PreparedPromptData&&,
                                                const runtime::ResolvedExecutionOptions&);
-    [[nodiscard]] std::vector<float> causal_score(PreparedPromptData&&, std::uint32_t first_target);
+    [[nodiscard]] std::vector<float> causal_score(qwen::PreparedPromptData&&,
+                                                  std::uint32_t first_target);
     [[nodiscard]] std::optional<SourceCandidate>
     inspect_source(const RequestBasePlan&, std::optional<CheckpointHandle>, bool = false,
                    std::span<const CheckpointHandle> = {},
@@ -366,11 +367,11 @@ public:
     std::unique_ptr<qwen3_5::DecoderState> decoder;
     std::unique_ptr<HostContextArena> host_context_arena;
     std::unique_ptr<HostKVArena> host_kv_arena;
-    std::unique_ptr<LogicalKVPageStore> text_kv_pages;
-    std::unique_ptr<KVAddressSpaceStore> text_kv_addresses;
-    std::unique_ptr<LogicalKVPageStore> backend_kv_pages;
-    std::unique_ptr<KVAddressSpaceStore> backend_kv_addresses;
-    std::unique_ptr<HostKVExtentStore> host_kv_extents;
+    std::unique_ptr<context::LogicalKVPageStore> text_kv_pages;
+    std::unique_ptr<context::KVAddressSpaceStore> text_kv_addresses;
+    std::unique_ptr<context::LogicalKVPageStore> backend_kv_pages;
+    std::unique_ptr<context::KVAddressSpaceStore> backend_kv_addresses;
+    std::unique_ptr<context::HostKVExtentStore> host_kv_extents;
     std::size_t text_host_kv_page_stride    = 0;
     std::size_t backend_host_kv_page_stride = 0;
     std::unique_ptr<qwen3_5::StateImageDevicePool> state_images;
@@ -392,7 +393,7 @@ public:
                                         std::span<const TokenId> drafts);
     Tensor token_counts;
 
-    VisionHandoffState vision_handoff;
+    qwen::VisionHandoffState vision_handoff;
     std::array<SequenceState, kMaximumConcurrency> sequences;
     std::array<RequestControl, kMaximumConcurrency> requests;
     std::array<std::uint64_t, kMaximumConcurrency> lane_epochs{};
@@ -426,11 +427,11 @@ public:
     std::uint64_t next_transaction_id_ = 1;
 
     struct KVTransfer {
-        LogicalKVPageStore* pages              = nullptr;
+        context::LogicalKVPageStore* pages     = nullptr;
         runtime::ContextResourceClass resource = runtime::ContextResourceClass::MainKV;
-        std::vector<LogicalKVPageHandle> logical;
+        std::vector<context::LogicalKVPageHandle> logical;
         std::vector<DeviceKVPageHandle> physical;
-        std::optional<HostKVExtentReservation> host_destination;
+        std::optional<context::HostKVExtentReservation> host_destination;
         std::optional<DeviceKVPageReservation> device_reservation;
         bool restore     = false;
         bool drop_device = false;
@@ -452,12 +453,12 @@ public:
         std::optional<ResumeState> paused;
         std::optional<StateImageTransfer> state_transfer;
         std::vector<KVTransfer> kv_transfers;
-        std::optional<KVPrefixForkReservation> text_fork;
-        std::optional<KVPrefixForkReservation> backend_fork;
-        std::optional<KVActivationReservation> text_activation;
-        std::optional<KVActivationReservation> backend_activation;
-        std::optional<KVActivePrefixViewReservation> text_view;
-        std::optional<KVActivePrefixViewReservation> backend_view;
+        std::optional<context::KVPrefixForkReservation> text_fork;
+        std::optional<context::KVPrefixForkReservation> backend_fork;
+        std::optional<context::KVActivationReservation> text_activation;
+        std::optional<context::KVActivationReservation> backend_activation;
+        std::optional<context::KVActivePrefixViewReservation> text_view;
+        std::optional<context::KVActivePrefixViewReservation> backend_view;
         std::optional<StateImageHandle> reserved_state;
         std::optional<DeviceKVPageReservation> main_growth;
         std::optional<DeviceKVPageReservation> backend_growth;
@@ -516,8 +517,9 @@ public:
     void enqueue_context_transfers(ContextTransaction&);
     void enqueue_state_backup(ContextTransaction&);
     void copy_local_for_context(ContextTransaction&, std::int32_t source, std::int32_t destination);
-    void copy_context_tail(ContextTransaction&, LogicalKVPageStore&, DeviceKVPageHandle source,
-                           DeviceKVPageHandle destination, runtime::ContextResourceClass);
+    void copy_context_tail(ContextTransaction&, context::LogicalKVPageStore&,
+                           DeviceKVPageHandle source, DeviceKVPageHandle destination,
+                           runtime::ContextResourceClass);
     void publish_context_transfers(ContextTransaction&);
     [[nodiscard]] bool prepare_backup(ContextTransaction&, CheckpointState&, bool shared_device);
     void install_binding(ContextTransaction&);
@@ -537,7 +539,7 @@ public:
     void clear_lane(SequenceState&, RequestControl&) noexcept;
     void clear_execution_failure_lanes(std::span<const std::uint32_t>) noexcept;
     void refresh_state_views(SequenceState&);
-    [[nodiscard]] StateImageSelectors state_selectors(const SequenceState&) const;
+    [[nodiscard]] context::StateImageSelectors state_selectors(const SequenceState&) const;
     void settle_state_fork(SequenceState&);
     void release_sequence_state(SequenceState&) noexcept;
     void release_sequence_kv(SequenceState&) noexcept;

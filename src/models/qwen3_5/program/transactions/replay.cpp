@@ -1,3 +1,4 @@
+#include "models/common/qwen/vision/prefill.h"
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/execution_context.h"
 #include "core/device.h"
@@ -13,21 +14,22 @@
 namespace ninfer::models::qwen3_5::detail {
 namespace {
 
-PreparedPromptData replay_prompt(const RequestBasePlanImpl& base, const SequenceState& sequence) {
+qwen::PreparedPromptData replay_prompt(const RequestBasePlanImpl& base,
+                                       const SequenceState& sequence) {
     if (!base.prompt || sequence.ledger.size() < base.prompt->token_ids.size()) {
         throw std::logic_error("replay ledger does not retain its prepared prompt");
     }
-    const PreparedPromptData& source = *base.prompt;
-    const std::size_t prompt_tokens  = source.token_ids.size();
-    const std::size_t ledger_tokens  = sequence.ledger.size();
+    const qwen::PreparedPromptData& source = *base.prompt;
+    const std::size_t prompt_tokens        = source.token_ids.size();
+    const std::size_t ledger_tokens        = sequence.ledger.size();
     if (source.token_types.size() != prompt_tokens ||
         source.positions.size() != 3ULL * prompt_tokens ||
         !std::equal(source.token_ids.begin(), source.token_ids.end(), sequence.ledger.begin())) {
         throw std::logic_error("replay input does not match the retained prompt");
     }
 
-    PreparedPromptData out = source;
-    out.token_ids          = sequence.ledger;
+    qwen::PreparedPromptData out = source;
+    out.token_ids                = sequence.ledger;
     out.token_types.resize(ledger_tokens, 0);
     out.positions.resize(3ULL * ledger_tokens);
     out.rope_delta = sequence.rope_delta;
@@ -197,7 +199,7 @@ ReplayProgress ProgramImpl::advance_replay(SequenceHandle handle,
             split = capture_frontier;
         }
 
-        const StateImageSelectors selectors = state_selectors(sequence);
+        const context::StateImageSelectors selectors = state_selectors(sequence);
         execution::PrefillContext context{
             {device, parameters, work, state_images->linear(),
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
@@ -232,9 +234,9 @@ ReplayProgress ProgramImpl::advance_replay(SequenceHandle handle,
             request.replay.emplace();
             auto& replay  = *request.replay;
             replay.prompt = replay_prompt(*request.base, sequence);
-            VisionPrefillPlan plan;
-            plan.control = std::make_shared<VisionControl>(
-                build_vision_control(replay.prompt, *request.base->vision_control_plan, 0));
+            qwen::VisionPrefillPlan plan;
+            plan.control = std::make_shared<qwen::VisionControl>(
+                qwen::build_vision_control(replay.prompt, *request.base->vision_control_plan, 0));
             const auto& items = request.base->vision_control_plan->items;
             for (std::size_t index = 0; index < items.size(); ++index) {
                 const auto& item = items[index];
@@ -243,15 +245,16 @@ ReplayProgress ProgramImpl::advance_replay(SequenceHandle handle,
                         ? item.token_begin - 1U
                         : item.token_begin;
                 plan.uses.push_back(
-                    VisionUseSpan{.begin               = begin,
-                                  .end                 = item.token_end,
-                                  .prepared_item_index = static_cast<std::uint32_t>(index),
-                                  .control_index       = static_cast<std::uint32_t>(index)});
+                    qwen::VisionUseSpan{.begin               = begin,
+                                        .end                 = item.token_end,
+                                        .prepared_item_index = static_cast<std::uint32_t>(index),
+                                        .control_index       = static_cast<std::uint32_t>(index)});
                 plan.max_merged_count = std::max(plan.max_merged_count, item.merged_count);
             }
             replay.vision_plan.emplace(std::move(plan));
-            replay.vision = std::make_unique<execution::VisionPrefillSession>(
-                device, parameters, workspace_storage.span(), *workspace_plan.vision, replay.prompt,
+            replay.vision = std::make_unique<qwen::VisionPrefillSession>(
+                device, *parameters.model.config().vision, *parameters.vision,
+                workspace_storage.span(), *workspace_plan.vision, replay.prompt,
                 *replay.vision_plan, vision_handoff, vision_handoff_peak_bytes);
         }
 

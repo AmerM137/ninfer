@@ -1,43 +1,33 @@
 #pragma once
 
-#include "models/qwen3_5/model.h"
-#include "models/qwen3_5/execution/parameters.h"
-#include "models/qwen3_5/program/runtime_types.h"
-#include "runtime/engine/context_cache/context_cost.h"
 #include "runtime/engine/kv_capacity.h"
 
 #include <memory>
+#include <utility>
 
 namespace ninfer::runtime {
 
-[[nodiscard]] EngineOptions normalize_engine_options(EngineOptions options);
-
+template <class Types>
 struct ModelInstance {
-    using ModelContract = models::qwen3_5::RuntimeTypes;
+    using ModelContract = Types;
 
-    std::unique_ptr<models::qwen3_5::Model> model;
-    const models::qwen3_5::execution::Parameters parameters;
-    models::qwen3_5::Frontend frontend;
+    std::unique_ptr<typename Types::Model> model;
+    const typename Types::Parameters parameters;
+    typename Types::Frontend frontend;
     KvCapacityResolution kv_capacity_resolution;
     std::size_t device_budget_bytes = 0;
     std::optional<GraphMemorySummary> cuda_graph;
     std::int64_t startup_retained_bytes = 0;
-    const std::uint32_t capacity;
-    std::unique_ptr<models::qwen3_5::Program> program;
+    std::unique_ptr<typename Types::Program> program;
 
-    ModelInstance(std::unique_ptr<models::qwen3_5::Model> model, const EngineOptions& options,
-                  std::shared_ptr<const models::qwen3_5::execution::ModelProfile> profile);
-    ~ModelInstance();
+    ModelInstance(std::unique_ptr<typename Types::Model> source,
+                  typename Types::Frontend prepared_frontend,
+                  std::shared_ptr<const typename Types::Profile> profile)
+        : model(std::move(source)), parameters(*model, std::move(profile)),
+          frontend(std::move(prepared_frontend)) {}
+
     ModelInstance(const ModelInstance&)            = delete;
     ModelInstance& operator=(const ModelInstance&) = delete;
 };
-
-struct ConstructedModel {
-    std::unique_ptr<ModelInstance> instance;
-    LoadSummary load;
-    ContextMachineCostModel context_cost;
-};
-
-[[nodiscard]] ConstructedModel construct_model(EngineOptions& options, DeviceContext& device);
 
 } // namespace ninfer::runtime
