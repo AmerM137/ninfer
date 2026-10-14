@@ -121,8 +121,13 @@ arena 的 allocation。预留、原生初始化、写入完成与副本物化是
 checkpoint 使用；lane 不持有可能随换槽失效的状态 Tensor。Replay 中的 Continuation 记录
 实际已重建的输入位置，恢复目标单独保存在请求控制中；已提交的账本与采样计数保持不变。
 各历史前沿的数学关系仍由模型决定。
-逻辑 KV 页、Host extent 与地址空间管理同样不依赖具体 Text 层。具体层连接、状态推进及
-speculative 提交保留原生实现。
+`KVHistory` 是单个 pool 的唯一可写历史，`KVPrefixRef` 持有该历史的精确只读前缀。
+`KVHistoryStore` 随引用增减局部维护保护和有效 coverage，保存前缀不复制尾页；独立写入发生
+冲突时才分支目录并 COW。Device 与 Host 可以覆盖不同长度，迁移按实际所需前缀检查副本。
+`ContextSnapshot<Metadata, Identity>` 一起持有 Continuation、各 pool 的前缀与输入身份，
+`CheckpointStore` 管理用途记录的发布、generation 与读者 lease。原生模型决定各 pool 的位置关系、
+保存机会和采用规则；公共层不推导 Main/MTP/DFlash 的数学前沿。
+具体层连接、状态推进及 speculative 提交保留原生实现。
 
 每个 Program 独占：
 

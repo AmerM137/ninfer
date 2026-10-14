@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ninfer/types.h"
+#include "models/common/context/checkpoint_store.h"
 #include "runtime/contract/execution.h"
 #include "runtime/contract/resources.h"
 #include "models/common/qwen/frontend/prepared_prompt.h"
@@ -140,13 +141,7 @@ private:
     friend struct detail::ContractAccess;
 };
 
-// One complete immutable state/KV coverage record. Generation protects reused descriptors.
-struct CheckpointHandle {
-    const void* owner                                                   = nullptr;
-    std::uint32_t index                                                 = 0;
-    std::uint64_t generation                                            = 0;
-    friend bool operator==(CheckpointHandle, CheckpointHandle) noexcept = default;
-};
+using CheckpointHandle = context::CheckpointHandle;
 
 struct CheckpointMetadata {
     std::uint32_t frontier       = 0;

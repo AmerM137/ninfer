@@ -158,6 +158,19 @@ void StateImageStore::make_mutable(Handle handle) {
     object.role = StateImageRole::ActiveMutable;
 }
 
+void StateImageStore::consume_checkpoint(Handle handle) {
+    Object& object = require(handle);
+    if (object.role != StateImageRole::CheckpointImmutable || !object.device_slot ||
+        object.checkpoint_references != 1 || object.source_pins != 0 || object.destination_pinned ||
+        has_pending_replica(object)) {
+        throw std::logic_error("StateImage checkpoint has other owners or readers");
+    }
+    object.checkpoint_references = 0;
+    object.release_pending       = false;
+    object.host_slot.reset();
+    object.role = StateImageRole::ActiveMutable;
+}
+
 bool StateImageStore::drop_device_replica(Handle handle) noexcept {
     if (!valid(handle)) { return false; }
     Object& object = objects_[handle.index_];

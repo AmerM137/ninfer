@@ -1,7 +1,7 @@
 # 续算状态与上下文快照重构设计
 
-状态：S1 已完成，S2–S4 待实施。固定状态、续算 metadata 与实际消费者已迁移；
-KV 前缀引用和统一迁移任务继续按后续步骤推进，再进入 Qwen4Exp 的加载与执行资源阶段。
+状态：S1、S2 已完成，S3–S4 待实施。固定状态、续算 metadata、KV 前缀引用与完整快照已迁移；
+异步迁移任务和 Runtime 资源合同继续按后续步骤推进，再进入 Qwen4Exp 的加载与执行资源阶段。
 本文描述目标设计和实施顺序；当前已实现合同以
 [Engine 架构](engine-architecture.md)、[上下文缓存](resource-scheduling-and-context-cache.md)
 和 [Paged KV](paged-kv-cache.md) 为准。
@@ -307,11 +307,11 @@ QSA selection、GDN/PLE 实际 records、候选特征窗口和 I/O ticket 是执
 
 ### S2：KV 前缀引用与完整快照
 
-- [ ] 区分活动 history 与稳定前缀引用，完成前缀目录共享、局部保护维护和 COW。
-- [ ] 建立包含续算状态、前缀引用和输入身份的完整快照；集中管理 checkpoint 引用与 pin。
-- [ ] 迁移 Qwen3_5 的内部锚点、公共分支、capture、截断、释放和来源完整性检查。
-- [ ] 移除模型扫描保护前沿、依赖 `shared_ptr::use_count()` 判断资源寿命及反向析构回调。
-- [ ] 用小型混合状态与 `tokens_per_row=4` 页组验证 Qwen4Exp 需要的组合和非对齐前沿。
+- [x] 区分活动 history 与稳定前缀引用，完成前缀目录共享、局部保护维护和 COW。
+- [x] 建立包含续算状态、前缀引用和输入身份的完整快照；集中管理 checkpoint 引用与 pin。
+- [x] 迁移 Qwen3_5 的内部锚点、公共分支、capture、截断、释放和来源完整性检查。
+- [x] 移除模型扫描保护前沿、依赖 `shared_ptr::use_count()` 判断资源寿命及反向析构回调。
+- [x] 用小型混合状态与 `tokens_per_row=4` 页组验证 Qwen4Exp 需要的组合和非对齐前沿。
 
 产出：checkpoint 通过明确引用保留完整恢复点，保护与释放由公共层兑现；内部锚点不因新
 接口无条件增加尾页复制，现存共享内容在分支、截断和释放后仍正确。

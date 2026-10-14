@@ -9,7 +9,7 @@ namespace ninfer::models::qwen3_5::detail {
 
 std::optional<CheckpointHandle> ProgramImpl::detach_checkpoint(SequenceState& state) {
     const auto frontier = state.continuation.metadata.text_kv_valid;
-    if (!frontier || !state.kv) { return std::nullopt; }
+    if (!frontier || !state.kv) return std::nullopt;
     auto backing     = std::make_shared<PreparedCaptureBacking>();
     backing->digests = state.prefix_digests;
     backing->digests.truncate(frontier);
@@ -17,45 +17,31 @@ std::optional<CheckpointHandle> ProgramImpl::detach_checkpoint(SequenceState& st
     backing->prefix_identity = state.prefix_identity;
     backing->prefix_identity.truncate(frontier);
     auto handle = reserve_checkpoint();
-    if (!handle) { return std::nullopt; }
-    if (state_store->role(state.continuation.image) == context::StateImageRole::ActiveMutable) {
+    if (!handle) return std::nullopt;
+    if (state_store->role(state.continuation.image) == context::StateImageRole::ActiveMutable)
         state_store->freeze(state.continuation.image);
-    }
-    // Acquire the new content owner before dropping this request's read lease. That lease may
-    // be the only remaining owner after the original cache checkpoint has been evicted.
-    state_store->retain_checkpoint_reference(state.continuation.image);
-    if (state.pending_write.valid()) {
-        const auto source = state.continuation.image;
-        state_store->abort_write(source, state.write_state());
-        if (!state_store->release(state.write_state())) {
-            throw std::logic_error("unused fork could not be released");
-        }
-        state.continuation.image = source;
-        state.pending_write      = {};
-    }
-    text_kv_addresses->release_growth(state.kv->text);
-    text_kv_addresses->set_checkpoint_requirement(state.kv->text, frontier);
-    text_kv_addresses->deactivate(state.kv->text);
-    if (state.kv->backend) {
-        backend_kv_addresses->release_growth(*state.kv->backend);
-        backend_kv_addresses->set_checkpoint_requirement(*state.kv->backend,
-                                                         backend_kv_valid(state));
-        backend_kv_addresses->deactivate(*state.kv->backend);
-    }
     auto captured                        = state.continuation;
     captured.metadata.execution_frontier = frontier;
     captured.metadata.backend_kv_valid   = backend_kv_valid(state);
-    checkpoints[handle->index].value =
-        CheckpointState{.kv           = state.kv,
-                        .continuation = captured,
-                        .identity     = std::move(backing),
-                        .key          = {state.prefix_digests.at(frontier), frontier,
-                                         requests[state.lane].base->prefix_identity_tag}};
-    checkpoints[handle->index].reserved = false;
+    std::vector<context::KVPrefixRef> prefixes;
+    prefixes.push_back(text_kv_histories->retain_prefix(state.kv->text.handle(), frontier));
+    if (state.kv->backend)
+        prefixes.push_back(backend_kv_histories->retain_prefix(state.kv->backend->handle(),
+                                                               backend_kv_valid(state)));
+    CheckpointState snapshot{
+        .snapshot = Snapshot(*state_store, captured, std::move(prefixes), std::move(backing)),
+        .key      = {state.prefix_digests.at(frontier), frontier,
+                     requests[state.lane].base->prefix_identity_tag}};
+    // The complete snapshot now owns the base before an outstanding writer is discarded.
+    if (state.pending_write.valid()) {
+        state_store->abort_write(state.continuation.image, state.write_state());
+        if (!state_store->release(state.write_state()))
+            throw std::logic_error("unused writer could not be released");
+    }
+    checkpoints.publish(*handle, std::move(snapshot));
     state.kv.reset();
     state.continuation.image = {};
     state.pending_write      = {};
-
     return handle;
 }
 
@@ -65,27 +51,26 @@ bool ProgramImpl::prepare_backup(ContextTransaction& tx, CheckpointState& record
     // Both copies already present cost no transfer. A source still read by another resident stays
     // resident; the paused record is an evictable reference, never a permanent Device pin.
     tx.preserve_state_device =
-        shared_device && state_store->source_pins(record.continuation.image) != 0;
-    if (!state_store->host_resident(record.continuation.image)) {
-        auto transfer = state_store->reserve_device_to_host(record.continuation.image);
+        shared_device && state_store->source_pins(record.continuation().image) != 0;
+    if (!state_store->host_resident(record.continuation().image)) {
+        auto transfer = state_store->reserve_device_to_host(record.continuation().image);
         if (transfer) { tx.state_transfer.emplace(std::move(*transfer)); }
         if (!tx.state_transfer) { return false; }
     }
-    const auto collect = [&](context::KVAddressSpaceStore& addresses,
-                             context::LogicalKVPageStore& pages,
-                             context::KVAddressSpaceHandle address,
+    const auto collect = [&](context::KVHistoryStore& histories, context::LogicalKVPageStore& pages,
+                             context::KVHistoryHandle address,
                              runtime::ContextResourceClass resource) {
         KVTransfer transfer;
         transfer.pages       = &pages;
         transfer.resource    = resource;
         transfer.drop_device = true;
-        for (std::uint32_t i = 0; i < addresses.mapped_pages(address); ++i) {
-            const auto page = addresses.logical_page(address, i);
+        for (std::uint32_t i = 0; i < histories.mapped_pages(address); ++i) {
+            const auto page = histories.logical_page(address, i);
             if (!pages.device_resident(page) ||
-                (shared_device && pages.active_address_references(page))) {
+                (shared_device && pages.active_history_references(page))) {
                 continue;
             }
-            if (pages.host_resident(page)) {
+            if (pages.host_replica_current(page)) {
                 if (!pages.drop_device_replica(page)) { return false; }
             } else {
                 transfer.logical.push_back(page);
@@ -101,12 +86,12 @@ bool ProgramImpl::prepare_backup(ContextTransaction& tx, CheckpointState& record
         tx.kv_transfers.push_back(std::move(transfer));
         return true;
     };
-    if (!collect(*text_kv_addresses, *text_kv_pages, record.kv->text,
+    if (!collect(*text_kv_histories, *text_kv_pages, record.history().text,
                  runtime::ContextResourceClass::MainKV)) {
         return false;
     }
-    return !record.kv->backend ||
-           collect(*backend_kv_addresses, *backend_kv_pages, *record.kv->backend,
+    return !record.history().backend ||
+           collect(*backend_kv_histories, *backend_kv_pages, *record.history().backend,
                    runtime::ContextResourceClass::BackendKV);
 }
 
@@ -220,8 +205,9 @@ ResumeState ProgramImpl::complete_pause(ContextTransaction& tx) {
     if (!tx.paused) { throw std::logic_error("pause operation lost its durable request"); }
     if (tx.paused->has_snapshot()) {
         const auto& record = checkpoint(*tx.paused->impl_->snapshot);
-        if (!tx.preserve_state_device && state_store->device_resident(record.continuation.image) &&
-            !state_store->drop_device_replica(record.continuation.image)) {
+        if (!tx.preserve_state_device &&
+            state_store->device_resident(record.continuation().image) &&
+            !state_store->drop_device_replica(record.continuation().image)) {
             throw std::logic_error("paused state is still Device-pinned");
         }
     }

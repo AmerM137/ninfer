@@ -170,10 +170,12 @@ ReplayProgress ProgramImpl::advance_replay(SequenceHandle handle,
                 ? std::optional<std::uint32_t>(request.capture_reservation->frontier)
                 : std::nullopt;
         ensure_sequence_kv_mapped(sequence, permit.main_frontier, permit.backend_frontier);
-        set_device_i32(io.text_kv_table_row, text_kv_addresses->bound_row(sequence.kv->text));
+        set_device_i32(io.text_kv_table_row,
+                       text_kv_histories->bound_row(sequence.kv->text.handle()));
         set_device_i32(io.backend_kv_table_row,
-                       sequence.kv->backend ? backend_kv_addresses->bound_row(*sequence.kv->backend)
-                                            : 0);
+                       sequence.kv->backend
+                           ? backend_kv_histories->bound_row(sequence.kv->backend->handle())
+                           : 0);
 
         const std::uint32_t cursor        = request.replay_cursor;
         const std::uint32_t prompt_tokens = request.base->summary.prompt_tokens;
@@ -215,7 +217,8 @@ ReplayProgress ProgramImpl::advance_replay(SequenceHandle handle,
             selectors.source,
             selectors.destination,
             0,
-            sequence.kv->backend ? backend_kv_addresses->bound_row(*sequence.kv->backend) : 0,
+            sequence.kv->backend ? backend_kv_histories->bound_row(sequence.kv->backend->handle())
+                                 : 0,
             dflash_prefill_host_ingress,
             sequence.continuation.metadata.rope_delta};
         context.prefill_gpu_timer = &prefill_gpu_timer_;

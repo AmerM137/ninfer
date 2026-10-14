@@ -153,6 +153,7 @@ public:
     [[nodiscard]] std::int32_t physical_slot(Handle handle) const;
 
     void make_mutable(Handle handle);
+    void consume_checkpoint(Handle handle);
 
     [[nodiscard]] bool drop_device_replica(Handle handle) noexcept;
 

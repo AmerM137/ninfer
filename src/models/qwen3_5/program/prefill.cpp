@@ -202,10 +202,10 @@ PrefillProgress ProgramImpl::advance_prefill(SequenceHandle handle,
     prepare_capture_boundary(lane);
     const auto permit = *requests[lane].permit;
     ensure_sequence_kv_mapped(state, permit.main_frontier, permit.backend_frontier);
-    set_device_i32(io.text_kv_table_row, text_kv_addresses->bound_row(state.kv->text));
+    set_device_i32(io.text_kv_table_row, text_kv_histories->bound_row(state.kv->text.handle()));
     if (state.kv->backend) {
         set_device_i32(io.backend_kv_table_row,
-                       backend_kv_addresses->bound_row(*state.kv->backend));
+                       backend_kv_histories->bound_row(state.kv->backend->handle()));
     }
     grammar_dead_positions[0] = 0;
     if (requests[lane].prefill && permit.main_frontier >= requests[lane].prefill->prompt_tokens &&
@@ -578,8 +578,9 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 schedule_state.state_source_slot      = selectors.source;
                 schedule_state.state_destination_slot = selectors.destination;
                 schedule_state.dflash_kv_table_row =
-                    sequence.kv->backend ? backend_kv_addresses->bound_row(*sequence.kv->backend)
-                                         : 0;
+                    sequence.kv->backend
+                        ? backend_kv_histories->bound_row(sequence.kv->backend->handle())
+                        : 0;
                 if (request.next_capture < request.capture_groups.size()) {
                     rewrite_capture_hidden =
                         state_images->continuation_hidden_slot(selectors.destination);

@@ -79,6 +79,25 @@ public:
 
     [[nodiscard]] std::uint32_t occupied() const noexcept { return capacity() - free_count_; }
 
+    void restrict_coverage(LogicalKVPageStore& pages, LogicalKVPageHandle handle,
+                           std::uint32_t coverage) {
+        auto& page = pages.require(handle);
+        if (!page.host_replica || page.source_pins || page.destination_pinned ||
+            coverage > page.host_replica->committed_columns) {
+            throw std::logic_error("Host KV coverage cannot be restricted");
+        }
+        auto& replica = *page.host_replica;
+        if (replica.extent.owner_ != this) {
+            throw std::logic_error("Host KV coverage belongs to another store");
+        }
+        auto& membership = memberships_.at(replica.membership_node);
+        if (membership.page != handle || membership.coverage != replica.committed_columns) {
+            throw std::logic_error("Host KV membership changed before restriction");
+        }
+        membership.coverage       = coverage;
+        replica.committed_columns = coverage;
+    }
+
     [[nodiscard]] const HostKVPageLayout& page_layout(const LogicalKVPageStore& pages) const {
         const HostKVPageLayout* layout = arena_->layout_for(pages.physical_pool().geometry());
         if (layout == nullptr) {
@@ -93,7 +112,10 @@ public:
             return std::nullopt;
         }
         for (const LogicalKVPageHandle page : membership) {
-            if (!pages.can_pin_source(page) || pages.host_resident(page)) { return std::nullopt; }
+            if (!pages.can_pin_source(page) || pages.source_pins(page) ||
+                pages.host_replica_current(page)) {
+                return std::nullopt;
+            }
         }
 
         const HostKVPageLayout& layout = page_layout(pages);
@@ -113,7 +135,7 @@ public:
             Membership& entry = memberships_[node];
             entry.page        = page;
             entry.epoch       = pages.content_epoch(page);
-            entry.coverage    = pages.committed_columns(page);
+            entry.coverage    = pages.required_columns(page);
             entry.extent      = descriptor;
             entry.offset      = extent.page_count;
             entry.next        = kInvalidIndex;
@@ -172,18 +194,26 @@ public:
 
     [[nodiscard]] HostKVExtentCapability publish(HostKVExtentReservation&& reservation) noexcept {
         if (!valid(reservation)) { std::terminate(); }
-        Extent& extent     = extents_[reservation.descriptor_];
+        Extent& extent = extents_[reservation.descriptor_];
+        std::vector<LogicalKVPageHandle> replaced;
+        replaced.reserve(extent.page_count);
         std::uint32_t node = extent.head;
         for (std::uint32_t index = 0; index < extent.page_count; ++index) {
             if (node == kInvalidIndex) { std::terminate(); }
             const Membership& entry = memberships_[node];
-            if (!extent.page_store->can_attach_host_replica(entry.page, entry.epoch,
-                                                            entry.coverage)) {
+            auto& pages             = *extent.page_store;
+            if (pages.content_epoch(entry.page) != entry.epoch ||
+                !pages.device_covers(entry.page, entry.coverage) ||
+                pages.source_pins(entry.page) != 1) {
                 std::terminate();
             }
+            if (pages.host_resident(entry.page)) replaced.push_back(entry.page);
+            pages.unpin_source(entry.page);
             node = entry.next;
         }
-        if (node != kInvalidIndex) { std::terminate(); }
+        if (node != kInvalidIndex || !release_page_replicas(*extent.page_store, replaced)) {
+            std::terminate();
+        }
         extent.allocation->publish();
         extent.state = ExtentState::Published;
         const HostKVExtentCapability capability(this, reservation.descriptor_, extent.generation);
@@ -192,13 +222,14 @@ public:
             Membership& entry = memberships_[node];
             try {
                 extent.page_store->attach_host_replica(
-                    entry.page, HostKVPageReplica{.extent            = capability,
-                                                  .page_offset       = index,
-                                                  .membership_node   = node,
-                                                  .content_epoch     = entry.epoch,
-                                                  .committed_columns = entry.coverage});
+                    entry.page,
+                    HostKVPageReplica{.extent            = capability,
+                                      .page_offset       = index,
+                                      .membership_node   = node,
+                                      .content_epoch     = entry.epoch,
+                                      .committed_columns = entry.coverage},
+                    *this);
             } catch (...) { std::terminate(); }
-            extent.page_store->unpin_source(entry.page);
             node = entry.next;
         }
         consume(reservation);
@@ -255,7 +286,7 @@ public:
                 replica.membership_node != node || membership.extent != capability.index_ ||
                 membership.offset != index ||
                 (!extent.page_store->device_resident(page) &&
-                 extent.page_store->address_references(page) != 0)) {
+                 extent.page_store->history_references(page) != 0)) {
                 return false;
             }
             node = memberships_[node].next;
@@ -274,7 +305,7 @@ public:
     [[nodiscard]] bool can_release_page_replica(LogicalKVPageStore& pages,
                                                 LogicalKVPageHandle page) const noexcept {
         if (!pages.valid(page) || !pages.host_resident(page) || pages.source_pins(page) != 0 ||
-            (!pages.device_resident(page) && pages.address_references(page) != 0)) {
+            (!pages.device_resident(page) && pages.history_references(page) != 0)) {
             return false;
         }
         const HostKVPageReplica replica = pages.host_replica(page);
@@ -342,7 +373,7 @@ public:
                 const std::size_t bytes =
                     partition_extent(index, [](const LogicalKVPageStore& pages,
                                                LogicalKVPageHandle page, std::uint32_t) {
-                        return pages.address_references(page) == 0 && pages.source_pins(page) == 0;
+                        return pages.history_references(page) == 0 && pages.source_pins(page) == 0;
                     });
                 if (bytes > std::numeric_limits<std::size_t>::max() - released_bytes) {
                     std::terminate();
@@ -505,7 +536,7 @@ private:
             const bool release = should_release(*pages, entry.page, node);
             if (release && (pages->source_pins(entry.page) != 0 ||
                             (!pages->device_resident(entry.page) &&
-                             pages->address_references(entry.page) != 0))) {
+                             pages->history_references(entry.page) != 0))) {
                 throw std::logic_error("Host KV partition contains an unreleasable page");
             }
             if (partition_runs_.empty() || partition_runs_.back().release != release) {

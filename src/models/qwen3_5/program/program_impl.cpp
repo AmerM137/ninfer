@@ -110,7 +110,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     // One immutable image can serve private replay, an explicit anchor, a public view and an
     // exact-hit endpoint. Alias descriptors are bounded separately from physical state slots.
     checkpoints.resize(checked_count(4ULL * logical_states + 2ULL * max_concurrency));
-    const auto address_capacity = checked_count(checkpoints.size() + max_concurrency + 2U);
+    const auto history_capacity = checked_count(checkpoints.size() + max_concurrency + 2U);
     if (host_bytes) {
         StartupPhaseScope phase(startup_observer, StartupPhase::HostContextPin,
                                 StartupProgressUnit::Bytes, host_bytes);
@@ -130,15 +130,15 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     };
     text_kv_pages = std::make_unique<context::LogicalKVPageStore>(
         decoder->text_kv.page_pool(), logical_pages(decoder->text_kv.page_pool()));
-    text_kv_addresses = std::make_unique<context::KVAddressSpaceStore>(
-        *text_kv_pages, decoder->text_kv.execution_tables(), address_capacity,
-        decoder->text_kv.execution_tables().logical_page_capacity());
+    text_kv_histories = std::make_unique<context::KVHistoryStore>(
+        *text_kv_pages, decoder->text_kv.execution_tables(), history_capacity,
+        decoder->text_kv.execution_tables().logical_page_capacity(), host_kv_extents.get());
     if (auto* backend = backend_kv_cache()) {
         backend_kv_pages = std::make_unique<context::LogicalKVPageStore>(
             backend->page_pool(), logical_pages(backend->page_pool()));
-        backend_kv_addresses = std::make_unique<context::KVAddressSpaceStore>(
-            *backend_kv_pages, backend->execution_tables(), address_capacity,
-            backend->execution_tables().logical_page_capacity());
+        backend_kv_histories = std::make_unique<context::KVHistoryStore>(
+            *backend_kv_pages, backend->execution_tables(), history_capacity,
+            backend->execution_tables().logical_page_capacity(), host_kv_extents.get());
     }
 
     io = qwen3_5::RoundState(backing, plan.persistent.round);
@@ -303,14 +303,10 @@ std::vector<float> ProgramImpl::causal_score(qwen::PreparedPromptData&& prompt,
     if (required_pages == 0) { throw std::logic_error("causal score requires KV pages"); }
 
     std::optional<StateImageHandle> state;
-    std::optional<context::KVAddressSpaceHandle> address;
+    std::optional<context::KVHistory> address;
     const auto cleanup = [&] {
         bool released = true;
-        if (address) {
-            if (text_kv_addresses->active(*address)) { text_kv_addresses->deactivate(*address); }
-            released = text_kv_addresses->release(*address) && released;
-            address.reset();
-        }
+        address.reset();
         if (state) {
             released = state_store->release(*state) && released;
             state.reset();
@@ -329,12 +325,11 @@ std::vector<float> ProgramImpl::causal_score(qwen::PreparedPromptData&& prompt,
         if (!state) { throw std::bad_alloc(); }
         state_images->storage().clear(state_store->physical_slot(*state), device.execution_view());
         state_store->complete_initialization(*state);
-        address = text_kv_addresses->create_active(required_pages, 0, device.stream());
-        if (!address) { throw std::bad_alloc(); }
-        if (text_kv_addresses->bound_row(*address) != 0) {
-            throw std::logic_error("causal score did not bind the unique Main KV row");
-        }
-        text_kv_addresses->ensure_mapped_to_tokens(*address, predictor_count, device.stream());
+        auto binding = text_kv_histories->prepare_binding(nullptr, 0, predictor_count, 0);
+        binding.publish_restores();
+        binding.prepare_tail_copy();
+        address.emplace(binding.commit(device.stream()));
+        text_kv_histories->prepare_write(*address, 0, predictor_count, device.stream());
 
         const std::int32_t state_slot = state_store->physical_slot(*state);
 
@@ -396,7 +391,7 @@ std::vector<float> ProgramImpl::causal_score(qwen::PreparedPromptData&& prompt,
             }
             const std::uint32_t chunk_begin = cursor;
             cursor += result.processed_tokens;
-            text_kv_addresses->commit_frontier(*address, cursor);
+            text_kv_histories->commit_frontier(address->handle(), cursor);
 
             std::uint32_t selected = std::max(chunk_begin, scored_predictor_begin);
             while (selected < cursor) {

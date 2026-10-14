@@ -9,10 +9,13 @@
 namespace ninfer::models::qwen3_5::detail {
 
 bool ProgramImpl::context_blocks(SequenceHandle sequence) const noexcept {
-    if (!context_transaction_ || !valid_sequence(sequence)) { return false; }
-    const auto& tx = *context_transaction_;
-    return tx.kind == ContextOperationKind::Bind && (tx.text_view || tx.backend_view) &&
-           sequences[ContractAccess::lane(sequence).value].kv == tx.source_history;
+    if (!context_transaction_ || !valid_sequence(sequence)) return false;
+    const auto& tx    = *context_transaction_;
+    const auto& state = sequences[ContractAccess::lane(sequence).value];
+    if (tx.kind != ContextOperationKind::Bind || !state.kv) return false;
+    return (tx.text_binding && tx.text_binding->blocks_writer(state.kv->text.handle())) ||
+           (tx.backend_binding && state.kv->backend &&
+            tx.backend_binding->blocks_writer(state.kv->backend->handle()));
 }
 
 void ProgramImpl::enqueue_state_backup(ContextTransaction& tx) {
@@ -122,9 +125,6 @@ void ProgramImpl::publish_context_transfers(ContextTransaction& tx) {
     }
     for (auto& transfer : tx.kv_transfers) {
         if (transfer.restore) {
-            for (const auto page : transfer.logical) {
-                transfer.pages->publish_device_replica(page);
-            }
             transfer.logical.clear();
         } else if (transfer.host_destination) {
             (void)host_kv_extents->publish(std::move(*transfer.host_destination));
@@ -138,6 +138,8 @@ void ProgramImpl::publish_context_transfers(ContextTransaction& tx) {
             }
         }
     }
+    if (tx.text_binding) tx.text_binding->publish_restores();
+    if (tx.backend_binding) tx.backend_binding->publish_restores();
 }
 
 ContextProgress ProgramImpl::poll_context(runtime::CancellationFlagView cancellation) {
@@ -187,8 +189,7 @@ ContextProgress ProgramImpl::poll_context(runtime::CancellationFlagView cancella
         } else if (tx.kind == ContextOperationKind::Pause) {
             out.paused.emplace(complete_pause(tx));
         }
-        if (tx.source) { --checkpoints[tx.source->index].pins; }
-        for (const auto point : tx.carried_pins) { --checkpoints[point.index].pins; }
+        tx.source_lease.reset();
         tx.carried_pins.clear();
         out.complete = out.published = true;
         out.transfers                = std::move(tx.observations);
@@ -200,95 +201,56 @@ ContextProgress ProgramImpl::poll_context(runtime::CancellationFlagView cancella
 }
 
 void ProgramImpl::abort_context() noexcept {
-    if (!context_transaction_) { return; }
+    if (!context_transaction_) return;
     auto& tx = *context_transaction_;
     try {
-        // Enqueue can fail before recording the completion event. Drain the transfer stream
-        // itself so every submitted reader has retired before releasing its source/destination.
-        // CUDA failure is already fatal to the Engine; it must not prevent CPU ownership cleanup.
+        // Enqueue can fail before publishing its event. Retire every actual transfer before
+        // returning the binding reservations and their source references.
         (void)cudaStreamSynchronize(device.transfer_stream());
         if (tx.state_transfer) {
             state_store->abort_transfer(std::move(*tx.state_transfer));
             tx.state_transfer.reset();
         }
-        for (auto& transfer : tx.kv_transfers) {
-            if (transfer.restore) {
-                for (const auto page : transfer.logical) {
-                    transfer.pages->abort_device_replica(page, *transfer.device_reservation);
-                }
-            }
-            transfer.host_destination.reset();
-        }
-        tx.text_fork.reset();
-        tx.backend_fork.reset();
-        tx.text_activation.reset();
-        tx.backend_activation.reset();
-        tx.text_view.reset();
-        tx.backend_view.reset();
-        if (tx.kind == ContextOperationKind::Bind && tx.adopted) {
-            release_sequence_state(sequences[tx.lane]);
-            release_sequence_kv(sequences[tx.lane]);
-            tx.reserved_state.reset();
-        }
-        if (tx.reserved_kv) {
-            const auto unwind_address = [&](context::KVAddressSpaceStore& addresses,
-                                            context::KVAddressSpaceHandle address, bool borrowed,
-                                            std::uint32_t frontier) {
-                if (!borrowed) {
-                    if (!addresses.release_after_deactivate(address)) { std::terminate(); }
-                } else if (addresses.active(address)) {
-                    addresses.deactivate(address);
-                    addresses.set_checkpoint_requirement(address, frontier);
-                }
-            };
-            if (tx.reserved_kv->backend) {
-                unwind_address(*backend_kv_addresses, *tx.reserved_kv->backend, tx.borrow_backend,
-                               tx.backend_frontier);
-            }
-            unwind_address(*text_kv_addresses, tx.reserved_kv->text, tx.borrow_text,
-                           tx.reuse_frontier);
-            tx.reserved_kv.reset();
-        }
+        tx.text_binding.reset();
+        tx.backend_binding.reset();
+        for (auto& transfer : tx.kv_transfers) transfer.host_destination.reset();
         if (tx.kind == ContextOperationKind::Bind) {
-            // Any already-installed state binding is still private to this unpublished lane.
-            if (sequences[tx.lane].pending_write.valid()) {
-                state_store->abort_write(sequences[tx.lane].continuation.image,
-                                         sequences[tx.lane].write_state());
+            auto& state = sequences[tx.lane];
+            if (tx.adopted) {
+                release_sequence_state(state);
+                release_sequence_kv(state);
+                tx.reserved_state.reset();
+            } else if (state.pending_write.valid()) {
+                state_store->abort_write(state.continuation.image, state.write_state());
             }
-            sequences[tx.lane].continuation  = {};
-            sequences[tx.lane].pending_write = {};
-            sequences[tx.lane].kv.reset();
+            state.continuation  = {};
+            state.pending_write = {};
+            state.kv.reset();
             requests[tx.lane] = {};
             invalidate_lane(tx.lane);
         }
         if (tx.kind == ContextOperationKind::Capture) {
             auto& state = sequences[tx.lane];
-            refresh_history_requirements(state.kv);
             if (state_store->role(state.continuation.image) ==
                     context::StateImageRole::CheckpointImmutable &&
-                !state_store->checkpoint_references(state.continuation.image)) {
+                !state_store->checkpoint_references(state.continuation.image))
                 state_store->make_mutable(state.continuation.image);
-            }
         }
         if (tx.kind == ContextOperationKind::Pause) {
             requests[tx.lane] = {};
             invalidate_lane(tx.lane);
         }
-        if (tx.reserved_state && !tx.borrow_state) {
-            (void)state_store->release(*tx.reserved_state);
-        }
-        if (tx.source) { --checkpoints[tx.source->index].pins; }
-        for (const auto point : tx.carried_pins) { --checkpoints[point.index].pins; }
+        if (tx.reserved_state && !tx.borrow_state) (void)state_store->release(*tx.reserved_state);
+        tx.source_lease.reset();
+        tx.carried_pins.clear();
         for (const auto& [from, to] : tx.carried_clones) {
-            if (valid_checkpoint(to)) {
+            if (valid_checkpoint(to))
                 (void)release_checkpoint(to);
-            } else {
-                checkpoints[to.index].reserved = false;
-            }
+            else
+                checkpoints.cancel(to);
         }
-        for (const auto& [handle, role] : tx.capture_points) {
-            if (!valid_checkpoint(handle)) { checkpoints[handle.index].reserved = false; }
-        }
+        for (const auto& [handle, role] : tx.capture_points)
+            if (!valid_checkpoint(handle)) checkpoints.cancel(handle);
         context_transaction_.reset();
     } catch (...) { std::terminate(); }
 }

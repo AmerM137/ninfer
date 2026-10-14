@@ -264,10 +264,11 @@ runtime::ExecutionTiming ProgramImpl::append_forced_tokens(
                 }
             }
 
-            set_device_i32(io.text_kv_table_row, text_kv_addresses->bound_row(sequence.kv->text));
+            set_device_i32(io.text_kv_table_row,
+                           text_kv_histories->bound_row(sequence.kv->text.handle()));
             if (sequence.kv->backend) {
                 set_device_i32(io.backend_kv_table_row,
-                               backend_kv_addresses->bound_row(*sequence.kv->backend));
+                               backend_kv_histories->bound_row(sequence.kv->backend->handle()));
             }
             std::uint32_t cursor = base;
             while (cursor < end) {
@@ -287,8 +288,9 @@ runtime::ExecutionTiming ProgramImpl::append_forced_tokens(
                     selectors.source,
                     selectors.destination,
                     0,
-                    sequence.kv->backend ? backend_kv_addresses->bound_row(*sequence.kv->backend)
-                                         : 0,
+                    sequence.kv->backend
+                        ? backend_kv_histories->bound_row(sequence.kv->backend->handle())
+                        : 0,
                     dflash_prefill_host_ingress,
                     sequence.continuation.metadata.rope_delta};
                 schedule_state.prefill_gpu_timer = &prefill_gpu_timer_;

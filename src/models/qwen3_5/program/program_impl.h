@@ -16,7 +16,8 @@
 #include "models/qwen3_5/program/planning/startup.h"
 #include "models/qwen3_5/program/storage/draft_context.h"
 #include "models/common/context/host_kv_store.h"
-#include "models/common/context/kv_address_space.h"
+#include "models/common/context/kv_history.h"
+#include "models/common/context/snapshot.h"
 #include "models/qwen3_5/state/state_image.h"
 #include "models/common/qwen/prefix_identity.h"
 #include "core/host_context_arena.h"
@@ -101,25 +102,26 @@ struct UnitDemand {
 };
 
 struct RecoveryPermit {
-    // The active KV addresses hold the physical reservation through this coverage.
+    // The active KV histories hold the physical reservation through this coverage.
     // These frontiers distinguish reconstructed work from committed new progress.
     UnitDemand coverage;
     std::uint32_t frontier    = 0;
     std::size_t ledger_tokens = 0;
 };
 
-struct SequenceKVBundle {
-    context::KVAddressSpaceHandle text;
-    std::optional<context::KVAddressSpaceHandle> backend;
+struct KVHistoryView {
+    context::KVHistoryHandle text;
+    std::optional<context::KVHistoryHandle> backend;
+    friend bool operator==(const KVHistoryView&, const KVHistoryView&) = default;
 };
 
-// One mutable KV directory shared by the internal recovery points of a private history.
-// Independent public/branch views own a different history and share only physical prefix pages.
-struct KVHistory {
-    ProgramImpl* owner = nullptr;
-    context::KVAddressSpaceHandle text;
-    std::optional<context::KVAddressSpaceHandle> backend;
-    ~KVHistory();
+struct SequenceKVBundle {
+    context::KVHistory text;
+    std::optional<context::KVHistory> backend;
+
+    [[nodiscard]] KVHistoryView view() const {
+        return {text.handle(), backend ? std::optional(backend->handle()) : std::nullopt};
+    }
 };
 
 struct DecodeGraphProfile {
@@ -160,7 +162,7 @@ struct DFlashDraftHandoff {
 };
 
 struct SequenceState {
-    std::shared_ptr<KVHistory> kv;
+    std::optional<SequenceKVBundle> kv;
     Continuation continuation;
     StateImageHandle pending_write;
     std::uint32_t lane = 0;
@@ -182,8 +184,6 @@ struct CaptureReservation {
     std::vector<std::pair<CheckpointHandle, runtime::CheckpointRole>> points;
     StateImageHandle state;
     std::optional<HostContextAllocation> host;
-    std::optional<DeviceKVPageReservation> main_tail;
-    std::optional<DeviceKVPageReservation> backend_tail;
     std::uint32_t frontier = 0;
     ~CaptureReservation();
 };
@@ -225,28 +225,38 @@ struct RequestControl {
     std::optional<Prefill> replay;
 };
 
+using Snapshot = context::ContextSnapshot<ContinuationMetadata, PreparedCaptureBacking>;
+
 struct CheckpointState {
-    std::shared_ptr<KVHistory> kv;
+    Snapshot snapshot;
     runtime::CheckpointRole role = runtime::CheckpointRole::Continuation;
-    Continuation continuation;
-    std::shared_ptr<const PreparedCaptureBacking> identity;
     PrefixShortlistKey key;
 
+    [[nodiscard]] const Continuation& continuation() const noexcept {
+        return snapshot.continuation();
+    }
+
     [[nodiscard]] std::uint32_t frontier() const noexcept {
-        return continuation.metadata.execution_frontier;
+        return continuation().metadata.execution_frontier;
     }
 
     [[nodiscard]] std::uint32_t backend_frontier() const noexcept {
-        return continuation.metadata.backend_kv_valid;
+        return continuation().metadata.backend_kv_valid;
+    }
+
+    [[nodiscard]] const context::KVPrefixRef& text_prefix() const { return snapshot.prefix(0); }
+
+    [[nodiscard]] const context::KVPrefixRef* backend_prefix() const {
+        return snapshot.prefixes().size() == 2 ? &snapshot.prefix(1) : nullptr;
+    }
+
+    [[nodiscard]] KVHistoryView history() const {
+        return {text_prefix().history(),
+                backend_prefix() ? std::optional(backend_prefix()->history()) : std::nullopt};
     }
 };
 
-struct CheckpointSlot {
-    std::optional<CheckpointState> value;
-    std::uint64_t generation = 1;
-    std::uint32_t pins       = 0;
-    bool reserved            = false;
-};
+using Checkpoints = context::CheckpointStore<CheckpointState>;
 
 struct ResumeStateImpl {
     ProgramImpl* owner = nullptr;
@@ -288,7 +298,6 @@ public:
         checkpoint_release_resources(std::span<const CheckpointHandle>,
                                      runtime::ContextResourceUsage) const;
     [[nodiscard]] bool release_checkpoint(CheckpointHandle) noexcept;
-    void refresh_history_requirements(const std::shared_ptr<KVHistory>&, bool trim_unused = false);
     [[nodiscard]] bool revoke_snapshot(ResumeState&) noexcept;
     [[nodiscard]] runtime::ContextResourceUsage snapshot_resources(const ResumeState& paused) const;
     // Exact Host bytes freed by deleting this fixed set, with physical sharing counted once.
@@ -370,9 +379,9 @@ public:
     std::unique_ptr<HostContextArena> host_context_arena;
     std::unique_ptr<HostKVArena> host_kv_arena;
     std::unique_ptr<context::LogicalKVPageStore> text_kv_pages;
-    std::unique_ptr<context::KVAddressSpaceStore> text_kv_addresses;
+    std::unique_ptr<context::KVHistoryStore> text_kv_histories;
     std::unique_ptr<context::LogicalKVPageStore> backend_kv_pages;
-    std::unique_ptr<context::KVAddressSpaceStore> backend_kv_addresses;
+    std::unique_ptr<context::KVHistoryStore> backend_kv_histories;
     std::unique_ptr<context::HostKVExtentStore> host_kv_extents;
     std::size_t text_host_kv_page_stride    = 0;
     std::size_t backend_host_kv_page_stride = 0;
@@ -398,7 +407,7 @@ public:
     std::array<SequenceState, kMaximumConcurrency> sequences;
     std::array<RequestControl, kMaximumConcurrency> requests;
     std::array<std::uint64_t, kMaximumConcurrency> lane_epochs{};
-    std::vector<CheckpointSlot> checkpoints;
+    Checkpoints checkpoints;
 
     std::optional<PinnedHostBuffer> round_host;
     std::optional<PinnedHostBuffer> score_logprobs_host;
@@ -433,7 +442,6 @@ public:
         std::vector<context::LogicalKVPageHandle> logical;
         std::vector<DeviceKVPageHandle> physical;
         std::optional<context::HostKVExtentReservation> host_destination;
-        std::optional<DeviceKVPageReservation> device_reservation;
         bool restore     = false;
         bool drop_device = false;
     };
@@ -445,7 +453,8 @@ public:
         std::optional<CheckpointHandle> source;
         std::vector<std::pair<CheckpointHandle, runtime::CheckpointRole>> capture_points;
         std::vector<CheckpointHandle> carried_points;
-        std::vector<CheckpointHandle> carried_pins;
+        Checkpoints::Lease source_lease;
+        std::vector<Checkpoints::Lease> carried_pins;
         std::vector<std::pair<CheckpointHandle, CheckpointHandle>> carried_clones;
         std::vector<CheckpointHandle> retired_points;
         std::shared_ptr<const RequestBasePlanImpl> base;
@@ -454,24 +463,15 @@ public:
         std::optional<ResumeState> paused;
         std::optional<StateImageTransfer> state_transfer;
         std::vector<KVTransfer> kv_transfers;
-        std::optional<context::KVPrefixForkReservation> text_fork;
-        std::optional<context::KVPrefixForkReservation> backend_fork;
-        std::optional<context::KVActivationReservation> text_activation;
-        std::optional<context::KVActivationReservation> backend_activation;
-        std::optional<context::KVActivePrefixViewReservation> text_view;
-        std::optional<context::KVActivePrefixViewReservation> backend_view;
+        std::optional<context::KVBinding> text_binding;
+        std::optional<context::KVBinding> backend_binding;
         std::optional<StateImageHandle> reserved_state;
-        std::optional<DeviceKVPageReservation> main_growth;
-        std::optional<DeviceKVPageReservation> backend_growth;
         bool binding_prepared          = false;
         std::uint32_t reuse_frontier   = 0;
         std::uint32_t backend_frontier = 0;
         UnitDemand first_unit;
         UnitDemand reservation_demand;
         std::optional<RecoveryPermit> recovery;
-        std::optional<SequenceKVBundle> reserved_kv;
-        std::shared_ptr<KVHistory> binding_history;
-        std::shared_ptr<KVHistory> source_history;
         std::vector<runtime::ContextTransferRequirement> transfers;
         std::vector<runtime::ContextTransferObservation> observations;
         runtime::ContextOperationCounts operations;
@@ -482,8 +482,6 @@ public:
         bool split_state           = false;
         bool backup_state          = false;
         bool adopted               = false;
-        bool borrow_text           = false;
-        bool borrow_backend        = false;
         bool borrow_state          = false;
         bool source_tail_hidden    = false;
     };

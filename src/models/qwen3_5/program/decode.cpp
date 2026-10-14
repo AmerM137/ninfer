@@ -88,8 +88,6 @@ void ordinary_decode_batch(OrdinaryBatchContext& state, std::int32_t batch_size,
 
 namespace ninfer::models::qwen3_5::detail {
 
-namespace {} // namespace
-
 void ProgramImpl::install_sampling(SequenceState& sequence, RequestControl& request,
                                    const ops::SamplingConfig& config) {
     Tensor counts = token_counts.slice(1, static_cast<std::int32_t>(sequence.lane), 1)
@@ -156,9 +154,10 @@ void ProgramImpl::enqueue_dflash_context_append(std::span<const std::uint32_t> l
         const std::uint32_t start = starts[row];
         const std::uint64_t end64 = static_cast<std::uint64_t>(start) + counts[row];
         const std::uint32_t end   = static_cast<std::uint32_t>(end64);
-        if (!sequence.kv || text_kv_addresses->bound_row(sequence.kv->text) < 0 ||
-            (backend_kv_cache() && (!sequence.kv->backend ||
-                                    backend_kv_addresses->bound_row(*sequence.kv->backend) < 0)) ||
+        if (!sequence.kv || text_kv_histories->bound_row(sequence.kv->text.handle()) < 0 ||
+            (backend_kv_cache() &&
+             (!sequence.kv->backend ||
+              backend_kv_histories->bound_row(sequence.kv->backend->handle()) < 0)) ||
             end64 > capacity) {
             throw std::logic_error("DFlash context append is outside retained target storage");
         }
@@ -167,7 +166,8 @@ void ProgramImpl::enqueue_dflash_context_append(std::span<const std::uint32_t> l
         dflash_host_ingress->execution_frontiers[row] =
             context::checked_i32(end, "DFlash append target frontier");
         dflash_host_ingress->dflash_kv_table_rows[row] =
-            sequence.kv->backend ? backend_kv_addresses->bound_row(*sequence.kv->backend) : 0;
+            sequence.kv->backend ? backend_kv_histories->bound_row(sequence.kv->backend->handle())
+                                 : 0;
         dflash_host_ingress->active_lanes[row]            = static_cast<std::int32_t>(lane);
         const context::StateImageSelectors selectors      = state_selectors(sequence);
         dflash_host_ingress->state_source_slots[row]      = selectors.source;
@@ -176,8 +176,7 @@ void ProgramImpl::enqueue_dflash_context_append(std::span<const std::uint32_t> l
         // coverage, including any uncommitted suffix that survives until the round is settled.
         // DFlash2 has only fixed cyclic state; DFlash also grows its Full backend KV here.
         if (sequence.kv->backend) {
-            backend_kv_addresses->ensure_mapped_to_tokens(*sequence.kv->backend, end,
-                                                          device.stream());
+            backend_kv_histories->prepare_write(*sequence.kv->backend, start, end, device.stream());
         }
         minimum_count = std::min(minimum_count, counts[row]);
         maximum_count = std::max(maximum_count, counts[row]);
@@ -247,7 +246,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_ordinary_batch(
         const RequestControl& request = requests[lane];
         if (request.lifecycle != Lifecycle::Active ||
             budgets[row].generated_tokens_remaining == 0 || !sequence.kv ||
-            text_kv_addresses->bound_row(sequence.kv->text) < 0 ||
+            text_kv_histories->bound_row(sequence.kv->text.handle()) < 0 ||
             sequence.continuation.metadata.execution_frontier >= capacity ||
             sequence.ledger_frontier != sequence.continuation.metadata.execution_frontier + 1 ||
             sequence.ledger.size() != sequence.ledger_frontier ||
@@ -289,7 +288,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_ordinary_batch(
                 context::checked_i32(frontier, "ordinary batch RoPE position") +
                 sequence.continuation.metadata.rope_delta;
             ordinary_host_ingress->text_kv_table_rows[row] =
-                text_kv_addresses->bound_row(sequence.kv->text);
+                text_kv_histories->bound_row(sequence.kv->text.handle());
             const context::StateImageSelectors selectors        = state_selectors(sequence);
             ordinary_host_ingress->state_source_slots[row]      = selectors.source;
             ordinary_host_ingress->state_destination_slots[row] = selectors.destination;
@@ -390,8 +389,8 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
         const RequestControl& request = requests[lane];
         if (request.lifecycle != Lifecycle::Active ||
             budgets[row].generated_tokens_remaining == 0 || !sequence.kv || !sequence.kv->backend ||
-            text_kv_addresses->bound_row(sequence.kv->text) < 0 ||
-            backend_kv_addresses->bound_row(*sequence.kv->backend) < 0 ||
+            text_kv_histories->bound_row(sequence.kv->text.handle()) < 0 ||
+            backend_kv_histories->bound_row(sequence.kv->backend->handle()) < 0 ||
             sequence.continuation.metadata.execution_frontier >= capacity ||
             sequence.continuation.metadata.backend_kv_valid !=
                 sequence.continuation.metadata.execution_frontier ||
@@ -457,9 +456,9 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
                     sequence.continuation.metadata.rope_delta;
             }
             mtp_host_ingress->text_kv_table_rows[row] =
-                text_kv_addresses->bound_row(sequence.kv->text);
+                text_kv_histories->bound_row(sequence.kv->text.handle());
             mtp_host_ingress->mtp_kv_table_rows[row] =
-                backend_kv_addresses->bound_row(*sequence.kv->backend);
+                backend_kv_histories->bound_row(sequence.kv->backend->handle());
             const context::StateImageSelectors selectors   = state_selectors(sequence);
             mtp_host_ingress->state_source_slots[row]      = selectors.source;
             mtp_host_ingress->state_destination_slots[row] = selectors.destination;
@@ -604,9 +603,10 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
         const RequestControl& request = requests[lane];
         if (request.lifecycle != Lifecycle::Active ||
             budgets[row].generated_tokens_remaining == 0 || !sequence.kv ||
-            text_kv_addresses->bound_row(sequence.kv->text) < 0 ||
-            (backend_kv_cache() && (!sequence.kv->backend ||
-                                    backend_kv_addresses->bound_row(*sequence.kv->backend) < 0)) ||
+            text_kv_histories->bound_row(sequence.kv->text.handle()) < 0 ||
+            (backend_kv_cache() &&
+             (!sequence.kv->backend ||
+              backend_kv_histories->bound_row(sequence.kv->backend->handle()) < 0)) ||
             sequence.continuation.metadata.execution_frontier >= capacity ||
             sequence.continuation.metadata.text_kv_valid !=
                 sequence.continuation.metadata.execution_frontier ||
@@ -688,9 +688,11 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
                     sequence.continuation.metadata.rope_delta;
             }
             dflash_host_ingress->text_kv_table_rows[row] =
-                text_kv_addresses->bound_row(sequence.kv->text);
+                text_kv_histories->bound_row(sequence.kv->text.handle());
             dflash_host_ingress->dflash_kv_table_rows[row] =
-                sequence.kv->backend ? backend_kv_addresses->bound_row(*sequence.kv->backend) : 0;
+                sequence.kv->backend
+                    ? backend_kv_histories->bound_row(sequence.kv->backend->handle())
+                    : 0;
             dflash_host_ingress->active_lanes[row]       = static_cast<std::int32_t>(sequence.lane);
             const context::StateImageSelectors selectors = state_selectors(sequence);
             dflash_host_ingress->state_source_slots[row] = selectors.source;
@@ -785,6 +787,11 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
                     request.speculative_stats.accepted_per_position[static_cast<std::size_t>(i)] +=
                         1;
                 }
+            }
+            // Forward has finished appending the previous accepted features. Publish that
+            // backend prefix before a terminal commit may append this round's accepted tokens.
+            if (sequence.kv->backend) {
+                backend_kv_histories->commit_frontier(sequence.kv->backend->handle(), base_E);
             }
             sequence.continuation.metadata.dflash_context_frontier = base_E;
 

@@ -387,6 +387,13 @@ Performance-only assertions belong in benchmarks and profiler review. Source sca
 implementation-shape assertions, trivial getters/configuration, retired command surfaces, and
 broad additions without a concrete regression risk do not belong in the permanent suite.
 
+`ninfer_context_store_test` checks StateImage transitions and replicas. `ninfer_kv_history_test`
+checks prefix retention, conflicting-writer COW, reservations, cancellation and Host extent lifetime.
+It compares page bytes against an independent CPU layout oracle and restores a complete mixed
+StateImage/KV snapshot at frontier 7, where `tokens_per_row=4` leaves one valid index row and a
+three-entry raw tail. Native transaction tests exercise the corresponding model-owned source,
+capture, retirement, recovery and consecutive decode/terminal paths.
+
 ## DFlash2 Engine integration
 
 The DFlash prefill regression checks actual KV contents after a StateImage fork and a conflicting

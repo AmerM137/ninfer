@@ -17,7 +17,7 @@ CaptureReservation::~CaptureReservation() {
     if (owner->state_store->valid(state) && !owner->state_store->release(state)) {
         std::terminate();
     }
-    for (const auto& [handle, role] : points) { owner->checkpoints[handle.index].reserved = false; }
+    for (const auto& [handle, role] : points) { owner->checkpoints.cancel(handle); }
 }
 
 bool ProgramImpl::reclaim_capture_reservation(runtime::ContextResourceUsage shortage) {
@@ -26,9 +26,7 @@ bool ProgramImpl::reclaim_capture_reservation(runtime::ContextResourceUsage shor
         if (!ticket) { continue; }
         const bool relevant =
             (shortage.state_slots && state_store->device_resident(ticket->state)) ||
-            (shortage.host_bytes && ticket->host) ||
-            (shortage.main_kv_pages && ticket->main_tail && ticket->main_tail->pages()) ||
-            (shortage.backend_kv_pages && ticket->backend_tail && ticket->backend_tail->pages());
+            (shortage.host_bytes && ticket->host);
         if (relevant) {
             request.capture_reservation.reset();
             return true;
@@ -63,33 +61,7 @@ bool ProgramImpl::reserve_capture_destination(std::uint32_t lane, std::uint32_t 
         if (ticket->host) { destination = state_store->reserve_logical_destination(); }
     }
     if (!destination) { return false; }
-    ticket->state = *destination;
-    const auto shared =
-        std::find_if(ticket->points.begin(), ticket->points.end(), [](const auto& point) {
-            return point.second == runtime::CheckpointRole::SharedPrefix;
-        });
-    if (shared != ticket->points.end()) {
-        const auto main_tail_pages = frontier % kPagedKVPageSize ? 1U : 0U;
-        const auto backend_frontier =
-            speculative_backend == SpeculativeBackend::Mtp ? frontier - 1U : frontier;
-        const auto backend_tail_pages =
-            backend_kv_pages && backend_frontier % kPagedKVPageSize ? 1U : 0U;
-        if (main_tail_pages) {
-            ticket->main_tail = text_kv_pages->physical_pool().reserve(main_tail_pages);
-        }
-        if (backend_tail_pages) {
-            ticket->backend_tail = backend_kv_pages->physical_pool().reserve(backend_tail_pages);
-        }
-        if ((main_tail_pages && !ticket->main_tail) ||
-            (backend_tail_pages && !ticket->backend_tail)) {
-            // The private recovery point has no independent KV snapshot requirement.
-            checkpoints[shared->first.index].reserved = false;
-            ticket->points.erase(shared);
-            ticket->main_tail.reset();
-            ticket->backend_tail.reset();
-            if (ticket->points.empty()) { return false; }
-        }
-    }
+    ticket->state               = *destination;
     request.capture_reservation = std::move(ticket);
     return true;
 }
@@ -130,25 +102,6 @@ std::optional<CapturePreparation> ProgramImpl::prepare_capture(SequenceHandle ha
         if (state_store->device_occupied() == state_store->device_capacity()) {
             result.shortage.state_slots = 1;
             result.host_bytes           = state_images->storage().image_bytes();
-        }
-        const auto& group = request.capture_groups[request.next_capture];
-        const bool private_point =
-            std::any_of(group.roles.begin(), group.roles.end(),
-                        [](auto role) { return role != runtime::CheckpointRole::SharedPrefix; });
-        if (!private_point) {
-            result.shortage.main_kv_pages =
-                frontier % kPagedKVPageSize && !text_kv_pages->physical_pool().available_pages()
-                    ? 1U
-                    : 0U;
-            const auto backend =
-                speculative_backend == SpeculativeBackend::Mtp ? frontier - 1U : frontier;
-            if (backend_kv_pages) {
-                result.shortage.backend_kv_pages =
-                    backend % kPagedKVPageSize &&
-                            !backend_kv_pages->physical_pool().available_pages()
-                        ? 1U
-                        : 0U;
-            }
         }
         return result;
     }
@@ -223,44 +176,6 @@ bool ProgramImpl::start_capture(SequenceHandle handle) {
     context_transaction_.emplace(std::move(tx));
     auto& operation = *context_transaction_;
     try {
-        const bool shared =
-            std::any_of(operation.capture_points.begin(), operation.capture_points.end(),
-                        [](const auto& point) {
-                            return point.second == runtime::CheckpointRole::SharedPrefix;
-                        });
-        if (shared) {
-            auto main = text_kv_addresses->create_inactive();
-            if (!main) {
-                abort_context();
-                return false;
-            }
-            operation.reserved_kv = SequenceKVBundle{.text = *main};
-            if (state.kv->backend) {
-                const auto backend = backend_kv_addresses->create_inactive();
-                if (!backend) {
-                    abort_context();
-                    return false;
-                }
-                operation.reserved_kv->backend = *backend;
-            }
-            operation.binding_history          = std::make_shared<KVHistory>();
-            operation.binding_history->text    = *main;
-            operation.binding_history->backend = operation.reserved_kv->backend;
-            // Reserve the protected range before exporting an external view. Abort restores
-            // the surviving private requirements; the directory and writer remain in place.
-            text_kv_addresses->set_checkpoint_requirement(state.kv->text, frontier);
-            ticket->main_tail.reset();
-            operation.text_view.emplace(
-                text_kv_addresses->prepare_active_prefix_view(state.kv->text, *main, frontier));
-            if (state.kv->backend && operation.backend_frontier) {
-                backend_kv_addresses->set_checkpoint_requirement(*state.kv->backend,
-                                                                 operation.backend_frontier);
-                ticket->backend_tail.reset();
-                operation.backend_view.emplace(backend_kv_addresses->prepare_active_prefix_view(
-                    *state.kv->backend, *operation.reserved_kv->backend,
-                    operation.backend_frontier));
-            }
-        }
         state_store->freeze(state.continuation.image);
         if (host_state) {
             auto transfer = state_store->reserve_device_to_host(state.continuation.image,
@@ -277,20 +192,6 @@ bool ProgramImpl::start_capture(SequenceHandle handle) {
             copy_local_for_context(operation, state_store->physical_slot(state.continuation.image),
                                    state_store->physical_slot(*operation.reserved_state));
         }
-        const auto copy = [&](context::KVAddressSpaceStore& addresses,
-                              context::LogicalKVPageStore& pages, const auto& view,
-                              runtime::ContextResourceClass resource) {
-            if (view && view->needs_tail_copy()) {
-                copy_context_tail(operation, pages, addresses.active_prefix_view_tail_source(*view),
-                                  addresses.active_prefix_view_tail_destination(*view), resource);
-            }
-        };
-        copy(*text_kv_addresses, *text_kv_pages, operation.text_view,
-             runtime::ContextResourceClass::MainKV);
-        if (backend_kv_pages) {
-            copy(*backend_kv_addresses, *backend_kv_pages, operation.backend_view,
-                 runtime::ContextResourceClass::BackendKV);
-        }
         enqueue_context_transfers(operation);
         return true;
     } catch (...) {
@@ -300,31 +201,23 @@ bool ProgramImpl::start_capture(SequenceHandle handle) {
 }
 
 void ProgramImpl::publish_capture(ContextTransaction& tx) {
-    auto& state             = sequences[tx.lane];
-    auto& request           = requests[tx.lane];
-    const auto& group       = request.capture_groups[request.next_capture];
-    const auto source_state = state.continuation.image;
-    if (tx.text_view) {
-        text_kv_addresses->commit_active_prefix_view(std::move(*tx.text_view));
-        if (tx.backend_view) {
-            backend_kv_addresses->commit_active_prefix_view(std::move(*tx.backend_view));
-        }
-        tx.binding_history->owner = this;
-        tx.reserved_kv.reset();
-    }
+    auto& state                          = sequences[tx.lane];
+    auto& request                        = requests[tx.lane];
+    const auto& group                    = request.capture_groups[request.next_capture];
+    const auto source_state              = state.continuation.image;
     Continuation captured                = state.continuation;
     captured.metadata.execution_frontier = tx.reuse_frontier;
     captured.metadata.backend_kv_valid   = tx.backend_frontier;
-    for (const auto& [handle, role] : tx.capture_points) {
-        state_store->retain_checkpoint_reference(source_state);
-        checkpoints[handle.index].value = CheckpointState{
-            .kv   = role == runtime::CheckpointRole::SharedPrefix ? tx.binding_history : state.kv,
-            .role = role,
-            .continuation = captured,
-            .identity     = group.identity,
-            .key          = group.key};
-        checkpoints[handle.index].reserved = false;
-    }
+    std::vector<context::KVPrefixRef> prefixes;
+    prefixes.push_back(
+        text_kv_histories->retain_prefix(state.kv->text.handle(), tx.reuse_frontier));
+    if (state.kv->backend)
+        prefixes.push_back(
+            backend_kv_histories->retain_prefix(state.kv->backend->handle(), tx.backend_frontier));
+    const Snapshot snapshot(*state_store, captured, std::move(prefixes), group.identity);
+    for (const auto& [handle, role] : tx.capture_points)
+        checkpoints.publish(handle,
+                            CheckpointState{.snapshot = snapshot, .role = role, .key = group.key});
     if (state_store->residency(*tx.reserved_state) == context::StateReplicaResidency::None) {
         state_store->split_device_replica_identity(source_state, *tx.reserved_state);
         state_store->complete_initialization(*tx.reserved_state);
@@ -337,7 +230,6 @@ void ProgramImpl::publish_capture(ContextTransaction& tx) {
         state.pending_write      = *tx.reserved_state;
     }
     tx.reserved_state.reset();
-    refresh_history_requirements(state.kv);
     skip_capture(sequence_handle(tx.lane));
 }
 

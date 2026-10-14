@@ -92,17 +92,7 @@ void ProgramImpl::release_sequence_state(SequenceState& sequence) noexcept {
     } catch (...) { std::terminate(); }
 }
 
-void ProgramImpl::release_sequence_kv(SequenceState& sequence) noexcept {
-    if (!sequence.kv) { return; }
-    if (sequence.kv->backend && backend_kv_addresses->active(*sequence.kv->backend)) {
-        backend_kv_addresses->deactivate(*sequence.kv->backend);
-    }
-    if (text_kv_addresses->active(sequence.kv->text)) {
-        text_kv_addresses->deactivate(sequence.kv->text);
-    }
-    refresh_history_requirements(sequence.kv, true);
-    sequence.kv.reset();
-}
+void ProgramImpl::release_sequence_kv(SequenceState& sequence) noexcept { sequence.kv.reset(); }
 
 void ProgramImpl::clear_lane(SequenceState& sequence, RequestControl& request) noexcept {
     // The caller settles real GPU readers before reaching this destruction boundary.
@@ -143,31 +133,37 @@ std::uint32_t ProgramImpl::backend_kv_valid(const SequenceState& state) const no
 
 void ProgramImpl::ensure_sequence_kv_mapped(SequenceState& state, std::uint32_t main,
                                             std::uint32_t backend) {
-    text_kv_addresses->ensure_mapped_to_tokens(state.kv->text, main, device.stream());
+    const auto main_begin = text_kv_histories->committed_frontier(state.kv->text.handle());
+    if (main > main_begin)
+        text_kv_histories->prepare_write(state.kv->text, main_begin, main, device.stream());
     if (state.kv->backend) {
-        backend_kv_addresses->ensure_mapped_to_tokens(*state.kv->backend, backend, device.stream());
+        const auto backend_begin =
+            backend_kv_histories->committed_frontier(state.kv->backend->handle());
+        if (backend > backend_begin)
+            backend_kv_histories->prepare_write(*state.kv->backend, backend_begin, backend,
+                                                device.stream());
     }
 }
 
 void ProgramImpl::commit_sequence_kv(SequenceState& state, std::uint32_t main,
                                      std::uint32_t backend) {
     state.continuation.metadata.backend_kv_valid = backend;
-    text_kv_addresses->commit_frontier(state.kv->text, main);
-    if (state.kv->backend) { backend_kv_addresses->commit_frontier(*state.kv->backend, backend); }
+    text_kv_histories->commit_frontier(state.kv->text.handle(), main);
+    if (state.kv->backend) {
+        backend_kv_histories->commit_frontier(state.kv->backend->handle(), backend);
+    }
 }
 
 void ProgramImpl::trim_sequence_kv(SequenceState& state, std::uint32_t main,
                                    std::uint32_t backend) {
-    text_kv_addresses->destructive_truncate(state.kv->text, main);
-    if (state.kv->backend) {
-        backend_kv_addresses->destructive_truncate(*state.kv->backend, backend);
-    }
+    text_kv_histories->trim(state.kv->text, main, device.stream());
+    if (state.kv->backend) backend_kv_histories->trim(*state.kv->backend, backend, device.stream());
 }
 
 PagedKVCacheView ProgramImpl::mtp_kv_view(const SequenceState& state) const {
     return speculative_backend == SpeculativeBackend::Mtp
                ? decoder->mtp_cache()->execution_view(
-                     backend_kv_addresses->execution_row(*state.kv->backend))
+                     backend_kv_histories->execution_row(state.kv->backend->handle()))
                : PagedKVCacheView{};
 }
 

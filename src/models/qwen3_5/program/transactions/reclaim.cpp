@@ -26,7 +26,7 @@ struct PageDemotion {
     std::uint32_t position          = 0;
     std::uint64_t content_epoch     = 0;
     std::uint32_t committed_columns = 0;
-    bool host_resident              = false;
+    bool host_covers_prefix         = false;
     std::vector<CheckpointHandle> references;
 
     friend bool operator==(const PageDemotion&, const PageDemotion&) = default;
@@ -34,16 +34,18 @@ struct PageDemotion {
 
 bool checkpoint_prefix(const CheckpointState& earlier, const CheckpointState& later) {
     const auto frontier = earlier.frontier();
-    if (frontier > later.frontier() || !earlier.identity || !later.identity ||
-        earlier.key.identity_tag != later.key.identity_tag ||
-        earlier.identity->digests.at(frontier) != later.identity->digests.at(frontier)) {
+    if (frontier > later.frontier() || !earlier.snapshot.identity_owner() ||
+        !later.snapshot.identity_owner() || earlier.key.identity_tag != later.key.identity_tag ||
+        earlier.snapshot.identity_owner()->digests.at(frontier) !=
+            later.snapshot.identity_owner()->digests.at(frontier)) {
         return false;
     }
-    if (earlier.identity == later.identity) { return true; }
-    return std::equal(earlier.identity->ledger.begin(), earlier.identity->ledger.begin() + frontier,
-                      later.identity->ledger.begin()) &&
-           earlier.identity->prefix_identity.prefix_equals(later.identity->prefix_identity,
-                                                           frontier);
+    if (earlier.snapshot.identity_owner() == later.snapshot.identity_owner()) { return true; }
+    return std::equal(earlier.snapshot.identity_owner()->ledger.begin(),
+                      earlier.snapshot.identity_owner()->ledger.begin() + frontier,
+                      later.snapshot.identity_owner()->ledger.begin()) &&
+           earlier.snapshot.identity_owner()->prefix_identity.prefix_equals(
+               later.snapshot.identity_owner()->prefix_identity, frontier);
 }
 
 struct PhysicalPage {
@@ -58,177 +60,68 @@ struct PhysicalOwners {
     std::vector<PhysicalPage> backend;
 };
 
-struct HistoryOwners {
-    const KVHistory* history = nullptr;
-    std::vector<std::uint32_t> checkpoints;
-    long references = 0;
-};
-
-struct PhysicalPageFacts {
-    context::LogicalKVPageHandle handle;
-    std::uint32_t descriptor = 0;
-    std::uint32_t references = 0;
-    bool source_pinned       = false;
-    bool active              = false;
-    bool device              = false;
-    bool host                = false;
-    bool releasable          = false;
-};
-
-struct HistoryPageFacts {
-    struct SharedPage {
-        std::uint32_t position, page;
-    };
-
-    context::KVAddressSpaceHandle address;
-    bool initialized                 = false;
-    bool inactive                    = false;
-    std::uint32_t committed_frontier = 0;
-    std::uint32_t page_count         = 0;
-    std::uint32_t scanned_begin      = 0;
-    std::uint32_t blocked            = std::numeric_limits<std::uint32_t>::max();
-    // Entries describe progressively longer suffixes, scanned from the end of the address.
-    std::vector<std::uint32_t> unique_counts;
-    std::vector<context::LogicalKVPageHandle> unique_device;
-    std::vector<SharedPage> shared;
-};
-
 constexpr auto kNoPhysicalPage = std::numeric_limits<std::uint32_t>::max();
 
 struct PhysicalPoolFacts {
-    const context::KVAddressSpaceStore* addresses = nullptr;
-    const context::LogicalKVPageStore* store      = nullptr;
-    bool account_host                             = false;
-    bool account_device                           = false;
-    std::vector<PhysicalPageFacts> pages;
+    struct History {
+        context::KVHistoryHandle address;
+        std::vector<std::uint32_t> checkpoints;
+    };
+
+    const context::KVHistoryStore* history_store = nullptr;
+    const context::LogicalKVPageStore* store     = nullptr;
+    std::vector<PhysicalPage> pages;
     std::vector<std::uint32_t> descriptors;
-    std::vector<HistoryPageFacts> histories;
+    std::vector<History> histories;
 
     std::uint32_t page(context::LogicalKVPageHandle handle) {
-        if (descriptors.empty()) { descriptors.assign(store->capacity(), kNoPhysicalPage); }
-        const auto descriptor = store->descriptor_index(handle);
-        auto& index           = descriptors[descriptor];
+        if (descriptors.empty()) descriptors.assign(store->capacity(), kNoPhysicalPage);
+        auto& index = descriptors[store->descriptor_index(handle)];
         if (index == kNoPhysicalPage) {
-            index = static_cast<std::uint32_t>(pages.size());
-            pages.push_back({handle, descriptor, store->address_references(handle),
-                             store->source_pins(handle) != 0,
-                             store->active_address_references(handle) != 0,
-                             store->device_resident(handle), store->host_resident(handle),
-                             store->can_release_reference(handle, false)});
+            index = pages.size();
+            pages.push_back({handle});
         }
         return index;
     }
-
-    bool inspect_suffix(std::uint32_t history_index, std::uint32_t frontier) {
-        auto& history = histories[history_index];
-        if (!history.address.valid()) { return true; }
-        if (!history.initialized) {
-            history.initialized = true;
-            history.inactive    = addresses->inactive_suffix_range(history.address, 0).has_value();
-            history.committed_frontier = addresses->committed_frontier(history.address);
-            history.page_count         = addresses->mapped_pages(history.address);
-            history.scanned_begin      = history.page_count;
-            if (account_host || account_device) { history.unique_counts.push_back(0); }
-        }
-        if (!history.inactive || frontier > history.committed_frontier) { return false; }
-        const auto target = context::kv_pages_for_frontier(frontier);
-        if (history.blocked != kNoPhysicalPage && history.blocked >= target) { return false; }
-        if (target < history.scanned_begin && account_device &&
-            history.unique_device.capacity() == 0) {
-            // Published release spans keep their storage and length while later candidates
-            // inspect a longer suffix of this same history.
-            history.unique_device.reserve(history.page_count);
-        }
-        while (history.scanned_begin > target) {
-            const auto position = history.scanned_begin - 1;
-            const auto handle   = addresses->logical_page(history.address, position);
-            if (account_host || account_device) {
-                const auto index  = page(handle);
-                const auto& facts = pages[index];
-                if (!facts.releasable) {
-                    history.blocked = position;
-                    return false;
-                }
-                auto count          = history.unique_counts.back();
-                const bool resident = account_host ? facts.host : facts.device;
-                if (facts.references == 1) {
-                    if (resident) {
-                        ++count;
-                        if (account_device) { history.unique_device.push_back(handle); }
-                    }
-                } else if (facts.source_pinned || resident) {
-                    history.shared.push_back({position, index});
-                }
-                history.unique_counts.push_back(count);
-            } else {
-                // Non-target pools contribute safety, not resource quantities. Only shared
-                // source leases need a cross-history reduction; ordinary pages need no facts.
-                if (!store->can_release_reference(handle, false)) {
-                    history.blocked = position;
-                    return false;
-                }
-                if (store->source_pins(handle)) {
-                    history.shared.push_back({position, page(handle)});
-                }
-            }
-            history.scanned_begin = position;
-        }
-        return true;
-    }
 };
 
-// Borrowed facts never add a history reference or acquire a reader lease. They exist only
-// through one synchronous read-only evaluation; Native mutation invalidates the evaluation.
-// Owner collection reads only its target residency. Release quotes lazily extend per-history
-// suffix facts; empty suffixes and State quotes releasing no State avoid page scans.
+// A read-only inventory of actual prefix holders. It does not retain content or infer
+// ownership from copies of C++ pointers; the stores answer release queries directly.
 struct PhysicalFacts {
     PhysicalFacts(const ProgramImpl& program, runtime::ContextResourceUsage shortage)
-        : checkpoint_history(program.checkpoints.size()),
-          host_kv(program.host_kv_extents && program.host_kv_extents->occupied() != 0) {
-        std::unordered_map<const KVHistory*, std::uint32_t> indices;
-        for (std::uint32_t index = 0; index < program.checkpoints.size(); ++index) {
-            const auto& slot = program.checkpoints[index];
-            if (!slot.value) { continue; }
-            const auto* history = slot.value->kv.get();
-            auto [entry, added] =
-                indices.try_emplace(history, static_cast<std::uint32_t>(histories.size()));
-            if (added) { histories.push_back({history, {}, slot.value->kv.use_count()}); }
-            histories[entry->second].checkpoints.push_back(index);
-            checkpoint_history[index] = entry->second;
-        }
-        const bool host        = shortage.host_bytes != 0;
-        const bool main_device = !host && !shortage.state_slots && shortage.main_kv_pages != 0;
-        const bool backend_device =
-            !host && !shortage.state_slots && !main_device && shortage.backend_kv_pages != 0;
-        prepare_pool(program, true, host && host_kv, main_device);
-        prepare_pool(program, false, host && host_kv, backend_device);
+        : host_kv(program.host_kv_extents && program.host_kv_extents->occupied()) {
+        const auto prepare = [&](PhysicalPoolFacts& pool, bool is_main) {
+            pool.history_store =
+                is_main ? program.text_kv_histories.get() : program.backend_kv_histories.get();
+            pool.store = is_main ? program.text_kv_pages.get() : program.backend_kv_pages.get();
+            if (!pool.history_store) return;
+            for (std::uint32_t index = 0; index < program.checkpoints.size(); ++index) {
+                const auto& slot = program.checkpoints[index];
+                if (!slot.value) continue;
+                const auto* prefix =
+                    is_main ? &slot.value->text_prefix() : slot.value->backend_prefix();
+                if (!prefix) continue;
+                const auto handle = prefix->history();
+                auto found =
+                    std::find_if(pool.histories.begin(), pool.histories.end(),
+                                 [&](const auto& history) { return history.address == handle; });
+                if (found == pool.histories.end()) {
+                    pool.histories.push_back({handle, {index}});
+                } else
+                    found->checkpoints.push_back(index);
+            }
+        };
+        if (shortage.host_bytes || (!shortage.state_slots && shortage.main_kv_pages))
+            prepare(main, true);
+        if (shortage.host_bytes ||
+            (!shortage.state_slots && !shortage.main_kv_pages && shortage.backend_kv_pages))
+            prepare(backend, false);
     }
 
-    std::vector<HistoryOwners> histories;
-    std::vector<std::uint32_t> checkpoint_history;
     bool host_kv;
     PhysicalPoolFacts main, backend;
-
-private:
-    void prepare_pool(const ProgramImpl& program, bool main_pool, bool host, bool device) {
-        auto& pool = main_pool ? main : backend;
-        pool.addresses =
-            main_pool ? program.text_kv_addresses.get() : program.backend_kv_addresses.get();
-        pool.store = main_pool ? program.text_kv_pages.get() : program.backend_kv_pages.get();
-        if (!pool.addresses || !pool.store) { return; }
-        pool.account_host   = host;
-        pool.account_device = device;
-        pool.histories.resize(histories.size());
-        for (std::size_t index = 0; index < histories.size(); ++index) {
-            const auto& history = *histories[index].history;
-            if (!main_pool && !history.backend) { continue; }
-            pool.histories[index].address = main_pool ? history.text : *history.backend;
-        }
-    }
 };
 
-// Group complete holders by descriptor. Holder unions repeat over long shared prefixes, so
-// intern each union once rather than sorting a reference record for every page and history.
 std::vector<PhysicalOwners> physical_owner_sets(const ProgramImpl& program, PhysicalFacts& facts,
                                                 std::span<const CheckpointHandle> allowed,
                                                 std::span<const CheckpointHandle> excluded,
@@ -259,7 +152,7 @@ std::vector<PhysicalOwners> physical_owner_sets(const ProgramImpl& program, Phys
         for (std::uint32_t index = 0; index < program.checkpoints.size(); ++index) {
             const auto& slot = program.checkpoints[index];
             if (!slot.value) { continue; }
-            const auto state = slot.value->continuation.image;
+            const auto state = slot.value->continuation().image;
             if (host ? program.state_store->host_resident(state)
                      : program.state_store->device_resident(state)) {
                 auto& owners  = states[program.state_store->descriptor_index(state)];
@@ -275,7 +168,7 @@ std::vector<PhysicalOwners> physical_owner_sets(const ProgramImpl& program, Phys
     }
     const auto collect_pages = [&](bool main_pool) {
         auto& pool = main_pool ? facts.main : facts.backend;
-        if (!pool.store || !pool.addresses || (host && !facts.host_kv)) { return; }
+        if (!pool.store || !pool.history_store || (host && !facts.host_kv)) { return; }
         struct PageOwners {
             std::uint32_t holders  = kNoPhysicalPage;
             std::uint32_t position = 0, last_owner = 0;
@@ -286,7 +179,7 @@ std::vector<PhysicalOwners> physical_owner_sets(const ProgramImpl& program, Phys
         std::unordered_map<std::uint64_t, std::uint32_t> merged_sets;
         std::vector<std::uint32_t> boundaries;
         for (std::size_t index = 0; index < pool.histories.size(); ++index) {
-            const auto& history = facts.histories[index];
+            const auto& history = pool.histories[index];
             const auto address  = pool.histories[index].address;
             if (!address.valid()) { continue; }
             boundaries.clear();
@@ -312,7 +205,7 @@ std::vector<PhysicalOwners> physical_owner_sets(const ProgramImpl& program, Phys
                 const auto holder_index = static_cast<std::uint32_t>(holder_sets.size());
                 holder_sets.push_back(std::move(holders));
                 for (auto position = begin; position < end; ++position) {
-                    const auto handle = pool.addresses->logical_page(address, position);
+                    const auto handle = pool.history_store->logical_page(address, position);
                     if (!(host ? pool.store->host_resident(handle)
                                : pool.store->device_resident(handle))) {
                         continue;
@@ -366,7 +259,7 @@ std::vector<PhysicalOwners> physical_owner_sets(const ProgramImpl& program, Phys
     for (auto& [indices, owners] : unique) {
         owners.sources.reserve(indices.size());
         for (const auto index : indices) {
-            owners.sources.push_back({&program, index, program.checkpoints[index].generation});
+            owners.sources.push_back(program.checkpoints.handle(index));
         }
         const auto deeper_first = [](const auto& left, const auto& right) {
             return left.position > right.position;
@@ -379,185 +272,82 @@ std::vector<PhysicalOwners> physical_owner_sets(const ProgramImpl& program, Phys
 }
 
 struct ReleasedPages {
-    // These spans borrow stable prefixes of the evaluation's unique-page arrays. Only shared
-    // pages need candidate-specific storage after their joint address-reference check.
-    std::vector<std::span<const context::LogicalKVPageHandle>> unique;
-    std::vector<context::LogicalKVPageHandle> shared;
+    std::vector<context::LogicalKVPageHandle> pages;
 
-    bool empty() const noexcept { return unique.empty() && shared.empty(); }
+    bool empty() const noexcept { return pages.empty(); }
 
     template <typename Predicate>
     bool all(Predicate&& predicate) const {
-        for (const auto range : unique) {
-            if (!std::all_of(range.begin(), range.end(), predicate)) { return false; }
-        }
-        return std::all_of(shared.begin(), shared.end(), predicate);
+        return std::all_of(pages.begin(), pages.end(), predicate);
     }
 };
 
 struct ReleaseScratch {
-    struct StateReferences {
+    std::vector<const context::KVPrefixRef*> main, backend;
+    std::vector<CheckpointHandle> records;
+
+    struct Image {
         StateImageHandle handle;
         std::uint32_t count = 0;
     };
 
-    struct HistoryRelease {
-        std::uint32_t index, main, backend;
-    };
-
-    struct PageReferences {
-        std::vector<std::uint32_t> counts, touched;
-
-        void reset(std::size_t size) {
-            for (const auto page : touched) { counts[page] = 0; }
-            touched.clear();
-            counts.resize(size);
-        }
-
-        void add(std::uint32_t page) {
-            if (counts[page]++ == 0) { touched.push_back(page); }
-        }
-    };
-
-    std::vector<std::uint32_t> removed, histories;
-    std::vector<StateReferences> states;
-    std::vector<HistoryRelease> suffixes;
-    PageReferences main, backend;
+    std::vector<Image> images;
 };
 
 std::optional<runtime::ContextResourceUsage>
-released_resources(const ProgramImpl& program, PhysicalFacts& facts,
-                   std::span<const CheckpointHandle> handles,
+released_resources(const ProgramImpl& program, std::span<const CheckpointHandle> handles,
                    runtime::ContextResourceUsage shortage, ReleaseScratch& scratch,
                    ReleasedPages& released_pages) {
-    const bool host    = shortage.host_bytes != 0;
-    const bool state   = !host && shortage.state_slots != 0;
-    const bool main    = !host && !state && shortage.main_kv_pages != 0;
-    const bool backend = !host && !state && !main && shortage.backend_kv_pages != 0;
-    auto& removed      = scratch.removed;
-    auto& histories    = scratch.histories;
-    auto& states       = scratch.states;
-    auto& suffixes     = scratch.suffixes;
-    removed.clear();
-    histories.clear();
-    states.clear();
-    suffixes.clear();
-    for (const auto handle : handles) {
-        if (!program.valid_checkpoint(handle) || program.checkpoints[handle.index].pins) {
-            return std::nullopt;
-        }
-        if (std::find(removed.begin(), removed.end(), handle.index) != removed.end()) { continue; }
-        removed.push_back(handle.index);
+    scratch.main.clear();
+    scratch.backend.clear();
+    scratch.records.clear();
+    scratch.images.clear();
+    for (auto handle : handles) {
+        if (!program.can_release_checkpoint(handle)) return std::nullopt;
+        if (std::find(scratch.records.begin(), scratch.records.end(), handle) !=
+            scratch.records.end())
+            continue;
+        scratch.records.push_back(handle);
         const auto& record = program.checkpoint(handle);
-        if (!program.state_store->can_release_checkpoint_owner(record.continuation.image)) {
-            return std::nullopt;
-        }
-        if (state || host) {
-            const auto found = std::find_if(states.begin(), states.end(), [&](const auto& entry) {
-                return entry.handle == record.continuation.image;
-            });
-            if (found == states.end()) {
-                states.push_back({record.continuation.image, 1});
-            } else {
-                ++found->count;
-            }
-        }
-        histories.push_back(facts.checkpoint_history[handle.index]);
+        const auto image   = record.continuation().image;
+        auto found         = std::find_if(scratch.images.begin(), scratch.images.end(),
+                                          [&](const auto& entry) { return entry.handle == image; });
+        if (found == scratch.images.end())
+            scratch.images.push_back({image, 1});
+        else
+            ++found->count;
+        scratch.main.push_back(&record.text_prefix());
+        if (const auto* prefix = record.backend_prefix()) scratch.backend.push_back(prefix);
     }
-    std::sort(removed.begin(), removed.end());
-    std::sort(histories.begin(), histories.end());
-    histories.erase(std::unique(histories.begin(), histories.end()), histories.end());
     runtime::ContextResourceUsage result;
-    for (const auto& reference : states) {
-        if (reference.count == program.state_store->checkpoint_references(reference.handle) &&
-            program.state_store->can_release_after_checkpoint_references(reference.handle,
-                                                                         reference.count)) {
-            if (state && program.state_store->device_resident(reference.handle)) {
-                ++result.state_slots;
-            }
-            if (host && program.state_store->host_resident(reference.handle)) {
-                result.host_bytes += program.state_images->storage().image_bytes();
-            }
-        }
+    for (const auto& image : scratch.images) {
+        if (image.count != program.state_store->checkpoint_references(image.handle) ||
+            !program.state_store->can_release_after_checkpoint_references(image.handle,
+                                                                          image.count))
+            continue;
+        if (shortage.host_bytes && program.state_store->host_resident(image.handle))
+            result.host_bytes += program.state_images->storage().image_bytes();
+        if (shortage.state_slots && program.state_store->device_resident(image.handle))
+            ++result.state_slots;
     }
-    if (state && !result.state_slots) { return std::nullopt; }
-    if (host && !result.host_bytes && !facts.host_kv) { return std::nullopt; }
-    for (const auto index : histories) {
-        const auto& history = facts.histories[index];
-        if (history.references != static_cast<long>(history.checkpoints.size())) { continue; }
-        std::uint32_t retained_main = 0, retained_backend = 0;
-        for (const auto owner : history.checkpoints) {
-            if (std::binary_search(removed.begin(), removed.end(), owner)) { continue; }
-            const auto& record = *program.checkpoints[owner].value;
-            retained_main      = std::max(retained_main, record.frontier());
-            retained_backend   = std::max(retained_backend, record.backend_frontier());
-        }
-        suffixes.push_back({index, retained_main, retained_backend});
-    }
-    const auto scan = [&](bool main_pool, bool account) {
-        auto& pool = main_pool ? facts.main : facts.backend;
-        if (pool.histories.empty()) { return true; }
-        // Build the needed suffixes before sizing the descriptor counters. A later quote may
-        // discover additional physical pages, but no vector grows during this reduction.
-        for (const auto& suffix : suffixes) {
-            if (!pool.inspect_suffix(suffix.index, main_pool ? suffix.main : suffix.backend)) {
-                return false;
+    const auto count = [&](const context::KVHistoryStore& histories,
+                           const context::LogicalKVPageStore& pages, const auto& removed, bool main,
+                           std::size_t stride) {
+        const bool device = main ? shortage.main_kv_pages != 0 : shortage.backend_kv_pages != 0;
+        if (!shortage.host_bytes && !device) return;
+        for (auto page : histories.released_pages(removed)) {
+            if (shortage.host_bytes && pages.host_resident(page)) result.host_bytes += stride;
+            if (device && pages.device_resident(page)) {
+                ++(main ? result.main_kv_pages : result.backend_kv_pages);
+                released_pages.pages.push_back(page);
             }
         }
-        auto& references = main_pool ? scratch.main : scratch.backend;
-        references.reset(pool.pages.size());
-        const auto host_stride =
-            main_pool ? program.text_host_kv_page_stride : program.backend_host_kv_page_stride;
-        for (const auto& suffix : suffixes) {
-            const auto& history = pool.histories[suffix.index];
-            if (!history.address.valid()) { continue; }
-            const auto target =
-                context::kv_pages_for_frontier(main_pool ? suffix.main : suffix.backend);
-            if (account && (pool.account_host || pool.account_device)) {
-                const auto count = history.unique_counts[history.page_count - target];
-                if (host) {
-                    result.host_bytes += count * host_stride;
-                } else {
-                    (main_pool ? result.main_kv_pages : result.backend_kv_pages) += count;
-                    if (count) {
-                        released_pages.unique.push_back(
-                            std::span(history.unique_device).first(count));
-                    }
-                }
-            }
-            for (const auto& page : history.shared) {
-                if (page.position < target) { break; }
-                references.add(page.page);
-            }
-        }
-        std::sort(references.touched.begin(), references.touched.end(), [&](auto a, auto b) {
-            return pool.pages[a].descriptor < pool.pages[b].descriptor;
-        });
-        for (const auto page_index : references.touched) {
-            const auto& page = pool.pages[page_index];
-            if (references.counts[page_index] != page.references) { continue; }
-            if (page.source_pinned || page.active) { return false; }
-            if (!account) { continue; }
-            if (host) {
-                if (page.host) { result.host_bytes += host_stride; }
-            } else if (page.device) {
-                ++(main_pool ? result.main_kv_pages : result.backend_kv_pages);
-                released_pages.shared.push_back(page.handle);
-            }
-        }
-        return true;
     };
-    if (main) {
-        if (!scan(true, true) || !result.main_kv_pages || !scan(false, false)) {
-            return std::nullopt;
-        }
-    } else if (backend) {
-        if (!scan(false, true) || !result.backend_kv_pages || !scan(true, false)) {
-            return std::nullopt;
-        }
-    } else if (!scan(true, host) || !scan(false, host)) {
-        return std::nullopt;
-    }
+    count(*program.text_kv_histories, *program.text_kv_pages, scratch.main, true,
+          program.text_host_kv_page_stride);
+    if (program.backend_kv_histories)
+        count(*program.backend_kv_histories, *program.backend_kv_pages, scratch.backend, false,
+              program.backend_host_kv_page_stride);
     return result;
 }
 
@@ -599,12 +389,13 @@ struct ReclaimPlan {
     bool prefix(CheckpointHandle earlier, CheckpointHandle later) const {
         const auto& a = owner->checkpoint(earlier);
         const auto& b = owner->checkpoint(later);
-        if (a.frontier() > b.frontier() || !a.identity || !b.identity ||
-            a.key.identity_tag != b.key.identity_tag ||
-            a.identity->digests.at(a.frontier()) != b.identity->digests.at(a.frontier())) {
+        if (a.frontier() > b.frontier() || !a.snapshot.identity_owner() ||
+            !b.snapshot.identity_owner() || a.key.identity_tag != b.key.identity_tag ||
+            a.snapshot.identity_owner()->digests.at(a.frontier()) !=
+                b.snapshot.identity_owner()->digests.at(a.frontier())) {
             return false;
         }
-        if (a.identity == b.identity) { return true; }
+        if (a.snapshot.identity_owner() == b.snapshot.identity_owner()) { return true; }
         const auto key   = (static_cast<std::uint64_t>(earlier.index) << 32U) | later.index;
         const auto found = prefixes.find(key);
         if (found != prefixes.end()) { return found->second; }
@@ -725,12 +516,11 @@ std::optional<ContextDemotion> quote_demotion(const ProgramImpl& program,
                                 : program.backend_host_kv_page_stride;
         for (const auto& object : objects) {
             const auto page = object.handle;
-            if (pages.active_address_references(page) || pages.source_pins(page) ||
-                !pages.can_pin_source(page) ||
-                (pages.host_resident(page) && !pages.host_replica_current(page))) {
+            if (pages.active_history_references(page) || pages.source_pins(page) ||
+                !pages.can_pin_source(page)) {
                 continue;
             }
-            const auto host = pages.host_resident(page);
+            const auto host = pages.host_replica_current(page);
             plan->pages.push_back({page, object.position, pages.content_epoch(page),
                                    pages.committed_columns(page), host, owners.sources});
             if (!host) { candidate.host_bytes += stride; }
@@ -749,9 +539,9 @@ std::optional<ContextDemotion> quote_demotion(const ProgramImpl& program,
 std::optional<ContextRelease> quote_release(const std::shared_ptr<ReclaimPlan>& evaluation,
                                             std::span<const CheckpointHandle> sources,
                                             ReleaseScratch& scratch) {
-    auto plan           = std::make_shared<ReleasePlan>();
-    const auto released = released_resources(*evaluation->owner, evaluation->facts, sources,
-                                             evaluation->shortage, scratch, plan->pages);
+    auto plan = std::make_shared<ReleasePlan>();
+    const auto released =
+        released_resources(*evaluation->owner, sources, evaluation->shortage, scratch, plan->pages);
     if (!released) { return std::nullopt; }
     const auto shortage = evaluation->shortage;
     const auto useful   = shortage.host_bytes         ? released->host_bytes
@@ -769,29 +559,9 @@ std::optional<ContextRelease> quote_release(const std::shared_ptr<ReclaimPlan>& 
 std::optional<runtime::ContextResourceUsage>
 ProgramImpl::checkpoint_release_resources(std::span<const CheckpointHandle> handles,
                                           runtime::ContextResourceUsage shortage) const {
-    runtime::ContextResourceUsage result;
-    if (handles.empty()) { return result; }
-    for (const auto handle : handles) {
-        if (!can_release_checkpoint(handle)) { return std::nullopt; }
-    }
-    // Reuse the reclamation inventory: suffixes and shared pages are credited only when
-    // this complete retirement set really releases their last physical owner.
-    const std::array shortages{
-        runtime::ContextResourceUsage{.state_slots = shortage.state_slots},
-        runtime::ContextResourceUsage{.main_kv_pages = shortage.main_kv_pages},
-        runtime::ContextResourceUsage{.backend_kv_pages = shortage.backend_kv_pages}};
-    for (const auto pool : shortages) {
-        if (!pool.state_slots && !pool.main_kv_pages && !pool.backend_kv_pages) { continue; }
-        PhysicalFacts facts(*this, pool);
-        ReleaseScratch scratch;
-        ReleasedPages pages;
-        if (const auto released = released_resources(*this, facts, handles, pool, scratch, pages)) {
-            result.state_slots += released->state_slots;
-            result.main_kv_pages += released->main_kv_pages;
-            result.backend_kv_pages += released->backend_kv_pages;
-        }
-    }
-    return result;
+    ReleaseScratch scratch;
+    ReleasedPages pages;
+    return released_resources(*this, handles, shortage, scratch, pages);
 }
 
 ContextReclaimPlan ProgramImpl::plan_reclaim(std::span<const CheckpointHandle> allowed,
@@ -889,12 +659,11 @@ struct DemotionBatch {
         for (std::uint32_t i = 0; i < component.pages.size(); ++i) {
             const auto& page = component.pages[i];
             if (!pages.valid(page.handle) || !pages.device_resident(page.handle) ||
-                pages.active_address_references(page.handle) || pages.source_pins(page.handle) ||
+                pages.active_history_references(page.handle) || pages.source_pins(page.handle) ||
                 !pages.can_pin_source(page.handle) ||
                 pages.content_epoch(page.handle) != page.content_epoch ||
                 pages.committed_columns(page.handle) != page.committed_columns ||
-                pages.host_resident(page.handle) != page.host_resident ||
-                (page.host_resident && !pages.host_replica_current(page.handle))) {
+                pages.host_replica_current(page.handle) != page.host_covers_prefix) {
                 valid = false;
                 return false;
             }
@@ -966,7 +735,7 @@ struct DemotionBatch {
         plan->excluded       = components.front()->excluded;
         ContextDemotion result;
         for (const auto* page : ordered) {
-            const auto bytes = page->host_resident ? 0 : stride;
+            const auto bytes = page->host_covers_prefix ? 0 : stride;
             if (plan->pages.size() == needed || bytes > available - result.host_bytes) { break; }
             plan->pages.push_back(*page);
             result.host_bytes += bytes;
@@ -1011,9 +780,9 @@ bool ProgramImpl::start_demote(const ContextDemotion& quote) {
         std::size_t matched  = 0;
         for (std::uint32_t index = 0; index < checkpoints.size(); ++index) {
             const auto& slot = checkpoints[index];
-            if (!slot.value || slot.value->continuation.image != expected.handle) { continue; }
+            if (!slot.value || slot.value->continuation().image != expected.handle) { continue; }
             if (matched == expected.references.size() ||
-                expected.references[matched++] != CheckpointHandle{this, index, slot.generation}) {
+                expected.references[matched++] != checkpoints.handle(index)) {
                 return false;
             }
         }
@@ -1031,8 +800,8 @@ bool ProgramImpl::start_demote(const ContextDemotion& quote) {
     } else {
         const bool main       = plan.resource == runtime::ContextResourceClass::MainKV;
         const auto* pages     = main ? text_kv_pages.get() : backend_kv_pages.get();
-        const auto* addresses = main ? text_kv_addresses.get() : backend_kv_addresses.get();
-        if (!pages || !addresses || plan.pages.empty()) { return false; }
+        const auto* histories = main ? text_kv_histories.get() : backend_kv_histories.get();
+        if (!pages || !histories || plan.pages.empty()) { return false; }
         runtime::ContextResourceUsage released;
         (main ? released.main_kv_pages : released.backend_kv_pages) =
             static_cast<std::uint32_t>(plan.pages.size());
@@ -1040,7 +809,7 @@ bool ProgramImpl::start_demote(const ContextDemotion& quote) {
 
         struct Holder {
             CheckpointHandle checkpoint;
-            context::KVAddressSpaceHandle address;
+            context::KVHistoryHandle address;
             std::uint32_t pages;
         };
 
@@ -1048,10 +817,10 @@ bool ProgramImpl::start_demote(const ContextDemotion& quote) {
         holders.reserve(checkpoints.size());
         for (std::uint32_t index = 0; index < checkpoints.size(); ++index) {
             const auto& slot = checkpoints[index];
-            if (!slot.value || (!main && !slot.value->kv->backend)) { continue; }
+            if (!slot.value || (!main && !slot.value->history().backend)) { continue; }
             const auto& record = *slot.value;
-            holders.push_back({{this, index, slot.generation},
-                               main ? record.kv->text : *record.kv->backend,
+            holders.push_back({checkpoints.handle(index),
+                               main ? record.history().text : *record.history().backend,
                                context::kv_pages_for_frontier(main ? record.frontier()
                                                                    : record.backend_frontier())});
         }
@@ -1061,18 +830,17 @@ bool ProgramImpl::start_demote(const ContextDemotion& quote) {
         descriptors.reserve(plan.pages.size());
         for (const auto& page : plan.pages) {
             if (!pages->valid(page.handle) || !pages->device_resident(page.handle) ||
-                pages->active_address_references(page.handle) || pages->source_pins(page.handle) ||
+                pages->active_history_references(page.handle) || pages->source_pins(page.handle) ||
                 !pages->can_pin_source(page.handle) ||
                 pages->content_epoch(page.handle) != page.content_epoch ||
                 pages->committed_columns(page.handle) != page.committed_columns ||
-                pages->host_resident(page.handle) != page.host_resident ||
-                (page.host_resident && !pages->host_replica_current(page.handle))) {
+                pages->host_replica_current(page.handle) != page.host_covers_prefix) {
                 return false;
             }
             std::size_t matched = 0;
             for (const auto& holder : holders) {
                 if (holder.pages <= page.position ||
-                    addresses->logical_page(holder.address, page.position) != page.handle) {
+                    histories->logical_page(holder.address, page.position) != page.handle) {
                     continue;
                 }
                 if (matched == page.references.size() ||
@@ -1082,7 +850,7 @@ bool ProgramImpl::start_demote(const ContextDemotion& quote) {
             }
             if (matched != page.references.size()) { return false; }
             descriptors.push_back(pages->descriptor_index(page.handle));
-            if (!page.host_resident) { host_bytes += stride; }
+            if (!page.host_covers_prefix) { host_bytes += stride; }
         }
         std::sort(descriptors.begin(), descriptors.end());
         if (std::adjacent_find(descriptors.begin(), descriptors.end()) != descriptors.end() ||
@@ -1109,7 +877,7 @@ bool ProgramImpl::start_demote(const ContextDemotion& quote) {
         const auto append_group = [&](std::size_t end) {
             for (auto index = end; index != begin; --index) {
                 const auto& page = plan.pages[index - 1];
-                if (!page.host_resident) { missing.push_back(page.handle); }
+                if (!page.host_covers_prefix) { missing.push_back(page.handle); }
             }
             begin = end;
         };
@@ -1148,13 +916,15 @@ bool ProgramImpl::start_demote(const ContextDemotion& quote) {
         // Complete Host replicas already preserve these contents. Once the entire batch is
         // reserved, release their Device copies synchronously, as for a single demotion.
         for (const auto& page : plan.pages) {
-            if (page.host_resident && !pages.drop_device_replica(page.handle)) {
+            if (page.host_covers_prefix && !pages.drop_device_replica(page.handle)) {
                 throw std::logic_error("quoted redundant Device page changed during demotion");
             }
         }
         if (transaction.kv_transfers.empty()) { return true; }
     }
 
+    for (const auto handle : plan.allowed)
+        transaction.carried_pins.push_back(checkpoints.lease(handle));
     context_transaction_.emplace(std::move(transaction));
     try {
         context_source_ready_.record(device.stream());

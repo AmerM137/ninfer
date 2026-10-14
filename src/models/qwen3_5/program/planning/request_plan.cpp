@@ -296,14 +296,17 @@ runtime::ResourceReservation ProgramImpl::reserve_units(std::span<const Executio
             }
             continue;
         }
-        const auto main = text_kv_addresses->growth_pages_for_tokens(state.kv->text,
-                                                                     coverage[lane].main_frontier);
-        old_main[lane]  = text_kv_addresses->reserved_growth_pages(state.kv->text);
+        const auto main = text_kv_histories->write_pages(state.kv->text.handle(),
+                                                         state.continuation.metadata.text_kv_valid,
+                                                         coverage[lane].main_frontier);
+        old_main[lane]  = text_kv_histories->reserved_growth_pages(state.kv->text.handle());
         main_needed += main > old_main[lane] ? main - old_main[lane] : 0;
         if (state.kv->backend) {
-            const auto backend = backend_kv_addresses->growth_pages_for_tokens(
-                *state.kv->backend, coverage[lane].backend_frontier);
-            old_backend[lane] = backend_kv_addresses->reserved_growth_pages(*state.kv->backend);
+            const auto backend = backend_kv_histories->write_pages(state.kv->backend->handle(),
+                                                                   backend_kv_valid(state),
+                                                                   coverage[lane].backend_frontier);
+            old_backend[lane] =
+                backend_kv_histories->reserved_growth_pages(state.kv->backend->handle());
             backend_needed += backend > old_backend[lane] ? backend - old_backend[lane] : 0;
         }
     }
@@ -326,13 +329,17 @@ runtime::ResourceReservation ProgramImpl::reserve_units(std::span<const Executio
             if (requests[lane].permit) { continue; }
             auto& state = active_sequence(lane);
             added[lane] = true;
-            text_kv_addresses->reserve_growth(state.kv->text,
-                                              text_kv_addresses->growth_pages_for_tokens(
-                                                  state.kv->text, coverage[lane].main_frontier));
+            text_kv_histories->reserve_growth(
+                state.kv->text.handle(),
+                text_kv_histories->write_pages(state.kv->text.handle(),
+                                               state.continuation.metadata.text_kv_valid,
+                                               coverage[lane].main_frontier));
             if (state.kv->backend) {
-                backend_kv_addresses->reserve_growth(
-                    *state.kv->backend, backend_kv_addresses->growth_pages_for_tokens(
-                                            *state.kv->backend, coverage[lane].backend_frontier));
+                backend_kv_histories->reserve_growth(
+                    state.kv->backend->handle(),
+                    backend_kv_histories->write_pages(state.kv->backend->handle(),
+                                                      backend_kv_valid(state),
+                                                      coverage[lane].backend_frontier));
             }
             requests[lane].permit = demands[lane];
         }
@@ -340,9 +347,10 @@ runtime::ResourceReservation ProgramImpl::reserve_units(std::span<const Executio
         for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
             if (!added[lane]) { continue; }
             auto& state = active_sequence(lane);
-            text_kv_addresses->reserve_growth(state.kv->text, old_main[lane]);
+            text_kv_histories->reserve_growth(state.kv->text.handle(), old_main[lane]);
             if (state.kv->backend) {
-                backend_kv_addresses->reserve_growth(*state.kv->backend, old_backend[lane]);
+                backend_kv_histories->reserve_growth(state.kv->backend->handle(),
+                                                     old_backend[lane]);
             }
             requests[lane].permit.reset();
         }
@@ -379,13 +387,14 @@ void ProgramImpl::settle_unit(std::uint32_t lane) noexcept {
     }
     if (state.kv) {
         try {
-            text_kv_addresses->settle_growth(
+            text_kv_histories->settle_growth(
                 state.kv->text, state.continuation.metadata.text_kv_valid,
-                request.recovery ? request.recovery->coverage.main_frontier : 0);
+                request.recovery ? request.recovery->coverage.main_frontier : 0, device.stream());
             if (state.kv->backend) {
-                backend_kv_addresses->settle_growth(
+                backend_kv_histories->settle_growth(
                     *state.kv->backend, backend_kv_valid(state),
-                    request.recovery ? request.recovery->coverage.backend_frontier : 0);
+                    request.recovery ? request.recovery->coverage.backend_frontier : 0,
+                    device.stream());
             }
         } catch (...) { std::terminate(); }
     }

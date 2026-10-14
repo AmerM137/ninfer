@@ -219,6 +219,21 @@ public:
                 "history-disabled request did not release its execution resources");
     }
 
+    void consecutive_decode_terminal() {
+        auto base           = request(64);
+        const auto sequence = bind(base);
+        finish_prefill(sequence, 64, false);
+        reserve(sequence, q35::ExecutionUnitKind::Decode, 8);
+        const std::array<q35::SequenceHandle, 1> members{sequence};
+        const std::array<runtime::RoundBudget, 1> budget{{{.generated_tokens_remaining = 8}}};
+        auto pending = program_.decode(members, budget);
+        const std::array<runtime::CommitDecision, 1> accepted{
+            {{.accepted_tokens = static_cast<std::uint32_t>(pending.row_counts().front())}}};
+        (void)program_.commit(std::move(pending), accepted);
+        decode_and_finish(sequence);
+        expect_empty("consecutive decode and terminal append leaked context");
+    }
+
     q35::CheckpointHandle checkpoint(const q35::RequestBasePlan& base) {
         const auto sequence = bind(base);
         finish_prefill(sequence, base.summary().prompt_tokens, true);
@@ -443,8 +458,17 @@ public:
             synchronize();
             auto copying = program_.poll_context({});
             if (!copying.complete) {
-                require(copying.advanced && !copying.sequence && program_.context_blocks(original),
-                        "pending active prefix export did not block its source writer");
+                const bool copies_kv = std::any_of(
+                    candidate->transfers.begin(), candidate->transfers.end(),
+                    [](const auto& transfer) {
+                        return transfer.resource != runtime::ContextResourceClass::State &&
+                               transfer.direction ==
+                                   runtime::ContextTransferDirection::DeviceToDevice;
+                    });
+                require(
+                    copying.advanced && !copying.sequence &&
+                        program_.context_blocks(original) == copies_kv,
+                    "binding blocked a writer inconsistently with its actual KV copy dependency");
             }
             const auto bound = copying.complete ? std::move(copying) : settle();
             require(bound.sequence && !program_.context_blocks(original) &&
@@ -760,8 +784,15 @@ public:
     }
 
     void cancel_gpu_binding() {
-        auto base = request(65, true); // A partial page makes the second binding perform real COW.
-        const auto source   = checkpoint(base);
+        auto base         = request(65, true);
+        const auto source = checkpoint(base);
+        // An independent active writer makes the next binding require a real private tail.
+        auto writer_candidate = program_.inspect_source(base, source);
+        require(writer_candidate && program_.start_binding(base, {1}, *writer_candidate),
+                "COW cancellation fixture could not bind its first writer");
+        const auto writer = settle();
+        require(writer.published && writer.sequence,
+                "COW fixture did not publish its first writer");
         const auto baseline = program_.physical_usage();
         for (const bool submit_copy : {false, true}) {
             auto candidate = program_.inspect_source(base, source);
@@ -793,6 +824,8 @@ public:
             require(program_.checkpoint_summary(source).frontier == 65,
                     "binding cancellation destroyed its source checkpoint");
         }
+        require(program_.abort(*writer.sequence).status == runtime::ConsumeStatus::Consumed,
+                "COW cancellation fixture retained its first writer");
         require(program_.release_checkpoint(source), "cancelled binding left its source pinned");
         expect_empty("binding cancellation leaked typed resources");
         next_request();
@@ -1113,9 +1146,14 @@ public:
     }
 
     void fork_exceeds_physical_capacity() {
-        auto prefix       = request(kCapacity - 1, true);
-        const auto point  = checkpoint(prefix);
-        auto full         = request(kCapacity, true);
+        auto prefix      = request(kCapacity - 1, true);
+        const auto point = checkpoint(prefix);
+        auto full        = request(kCapacity, true);
+        const auto first = program_.inspect_source(full, point);
+        require(first && program_.start_binding(full, {1}, *first),
+                "fork capacity fixture could not claim its first tail writer");
+        const auto writer = settle();
+        require(writer.sequence.has_value(), "fork capacity fixture lost its tail writer");
         const auto source = program_.inspect_source(full, point);
         require(source && !source->move_history, "fork capacity fixture consumed its source");
         const auto before  = program_.physical_usage();
@@ -1124,6 +1162,8 @@ public:
                     blocked.shortage.main_kv_pages == 1 && program_.valid_checkpoint(point),
                 "a full-pool fork waited for capacity that its extra tail can never obtain");
         expect_usage(before, "impossible fork changed its immutable source");
+        require(program_.abort(*writer.sequence).status == runtime::ConsumeStatus::Consumed,
+                "fork capacity fixture leaked its tail writer");
         require(program_.release_checkpoint(point), "fork capacity fixture leaked its source");
         const auto cold = bind(full);
         finish_prefill(cold, kCapacity, true);
@@ -1294,6 +1334,15 @@ public:
             const auto* tail     = demotion_with_sources(tail_plan.demotions, source_set);
             require(full && tail, "holder-change fixture has no original demotion quote");
 
+            std::optional<q35::SequenceHandle> writer;
+            if (source_tokens % 64) {
+                const auto first = program_.inspect_source(seed, source);
+                require(first && program_.start_binding(seed, {1}, *first),
+                        "holder-change fixture could not reserve its first tail writer");
+                const auto active = settle();
+                require(active.published && active.sequence, "tail writer was not published");
+                writer = active.sequence;
+            }
             auto extension       = request(source_tokens + 64, true);
             const auto candidate = program_.inspect_source(extension, source);
             require(candidate &&
@@ -1305,7 +1354,10 @@ public:
             const auto finished = program_.finish(*bound.sequence);
             require(finished.checkpoint.has_value(), "holder-change descendant was not retained");
             const auto descendant = *finished.checkpoint;
-            const auto before     = program_.physical_usage();
+            if (writer)
+                require(program_.abort(*writer).status == runtime::ConsumeStatus::Consumed,
+                        "holder-change fixture retained its tail writer");
+            const auto before = program_.physical_usage();
             require(!program_.start_demote(*full) && !program_.has_context_transaction(),
                     "an old quote ignored a newly retained holder of its shared full page");
             expect_usage(before, "stale-holder rejection changed resources before validation");
@@ -1787,24 +1839,14 @@ void shared_capture_alignment(DeviceContext& device, const q35::execution::Param
                                     "aligned capture published an unexpected role");
                         }
                     }
-                    const bool main_copy = frontier % 64 != 0;
-                    const auto backend_frontier =
-                        frontier -
-                        (options.speculative.backend == SpeculativeBackend::Mtp ? 1U : 0U);
-                    const bool backend_copy =
-                        (options.speculative.backend == SpeculativeBackend::Mtp ||
-                         options.speculative.backend == SpeculativeBackend::DFlash) &&
-                        backend_frontier % 64 != 0;
-                    require(
-                        shared &&
-                            captured.operations.partial_tail_cow_pages ==
-                                static_cast<unsigned>(main_copy) +
-                                    static_cast<unsigned>(backend_copy) &&
-                            transferred(captured, runtime::ContextTransferDirection::DeviceToDevice,
-                                        runtime::ContextResourceClass::MainKV) == main_copy &&
-                            transferred(captured, runtime::ContextTransferDirection::DeviceToDevice,
-                                        runtime::ContextResourceClass::BackendKV) == backend_copy,
-                        "capture did not independently copy the required Main/backend tails");
+                    require(shared && captured.operations.partial_tail_cow_pages == 0 &&
+                                !transferred(captured,
+                                             runtime::ContextTransferDirection::DeviceToDevice,
+                                             runtime::ContextResourceClass::MainKV) &&
+                                !transferred(captured,
+                                             runtime::ContextTransferDirection::DeviceToDevice,
+                                             runtime::ContextResourceClass::BackendKV),
+                            "read-only capture copied Main or backend tails");
                     require(
                         program.checkpoint_footprint(captured.captured_checkpoints).state_slots ==
                             1,
@@ -2022,6 +2064,7 @@ int main(int argc, char** argv) {
             fixture.capture_opportunities();
             fixture.input_replay_lifecycle();
             fixture.active_input_zero_growth_binding();
+            fixture.consecutive_decode_terminal();
             fixture.replay_carries_independent_input();
             fixture.retained_input_host_suffix();
             fixture.retired_host_image_preserves_input();

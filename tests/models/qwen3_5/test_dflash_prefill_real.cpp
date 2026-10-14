@@ -27,17 +27,6 @@ void require(bool condition, const char* message) {
     if (!condition) { throw std::runtime_error(message); }
 }
 
-// These addresses belong to the fixture, rather than to an admitted Program continuation.
-// Release their page and table leases before Program destroys its backing cache pools.
-struct AddressOwner {
-    ninfer::models::context::KVAddressSpaceStore* store = nullptr;
-    ninfer::models::context::KVAddressSpaceHandle handle;
-
-    ~AddressOwner() {
-        if (store && !store->release_after_deactivate(handle)) { std::terminate(); }
-    }
-};
-
 void append_bytes(std::vector<std::byte>& bytes, const Tensor& tensor) {
     const auto offset = bytes.size();
     bytes.resize(offset + tensor.bytes());
@@ -146,21 +135,18 @@ void run(const char* artifact, SpeculativeBackend backend) {
                                               device.execution_view());
         states.complete_initialization(handle);
     }
-    const auto text = program.text_kv_addresses->create_active(pages, 1, device.stream());
-    require(text.has_value(), "fixture text KV allocation failed");
-    AddressOwner text_owner{program.text_kv_addresses.get(), *text};
-    program.text_kv_addresses->ensure_mapped_to_tokens(*text, capacity, device.stream());
-    std::array<AddressOwner, 2> full_owners;
-    if (program.backend_kv_addresses) {
-        for (const auto row : {0, 1}) {
-            const auto address =
-                program.backend_kv_addresses->create_active(pages, row, device.stream());
-            require(address.has_value(), "fixture full KV allocation failed");
-            full_owners[row].store  = program.backend_kv_addresses.get();
-            full_owners[row].handle = *address;
-            program.backend_kv_addresses->ensure_mapped_to_tokens(*address, capacity,
-                                                                  device.stream());
-        }
+    const auto bind = [&](models::context::KVHistoryStore& histories, int row) {
+        auto binding = histories.prepare_binding(nullptr, 0, capacity, row);
+        binding.publish_restores();
+        binding.prepare_tail_copy();
+        auto history = binding.commit(device.stream());
+        histories.prepare_write(history, 0, capacity, device.stream());
+        return history;
+    };
+    auto text_owner = bind(*program.text_kv_histories, 1);
+    std::array<models::context::KVHistory, 2> full_owners;
+    if (program.backend_kv_histories) {
+        for (const auto row : {0, 1}) full_owners[row] = bind(*program.backend_kv_histories, row);
         auto& pool = program.dflash->full->page_pool();
         for (std::size_t plane = 0; plane < pool.plane_count(); ++plane) {
             CUDA_CHECK(cudaMemsetAsync(pool.plane(plane).data, 0, pool.plane(plane).bytes(),

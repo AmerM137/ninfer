@@ -160,12 +160,12 @@ void ProgramImpl::prepare_graphs() {
         return state_store->physical_slot(capture_states.at(row));
     };
 
-    std::vector<context::KVAddressSpaceHandle> text_capture_allocations;
-    std::vector<context::KVAddressSpaceHandle> mtp_capture_allocations;
-    std::vector<context::KVAddressSpaceHandle> dflash_capture_allocations;
+    std::vector<context::KVHistory> text_capture_allocations;
+    std::vector<context::KVHistory> mtp_capture_allocations;
+    std::vector<context::KVHistory> dflash_capture_allocations;
     const auto reserve_capture_rows = [&](qwen3_5::PagedKVCache& cache,
-                                          context::KVAddressSpaceStore& addresses,
-                                          std::vector<context::KVAddressSpaceHandle>& allocations,
+                                          context::KVHistoryStore& histories,
+                                          std::vector<context::KVHistory>& allocations,
                                           const char* label) {
         DeviceKVPagePool& pool       = cache.page_pool();
         KVExecutionTablePool& tables = cache.execution_tables();
@@ -175,27 +175,28 @@ void ProgramImpl::prepare_graphs() {
         }
         allocations.reserve(max_concurrency);
         for (std::uint32_t row = 0; row < max_concurrency; ++row) {
-            std::optional<context::KVAddressSpaceHandle> allocation =
-                addresses.create_active(1, static_cast<std::int32_t>(row), device.stream());
-            if (!allocation) { throw std::bad_alloc(); }
-            allocations.push_back(*allocation);
-            addresses.ensure_mapped_to_tokens(*allocation, 1, device.stream());
+            auto binding = histories.prepare_binding(nullptr, 0, 1, row);
+            binding.publish_restores();
+            binding.prepare_tail_copy();
+            allocations.push_back(binding.commit(device.stream()));
+            auto& allocation = allocations.back();
+            histories.prepare_write(allocation, 0, 1, device.stream());
 
             // Capture profiles exercise arbitrary context envelopes. Repeating each row's private
             // page across its temporary table keeps every dummy read/write address valid without
             // reserving C full contexts solely for graph construction.
-            tables.publish_repeated(addresses.execution_row(*allocation).handle(),
-                                    addresses.physical_page(*allocation, 0),
+            tables.publish_repeated(histories.execution_row(allocation.handle()).handle(),
+                                    histories.physical_page(allocation.handle(), 0),
                                     tables.logical_page_capacity(), device.stream());
         }
     };
-    reserve_capture_rows(decoder->text_kv, *text_kv_addresses, text_capture_allocations,
+    reserve_capture_rows(decoder->text_kv, *text_kv_histories, text_capture_allocations,
                          "target KV cache");
     if (speculative_backend == SpeculativeBackend::Mtp) {
-        reserve_capture_rows(*decoder->mtp_cache(), *backend_kv_addresses, mtp_capture_allocations,
+        reserve_capture_rows(*decoder->mtp_cache(), *backend_kv_histories, mtp_capture_allocations,
                              "MTP KV cache");
     } else if (dflash && dflash->full) {
-        reserve_capture_rows(*dflash->full, *backend_kv_addresses, dflash_capture_allocations,
+        reserve_capture_rows(*dflash->full, *backend_kv_histories, dflash_capture_allocations,
                              "DFlash Full KV cache");
     }
     device.synchronize();
@@ -219,13 +220,12 @@ void ProgramImpl::prepare_graphs() {
         }
     };
     const auto zero_capture_pages =
-        [&](qwen3_5::PagedKVCache& cache, const context::KVAddressSpaceStore& addresses,
-            const std::vector<context::KVAddressSpaceHandle>& allocations,
-            std::uint32_t batch_size) {
+        [&](qwen3_5::PagedKVCache& cache, const context::KVHistoryStore& histories,
+            const std::vector<context::KVHistory>& allocations, std::uint32_t batch_size) {
             std::vector<DeviceKVPageHandle> pages;
             pages.reserve(batch_size);
             for (std::uint32_t row = 0; row < batch_size; ++row) {
-                pages.push_back(addresses.physical_page(allocations[row], 0));
+                pages.push_back(histories.physical_page(allocations[row].handle(), 0));
             }
             cache.page_pool().zero_pages(pages, device.stream());
         };
@@ -235,14 +235,14 @@ void ProgramImpl::prepare_graphs() {
         }
         work.reset();
         clear_stable_controls();
-        zero_capture_pages(decoder->text_kv, *text_kv_addresses, text_capture_allocations,
+        zero_capture_pages(decoder->text_kv, *text_kv_histories, text_capture_allocations,
                            batch_size);
         if (decoder->mtp_cache() != nullptr) {
-            zero_capture_pages(*decoder->mtp_cache(), *backend_kv_addresses,
+            zero_capture_pages(*decoder->mtp_cache(), *backend_kv_histories,
                                mtp_capture_allocations, batch_size);
         }
         if (dflash && dflash->full) {
-            zero_capture_pages(*dflash->full, *backend_kv_addresses, dflash_capture_allocations,
+            zero_capture_pages(*dflash->full, *backend_kv_histories, dflash_capture_allocations,
                                batch_size);
         }
         for (std::uint32_t row = 0; row < batch_size; ++row) {
@@ -571,23 +571,9 @@ void ProgramImpl::prepare_graphs() {
         }
     }
 
-    const auto release_capture_rows = [](context::KVAddressSpaceStore& addresses,
-                                         std::vector<context::KVAddressSpaceHandle>& allocations) {
-        for (const context::KVAddressSpaceHandle allocation : allocations) {
-            addresses.deactivate(allocation);
-            if (!addresses.release(allocation)) {
-                throw std::logic_error("CUDA Graph capture KV address space could not be released");
-            }
-        }
-        allocations.clear();
-    };
-    if (!dflash_capture_allocations.empty()) {
-        release_capture_rows(*backend_kv_addresses, dflash_capture_allocations);
-    }
-    if (!mtp_capture_allocations.empty()) {
-        release_capture_rows(*backend_kv_addresses, mtp_capture_allocations);
-    }
-    release_capture_rows(*text_kv_addresses, text_capture_allocations);
+    dflash_capture_allocations.clear();
+    mtp_capture_allocations.clear();
+    text_capture_allocations.clear();
 }
 
 } // namespace ninfer::models::qwen3_5::detail
