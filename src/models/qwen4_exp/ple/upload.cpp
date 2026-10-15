@@ -5,7 +5,6 @@
 #include "core/transfer.h"
 
 #include <exception>
-#include <limits>
 #include <stdexcept>
 
 namespace ninfer::models::qwen4_exp::ple {
@@ -43,10 +42,7 @@ struct UploadSlots::Impl {
 
     Impl(const DeviceContext& context, std::uint32_t positions, std::uint32_t count)
         : device(context.device()), max_positions(positions) {
-        if (!positions || positions > std::uint32_t(std::numeric_limits<std::int32_t>::max()) ||
-            !count) {
-            throw std::invalid_argument("invalid PLE upload capacity");
-        }
+        (void)UploadSlots::memory(positions, count);
         CudaDeviceScope scope(device);
         const auto bytes = std::size_t(positions) * kEmbeddingBytes;
         slots.reserve(count);
@@ -103,6 +99,15 @@ struct UploadSlots::Impl {
 UploadSlots::UploadSlots(const DeviceContext& context, std::uint32_t max_positions,
                          std::uint32_t slots)
     : impl_(std::make_unique<Impl>(context, max_positions, slots)) {}
+
+UploadMemory UploadSlots::memory(std::uint32_t positions, std::uint32_t slots) {
+    if (!positions || positions > INT32_MAX || !slots ||
+        std::size_t(slots) > SIZE_MAX / kEmbeddingBytes / positions)
+        throw std::invalid_argument("invalid PLE upload capacity");
+    const auto bytes = std::size_t(positions) * slots * kEmbeddingBytes;
+    return {sizeof(Impl) + std::size_t(slots) * (sizeof(Impl::Slot) + sizeof(MemorySpan)), bytes,
+            bytes};
+}
 
 UploadSlots::~UploadSlots() = default;
 
@@ -191,10 +196,8 @@ Tensor UploadSlots::device_slot(std::uint32_t slot, std::uint32_t tokens,
 }
 
 UploadMemory UploadSlots::memory() const noexcept {
-    const auto& p    = *impl_;
-    const auto bytes = std::size_t(p.max_positions) * p.slots.size() * kEmbeddingBytes;
-    return {sizeof(Impl) + p.slots.size() * (sizeof(Impl::Slot) + sizeof(MemorySpan)), bytes,
-            bytes};
+    const auto& p = *impl_;
+    return memory(p.max_positions, static_cast<std::uint32_t>(p.slots.size()));
 }
 
 } // namespace ninfer::models::qwen4_exp::ple

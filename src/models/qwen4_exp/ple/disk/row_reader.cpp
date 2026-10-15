@@ -136,35 +136,69 @@ struct RowReader::Impl {
     ReadStats stats;
     std::unique_ptr<io::DirectReadQueue> queue;
 
+    struct Layout {
+        std::uint32_t owners, owner_rows, rows, fragments, parts, depth;
+        std::size_t cache_sets, segments, alignment = 4096, read_bytes = 4096;
+
+        [[nodiscard]] std::size_t bytes() const {
+            return sizeof(Impl) + owners * sizeof(Owner) +
+                   rows * (sizeof(Target) + sizeof(Row) + 3 * sizeof(std::uint32_t)) +
+                   fragments * (sizeof(Fragment) + sizeof(Page) + sizeof(std::uint32_t)) +
+                   (std::bit_ceil(std::size_t(rows) * 2) +
+                    std::bit_ceil(std::size_t(fragments) * 2)) *
+                       sizeof(std::uint32_t) +
+                   cache_sets * sizeof(CacheSet) + segments * sizeof(artifact::ReadSegment) +
+                   depth * (read_bytes + sizeof(MemorySpan) + sizeof(io::ReadCompletion) +
+                            sizeof(std::uint32_t));
+        }
+    };
+
+    static Layout describe(const Table& table, std::uint32_t count, std::uint32_t per_owner,
+                           std::uint32_t depth, std::size_t cache_bytes) {
+        if (!depth || depth > 65535 || table.files().empty() || !count || !per_owner ||
+            (cache_bytes && cache_bytes < sizeof(CacheSet)))
+            throw std::invalid_argument("invalid PLE row reader resources");
+        // Later segments start at a V3 file's 4 KiB-aligned payload prefix. Only the
+        // first segment can straddle a read page; each later segment is at most 90 bytes.
+        Layout out{count,
+                   per_owner,
+                   capacity(std::uint64_t(count) * per_owner),
+                   0,
+                   static_cast<std::uint32_t>(
+                       std::min<std::size_t>(kRowBytes, table.max_row_segments() + 1)),
+                   depth,
+                   cache_bytes / sizeof(CacheSet),
+                   table.max_row_segments()};
+        out.fragments = capacity(std::uint64_t(out.rows) * out.parts);
+        for (const auto file : table.files()) {
+            out.alignment  = std::max(out.alignment, std::size_t(file.memory_alignment));
+            out.read_bytes = std::max({out.read_bytes, std::size_t(file.offset_alignment),
+                                       std::size_t(file.memory_alignment)});
+        }
+        return out;
+    }
+
     Impl(const Table& table, std::uint32_t count, std::uint32_t per_owner, std::uint32_t depth,
          std::size_t cache_bytes)
-        : table(table), owner_rows(per_owner),
-          // Further segments start at a V3 file's 4 KiB-aligned payload prefix. Only the
-          // first segment can straddle a read page; each later segment is at most 90 bytes.
-          part_capacity(std::min<std::size_t>(kRowBytes, table.max_row_segments() + 1)),
-          owners(count), targets(capacity(std::uint64_t(count) * per_owner)), rows(targets.size()),
-          fragments(capacity(rows.size() * part_capacity)), pages(fragments.size()),
-          inflight(depth, none), ready_rows(rows.size()), row_index(rows.size()),
-          page_index(pages.size()), cache(cache_bytes / sizeof(CacheSet)),
-          segments(table.max_row_segments()), completions(depth) {
-        if (!depth || depth > 65535 || table.files().empty() || (cache_bytes && cache.empty()))
-            throw std::invalid_argument("invalid PLE row reader resources");
-        for (auto& owner : owners) owner.targets.reserve(per_owner);
+        : Impl(table, describe(table, count, per_owner, depth, cache_bytes)) {}
+
+    Impl(const Table& table, const Layout& layout)
+        : table(table), owner_rows(layout.owner_rows), part_capacity(layout.parts),
+          read_bytes(layout.read_bytes), owners(layout.owners), targets(layout.rows),
+          rows(layout.rows), fragments(layout.fragments), pages(layout.fragments),
+          inflight(layout.depth, none), ready_rows(layout.rows), row_index(layout.rows),
+          page_index(layout.fragments), cache(layout.cache_sets), segments(layout.segments),
+          completions(layout.depth) {
+        for (auto& owner : owners) owner.targets.reserve(owner_rows);
         free_rows.resize(rows.size());
         free_pages.resize(pages.size());
         std::iota(free_rows.rbegin(), free_rows.rend(), 0);
         std::iota(free_pages.rbegin(), free_pages.rend(), 0);
-        std::size_t alignment = 4096;
-        for (auto file : table.files()) {
-            alignment  = std::max(alignment, file.memory_alignment);
-            read_bytes = std::max<std::size_t>(read_bytes, file.offset_alignment);
-            read_bytes = std::max<std::size_t>(read_bytes, file.memory_alignment);
-        }
-        slab = HostBuffer(std::size_t(depth) * read_bytes, alignment);
-        buffers.reserve(depth);
-        for (std::uint32_t i = 0; i < depth; ++i)
+        slab = HostBuffer(std::size_t(layout.depth) * read_bytes, layout.alignment);
+        buffers.reserve(layout.depth);
+        for (std::uint32_t i = 0; i < layout.depth; ++i)
             buffers.push_back(slab.span().subspan(std::size_t(i) * read_bytes, read_bytes));
-        queue = std::make_unique<io::DirectReadQueue>(table.files(), buffers, depth);
+        queue = std::make_unique<io::DirectReadQueue>(table.files(), buffers, layout.depth);
     }
 
     Owner& owner(std::uint32_t id) {
@@ -544,6 +578,11 @@ std::size_t RowReader::memory_bytes() const noexcept {
            p.segments.size() * sizeof(artifact::ReadSegment) + p.slab.size() +
            p.buffers.size() *
                (sizeof(MemorySpan) + sizeof(io::ReadCompletion) + sizeof(std::uint32_t));
+}
+
+std::size_t RowReader::memory_bytes(const Table& table, std::uint32_t owners, std::uint32_t rows,
+                                    std::uint32_t depth, std::size_t cache) {
+    return Impl::describe(table, owners, rows, depth, cache).bytes();
 }
 
 } // namespace ninfer::models::qwen4_exp::ple::disk

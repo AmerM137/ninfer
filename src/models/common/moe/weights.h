@@ -24,6 +24,8 @@ struct BankDescription {
 // Logical expert order must form affine gate/up and down banks in the stored parents.
 [[nodiscard]] BankDescription describe_bank(const artifact::Reader&,
                                             std::span<const ExpertBinding>);
+// Three rank-3 logical [E,I,H], [E,I,H], [E,H,I] bindings over affine stored banks.
+[[nodiscard]] BankDescription describe_bank(const artifact::Reader&, const ExpertBinding&);
 [[nodiscard]] std::vector<ExpertBankSource> bind_banks(std::span<const BankDescription>,
                                                        const artifact::MaterializedArtifact&,
                                                        std::span<const Device>);

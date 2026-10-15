@@ -115,6 +115,9 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
     artifact::Reader reader(options.artifact_path);
     inspect.complete();
     switch (models::resolve_architecture(reader.directory())) {
+    case models::Architecture::Qwen4Exp:
+        throw std::invalid_argument(
+            "Qwen4Exp loading is available; Engine execution is not implemented");
     case models::Architecture::Qwen3_5:
     case models::Architecture::Qwen3_5Moe: {
         auto built =

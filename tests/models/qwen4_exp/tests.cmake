@@ -23,3 +23,15 @@ ninfer_add_test(ninfer_ple_upload_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/ple/test_upload.cpp"
   LIBRARIES ninfer_model_runtime)
 set_tests_properties(ninfer_ple_upload_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
+ninfer_add_test(ninfer_qwen4_exp_loading_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_loading_real.cpp"
+  LIBRARIES ninfer_model_runtime)
+set_tests_properties(ninfer_qwen4_exp_loading_real_test PROPERTIES
+  SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real")
+ninfer_add_test(ninfer_qwen4_exp_loading_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_loading.cpp"
+  LIBRARIES ninfer_model_loading)
+ninfer_add_test(ninfer_qwen4_exp_state_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_state.cpp"
+  LIBRARIES ninfer_model_runtime)
+set_tests_properties(ninfer_qwen4_exp_state_test PROPERTIES SKIP_RETURN_CODE 77 LABELS "gpu")

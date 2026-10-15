@@ -377,4 +377,15 @@ std::size_t PrepareService::memory_bytes() const noexcept {
            p.reader.memory_bytes();
 }
 
+std::size_t PrepareService::memory_bytes(const Table& table, const PrepareOptions& options,
+                                         std::uint32_t slots) {
+    if (!options.max_positions || options.max_positions > UINT32_MAX / kHeads || !slots)
+        throw std::invalid_argument("invalid PLE preparation capacity");
+    return sizeof(Impl) +
+           std::size_t(slots) *
+               (sizeof(Impl::Window) + std::size_t(options.max_positions) * sizeof(std::int32_t)) +
+           RowReader::memory_bytes(table, slots, options.max_positions * kHeads, options.io_depth,
+                                   options.cache_bytes);
+}
+
 } // namespace ninfer::models::qwen4_exp::ple::disk

@@ -320,6 +320,10 @@ Cache、ticket 和 staging 不进入 checkpoint；丢弃错误草稿也不要求
 
 ## 7. 启动预算
 
+`PrepareService::memory_bytes(table, options, slots)` 与 `UploadSlots::memory(max_positions, slots)`
+提供创建前的容量查询。Reader 构造和查询使用同一容量描述；Host 数组统计不含 allocator、
+线程栈及内核 I/O 系统开销。Model 的表 backing/LUT 与 Program 的可变准备资源分别计量。
+
 令 `Mmax=max(计划 prefill chunk, verify width×并发数, ordinary 并发数)`，按实际最大
 T*B 规划；当前 prefill 一次一条请求。它是 Program 调用形状的容量，不是 Op 的 T 上限。
 

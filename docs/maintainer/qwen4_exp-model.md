@@ -2,7 +2,8 @@
 
 Qwen3.8-Flash-Next 是本合同的 checkpoint 实例，数学架构为 Qwen4Exp。现有
 `qwen3_8_flash_next` recipe 已完成 Text、可选 Vision 和原生 MTP 的 V3 `.ninfer` 转换；
-Qwen4Exp 尚未接入 Engine。Op 与模型执行的完成范围、状态组合和剩余需求统一见
+原生 loader、Parameters 和执行资源规划已实现，完整执行尚未接入 Engine。
+Op 与模型执行的完成范围、状态组合和剩余需求统一见
 [执行进度](qwen4_exp-execution.md#implementation-status)，PLE 的 Host 数学和读取流水见
 [PLE I/O](qwen4_exp-ple-io.md)。
 
@@ -309,7 +310,8 @@ A16/A4 共用同一份 NVFP4 编码。对象允许跨 V3 续卷，文件名不�
 
 ## 5. 驻留与容量
 
-以下是原生执行的既定驻留方案，尚未由 Qwen4Exp loader/Program 实现：
+以下驻留方案已由 [loader](../../src/models/qwen4_exp/load.cpp) 和
+[执行资源](../../src/models/qwen4_exp/program/resources.h)实现；层计算与 Program 编排继续推进：
 
 | 数据 | 驻留与所有权 |
 |---|---|

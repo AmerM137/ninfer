@@ -8,7 +8,8 @@
 单个 Op 的完整公式、支持域、alias、workspace 和执行约束由 `include/ninfer/ops/`
 中的合同维护，本文只规定模型如何组合这些计算。[Engine 架构](engine-architecture.md)
 拥有请求事务与发布规则，[Paged KV](paged-kv-cache.md)拥有物理页、replica 和迁移机制。
-原生 Qwen4Exp 模型执行尚未接入；下述层流程和提交关系是集成时须落实的设计。
+原生加载、Parameters、StateImage、QSA 页池和执行资源规划已实现；完整模型执行尚未接入。
+下述层流程和提交关系是后续 Program 集成须落实的设计。
 
 ## 1. 共同轴、前沿与所有权
 
@@ -350,13 +351,14 @@ lead 规划，不假定与 Main 相同。最终容量、Host reservation、迁�
 
 | 已完成能力 | 范围与权威入口 |
 |---|---|
+| 加载与执行资源 | `qwen4_exp/load.*`、`execution/profile.*`、`parameters.*`、`state/` 和 `program/` 已实现组件选择、原表示绑定、连续 StateImage、Main/MTP 页组、records/workspace、公共 MoE 资源与 PLE 双槽；完整 forward 和请求事务尚待实现 |
 | Artifact/converter 与纯 Linear | Qwen4Exp 配置、Binding/Use、完整 Text/Vision/MTP 权重产物、NF4 持久编码/分页布局及 20 项矩阵支持；详见模型文档 |
 | GDN 输出 norm | `sigmoid_gated_rmsnorm`，与 SiLU gated 形式共用 RMSNorm 家族；已通过数学与 Op 性能验收 |
 | GDN control | BF16 `[96,2560]` 合并 AB projection、权重准备、FP32 controls 和容量查询；已通过数学与 Op 性能验收 |
 | HC 基础计算与 Mix | 五种基础形式、block/final Mix 及区间容量查询，保留 residual seam；已通过数学与 Op 性能验收 |
 | GDN input 与 ReplaySSM | Q8 `[16384,2560]` 的 `linear_split`、融合投影/卷积 snapshot/record 及各自容量查询；`(36,16,48,10240)` 全层 fold 已实现 |
 | QSA | 分段输入投影、五类 KV 的 Prepare/Sparse GQA、Indexer、tail extraction 已实现 |
-| Paged KV 机制 | `tokens_per_row=1/4` 的共同逻辑页及 Host/Device plane 布局、传输和相应覆盖语义已有通用实现；模型 pool/StateImage 接入仍待完成 |
+| Paged KV 机制 | `tokens_per_row=1/4` 的共同逻辑页及 Host/Device plane 布局、传输和相应覆盖语义已有通用实现；原生 Main/MTP QSA pools 与 StateImage 已接入这些公共存储机制 |
 | PLE GPU 局部能力 | `ple_gate`、`ple_conv_add`、`ple_conv_add_norm`、`ple_state_extract` 已实现；Gate 直接消费合并 K/V view，写 BF16 U 和正式 N records |
 | Main/MTP GPU MoE | NVFP4 A4、block-FP8 A8/G128、小批量 A16、BF16 router/shared、完整与子集入口及固定 Graph replay 已实现 |
 | Main CPU MoE | CPU `routed_swiglu` 直接读取 NVFP4 bank；BF16 输入、FP32 contribution、expert subset、逐 expert divisor 与有界 workspace 已实现 |
@@ -375,11 +377,12 @@ lead 规划，不假定与 Main 相同。最终容量、Host reservation、迁�
    GPU 计算保持固定 Graph 拓扑；驻留调度由 Program 处理。PLE 与 expert
    H2D 的实际竞争在完整 schedule 评估。
    Bank/cache、固定区与流式窗口规划、混合执行及预取已有 `models/common/moe` 公共组件；
-   接入时提供本模型的计算 profile、策略和 `Write` 出口，由 HC 消费 block 输出。
-3. **原生模型集成。** Qwen4Exp binder、驻留、Parameters、planner、StateImage、层
-   编排和 Program 尚未接入。先贯通 Text prefill/ordinary/control/Replay/scoring，
-   连同统一提交、checkpoint/offload、取消和 eager/Graph；再完成 Vision 的特征替换
-   与位置交接，以及 MTP 的 draft/verify/bridge、双特征选择与恢复。既有 Qwen3.5
+   本模型的计算 profile、起始策略和 `Write` 出口已进入资源规划；下一步接入实际层调用，
+   由 HC 消费 block 输出。
+3. **原生模型集成。** 加载、参数和执行资源基础已完成，继续实现层编排和 Program。
+   先贯通 Text prefill/ordinary/control/Replay/scoring，
+   连同统一提交、checkpoint/offload 和取消，先完成 eager 路径；随后接 Vision 的特征替换
+   与位置交接、MTP 的 draft/verify/bridge、双特征选择与恢复，最后统一接入 Graph。既有 Qwen3.5
    DFlash/DFlash2 不构成 Qwen4Exp 支持声明。
 4. **完整路线资格与测量。** 原生模型就绪后验证组合数值/质量、MTP 接受率、资源峰值、
    SSD/PCIe 与计算重叠及端到端延迟。当前 Op 或 I/O 证据不能替代这些结论。

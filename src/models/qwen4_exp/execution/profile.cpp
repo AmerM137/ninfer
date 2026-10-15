@@ -1,0 +1,141 @@
+#include "models/qwen4_exp/execution/profile.h"
+#include "models/qwen4_exp/load.h"
+#include "ninfer/ops/gated_residual.h"
+#include "ninfer/ops/linear_split.h"
+
+#include <array>
+
+namespace ninfer::models::qwen4_exp::execution {
+namespace {
+template <class Source>
+class Describe {
+public:
+    explicit Describe(const Source& source) : source_(source) {}
+
+    ops::LinearProfile linear(std::initializer_list<WeightId> ids) const {
+        std::vector<ops::WeightInput> inputs;
+        for (const auto id : ids) inputs.push_back(source_.input(id));
+        return ops::describe_linear_weight(inputs);
+    }
+
+    HcProfile hc(const HcWeights& w) const {
+        HcProfile out{w.injection ? linear({w.down, *w.injection}) : linear({w.down}),
+                      linear({w.up})};
+        (void)hc_workspace_bytes(out, 1, 1);
+        return out;
+    }
+
+    BlockProfile block(const BlockWeights& w, bool mtp) const {
+        BlockProfile out;
+        out.attention_hc = hc(w.attention_hc);
+        out.moe_hc       = hc(w.moe_hc);
+        if (const auto* g = std::get_if<GdnWeights>(&w.mixer)) {
+            const auto input   = linear({g->query, g->key, g->value, g->z});
+            const auto control = linear({g->a, g->b});
+            out.mixer          = GdnProfile{{input, {}}, {control, {}}, linear({g->output})};
+        } else {
+            const auto& q = std::get<QsaWeights>(w.mixer);
+            QsaProfile profile;
+            if (mtp)
+                profile.input =
+                    linear({q.query, q.key, q.gate, q.value, q.index_query, q.index_key});
+            else
+                profile.input =
+                    MainQsaProjectionProfile{linear({q.query, q.gate}),
+                                             linear({q.key, q.value, q.index_query, q.index_key})};
+            profile.output = linear({q.output});
+            (void)qsa_projection_workspace_bytes(profile, 1, 1);
+            out.mixer = profile;
+        }
+        const auto& m    = w.moe;
+        const auto& bank = source_.expert_banks()[m.bank.index];
+        ops::ExpertInputUsage gu, down;
+        gu.include(source_.input(m.gate));
+        gu.include(source_.input(m.up));
+        down.include(source_.input(m.down));
+        const auto control = linear({m.router, m.shared_score});
+        if (control.qtype != QType::BF16 || control.policy != ops::LinearPolicy::A16Only)
+            throw std::invalid_argument("Qwen4Exp router requires BF16 A16 control weights");
+        out.moe = {
+            {ops::routed_swiglu_profile(bank.gate_up.layout, bank.down.layout,
+                                        source_.config().text.moe.top_k, gu.policy(),
+                                        down.policy()),
+             ops::swiglu_profile(linear({m.shared_gate, m.shared_up}), linear({m.shared_down}))},
+            m.bank,
+            {gu.activation_divisor(bank.gate_up.layout.format),
+             down.activation_divisor(bank.down.layout.format)}};
+        return out;
+    }
+private:
+    const Source& source_;
+};
+
+template <class Source>
+std::shared_ptr<const ModelProfile> describe(const Source& source) {
+    auto out           = std::make_shared<ModelProfile>();
+    out->config        = source.config();
+    out->options       = source.options();
+    out->public_tokens = source.resources().public_token_count;
+    const Describe d(source);
+    const auto& w = source.weights();
+    for (const auto& layer : w.text.layers) out->text.layers.push_back(d.block(layer, false));
+    out->text.final_hc = d.hc(w.text.final_hc);
+    out->text.ple      = d.linear({w.text.ple.key, w.text.ple.value});
+    out->text.head     = d.linear({w.text.head});
+    if (w.mtp) {
+        const auto& m = *w.mtp;
+        out->mtp      = {d.linear({m.fc_embedding}), d.linear({m.fc_hidden}), d.linear({m.head}),
+                         d.block(m.layer, true), d.hc(m.final_hc)};
+    }
+    if (w.vision)
+        out->vision =
+            qwen::describe_vision(*w.vision, [&](WeightId id) { return source.input(id); });
+    for (const auto& b : source.expert_banks())
+        out->banks.push_back({b.gate_up.layout, b.down.layout, true});
+    for (const auto& layer : out->text.layers) out->banks[layer.moe.bank.index].resident = false;
+    return out;
+}
+
+Weight hc_geometry(ops::LinearProfile p) {
+    if (p.qtype != QType::BF16 || p.layout != QuantLayout::Contiguous ||
+        p.policy != ops::LinearPolicy::A16Only)
+        throw std::invalid_argument("HC requires compact BF16 A16 weights");
+    Weight w;
+    w.qtype  = p.qtype;
+    w.layout = p.layout;
+    w.ndim   = 2;
+    w.n = w.shape[0] = w.padded_shape[0] = p.n;
+    w.k = w.shape[1] = w.padded_shape[1] = p.k;
+    w.payload_bytes                      = std::uint64_t(p.n) * p.k * 2;
+    return w;
+}
+} // namespace
+
+std::shared_ptr<const ModelProfile> describe_model(const LoadPlan& source) {
+    return describe(source);
+}
+
+std::shared_ptr<const ModelProfile> describe_model(const Model& source) { return describe(source); }
+
+std::size_t hc_workspace_bytes(const HcProfile& profile, std::int32_t first, std::int32_t last) {
+    const auto down = hc_geometry(profile.down), up = hc_geometry(profile.up);
+    if (down.n == 324)
+        return ops::hc_mix_workspace_capacity_bytes(ops::HcMixWeights{down, up}, first, last);
+    return ops::hc_mix_workspace_capacity_bytes(ops::HcFinalMixWeights{down, up}, first, last);
+}
+
+std::size_t qsa_projection_workspace_bytes(const QsaProfile& p, std::int32_t first,
+                                           std::int32_t last) {
+    if (const auto* main = std::get_if<MainQsaProjectionProfile>(&p.input)) {
+        return std::max(
+            ops::linear_split_workspace_capacity_bytes(
+                {main->query_gate, {}}, std::array<std::int32_t, 2>{6144, 6144}, first, last),
+            ops::linear_split_workspace_capacity_bytes(
+                {main->kv_index, {}}, std::array<std::int32_t, 4>{512, 512, 512, 128}, first,
+                last));
+    }
+    return ops::linear_split_workspace_capacity_bytes(
+        {std::get<ops::LinearProfile>(p.input), {}},
+        std::array<std::int32_t, 6>{6144, 512, 6144, 512, 512, 128}, first, last);
+}
+} // namespace ninfer::models::qwen4_exp::execution

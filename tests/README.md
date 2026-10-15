@@ -19,7 +19,8 @@ ownership contracts are defined in [Engine architecture](../docs/maintainer/engi
 - `runtime/` — scheduler fairness, cache resource policy, capacity and context-cost calculations;
 - `cpu/` — topology/ISA, bounded task admission, bound collectives, publication and shutdown;
 - `io/` — bounded direct reads, partial submission, completion, wakeup and borrowed-buffer lifetime;
-- `models/qwen4_exp/ple/` — PLE disk binding, exact hash/NF4 reconstruction, incremental windows,
+- `models/qwen4_exp/` — native bank binding, state/page-group layouts and transfers, plus PLE
+  disk binding, exact hash/NF4 reconstruction, incremental windows,
   cancellation and Host/CUDA buffer lifetimes;
 - `bench/ttft/` — HTTP measurements, campaign orchestration and workload construction;
 - root C++ tests — core storage, public API, serving protocols, logging, benchmark reports and
@@ -448,3 +449,16 @@ fixed tensors on GPU. This checks storage and binding, not mixed MoE execution:
 build/tests/ninfer_qwen3_5_loading_real_test --artifact out/qwen3_6_35b_a3b.ninfer \
   --vision --speculative mtp --host-experts
 ```
+
+Qwen4Exp loading/resources can be checked before the full Engine route is implemented:
+
+```bash
+./build/tests/ninfer_qwen4_exp_loading_real_test out/qwen3_8_flash_next.ninfer
+./build/tests/ninfer_qwen4_exp_loading_real_test out/qwen3_8_flash_next.ninfer --materialize
+```
+
+The first command plans component combinations, KV formats and concurrency without loading weight
+payloads. `--materialize` additionally loads one full-component model, checks stored words and
+parameter sharing, constructs its execution resources, and reads/uploads a PLE window. It needs
+about 64 GiB of available Host memory plus system headroom. These are loading/resource checks;
+text generation and model-quality qualification belong to the subsequent Engine integration.

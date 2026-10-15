@@ -36,6 +36,8 @@ target_sources(ninfer_model_runtime PRIVATE
   common/moe/resources.cpp)
 
 include(qwen3_5/loading_sources.cmake)
+include(qwen4_exp/loading_sources.cmake)
 include(common/qwen/sources.cmake)
 include(qwen3_5/execution_sources.cmake)
+include(qwen4_exp/execution_sources.cmake)
 include(qwen3_5/program_sources.cmake)

@@ -57,6 +57,8 @@ public:
     [[nodiscard]] ReadStats stats() const;
     // Owned Host array capacities, excluding borrowed outputs and allocator/system overhead.
     [[nodiscard]] std::size_t memory_bytes() const noexcept;
+    [[nodiscard]] static std::size_t memory_bytes(const Table&, const PrepareOptions&,
+                                                  std::uint32_t slots);
 
 private:
     struct Impl;
