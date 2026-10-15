@@ -21,8 +21,7 @@ struct TextExecution {
 // compute stream; canonical publication belongs to Program.
 class TextRun {
 public:
-    TextRun(const Parameters&, TextExecution, BatchView, std::optional<SequenceSlots>,
-            CudaExecutionView);
+    TextRun(const Parameters&, TextExecution, BatchView, StateUpdate, CudaExecutionView);
     void prefix(std::optional<VisualEmbeddingView> = {});
     void consume_ple(const Tensor& embedding);
     void suffix(TextOutputs);
@@ -32,7 +31,7 @@ private:
     const Parameters& parameters_;
     TextExecution execution_;
     BatchView batch_;
-    std::optional<SequenceSlots> sequence_;
+    StateUpdate update_;
     CudaExecutionView cuda_;
     MemoryArena::Scope scope_;
     workspace::Roots roots_;

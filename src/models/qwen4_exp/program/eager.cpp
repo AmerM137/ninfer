@@ -5,11 +5,7 @@
 #include <algorithm>
 
 namespace ninfer::models::qwen4_exp {
-namespace {
-double seconds(detail::Clock::time_point start) {
-    return std::chrono::duration<double>(detail::Clock::now() - start).count();
-}
-} // namespace
+using detail::seconds;
 
 PrefillProgress Program::advance_prefill(SequenceHandle handle, runtime::ExecutionTiming* failed,
                                          runtime::TokenMaskProvider* masks) {
@@ -70,20 +66,29 @@ PendingBatch Program::decode(std::span<const SequenceHandle> members,
     auto& p = *impl_;
     if (p.pending_transaction || members.empty() || members.size() > p.shape.max_concurrency ||
         budgets.size() != members.size())
-        throw std::logic_error("invalid ordinary batch");
+        throw std::logic_error("invalid decode batch");
     std::vector<detail::Sequence*> rows;
+    bool speculative = false;
     for (std::size_t i = 0; i < members.size(); ++i) {
         auto& s = p.sequence(members[i]);
         if (s.phase != detail::Phase::Active || !s.permit ||
             !budgets[i].generated_tokens_remaining ||
             s.identity.tokens.size() != s.continuation.metadata.main_frontier + 1 ||
             std::find(rows.begin(), rows.end(), &s) != rows.end())
-            throw std::logic_error("ordinary row is not decode-ready");
+            throw std::logic_error("row is not decode-ready");
         rows.push_back(&s);
+        speculative |= p.shape.draft_tokens && budgets[i].generated_tokens_remaining > 1 &&
+                       s.continuation.metadata.main_frontier + 1 < p.shape.max_context;
     }
     runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Submit, failed);
     const auto started = detail::Clock::now();
     try {
+        if (speculative) {
+            auto pending = p.mtp_decode(rows, budgets, masks, timing);
+            for (auto* s : rows) s->timings.decode_seconds += seconds(started);
+            pending.timing_ = timing.finish();
+            return pending;
+        }
         const auto hidden = p.forward(rows, 1, false);
         p.adopt_forward(rows, 1);
         auto pending = p.sample(rows, hidden, false, masks, timing);
@@ -101,64 +106,6 @@ PendingBatch Program::decode(std::span<const SequenceHandle> members,
     }
 }
 
-CommitResult Program::commit(PendingBatch&& batch,
-                             std::span<const runtime::CommitDecision> decisions,
-                             runtime::CommitObservation, runtime::ExecutionTiming* failed) {
-    auto& p = *impl_;
-    if (batch.owner_ != &p || batch.transaction_ != p.pending_transaction ||
-        batch.members_ != p.pending_members || decisions.size() != batch.row_count())
-        throw std::logic_error("invalid pending transaction");
-    runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Post, failed);
-    CommitResult out;
-    out.row_count = decisions.size();
-    for (std::size_t row = 0; row < decisions.size(); ++row) {
-        const auto& d = decisions[row];
-        if ((d.cancelled && d.failed) || (d.failed && !p.pending_failed[row]) ||
-            ((d.cancelled || d.failed) ? (!d.terminal || d.accepted_tokens != 0)
-                                       : (d.accepted_tokens != 1 || p.pending_failed[row])) ||
-            (d.prefix_execution_split_after && *d.prefix_execution_split_after != 1))
-            throw std::logic_error("invalid ordinary commit decision");
-    }
-    for (std::size_t row = 0; row < decisions.size(); ++row) {
-        const auto h  = batch.members_[row];
-        auto& s       = p.sequence(h);
-        const auto& d = decisions[row];
-        if (d.cancelled || d.failed) {
-            out.rows[row].timings     = s.timings;
-            out.rows[row].disposition = d.cancelled ? runtime::CommitDisposition::CancelledReleased
-                                                    : runtime::CommitDisposition::FailedReleased;
-            p.clear(s);
-            p.sequences[h.lane].reset();
-            continue;
-        }
-        const auto token = p.pending_tokens[row];
-        s.identity.tokens.push_back(token);
-        s.identity.positions.append_generated(1, s.continuation.metadata.rope_delta,
-                                              d.prefix_execution_split_after);
-        s.identity.digests.append_generated({&token, 1}, s.continuation.metadata.rope_delta,
-                                            d.prefix_execution_split_after);
-        s.phase         = d.terminal ? detail::Phase::Finished : detail::Phase::Active;
-        s.recovery_peak = 0;
-        p.settle(s);
-        if (!s.first_output) {
-            s.first_output                = detail::Clock::now();
-            s.timings.first_token_seconds = seconds(s.started);
-            s.timings.prompt_wall_seconds = s.timings.first_token_seconds;
-        }
-        s.timings.total_seconds           = seconds(s.started);
-        s.timings.generation_wall_seconds = seconds(*s.first_output);
-        out.rows[row].timings             = s.timings;
-        out.rows[row].disposition         = d.terminal ? runtime::CommitDisposition::Finishable
-                                                       : runtime::CommitDisposition::Active;
-        out.capture_ready[row]            = s.capture_pending;
-    }
-    batch.owner_          = nullptr;
-    p.pending_transaction = 0;
-    p.pending_members.clear();
-    out.timing = timing.finish();
-    return out;
-}
-
 DiscardResult Program::abort_pending(PendingBatch&& batch) noexcept {
     auto& p = *impl_;
     if (batch.owner_ != &p || batch.transaction_ != p.pending_transaction ||
@@ -173,6 +120,7 @@ DiscardResult Program::abort_pending(PendingBatch&& batch) noexcept {
     batch.owner_          = nullptr;
     p.pending_transaction = 0;
     p.pending_members.clear();
+    p.pending_verify.reset();
     return {runtime::ConsumeStatus::Consumed, count};
 }
 
@@ -181,7 +129,7 @@ FinishResult Program::finish(SequenceHandle h) noexcept {
     if (!p.valid(h) || p.sequence(h).phase != detail::Phase::Finished) return {};
     try {
         auto& s = p.sequence(h);
-        FinishResult out{runtime::ConsumeStatus::Consumed, s.timings, {}, {}};
+        FinishResult out{runtime::ConsumeStatus::Consumed, s.timings, s.speculative, {}};
         if (s.request->summary.publish_continuation)
             out.checkpoint = p.detach(s, runtime::CheckpointRole::Continuation);
         p.clear(s);
@@ -194,7 +142,7 @@ AbortResult Program::abort(SequenceHandle h) noexcept {
     auto& p = *impl_;
     if (!p.valid(h)) return {};
     auto& s = p.sequence(h);
-    AbortResult out{runtime::ConsumeStatus::Consumed, s.timings, {}};
+    AbortResult out{runtime::ConsumeStatus::Consumed, s.timings, s.speculative};
     p.clear(s);
     p.sequences[h.lane].reset();
     return out;

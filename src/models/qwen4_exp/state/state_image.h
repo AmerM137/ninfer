@@ -29,6 +29,10 @@ struct ContinuationMetadata {
     std::optional<std::uint32_t> mtp_frontier;
 };
 
+[[nodiscard]] inline std::uint32_t mtp_history_frontier(std::uint32_t main_frontier) {
+    return main_frontier ? main_frontier - 1 : 0;
+}
+
 using Continuation = context::Continuation<ContinuationMetadata>;
 
 class StateViews {

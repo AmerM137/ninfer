@@ -1,5 +1,6 @@
 #include "core/device.h"
 #include "core/buffer.h"
+#include "core/transfer.h"
 
 #include <cuda_runtime.h>
 
@@ -131,6 +132,32 @@ int main(int argc, char** argv) {
         std::cerr << "move construction did not transfer compute stream\n";
     }
     failures += check_context(moved, "moved");
+
+    {
+        ninfer::PinnedHostBuffer input(64), output(128);
+        auto* values = static_cast<std::int32_t*>(input.data());
+        for (int i = 0; i < 16; ++i) values[i] = i + 1;
+        ninfer::DeviceBuffer source(moved.device(), 64), destination(moved.device(), 128);
+        const auto execution = moved.execution_view();
+        ninfer::copy_bytes_async(source.span(), input.span(), execution);
+        CUDA_CHECK(cudaMemsetAsync(destination.data(), 0x5a, destination.size(), moved.stream()));
+        ninfer::copy_rows_async(destination.span().subspan(4), 32, source.span().subspan(8), 16, 8,
+                                4, execution);
+        ninfer::copy_bytes_async(output.span(), destination.span(), execution);
+        moved.synchronize();
+        const auto* copied = static_cast<const std::int32_t*>(output.data());
+        for (int row = 0; row < 4; ++row)
+            for (int column = 0; column < 8; ++column) {
+                const auto expected =
+                    column == 1 || column == 2 ? values[row * 4 + column + 1] : 0x5a5a5a5a;
+                if (copied[row * 8 + column] != expected)
+                    return fail("pitched copy changed a row or its padding");
+            }
+        try {
+            ninfer::copy_rows_async(destination.span(), 32, source.span(), 16, 8, 5, execution);
+            return fail("pitched copy accepted an out-of-bounds row");
+        } catch (const std::out_of_range&) {}
+    }
 
     failures += expect_throws_device(count);
     failures += expect_throws_device(-1);

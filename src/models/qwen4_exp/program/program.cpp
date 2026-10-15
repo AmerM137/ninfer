@@ -8,10 +8,13 @@ ProgramImpl::ProgramImpl(const execution::Parameters& p, ExecutionPlan plan, Dev
     : parameters(p), device(d), cuda(d.execution_view()), resources(p, std::move(plan), d),
       ple(resources, d), shape(resources.plan.shape),
       checkpoints(resources.state_store->capacity() * 8ULL), prefill_timer(d) {
-    const auto& pool   = resources.main->cache.pages();
-    const auto payload = pool.device_copy_work(1).payload_bytes;
-    const auto host    = plan_host_kv_page_layout(pool.geometry()).page_stride;
-    pools.push_back({kMainPool, "main", &pool.geometry(), pool.capacity_pages(), payload, host});
+    for (std::uint16_t i = 0; i < resources.pool_count(); ++i) {
+        const auto& pool   = resources.pool(i).cache.pages();
+        const auto payload = pool.device_copy_work(1).payload_bytes;
+        const auto host    = plan_host_kv_page_layout(pool.geometry()).page_stride;
+        pools.push_back(
+            {{i}, i == 0 ? "main" : "mtp", &pool.geometry(), pool.capacity_pages(), payload, host});
+    }
 }
 
 ProgramImpl::~ProgramImpl() { cleanup(); }
@@ -48,7 +51,7 @@ void ProgramImpl::clear(Sequence& s) noexcept {
         ple.cancel(s.id);
         retire_vision(s);
         s.capture.reset();
-        s.history.reset();
+        for (auto& history : s.histories) history.reset();
         auto& store = *resources.state_store;
         if (s.write_destination.valid()) {
             store.abort_write(s.continuation.image, s.write_destination);
@@ -77,18 +80,21 @@ void ProgramImpl::cleanup() noexcept {
         checkpoints.clear();
         pending_transaction = 0;
         pending_members.clear();
+        pending_verify.reset();
     } catch (...) { std::terminate(); }
 }
 
 PhysicalUsageSnapshot ProgramImpl::usage() const noexcept {
     PhysicalUsageSnapshot out;
-    const auto& r                  = resources;
-    const auto& pool               = r.main->cache.pages();
-    out.occupied.state_slots       = r.state_store->device_occupied();
-    out.capacity.state_slots       = r.state_store->device_capacity();
-    out.occupied.kv_page_groups[0] = pool.allocated_pages() + pool.reserved_pages();
-    out.capacity.kv_page_groups[0] = pool.capacity_pages();
-    out.host_state_slots           = r.state_store->host_occupied();
+    const auto& r            = resources;
+    out.occupied.state_slots = r.state_store->device_occupied();
+    out.capacity.state_slots = r.state_store->device_capacity();
+    for (std::uint32_t i = 0; i < r.pool_count(); ++i) {
+        const auto& pool               = r.pool(i).cache.pages();
+        out.occupied.kv_page_groups[i] = pool.allocated_pages() + pool.reserved_pages();
+        out.capacity.kv_page_groups[i] = pool.capacity_pages();
+    }
+    out.host_state_slots = r.state_store->host_occupied();
     if (r.host_context) {
         out.occupied.host_bytes      = r.host_context->occupied_bytes();
         out.capacity.host_bytes      = r.host_context->capacity_bytes();
@@ -124,8 +130,12 @@ bool Program::context_blocks(SequenceHandle h) const noexcept {
     if (!p.operation || !p.valid(h)) return false;
     const auto* bind = std::get_if<detail::BindOperation>(&p.operation->action);
     if (bind) {
-        const auto* binding = p.operation->migration.binding(kMainPool);
-        return binding && binding->blocks_writer(p.sequences[h.lane]->history.handle());
+        for (std::uint16_t i = 0; i < p.resources.pool_count(); ++i) {
+            const auto* binding = p.operation->migration.binding({i});
+            if (binding && binding->blocks_writer(p.sequences[h.lane]->histories[i].handle()))
+                return true;
+        }
+        return false;
     }
     if (const auto* capture = std::get_if<detail::CaptureOperation>(&p.operation->action))
         return capture->lane == h.lane;
@@ -191,9 +201,10 @@ MemorySummary Program::memory_summary() const {
     out.host_context_reserved_bytes  = usage.host_reserved_bytes;
     out.host_state_occupied_slots    = usage.host_state_slots;
     out.host_kv_occupied_bytes       = usage.host_kv_bytes;
-    out.kv_payload_bytes             = p.pools[0].device_page_bytes * p.pools[0].device_page_groups;
-    const auto cache                 = p.resources.experts->cache_usage();
-    const auto& m                    = *plan.moe;
+    for (const auto& pool : p.pools)
+        out.kv_payload_bytes += pool.device_page_bytes * pool.device_page_groups;
+    const auto cache = p.resources.experts->cache_usage();
+    const auto& m    = *plan.moe;
     out.moe.emplace();
     auto& summary                 = *out.moe;
     summary.host_weights_bytes    = weights.host_capacity_bytes;

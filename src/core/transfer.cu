@@ -70,6 +70,32 @@ void copy_bytes_async(MemorySpan destination, ConstMemorySpan source, CudaExecut
     enqueue(destination, source, kind, execution);
 }
 
+void copy_rows_async(MemorySpan destination, std::size_t destination_pitch, ConstMemorySpan source,
+                     std::size_t source_pitch, std::size_t width, std::size_t rows,
+                     CudaExecutionView execution) {
+    validate_memory(destination);
+    validate_memory(source);
+    if (!width || !rows) return;
+    const auto fits = [&](std::size_t bytes, std::size_t pitch) {
+        return width <= pitch && width <= bytes && rows - 1 <= (bytes - width) / pitch;
+    };
+    if (!fits(destination.bytes, destination_pitch) || !fits(source.bytes, source_pitch))
+        throw std::out_of_range("pitched copy exceeds backing");
+    const auto kind =
+        validate_copy(destination.subspan(0, width), source.subspan(0, width), execution, true);
+    if (destination.device == source.device) {
+        const auto dst       = reinterpret_cast<std::uintptr_t>(destination.data);
+        const auto src       = reinterpret_cast<std::uintptr_t>(source.data);
+        const auto dst_bytes = (rows - 1) * destination_pitch + width;
+        const auto src_bytes = (rows - 1) * source_pitch + width;
+        if (src <= dst ? dst - src < src_bytes : src - dst < dst_bytes)
+            throw std::invalid_argument("pitched copy spans overlap");
+    }
+    CudaDeviceScope scope(execution.device());
+    CUDA_CHECK(cudaMemcpy2DAsync(destination.data, destination_pitch, source.data, source_pitch,
+                                 width, rows, kind, execution.stream()));
+}
+
 void copy_bytes(MemorySpan destination, ConstMemorySpan source, CudaExecutionView execution) {
     const auto kind = validate_copy(destination, source, execution, false);
     CudaDeviceScope scope(execution.device());

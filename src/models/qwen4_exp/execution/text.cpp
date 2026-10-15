@@ -9,15 +9,17 @@
 
 namespace ninfer::models::qwen4_exp::execution {
 
-TextRun::TextRun(const Parameters& p, TextExecution execution, BatchView batch,
-                 std::optional<SequenceSlots> sequence, CudaExecutionView cuda)
-    : parameters_(p), execution_(execution), batch_(batch), sequence_(sequence), cuda_(cuda),
+TextRun::TextRun(const Parameters& p, TextExecution execution, BatchView batch, StateUpdate update,
+                 CudaExecutionView cuda)
+    : parameters_(p), execution_(execution), batch_(batch), update_(update), cuda_(cuda),
       scope_(execution.workspace.scope()),
       roots_(
           workspace::roots(execution.workspace, p.model.config().text, batch.tokens * batch.batch)),
       cpu_activity_(execution.experts.begin(batch.tokens * batch.batch)) {
     if (batch.tokens <= 0 || batch.batch < 1 || batch.batch > kMaximumConcurrency ||
-        (sequence ? batch.batch != 1 : batch.tokens != 1))
+        (std::holds_alternative<SequenceSlots>(update) && batch.batch != 1) ||
+        (std::holds_alternative<StepUpdate>(update) && batch.tokens != 1) ||
+        (std::holds_alternative<VerifyRecords>(update) && batch.tokens < 2))
         throw std::invalid_argument("invalid Qwen4Exp sequence/step window");
 }
 
@@ -46,19 +48,22 @@ void TextRun::layer(std::uint32_t i) {
     }
     if (const auto* g = std::get_if<GdnParameters>(&p.mixer)) {
         gdn(roots_.input, config.gdn, *g, batch_, execution_.states.gdn(), state.state_index,
-            sequence_, config.norm_epsilon, roots_.output, arena, cuda_);
+            update_, config.norm_epsilon, roots_.output, arena, cuda_);
     } else {
         ops::QsaRawRecordWriteView records;
-        if (!sequence_) {
+        if (!std::holds_alternative<SequenceSlots>(update_)) {
             records = {
                 execution_.qsa_raw_records.slice(3, state.state_index, 1).slice(2, 0, batch_.batch),
                 execution_.qsa_coordinate_records.slice(3, state.state_index, 1)
                     .slice(2, 0, batch_.batch),
                 batch_.record_offsets};
         }
+        const auto after = std::holds_alternative<VerifyRecords>(update_)
+                               ? std::nullopt
+                               : std::optional{execution_.states.main_tail(
+                                     state.state_index, batch_.destination_slots)};
         qsa(roots_.input, config.qsa, std::get<QsaParameters>(p.mixer), batch_,
-            execution_.states.main_tail(state.state_index, batch_.source_slots),
-            execution_.states.main_tail(state.state_index, batch_.destination_slots),
+            execution_.states.main_tail(state.state_index, batch_.source_slots), after,
             execution_.cache.layer(state.state_index), records, roots_.output, arena, cuda_);
     }
     ops::hc_combine_norm(roots_.residual, roots_.output, roots_.injection, p.moe_hc.norm,
@@ -86,12 +91,14 @@ void TextRun::consume_ple(const Tensor& embedding) {
     const auto& p    = parameters_.text;
     const auto start = parameters_.model.config().text.ple.layer;
     ops::PleConvRecordWindowView records;
-    if (!sequence_)
+    if (!std::holds_alternative<SequenceSlots>(update_))
         records = {execution_.ple_records.slice(2, 0, batch_.batch), batch_.record_offsets};
+    const auto after = std::holds_alternative<VerifyRecords>(update_)
+                           ? std::nullopt
+                           : std::optional{execution_.states.ple(batch_.destination_slots)};
     ple(embedding, parameters_.model.config().text, p.ple, batch_,
-        execution_.states.ple(batch_.source_slots), execution_.states.ple(batch_.destination_slots),
-        records, p.layers[start].attention_hc, roots_.residual, roots_.normalized,
-        execution_.workspace, cuda_);
+        execution_.states.ple(batch_.source_slots), after, records, p.layers[start].attention_hc,
+        roots_.residual, roots_.normalized, execution_.workspace, cuda_);
 }
 
 void TextRun::suffix(TextOutputs output) {

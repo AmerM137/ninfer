@@ -146,9 +146,9 @@ public:
 
     [[nodiscard]] std::span<const TokenId> tokens() const noexcept { return tokens_; }
 
-    [[nodiscard]] std::span<const std::int32_t> row_counts() const noexcept { return {}; }
+    [[nodiscard]] std::span<const std::int32_t> row_counts() const noexcept { return counts_; }
 
-    [[nodiscard]] std::uint32_t row_stride() const noexcept { return 1; }
+    [[nodiscard]] std::uint32_t row_stride() const noexcept { return stride_; }
 
     [[nodiscard]] bool constraint_failed(std::size_t row) const { return failed_.at(row); }
 
@@ -159,6 +159,9 @@ private:
     std::uint64_t transaction_ = 0;
     std::vector<SequenceHandle> members_;
     std::vector<TokenId> tokens_;
+    std::vector<std::int32_t> counts_;
+    std::uint32_t stride_ = 1;
+    bool decode_          = false;
     std::array<bool, kMaximumConcurrency> failed_{};
     runtime::ExecutionTiming timing_;
     friend class detail::ProgramImpl;

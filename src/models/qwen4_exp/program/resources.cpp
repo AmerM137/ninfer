@@ -1,4 +1,5 @@
 #include "models/qwen4_exp/program/resources.h"
+#include "core/transfer.h"
 
 #include <algorithm>
 
@@ -30,7 +31,8 @@ Resources::Resources(const execution::Parameters& p, ExecutionPlan input, Device
     : plan(checked_plan(p, std::move(input))), device_(device),
       persistent_(device.device(), plan.persistent.bytes),
       workspace_(device.device(), plan.workspace.bytes), ingress_(plan.pinned_io_bytes),
-      egress_(plan.pinned_output_bytes), sampling_(plan.pinned_sampling_bytes), ple_stream_(device),
+      egress_(plan.pinned_output_bytes), sampling_(plan.pinned_sampling_bytes),
+      mtp_ingress_(plan.pinned_mtp_bytes), ple_stream_(device),
       ple_transfer_(device.execution_view(ple_stream_.stream())),
       workspace(workspace_.span().subspan(0, plan.workspace.general_bytes)) {
     const auto backing = persistent_.span();
@@ -74,6 +76,14 @@ Resources::Resources(const execution::Parameters& p, ExecutionPlan input, Device
         ple_upload->memory().device_bytes != plan.ple_upload.device_bytes)
         throw std::logic_error("PLE allocated capacity differs from the execution plan");
     states->storage().clear_all(device.execution_view());
+    if (plan.persistent.buffers.mtp) {
+        const auto& region = plan.persistent.buffers.mtp->row_indices;
+        auto* rows         = static_cast<std::int32_t*>(mtp_ingress_.data());
+        for (std::uint32_t i = 0; i < plan.shape.max_concurrency; ++i) rows[i] = i;
+        copy_bytes_async(region.region.bind(backing),
+                         mtp_ingress_.span().subspan(0, region.region.bytes),
+                         device.execution_view());
+    }
     if (const auto& counts = plan.persistent.buffers.token_counts)
         CUDA_CHECK(
             cudaMemsetAsync(counts->bind(backing).data, 0, counts->region.bytes, device.stream()));

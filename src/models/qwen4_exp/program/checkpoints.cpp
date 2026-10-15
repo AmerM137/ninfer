@@ -9,7 +9,10 @@ std::optional<CheckpointHandle> ProgramImpl::detach(Sequence& s, runtime::Checkp
     if (!s.request->can_checkpoint(f)) return {};
     auto identity = capture_identity(s);
     std::vector<context::KVPrefixRef> prefixes;
-    prefixes.push_back(resources.main->histories.retain_prefix(s.history.handle(), f));
+    for (std::uint16_t pool = 0; pool < resources.pool_count(); ++pool)
+        prefixes.push_back(resources.pool(pool).histories.retain_prefix(
+            s.histories[pool].handle(),
+            pool == 0 ? f : s.continuation.metadata.mtp_frontier.value()));
     const auto record = checkpoints.reserve();
     if (!record) return {};
     auto& states     = *resources.state_store;
@@ -25,7 +28,7 @@ std::optional<CheckpointHandle> ProgramImpl::detach(Sequence& s, runtime::Checkp
         s.write_destination = {};
     }
     s.continuation.image = {};
-    s.history.reset();
+    for (auto& history : s.histories) history.reset();
     return record;
 }
 
@@ -118,8 +121,11 @@ bool Program::start_capture(SequenceHandle h) {
         migration.own_state(*p.resources.state_store, reservation.destination);
         reservation.destination = {};
         std::vector<context::KVPrefixRef> prefixes;
-        prefixes.push_back(p.resources.main->histories.retain_prefix(
-            s.history.handle(), s.continuation.metadata.main_frontier));
+        for (std::uint16_t pool = 0; pool < p.resources.pool_count(); ++pool)
+            prefixes.push_back(p.resources.pool(pool).histories.retain_prefix(
+                s.histories[pool].handle(), pool == 0
+                                                ? s.continuation.metadata.main_frontier
+                                                : s.continuation.metadata.mtp_frontier.value()));
         p.resources.state_store->freeze(s.continuation.image);
         tx.snapshot.emplace(*p.resources.state_store, s.continuation, std::move(prefixes),
                             s.request->identity);
@@ -144,15 +150,19 @@ std::optional<std::size_t> Program::pause_host_bytes(SequenceHandle h) const {
     if (!s.request->can_checkpoint(s.continuation.metadata.main_frontier) ||
         !p.resources.host_context)
         return {};
-    std::size_t bytes     = p.resources.state_store->host_resident(s.continuation.image)
-                                ? 0
-                                : p.resources.states->storage().image_bytes();
-    const auto& histories = p.resources.main->histories;
-    const auto& pages     = p.resources.main->pages;
-    for (std::uint32_t i = 0; i < (s.continuation.metadata.main_frontier + 63) / 64; ++i) {
-        const auto page = histories.logical_page(s.history.handle(), i);
-        if (pages.active_history_references(page) <= 1 && !pages.host_replica_current(page))
-            bytes += p.pools[0].host_page_stride;
+    std::size_t bytes = p.resources.state_store->host_resident(s.continuation.image)
+                            ? 0
+                            : p.resources.states->storage().image_bytes();
+    for (std::uint16_t pool = 0; pool < p.resources.pool_count(); ++pool) {
+        const auto& storage = p.resources.pool(pool);
+        const auto frontier = pool == 0 ? s.continuation.metadata.main_frontier
+                                        : s.continuation.metadata.mtp_frontier.value();
+        for (std::uint32_t i = 0; i < (frontier + 63) / 64; ++i) {
+            const auto page = storage.histories.logical_page(s.histories[pool].handle(), i);
+            if (storage.pages.active_history_references(page) <= 1 &&
+                !storage.pages.host_replica_current(page))
+                bytes += p.pools[pool].host_page_stride;
+        }
     }
     return bytes;
 }
@@ -192,8 +202,9 @@ bool Program::start_pause(SequenceHandle h, bool save, runtime::ExecutionTiming*
         p.ple.cancel(s.id);
         tx.paused->sequence = std::move(p.sequences[h.lane]);
         if (tx.paused->snapshot) {
-            const auto demotion = p.demotion({&*tx.paused->snapshot, 1},
-                                             {.state_slots = 1, .kv_page_groups = {UINT32_MAX, 0}});
+            const auto demotion =
+                p.demotion({&*tx.paused->snapshot, 1},
+                           {.state_slots = 1, .kv_page_groups = {UINT32_MAX, UINT32_MAX}});
             if (demotion && !p.prepare_demotion(migration, *demotion)) {
                 migration.reset_plan();
                 if (!p.checkpoints.erase(*tx.paused->snapshot))

@@ -6,7 +6,7 @@ NInfer is a C++/CUDA inference engine for maximum single-GPU performance, target
 on NVIDIA GeForce RTX 5090. Choose designs for functional and numerical correctness, clear
 ownership, and the performance goal within the requested scope.
 
-It implements `Qwen3_5ForCausalLM`, `Qwen3_5MoeForCausalLM`, and eager Text/Vision for
+It implements `Qwen3_5ForCausalLM`, `Qwen3_5MoeForCausalLM`, and eager Text/Vision/MTP for
 `Qwen4ExpForCausalLM`. Checkpoints and recipe combinations
 of existing representations use the same architecture, binding and execution path; do not add
 checkpoint-specific execution registration. Generation uses one GPU, one resident model, and

@@ -6,9 +6,9 @@
 namespace ninfer::models::qwen4_exp {
 namespace {
 LoadOptions selection(const EngineOptions& options) {
-    if (options.speculative.backend != SpeculativeBackend::None || options.use_cuda_graph)
+    if (options.use_cuda_graph)
         throw std::invalid_argument(
-            "Qwen4Exp currently supports eager Text/Vision; disable speculation and CUDA Graph");
+            "Qwen4Exp currently supports eager execution; disable CUDA Graph");
     return load_options(options);
 }
 } // namespace

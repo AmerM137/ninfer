@@ -37,6 +37,7 @@ struct ExecutionPlan {
     std::size_t host_context_bytes    = 0;
     std::size_t pinned_io_bytes       = 0;
     std::size_t pinned_sampling_bytes = 0;
+    std::size_t pinned_mtp_bytes      = 0;
     runtime::KvCapacityResolution capacity;
 
     [[nodiscard]] std::size_t device_bytes() const;

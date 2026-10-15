@@ -17,6 +17,12 @@ void copy_bytes(MemorySpan destination, ConstMemorySpan source, CudaExecutionVie
 // The caller keeps both spans alive and orders all consumers through the stream or an event.
 void copy_bytes_async(MemorySpan destination, ConstMemorySpan source, CudaExecutionView execution);
 
+// Copies unchanged rows between disjoint spans. Pitches include row gaps; both spans cover
+// every addressed row. Device and pinned-Host requirements follow copy_bytes_async.
+void copy_rows_async(MemorySpan destination, std::size_t destination_pitch, ConstMemorySpan source,
+                     std::size_t source_pitch, std::size_t width, std::size_t rows,
+                     CudaExecutionView execution);
+
 // Copies rows of unchanged bytes. Both pitches include the gap between rows;
 // source and destination spans cover all addressed rows.
 void copy_host_2d_async(MemorySpan destination, std::size_t destination_pitch, CudaHostView source,

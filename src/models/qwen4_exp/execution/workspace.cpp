@@ -61,7 +61,7 @@ std::size_t body(const ModelProfile& p, const EngineOptions& options, int first,
                 scratch(linear(g->output, minimum, columns));
             } else {
                 const auto& q = std::get<QsaProfile>(layer.mixer);
-                (void)workspace::qsa(a, p.config.text.qsa, columns, prefill);
+                (void)workspace::qsa(a, p.config.text.qsa, columns, prefill || mtp);
                 scratch(qsa_projection_workspace_bytes(q, minimum, columns));
                 scratch(ops::qsa_indexer_workspace_capacity_bytes(first, last, batch,
                                                                   {options.max_context}));
@@ -99,7 +99,8 @@ WorkspacePlan plan_workspace(const ModelProfile& p, const EngineOptions& o, std:
         if (p.mtp) {
             out.verify = std::max(out.verify, body(p, o, 2, o.speculative.draft_tokens + 1, b,
                                                    false, false, sm_count, offload));
-            out.mtp    = std::max(out.mtp, body(p, o, 1, 1, b, false, true, sm_count, nullptr));
+            out.mtp    = std::max(out.mtp, body(p, o, 1, o.speculative.draft_tokens + 1, b, false,
+                                                true, sm_count, nullptr));
         }
     }
     if (p.mtp) out.mtp = std::max(out.mtp, body(p, o, 1, chunk, 1, true, true, sm_count, nullptr));

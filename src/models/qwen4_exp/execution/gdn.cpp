@@ -12,16 +12,16 @@
 namespace ninfer::models::qwen4_exp::execution {
 
 void gdn(const Tensor& input, const GdnConfig& c, const GdnParameters& p, const BatchView& batch,
-         const LinearAttentionStateView& states, std::uint32_t layer,
-         std::optional<SequenceSlots> sequence, float epsilon, Tensor& output, MemoryArena& arena,
-         CudaExecutionView cuda) {
+         const LinearAttentionStateView& states, std::uint32_t layer, const StateUpdate& update,
+         float epsilon, Tensor& output, MemoryArena& arena, CudaExecutionView cuda) {
     const auto kd = dimension(c.key_dim), vd = dimension(c.value_dim);
     const auto kh = dimension(c.key_heads), vh = dimension(c.value_heads);
     const auto kw = dimension(c.key_width()), vw = dimension(c.value_width());
-    const float scale = static_cast<float>(1.0 / std::sqrt(double(c.key_dim)));
-    auto scope        = arena.scope();
-    const auto m      = batch.tokens * batch.batch;
-    auto b            = workspace::gdn(arena, c, m, sequence.has_value());
+    const float scale    = static_cast<float>(1.0 / std::sqrt(double(c.key_dim)));
+    auto scope           = arena.scope();
+    const auto m         = batch.tokens * batch.batch;
+    const auto* sequence = std::get_if<SequenceSlots>(&update);
+    auto b               = workspace::gdn(arena, c, m, sequence != nullptr);
     {
         auto scratch = arena.scope();
         ops::gdn_control_proj(input, p.control, p.a_log, p.dt_bias, {b.g, b.beta}, arena, cuda);
@@ -44,6 +44,29 @@ void gdn(const Tensor& input, const GdnConfig& c, const GdnParameters& p, const 
         auto scratch   = arena.scope();
         ops::gated_delta_net(b.query, b.key, b.value, b.g, b.beta, scale, true, arena, initial,
                              final, recurrent, cuda);
+    } else if (const auto* record = std::get_if<VerifyRecords>(&update)) {
+        auto state         = states.layer_view(layer);
+        const auto records = record->gdn.layer(layer, batch.batch);
+        const auto t       = batch.tokens;
+        auto q             = b.query.view({kd, kh, t, batch.batch});
+        auto k             = b.key.view({kd, kh, t, batch.batch});
+        auto v             = b.value.view({vd, vh, t, batch.batch});
+        auto z             = b.z.view({vw, t, batch.batch});
+        {
+            auto scratch = arena.scope();
+            auto conv    = records.conv;
+            ops::gdn_input_proj_conv_record(
+                input.view({input.ne[0], t, batch.batch}), p.input, p.convolution,
+                {state.conv, batch.source_slots}, batch.valid_columns,
+                {q.view({kw, t, batch.batch}), k.view({kw, t, batch.batch}),
+                 v.view({vw, t, batch.batch}), z},
+                conv, arena, cuda);
+        }
+        auto recurrent = b.recurrent.view({vd, vh, t, batch.batch});
+        ops::gated_delta_net_replay_record(
+            q, k, v, b.g.view({vh, t, batch.batch}), b.beta.view({vh, t, batch.batch}), scale,
+            state.recurrent, batch.valid_columns, batch.source_slots,
+            {records.key, records.value, records.gate}, recurrent, cuda);
     } else {
         auto state = states.layer_view(layer);
         auto q     = b.query.view({kd, kh, 1, batch.batch});

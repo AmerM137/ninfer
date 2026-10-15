@@ -33,15 +33,21 @@ public:
 
     [[nodiscard]] MemorySpan sampling_ingress() { return sampling_.span(); }
 
+    [[nodiscard]] MemorySpan mtp_ingress() { return mtp_ingress_.span(); }
+
     [[nodiscard]] MemorySpan workspace_storage() { return workspace_.span(); }
 
     [[nodiscard]] CudaExecutionView ple_transfer() const { return ple_transfer_; }
+
+    [[nodiscard]] std::uint32_t pool_count() const { return mtp ? 2 : 1; }
+
+    [[nodiscard]] ContextPool& pool(std::uint32_t index) const { return index == 0 ? *main : *mtp; }
 
     const ExecutionPlan plan;
 private:
     DeviceContext& device_;
     DeviceBuffer persistent_, workspace_;
-    PinnedHostBuffer ingress_, egress_, sampling_;
+    PinnedHostBuffer ingress_, egress_, sampling_, mtp_ingress_;
     CudaStream ple_stream_;
     CudaExecutionView ple_transfer_;
 public:

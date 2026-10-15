@@ -32,15 +32,15 @@ std::vector<Image> ProgramImpl::checkpoint_images(std::span<const CheckpointHand
 }
 
 std::vector<context::LogicalKVPageHandle>
-ProgramImpl::checkpoint_pages(std::span<const CheckpointHandle> records) const {
+ProgramImpl::checkpoint_pages(std::span<const CheckpointHandle> records, std::uint32_t pool) const {
     std::vector<context::LogicalKVPageHandle> out;
     std::unordered_set<std::uint32_t> seen;
     for (const auto h : records)
         if (checkpoints.valid(h)) {
-            const auto& prefix = checkpoints.at(h).snapshot.prefix(0);
+            const auto& prefix = checkpoints.at(h).snapshot.prefix(pool);
             for (std::uint32_t i = 0; i < (prefix.frontier() + 63) / 64; ++i) {
-                const auto page = resources.main->histories.logical_page(prefix.history(), i);
-                if (seen.insert(resources.main->pages.descriptor_index(page)).second)
+                const auto page = resources.pool(pool).histories.logical_page(prefix.history(), i);
+                if (seen.insert(resources.pool(pool).pages.descriptor_index(page)).second)
                     out.push_back(page);
             }
         }
@@ -65,17 +65,21 @@ ContextResources ProgramImpl::footprint(std::span<const CheckpointHandle> input,
         if (states.host_resident(image))
             out.host_bytes += resources.states->storage().image_bytes();
     }
-    std::vector<context::LogicalKVPageHandle> pages;
-    if (released) {
-        std::vector<const context::KVPrefixRef*> prefixes;
-        for (const auto h : records) prefixes.push_back(&checkpoints.at(h).snapshot.prefix(0));
-        pages = resources.main->histories.released_pages(prefixes);
-    } else
-        pages = checkpoint_pages(records);
-    for (const auto page : pages) {
-        if (released && resources.main->pages.source_pins(page)) continue;
-        out.kv_page_groups[0] += resources.main->pages.device_resident(page);
-        if (resources.main->pages.host_resident(page)) out.host_bytes += pools[0].host_page_stride;
+    for (std::uint16_t pool = 0; pool < resources.pool_count(); ++pool) {
+        const auto& storage = resources.pool(pool);
+        std::vector<context::LogicalKVPageHandle> pages;
+        if (released) {
+            std::vector<const context::KVPrefixRef*> prefixes;
+            for (const auto h : records)
+                prefixes.push_back(&checkpoints.at(h).snapshot.prefix(pool));
+            pages = storage.histories.released_pages(prefixes);
+        } else
+            pages = checkpoint_pages(records, pool);
+        for (const auto page : pages) {
+            if (released && storage.pages.source_pins(page)) continue;
+            out.kv_page_groups[pool] += storage.pages.device_resident(page);
+            if (storage.pages.host_resident(page)) out.host_bytes += pools[pool].host_page_stride;
+        }
     }
     return out;
 }
@@ -129,26 +133,30 @@ std::shared_ptr<Demotion> ProgramImpl::demotion(std::span<const CheckpointHandle
             if (resources.state_store->device_resident(image) &&
                 !resources.state_store->source_pins(image))
                 out->images.push_back(image);
-    if (shortage.kv_page_groups[0])
-        for (const auto page : checkpoint_pages(out->records))
-            if (resources.main->pages.device_resident(page) &&
-                !resources.main->pages.source_pins(page) &&
-                !resources.main->pages.active_history_references(page))
-                out->pages.push_back(page);
-    return out->images.empty() && out->pages.empty() ? nullptr : out;
+    for (std::uint16_t pool = 0; pool < resources.pool_count(); ++pool)
+        if (shortage.kv_page_groups[pool]) {
+            const auto& pages = resources.pool(pool).pages;
+            for (const auto page : checkpoint_pages(out->records, pool))
+                if (pages.device_resident(page) && !pages.source_pins(page) &&
+                    !pages.active_history_references(page))
+                    out->pages[pool].push_back(page);
+        }
+    return out->empty() ? nullptr : out;
 }
 
 ContextDemotion ProgramImpl::describe_demotion(std::shared_ptr<const Demotion> plan) const {
     ContextDemotion out;
-    out.sources                    = plan->records;
-    out.released.state_slots       = plan->images.size();
-    out.released.kv_page_groups[0] = plan->pages.size();
+    out.sources              = plan->records;
+    out.released.state_slots = plan->images.size();
     for (const auto image : plan->images)
         if (!resources.state_store->host_resident(image))
             out.host_bytes += resources.states->storage().image_bytes();
-    for (const auto page : plan->pages)
-        if (!resources.main->pages.host_replica_current(page))
-            out.host_bytes += pools[0].host_page_stride;
+    for (std::uint16_t pool = 0; pool < resources.pool_count(); ++pool) {
+        out.released.kv_page_groups[pool] = plan->pages[pool].size();
+        for (const auto page : plan->pages[pool])
+            if (!resources.pool(pool).pages.host_replica_current(page))
+                out.host_bytes += pools[pool].host_page_stride;
+    }
     out.impl = std::move(plan);
     return out;
 }
@@ -167,29 +175,32 @@ bool ProgramImpl::prepare_demotion(context::MigrationBatch& migration, const Dem
             migration.add_state_copy(std::move(*transfer), false);
         }
     }
-    std::vector<context::LogicalKVPageHandle> pages, redundant_pages;
-    for (auto page : plan.pages) {
-        const auto& store = resources.main->pages;
-        if (!store.valid(page) || !store.device_resident(page) || store.source_pins(page) ||
-            store.active_history_references(page))
-            return false;
-        if (store.host_replica_current(page))
-            redundant_pages.push_back(page);
-        else
-            pages.push_back(page);
-    }
-    if (!pages.empty()) {
-        auto target = resources.host_extents->prepare(resources.main->pages, pages);
-        if (!target) return false;
-        migration.add_backup(kMainPool, resources.main->pages, std::move(pages), std::move(*target),
-                             true);
+    std::array<std::vector<context::LogicalKVPageHandle>, 2> redundant_pages;
+    for (std::uint16_t pool = 0; pool < resources.pool_count(); ++pool) {
+        auto& store = resources.pool(pool).pages;
+        std::vector<context::LogicalKVPageHandle> pages;
+        for (auto page : plan.pages[pool]) {
+            if (!store.valid(page) || !store.device_resident(page) || store.source_pins(page) ||
+                store.active_history_references(page))
+                return false;
+            if (store.host_replica_current(page))
+                redundant_pages[pool].push_back(page);
+            else
+                pages.push_back(page);
+        }
+        if (!pages.empty()) {
+            auto target = resources.host_extents->prepare(store, pages);
+            if (!target) return false;
+            migration.add_backup({pool}, store, std::move(pages), std::move(*target), true);
+        }
     }
     for (const auto image : redundant)
         if (!resources.state_store->drop_device_replica(image))
             throw std::logic_error("state demotion lost exclusivity");
-    for (const auto page : redundant_pages)
-        if (!resources.main->pages.drop_device_replica(page))
-            throw std::logic_error("KV demotion lost exclusivity");
+    for (std::uint16_t pool = 0; pool < resources.pool_count(); ++pool)
+        for (const auto page : redundant_pages[pool])
+            if (!resources.pool(pool).pages.drop_device_replica(page))
+                throw std::logic_error("KV demotion lost exclusivity");
     return true;
 }
 
@@ -245,16 +256,18 @@ std::vector<ContextRelease> Program::plan_releases(std::span<const CheckpointHan
             add(std::move(owners));
         }
     }
-    if (shortage.kv_page_groups[0] || shortage.host_bytes) {
-        for (const auto page : p.checkpoint_pages(records)) {
-            std::vector<CheckpointHandle> owners;
-            for (auto h : records) {
-                const auto pages = p.checkpoint_pages({&h, 1});
-                if (std::find(pages.begin(), pages.end(), page) != pages.end()) owners.push_back(h);
+    for (std::uint16_t pool = 0; pool < p.resources.pool_count(); ++pool)
+        if (shortage.kv_page_groups[pool] || shortage.host_bytes) {
+            for (const auto page : p.checkpoint_pages(records, pool)) {
+                std::vector<CheckpointHandle> owners;
+                for (auto h : records) {
+                    const auto pages = p.checkpoint_pages({&h, 1}, pool);
+                    if (std::find(pages.begin(), pages.end(), page) != pages.end())
+                        owners.push_back(h);
+                }
+                add(std::move(owners));
             }
-            add(std::move(owners));
         }
-    }
     return out;
 }
 
@@ -276,25 +289,31 @@ ContextReclaimPlan Program::plan_reclaim(std::span<const CheckpointHandle> allow
             const auto other = p.checkpoints.handle(i);
             if (!p.checkpoints.valid(other) || other == h) continue;
             const auto image = p.checkpoints.at(other).snapshot.continuation().image;
-            const auto pages = p.checkpoint_pages({&other, 1});
-            if (std::find(plan->images.begin(), plan->images.end(), image) == plan->images.end() &&
-                std::none_of(pages.begin(), pages.end(), [&](auto page) {
-                    return std::find(plan->pages.begin(), plan->pages.end(), page) !=
-                           plan->pages.end();
-                }))
-                continue;
+            std::array<std::vector<context::LogicalKVPageHandle>, 2> pages;
+            bool shares =
+                std::find(plan->images.begin(), plan->images.end(), image) != plan->images.end();
+            for (std::uint16_t pool = 0; pool < p.resources.pool_count(); ++pool) {
+                pages[pool] = p.checkpoint_pages({&other, 1}, pool);
+                shares |= std::any_of(pages[pool].begin(), pages[pool].end(), [&](auto page) {
+                    return std::find(plan->pages[pool].begin(), plan->pages[pool].end(), page) !=
+                           plan->pages[pool].end();
+                });
+            }
+            if (!shares) continue;
             if (std::find(allowed.begin(), allowed.end(), other) == allowed.end() ||
                 std::find(excluded.begin(), excluded.end(), other) != excluded.end() ||
                 !p.checkpoints.erasable(other)) {
                 std::erase(plan->images, image);
-                std::erase_if(plan->pages, [&](auto page) {
-                    return std::find(pages.begin(), pages.end(), page) != pages.end();
-                });
-            } else
+                for (std::uint16_t pool = 0; pool < p.resources.pool_count(); ++pool)
+                    std::erase_if(plan->pages[pool], [&](auto page) {
+                        return std::find(pages[pool].begin(), pages[pool].end(), page) !=
+                               pages[pool].end();
+                    });
+            } else if (std::find(plan->records.begin(), plan->records.end(), other) ==
+                       plan->records.end())
                 plan->records.push_back(other);
         }
-        if (!plan->images.empty() || !plan->pages.empty())
-            out.demotions.push_back(p.describe_demotion(std::move(plan)));
+        if (!plan->empty()) out.demotions.push_back(p.describe_demotion(std::move(plan)));
     }
     return out;
 }
@@ -318,7 +337,8 @@ bool ContextDemotionBatch::append(const ContextDemotion& other) {
                 values.push_back(value);
     };
     append(plan_->images, other.impl->images);
-    append(plan_->pages, other.impl->pages);
+    for (std::uint16_t pool = 0; pool < plan_->owner->resources.pool_count(); ++pool)
+        append(plan_->pages[pool], other.impl->pages[pool]);
     append(plan_->records, other.impl->records);
     return true;
 }
@@ -330,7 +350,7 @@ bool ContextDemotionBatch::covers(const ContextRelease& release) const {
 }
 
 std::optional<ContextDemotion> ContextDemotionBatch::finish() const {
-    if (plan_->images.empty() && plan_->pages.empty()) return {};
+    if (plan_->empty()) return {};
     return plan_->owner->describe_demotion(plan_);
 }
 
@@ -361,7 +381,6 @@ std::size_t Program::release_redundant_host(std::span<const CheckpointHandle> ex
     if (!p.resources.host_context) return 0;
     const auto before = p.resources.host_context->occupied_bytes();
     const auto images = p.checkpoint_images(excluded);
-    const auto pages  = p.checkpoint_pages(excluded);
     std::vector<CheckpointHandle> all;
     for (std::uint32_t i = 0; i < p.checkpoints.size(); ++i)
         if (p.checkpoints.valid(p.checkpoints.handle(i))) all.push_back(p.checkpoints.handle(i));
@@ -371,16 +390,19 @@ std::size_t Program::release_redundant_host(std::span<const CheckpointHandle> ex
             continue;
         (void)p.resources.state_store->drop_host_replica(image);
     }
-    std::vector<context::LogicalKVPageHandle> drop;
-    for (const auto page : p.checkpoint_pages(all))
-        if (std::find(pages.begin(), pages.end(), page) == pages.end() &&
-            p.resources.main->pages.host_resident(page) &&
-            p.resources.main->pages.device_covers(page,
-                                                  p.resources.main->pages.required_columns(page)) &&
-            p.resources.host_extents->can_release_page_replica(p.resources.main->pages, page))
-            drop.push_back(page);
-    if (!drop.empty())
-        (void)p.resources.host_extents->release_page_replicas(p.resources.main->pages, drop);
+    for (std::uint16_t pool = 0; pool < p.resources.pool_count(); ++pool) {
+        const auto protected_pages = p.checkpoint_pages(excluded, pool);
+        auto& store                = p.resources.pool(pool).pages;
+        std::vector<context::LogicalKVPageHandle> drop;
+        for (const auto page : p.checkpoint_pages(all, pool))
+            if (std::find(protected_pages.begin(), protected_pages.end(), page) ==
+                    protected_pages.end() &&
+                store.host_resident(page) &&
+                store.device_covers(page, store.required_columns(page)) &&
+                p.resources.host_extents->can_release_page_replica(store, page))
+                drop.push_back(page);
+        if (!drop.empty()) (void)p.resources.host_extents->release_page_replicas(store, drop);
+    }
     return before - p.resources.host_context->occupied_bytes();
 }
 

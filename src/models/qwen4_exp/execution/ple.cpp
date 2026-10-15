@@ -4,9 +4,10 @@
 namespace ninfer::models::qwen4_exp::execution {
 
 void ple(const Tensor& embedding, const TextConfig& c, const PleParameters& p,
-         const BatchView& batch, const ops::PleConvStateView& before, ops::PleConvStateView after,
-         ops::PleConvRecordWindowView records, const HcParameters& next, Tensor& residual,
-         Tensor& normalized, MemoryArena& arena, CudaExecutionView cuda) {
+         const BatchView& batch, const ops::PleConvStateView& before,
+         std::optional<ops::PleConvStateView> after, ops::PleConvRecordWindowView records,
+         const HcParameters& next, Tensor& residual, Tensor& normalized, MemoryArena& arena,
+         CudaExecutionView cuda) {
     const auto h = dimension(c.hidden), streams = dimension(c.hc.streams);
     const auto channels = dimension(c.residual_width());
     auto scope          = arena.scope();
@@ -31,8 +32,9 @@ void ple(const Tensor& embedding, const TextConfig& c, const PleParameters& p,
     ops::ple_conv_add_norm(residual_view, gated, p.convolution, {batch.valid_columns}, before,
                            records, next.norm, p.gate.rms_epsilon, residual_view, normalized_view,
                            cuda);
-    ops::ple_state_extract(before, {records.values, batch.valid_columns}, batch.valid_columns,
-                           after, cuda);
+    if (after)
+        ops::ple_state_extract(before, {records.values, batch.valid_columns}, batch.valid_columns,
+                               *after, cuda);
 }
 
 } // namespace ninfer::models::qwen4_exp::execution

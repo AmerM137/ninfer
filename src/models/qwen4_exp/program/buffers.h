@@ -12,9 +12,26 @@ struct QsaRecordLayout {
 struct BatchLayout {
     TensorRegion ids, positions, rope_positions;
     std::optional<TensorRegion> visual_indices;
-    TensorRegion valid_columns, source_slots, destination_slots, main_tables, backend_tables;
-    TensorRegion base_positions, record_offsets, recorded_columns, accepted_columns;
-    std::uint32_t max_positions, max_batch;
+    TensorRegion valid_columns, source_slots, destination_slots, main_tables;
+    TensorRegion base_positions, record_offsets, accepted_columns;
+    std::uint32_t max_positions;
+};
+
+struct MtpBatchLayout {
+    TensorRegion ids, positions, rope_positions;
+    TensorRegion valid_columns, source_slots, destination_slots, table_rows;
+    TensorRegion base_positions, record_offsets;
+    std::optional<TensorRegion> visual_indices;
+    LayoutRegion ingress;
+};
+
+struct MtpBufferLayout {
+    MtpBatchLayout history;
+    std::vector<MtpBatchLayout> draft_steps;
+    LayoutRegion ingress;
+    TensorRegion base_conditioning, alignment_conditioning, hidden, sample;
+    TensorRegion tail_keys, tail_coordinates, row_indices;
+    TensorRegion drafts, extents, anchors, frontiers, target_tokens, token_counts;
 };
 
 struct BufferLayout {
@@ -26,10 +43,9 @@ struct BufferLayout {
     QsaRecordLayout main_qsa;
     TensorRegion ple_records;
     std::optional<GdnReplayRecordLayout> gdn_records;
-    std::optional<QsaRecordLayout> mtp_qsa;
-    std::optional<TensorRegion> mtp_hidden, mtp_sample, draft_ids;
+    std::optional<MtpBufferLayout> mtp;
     std::optional<TensorRegion> logits;
-    std::optional<TensorRegion> sampled_ids, output_counts, next_anchors, accepted_drafts;
+    std::optional<TensorRegion> sampled_ids, output_counts, accepted_drafts;
     std::optional<TensorRegion> token_counts, sampling, grammar_masks;
 };
 

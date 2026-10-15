@@ -14,6 +14,10 @@ namespace ninfer::models::qwen4_exp::detail {
 using Image = context::StateImageStore::Handle;
 using Clock = std::chrono::steady_clock;
 
+inline double seconds(Clock::time_point start) {
+    return std::chrono::duration<double>(Clock::now() - start).count();
+}
+
 struct CapturePoint {
     std::uint32_t frontier;
     std::vector<runtime::CheckpointRole> roles;
@@ -69,7 +73,7 @@ struct Sequence {
     Identity identity;
     Continuation continuation;
     Image write_destination;
-    context::KVHistory history;
+    std::array<context::KVHistory, 2> histories;
     Phase phase = Phase::Prefill, resume_phase = Phase::Active;
     std::uint32_t reused = 0, replay_target = 0, recovery_peak = 0;
     std::optional<ExecutionUnit> permit;
@@ -80,8 +84,21 @@ struct Sequence {
     std::unique_ptr<qwen::VisionPrefillSession> vision;
     double observed_vision_seconds = 0;
     GenerationTimings timings;
+    SpeculativeStats speculative;
     Clock::time_point started = Clock::now();
     std::optional<Clock::time_point> first_output;
+};
+
+struct MtpInputRow {
+    std::uint32_t base;
+    std::span<const TokenId> ids;
+};
+
+struct VerifyRound {
+    std::uint32_t width;
+    std::vector<std::uint32_t> bases, extents;
+    std::vector<TokenId> inputs;
+    execution::BatchView batch;
 };
 
 struct Suspended {
@@ -95,8 +112,12 @@ struct Suspended {
 struct Demotion {
     const ProgramImpl* owner = nullptr;
     std::vector<Image> images;
-    std::vector<context::LogicalKVPageHandle> pages;
+    std::array<std::vector<context::LogicalKVPageHandle>, 2> pages;
     std::vector<CheckpointHandle> records;
+
+    [[nodiscard]] bool empty() const {
+        return images.empty() && pages[0].empty() && pages[1].empty();
+    }
 };
 
 struct Reclaim {
@@ -170,6 +191,19 @@ public:
     void settle(Sequence&);
     [[nodiscard]] Tensor device_tensor(const TensorRegion&);
     [[nodiscard]] Tensor host_tensor(const TensorRegion&);
+    [[nodiscard]] Tensor packed_tensor(const TensorRegion&, std::initializer_list<std::int32_t>);
+    [[nodiscard]] execution::BatchView mtp_inputs(const MtpBatchLayout&, std::span<Sequence* const>,
+                                                  std::uint32_t tokens,
+                                                  std::span<const MtpInputRow>);
+    void align_mtp(std::span<Sequence* const>, std::uint32_t tokens, const Tensor& previous,
+                   const Tensor& conditioning, std::optional<execution::VisualEmbeddingView>);
+    [[nodiscard]] ops::QsaTailStateView mtp_working_tail(std::uint32_t slot, std::uint32_t batch);
+    [[nodiscard]] PendingBatch mtp_decode(std::span<Sequence* const>,
+                                          std::span<const runtime::RoundBudget>,
+                                          runtime::TokenMaskProvider*,
+                                          runtime::ExecutionTimingRecorder&);
+    void commit_verify(std::span<const SequenceHandle>, std::span<const runtime::CommitDecision>,
+                       runtime::ExecutionTimingRecorder&);
     [[nodiscard]] Tensor forward(std::span<Sequence* const>, std::uint32_t tokens, bool sequence);
     void adopt_forward(std::span<Sequence* const>, std::uint32_t tokens);
     [[nodiscard]] PendingBatch sample(std::span<Sequence* const>, const Tensor&, bool first,
@@ -185,7 +219,7 @@ public:
     [[nodiscard]] std::size_t active_vision_bytes() const noexcept;
     [[nodiscard]] std::optional<CheckpointHandle> detach(Sequence&, runtime::CheckpointRole);
     [[nodiscard]] std::vector<context::LogicalKVPageHandle>
-        checkpoint_pages(std::span<const CheckpointHandle>) const;
+    checkpoint_pages(std::span<const CheckpointHandle>, std::uint32_t pool) const;
     [[nodiscard]] std::vector<Image> checkpoint_images(std::span<const CheckpointHandle>) const;
     [[nodiscard]] ContextResources footprint(std::span<const CheckpointHandle>,
                                              bool released) const;
@@ -215,8 +249,8 @@ public:
     std::unique_ptr<ContextOperation> operation;
     std::uint64_t next_sequence = 1, next_transaction = 1, pending_transaction = 0;
     std::vector<SequenceHandle> pending_members;
-    std::array<TokenId, kMaximumConcurrency> pending_tokens{};
     std::array<bool, kMaximumConcurrency> pending_failed{};
+    std::optional<VerifyRound> pending_verify;
 };
 
 [[nodiscard]] ops::SamplingConfig sampling_config(const ResolvedSamplingParameters&);

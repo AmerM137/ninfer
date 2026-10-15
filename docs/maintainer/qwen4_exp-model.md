@@ -2,7 +2,7 @@
 
 Qwen3.8-Flash-Next 是本合同的 checkpoint 实例，数学架构为 Qwen4Exp。现有
 `qwen3_8_flash_next` recipe 已完成 Text、可选 Vision 和原生 MTP 的 V3 `.ninfer` 转换；
-原生 loader、Parameters、执行资源与 Main eager Text/Vision 已接入 Engine。
+原生 loader、Parameters、执行资源与 eager Text/Vision/MTP 已接入 Engine。
 Op 与模型执行的完成范围、状态组合和剩余需求统一见
 [执行进度](qwen4_exp-execution.md#implementation-status)，PLE 的 Host 数学和读取流水见
 [PLE I/O](qwen4_exp-ple-io.md)。
@@ -189,7 +189,7 @@ Recipe 与产物的 MTP expert Uses 使用 `AllowA8`。GPU 计算目标为 W8A8�
 PLE 使用 [stored_scale_mse](tensor-formats.md#36-stored_scale_mse-conversion-method)，
 每个原始 shard 独立计算完整 `amax` 与 divisor。固定 codebook、完整 scale 候选域、
 FP64 误差和平局规则由该通用合同维护。分块只改变工作集，不能改变分组或 divisor。
-完整量化组合的模型质量及 MTP 接受率在模型接入后验证。
+接受率与端到端延迟按实际语料、draft 数和 Main expert 驻留容量评估。
 
 ## 3. 物理 parent 与行顺序
 

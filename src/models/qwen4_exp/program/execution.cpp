@@ -13,6 +13,13 @@ Tensor first(const Tensor& tensor, std::int32_t count) {
 
 Tensor ProgramImpl::device_tensor(const TensorRegion& r) { return r.bind(resources.persistent()); }
 
+Tensor ProgramImpl::packed_tensor(const TensorRegion& region,
+                                  std::initializer_list<std::int32_t> shape) {
+    std::int32_t count = 1;
+    for (const auto n : shape) count *= n;
+    return first(device_tensor(region), count).view(shape);
+}
+
 Tensor ProgramImpl::host_tensor(const TensorRegion& region) {
     auto r = region;
     r.region.offset -= resources.plan.persistent.buffers.batch.ids.region.offset;
@@ -57,7 +64,7 @@ std::uint32_t ProgramImpl::unit_end(const Sequence& s, ExecutionUnitKind kind,
     case ExecutionUnitKind::Replay:
         return window_end(s, f, s.replay_target);
     case ExecutionUnitKind::Decode:
-        return f + 1;
+        return f + std::min({shape.draft_tokens + 1, std::max(tokens, 1U), shape.max_context - f});
     case ExecutionUnitKind::Control:
         return std::min(shape.max_context, f + tokens);
     case ExecutionUnitKind::Normalize:
@@ -67,8 +74,12 @@ std::uint32_t ProgramImpl::unit_end(const Sequence& s, ExecutionUnitKind kind,
 }
 
 void ProgramImpl::settle(Sequence& s) {
-    resources.main->histories.settle_growth(s.history, s.continuation.metadata.main_frontier,
-                                            s.recovery_peak, cuda.stream());
+    for (std::uint32_t i = 0; i < resources.pool_count(); ++i) {
+        const auto frontier = i == 0 ? s.continuation.metadata.main_frontier
+                                     : s.continuation.metadata.mtp_frontier.value();
+        const auto retain   = i == 0 ? s.recovery_peak : mtp_history_frontier(s.recovery_peak);
+        resources.pool(i).histories.settle_growth(s.histories[i], frontier, retain, cuda.stream());
+    }
     s.permit.reset();
 }
 
@@ -95,15 +106,14 @@ Tensor ProgramImpl::forward(std::span<Sequence* const> rows, std::uint32_t token
         const auto f = s.continuation.metadata.main_frontier;
         if (f + tokens > s.identity.tokens.size() || f + tokens > s.permitted_frontier)
             throw std::logic_error("forward exceeds its input or resource reservation");
-        resources.main->histories.prepare_write(s.history, f, f + tokens, cuda.stream());
+        resources.main->histories.prepare_write(s.histories[0], f, f + tokens, cuda.stream());
         const auto slots = selectors(s);
         set(io.valid_columns, b, t);
         set(io.source_slots, b, slots.source);
         set(io.destination_slots, b, slots.destination);
-        set(io.main_tables, b, resources.main->histories.bound_row(s.history.handle()));
+        set(io.main_tables, b, resources.main->histories.bound_row(s.histories[0].handle()));
         set(io.base_positions, b, f);
         set(io.record_offsets, b, 0);
-        set(io.recorded_columns, b, t);
         set(io.accepted_columns, b, t);
         for (int j = 0; j < t; ++j) {
             ids[j + t * b]       = s.identity.tokens[f + j];
@@ -119,6 +129,29 @@ Tensor ProgramImpl::forward(std::span<Sequence* const> rows, std::uint32_t token
         maximum   = std::max(maximum, f + tokens);
     }
     const auto ticket = ple.require(tokens, {inputs.data(), rows.size()});
+    Tensor conditioning, previous_conditioning;
+    if (parameters.mtp) {
+        const auto channels = dimension(parameters.model.config().text.residual_width());
+        const auto& mtp     = *layout.mtp;
+        auto base           = packed_tensor(mtp.base_conditioning, {channels, batch});
+        for (int row = 0; row < batch; ++row) {
+            auto old   = resources.states->conditioning().slice(1, selectors(*rows[row]).source, 1);
+            auto saved = base.slice(1, row, 1);
+            copy_bytes_async({saved.data, saved.bytes(), cuda.device()},
+                             {old.data, old.bytes(), cuda.device()}, cuda);
+        }
+        if (sequence_route) {
+            auto window       = device_tensor(*layout.prefill_conditioning);
+            auto first_column = window.slice(1, 0, 1);
+            copy_bytes_async({first_column.data, first_column.bytes(), cuda.device()},
+                             {base.data, base.bytes(), cuda.device()}, cuda);
+            conditioning          = window.slice(1, 1, t);
+            previous_conditioning = window.slice(1, 0, t);
+        } else {
+            conditioning = packed_tensor(*layout.pending_conditioning, {channels, t, batch});
+            previous_conditioning = base.view({channels, t, batch});
+        }
+    }
     std::optional<execution::VisualEmbeddingView> visual;
     if (sequence_route && rows[0]->request->vision) {
         visual = prepare_vision(*rows[0], tokens);
@@ -169,7 +202,9 @@ Tensor ProgramImpl::forward(std::span<Sequence* const> rows, std::uint32_t token
             layout.main_qsa.keys.bind(resources.persistent()),
             layout.main_qsa.coordinates.bind(resources.persistent()),
             layout.ple_records.bind(resources.persistent())};
-        execution::TextRun run(parameters, execution, call, sequence, cuda);
+        execution::StateUpdate update = execution::StepUpdate{};
+        if (sequence) update = *sequence;
+        execution::TextRun run(parameters, execution, call, update, cuda);
         run.prefix(visual);
         auto embedding = ple.consume(ticket);
         run.consume_ple(embedding);
@@ -191,8 +226,9 @@ Tensor ProgramImpl::forward(std::span<Sequence* const> rows, std::uint32_t token
                 ple.prefetch(end - begin, {&next, 1});
             }
         }
-        run.suffix({sample, {}});
+        run.suffix({sample, conditioning});
     }
+    if (parameters.mtp) align_mtp(rows, tokens, previous_conditioning, conditioning, visual);
     auto hidden = resources.states->sample_hidden();
     if (sequence_route) {
         const auto last  = sample.slice(1, t - 1, 1);
@@ -214,7 +250,11 @@ void ProgramImpl::adopt_forward(std::span<Sequence* const> rows, std::uint32_t t
             m.ple_raw_tail = {m.ple_raw_tail[1], s.identity.tokens[m.main_frontier + j]};
         complete_write(s);
         m.main_frontier += tokens;
-        resources.main->histories.commit_frontier(s.history.handle(), m.main_frontier);
+        resources.main->histories.commit_frontier(s.histories[0].handle(), m.main_frontier);
+        if (resources.mtp) {
+            m.mtp_frontier = mtp_history_frontier(m.main_frontier);
+            resources.mtp->histories.commit_frontier(s.histories[1].handle(), *m.mtp_frontier);
+        }
     }
 }
 
@@ -234,6 +274,7 @@ PendingBatch ProgramImpl::sample(std::span<Sequence* const> rows, const Tensor& 
     PendingBatch pending;
     pending.owner_       = this;
     pending.transaction_ = next_transaction++;
+    pending.decode_      = !first_token;
     for (int row = 0; row < b; ++row) {
         auto& s      = *rows[row];
         configs[row] = s.request->sampling;
@@ -280,7 +321,6 @@ PendingBatch ProgramImpl::sample(std::span<Sequence* const> rows, const Tensor& 
     pending_members     = pending.members_;
     for (int row = 0; row < b; ++row) {
         rows[row]->phase    = Phase::Pending;
-        pending_tokens[row] = ids[row];
         pending_failed[row] = pending.failed_[row];
     }
     return pending;

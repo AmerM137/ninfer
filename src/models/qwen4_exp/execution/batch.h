@@ -1,6 +1,9 @@
 #pragma once
 
 #include "core/tensor.h"
+#include "core/gdn_replay_records.h"
+
+#include <variant>
 
 namespace ninfer::models::qwen4_exp::execution {
 
@@ -15,6 +18,14 @@ struct BatchView {
 struct SequenceSlots {
     std::int32_t source, destination;
 };
+
+struct StepUpdate {};
+
+struct VerifyRecords {
+    const GdnReplayRecords& gdn;
+};
+
+using StateUpdate = std::variant<SequenceSlots, StepUpdate, VerifyRecords>;
 
 struct TextOutputs {
     Tensor sample;

@@ -7,7 +7,7 @@
 namespace ninfer::models::qwen4_exp::execution {
 
 void gdn(const Tensor& input, const GdnConfig& c, const GdnParameters&, const BatchView&,
-         const LinearAttentionStateView&, std::uint32_t layer, std::optional<SequenceSlots>,
-         float epsilon, Tensor& output, MemoryArena&, CudaExecutionView);
+         const LinearAttentionStateView&, std::uint32_t layer, const StateUpdate&, float epsilon,
+         Tensor& output, MemoryArena&, CudaExecutionView);
 
 } // namespace ninfer::models::qwen4_exp::execution

@@ -8,8 +8,8 @@
 单个 Op 的完整公式、支持域、alias、workspace 和执行约束由 `include/ninfer/ops/`
 中的合同维护，本文只规定模型如何组合这些计算。[Engine 架构](engine-architecture.md)
 拥有请求事务与发布规则，[Paged KV](paged-kv-cache.md)拥有物理页、replica 和迁移机制。
-Main eager Text/Vision 已接入公共 Engine，使用下述层流程、StateImage、QSA 页池和请求事务。
-MTP 与 Graph 的段落保留后续集成约定；当前启用范围见文末执行进度。
+Eager Text/Vision/MTP 已接入公共 Engine，使用下述层流程、StateImage、QSA 页池和请求事务。
+Graph 尚未接入；当前启用范围见文末执行进度。
 
 ## 1. 共同轴、前沿与所有权
 
@@ -22,9 +22,10 @@ MTP 与 Graph 的段落保留后续集成约定；当前启用范围见文末执
 | `R`、`u[b]`、`a[b]` | 记录容量、连续已记录列数、最终采用的输入列数；`0<=a<=u<=R` |
 | `S` | StateImage 槽数；state slot、resident lane、batch row、KV table row 是独立身份 |
 
-Main 和 MTP Backend 各自维护前沿，模型 bridge 建立两者关系。接受长度 `a` 按实际
-输入列计数，由 Program 从后端接受结果和 Frontend decision 换算，不能直接使用输出
-token 数、预取进度或 ledger 中尚未执行的下一输入。
+Main 和 MTP Backend 各自维护前沿。规范提交边界的 Main 前沿为 `F`，Backend 前沿为
+`max(F-1,0)`；Backend 位置 `j` 配对 Main conditioning `j` 与输入 embedding `j+1`，
+RoPE 使用位置 `j` 的坐标。接受长度 `a` 按实际输入列计数，由 Program 从后端接受结果和
+Frontend decision 换算；预取进度和 ledger 中尚未执行的下一输入不推进前沿。
 
 连续 `[H,T,B]` 与 `[H,M]`、`[H,4,T,B]` 与 `[H,4,M]` 可以零拷贝改 view；合并投影的
 子范围保留真实 parent strides。HC 的四条 stream 是 feature 轴，不使 GDN/QSA/MoE
@@ -54,7 +55,8 @@ Program 的单份 workspace 包含通用区域和不与其重叠的视觉 handof
 可复用通用区域，编码必须先于 Text 激活分配。每请求 session 借用同一个 handoff，
 按 owner/generation 判断其有效性；Text/decode 保留它，另一个 Vision 编码可以覆盖它。
 跨 chunk 继续使用有效特征，覆盖后的再次消费从保留的 prepared patches 重编码。
-最后消费者结束、暂停或取消时退役绑定，不为每个 lane 分配完整编码 workspace。
+Main 与 MTP 历史建立都消费完对应视觉列后，才退役绑定；暂停或取消也退役绑定。
+不为每个 lane 分配完整编码 workspace。
 
 已复用前缀覆盖的视觉条目不再编码。Checkpoint 不截断同一视觉条目的消费范围；
 条目中途暂停通过 Replay 恢复。Vision 不新增 StateImage 或 KV pool；历史效果已包含
@@ -122,9 +124,8 @@ normalized、block output 或 sample hidden 代替或反推。`F=0` 没有有效
 
 Verify 保留 `[2560,T,B]` sample window 和启用 MTP 时的 `[10240,T,B]` conditioning
 window。`a>0` 使用同一 selector 选择两个窗口的 `a-1` 列；`a=0` 保留旧恢复点，
-不以负 selector gather。可复用
-[batch column gather 合同](../../include/ninfer/ops/indexing.h)分别复制两种宽度，
-保留原 words，不重跑较短投影或 final Mix 来重建。StateImage 的 Device/Host layout、
+不以负 selector gather。两种宽度分别复制，保留原 words，不重跑较短投影或 final Mix
+来重建。StateImage 的 Device/Host layout、
 clone、checkpoint 和 restore 必须显式表达这两个不同字段。
 
 MTP 第一步消费 Main conditioning，后续 draft step 消费前一步 MTP 的 pre-final
@@ -136,8 +137,37 @@ multistream。初始化中，`pre_fc_norm_hidden` 沿完整 10240 维归约，�
 每步 MTP 产生 2560 维 sample hidden 供 head、10240 维 multistream 供下一步。
 多个待定前缀需要的候选版本保留到选择结束。规范 checkpoint 位于模型提交边界，保存
 Main 末端 pair 和已提交 Backend KV/QSA tail；未决 draft 内部特征不单独成为恢复点。
-Resume 从保存的 Main conditioning 和正确 Backend 前沿重新进入 bridge。完整
-draft/verify/bridge 顺序与输入接受长度换算仍须在原生 MTP 集成时落实。
+Resume 从保存的 Main conditioning 和 Backend 前沿重新进入 bridge。
+
+### 2.2 Eager MTP 执行与采用
+
+原生执行支持 `K=1..5`、`B=1..8`。MTP experts 常驻 GPU，使用产物中的 block-FP8
+权重及其 A8 许可；proposal 使用共享 BF16 全词表 head。Main MoE 按 verify 的实际物理
+列数 `T*B` 选择计算策略，不根据 prefill、decode 或 verify 名称分派。
+
+1. **历史建立。** Prefill、Replay 和 control 将当前输入 embedding 与前一列 Main
+   conditioning 配对。连续窗口保留一列旧 conditioning，在根部跳过第一列；不预读下一
+   chunk 的输入或媒体。只执行 MTP stem、attention HC mix、QSA projection/prepare
+   和 tail 提取，省去 attention readout、MoE、final mixer 和 head。
+2. **Draft。** Live ledger 的末尾是已发布但 Main 尚未执行的 anchor `x_F`。第一步在
+   Backend `F-1` 配对保存的 Main conditioning 与 anchor，将结果 tail 单独保留。
+   后续步骤使用 MTP 的 conditioning，候选 tail 和 hidden 双缓冲；不修改规范 StateImage。
+3. **Verify。** 固定物理窗口 `T=K+1`，每行输入为 `[anchor,drafts...]`，有效长度按输出
+   预算与上下文剩余量缩短。基准 GDN state 只读，QSA/PLE 暂不采用 tail；保存实际 records
+   及 Main sample/conditioning 窗口。成员和行顺序保持到本轮提交结束。
+4. **采用。** 后端接受 `c` 个 draft，提供 `c+1` 个许可输出；Frontend 可截断为 `a`。
+   Main 采用前 `a` 个输入，末端 pair 同取 `a-1` 列。利用第一步 draft 的真实 bridge tail，
+   用 Main verify conditioning 和已接受的 shifted IDs 重建其后的 `a-1` 列 Backend
+   历史，再提交 Main `F+a`、Backend `F+a-1`。拒绝后缀不进入有效 coverage。
+
+未接受任何 draft 时通常仍采用 anchor，即 `a=1`。`a=0` 的取消或失败行不采用候选状态。
+Penalty 采样使用临时 token counts；正式计数只增加最终发布的 token。Forced control 通过
+同一历史建立路径推进；Snapshot 同时保存两个 pool 的精确前缀与 StateImage，Replay
+从已提交 ledger 重建两套历史。
+
+PLE 在 anchor 已知时创建窗口；每个 draft ID 通过 event 排序的小型 D2H 增量交给读取服务，
+不逐步等待 GPU。Host 按 draft 顺序追加，全部有效 IDs 到齐后 seal。Main 先执行 PLE 前的
+层，再等待 embedding 上传；最终采用所需的 IDs 先复制到本轮记录，不借用即将回收的 ticket。
 
 ## 3. GDN 的三条执行路径
 
@@ -375,6 +405,7 @@ lead 规划，不假定与 Main 相同。最终容量、Host reservation、迁�
 | 加载与执行资源 | `qwen4_exp/load.*`、`execution/profile.*`、`parameters.*`、`state/` 和 `program/` 已实现组件选择、原表示绑定、连续 StateImage、Main/MTP 页组、records/workspace、公共 MoE 资源与 PLE 双槽 |
 | Main eager Text | `execution/text.*` 组合 HC/GDN/QSA/PLE/MoE；原生 `program/` 支持 prefill、ordinary decode、control、Replay、scoring、checkpoint/Host 恢复与取消；公共 Qwen Frontend 提供 thinking、tool call 和约束输出 |
 | Eager Vision | 共享图像/视频编码、HC 前 embedding 替换、MRoPE、跨 chunk handoff、媒体前缀复用及暂停恢复；PLE 使用原 IDs，与编码异步重叠 |
+| Eager MTP | `execution/mtp.*` 与 `program/mtp.cpp`、`commit.cpp` 实现 stem、历史建立、draft/verify/bridge、精确接受前缀、双 pool 恢复、约束输出及增量 PLE；Text/Vision 共用 |
 | Artifact/converter 与纯 Linear | Qwen4Exp 配置、Binding/Use、完整 Text/Vision/MTP 权重产物、NF4 持久编码/分页布局及 20 项矩阵支持；详见模型文档 |
 | GDN 输出 norm | `sigmoid_gated_rmsnorm`，与 SiLU gated 形式共用 RMSNorm 家族；已通过数学与 Op 性能验收 |
 | GDN control | BF16 `[96,2560]` 合并 AB projection、权重准备、FP32 controls 和容量查询；已通过数学与 Op 性能验收 |
@@ -393,10 +424,8 @@ Main eager 使用 1–8 路执行和 BF16、INT8、FP8、NVFP4、K8V4 五种 KV 
 由启动配置决定，默认 4096。PLE 的 raw-ID tail 随 continuation 保存，准备服务与上传双槽
 由 Program 拥有，下一窗口的 I/O 不推进模型前沿。
 
-剩余集成依次为：
-
-1. **原生 MTP。** 接入 stem、draft/verify/bridge、Main 双特征与 Backend 状态的接受和恢复。
-2. **CUDA Graph。** 组织 PLE Host handoff、MoE 分段图及启动校准，覆盖实际 T/B 与上下文更新。
+剩余集成为 **CUDA Graph**：组织 PLE Host handoff、MoE 分段图及启动校准，覆盖实际
+T/B 与上下文更新。
 
 后续性能工作包括本实例的 expert 优先级、CPU/GPU 切换策略和上下文成本校准。现有
 Qwen3.5 的 DFlash/DFlash2 支持不扩展为 Qwen4Exp 的执行声明。

@@ -3,8 +3,9 @@
 `build/apps/ninfer-serve` loads one v3 `.ninfer` artifact and exposes OpenAI- and
 Anthropic-compatible HTTP endpoints over one resident NInfer Engine.
 
-Qwen3.8-Flash-Next supports eager Text serving with `--no-cuda-graph`; its Vision and
-speculative backends are not yet enabled. See the [CLI example](cli.md) for artifact and resource use.
+Qwen3.8-Flash-Next supports eager Text/Vision/MTP serving with `--no-cuda-graph`.
+Add `--vision` for media and `--spec mtp --draft-tokens 3` for native MTP with the full head.
+See the [CLI example](cli.md) for artifact and resource use.
 
 ## Start the server
 

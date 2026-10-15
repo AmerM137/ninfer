@@ -129,10 +129,16 @@ std::optional<ExecutionPlan> plan_execution(std::shared_ptr<const execution::Mod
     out.pinned_io_bytes = out.persistent.buffers.batch.accepted_columns.region.offset +
                           out.persistent.buffers.batch.accepted_columns.region.bytes -
                           out.persistent.buffers.batch.ids.region.offset;
+    if (out.persistent.buffers.mtp)
+        out.pinned_mtp_bytes =
+            out.persistent.buffers.mtp->ingress.bytes +
+            2ULL * o.speculative.draft_tokens * o.max_concurrency * sizeof(TokenId);
     if (out.persistent.buffers.sampled_ids) {
         out.pinned_sampling_bytes =
-            o.max_concurrency * (sizeof(ops::SamplingConfig) + sizeof(std::int32_t) +
-                                 ((out.profile->public_tokens + 31) / 32) * sizeof(std::uint32_t));
+            o.max_concurrency *
+            (sizeof(ops::SamplingConfig) + sizeof(std::int32_t) +
+             (o.speculative.draft_tokens + 1) * ((out.profile->public_tokens + 31) / 32) *
+                 sizeof(std::uint32_t));
         const auto& buffers = out.persistent.buffers;
         const auto end =
             buffers.accepted_drafts ? *buffers.accepted_drafts : *buffers.output_counts;
