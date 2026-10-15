@@ -23,7 +23,7 @@ class TextRun {
 public:
     TextRun(const Parameters&, TextExecution, BatchView, std::optional<SequenceSlots>,
             CudaExecutionView);
-    void prefix();
+    void prefix(std::optional<VisualEmbeddingView> = {});
     void consume_ple(const Tensor& embedding);
     void suffix(TextOutputs);
 

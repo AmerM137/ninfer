@@ -12,6 +12,14 @@ using namespace ninfer;
 using namespace ninfer::test;
 
 int main() {
+    const ninfer::models::qwen::VisionPrefillPlan plan{
+        .uses = {{2, 8, 0, 0}, {12, 20, 1, 1}, {22, 26, 2, 2}}};
+    if (plan.window_end(0, 24) != 12 || plan.window_end(4, 7) != 7 ||
+        plan.window_end(8, 24) != 22 || plan.window_end(9, 11) != 11 ||
+        plan.window_end(26, 30) != 30) {
+        std::cerr << "Vision windows must preserve chunks and stop before a second media item\n";
+        return 1;
+    }
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;

@@ -53,6 +53,19 @@ Program::inspect_source(const RequestBasePlan& base, std::optional<CheckpointHan
     out.remaining_work = runtime::make_prefill_work(
         out.reused_tokens, base.summary().prompt_tokens - out.reused_tokens, 0, 0,
         p.shape.prefill_chunk);
+    for (const auto& item : base.plan_->prompt.vision_items)
+        if (item.token_spans.back().begin + item.token_spans.back().count > out.reused_tokens) {
+            ++out.remaining_work.vision_items;
+            out.remaining_work.vision_patches += item.patch_count;
+        }
+    if (const auto& vision = base.plan_->vision) {
+        out.remaining_work.chunks = 0;
+        for (auto cursor = out.reused_tokens; cursor < base.summary().prompt_tokens;) {
+            cursor = vision->window_end(
+                cursor, std::min(base.summary().prompt_tokens, cursor + p.shape.prefill_chunk));
+            ++out.remaining_work.chunks;
+        }
+    }
     if (h) {
         const auto& c      = p.checkpoints.at(*h);
         const auto image   = c.snapshot.continuation().image;
@@ -124,6 +137,8 @@ BindingReservation Program::start_binding(const RequestBasePlan& base, runtime::
     if (resume && resume_kind == ExecutionUnitKind::Prefill)
         peak = std::min<std::uint64_t>(base.summary().prompt_tokens,
                                        std::uint64_t(target) + p.shape.prefill_chunk);
+    if ((!resume || resume_kind == ExecutionUnitKind::Prefill) && base.plan_->vision)
+        peak = base.plan_->vision->window_end(target, peak);
     std::vector<CheckpointHandle> retired;
     std::vector<const context::KVPrefixRef*> retired_prefixes;
     for (const auto point : candidate.retired_points) {

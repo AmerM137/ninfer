@@ -49,6 +49,15 @@ void scatter_visual_embeddings(Tensor& input_embeddings, const Tensor& visual_em
     ops::scatter(embeddings, destination_indices, input_embeddings, execution);
 }
 
+std::uint32_t VisionPrefillPlan::window_end(std::uint32_t begin, std::uint32_t end) const {
+    const auto next = std::lower_bound(
+        uses.begin(), uses.end(), begin,
+        [](const VisionUseSpan& use, std::uint32_t position) { return use.end <= position; });
+    if (next != uses.end() && next->begin < end && next + 1 != uses.end())
+        end = std::min(end, (next + 1)->begin);
+    return end;
+}
+
 VisionPrefillSession::VisionPrefillSession(DeviceContext& device, const VisionConfig& config,
                                            const VisionParameters& parameters, MemorySpan workspace,
                                            const VisionWorkspacePlan& workspace_plan,
@@ -129,24 +138,22 @@ VisionChunk VisionPrefillSession::prepare_chunk(std::uint32_t begin, std::uint32
     }
     const std::uint64_t nominal_end64 =
         static_cast<std::uint64_t>(begin) + static_cast<std::uint64_t>(nominal_length);
-    std::uint32_t end = static_cast<std::uint32_t>(
-        std::min<std::uint64_t>(nominal_end64, prompt_.token_ids.size()));
+    const auto end = plan_.window_end(begin, static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                                                 nominal_end64, prompt_.token_ids.size())));
 
     // Replay can revisit an earlier item, including after the last item was consumed.
     const auto next_use = std::lower_bound(
         plan_.uses.begin(), plan_.uses.end(), begin,
         [](const VisionUseSpan& use, std::uint32_t position) { return use.end <= position; });
     const VisionUseSpan* active = nullptr;
-    if (next_use != plan_.uses.end() && next_use->begin < end) {
-        active = &*next_use;
-        if (next_use + 1 != plan_.uses.end()) { end = std::min(end, (next_use + 1)->begin); }
-    }
+    if (next_use != plan_.uses.end() && next_use->begin < end) { active = &*next_use; }
     if (end <= begin) { throw std::logic_error("Vision chunk cap made no forward progress"); }
     if (active == nullptr) {
         return VisionChunk{static_cast<std::int32_t>(end - begin), nullptr, {}};
     }
     const VisionItemControl& control = plan_.control->items[active->control_index];
     Tensor output = VisionContext::bind_output(workspace_, workspace_plan_, control.merged_count);
+    std::size_t encode_bytes = 0;
 
     if (!owns_handoff() || !active_item_ || *active_item_ != active->prepared_item_index) {
         const auto& payload = prompt_.media_payloads[active->prepared_item_index];
@@ -160,8 +167,8 @@ VisionChunk VisionPrefillSession::prepare_chunk(std::uint32_t begin, std::uint32
         // Revoke that binding before enqueueing any work, including a failed encode.
         handoff_.owner_ = nullptr;
         ++handoff_.generation_;
-        context_.encode(VisionItemView{payload->span(), &control}, output, workspace_,
-                        workspace_plan_);
+        encode_bytes = context_.encode(VisionItemView{payload->span(), &control}, output,
+                                       workspace_, workspace_plan_);
         timers_.back().record_stop();
         handoff_.owner_       = this;
         active_generation_    = handoff_.generation_;
@@ -169,7 +176,7 @@ VisionChunk VisionPrefillSession::prepare_chunk(std::uint32_t begin, std::uint32
         active_handoff_bytes_ = output.bytes();
         handoff_peak_bytes_   = std::max(handoff_peak_bytes_, active_handoff_bytes_);
     }
-    return VisionChunk{static_cast<std::int32_t>(end - begin), &control, output};
+    return VisionChunk{static_cast<std::int32_t>(end - begin), &control, output, encode_bytes};
 }
 
 void VisionPrefillSession::retire_handoff() noexcept {

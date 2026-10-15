@@ -43,6 +43,8 @@ std::uint32_t ProgramImpl::window_end(const Sequence& s, std::uint32_t begin,
         }
     if (s.capture && s.next_capture < s.request->captures.size())
         end = std::min(end, s.request->captures[s.next_capture].frontier);
+    if (s.request->vision && begin < s.request->summary.prompt_tokens)
+        end = s.request->vision->window_end(begin, std::min(end, s.request->summary.prompt_tokens));
     return end;
 }
 
@@ -117,6 +119,11 @@ Tensor ProgramImpl::forward(std::span<Sequence* const> rows, std::uint32_t token
         maximum   = std::max(maximum, f + tokens);
     }
     const auto ticket = ple.require(tokens, {inputs.data(), rows.size()});
+    std::optional<execution::VisualEmbeddingView> visual;
+    if (sequence_route && rows[0]->request->vision) {
+        visual = prepare_vision(*rows[0], tokens);
+        ple.progress();
+    }
     const auto upload = [&](const TensorRegion& r, int count) {
         copy_bytes_async({device_tensor(r).data, std::size_t(count) * 4, cuda.device()},
                          {host_tensor(r).data, std::size_t(count) * 4, Device::cpu(), true}, cuda);
@@ -163,7 +170,7 @@ Tensor ProgramImpl::forward(std::span<Sequence* const> rows, std::uint32_t token
             layout.main_qsa.coordinates.bind(resources.persistent()),
             layout.ple_records.bind(resources.persistent())};
         execution::TextRun run(parameters, execution, call, sequence, cuda);
-        run.prefix();
+        run.prefix(visual);
         auto embedding = ple.consume(ticket);
         run.consume_ple(embedding);
         ple.consumed(ticket);

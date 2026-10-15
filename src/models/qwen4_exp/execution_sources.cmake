@@ -12,6 +12,7 @@ target_sources(ninfer_model_runtime PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/program/ple_pipeline.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/program.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/request.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/program/vision.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/execution.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/eager.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/context.cpp"

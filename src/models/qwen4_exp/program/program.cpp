@@ -46,6 +46,7 @@ Suspended::~Suspended() {
 void ProgramImpl::clear(Sequence& s) noexcept {
     try {
         ple.cancel(s.id);
+        retire_vision(s);
         s.capture.reset();
         s.history.reset();
         auto& store = *resources.state_store;
@@ -139,7 +140,15 @@ bool Program::recovery_pending(SequenceHandle h) const noexcept {
 
 void Program::fail_all_cleanup() noexcept { impl_->cleanup(); }
 
-void Program::reset_memory_peaks() noexcept { impl_->resources.workspace.reset_peak(); }
+void Program::reset_memory_peaks() noexcept {
+    auto& p = *impl_;
+    p.resources.workspace.reset_peak();
+    p.vision_handoff_peak_bytes = p.active_vision_bytes();
+    p.vision_workspace_peak_bytes =
+        p.vision_handoff_peak_bytes
+            ? p.resources.plan.workspace.vision->handoff_offset_bytes + p.vision_handoff_peak_bytes
+            : 0;
+}
 
 MemorySummary Program::memory_summary() const {
     const auto& p       = *impl_;
@@ -154,8 +163,26 @@ MemorySummary Program::memory_summary() const {
     out.weights       = {weights.device_capacity_bytes, weights.device_capacity_bytes,
                          weights.device_capacity_bytes};
     out.sequence      = {plan.persistent.bytes, plan.persistent.bytes, plan.persistent.bytes};
-    out.workspace     = {plan.workspace.bytes, p.resources.workspace.used(),
-                         p.resources.workspace.peak_used()};
+    const auto active_vision = p.active_vision_bytes();
+    const auto active_workspace =
+        active_vision ? std::max(p.resources.workspace.used(),
+                                 plan.workspace.vision->handoff_offset_bytes + active_vision)
+                      : p.resources.workspace.used();
+    out.workspace = {plan.workspace.bytes, active_workspace,
+                     std::max(p.resources.workspace.peak_used(), p.vision_workspace_peak_bytes)};
+    if (plan.workspace.vision) {
+        const auto& vision   = *plan.workspace.vision;
+        out.vision_workspace = VisionWorkspaceMemorySummary{
+            .aggregate_prompt_tokens = static_cast<std::uint32_t>(
+                std::min<std::uint64_t>(p.shape.max_context, qwen::kMaximumPromptVisionTokens)),
+            .max_item_tokens        = vision.max_merged_tokens,
+            .general_capacity_bytes = vision.general_capacity_bytes,
+            .encode_peak_bytes      = vision.encode_peak_bytes,
+            .handoff_offset_bytes   = vision.handoff_offset_bytes,
+            .handoff_capacity_bytes = vision.handoff_capacity_bytes,
+            .handoff_active_bytes   = active_vision,
+            .handoff_peak_bytes     = p.vision_handoff_peak_bytes};
+    }
     out.workspace_logical_peak_bytes = out.workspace.peak_used_bytes;
     out.runtime_reservation_bytes    = plan.device_bytes();
     const auto usage                 = p.usage();

@@ -54,8 +54,9 @@ public:
 
     [[nodiscard]] static Tensor bind_output(MemorySpan backing, const VisionWorkspacePlan& plan,
                                             std::size_t merged_tokens);
-    void encode(const VisionItemView& item, Tensor& output, MemorySpan backing,
-                const VisionWorkspacePlan& plan) const;
+    // Enqueue encoding and return its workspace extent, including the output handoff.
+    [[nodiscard]] std::size_t encode(const VisionItemView& item, Tensor& output, MemorySpan backing,
+                                     const VisionWorkspacePlan& plan) const;
 
 private:
     CudaExecutionView execution_;

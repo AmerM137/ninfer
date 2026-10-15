@@ -45,12 +45,15 @@ struct VisionPrefillPlan {
     std::shared_ptr<const VisionControl> control;
     std::vector<VisionUseSpan> uses;
     std::size_t max_merged_count = 0;
+
+    [[nodiscard]] std::uint32_t window_end(std::uint32_t begin, std::uint32_t end) const;
 };
 
 struct VisionChunk {
     std::int32_t length              = 0;
     const VisionItemControl* control = nullptr;
     Tensor embeddings;
+    std::size_t encode_workspace_bytes = 0;
 };
 
 class VisionPrefillSession {

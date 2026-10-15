@@ -461,4 +461,5 @@ The first command plans component combinations, KV formats and concurrency witho
 payloads. `--materialize` additionally loads one full-component model, checks stored words and
 parameter sharing, constructs its execution resources, and reads/uploads a PLE window. It needs
 about 64 GiB of available Host memory plus system headroom. These are loading/resource checks;
-eager Text generation and causal scoring use the public Engine, as described in the [CLI guide](../docs/cli.md).
+eager Text/Vision generation and text causal scoring use the public Engine, as described in the
+[CLI guide](../docs/cli.md).

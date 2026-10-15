@@ -8,8 +8,8 @@
 单个 Op 的完整公式、支持域、alias、workspace 和执行约束由 `include/ninfer/ops/`
 中的合同维护，本文只规定模型如何组合这些计算。[Engine 架构](engine-architecture.md)
 拥有请求事务与发布规则，[Paged KV](paged-kv-cache.md)拥有物理页、replica 和迁移机制。
-Main eager Text 已接入公共 Engine，使用下述层流程、StateImage、QSA 页池和请求事务。
-Vision、MTP 与 Graph 的段落保留后续集成约定；当前启用范围见文末执行进度。
+Main eager Text/Vision 已接入公共 Engine，使用下述层流程、StateImage、QSA 页池和请求事务。
+MTP 与 Graph 的段落保留后续集成约定；当前启用范围见文末执行进度。
 
 ## 1. 共同轴、前沿与所有权
 
@@ -38,6 +38,27 @@ HC/Linear 对全部物理列计算，Program 为 padding 提供有限安全输�
 Model 持有只读参数和权重 backing。Program 独占可变 state、records、激活、workspace、
 页表及 Graph，决定槽选择、前沿和最后消费者。Ops 接收非 owning views，只计算和
 读写合同指定的区域；不分配持久设备资源，也不采用或发布请求状态。
+
+### 1.1 Vision 输入与特征交接
+
+共享 Qwen Frontend 提供原 token IDs、媒体 patches、视觉 token spans 和三轴 MRoPE。
+Program 按需调用共享 Vision 编码器，在 token embedding 后、HC 展开前替换视觉列。
+原 IDs 仍用于 PLE；KV/QSA 的因果顺序使用 token ordinal，RoPE 独立消费三轴坐标。
+生成文本使用保存的 `rope_delta` 推进位置。
+
+Vision 条目可以跨多个 Text chunk；一个执行窗口至多消费一个条目。媒体边界参与
+输入窗口和 KV 预留，PLE 准备与预取使用同一窗口。当前窗口的 PLE 读取先于 Vision
+编码提交，上传使用独立流；计算流顺序连接 Vision 输出和 Text 消费。
+
+Program 的单份 workspace 包含通用区域和不与其重叠的视觉 handoff。编码 scratch
+可复用通用区域，编码必须先于 Text 激活分配。每请求 session 借用同一个 handoff，
+按 owner/generation 判断其有效性；Text/decode 保留它，另一个 Vision 编码可以覆盖它。
+跨 chunk 继续使用有效特征，覆盖后的再次消费从保留的 prepared patches 重编码。
+最后消费者结束、暂停或取消时退役绑定，不为每个 lane 分配完整编码 workspace。
+
+已复用前缀覆盖的视觉条目不再编码。Checkpoint 不截断同一视觉条目的消费范围；
+条目中途暂停通过 Replay 恢复。Vision 不新增 StateImage 或 KV pool；历史效果已包含
+在 GDN、QSA、PLE 及末端特征中。Prepared media 和位置随请求保留，供 Replay 重建。
 
 ## 2. 完整层流程与 HC 边界
 
@@ -353,6 +374,7 @@ lead 规划，不假定与 Main 相同。最终容量、Host reservation、迁�
 |---|---|
 | 加载与执行资源 | `qwen4_exp/load.*`、`execution/profile.*`、`parameters.*`、`state/` 和 `program/` 已实现组件选择、原表示绑定、连续 StateImage、Main/MTP 页组、records/workspace、公共 MoE 资源与 PLE 双槽 |
 | Main eager Text | `execution/text.*` 组合 HC/GDN/QSA/PLE/MoE；原生 `program/` 支持 prefill、ordinary decode、control、Replay、scoring、checkpoint/Host 恢复与取消；公共 Qwen Frontend 提供 thinking、tool call 和约束输出 |
+| Eager Vision | 共享图像/视频编码、HC 前 embedding 替换、MRoPE、跨 chunk handoff、媒体前缀复用及暂停恢复；PLE 使用原 IDs，与编码异步重叠 |
 | Artifact/converter 与纯 Linear | Qwen4Exp 配置、Binding/Use、完整 Text/Vision/MTP 权重产物、NF4 持久编码/分页布局及 20 项矩阵支持；详见模型文档 |
 | GDN 输出 norm | `sigmoid_gated_rmsnorm`，与 SiLU gated 形式共用 RMSNorm 家族；已通过数学与 Op 性能验收 |
 | GDN control | BF16 `[96,2560]` 合并 AB projection、权重准备、FP32 controls 和容量查询；已通过数学与 Op 性能验收 |
@@ -373,9 +395,8 @@ Main eager 使用 1–8 路执行和 BF16、INT8、FP8、NVFP4、K8V4 五种 KV 
 
 剩余集成依次为：
 
-1. **Vision。** 接入视觉 embedding 替换、MRoPE、跨 chunk 特征和多模态续接。
-2. **原生 MTP。** 接入 stem、draft/verify/bridge、Main 双特征与 Backend 状态的接受和恢复。
-3. **CUDA Graph。** 组织 PLE Host handoff、MoE 分段图及启动校准，覆盖实际 T/B 与上下文更新。
+1. **原生 MTP。** 接入 stem、draft/verify/bridge、Main 双特征与 Backend 状态的接受和恢复。
+2. **CUDA Graph。** 组织 PLE Host handoff、MoE 分段图及启动校准，覆盖实际 T/B 与上下文更新。
 
 后续性能工作包括本实例的 expert 优先级、CPU/GPU 切换策略和上下文成本校准。现有
 Qwen3.5 的 DFlash/DFlash2 支持不扩展为 Qwen4Exp 的执行声明。

@@ -296,8 +296,8 @@ Tensor VisionContext::bind_output(MemorySpan backing, const VisionWorkspacePlan&
     return region.bind(backing);
 }
 
-void VisionContext::encode(const VisionItemView& item, Tensor& output, MemorySpan backing,
-                           const VisionWorkspacePlan& plan) const {
+std::size_t VisionContext::encode(const VisionItemView& item, Tensor& output, MemorySpan backing,
+                                  const VisionWorkspacePlan& plan) const {
     if (item.control == nullptr) { throw std::invalid_argument("Vision item control is null"); }
     const VisionItemControl& control = *item.control;
     const auto patches64             = control.patch_count;
@@ -425,6 +425,7 @@ void VisionContext::encode(const VisionItemView& item, Tensor& output, MemorySpa
         project(hidden, parameters_.merger_fc2, output, layout.merger_second_scratch);
         ops::add_bias(parameters_.merger_fc2_bias, output, execution_);
     }
+    return layout.bytes;
 }
 
 } // namespace ninfer::models::qwen

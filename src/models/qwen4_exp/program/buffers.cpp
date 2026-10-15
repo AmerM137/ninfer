@@ -15,9 +15,11 @@ BufferLayout plan_buffers(LayoutBuilder& b, const Config& c, const EngineOptions
                             const char* label) { return b.add_tensor(dtype, shape, 256, label); };
     const auto rows      = [&] { return tensor(DType::I32, {batch}, "batch metadata"); };
     BufferLayout out;
-    out.batch.ids               = tensor(DType::I32, {positions}, "input IDs");
-    out.batch.positions         = tensor(DType::I32, {positions}, "input ordinals");
-    out.batch.rope_positions    = tensor(DType::I32, {positions, 3}, "input RoPE coordinates");
+    out.batch.ids            = tensor(DType::I32, {positions}, "input IDs");
+    out.batch.positions      = tensor(DType::I32, {positions}, "input ordinals");
+    out.batch.rope_positions = tensor(DType::I32, {positions, 3}, "input RoPE coordinates");
+    if (c.vision)
+        out.batch.visual_indices = tensor(DType::I32, {positions}, "visual embedding indices");
     out.batch.valid_columns     = rows();
     out.batch.source_slots      = rows();
     out.batch.destination_slots = rows();

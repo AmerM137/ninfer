@@ -6,7 +6,7 @@ namespace ninfer::models::qwen4_exp::detail {
 
 std::optional<CheckpointHandle> ProgramImpl::detach(Sequence& s, runtime::CheckpointRole role) {
     const auto f = s.continuation.metadata.main_frontier;
-    if (!f) return {};
+    if (!s.request->can_checkpoint(f)) return {};
     auto identity = capture_identity(s);
     std::vector<context::KVPrefixRef> prefixes;
     prefixes.push_back(resources.main->histories.retain_prefix(s.history.handle(), f));
@@ -141,7 +141,9 @@ bool Program::start_capture(SequenceHandle h) {
 std::optional<std::size_t> Program::pause_host_bytes(SequenceHandle h) const {
     const auto& p = *impl_;
     const auto& s = p.sequence(h);
-    if (!s.continuation.metadata.main_frontier || !p.resources.host_context) return {};
+    if (!s.request->can_checkpoint(s.continuation.metadata.main_frontier) ||
+        !p.resources.host_context)
+        return {};
     std::size_t bytes     = p.resources.state_store->host_resident(s.continuation.image)
                                 ? 0
                                 : p.resources.states->storage().image_bytes();
@@ -182,6 +184,7 @@ bool Program::start_pause(SequenceHandle h, bool save, runtime::ExecutionTiming*
         s.capture.reset();
         s.capture_pending = false;
         s.recovery_peak   = 0;
+        p.retire_vision(s);
         p.settle(s);
         if (s.phase == detail::Phase::Replay) s.phase = s.resume_phase;
         if (save) tx.paused->snapshot = p.detach(s, runtime::CheckpointRole::Continuation);

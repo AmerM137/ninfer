@@ -4,6 +4,14 @@
 
 namespace ninfer::models::qwen4_exp::detail {
 
+bool RequestPlan::can_checkpoint(std::uint32_t frontier) const {
+    if (!frontier) return false;
+    if (vision)
+        for (const auto& item : vision->control_plan->items)
+            if (item.token_begin < frontier && frontier < item.token_end) return false;
+    return true;
+}
+
 ops::SamplingConfig sampling_config(const ResolvedSamplingParameters& p) {
     return {.temperature       = p.temperature,
             .top_k             = p.top_k,
@@ -46,7 +54,7 @@ std::vector<std::uint32_t> RequestBasePlan::capture_frontiers() const {
 }
 
 std::optional<PrefixShortlistKey> RequestBasePlan::prefix_shortlist_key(std::uint32_t f) const {
-    if (!plan_->reuse || !f || f > plan_->summary.prompt_tokens) return {};
+    if (!plan_->reuse || !plan_->can_checkpoint(f) || f > plan_->summary.prompt_tokens) return {};
     return detail::key(*plan_->identity, f);
 }
 
@@ -57,10 +65,12 @@ RequestBasePlan Program::plan_request(qwen::PreparedPrompt&& prompt,
     plan->prompt      = qwen::PreparedPromptAccess::take(std::move(prompt));
     const auto& input = plan->prompt;
     const auto count  = input.token_ids.size();
-    if (!count || count > p.shape.max_context || input.has_media() ||
-        input.token_types.size() != count || input.positions.size() != 3 * count)
-        throw std::invalid_argument(
-            "Qwen4Exp eager Text requires a nonempty text prompt within capacity");
+    if (!count || count > p.shape.max_context || input.token_types.size() != count ||
+        input.positions.size() != 3 * count)
+        throw std::invalid_argument("Qwen4Exp requires a nonempty prepared prompt within capacity");
+    if (input.media_payloads.size() != input.vision_items.size())
+        throw std::invalid_argument("prepared prompt media payload is incomplete");
+    if (input.has_media()) plan->vision = p.plan_vision(input);
     for (const auto id : input.token_ids)
         if (id < 0 || std::uint32_t(id) >= p.parameters.profile->public_tokens)
             throw std::invalid_argument("prompt token is outside the public vocabulary");
@@ -90,6 +100,7 @@ RequestBasePlan Program::plan_request(qwen::PreparedPrompt&& prompt,
     if (plan->reuse) {
         const auto add = [&](std::uint32_t f, runtime::CheckpointRole role) {
             if (!f || f > count) throw std::invalid_argument("invalid capture frontier");
+            if (!plan->can_checkpoint(f)) return;
             auto found = std::find_if(plan->captures.begin(), plan->captures.end(),
                                       [&](const auto& c) { return c.frontier == f; });
             if (found == plan->captures.end()) {

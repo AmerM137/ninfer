@@ -33,6 +33,8 @@ public:
 
     [[nodiscard]] MemorySpan sampling_ingress() { return sampling_.span(); }
 
+    [[nodiscard]] MemorySpan workspace_storage() { return workspace_.span(); }
+
     [[nodiscard]] CudaExecutionView ple_transfer() const { return ple_transfer_; }
 
     const ExecutionPlan plan;

@@ -5,6 +5,7 @@
 #include "models/qwen4_exp/execution/text.h"
 #include "models/common/context/snapshot.h"
 #include "models/common/qwen/prefix_identity.h"
+#include "models/common/qwen/vision/prefill.h"
 #include "ninfer/ops/sampling.h"
 
 #include <chrono>
@@ -30,8 +31,11 @@ struct RequestPlan {
     runtime::RequestPlanSummary summary;
     std::shared_ptr<const Identity> identity;
     std::vector<CapturePoint> captures;
+    std::optional<qwen::VisionPrefillPlan> vision;
     ops::SamplingConfig sampling;
     bool reuse = true;
+
+    [[nodiscard]] bool can_checkpoint(std::uint32_t frontier) const;
 };
 
 using Snapshot = context::ContextSnapshot<ContinuationMetadata, Identity>;
@@ -73,6 +77,8 @@ struct Sequence {
     std::size_t next_capture         = 0;
     std::unique_ptr<CaptureReservation> capture;
     bool capture_pending = false;
+    std::unique_ptr<qwen::VisionPrefillSession> vision;
+    double observed_vision_seconds = 0;
     GenerationTimings timings;
     Clock::time_point started = Clock::now();
     std::optional<Clock::time_point> first_output;
@@ -171,6 +177,12 @@ public:
                                       runtime::ExecutionTimingRecorder&);
     void restore_counts(Sequence&);
     void increment_counts(Sequence&, std::span<const TokenId>);
+    [[nodiscard]] qwen::VisionPrefillPlan plan_vision(const qwen::PreparedPromptData&) const;
+    [[nodiscard]] std::optional<execution::VisualEmbeddingView>
+    prepare_vision(Sequence&, std::uint32_t tokens);
+    double collect_vision_timing(Sequence&);
+    void retire_vision(Sequence&) noexcept;
+    [[nodiscard]] std::size_t active_vision_bytes() const noexcept;
     [[nodiscard]] std::optional<CheckpointHandle> detach(Sequence&, runtime::CheckpointRole);
     [[nodiscard]] std::vector<context::LogicalKVPageHandle>
         checkpoint_pages(std::span<const CheckpointHandle>) const;
@@ -195,6 +207,8 @@ public:
     const ExecutionShape& shape;
     Checkpoints checkpoints;
     CudaEventTimer prefill_timer;
+    qwen::VisionHandoffState vision_handoff;
+    std::size_t vision_handoff_peak_bytes = 0, vision_workspace_peak_bytes = 0;
     std::array<std::unique_ptr<Sequence>, kMaximumConcurrency> sequences;
     std::array<std::uint64_t, kMaximumConcurrency> epochs{};
     std::vector<runtime::KvPoolDescriptor> pools;

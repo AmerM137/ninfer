@@ -31,7 +31,8 @@ Resources::Resources(const execution::Parameters& p, ExecutionPlan input, Device
       persistent_(device.device(), plan.persistent.bytes),
       workspace_(device.device(), plan.workspace.bytes), ingress_(plan.pinned_io_bytes),
       egress_(plan.pinned_output_bytes), sampling_(plan.pinned_sampling_bytes), ple_stream_(device),
-      ple_transfer_(device.execution_view(ple_stream_.stream())), workspace(workspace_.span()) {
+      ple_transfer_(device.execution_view(ple_stream_.stream())),
+      workspace(workspace_.span().subspan(0, plan.workspace.general_bytes)) {
     const auto backing = persistent_.span();
     states             = std::make_unique<StateViews>(backing, plan.persistent.state);
     std::vector<HostKVPageLayout> layouts{

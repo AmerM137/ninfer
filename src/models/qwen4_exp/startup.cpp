@@ -6,10 +6,9 @@
 namespace ninfer::models::qwen4_exp {
 namespace {
 LoadOptions selection(const EngineOptions& options) {
-    if (options.enable_vision || options.speculative.backend != SpeculativeBackend::None ||
-        options.use_cuda_graph)
+    if (options.speculative.backend != SpeculativeBackend::None || options.use_cuda_graph)
         throw std::invalid_argument(
-            "Qwen4Exp currently supports eager Text; disable Vision, speculation and CUDA Graph");
+            "Qwen4Exp currently supports eager Text/Vision; disable speculation and CUDA Graph");
     return load_options(options);
 }
 } // namespace
@@ -53,7 +52,7 @@ qwen::Frontend Startup::frontend(const Model& model, const EngineOptions& o) con
     return qwen::make_frontend(model.resources(),
                                {.chat_template_path       = o.chat_template_path,
                                 .grammar_cache_bytes      = o.grammar_cache_bytes,
-                                .vision_enabled           = false,
+                                .vision_enabled           = o.enable_vision,
                                 .max_context              = o.max_context,
                                 .media_cache_bytes        = o.media_cache_bytes,
                                 .media_live_bytes         = o.media_live_bytes,
@@ -81,6 +80,15 @@ std::string prefill_signature(const Model& model, const moe::Plan* moe, std::uin
                  c.qsa.block_budget}},
                {"ple", {c.ple.layer, c.ple.shards, c.ple.rows_per_shard}}};
     auto& layers = facts["layers"] = Json::array();
+    if (const auto& vision = model.config().vision)
+        facts["vision"] = {vision->depth,
+                           vision->hidden_size,
+                           vision->intermediate_size,
+                           vision->num_heads,
+                           vision->patch_size,
+                           vision->temporal_patch_size,
+                           vision->spatial_merge_size,
+                           vision->num_position_embeddings};
     for (const auto& layer : c.layers) layers.push_back(static_cast<int>(layer.mixer));
     auto& weights = facts["weights"] = Json::array();
     for (const auto& w : model.weight_data()) {

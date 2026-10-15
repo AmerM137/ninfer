@@ -11,6 +11,7 @@ struct QsaRecordLayout {
 
 struct BatchLayout {
     TensorRegion ids, positions, rope_positions;
+    std::optional<TensorRegion> visual_indices;
     TensorRegion valid_columns, source_slots, destination_slots, main_tables, backend_tables;
     TensorRegion base_positions, record_offsets, recorded_columns, accepted_columns;
     std::uint32_t max_positions, max_batch;

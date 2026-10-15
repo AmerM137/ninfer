@@ -51,8 +51,9 @@ PrefillProgress Program::advance_prefill(SequenceHandle handle, runtime::Executi
         if (out.processed_prompt_tokens)
             timing.include({.gpu_elapsed_ns = static_cast<std::uint64_t>(
                                 double(p.prefill_timer.elapsed_ms()) * 1.0e6 + 0.5)});
-        out.capture_ready = s.capture_pending;
-        s.timings.prefill_seconds += seconds(started);
+        out.capture_ready         = s.capture_pending;
+        const auto vision_seconds = p.collect_vision_timing(s);
+        s.timings.prefill_seconds += std::max(0.0, seconds(started) - vision_seconds);
         out.timing = timing.finish();
         return out;
     } catch (...) {
@@ -214,6 +215,7 @@ ReplayProgress Program::advance_replay(SequenceHandle h, runtime::ExecutionTimin
             timing.begin_wait();
             p.ple.wait_compute();
             timing.end_wait();
+            p.collect_vision_timing(s);
         }
         const bool complete = end == s.replay_target;
         if (complete) s.phase = s.resume_phase;

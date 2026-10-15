@@ -23,7 +23,7 @@ Program，窗口使用临时 State 与 Main KV，不进入 Generation Scheduler 
 
 模型代码拥有数学公式、调用顺序、组件交接和状态转移。Config 提供层数、维度、Attention/GDN
 分布和 expert 几何等实例参数。架构入口为 `Qwen3_5ForCausalLM`、`Qwen3_5MoeForCausalLM`
-与 `Qwen4ExpForCausalLM`；后者当前支持 eager Text。
+与 `Qwen4ExpForCausalLM`；后者当前支持 eager Text/Vision。
 训练实例和物理权重分配作为数据进入对应实现。
 
 V3 artifact 保存配置、物理对象、逻辑参数 Binding、使用位置的 Use 和 Frontend 资源。

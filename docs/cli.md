@@ -18,7 +18,7 @@ NINFER_VRAM_BUDGET_MIB=16384 ./build/apps/ninfer out/qwen3_6_35b_a3b.ninfer \
 resident models and 4096 for CPU expert offload. Serving and offline scoring use the same Engine
 defaults. See [expert execution](maintainer/expert-weight-cache.md) for ownership and scheduling.
 
-Qwen3.8-Flash-Next uses Qwen4Exp eager Text. Run a converted artifact with `--no-cuda-graph`:
+Qwen3.8-Flash-Next uses Qwen4Exp eager Text/Vision. Run a converted artifact with `--no-cuda-graph`:
 
 ```bash
 ./build/apps/ninfer out/qwen3_8_flash_next.ninfer \
@@ -27,8 +27,15 @@ Qwen3.8-Flash-Next uses Qwen4Exp eager Text. Run a converted artifact with `--no
 ```
 
 Main experts remain in registered Host memory, with GPU caching and streaming; PLE reads its
-NF4 rows from the artifact on disk. Vision and speculative backends are not yet enabled for this
-architecture. The same eager Text path is available through serving and offline causal scoring.
+NF4 rows from the artifact on disk. Add `--vision` for image/video messages; speculative backends
+are not yet enabled for this architecture. Serving uses the same Text/Vision path; offline causal
+scoring remains text-only.
+
+```bash
+./build/apps/ninfer out/qwen3_8_flash_next.ninfer \
+  --no-cuda-graph --vision --max-context 32768 --prefill-chunk 4096 --kv-dtype fp8 \
+  --messages examples/cli/messages/image_chart.json --no-thinking --greedy --max-new 64
+```
 
 ## Text input
 

@@ -59,8 +59,8 @@ these references.
 
 ## Architecture integration and planned work
 
-Qwen3.8-Flash-Next uses the Qwen4Exp architecture. Its eager Text Engine includes CPU/GPU MoE
-and disk-backed PLE; Vision, MTP and CUDA Graph integration remain planned. The execution document
+Qwen3.8-Flash-Next uses the Qwen4Exp architecture. Its eager Text/Vision Engine includes CPU/GPU MoE
+and disk-backed PLE; MTP and CUDA Graph integration remain planned. The execution document
 owns current support and remaining work. Concrete Op contracts live in `include/ninfer/ops/`.
 
 | Design | Responsibility |

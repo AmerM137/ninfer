@@ -5,6 +5,7 @@
 #include "core/transfer.h"
 #include "core/nvtx.h"
 #include "ninfer/ops/embedding.h"
+#include "ninfer/ops/indexing.h"
 
 namespace ninfer::models::qwen4_exp::execution {
 
@@ -20,10 +21,11 @@ TextRun::TextRun(const Parameters& p, TextExecution execution, BatchView batch,
         throw std::invalid_argument("invalid Qwen4Exp sequence/step window");
 }
 
-void TextRun::prefix() {
+void TextRun::prefix(std::optional<VisualEmbeddingView> visual) {
     const auto& p = parameters_.text;
     ops::embedding(batch_.ids.view({batch_.tokens * batch_.batch}), p.embedding, roots_.input,
                    cuda_);
+    if (visual) ops::scatter(visual->features, visual->columns, roots_.input, cuda_);
     ops::hc_expand_norm(roots_.input, p.layers.front().attention_hc.norm,
                         parameters_.model.config().text.norm_epsilon, roots_.residual,
                         roots_.normalized, cuda_);

@@ -3,7 +3,7 @@
 > Selected checkpoints. Maximum single-GPU inference performance.
 
 NInfer is a from-scratch C++/CUDA inference engine for a single NVIDIA GeForce RTX 5090.
-Qwen3.5 Dense and MoE support text, image and video prompts; Qwen4Exp supports eager Text.
+Qwen3.5 Dense and MoE support text, image and video prompts; Qwen4Exp supports eager Text/Vision.
 Both use the local CLI or OpenAI-/Anthropic-compatible HTTP APIs. The runtime uses one GPU, one
 resident model, and one to eight execution lanes fixed at startup.
 

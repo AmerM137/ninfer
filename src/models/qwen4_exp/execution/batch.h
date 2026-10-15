@@ -21,4 +21,9 @@ struct TextOutputs {
     Tensor conditioning;
 };
 
+struct VisualEmbeddingView {
+    Tensor features;
+    Tensor columns;
+};
+
 } // namespace ninfer::models::qwen4_exp::execution
