@@ -7,7 +7,7 @@
 Engine 支持常驻 GPU，以及受显存预算约束的 MoE 混合执行。CPU `routed_swiglu` Op
 支持 Q4 GU + Q5/Q6 down 及 NVFP4 GU/down，直接消费 Host bank 并产生 FP32 分项。
 GPU 使用同一组 logical expert ID，既可以计算固定子集，也可以消费补齐后的整层 bank。
-Qwen3.5 MoE 与 Qwen4Exp Main eager 均使用这套公共调度。
+Qwen3.5 MoE 与 Qwen4Exp Main 均使用这套公共调度，支持 eager 和分段 CUDA Graph。
 
 ## 来源与身份
 

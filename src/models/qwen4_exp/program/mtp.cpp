@@ -51,30 +51,35 @@ execution::BatchView ProgramImpl::mtp_inputs(const MtpBatchLayout& layout,
     const auto offset = layout.ingress.offset, bytes = layout.ingress.bytes;
     copy_bytes_async(resources.persistent().subspan(offset, bytes),
                      resources.mtp_ingress().subspan(offset - frame.ingress.offset, bytes), cuda);
-    const auto row = [&](const TensorRegion& r) { return device_tensor(r).slice(0, 0, batch); };
-    return {t,
-            batch,
-            packed_tensor(layout.ids, {t, batch}),
-            packed_tensor(layout.positions, {t, batch}),
-            packed_tensor(layout.rope_positions, {t, 3, batch}),
-            row(layout.valid_columns),
-            row(layout.source_slots),
-            row(layout.destination_slots),
-            row(layout.table_rows),
-            row(layout.base_positions),
-            row(layout.record_offsets),
-            maximum};
+    return resources.mtp_batch(layout, t, batch, maximum);
 }
 
 ops::QsaTailStateView ProgramImpl::mtp_working_tail(std::uint32_t slot, std::uint32_t batch) {
-    const auto& frame = *resources.plan.persistent.buffers.mtp;
-    const auto& qsa   = parameters.model.config().text.qsa;
-    const auto width = dimension(qsa.index_key_width()), history = dimension(qsa.compression - 1);
-    return {
-        packed_tensor(frame.tail_keys, {width, history, static_cast<int>(batch), 3})
-            .slice(3, slot, 1),
-        packed_tensor(frame.tail_coordinates, {3, static_cast<int>(batch), 3}).slice(2, slot, 1),
-        device_tensor(frame.row_indices).slice(0, 0, batch)};
+    return resources.mtp_working_tail(slot, batch);
+}
+
+void ProgramImpl::draft_forward(std::uint32_t step, std::int32_t batch, std::uint32_t visible) {
+    const auto& buffers = resources.plan.persistent.buffers;
+    const auto& frame   = *buffers.mtp;
+    const auto channels = dimension(parameters.model.config().text.residual_width());
+    const auto hidden   = dimension(parameters.model.config().text.hidden);
+    const auto call     = resources.mtp_batch(frame.draft_steps[step], 1, batch, visible);
+    const auto before   = step == 0 ? resources.states->mtp_tail(call.source_slots)
+                                    : mtp_working_tail(step == 1 ? 0 : 1 + (step - 2) % 2, batch);
+    auto after          = mtp_working_tail(step == 0 ? 0 : 1 + (step - 1) % 2, batch);
+    auto working        = packed_tensor(frame.hidden, {channels, batch, 2});
+    const auto previous = step == 0 ? packed_tensor(frame.base_conditioning, {channels, batch})
+                                    : working.slice(2, (step - 1) % 2, 1).view({channels, batch});
+    auto next           = working.slice(2, step % 2, 1).view({channels, batch});
+    auto sample         = packed_tensor(frame.sample, {hidden, batch});
+    execution::mtp_forward(parameters.model.config().text, *parameters.mtp, previous, call, before,
+                           after, resources.mtp->cache.layer(0), {sample, next},
+                           resources.workspace, cuda);
+    auto logits = packed_tensor(*buffers.logits,
+                                {dimension(parameters.model.config().text.vocabulary), batch});
+    execution::project_head(sample, parameters.mtp->head, logits, resources.workspace, cuda);
+    auto ids = device_tensor(frame.draft_steps[step + 1].ids).slice(0, 0, batch);
+    ops::argmax(logits, ids, parameters.profile->public_tokens, cuda);
 }
 
 void ProgramImpl::align_mtp(std::span<Sequence* const> rows, std::uint32_t tokens,
@@ -141,6 +146,39 @@ void ProgramImpl::align_mtp(std::span<Sequence* const> rows, std::uint32_t token
             resources.states->conditioning().slice(1, selectors(*rows[b]).destination, 1);
         copy_bytes_async({destination.data, destination.bytes(), cuda.device()},
                          {next.data, next.bytes(), cuda.device()}, cuda);
+    }
+}
+
+void ProgramImpl::accept_forward(std::int32_t batch) {
+    const auto& buffers   = resources.plan.persistent.buffers;
+    const auto& frame     = *buffers.mtp;
+    const auto width      = shape.draft_tokens + 1;
+    const auto hidden     = dimension(parameters.model.config().text.hidden);
+    const auto vocabulary = parameters.profile->public_tokens;
+    const auto row = [&](const TensorRegion& r) { return device_tensor(r).slice(0, 0, batch); };
+    auto sample  = packed_tensor(buffers.pending_sample, {hidden, static_cast<int>(width), batch});
+    auto drafts  = packed_tensor(frame.drafts, {static_cast<int>(shape.draft_tokens), batch});
+    auto anchors = row(frame.anchors), extents = row(frame.extents);
+    auto device_configs = device_tensor(*buffers.sampling);
+    auto logits =
+        packed_tensor(*buffers.logits, {dimension(parameters.model.config().text.vocabulary),
+                                        static_cast<int>(width), batch});
+    auto flat_logits = logits.view({logits.ne[0], static_cast<int>(width) * batch});
+    execution::project_head(sample.view({hidden, static_cast<int>(width) * batch}),
+                            parameters.text.head, flat_logits, resources.workspace, cuda);
+    auto target      = packed_tensor(frame.target_tokens, {static_cast<int>(width), batch});
+    auto target_flat = target.view({static_cast<int>(width) * batch});
+    ops::argmax(logits.view({logits.ne[0], static_cast<int>(width) * batch}), target_flat,
+                vocabulary, cuda);
+    auto licensed = packed_tensor(*buffers.sampled_ids, {static_cast<int>(width), batch});
+    auto counts = row(*buffers.output_counts), accepted = row(*buffers.accepted_drafts);
+    auto lengths = row(frame.frontiers);
+    {
+        auto scope = resources.workspace.scope();
+        ops::speculative_accept_greedy_drafts(
+            target, logits, drafts, extents, lengths, anchors, licensed, counts, accepted,
+            vocabulary, static_cast<const ops::SamplingConfig*>(device_configs.data),
+            resources.workspace, cuda);
     }
 }
 
@@ -213,18 +251,7 @@ PendingBatch ProgramImpl::mtp_decode(std::span<Sequence* const> rows,
     upload(io.valid_columns, io.accepted_columns.region.offset + io.accepted_columns.region.bytes -
                                  io.valid_columns.region.offset);
     const auto row = [&](const TensorRegion& r) { return device_tensor(r).slice(0, 0, batch); };
-    round.batch    = {static_cast<int>(width),
-                      batch,
-                      packed_tensor(io.ids, {static_cast<int>(width), batch}),
-                      packed_tensor(io.positions, {static_cast<int>(width), batch}),
-                      packed_tensor(io.rope_positions, {static_cast<int>(width), 3, batch}),
-                      row(io.valid_columns),
-                      row(io.source_slots),
-                      row(io.destination_slots),
-                      row(io.main_tables),
-                      row(io.base_positions),
-                      row(io.record_offsets),
-                      maximum};
+    round.batch    = resources.main_batch(width, batch, maximum);
     auto drafts    = packed_tensor(frame.drafts, {static_cast<int>(k), batch});
     CUDA_CHECK(cudaMemsetAsync(drafts.data, 0, drafts.bytes(), cuda.stream()));
     const auto row_bytes = rows.size() * sizeof(std::int32_t);
@@ -250,25 +277,11 @@ PendingBatch ProgramImpl::mtp_decode(std::span<Sequence* const> rows,
     {
         nvtx::ScopedRange range(nvtx::Name::DecodeMtpDraft, nvtx::Category::Mtp, steps * batch);
         for (std::uint32_t step = 0; step < steps; ++step) {
-            const auto before   = step == 0
-                                      ? resources.states->mtp_tail(calls[step].source_slots)
-                                      : mtp_working_tail(step == 1 ? 0 : 1 + (step - 2) % 2, batch);
-            auto after          = mtp_working_tail(step == 0 ? 0 : 1 + (step - 1) % 2, batch);
-            auto working        = packed_tensor(frame.hidden, {channels, batch, 2});
-            const auto previous = step == 0
-                                      ? packed_tensor(frame.base_conditioning, {channels, batch})
-                                      : working.slice(2, (step - 1) % 2, 1).view({channels, batch});
-            auto next           = working.slice(2, step % 2, 1).view({channels, batch});
-            auto sample         = packed_tensor(frame.sample, {hidden, batch});
-            execution::mtp_forward(parameters.model.config().text, *parameters.mtp, previous,
-                                   calls[step], before, after, resources.mtp->cache.layer(0),
-                                   {sample, next}, resources.workspace, cuda);
-            auto logits = packed_tensor(
-                *buffers.logits, {dimension(parameters.model.config().text.vocabulary), batch});
-            execution::project_head(sample, parameters.mtp->head, logits, resources.workspace,
-                                    cuda);
+            if (graphs)
+                graphs->draft(batch, step, calls[step].max_visible_tokens);
+            else
+                draft_forward(step, batch, calls[step].max_visible_tokens);
             auto ids = device_tensor(frame.draft_steps[step + 1].ids).slice(0, 0, batch);
-            ops::argmax(logits, ids, parameters.profile->public_tokens, cuda);
             const auto destination = static_cast<TokenId*>(drafts.data) + step;
             copy_rows_async({destination, drafts.bytes() - step * sizeof(TokenId), cuda.device()},
                             k * sizeof(TokenId), {ids.data, ids.bytes(), cuda.device()},
@@ -297,15 +310,25 @@ PendingBatch ProgramImpl::mtp_decode(std::span<Sequence* const> rows,
             buffers.ple_records.bind(resources.persistent())};
         execution::TextRun run(parameters, execution, round.batch,
                                execution::VerifyRecords{*resources.gdn_records}, cuda);
-        run.prefix();
+        auto* graph = graphs ? &graphs->main(batch, true, maximum) : nullptr;
+        if (graph)
+            graph->prefix(*resources.experts, run.block_output(), cuda);
+        else
+            run.prefix();
         auto embedding = ple.consume(ticket);
         for (int b = 0; b < batch; ++b) {
             const auto input = ple.input(ticket, b);
             std::copy(input.begin(), input.end(), round.inputs.begin() + b * width);
         }
-        run.consume_ple(embedding);
+        if (graph)
+            graph->consume_ple(ticket.slot, cuda);
+        else
+            run.consume_ple(embedding);
         ple.consumed(ticket);
-        run.suffix({sample, conditioning});
+        if (graph)
+            graph->suffix(*resources.experts, run.block_output(), cuda);
+        else
+            run.suffix({sample, conditioning});
     }
     const auto vocabulary = parameters.profile->public_tokens;
     const auto words      = (vocabulary + 31) / 32;
@@ -340,26 +363,10 @@ PendingBatch ProgramImpl::mtp_decode(std::span<Sequence* const> rows,
     auto device_configs = device_tensor(*buffers.sampling);
     copy_bytes_async({device_configs.data, rows.size() * sizeof(*configs), cuda.device()},
                      {configs, rows.size() * sizeof(*configs), Device::cpu(), true}, cuda);
-    auto logits =
-        packed_tensor(*buffers.logits, {dimension(parameters.model.config().text.vocabulary),
-                                        static_cast<int>(width), batch});
-    auto flat_logits = logits.view({logits.ne[0], static_cast<int>(width) * batch});
-    execution::project_head(sample.view({hidden, static_cast<int>(width) * batch}),
-                            parameters.text.head, flat_logits, resources.workspace, cuda);
-    auto target      = packed_tensor(frame.target_tokens, {static_cast<int>(width), batch});
-    auto target_flat = target.view({static_cast<int>(width) * batch});
-    ops::argmax(logits.view({logits.ne[0], static_cast<int>(width) * batch}), target_flat,
-                vocabulary, cuda);
-    auto licensed = packed_tensor(*buffers.sampled_ids, {static_cast<int>(width), batch});
-    auto counts = row(*buffers.output_counts), accepted = row(*buffers.accepted_drafts);
-    auto lengths = row(frame.frontiers);
-    {
-        auto scope = resources.workspace.scope();
-        ops::speculative_accept_greedy_drafts(
-            target, logits, drafts, extents, lengths, anchors, licensed, counts, accepted,
-            vocabulary, static_cast<const ops::SamplingConfig*>(device_configs.data),
-            resources.workspace, cuda);
-    }
+    if (graphs)
+        graphs->accept(batch);
+    else
+        accept_forward(batch);
     const auto egress_offset = buffers.sampled_ids->region.offset;
     const auto bytes         = buffers.accepted_drafts->region.offset +
                        buffers.accepted_drafts->region.bytes - egress_offset;

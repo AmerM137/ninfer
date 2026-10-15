@@ -2,6 +2,7 @@
 
 #include "models/qwen4_exp/program/planning.h"
 #include "models/qwen4_exp/execution/parameters.h"
+#include "models/qwen4_exp/execution/batch.h"
 #include "models/common/context/migration.h"
 #include "models/common/moe/resources.h"
 #include "ninfer/ops/gdn_replay.h"
@@ -42,6 +43,14 @@ public:
     [[nodiscard]] std::uint32_t pool_count() const { return mtp ? 2 : 1; }
 
     [[nodiscard]] ContextPool& pool(std::uint32_t index) const { return index == 0 ? *main : *mtp; }
+
+    [[nodiscard]] Tensor tensor(const TensorRegion&);
+    [[nodiscard]] Tensor packed(const TensorRegion&, std::initializer_list<std::int32_t>);
+    [[nodiscard]] execution::BatchView main_batch(std::int32_t tokens, std::int32_t batch,
+                                                  std::uint32_t visible);
+    [[nodiscard]] execution::BatchView mtp_batch(const MtpBatchLayout&, std::int32_t tokens,
+                                                 std::int32_t batch, std::uint32_t visible);
+    [[nodiscard]] ops::QsaTailStateView mtp_working_tail(std::uint32_t slot, std::int32_t batch);
 
     const ExecutionPlan plan;
 private:

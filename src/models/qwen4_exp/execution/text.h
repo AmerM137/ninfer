@@ -26,6 +26,17 @@ public:
     void consume_ple(const Tensor& embedding);
     void suffix(TextOutputs);
 
+    // GPU bodies share the same activation frame in eager execution and graph capture.
+    void stem(std::optional<VisualEmbeddingView> = {});
+    void mixer(std::uint32_t layer);
+    void gpu_moe(const moe::PreparedExecution&);
+    void combine(std::uint32_t layer);
+    void finish(TextOutputs);
+
+    [[nodiscard]] Tensor& block_output() { return roots_.output; }
+
+    void set_visible_tokens(std::uint32_t maximum) { batch_.max_visible_tokens = maximum; }
+
 private:
     void layer(std::uint32_t);
     const Parameters& parameters_;

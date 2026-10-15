@@ -3,6 +3,7 @@
 #include "models/common/startup.h"
 #include "models/qwen4_exp/load.h"
 #include "models/qwen4_exp/program/runtime_types.h"
+#include "models/qwen4_exp/program/graph_preparation.h"
 #include "models/registry.h"
 
 namespace ninfer::models::qwen4_exp {
@@ -11,7 +12,8 @@ class Startup {
 public:
     using Types                          = RuntimeTypes;
     using ExecutionPlan                  = models::ExecutionPlan<qwen4_exp::ExecutionPlan>;
-    static constexpr bool supports_graph = false;
+    using Calibration                    = GraphCalibration;
+    static constexpr bool supports_graph = true;
 
     Startup(const artifact::Reader&, const EngineOptions&, Device);
 
@@ -22,6 +24,10 @@ public:
     [[nodiscard]] std::unique_ptr<Model> materialize(DeviceContext&, bool host_experts,
                                                      const StartupObserver&);
     [[nodiscard]] qwen::Frontend frontend(const Model&, const EngineOptions&) const;
+    [[nodiscard]] GraphPreparationPlan graph_plan(const EngineOptions&, const moe::Plan*) const;
+    [[nodiscard]] Calibration calibrate(const execution::Parameters&, DeviceContext&,
+                                        const EngineOptions&,
+                                        std::shared_ptr<const moe::Plan>) const;
     WeightPlacement weights;
     std::shared_ptr<const execution::ModelProfile> profile;
 private:

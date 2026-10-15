@@ -2,8 +2,9 @@
 
 本文定义 PLE 查表的共同输入/输出、当前磁盘准备路径，以及 Host E 到 GPU 的交接。
 精确 LUT/行解码、文件 backing、Host hash、行缓存/去重、增量窗口和上传槽已实现，
-Eager Program 已接入窗口准备、下一 chunk 预取、上传、消费和取消；MTP 草稿 ID 通过
-异步 D2H 增量追加，verify 消费前完成 seal。Graph 编排后续接入。
+Program 已接入窗口准备、下一 chunk 预取、上传、消费和取消；MTP 草稿 ID 通过
+异步 D2H 增量追加，verify 消费前完成 seal。Eager 与 Graph 共用 Host 准备与 event 交接；
+Graph 为两个稳定上传地址分别绑定 PLE 消费段。
 内存表与显存表的准备路径尚未实现。
 独立 SSD 实验是选型依据；生产组件的实测入口见 [Benchmarks](../../bench/README.md)。
 

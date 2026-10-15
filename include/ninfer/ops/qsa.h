@@ -115,7 +115,8 @@ qsa_indexer_workspace_capacity_bytes(std::int32_t min_tokens, std::int32_t max_t
  *
  * Workspace / execution:
  * Scratch comes from the caller's arena and is reused across bounded query windows, without
- * hidden allocation. Fixed T/B, views, envelope and device facts determine the launch topology.
+ * hidden allocation. Fixed T/B, views and device facts keep node count/order compatible across
+ * envelope updates; the bound selects launch/workspace configuration.
  * Actual per-query lengths, mixed batch contexts and all-select/inert cases are handled inside
  * the same kernels, including Graph replay. Metadata is not read back by the Host. Downstream
  * consumers read only count ids; same-stream ordering supplies the dependency.

@@ -2,7 +2,7 @@
 
 Qwen3.8-Flash-Next 是本合同的 checkpoint 实例，数学架构为 Qwen4Exp。现有
 `qwen3_8_flash_next` recipe 已完成 Text、可选 Vision 和原生 MTP 的 V3 `.ninfer` 转换；
-原生 loader、Parameters、执行资源与 eager Text/Vision/MTP 已接入 Engine。
+原生 loader、Parameters、执行资源与 Text/Vision/MTP 已接入 Engine。
 Op 与模型执行的完成范围、状态组合和剩余需求统一见
 [执行进度](qwen4_exp-execution.md#implementation-status)，PLE 的 Host 数学和读取流水见
 [PLE I/O](qwen4_exp-ple-io.md)。

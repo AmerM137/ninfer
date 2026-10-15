@@ -2,6 +2,7 @@
 
 #include "models/qwen4_exp/program/program.h"
 #include "models/qwen4_exp/program/ple_pipeline.h"
+#include "models/qwen4_exp/program/graphs.h"
 #include "models/qwen4_exp/execution/text.h"
 #include "models/common/context/snapshot.h"
 #include "models/common/qwen/prefix_identity.h"
@@ -183,6 +184,11 @@ public:
     [[nodiscard]] SequenceHandle handle(const Sequence&) const;
     void clear(Sequence&) noexcept;
     void cleanup() noexcept;
+    void initialize_graphs();
+    void release_graphs();
+    void draft_forward(std::uint32_t step, std::int32_t batch, std::uint32_t visible);
+    void sample_forward(std::int32_t batch, const Tensor& hidden, bool first_token);
+    void accept_forward(std::int32_t batch);
     [[nodiscard]] context::StateImageSelectors selectors(const Sequence&) const;
     void complete_write(Sequence&);
     [[nodiscard]] std::uint32_t window_end(const Sequence&, std::uint32_t begin,
@@ -239,6 +245,8 @@ public:
     Resources resources;
     PlePipeline ple;
     const ExecutionShape& shape;
+    std::unique_ptr<Graphs> graphs;
+    std::optional<GraphMemorySummary> graph_memory;
     Checkpoints checkpoints;
     CudaEventTimer prefill_timer;
     qwen::VisionHandoffState vision_handoff;

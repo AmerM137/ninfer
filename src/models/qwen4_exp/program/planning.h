@@ -22,6 +22,7 @@ struct ExecutionShape {
     KvCacheStorage kv_storage;
     EnginePurpose purpose;
     bool context_cache = false;
+    bool cuda_graph    = false;
 };
 
 struct ExecutionPlan {
@@ -39,6 +40,7 @@ struct ExecutionPlan {
     std::size_t pinned_sampling_bytes = 0;
     std::size_t pinned_mtp_bytes      = 0;
     runtime::KvCapacityResolution capacity;
+    bool graph_probe = false;
 
     [[nodiscard]] std::size_t device_bytes() const;
 
@@ -56,4 +58,8 @@ struct ExecutionPlan {
 [[nodiscard]] std::optional<ExecutionPlan>
 plan_execution(std::shared_ptr<const execution::ModelProfile>, const ple::disk::Table&,
                const EngineOptions&, DeviceContext&, std::size_t available_bytes);
+
+[[nodiscard]] ExecutionPlan plan_graph_probe(std::shared_ptr<const execution::ModelProfile>,
+                                             const ple::disk::Table&, const EngineOptions&,
+                                             DeviceContext&, std::shared_ptr<const moe::Plan>);
 } // namespace ninfer::models::qwen4_exp

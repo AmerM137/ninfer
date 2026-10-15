@@ -11,13 +11,11 @@ Tensor first(const Tensor& tensor, std::int32_t count) {
 }
 } // namespace
 
-Tensor ProgramImpl::device_tensor(const TensorRegion& r) { return r.bind(resources.persistent()); }
+Tensor ProgramImpl::device_tensor(const TensorRegion& r) { return resources.tensor(r); }
 
 Tensor ProgramImpl::packed_tensor(const TensorRegion& region,
                                   std::initializer_list<std::int32_t> shape) {
-    std::int32_t count = 1;
-    for (const auto n : shape) count *= n;
-    return first(device_tensor(region), count).view(shape);
+    return resources.packed(region, shape);
 }
 
 Tensor ProgramImpl::host_tensor(const TensorRegion& region) {
@@ -170,21 +168,7 @@ Tensor ProgramImpl::forward(std::span<Sequence* const> rows, std::uint32_t token
     copy_bytes_async({device_tensor(io.valid_columns).data, metadata_bytes, cuda.device()},
                      {host_tensor(io.valid_columns).data, metadata_bytes, Device::cpu(), true},
                      cuda);
-    const auto row_view = [&](const TensorRegion& r) {
-        return device_tensor(r).slice(0, 0, batch);
-    };
-    execution::BatchView call{t,
-                              batch,
-                              first(device_tensor(io.ids), m).view({t, batch}),
-                              first(device_tensor(io.positions), m).view({t, batch}),
-                              first(device_tensor(io.rope_positions), 3 * m).view({t, 3, batch}),
-                              row_view(io.valid_columns),
-                              row_view(io.source_slots),
-                              row_view(io.destination_slots),
-                              row_view(io.main_tables),
-                              row_view(io.base_positions),
-                              row_view(io.record_offsets),
-                              maximum};
+    auto call = resources.main_batch(t, batch, maximum);
     std::optional<execution::SequenceSlots> sequence;
     if (sequence_route) {
         const auto slots = selectors(*rows[0]);
@@ -205,9 +189,16 @@ Tensor ProgramImpl::forward(std::span<Sequence* const> rows, std::uint32_t token
         execution::StateUpdate update = execution::StepUpdate{};
         if (sequence) update = *sequence;
         execution::TextRun run(parameters, execution, call, update, cuda);
-        run.prefix(visual);
+        auto* graph = graphs && !sequence_route ? &graphs->main(batch, false, maximum) : nullptr;
+        if (graph)
+            graph->prefix(*resources.experts, run.block_output(), cuda);
+        else
+            run.prefix(visual);
         auto embedding = ple.consume(ticket);
-        run.consume_ple(embedding);
+        if (graph)
+            graph->consume_ple(ticket.slot, cuda);
+        else
+            run.consume_ple(embedding);
         ple.consumed(ticket);
         if (sequence_route) {
             auto& s          = *rows[0];
@@ -226,7 +217,10 @@ Tensor ProgramImpl::forward(std::span<Sequence* const> rows, std::uint32_t token
                 ple.prefetch(end - begin, {&next, 1});
             }
         }
-        run.suffix({sample, conditioning});
+        if (graph)
+            graph->suffix(*resources.experts, run.block_output(), cuda);
+        else
+            run.suffix({sample, conditioning});
     }
     if (parameters.mtp) align_mtp(rows, tokens, previous_conditioning, conditioning, visual);
     auto hidden = resources.states->sample_hidden();
@@ -255,6 +249,23 @@ void ProgramImpl::adopt_forward(std::span<Sequence* const> rows, std::uint32_t t
             m.mtp_frontier = mtp_history_frontier(m.main_frontier);
             resources.mtp->histories.commit_frontier(s.histories[1].handle(), *m.mtp_frontier);
         }
+    }
+}
+
+void ProgramImpl::sample_forward(std::int32_t b, const Tensor& hidden, bool first_token) {
+    const auto& io               = resources.plan.persistent.buffers;
+    const auto vocabulary        = parameters.profile->public_tokens;
+    const auto device_configs    = device_tensor(*io.sampling);
+    const auto logical_positions = device_tensor(io.batch.base_positions).slice(0, 0, b);
+    auto logits                  = device_tensor(*io.logits).slice(1, 0, b);
+    execution::project_head(hidden, parameters.text.head, logits, resources.workspace, cuda);
+    auto sampled = first(device_tensor(*io.sampled_ids), b);
+    {
+        auto scope = resources.workspace.scope();
+        ops::sample(logits, sampled, vocabulary,
+                    static_cast<const ops::SamplingConfig*>(device_configs.data), logical_positions,
+                    first_token ? ops::kSamplePurposePrefill : ops::kSamplePurposeDecode,
+                    resources.workspace, cuda);
     }
 }
 
@@ -300,16 +311,11 @@ PendingBatch ProgramImpl::sample(std::span<Sequence* const> rows, const Tensor& 
     auto logical_positions = device_tensor(io.batch.base_positions).slice(0, 0, b);
     copy_bytes_async({logical_positions.data, rows.size() * 4, cuda.device()},
                      {positions, rows.size() * 4, Device::cpu(), true}, cuda);
-    auto logits = device_tensor(*io.logits).slice(1, 0, b);
-    execution::project_head(hidden, parameters.text.head, logits, resources.workspace, cuda);
-    auto sampled = first(device_tensor(*io.sampled_ids), b);
-    {
-        auto scope = resources.workspace.scope();
-        ops::sample(logits, sampled, vocabulary,
-                    static_cast<const ops::SamplingConfig*>(device_configs.data), logical_positions,
-                    first_token ? ops::kSamplePurposePrefill : ops::kSamplePurposeDecode,
-                    resources.workspace, cuda);
-    }
+    if (graphs && !first_token)
+        graphs->sample(b);
+    else
+        sample_forward(b, hidden, first_token);
+    const auto sampled = first(device_tensor(*io.sampled_ids), b);
     copy_bytes_async(resources.egress().subspan(0, rows.size() * 4),
                      {sampled.data, rows.size() * 4, cuda.device()}, cuda);
     timing.begin_wait();

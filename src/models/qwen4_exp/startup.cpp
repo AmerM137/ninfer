@@ -4,17 +4,8 @@
 #include <nlohmann/json.hpp>
 
 namespace ninfer::models::qwen4_exp {
-namespace {
-LoadOptions selection(const EngineOptions& options) {
-    if (options.use_cuda_graph)
-        throw std::invalid_argument(
-            "Qwen4Exp currently supports eager execution; disable CUDA Graph");
-    return load_options(options);
-}
-} // namespace
-
 Startup::Startup(const artifact::Reader& reader, const EngineOptions& options, Device device)
-    : source_(plan_load(reader, selection(options))), table_(&source_.ple_table()) {
+    : source_(plan_load(reader, load_options(options))), table_(&source_.ple_table()) {
     profile             = execution::describe_model(source_);
     weights.fixed_bytes = source_.placement(device).device_capacity_bytes;
     weights.banks       = profile->banks;
@@ -64,6 +55,17 @@ std::unique_ptr<Program> create_program(const execution::Parameters& p,
                                         qwen4_exp::ExecutionPlan&& plan, DeviceContext& device,
                                         const StartupObserver&) {
     return std::make_unique<Program>(p, std::move(plan), device);
+}
+
+GraphPreparationPlan Startup::graph_plan(const EngineOptions& options,
+                                         const moe::Plan* plan) const {
+    return describe_graph_preparation(options, plan);
+}
+
+Startup::Calibration Startup::calibrate(const execution::Parameters& parameters,
+                                        DeviceContext& device, const EngineOptions& options,
+                                        std::shared_ptr<const moe::Plan> plan) const {
+    return calibrate_graphs(parameters, device, options, std::move(plan));
 }
 
 std::string prefill_signature(const Model& model, const moe::Plan* moe, std::uint32_t chunk) {

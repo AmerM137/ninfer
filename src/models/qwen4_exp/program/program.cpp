@@ -81,6 +81,7 @@ void ProgramImpl::cleanup() noexcept {
         pending_transaction = 0;
         pending_members.clear();
         pending_verify.reset();
+        graphs.reset();
     } catch (...) { std::terminate(); }
 }
 
@@ -113,7 +114,9 @@ PhysicalUsageSnapshot ProgramImpl::usage() const noexcept {
 namespace ninfer::models::qwen4_exp {
 
 Program::Program(const execution::Parameters& p, ExecutionPlan plan, DeviceContext& device)
-    : impl_(std::make_unique<detail::ProgramImpl>(p, std::move(plan), device)) {}
+    : impl_(std::make_unique<detail::ProgramImpl>(p, std::move(plan), device)) {
+    impl_->initialize_graphs();
+}
 
 Program::~Program() = default;
 
@@ -153,6 +156,7 @@ void Program::fail_all_cleanup() noexcept { impl_->cleanup(); }
 void Program::reset_memory_peaks() noexcept {
     auto& p = *impl_;
     p.resources.workspace.reset_peak();
+    if (p.graphs) p.graphs->reset_workspace_peak();
     p.vision_handoff_peak_bytes = p.active_vision_bytes();
     p.vision_workspace_peak_bytes =
         p.vision_handoff_peak_bytes
@@ -165,6 +169,7 @@ MemorySummary Program::memory_summary() const {
     const auto& plan    = p.resources.plan;
     const auto& weights = p.parameters.model.storage_stats();
     MemorySummary out;
+    out.cuda_graph    = p.graph_memory;
     out.device        = p.device.device().index();
     out.max_context   = plan.shape.max_context;
     out.prefill_chunk = plan.shape.prefill_chunk;
@@ -179,7 +184,8 @@ MemorySummary Program::memory_summary() const {
                                  plan.workspace.vision->handoff_offset_bytes + active_vision)
                       : p.resources.workspace.used();
     out.workspace = {plan.workspace.bytes, active_workspace,
-                     std::max(p.resources.workspace.peak_used(), p.vision_workspace_peak_bytes)};
+                     std::max({p.resources.workspace.peak_used(), p.vision_workspace_peak_bytes,
+                               p.graphs ? p.graphs->workspace_peak() : 0})};
     if (plan.workspace.vision) {
         const auto& vision   = *plan.workspace.vision;
         out.vision_workspace = VisionWorkspaceMemorySummary{

@@ -24,6 +24,11 @@ TextRun::TextRun(const Parameters& p, TextExecution execution, BatchView batch, 
 }
 
 void TextRun::prefix(std::optional<VisualEmbeddingView> visual) {
+    stem(visual);
+    for (std::uint32_t i = 0; i < parameters_.model.config().text.ple.layer; ++i) layer(i);
+}
+
+void TextRun::stem(std::optional<VisualEmbeddingView> visual) {
     const auto& p = parameters_.text;
     ops::embedding(batch_.ids.view({batch_.tokens * batch_.batch}), p.embedding, roots_.input,
                    cuda_);
@@ -31,16 +36,26 @@ void TextRun::prefix(std::optional<VisualEmbeddingView> visual) {
     ops::hc_expand_norm(roots_.input, p.layers.front().attention_hc.norm,
                         parameters_.model.config().text.norm_epsilon, roots_.residual,
                         roots_.normalized, cuda_);
-    for (std::uint32_t i = 0; i < parameters_.model.config().text.ple.layer; ++i) layer(i);
 }
 
 void TextRun::layer(std::uint32_t i) {
     nvtx::ScopedRange layer(nvtx::Name::TextLayer, nvtx::Category::Runtime, i);
+    const auto& p = parameters_.text.layers[i];
+    execution_.experts.before_layer(p.moe.bank);
+    mixer(i);
+    {
+        auto scratch = execution_.workspace.scope();
+        execution_.experts.execute(p.moe.bank, roots_.input, roots_.output, execution_.workspace,
+                                   {});
+    }
+    combine(i);
+}
+
+void TextRun::mixer(std::uint32_t i) {
     const auto& config = parameters_.model.config().text;
     const auto& p      = parameters_.text.layers[i];
     const auto& state  = config.layers[i];
     auto& arena        = execution_.workspace;
-    execution_.experts.before_layer(p.moe.bank);
     {
         auto scratch = arena.scope();
         ops::hc_mix(roots_.normalized, p.attention_hc.mix, arena, roots_.input, roots_.injection,
@@ -72,10 +87,16 @@ void TextRun::layer(std::uint32_t i) {
         auto scratch = arena.scope();
         ops::hc_mix(roots_.normalized, p.moe_hc.mix, arena, roots_.input, roots_.injection, cuda_);
     }
-    {
-        auto scratch = arena.scope();
-        execution_.experts.execute(p.moe.bank, roots_.input, roots_.output, arena, {});
-    }
+}
+
+void TextRun::gpu_moe(const moe::PreparedExecution& call) {
+    auto scratch = execution_.workspace.scope();
+    moe::enqueue_gpu(roots_.input, call, roots_.output, execution_.workspace,
+                     moe::GpuSubmission::Capture);
+}
+
+void TextRun::combine(std::uint32_t i) {
+    const auto& config = parameters_.model.config().text;
     if (i + 1 == config.ple.layer) {
         ops::hc_combine(roots_.residual, roots_.output, roots_.injection, roots_.residual, cuda_);
     } else {
@@ -102,9 +123,13 @@ void TextRun::consume_ple(const Tensor& embedding) {
 }
 
 void TextRun::suffix(TextOutputs output) {
-    const auto& p    = parameters_.text;
     const auto start = parameters_.model.config().text.ple.layer;
-    for (std::uint32_t i = start; i < p.layers.size(); ++i) layer(i);
+    for (std::uint32_t i = start; i < parameters_.text.layers.size(); ++i) layer(i);
+    finish(output);
+}
+
+void TextRun::finish(TextOutputs output) {
+    const auto& p = parameters_.text;
     if (output.conditioning.data)
         copy_bytes_async({output.conditioning.data, output.conditioning.bytes(), cuda_.device()},
                          {roots_.residual.data, roots_.residual.bytes(), cuda_.device()}, cuda_);

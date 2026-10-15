@@ -8,8 +8,8 @@
 单个 Op 的完整公式、支持域、alias、workspace 和执行约束由 `include/ninfer/ops/`
 中的合同维护，本文只规定模型如何组合这些计算。[Engine 架构](engine-architecture.md)
 拥有请求事务与发布规则，[Paged KV](paged-kv-cache.md)拥有物理页、replica 和迁移机制。
-Eager Text/Vision/MTP 已接入公共 Engine，使用下述层流程、StateImage、QSA 页池和请求事务。
-Graph 尚未接入；当前启用范围见文末执行进度。
+Text/Vision/MTP 已接入公共 Engine，使用下述层流程、StateImage、QSA 页池和请求事务。
+Decode 支持 eager 与分段 CUDA Graph；当前启用范围见文末执行进度。
 
 ## 1. 共同轴、前沿与所有权
 
@@ -139,7 +139,7 @@ multistream。初始化中，`pre_fc_norm_hidden` 沿完整 10240 维归约，�
 Main 末端 pair 和已提交 Backend KV/QSA tail；未决 draft 内部特征不单独成为恢复点。
 Resume 从保存的 Main conditioning 和 Backend 前沿重新进入 bridge。
 
-### 2.2 Eager MTP 执行与采用
+### 2.2 MTP 执行与采用
 
 原生执行支持 `K=1..5`、`B=1..8`。MTP experts 常驻 GPU，使用产物中的 block-FP8
 权重及其 A8 许可；proposal 使用共享 BF16 全词表 head。Main MoE 按 verify 的实际物理
@@ -361,7 +361,34 @@ exact-B topology 和稳定 backing 规划；[GDN fold](../../include/ninfer/ops/
 的 host row descriptors 在 capture 时按值固定，改变它们需新 capture，不能套用
 QSA/PLE Device metadata 的 replay 规则。
 
-### 6.1 Planner 的基础 payload 预算
+### 6.1 CUDA Graph 与 Host 交接
+
+`program/graphs.*` 按 exact-B 建立 ordinary `T=1`、MTP verify `T=K+1`、逐步 draft
+和 sampling/Finish 图。`program/text_graph.*` 组织原生 Main 层遍历，复用公共 MoE
+分段图。Eager 与 capture 调用同一份 stem、mixer、MoE GPU body、combine 和 final mixer。
+
+Main 在 PLE 所在位置保留 Host 交接：先执行前序层，取得上传 dependency，再重放对应
+PLE 槽的消费图并继续后序层。两个上传槽只复制 PLE 消费段；GDN 层定义和 MoE subset
+定义在上下文档位之间共享，只有 QSA 相关段随 envelope 更新。CPU experts、expert cache
+调度、文件 I/O 和 Host 等待均在 capture 外执行。
+
+各行位置、有效列数、state selectors、KV table rows 和采样配置通过稳定 Device buffers
+更新，不属于 graph key。上下文档位是资源上界，由 Program 选取并在启动时验证 graph
+update；kernel 分派仍由 Ops 决定。短上下文、all-select 与不同 batch 行的有效范围由
+Indexer/Sparse GQA 在 kernel 内处理。
+
+每个 MTP draft 图产生下一 ID，随后在图外 record event 并异步 D2H，继续增量准备 PLE。
+Target verify 与 Finish 分开，Host 在 Finish 前准备约束 mask。Frontend 决定最终采用长度
+后，仍调用 GDN fold、QSA/PLE tail 提取、末端 pair 选择与 Backend 历史对齐；这些提交
+操作不冻结 Host 的动态接受长度，也不改变规范 Main/Backend 前沿关系。
+
+`graph_preparation.*` 接入公共启动校准。Probe 借用已加载权重，使用少量私有 KV 页和
+公共 MoE calibration bank，保留实际 T/B、KV 格式、上下文容量和图共享关系。临时状态与
+映射在准备后释放。图销毁、probe 销毁后的驱动保留量与图重建估计按公共启动合同处理，
+再规划正式 expert cache。Graph resources 先于其引用的 workspace、bridge 和 events 销毁。
+重放的 workspace 用量依据捕获时记录的布局维护逻辑峰值。
+
+### 6.2 Planner 的基础 payload 预算
 
 以下是本实例的逻辑 payload；state 副本数、页取整、对齐、workspace、Graph、传输槽和
 容量余量由实际 planner 另计。每份 canonical state 都对应一个完整恢复点。
@@ -403,9 +430,10 @@ lead 规划，不假定与 Main 相同。最终容量、Host reservation、迁�
 | 已完成能力 | 范围与权威入口 |
 |---|---|
 | 加载与执行资源 | `qwen4_exp/load.*`、`execution/profile.*`、`parameters.*`、`state/` 和 `program/` 已实现组件选择、原表示绑定、连续 StateImage、Main/MTP 页组、records/workspace、公共 MoE 资源与 PLE 双槽 |
-| Main eager Text | `execution/text.*` 组合 HC/GDN/QSA/PLE/MoE；原生 `program/` 支持 prefill、ordinary decode、control、Replay、scoring、checkpoint/Host 恢复与取消；公共 Qwen Frontend 提供 thinking、tool call 和约束输出 |
-| Eager Vision | 共享图像/视频编码、HC 前 embedding 替换、MRoPE、跨 chunk handoff、媒体前缀复用及暂停恢复；PLE 使用原 IDs，与编码异步重叠 |
-| Eager MTP | `execution/mtp.*` 与 `program/mtp.cpp`、`commit.cpp` 实现 stem、历史建立、draft/verify/bridge、精确接受前缀、双 pool 恢复、约束输出及增量 PLE；Text/Vision 共用 |
+| Main Text | `execution/text.*` 组合 HC/GDN/QSA/PLE/MoE；原生 `program/` 支持 prefill、ordinary decode、control、Replay、scoring、checkpoint/Host 恢复与取消；公共 Qwen Frontend 提供 thinking、tool call 和约束输出 |
+| Vision | 共享图像/视频编码、HC 前 embedding 替换、MRoPE、跨 chunk handoff、媒体前缀复用及暂停恢复；PLE 使用原 IDs，与编码异步重叠 |
+| MTP | `execution/mtp.*` 与 `program/mtp.cpp`、`commit.cpp` 实现 stem、历史建立、draft/verify/bridge、精确接受前缀、双 pool 恢复、约束输出及增量 PLE；Text/Vision 共用 |
+| CUDA Graph | ordinary、MTP draft/verify/Finish、单列 control；exact-B、QSA envelope 更新、PLE 双槽、共享 MoE 交接与启动实测校准 |
 | Artifact/converter 与纯 Linear | Qwen4Exp 配置、Binding/Use、完整 Text/Vision/MTP 权重产物、NF4 持久编码/分页布局及 20 项矩阵支持；详见模型文档 |
 | GDN 输出 norm | `sigmoid_gated_rmsnorm`，与 SiLU gated 形式共用 RMSNorm 家族；已通过数学与 Op 性能验收 |
 | GDN control | BF16 `[96,2560]` 合并 AB projection、权重准备、FP32 controls 和容量查询；已通过数学与 Op 性能验收 |
@@ -416,16 +444,16 @@ lead 规划，不假定与 Main 相同。最终容量、Host reservation、迁�
 | PLE GPU 局部能力 | `ple_gate`、`ple_conv_add`、`ple_conv_add_norm`、`ple_state_extract` 已实现；Gate 直接消费合并 K/V view，写 BF16 U 和正式 N records |
 | Main/MTP GPU MoE | NVFP4 A4、block-FP8 A8/G128、小批量 A16、BF16 router/shared、完整与子集入口及固定 Graph replay 已实现 |
 | Main CPU MoE | CPU `routed_swiglu` 直接读取 NVFP4 bank；BF16 输入、FP32 contribution、expert subset、逐 expert divisor 与有界 workspace 已实现 |
-| PLE 准备组件 | 精确 hash/NF4 解码、磁盘 backing、行/页去重与缓存、增量窗口、取消和 GPU 双槽交接已实现，并已接入 Main eager Program 的准备/上传/消费、下一 chunk 预取与取消退役 |
+| PLE 准备组件 | 精确 hash/NF4 解码、磁盘 backing、行/页去重与缓存、增量窗口、取消和 GPU 双槽交接已实现，并已接入 Main Program 的准备/上传/消费、下一 chunk 预取与取消退役 |
 
-Main eager 使用 1–8 路执行和 BF16、INT8、FP8、NVFP4、K8V4 五种 KV 存储。Main experts
+Main 使用 1–8 路执行和 BF16、INT8、FP8、NVFP4、K8V4 五种 KV 存储。Main experts
 采用完整 Host backing；公共 MoE 根据实际 token 列数选择 CPU/GPU 子集或完整层流式计算。
 默认 expert 优先级为 ID 顺序，`MoeOptions::expert_priority` 可覆盖各层排序。Prefill chunk
 由启动配置决定，默认 4096。PLE 的 raw-ID tail 随 continuation 保存，准备服务与上传双槽
 由 Program 拥有，下一窗口的 I/O 不推进模型前沿。
 
-剩余集成为 **CUDA Graph**：组织 PLE Host handoff、MoE 分段图及启动校准，覆盖实际
-T/B 与上下文更新。
+CUDA Graph 已覆盖 ordinary、MTP draft/verify/Finish 及单列 control；Prefill、Replay、
+Vision 编码和最终接受状态采用沿用 eager 路径。
 
 后续性能工作包括本实例的 expert 优先级、CPU/GPU 切换策略和上下文成本校准。现有
 Qwen3.5 的 DFlash/DFlash2 支持不扩展为 Qwen4Exp 的执行声明。
