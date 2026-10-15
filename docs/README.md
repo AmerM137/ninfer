@@ -57,11 +57,11 @@ Model cards contain official artifact facts and source provenance. The
 fields, parameter expansion and native supported domains are maintained by the code linked from
 these references.
 
-## Planned work
+## Architecture integration and planned work
 
-Qwen3.8-Flash-Next uses the Qwen4Exp architecture. Its converter and many supporting Ops are
-implemented; Engine integration remains pending. The execution design owns the current support
-status and remaining requirements. Concrete Op contracts live in `include/ninfer/ops/`.
+Qwen3.8-Flash-Next uses the Qwen4Exp architecture. Its eager Text Engine includes CPU/GPU MoE
+and disk-backed PLE; Vision, MTP and CUDA Graph integration remain planned. The execution document
+owns current support and remaining work. Concrete Op contracts live in `include/ninfer/ops/`.
 
 | Design | Responsibility |
 |---|---|

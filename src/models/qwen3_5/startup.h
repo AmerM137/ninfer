@@ -10,9 +10,10 @@ namespace ninfer::models::qwen3_5 {
 // Native loading and execution planning. Runtime owns the budget, calibration loop and retries.
 class Startup {
 public:
-    using Types         = RuntimeTypes;
-    using ExecutionPlan = models::ExecutionPlan<SequencePlan>;
-    using Calibration   = GraphCalibration;
+    static constexpr bool supports_graph = true;
+    using Types                          = RuntimeTypes;
+    using ExecutionPlan                  = models::ExecutionPlan<SequencePlan>;
+    using Calibration                    = GraphCalibration;
 
     Startup(const artifact::Reader&, const EngineOptions&, Device);
 

@@ -14,7 +14,16 @@ public:
 
     Tensor tensor(WeightId id) const { return parameter_tensor(model_.weight(id)); }
 
-    Tensor hc_norm(WeightId id) const { return tensor(id).view({2560, 4}); }
+    Tensor hc_norm(WeightId id) const {
+        const auto& c = model_.config().text;
+        return tensor(id).view({dimension(c.hidden), dimension(c.hc.streams)});
+    }
+
+    ops::ProjectionWeights projection(std::initializer_list<WeightId> ids) const {
+        std::vector<ops::WeightInput> inputs;
+        for (const auto id : ids) inputs.push_back(model_.input(id));
+        return ops::prepare_projection_weights(inputs);
+    }
 
     HcParameters hc(const HcWeights& w) const {
         return {hc_norm(w.norm),
@@ -31,7 +40,7 @@ public:
         out.moe_hc       = hc(w.moe_hc);
         if (const auto* g = std::get_if<GdnWeights>(&w.mixer)) {
             out.mixer = GdnParameters{
-                linear({g->query, g->key, g->value, g->z}),
+                projection({g->query, g->key, g->value, g->z}),
                 ops::prepare_gdn_control_proj_weights(model_.input(g->a), model_.input(g->b)),
                 tensor(g->a_log),
                 tensor(g->dt_bias),
@@ -51,7 +60,10 @@ public:
                          tensor(q.index_query_norm),
                          tensor(q.index_key_norm),
                          model_.config().text.norm_epsilon,
-                         model_.config().text.qsa.rope_theta};
+                         model_.config().text.qsa.rope_theta,
+                         model_.config().text.qsa.rotary_dim,
+                         model_.config().text.qsa.rope_sections,
+                         model_.config().text.qsa.rope_interleaved};
             p.output  = linear({q.output});
             out.mixer = std::move(p);
         }

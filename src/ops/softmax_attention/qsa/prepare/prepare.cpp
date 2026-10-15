@@ -27,6 +27,9 @@ void qsa_prepare(const QsaProjectionView& p, const QsaPrepareParameters& paramet
     v.require(parameters.rms_epsilon > 0 && std::isfinite(parameters.rms_epsilon) &&
                   parameters.rope_theta > 0 && std::isfinite(parameters.rope_theta),
               "epsilon/theta");
+    v.require(parameters.rotary_dim == 64 && parameters.rope_interleaved &&
+                  parameters.rope_sections == std::array<std::uint32_t, 3>{11, 11, 10},
+              "unsupported rotary geometry");
     v.dense(p.query, DType::BF16, {256, 24, tokens, rows}, 16, "query projection");
     v.dense(p.key, DType::BF16, {256, 2, tokens, rows}, 16, "key projection");
     v.dense(p.value, DType::BF16, {256, 2, tokens, rows}, 16, "value projection");

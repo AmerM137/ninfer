@@ -454,12 +454,71 @@ int qualify_schedule(const DeviceContext& device, const CpuTopology& topology,
 }
 } // namespace
 
+namespace {
+void qualify_top10_bridge_routes(const DeviceContext& device, const CpuTopology& topology) {
+    shared::Parameters p;
+    p.bank           = {0};
+    p.profile.routed = {{2560, 640, QType::NVFP4, QType::NVFP4, QuantLayout::BlockScaleK16M128x4,
+                         QuantLayout::BlockScaleK16M128x4, ops::LinearPolicy::AllowA4,
+                         ops::LinearPolicy::AllowA4},
+                        512,
+                        10};
+    p.profile.shared = {2560, 640};
+    GuardedDeviceBuffer control(513 * 2560 * 2), inputs(2560 * 9 * 2);
+    CUDA_CHECK(cudaMemsetAsync(control.data(), 0, control.bytes(), device.stream()));
+    CUDA_CHECK(cudaMemsetAsync(inputs.data(), 0, inputs.bytes(), device.stream()));
+    auto& weight   = p.control;
+    weight.device  = device.device();
+    weight.payload = weight.qdata = control.data();
+    weight.payload_bytes          = control.bytes();
+    weight.qtype                  = QType::BF16;
+    weight.layout                 = QuantLayout::Contiguous;
+    weight.ndim                   = 2;
+    weight.n = weight.shape[0] = weight.padded_shape[0] = 513;
+    weight.k = weight.shape[1] = weight.padded_shape[1] = 2560;
+    const auto requirements =
+        shared::describe_execution(p.profile, Kind::None, Epilogue::Write, 1, 9);
+    Bridge bridge(requirements, topology, plan_cpu_team(topology.info(), 1), device);
+    GuardedDeviceBuffer scratch(requirements.gpu_workspace_bytes);
+    MemoryArena workspace(scratch.span());
+    // Only the router consumes payload in this check; the expert sources remain descriptors.
+    WeightParent parent;
+    parent.device = Device::cpu();
+    const ExpertBankSource source{{&parent, {}}, {&parent, {}}, {}, {}};
+    const ExpertBankDeviceView bank{{}, {}, 512, device.device()};
+    const shared::PartitionView partition{{0}, 512, Kind::None, {}, {}};
+    for (int tokens : {1, 3, 8, 9}) {
+        auto prepared = shared::prepare_execution(p, partition, source, bank, Epilogue::Write,
+                                                  tokens, bridge.execution_view());
+        auto x = Tensor(inputs.span().subspan(0, 2560 * tokens * 2), DType::BF16, {2560, tokens});
+        ops::topk_softmax_route(x, {2560, 512, 10}, p.control, prepared.frame.device_routes,
+                                prepared.frame.shared, workspace, device.execution_view());
+        device.synchronize();
+        const auto ids = from_device<int>(prepared.frame.device_routes.ids.data, 10 * tokens);
+        const auto coefficients =
+            from_device<float>(prepared.frame.device_routes.coefficients.data, 10 * tokens);
+        const auto shared = from_device<float>(prepared.frame.shared.data, tokens);
+        for (int t = 0; t < tokens; ++t) {
+            require(shared[t] == 0.5F, "zero shared logit must yield one half");
+            for (int k = 0; k < 10; ++k)
+                require(ids[t * 10 + k] == k && std::abs(coefficients[t * 10 + k] - 0.1F) < 1e-7F,
+                        "top-10 bridge route differs from uniform-logit softmax");
+        }
+        require(control.verify_guards("top-10 control") == 0 &&
+                    inputs.verify_guards("top-10 input") == 0 &&
+                    scratch.verify_guards("top-10 scratch") == 0,
+                "top-10 bridge route exceeded storage");
+    }
+}
+} // namespace
+
 int main() {
     if (ninfer::test::cuda_unavailable()) { return 77; }
     try {
         qualify_allocation();
         CpuTopology topology;
         auto& device = cuda_environment().context;
+        qualify_top10_bridge_routes(device, topology);
         int failures = 0;
         for (const auto down : {QType::Q5_G64_FP16, QType::Q6_G64_FP16}) {
             for (const auto epilogue : {Epilogue::Write, Epilogue::AddResidual})

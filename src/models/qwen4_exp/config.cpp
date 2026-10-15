@@ -11,7 +11,7 @@ using artifact::Json;
 
 std::uint32_t integer(const Json& value, std::string_view name) {
     const auto n = artifact::require_u64(value, name, true);
-    if (n > INT32_MAX) throw ArtifactError(std::string(name) + ": dimension exceeds int32");
+    if (n > UINT32_MAX) throw ArtifactError(std::string(name) + ": dimension exceeds uint32");
     return static_cast<std::uint32_t>(n);
 }
 
@@ -59,13 +59,10 @@ TextConfig text_config(const Json& c) {
                dimension(c, "linear_conv_kernel_dim")};
     const auto& rope = c.at("rope_parameters");
     expect(rope, "rope_type", "default");
-    expect(rope, "mrope_interleaved", true);
-    expect(rope, "mrope_section", Json::array({11, 11, 10}));
-    expect(rope, "partial_rotary_factor", 0.25);
     const auto compression = dimension(c, "indexer_compress_ratio");
     const auto budget      = dimension(c, "indexer_budget");
-    if (compression != 4 || budget != 2048 || dimension(c, "indexer_kv_heads") != 1)
-        throw ArtifactError("Qwen4Exp requires four-token index blocks and a 512-block budget");
+    if (budget % compression)
+        throw ArtifactError("QSA token budget must contain whole compressed blocks");
     out.qsa = {dimension(c, "num_attention_heads"),
                dimension(c, "num_key_value_heads"),
                dimension(c, "head_dim"),
@@ -77,14 +74,33 @@ TextConfig text_config(const Json& c) {
     out.moe = {dimension(c, "num_experts"), dimension(c, "num_experts_per_tok"),
                dimension(c, "moe_intermediate_size"),
                dimension(c, "shared_expert_intermediate_size")};
-    if (out.hidden != 2560 || out.hc.streams != 4 || out.hc.lowrank != 320 ||
-        out.gdn.key_heads != 16 || out.gdn.value_heads != 48 || out.gdn.key_dim != 128 ||
-        out.gdn.value_dim != 128 || out.gdn.conv_width != 4 || out.qsa.query_heads != 24 ||
-        out.qsa.kv_heads != 2 || out.qsa.head_dim != 256 || out.qsa.index_heads != 4 ||
-        out.qsa.index_dim != 128 || out.moe.experts != 512 || out.moe.top_k != 10 ||
-        out.moe.intermediate != 640 || out.moe.shared_intermediate != 640 ||
-        out.max_context > 262144)
-        throw ArtifactError("Qwen4Exp geometry is outside the native Op domain");
+    if (out.gdn.value_heads % out.gdn.key_heads || out.qsa.query_heads % out.qsa.kv_heads)
+        throw ArtifactError("attention head counts must be divisible");
+    if (out.moe.top_k > out.moe.experts)
+        throw ArtifactError("selected experts exceed expert count");
+    auto& q          = out.qsa;
+    q.index_kv_heads = dimension(c, "indexer_kv_heads");
+    if (q.index_heads % q.index_kv_heads)
+        throw ArtifactError("index query heads must be divisible by key heads");
+    const auto fraction = positive(rope, "partial_rotary_factor");
+    if (fraction > 1) throw ArtifactError("partial_rotary_factor exceeds one");
+    q.rotary_dim = static_cast<std::uint32_t>(double(q.head_dim) * fraction);
+    if (!q.rotary_dim || q.rotary_dim % 2 || q.rotary_dim > q.index_dim)
+        throw ArtifactError("rotary dimension must be even and fit both attention and index heads");
+    if (!rope.at("mrope_interleaved").is_boolean())
+        throw ArtifactError("mrope_interleaved must be boolean");
+    q.rope_interleaved   = rope.at("mrope_interleaved").get<bool>();
+    const auto& sections = rope.at("mrope_section");
+    if (!sections.is_array() || sections.size() != q.rope_sections.size())
+        throw ArtifactError("MRoPE requires three sections");
+    std::uint64_t sum = 0;
+    for (std::size_t i = 0; i < q.rope_sections.size(); ++i) {
+        const auto n = artifact::require_u64(sections[i], "MRoPE section", false);
+        if (n > UINT32_MAX) throw ArtifactError("MRoPE section exceeds uint32");
+        q.rope_sections[i] = static_cast<std::uint32_t>(n);
+        sum += n;
+    }
+    if (sum != q.rotary_dim / 2) throw ArtifactError("MRoPE sections differ from the rotary width");
     const auto layers = dimension(c, "num_hidden_layers");
     const auto& kinds = c.at("layer_types");
     if (!kinds.is_array() || kinds.size() != layers)
@@ -97,24 +113,26 @@ TextConfig text_config(const Json& c) {
         else
             throw ArtifactError("unknown Qwen4Exp mixer");
     }
-    if (!out.gdn_layers || !out.qsa_layers)
-        throw ArtifactError("Qwen4Exp requires GDN and QSA layers");
-    expect(c, "ple_embed_dim", 2560);
-    expect(c, "ngram_size", 3);
-    expect(c, "heads_per_ngram", 8);
-    expect(c, "ple_conv_kernel_size", 4);
-    expect(c, "ple_conv_dilation", 3);
     const auto& positions = c.at("ple_layer_ids");
     if (!positions.is_array() || positions.size() != 1)
         throw ArtifactError("Qwen4Exp requires one PLE layer");
     const auto layer  = artifact::require_u64(positions[0], "PLE layer", false);
     const auto& shard = c.at("ple_shard_shape");
-    if (layer >= layers || !shard.is_array() || shard.size() != 2 || shard[1] != 160)
+    if (layer >= layers || !shard.is_array() || shard.size() != 2)
         throw ArtifactError("invalid Qwen4Exp PLE geometry");
     const auto eos = artifact::require_u64(c.at("eos_token_id"), "EOS", false);
-    if (eos >= out.vocabulary) throw ArtifactError("PLE EOS is outside vocabulary");
-    out.ple = {static_cast<std::uint32_t>(layer), dimension(c, "split_ngram_parts"),
-               integer(shard[0], "PLE shard rows"), static_cast<std::int32_t>(eos)};
+    if (eos >= out.vocabulary || eos > INT32_MAX)
+        throw ArtifactError("PLE EOS is outside vocabulary");
+    out.ple         = {static_cast<std::uint32_t>(layer),    dimension(c, "split_ngram_parts"),
+                       integer(shard[0], "PLE shard rows"),  static_cast<std::int32_t>(eos),
+                       dimension(c, "ple_embed_dim"),        dimension(c, "ngram_size"),
+                       dimension(c, "heads_per_ngram"),      integer(shard[1], "PLE row width"),
+                       dimension(c, "ple_conv_kernel_size"), dimension(c, "ple_conv_dilation")};
+    const auto& ple = out.ple;
+    if (ple.ngram_size < 2 ||
+        (ple.embedding % ple.row_width ||
+         std::uint64_t(ple.ngram_size - 1) * ple.heads_per_ngram != ple.embedding / ple.row_width))
+        throw ArtifactError("PLE head geometry differs from its embedding width");
     return out;
 }
 
@@ -133,14 +151,18 @@ qwen::VisionConfig vision_config(const Json& c, std::uint32_t hidden) {
                            dimension(c, "spatial_merge_size"),
                            dimension(c, "num_position_embeddings")};
     out.position_grid_side = static_cast<std::uint32_t>(std::sqrt(out.num_position_embeddings));
-    if (out.hidden_size != 1152 || out.num_heads != 16 || out.patch_size != 16 ||
-        out.temporal_patch_size != 2 || out.spatial_merge_size != 2 ||
+    if (out.hidden_size % out.num_heads || (out.hidden_size / out.num_heads) % 4 ||
         std::uint64_t(out.position_grid_side) * out.position_grid_side !=
             out.num_position_embeddings)
-        throw ArtifactError("Qwen4Exp Vision geometry is outside the encoder domain");
+        throw ArtifactError("invalid Vision head or square position geometry");
     return out;
 }
 } // namespace
+
+std::uint64_t GdnConfig::conv_channels() const {
+    return artifact::checked_add(artifact::checked_mul(2, key_width(), "GDN Q/K width"),
+                                 value_width(), "GDN convolution channels");
+}
 
 Config parse_config(const artifact::Directory& directory, const LoadOptions& options) {
     if (options.masked_draft() || options.proposal_enabled())

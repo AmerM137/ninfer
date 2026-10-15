@@ -10,8 +10,12 @@ namespace ninfer::models::qwen4_exp::ple {
 
 LookupParameters load_lookup_parameters(const artifact::Reader& reader,
                                         const artifact::Binding& table,
-                                        artifact::ObjectHandle controls) {
+                                        artifact::ObjectHandle controls,
+                                        HashGeometry hash_geometry) {
     using namespace artifact;
+    if (hash_geometry.ngram_size != 3 || hash_geometry.heads_per_ngram != kHeads / 2)
+        throw ArtifactError(
+            "PLE hash controls v1 require eight heads for each of 2-gram and 3-gram");
     if (table.parts.empty()) throw ArtifactError("PLE table has no shards");
     LookupParameters result{};
     result.shards.reserve(table.parts.size());

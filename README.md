@@ -2,9 +2,9 @@
 
 > Selected checkpoints. Maximum single-GPU inference performance.
 
-NInfer is a from-scratch C++/CUDA inference engine for Qwen3.5 Dense and MoE architectures on a
-single NVIDIA GeForce RTX 5090. It runs text, image, and video prompts through a local CLI or
-OpenAI-/Anthropic-compatible HTTP APIs. The runtime is deliberately specialized: one GPU, one
+NInfer is a from-scratch C++/CUDA inference engine for a single NVIDIA GeForce RTX 5090.
+Qwen3.5 Dense and MoE support text, image and video prompts; Qwen4Exp supports eager Text.
+Both use the local CLI or OpenAI-/Anthropic-compatible HTTP APIs. The runtime uses one GPU, one
 resident model, and one to eight execution lanes fixed at startup.
 
 Five official artifacts are available. The quick-start commands use Qwen3.8-27B NVFP4.
@@ -252,8 +252,8 @@ The product boundary remains intentionally small:
 
 `--max-context` is each sequence's logical limit. `--kv-capacity` sizes the shared Main Text KV pool
 used by active requests and retained prefixes; `auto` resolves the largest legal capacity at
-startup from the memory remaining after weights while keeping 1 GiB of sizing headroom. Explicit
-capacities remain fixed for the process lifetime.
+startup from the memory remaining after weights. Both explicit and automatic modes use 1 GiB of
+startup planning headroom. Explicit capacities remain fixed for the process lifetime.
 
 ## Documentation
 

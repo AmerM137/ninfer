@@ -19,7 +19,7 @@ HcWeights hc(Bindings& b, const TextConfig& c, const std::string& p, bool final 
 GdnWeights gdn(Bindings& b, const TextConfig& c, const std::string& p) {
     const auto& g     = c.gdn;
     const auto prefix = p + "gdn/", input = p + "attention_input";
-    const auto projection = [&](const char* name, std::uint32_t width) {
+    const auto projection = [&](const char* name, std::uint64_t width) {
         return b.parameter(prefix + name, {width, c.hidden}, {input});
     };
     return {projection("query", g.key_width()),
@@ -38,15 +38,15 @@ GdnWeights gdn(Bindings& b, const TextConfig& c, const std::string& p) {
 QsaWeights qsa(Bindings& b, const TextConfig& c, const std::string& p) {
     const auto& q     = c.qsa;
     const auto prefix = p + "attention/", input = p + "attention_input";
-    const auto projection = [&](const char* name, std::uint32_t width) {
+    const auto projection = [&](const char* name, std::uint64_t width) {
         return b.parameter(prefix + name, {width, c.hidden}, {input});
     };
     return {projection("query", q.query_width()),
             projection("key", q.kv_width()),
             projection("output_gate", q.query_width()),
             projection("value", q.kv_width()),
-            projection("index_query", q.index_heads * q.index_dim),
-            projection("index_key", q.index_dim),
+            projection("index_query", q.index_query_width()),
+            projection("index_key", q.index_key_width()),
             b.direct(prefix + "query_norm", {q.head_dim}),
             b.direct(prefix + "key_norm", {q.head_dim}),
             b.direct(prefix + "index_query_norm", {q.index_dim}),
@@ -92,12 +92,12 @@ TextWeights bind_text(Bindings& b, const TextConfig& c) {
         out.layers.push_back(
             block(b, c, "text/layers/" + std::to_string(l) + "/", c.layers[l].mixer));
     const auto p = "text/layers/" + std::to_string(c.ple.layer) + "/ple/";
-    out.ple      = {b.parameter(p + "key", {c.residual_width(), c.hidden}, {p + "embedding"}),
-                    b.parameter(p + "value", {c.hidden, c.hidden}, {p + "embedding"}),
-                    b.direct(p + "norm_key", {c.residual_width()}),
-                    b.direct(p + "norm_query", {c.residual_width()}),
-                    b.direct(p + "norm_conv", {c.residual_width()}),
-                    b.direct(p + "convolution", {4, c.residual_width()})};
+    out.ple = {b.parameter(p + "key", {c.residual_width(), c.ple.embedding}, {p + "embedding"}),
+               b.parameter(p + "value", {c.hidden, c.ple.embedding}, {p + "embedding"}),
+               b.direct(p + "norm_key", {c.residual_width()}),
+               b.direct(p + "norm_query", {c.residual_width()}),
+               b.direct(p + "norm_conv", {c.residual_width()}),
+               b.direct(p + "convolution", {c.ple.conv_width, c.residual_width()})};
     return out;
 }
 

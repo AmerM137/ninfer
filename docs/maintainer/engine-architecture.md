@@ -22,7 +22,8 @@ Program，窗口使用临时 State 与 Main KV，不进入 Generation Scheduler 
 ### 1.1 架构、实例与权重
 
 模型代码拥有数学公式、调用顺序、组件交接和状态转移。Config 提供层数、维度、Attention/GDN
-分布和 expert 几何等实例参数。架构入口为 `Qwen3_5ForCausalLM` 与 `Qwen3_5MoeForCausalLM`；
+分布和 expert 几何等实例参数。架构入口为 `Qwen3_5ForCausalLM`、`Qwen3_5MoeForCausalLM`
+与 `Qwen4ExpForCausalLM`；后者当前支持 eager Text。
 训练实例和物理权重分配作为数据进入对应实现。
 
 V3 artifact 保存配置、物理对象、逻辑参数 Binding、使用位置的 Use 和 Frontend 资源。
@@ -427,8 +428,10 @@ Graph 校准记录准备前、准备完成、仅销毁 Graph 后的显存快照�
 这些差值包含 CUDA 延迟加载和驱动缓存，不作为纯 Graph allocation 的精确归因。
 `runtime_reservation_bytes` 仅包含显式 Program backing。
 正式准备的增长单独报告，以实际总占用是否满足 Device 预算判断启动，不要求它小于估计值。
-统一 headroom 是容量规划缓冲，不按拓扑类重复预留。正式分配不足时最多进行一次容量纠偏重建；
-只调整自动 KV 或可选 expert cache，保持显式容量与执行功能。Device 分配不足可以回收，
+显式与自动 KV 容量统一使用至少 1 GiB headroom，自动容量显式要求更大余量时取其值。
+这部分是容量规划缓冲，用于容纳未精确计入的开销，不要求初始化后仍完整空闲，也不按拓扑类重复预留。
+正式分配不足时最多进行一次容量纠偏重建；只调整自动 KV 或可选 expert cache，保持显式容量与执行功能。
+Device 分配不足可以回收，
 执行错误与 Host 内存分配失败不作为缩减 GPU 容量的理由。
 Graph 只记录 GPU 工作，warmup 不绑定运行期控制线程；结束异步工作后先销毁 Graph，
 再释放其引用的 bridge 和 events。具体依赖见 [Expert 权重缓存](expert-weight-cache.md)。
@@ -456,12 +459,12 @@ continuation 或 checkpoint。
 | 实例构造与启动策略 | `src/runtime/engine/model_construction.*`, `model_instance.h`, `model_startup.h` |
 | 缓存 owner、索引与成本 | `src/runtime/engine/context_cache/` |
 | 公共请求、执行与资源合同 | `src/runtime/contract/` |
-| 模型 config、绑定与只读数据 | `src/models/qwen3_5/config.*`, `load/`, `model.*` |
-| 原生参数与固定模型调用 | `src/models/qwen3_5/execution/` |
-| Program 规划、存储、上下文及模型事务 | `src/models/qwen3_5/program/` |
+| 模型 config、绑定与只读数据 | `src/models/{qwen3_5,qwen4_exp}/config.*`, `load/`, `model.*` |
+| 原生参数与固定模型调用 | `src/models/{qwen3_5,qwen4_exp}/execution/` |
+| Program 规划、存储、上下文及模型事务 | `src/models/{qwen3_5,qwen4_exp}/program/` |
 | Qwen Frontend、Vision 与输入身份 | `src/models/common/qwen/` |
 | 逻辑上下文存储 | `src/models/common/context/` |
-| 原生启动与状态布局 | `src/models/qwen3_5/startup.*`, `state/` |
+| 原生启动与状态布局 | `src/models/{qwen3_5,qwen4_exp}/startup.*`, `state/` |
 | 共享权重绑定与 MoE | `src/models/common/bindings.*`, `weights.*`, `moe/` |
 | Tensor、arenas、graphs、物理 KV 与 raw transfers | `src/core/` |
 | 通用 artifact framing 与 materialization | `src/artifact/` |

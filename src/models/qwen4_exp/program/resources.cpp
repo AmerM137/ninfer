@@ -30,7 +30,7 @@ Resources::Resources(const execution::Parameters& p, ExecutionPlan input, Device
     : plan(checked_plan(p, std::move(input))), device_(device),
       persistent_(device.device(), plan.persistent.bytes),
       workspace_(device.device(), plan.workspace.bytes), ingress_(plan.pinned_io_bytes),
-      egress_(plan.pinned_output_bytes), ple_stream_(device),
+      egress_(plan.pinned_output_bytes), sampling_(plan.pinned_sampling_bytes), ple_stream_(device),
       ple_transfer_(device.execution_view(ple_stream_.stream())), workspace(workspace_.span()) {
     const auto backing = persistent_.span();
     states             = std::make_unique<StateViews>(backing, plan.persistent.state);

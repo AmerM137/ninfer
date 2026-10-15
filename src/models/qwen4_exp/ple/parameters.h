@@ -16,6 +16,10 @@ inline constexpr std::uint32_t kRowElements       = 160;
 inline constexpr std::uint32_t kEmbeddingElements = kHeads * kRowElements;
 inline constexpr std::size_t kEmbeddingBytes      = kEmbeddingElements * sizeof(std::uint16_t);
 
+struct HashGeometry {
+    std::uint32_t ngram_size, heads_per_ngram;
+};
+
 struct HashControls {
     std::array<std::int64_t, 3> multipliers;
     std::array<std::int64_t, kHeads> vocab_sizes;
@@ -41,6 +45,7 @@ struct LookupParameters {
 // The supported representation is complete NF4_G16_E4M3FN/RowPagedG16_4K shards of width 160.
 [[nodiscard]] LookupParameters load_lookup_parameters(const artifact::Reader&,
                                                       const artifact::Binding& table,
-                                                      artifact::ObjectHandle controls);
+                                                      artifact::ObjectHandle controls,
+                                                      HashGeometry);
 
 } // namespace ninfer::models::qwen4_exp::ple

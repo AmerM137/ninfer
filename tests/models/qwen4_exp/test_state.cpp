@@ -17,6 +17,8 @@ q4::Config config(bool mtp) {
     c.text.hidden     = 2560;
     c.text.hc         = {4, 320};
     c.text.gdn        = {16, 48, 128, 128, 4};
+    c.text.qsa        = {24, 2, 256, 4, 128, 4, 512, 1e7F, 1, 64, {11, 11, 10}, true};
+    c.text.ple        = {1, 128, 2500012, 248044, 2560, 3, 8, 160, 4, 3};
     c.text.gdn_layers = 36;
     c.text.qsa_layers = 12;
     c.mtp             = mtp;
@@ -111,7 +113,7 @@ void image(DeviceContext& device, bool mtp) {
 void cache(DeviceContext& device, KvCacheStorage storage, std::uint32_t layers,
            std::size_t per_layer) {
     LayoutBuilder b;
-    const auto layout = q4::plan_qsa_cache(b, layers, 130, 2, 2, storage);
+    const auto layout = q4::plan_qsa_cache(b, config(false).text.qsa, layers, 130, 2, 2, storage);
     DeviceBuffer backing(device.device(), b.finish());
     q4::QsaCache cache(backing.span(), layout);
     auto& pool = cache.pages();

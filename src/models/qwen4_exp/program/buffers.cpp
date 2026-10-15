@@ -6,6 +6,8 @@
 namespace ninfer::models::qwen4_exp {
 BufferLayout plan_buffers(LayoutBuilder& b, const Config& c, const EngineOptions& o,
                           std::uint32_t chunk, std::uint32_t public_tokens) {
+    const auto hidden = dimension(c.text.hidden), channels = dimension(c.text.residual_width());
+    const auto index_key = dimension(c.text.qsa.index_key_width());
     const auto batch     = static_cast<std::int32_t>(o.max_concurrency);
     const auto width     = static_cast<std::int32_t>(c.mtp ? o.speculative.draft_tokens + 1 : 1);
     const auto positions = std::max(static_cast<std::int32_t>(chunk), batch * width);
@@ -28,29 +30,32 @@ BufferLayout plan_buffers(LayoutBuilder& b, const Config& c, const EngineOptions
     out.batch.max_positions    = positions;
     out.batch.max_batch        = o.max_concurrency;
     out.prefill_sample =
-        tensor(DType::BF16, {2560, static_cast<std::int32_t>(chunk)}, "prefill sample");
-    out.pending_sample = tensor(DType::BF16, {2560, width, batch}, "pending sample");
+        tensor(DType::BF16, {hidden, static_cast<std::int32_t>(chunk)}, "prefill sample");
+    out.pending_sample = tensor(DType::BF16, {hidden, width, batch}, "pending sample");
     const auto records = [&](std::uint32_t layers, std::int32_t columns) {
         return QsaRecordLayout{
-            tensor(DType::BF16, {128, columns, batch, static_cast<std::int32_t>(layers)},
+            tensor(DType::BF16, {index_key, columns, batch, static_cast<std::int32_t>(layers)},
                    "QSA raw records"),
             tensor(DType::I32, {3, columns, batch, static_cast<std::int32_t>(layers)},
                    "QSA coordinate records"),
             layers, static_cast<std::uint32_t>(columns), o.max_concurrency};
     };
     out.main_qsa    = records(c.text.qsa_layers, width);
-    out.ple_records = tensor(DType::BF16, {10240, width, batch}, "PLE pending records");
+    out.ple_records = tensor(DType::BF16, {channels, width, batch}, "PLE pending records");
     if (c.mtp) {
-        out.prefill_conditioning =
-            tensor(DType::BF16, {10240, static_cast<std::int32_t>(chunk)}, "prefill conditioning");
+        out.prefill_conditioning = tensor(DType::BF16, {channels, static_cast<std::int32_t>(chunk)},
+                                          "prefill conditioning");
         out.pending_conditioning =
-            tensor(DType::BF16, {10240, width, batch}, "pending conditioning");
-        out.gdn_records = plan_gdn_replay_records(b, {static_cast<std::int32_t>(c.text.gdn_layers),
-                                                      batch, width, 10240, 16, 48, 128, 128});
-        out.mtp_qsa     = records(1, width + 1);
-        out.mtp_hidden  = tensor(DType::BF16, {10240, 2, batch}, "MTP working residuals");
-        out.mtp_sample  = tensor(DType::BF16, {2560, batch}, "MTP sample");
-        out.draft_ids   = tensor(DType::I32, {width - 1, batch}, "MTP draft IDs");
+            tensor(DType::BF16, {channels, width, batch}, "pending conditioning");
+        out.gdn_records = plan_gdn_replay_records(
+            b, {static_cast<std::int32_t>(c.text.gdn_layers), batch, width,
+                dimension(c.text.gdn.conv_channels()), dimension(c.text.gdn.key_heads),
+                dimension(c.text.gdn.value_heads), dimension(c.text.gdn.key_dim),
+                dimension(c.text.gdn.value_dim)});
+        out.mtp_qsa    = records(1, width + 1);
+        out.mtp_hidden = tensor(DType::BF16, {channels, 2, batch}, "MTP working residuals");
+        out.mtp_sample = tensor(DType::BF16, {hidden, batch}, "MTP sample");
+        out.draft_ids  = tensor(DType::I32, {width - 1, batch}, "MTP draft IDs");
     }
     const bool scoring = o.purpose == EnginePurpose::CausalScoring;
     if (!scoring) {

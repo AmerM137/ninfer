@@ -148,6 +148,66 @@ struct BuiltModel {
 };
 
 template <class Setup>
+std::optional<CalibratedPlan<typename Setup::ExecutionPlan>>
+initialize_program(const Setup& setup, ModelInstance<typename Setup::Types>& instance,
+                   DeviceContext& device, EngineOptions& options, const StartupMemoryBudget& budget,
+                   typename Setup::ExecutionPlan candidate, unsigned& attempts) {
+    if constexpr (Setup::supports_graph) {
+        std::vector<typename Setup::Calibration> measured;
+        StartupPhaseScope phase(options.startup_observer, StartupPhase::TargetFinalize);
+        auto calibrated = calibrate_plan(setup, instance, device, options, budget,
+                                         std::move(candidate), measured);
+        if (!calibrated) return {};
+        phase.complete();
+        return prepare_program(setup, instance, device, options, budget, std::move(*calibrated),
+                               measured, attempts);
+    } else {
+        std::size_t reserve = 0;
+        while (attempts < 2) {
+            ++attempts;
+            const auto before    = device_memory_snapshot(device.device());
+            const auto available = budget.available(before);
+            if (reserve > available) return {};
+            auto plan = setup.plan(device, options, candidate.host_experts, available - reserve);
+            if (!plan) return {};
+            const auto explicit_bytes = plan->sequence.device_reservation_bytes();
+            const auto host_bytes     = plan->sequence.host_capacity_bytes();
+            if (explicit_bytes != plan->capacity.runtime_reservation_bytes ||
+                plan->sequence.kv_capacity() != plan->capacity.resolved_tokens)
+                throw std::logic_error("eager plan differs from its resolved capacity");
+            std::optional<DeviceMemorySnapshot> ready;
+            try {
+                StartupPhaseScope phase(options.startup_observer, StartupPhase::ProgramInitialize);
+                instance.program = create_program(instance.parameters, std::move(plan->sequence),
+                                                  device, options.startup_observer);
+                device.synchronize();
+                ready = device_memory_snapshot(device.device());
+                if (budget.fits(*ready)) {
+                    options.prefill_chunk                                    = plan->chunk;
+                    options.context_cache.host_capacity_bytes                = host_bytes;
+                    instance.kv_capacity_resolution                          = plan->capacity;
+                    instance.kv_capacity_resolution.automatic_headroom_bytes = budget.headroom();
+                    instance.device_budget_bytes                             = budget.limit();
+                    instance.startup_retained_bytes                          = budget.retained(
+                        before, instance.model->storage_stats().device_capacity_bytes);
+                    phase.complete();
+                    return CalibratedPlan<typename Setup::ExecutionPlan>{std::move(*plan), {}};
+                }
+            } catch (const DeviceAllocationError&) {}
+            instance.program.reset();
+            device.synchronize();
+            if (ready) {
+                const auto after = device_memory_snapshot(device.device());
+                reserve = std::max(reserve, static_cast<std::size_t>(std::max<std::int64_t>(
+                                                0, device_memory_growth(after, *ready) -
+                                                       static_cast<std::int64_t>(explicit_bytes))));
+            }
+        }
+        return {};
+    }
+}
+
+template <class Setup>
 BuiltModel<typename Setup::Types>
 build_model(const artifact::Reader& reader, EngineOptions& options, DeviceContext& device,
             const StartupMemoryBudget& budget, std::chrono::steady_clock::time_point start) {
@@ -156,8 +216,8 @@ build_model(const artifact::Reader& reader, EngineOptions& options, DeviceContex
     const auto& weights          = setup.weights;
     const auto initial_available = budget.available(device_memory_snapshot(device.device()));
     auto candidate =
-        weights.resident_bytes <= initial_available
-            ? setup.plan(device, options, false, initial_available - weights.resident_bytes)
+        weights.resident_bytes && *weights.resident_bytes <= initial_available
+            ? setup.plan(device, options, false, initial_available - *weights.resident_bytes)
             : std::nullopt;
     bool host_experts = !candidate.has_value();
     if (host_experts && weights.offload && weights.fixed_bytes <= initial_available)
@@ -168,7 +228,6 @@ build_model(const artifact::Reader& reader, EngineOptions& options, DeviceContex
     binding.complete();
     std::unique_ptr<ModelInstance<typename Setup::Types>> instance;
     std::optional<CalibratedPlan<typename Setup::ExecutionPlan>> calibrated;
-    std::vector<typename Setup::Calibration> measured;
     unsigned preparation_attempts       = 0;
     std::size_t available_after_weights = 0;
     LoadSummary summary;
@@ -189,16 +248,8 @@ build_model(const artifact::Reader& reader, EngineOptions& options, DeviceContex
             phase.complete();
         }
         try {
-            {
-                StartupPhaseScope phase(options.startup_observer, StartupPhase::TargetFinalize);
-                calibrated = calibrate_plan(setup, *instance, device, options, budget,
-                                            std::move(*candidate), measured);
-                if (calibrated) phase.complete();
-            }
-            if (calibrated)
-                calibrated =
-                    prepare_program(setup, *instance, device, options, budget,
-                                    std::move(*calibrated), measured, preparation_attempts);
+            calibrated = initialize_program(setup, *instance, device, options, budget,
+                                            std::move(*candidate), preparation_attempts);
         } catch (const DeviceAllocationError&) {
             if (host_experts || !weights.offload) throw;
             calibrated.reset();

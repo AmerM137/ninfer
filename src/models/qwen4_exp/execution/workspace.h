@@ -23,10 +23,11 @@ struct Roots {
 };
 
 template <class Arena>
-Roots roots(Arena& a, std::int32_t m) {
-    return {a.alloc(DType::BF16, {2560, 4, m}), a.alloc(DType::BF16, {2560, 4, m}),
-            a.alloc(DType::BF16, {2560, m}), a.alloc(DType::BF16, {2560, m}),
-            a.alloc(DType::FP32, {4, m})};
+Roots roots(Arena& a, const TextConfig& c, std::int32_t m) {
+    const auto h = dimension(c.hidden), streams = dimension(c.hc.streams);
+    return {a.alloc(DType::BF16, {h, streams, m}), a.alloc(DType::BF16, {h, streams, m}),
+            a.alloc(DType::BF16, {h, m}), a.alloc(DType::BF16, {h, m}),
+            a.alloc(DType::FP32, {streams, m})};
 }
 
 struct GdnBuffers {
@@ -34,16 +35,19 @@ struct GdnBuffers {
 };
 
 template <class Arena>
-GdnBuffers gdn(Arena& a, std::int32_t m, bool prefill) {
-    return {prefill ? a.alloc(DType::BF16, {10240, m}) : Tensor{},
-            a.alloc(DType::BF16, {6144, m}),
-            a.alloc(DType::BF16, {128, 16, m}),
-            a.alloc(DType::BF16, {128, 16, m}),
-            a.alloc(DType::BF16, {128, 48, m}),
-            a.alloc(DType::FP32, {48, m}),
-            a.alloc(DType::FP32, {48, m}),
-            a.alloc(DType::BF16, {6144, m}),
-            a.alloc(DType::BF16, {6144, m})};
+GdnBuffers gdn(Arena& a, const GdnConfig& c, std::int32_t m, bool prefill) {
+    const auto k = dimension(c.key_dim), v = dimension(c.value_dim);
+    const auto kh = dimension(c.key_heads), vh = dimension(c.value_heads);
+    const auto value = dimension(c.value_width());
+    return {prefill ? a.alloc(DType::BF16, {dimension(c.conv_channels()), m}) : Tensor{},
+            a.alloc(DType::BF16, {value, m}),
+            a.alloc(DType::BF16, {k, kh, m}),
+            a.alloc(DType::BF16, {k, kh, m}),
+            a.alloc(DType::BF16, {v, vh, m}),
+            a.alloc(DType::FP32, {vh, m}),
+            a.alloc(DType::FP32, {vh, m}),
+            a.alloc(DType::BF16, {value, m}),
+            a.alloc(DType::BF16, {value, m})};
 }
 
 struct QsaBuffers {
@@ -52,17 +56,20 @@ struct QsaBuffers {
 };
 
 template <class Arena>
-QsaBuffers qsa(Arena& a, std::int32_t m, bool prefill) {
-    return {a.alloc(DType::BF16, {256, 24, m}),
-            a.alloc(DType::BF16, {256, 24, m}),
-            a.alloc(DType::BF16, {256, 2, m}),
-            a.alloc(DType::BF16, {256, 2, m}),
-            a.alloc(DType::BF16, {128, 4, m}),
-            a.alloc(DType::BF16, {128, m}),
-            a.alloc(DType::I32, {512, m}),
+QsaBuffers qsa(Arena& a, const QsaConfig& c, std::int32_t m, bool prefill) {
+    const auto d = dimension(c.head_dim), qh = dimension(c.query_heads), kh = dimension(c.kv_heads);
+    const auto id = dimension(c.index_dim), ih = dimension(c.index_heads);
+    const auto ik = dimension(c.index_key_width());
+    return {a.alloc(DType::BF16, {d, qh, m}),
+            a.alloc(DType::BF16, {d, qh, m}),
+            a.alloc(DType::BF16, {d, kh, m}),
+            a.alloc(DType::BF16, {d, kh, m}),
+            a.alloc(DType::BF16, {id, ih, m}),
+            a.alloc(DType::BF16, {ik, m}),
+            a.alloc(DType::I32, {dimension(c.block_budget), m}),
             a.alloc(DType::I32, {m}),
-            a.alloc(DType::BF16, {256, 24, m}),
-            prefill ? a.alloc(DType::BF16, {128, m}) : Tensor{},
+            a.alloc(DType::BF16, {d, qh, m}),
+            prefill ? a.alloc(DType::BF16, {ik, m}) : Tensor{},
             prefill ? a.alloc(DType::I32, {3, m}) : Tensor{}};
 }
 
@@ -71,9 +78,12 @@ struct PleBuffers {
 };
 
 template <class Arena>
-PleBuffers ple(Arena& a, std::int32_t m, bool prefill) {
-    return {a.alloc(DType::BF16, {12800, m}), a.alloc(DType::BF16, {2560, 4, m}),
-            prefill ? a.alloc(DType::BF16, {10240, m}) : Tensor{}};
+PleBuffers ple(Arena& a, const TextConfig& c, std::int32_t m, bool prefill) {
+    const auto h = dimension(c.hidden), streams = dimension(c.hc.streams);
+    const auto channels = dimension(c.residual_width());
+    return {a.alloc(DType::BF16, {dimension(c.residual_width() + c.hidden), m}),
+            a.alloc(DType::BF16, {h, streams, m}),
+            prefill ? a.alloc(DType::BF16, {channels, m}) : Tensor{}};
 }
 
 struct ScoreBuffers {
@@ -91,8 +101,9 @@ struct MtpStemBuffers {
 };
 
 template <class Arena>
-MtpStemBuffers mtp_stem(Arena& a, std::int32_t m) {
-    return {a.alloc(DType::BF16, {2560, m}), a.alloc(DType::BF16, {2560, m}),
-            a.alloc(DType::BF16, {10240, m}), a.alloc(DType::BF16, {2560, m})};
+MtpStemBuffers mtp_stem(Arena& a, const TextConfig& c, std::int32_t m) {
+    const auto h = dimension(c.hidden), channels = dimension(c.residual_width());
+    return {a.alloc(DType::BF16, {h, m}), a.alloc(DType::BF16, {h, m}),
+            a.alloc(DType::BF16, {channels, m}), a.alloc(DType::BF16, {h, m})};
 }
 } // namespace ninfer::models::qwen4_exp::execution::workspace

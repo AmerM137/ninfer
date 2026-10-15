@@ -7,7 +7,7 @@
 Engine 支持常驻 GPU，以及受显存预算约束的 MoE 混合执行。CPU `routed_swiglu` Op
 支持 Q4 GU + Q5/Q6 down 及 NVFP4 GU/down，直接消费 Host bank 并产生 FP32 分项。
 GPU 使用同一组 logical expert ID，既可以计算固定子集，也可以消费补齐后的整层 bank。
-Qwen4Exp 的模型接入仍待完成。
+Qwen3.5 MoE 与 Qwen4Exp Main eager 均使用这套公共调度。
 
 ## 来源与身份
 
@@ -62,8 +62,8 @@ Qwen3.5 的 bank ID 按 Main 层顺序建立，选中的 MTP bank 追加在末�
 `Parameters` 保存 bank 身份、矩阵 profile 与 Use 元数据，可以描述 CPU 来源。
 workspace 查询消费数学 profile；完整 GPU FFN 显式接受 resident/cached CUDA bank，
 混合单层执行另外借用原生 Host bank 和交接资源。
-Flash Next 的 NVFP4/Block-FP8 bank 可通过通用 artifact/core 接口加载；
-这不代表已接入完整 Qwen4Exp 模型执行。
+Flash Next Main eager 使用 NVFP4 Host bank、GPU cache 与公共混合执行；
+Block-FP8 MTP bank 已支持加载和 GPU 计算，MTP 模型编排见 [执行进度](qwen4_exp-execution.md#implementation-status)。
 
 ## 副本容量与 GPU 寻址
 

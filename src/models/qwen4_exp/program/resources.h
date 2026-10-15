@@ -31,13 +31,15 @@ public:
 
     [[nodiscard]] MemorySpan egress() { return egress_.span(); }
 
+    [[nodiscard]] MemorySpan sampling_ingress() { return sampling_.span(); }
+
     [[nodiscard]] CudaExecutionView ple_transfer() const { return ple_transfer_; }
 
     const ExecutionPlan plan;
 private:
     DeviceContext& device_;
     DeviceBuffer persistent_, workspace_;
-    PinnedHostBuffer ingress_, egress_;
+    PinnedHostBuffer ingress_, egress_, sampling_;
     CudaStream ple_stream_;
     CudaExecutionView ple_transfer_;
 public:

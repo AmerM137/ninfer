@@ -54,11 +54,13 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
     if (out->config.mtp) out->weights.mtp = loading::bind_mtp(b, c, out->weights.text);
     if (out->config.vision)
         out->weights.vision = qwen::bind_vision(b, *out->config.vision, c.hidden);
-    const auto table = binder.parameter("text/layers/" + std::to_string(c.ple.layer) + "/ple/table",
-                                        {std::uint64_t(c.ple.shards) * c.ple.rows_per_shard, 160},
-                                        QType::NF4_G16_E4M3FN);
-    auto lookup      = ple::load_lookup_parameters(reader, table.binding,
-                                                   binder.resource("text", "ple_hash_controls"));
+    const auto table =
+        binder.parameter("text/layers/" + std::to_string(c.ple.layer) + "/ple/table",
+                         {std::uint64_t(c.ple.shards) * c.ple.rows_per_shard, c.ple.row_width},
+                         QType::NF4_G16_E4M3FN);
+    auto lookup = ple::load_lookup_parameters(reader, table.binding,
+                                              binder.resource("text", "ple_hash_controls"),
+                                              {c.ple.ngram_size, c.ple.heads_per_ngram});
     if (lookup.shards.size() != c.ple.shards)
         throw artifact::ArtifactError("PLE table shard count differs from config");
     for (const auto& shard : lookup.shards)

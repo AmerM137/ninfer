@@ -2,6 +2,7 @@
 #include "runtime/engine/model_startup.h"
 #include "models/qwen3_5/startup.h"
 #include "models/qwen3_5/measurement.h"
+#include "models/qwen4_exp/startup.h"
 
 #include <charconv>
 #include <cstdlib>
@@ -109,15 +110,17 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
     const auto initial = device_memory_snapshot(device.device());
     const auto limit   = device_budget(initial.free_bytes);
     const auto headroom =
-        std::max<std::size_t>(256ULL * 1024 * 1024, options.kv_capacity.automatic_headroom_bytes);
+        std::max(kDefaultKvCapacityHeadroomBytes, options.kv_capacity.automatic_headroom_bytes);
     StartupMemoryBudget budget(initial, limit, headroom);
     StartupPhaseScope inspect(options.startup_observer, StartupPhase::ArtifactInspect);
     artifact::Reader reader(options.artifact_path);
     inspect.complete();
     switch (models::resolve_architecture(reader.directory())) {
-    case models::Architecture::Qwen4Exp:
-        throw std::invalid_argument(
-            "Qwen4Exp loading is available; Engine execution is not implemented");
+    case models::Architecture::Qwen4Exp: {
+        auto built =
+            detail::build_model<models::qwen4_exp::Startup>(reader, options, device, budget, start);
+        return {std::move(built.instance), std::move(built.load), std::move(built.context_cost)};
+    }
     case models::Architecture::Qwen3_5:
     case models::Architecture::Qwen3_5Moe: {
         auto built =

@@ -1,7 +1,8 @@
 # Qwen4Exp MoE GPU 计算设计
 
 本文定义 Qwen3.8-Flash-Next 的 GPU MoE 计算。Main NVFP4 A4、MTP block-FP8 A8/G128、
-BF16 router/shared 已在现有 MoE 入口实现。Expert streaming 与完整 Program 接入另行推进。
+BF16 router/shared 已在现有 MoE 入口实现。Main eager 已接入 expert streaming 和混合执行；
+模型集成状态由 [执行进度](qwen4_exp-execution.md#implementation-status)维护。
 
 权重、binding 和驻留由[模型与权重](qwen4_exp-model.md)定义；表示值和地址分别沿用
 [数值格式](tensor-formats.md)、[存储布局](storage-layouts.md)。本设计扩展现有
@@ -25,8 +26,8 @@ Expert 上传、CPU 计算分工及 Program 编排继续由
    routed 归约在 FP32 中汇合，最终写 BF16。先保留清楚的 GU → down 依赖。
 
 Main 现可独立调用完整 GPU MoE，也可用既有 routes/mask 计算一个 GPU 子集，
-为后续混合执行提供 FP32 contribution。CPU NVFP4 routed contribution 已有独立实现；本文不包含
-CPU FP8 数学、动态上传调度，也不代表完整 Qwen4Exp 模型已经接入。
+向公共混合执行提供 FP32 contribution。CPU NVFP4 routed contribution 已实现；本文不包含
+CPU FP8 数学与上传调度。
 
 ## 2. 几何和数学
 

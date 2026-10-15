@@ -6,21 +6,25 @@ StateLayout plan_state_image(LayoutBuilder& backing, const Config& config, std::
     StateImageBuilder b;
     StateLayout out;
     out.gdn = plan_linear_attention_state(
-        b,
-        {c.gdn_layers, static_cast<std::int32_t>(c.gdn.conv_channels()),
-         static_cast<std::int32_t>(c.gdn.conv_width - 1),
-         static_cast<std::int32_t>(c.gdn.value_heads), static_cast<std::int32_t>(c.gdn.value_dim),
-         static_cast<std::int32_t>(c.gdn.key_dim), DType::BF16});
+        b, {c.gdn_layers, dimension(c.gdn.conv_channels()), dimension(c.gdn.conv_width - 1),
+            dimension(c.gdn.value_heads), dimension(c.gdn.value_dim), dimension(c.gdn.key_dim),
+            DType::BF16});
     const auto qsa = [&](std::uint32_t layers) {
-        return QsaTailLayout{b.add(DType::BF16, {128, 3}, layers, "QSA raw tail"),
-                             b.add(DType::I32, {3}, layers, "QSA block coordinates")};
+        return QsaTailLayout{
+            b.add(DType::BF16,
+                  {dimension(c.qsa.index_key_width()), dimension(c.qsa.compression - 1)}, layers,
+                  "QSA raw tail"),
+            b.add(DType::I32, {3}, layers, "QSA block coordinates")};
     };
-    out.main_qsa      = qsa(c.qsa_layers);
-    out.ple_history   = b.add(DType::BF16, {10240, 9}, 1, "PLE history");
-    out.sample_hidden = b.add(DType::BF16, {2560}, 1, "Main sample hidden");
+    out.main_qsa = qsa(c.qsa_layers);
+    out.ple_history =
+        b.add(DType::BF16, {dimension(c.residual_width()), dimension(c.ple.history_columns())}, 1,
+              "PLE history");
+    out.sample_hidden = b.add(DType::BF16, {dimension(c.hidden)}, 1, "Main sample hidden");
     if (config.mtp) {
-        out.conditioning = b.add(DType::BF16, {10240}, 1, "Main MTP conditioning");
-        out.mtp_qsa      = qsa(1);
+        out.conditioning =
+            b.add(DType::BF16, {dimension(c.residual_width())}, 1, "Main MTP conditioning");
+        out.mtp_qsa = qsa(1);
     }
     out.images = b.finish(backing, slots);
     return out;

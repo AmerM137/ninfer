@@ -21,6 +21,7 @@ struct ExecutionShape {
     std::uint32_t max_context, max_concurrency, prefill_chunk, draft_tokens;
     KvCacheStorage kv_storage;
     EnginePurpose purpose;
+    bool context_cache = false;
 };
 
 struct ExecutionPlan {
@@ -31,14 +32,23 @@ struct ExecutionPlan {
     std::shared_ptr<const moe::Plan> moe;
     ple::disk::PrepareOptions ple;
     ple::UploadMemory ple_upload{};
-    std::size_t pinned_output_bytes = 0;
-    std::size_t ple_prepare_bytes   = 0;
-    std::size_t host_context_bytes  = 0;
-    std::size_t pinned_io_bytes     = 0;
+    std::size_t pinned_output_bytes   = 0;
+    std::size_t ple_prepare_bytes     = 0;
+    std::size_t host_context_bytes    = 0;
+    std::size_t pinned_io_bytes       = 0;
+    std::size_t pinned_sampling_bytes = 0;
     runtime::KvCapacityResolution capacity;
 
     [[nodiscard]] std::size_t device_bytes() const;
+
+    [[nodiscard]] std::size_t device_reservation_bytes() const { return device_bytes(); }
+
+    [[nodiscard]] std::size_t host_capacity_bytes() const { return host_context_bytes; }
+
+    [[nodiscard]] std::uint32_t kv_capacity() const { return capacity.resolved_tokens; }
 };
+
+[[nodiscard]] moe::Plan describe_moe_plan(const execution::ModelProfile&, const MoeOptions&);
 
 // Available bytes exclude immutable GPU weights and the caller's startup headroom.
 // Ordinary Host, registered expert backing, and pinned context capacity are independent budgets.

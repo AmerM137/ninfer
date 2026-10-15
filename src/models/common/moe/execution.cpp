@@ -39,10 +39,11 @@ struct FrameLayout {
         : top_k(profile.routed.top_k), tokens(columns) {
         const auto h = profile.routed.ffn.hidden;
         LayoutBuilder device, host;
-        const auto route_bytes = Tensor::metadata(DType::I32, {top_k, tokens, 2}).bytes();
-        device_routes          = device.add(route_bytes, 16, "MoE Device routes");
-        host_routes            = host.add(route_bytes, 16, "MoE Host routes");
-        host_input             = host.add_tensor(DType::BF16, {h, tokens}, 16, "MoE Host input");
+        const auto coefficients_offset = (std::size_t(top_k) * tokens * 4 + 15) / 16 * 16;
+        const auto route_bytes         = coefficients_offset + std::size_t(top_k) * tokens * 4;
+        device_routes                  = device.add(route_bytes, 16, "MoE Device routes");
+        host_routes                    = host.add(route_bytes, 16, "MoE Host routes");
+        host_input  = host.add_tensor(DType::BF16, {h, tokens}, 16, "MoE Host input");
         shared      = device.add_tensor(DType::FP32, {tokens}, 4, "MoE shared coefficients");
         gpu_partial = device.add_tensor(DType::FP32, {h, tokens}, 16, "MoE GPU contribution");
         device_cpu_partial =
@@ -54,9 +55,11 @@ struct FrameLayout {
 
     Frame bind(MemorySpan device, MemorySpan host) const {
         const auto routes = [&](MemorySpan storage) {
-            const auto bytes = storage.bytes / 2;
-            return ops::ExpertRoutes{Tensor(storage.subspan(0, bytes), DType::I32, {top_k, tokens}),
-                                     Tensor(storage.subspan(bytes), DType::FP32, {top_k, tokens})};
+            const auto bytes               = std::size_t(top_k) * tokens * 4;
+            const auto coefficients_offset = (bytes + 15) / 16 * 16;
+            return ops::ExpertRoutes{
+                Tensor(storage.subspan(0, bytes), DType::I32, {top_k, tokens}),
+                Tensor(storage.subspan(coefficients_offset, bytes), DType::FP32, {top_k, tokens})};
         };
         const auto dr = device_routes.bind(device), hr = host_routes.bind(host);
         return {host_input.bind(host),

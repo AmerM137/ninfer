@@ -18,6 +18,18 @@ NINFER_VRAM_BUDGET_MIB=16384 ./build/apps/ninfer out/qwen3_6_35b_a3b.ninfer \
 resident models and 4096 for CPU expert offload. Serving and offline scoring use the same Engine
 defaults. See [expert execution](maintainer/expert-weight-cache.md) for ownership and scheduling.
 
+Qwen3.8-Flash-Next uses Qwen4Exp eager Text. Run a converted artifact with `--no-cuda-graph`:
+
+```bash
+./build/apps/ninfer out/qwen3_8_flash_next.ninfer \
+  --no-cuda-graph --max-context 32768 --prefill-chunk 4096 --kv-dtype fp8 \
+  --prompt "Explain how sparse attention works." --max-new 256
+```
+
+Main experts remain in registered Host memory, with GPU caching and streaming; PLE reads its
+NF4 rows from the artifact on disk. Vision and speculative backends are not yet enabled for this
+architecture. The same eager Text path is available through serving and offline causal scoring.
+
 ## Text input
 
 ```bash
@@ -334,9 +346,9 @@ the 64-token page size. Startup plans the selected weights and complete enabled 
 from artifact metadata before allocating their backing. With resident weights,
 `--kv-capacity auto` chooses the largest legal page capacity within the available Device budget,
 including the selected speculative backend, fixed sequence state, unified workspace and
-measured CUDA Graph rebuilding cost, using 1 GiB of automatic headroom as a planning margin. Startup
-calibration releases its temporary storage before sizing the final pools; retained driver memory
-is already included in the remaining free memory. With CPU expert
+measured CUDA Graph rebuilding cost. Both explicit and automatic capacity use 1 GiB of startup
+planning headroom. Startup calibration releases its temporary storage before sizing the final pools;
+retained driver memory is already included in the remaining free memory. With CPU expert
 offload, `auto` reserves one full context and assigns the remaining budget to expert storage;
 set an explicit capacity when more shared KV is needed. Graph calibration runs only at startup;
 the pool stays fixed while serving requests. The single-request

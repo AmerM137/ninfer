@@ -3,6 +3,9 @@
 `build/apps/ninfer-serve` loads one v3 `.ninfer` artifact and exposes OpenAI- and
 Anthropic-compatible HTTP endpoints over one resident NInfer Engine.
 
+Qwen3.8-Flash-Next supports eager Text serving with `--no-cuda-graph`; its Vision and
+speculative backends are not yet enabled. See the [CLI example](cli.md) for artifact and resource use.
+
 ## Start the server
 
 See [CUDA synchronization](cli.md#cuda-synchronization) for the shared `NINFER_CUDA_SYNC` setting.
@@ -1164,8 +1167,8 @@ outside the GPU executor and do not delay formation of the next batch.
 
 `--max-context` is each sequence's logical ceiling. `--kv-capacity` fixes the shared Main Text KV
 pool used by active requests and retained prefixes. `auto` accounts for the complete enabled runtime
-and uses 1 GiB as a planning margin; omitting the option makes it follow `--max-context`. Capacity
-resolves once at startup.
+when sizing the pool; omitting the option makes it follow `--max-context`. Both explicit and automatic
+capacity use 1 GiB of startup planning headroom. Capacity resolves once at startup.
 
 Before each prefill, decode or replay unit, the runtime reserves the additional pages and temporary
 storage required by that unit. It first reclaims inactive cache resources when capacity is short.

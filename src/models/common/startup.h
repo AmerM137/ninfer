@@ -6,7 +6,8 @@
 namespace ninfer::models {
 
 struct WeightPlacement {
-    std::size_t resident_bytes = 0, fixed_bytes = 0;
+    std::optional<std::size_t> resident_bytes;
+    std::size_t fixed_bytes = 0;
     std::optional<moe::Plan> offload;
     std::vector<ExpertBankCacheSpec> banks;
 };

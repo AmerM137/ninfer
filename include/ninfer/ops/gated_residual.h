@@ -4,6 +4,7 @@
 #include "core/tensor.h"
 #include "core/arena.h"
 #include "core/weight.h"
+#include "ninfer/ops/projection_weights.h"
 
 namespace ninfer::ops {
 
@@ -84,6 +85,14 @@ struct HcFinalMixWeights {
     Weight up;   // BF16 Contiguous [10240,320], row=s*2560+d.
 };
 
+struct HcMixProfile {
+    LinearProfile down_injection, up;
+};
+
+struct HcFinalMixProfile {
+    LinearProfile down, up;
+};
+
 /**
  * Low-rank mixing, independently for each column:
  *   [a,b] = down_injection * flatten(normalized), with a:320 and b:4
@@ -124,6 +133,14 @@ void hc_mix(const Tensor& normalized, const HcFinalMixWeights& weights, MemoryAr
                                                           std::int32_t min_tokens,
                                                           std::int32_t max_tokens);
 [[nodiscard]] std::size_t hc_mix_workspace_capacity_bytes(const HcFinalMixWeights& weights,
+                                                          std::int32_t min_tokens,
+                                                          std::int32_t max_tokens);
+
+// Address-free forms use the same admission and capacity rules as bound weights.
+[[nodiscard]] std::size_t hc_mix_workspace_capacity_bytes(const HcMixProfile& profile,
+                                                          std::int32_t min_tokens,
+                                                          std::int32_t max_tokens);
+[[nodiscard]] std::size_t hc_mix_workspace_capacity_bytes(const HcFinalMixProfile& profile,
                                                           std::int32_t min_tokens,
                                                           std::int32_t max_tokens);
 

@@ -100,8 +100,9 @@ The Qwen4Exp adapter selects the dedicated
 [`qwen3_8_flash_next.jinja`](../tools/chat_templates/qwen3_8_flash_next.jinja) by default;
 `--resource chat_template.jinja=PATH` explicitly replaces it. The 27B template is independent.
 
-The Qwen4Exp adapter supports Text, Vision and MTP conversion. Engine execution, DFlash and
-indexed proposal are not yet connected for this architecture. CUDA self-quantization compiles
+The Qwen4Exp adapter supports Text, Vision and MTP conversion. The Engine supports eager Text
+with `--no-cuda-graph`; Vision, MTP, DFlash and indexed proposal execution remain unconnected.
+CUDA self-quantization compiles
 the SM120 encoder on first use and requires a CUDA toolkit, C++ compiler and Ninja.
 PLE uses two bounded passes per shard, with no full-table materialization. The complete recipe
 contains about 100.67 GiB of weight/control payload, split by the existing V3 writer.

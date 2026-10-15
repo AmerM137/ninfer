@@ -1,4 +1,5 @@
 #include "models/qwen4_exp/program/planning.h"
+#include "ninfer/ops/sampling.h"
 
 #include <algorithm>
 #include <numeric>
@@ -13,11 +14,11 @@ PersistentLayout persistent(const execution::ModelProfile& p, const EngineOption
         std::uint64_t(o.max_concurrency) + o.context_cache.device_state_slots.value();
     if (slots > INT32_MAX) throw std::invalid_argument("StateImage slots exceed int32");
     out.state = plan_state_image(b, p.config, slots);
-    out.main  = plan_qsa_cache(b, p.config.text.qsa_layers, o.max_context, pages, o.max_concurrency,
-                               o.kv_cache);
+    out.main  = plan_qsa_cache(b, p.config.text.qsa, p.config.text.qsa_layers, o.max_context, pages,
+                               o.max_concurrency, o.kv_cache);
     if (p.mtp)
         out.mtp =
-            plan_qsa_cache(b, 1, o.max_context,
+            plan_qsa_cache(b, p.config.text.qsa, 1, o.max_context,
                            pages + o.max_concurrency * ((o.speculative.draft_tokens + 63) / 64),
                            o.max_concurrency, o.kv_cache);
     out.buffers = plan_buffers(b, p.config, o, o.prefill_chunk, p.public_tokens);
@@ -25,7 +26,9 @@ PersistentLayout persistent(const execution::ModelProfile& p, const EngineOption
     return out;
 }
 
-moe::Plan moe_plan(const execution::ModelProfile& p, const MoeOptions& o) {
+} // namespace
+
+moe::Plan describe_moe_plan(const execution::ModelProfile& p, const MoeOptions& o) {
     if (o.expert_priority && o.expert_priority->size() != p.text.layers.size())
         throw std::invalid_argument("expert priority must cover every Main layer");
     std::vector<moe::LayerSpec> layers;
@@ -44,14 +47,14 @@ moe::Plan moe_plan(const execution::ModelProfile& p, const MoeOptions& o) {
     return moe::describe_plan(p.banks, layers);
 }
 
+namespace {
 EngineOptions options(const execution::ModelProfile& profile, const EngineOptions& supplied) {
     auto o = supplied;
-    if (load_options(o) != profile.options || o.max_concurrency == 0 || o.max_concurrency > 8 ||
-        !o.max_context || o.max_context > profile.config.text.max_context)
+    if (load_options(o) != profile.options || o.max_concurrency == 0 ||
+        o.max_concurrency > kMaximumConcurrency || !o.max_context ||
+        o.max_context > profile.config.text.max_context)
         throw std::invalid_argument(
             "execution options differ from selected Qwen4Exp components or domain");
-    if (o.use_cuda_graph)
-        throw std::invalid_argument("Qwen4Exp Graph execution is not implemented");
     if (o.speculative.backend == SpeculativeBackend::None) {
         if (o.speculative.draft_tokens || o.speculative.proposal_head != ProposalHead::Full)
             throw std::invalid_argument("disabled MTP requires zero drafts and the full head");
@@ -81,13 +84,13 @@ std::optional<ExecutionPlan> plan_execution(std::shared_ptr<const execution::Mod
                                             const ple::disk::Table& table,
                                             const EngineOptions& supplied, DeviceContext& device,
                                             std::size_t available) {
-    if (!profile || device.compute_capability() != 120)
-        throw std::invalid_argument("Qwen4Exp planning requires a profile and sm_120");
+    if (!profile) throw std::invalid_argument("execution planning requires a model profile");
     ExecutionPlan out;
     out.profile  = std::move(profile);
     const auto o = options(*out.profile, supplied);
-    out.shape    = {o.max_context, o.max_concurrency, o.prefill_chunk, o.speculative.draft_tokens,
-                    o.kv_cache,    o.purpose};
+    out.shape    = {
+        o.max_context, o.max_concurrency, o.prefill_chunk,        o.speculative.draft_tokens,
+        o.kv_cache,    o.purpose,         o.context_cache.enabled};
     const auto logical_pages        = (o.max_context + 63) / 64;
     const auto minimum_pages        = std::max(logical_pages, o.max_concurrency);
     const auto maximum_pages        = logical_pages * o.max_concurrency;
@@ -104,7 +107,7 @@ std::optional<ExecutionPlan> plan_execution(std::shared_ptr<const execution::Mod
     } else if (policy.mode != KvCapacityMode::Automatic || policy.explicit_tokens)
         throw std::invalid_argument("invalid KV capacity policy");
     out.persistent = persistent(*out.profile, o, pages);
-    auto prototype = moe_plan(*out.profile, o.moe);
+    auto prototype = describe_moe_plan(*out.profile, o.moe);
     out.workspace  = execution::plan_workspace(*out.profile, o, o.prefill_chunk,
                                                device.multiprocessor_count(), &prototype);
     out.ple.max_positions =
@@ -127,6 +130,9 @@ std::optional<ExecutionPlan> plan_execution(std::shared_ptr<const execution::Mod
                           out.persistent.buffers.batch.accepted_columns.region.bytes -
                           out.persistent.buffers.batch.ids.region.offset;
     if (out.persistent.buffers.sampled_ids) {
+        out.pinned_sampling_bytes =
+            o.max_concurrency * (sizeof(ops::SamplingConfig) + sizeof(std::int32_t) +
+                                 ((out.profile->public_tokens + 31) / 32) * sizeof(std::uint32_t));
         const auto& buffers = out.persistent.buffers;
         const auto end =
             buffers.accepted_drafts ? *buffers.accepted_drafts : *buffers.output_counts;

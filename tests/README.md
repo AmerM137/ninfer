@@ -450,7 +450,7 @@ build/tests/ninfer_qwen3_5_loading_real_test --artifact out/qwen3_6_35b_a3b.ninf
   --vision --speculative mtp --host-experts
 ```
 
-Qwen4Exp loading/resources can be checked before the full Engine route is implemented:
+Qwen4Exp loading/resources can be checked independently of the public Engine route:
 
 ```bash
 ./build/tests/ninfer_qwen4_exp_loading_real_test out/qwen3_8_flash_next.ninfer
@@ -461,4 +461,4 @@ The first command plans component combinations, KV formats and concurrency witho
 payloads. `--materialize` additionally loads one full-component model, checks stored words and
 parameter sharing, constructs its execution resources, and reads/uploads a PLE window. It needs
 about 64 GiB of available Host memory plus system headroom. These are loading/resource checks;
-text generation and model-quality qualification belong to the subsequent Engine integration.
+eager Text generation and causal scoring use the public Engine, as described in the [CLI guide](../docs/cli.md).
