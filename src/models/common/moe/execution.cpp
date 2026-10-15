@@ -256,15 +256,17 @@ bool compute_cpu(const PreparedExecution& call) {
     const auto* mask  = static_cast<const std::int32_t*>(call.partition.host_mask.data);
     const auto kind   = call.partition.gpu_kind;
     if (kind == Subset::All) return false;
-    const bool cpu_work = kind == Subset::None ||
-                          std::any_of(ids, ids + std::size_t(p.profile.routed.top_k) * call.tokens,
-                                      [&](auto id) { return mask[id] == 0; });
-    if (!cpu_work) return false;
+    const auto assignments = std::size_t(p.profile.routed.top_k) * call.tokens;
+    const auto cpu_assignments =
+        kind == Subset::None
+            ? assignments
+            : std::count_if(ids, ids + assignments, [&](auto id) { return mask[id] == 0; });
+    if (!cpu_assignments) return false;
     const auto& host = *call.execution.host;
     auto scope       = host.workspace.scope();
     MemoryArena scratch(host.workspace.alloc_bytes(call.requirements.cpu_workspace_bytes));
     auto destination = frame.host_partial;
-    nvtx::ScopedRange cpu(nvtx::Name::MoeCpu, nvtx::Category::Moe);
+    nvtx::ScopedRange cpu(nvtx::Name::MoeCpu, nvtx::Category::Moe, cpu_assignments);
     ops::routed_swiglu(frame.host_input, p.profile.routed, {call.source.gate_up, call.source.down},
                        frame.host_routes, call.partition.cpu(), destination, scratch, host.cpu);
     return true;

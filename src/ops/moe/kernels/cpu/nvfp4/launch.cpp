@@ -1,5 +1,6 @@
 #include "ops/moe/kernels/cpu/nvfp4/work.h"
 #include "core/layout.h"
+#include "core/nvtx.h"
 
 #include <algorithm>
 #include <array>
@@ -81,6 +82,7 @@ void launch(const Invocation& args, const Plan& plan, MemoryArena& arena,
     Work work{
         .args = args, .plan = plan, .scratch = allocate(arena, args.tokens, plan.token_block)};
     prepare_chunk(work, 0, std::min(args.tokens, plan.token_block));
+    nvtx::ScopedRange compute(nvtx::Name::MoeCpuCompute, nvtx::Category::Moe, work.group_count);
     execution.run(plan.run, &work);
 }
 

@@ -1,4 +1,5 @@
 #include "models/qwen4_exp/program/ple_pipeline.h"
+#include "core/nvtx.h"
 
 #include <algorithm>
 #include <thread>
@@ -33,6 +34,8 @@ bool PlePipeline::matches(const Window& w, std::uint32_t tokens,
 
 std::optional<ple::Ticket>
 PlePipeline::prepare(std::uint32_t tokens, std::span<const ple::InputRow> rows, bool required) {
+    nvtx::ScopedRange prepare(nvtx::Name::PlePrepare, nvtx::Category::Runtime,
+                              tokens * rows.size());
     progress();
     for (auto& w : windows_) {
         if (w && matches(*w, tokens, rows)) {
@@ -101,6 +104,7 @@ void PlePipeline::progress() {
 }
 
 Tensor PlePipeline::consume(ple::Ticket ticket) {
+    nvtx::ScopedRange wait(nvtx::Name::PleWait, nvtx::Category::Runtime);
     for (;;) {
         progress();
         auto& w = window(ticket);

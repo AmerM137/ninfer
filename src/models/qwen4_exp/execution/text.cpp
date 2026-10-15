@@ -3,6 +3,7 @@
 #include "models/qwen4_exp/execution/qsa.h"
 #include "models/qwen4_exp/execution/ple.h"
 #include "core/transfer.h"
+#include "core/nvtx.h"
 #include "ninfer/ops/embedding.h"
 
 namespace ninfer::models::qwen4_exp::execution {
@@ -30,6 +31,7 @@ void TextRun::prefix() {
 }
 
 void TextRun::layer(std::uint32_t i) {
+    nvtx::ScopedRange layer(nvtx::Name::TextLayer, nvtx::Category::Runtime, i);
     const auto& config = parameters_.model.config().text;
     const auto& p      = parameters_.text.layers[i];
     const auto& state  = config.layers[i];
