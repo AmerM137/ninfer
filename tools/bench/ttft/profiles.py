@@ -5,7 +5,7 @@ from __future__ import annotations
 from decimal import Decimal
 
 
-# qwen3_8_27b_nvfp4: StateImageHostLayout sums 48 GDN conv/state regions and
+# qwen3_8_27b_nvfp4: StateImageLayout sums 48 GDN conv/state regions and
 # continuation hidden, each aligned to 256 B (state/state_image.cpp). DFlash2 also
 # carries 5 local K/V layers of 2048 positions. MTP Full KV is in the KV arena.
 STATE_IMAGE_BYTES = 153_954_304

@@ -182,13 +182,9 @@ public:
 
     void retain_checkpoint_reference(Handle handle);
 
-    [[nodiscard]] bool can_release_checkpoint_owner(Handle handle) const noexcept;
-
     // Content owners and readers retire independently. A last checkpoint can disappear while
     // another request still reads this immutable image; that read lease keeps its replicas alive.
     [[nodiscard]] bool release_checkpoint_owner(Handle handle) noexcept;
-
-    void release_checkpoint_reference(Handle handle);
 
     [[nodiscard]] std::int32_t physical_slot(Handle handle) const;
 
@@ -221,10 +217,6 @@ public:
     [[nodiscard]] std::optional<Transfer> reserve_host_to_device(Handle source);
     [[nodiscard]] std::optional<Transfer> reserve_host_to_device(Handle source, Handle destination);
 
-    void publish_transfer(Transfer&& transfer, bool keep_source_replica);
-
-    void abort_transfer(Transfer&& transfer) noexcept;
-
     [[nodiscard]] bool release(Handle handle) noexcept;
 
     [[nodiscard]] bool can_release(Handle handle) const noexcept;
@@ -248,6 +240,7 @@ private:
     };
 
     void retire_released_owner(Handle handle) noexcept;
+    [[nodiscard]] bool can_release_checkpoint_owner(Handle handle) const noexcept;
 
     [[nodiscard]] static bool has_pending_replica(const Object& object) noexcept;
 
@@ -268,6 +261,9 @@ private:
     [[nodiscard]] bool valid_transfer(const Transfer& transfer) const noexcept;
 
     void validate_transfer(const Transfer& transfer) const;
+
+    void publish_transfer(Transfer& transfer, bool keep_source_replica);
+    void abort_transfer(Transfer& transfer) noexcept;
 
     static void consume(Transfer& transfer) noexcept;
 

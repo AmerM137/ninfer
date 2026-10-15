@@ -1,12 +1,12 @@
 #include "core/device.h"
+#include "models/common/context/checkpoint_store.h"
 #include "models/common/context/host_kv_store.h"
 #include "models/common/context/kv_history.h"
 #include "models/common/context/migration.h"
-#include <atomic>
 #include "models/common/context/snapshot.h"
-#include "models/common/context/checkpoint_store.h"
 
 #include <array>
+#include <atomic>
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
@@ -297,10 +297,11 @@ void reservations_and_host(DeviceContext& device) {
            "partial Host release did not rebind the retained run");
     expect(f.host->release_page_replicas(*f.pages, second) && f.arena->occupied_bytes() == 0,
            "partitioned Host allocation leaked");
-    extent = f.backup(original);
+    (void)f.backup(original);
     for (auto page : original)
         expect(f.pages->drop_device_replica(page), "Host replica could not replace Device");
-    expect(!f.host->release(extent) && f.host_arena->can_allocate(f.host_layout, 6) &&
+    expect(!f.host->release_page_replicas(*f.pages, original) &&
+               f.host_arena->can_allocate(f.host_layout, 6) &&
                !f.host_arena->can_allocate(f.host_layout, 7),
            "last Host-only copy became reclaimable");
     {
@@ -312,7 +313,8 @@ void reservations_and_host(DeviceContext& device) {
     owner = f.bind(&prefix, 65, 65);
     expect(f.pages->writer_identity(original[1]) != 0 && f.physical->reserved_pages() == 0,
            "zero-growth binding did not claim its tail");
-    expect(f.host->release(extent), "restored Host replica could not release");
+    expect(f.host->release_page_replicas(*f.pages, original),
+           "restored Host replica could not release");
     prefix.reset();
     f.histories->trim(owner, 32, device.stream());
     auto shallow = f.histories->retain_prefix(owner.handle(), 32);
@@ -695,6 +697,12 @@ void host_reader_survives_extent_partition(DeviceContext& device) {
         (void)f.host->publish(std::move(backup));
         expect(f.pages->source_pins(logical[1]) == 1,
                "Host publication consumed another Device reader");
+    }
+    {
+        auto reader = f.pages->read_host(logical[1], 64);
+        expect(!f.host->release_page_replicas(*f.pages, logical) &&
+                   f.arena->occupied_bytes() == 3 * f.host_layout.page_stride,
+               "Host release invalidated a live reader or partially released its extent");
     }
     for (auto page : logical)
         expect(f.pages->drop_device_replica(page), "failed to drop Device source");

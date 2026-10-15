@@ -57,9 +57,6 @@ public:
 
     [[nodiscard]] LayoutRegion dflash_local_group() const { return dflash_group_.value(); }
 
-    void copy_dflash_local(std::int32_t source, std::int32_t destination,
-                           CudaExecutionView execution) const;
-
 private:
     StateImageStorage storage_;
     LinearAttentionStateView linear_;

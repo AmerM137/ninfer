@@ -45,10 +45,4 @@ TransferWork StateImageViews::dflash_local_transfer_work() const {
     return {.payload_bytes = dflash_group_->bytes, .copy_operations = 1};
 }
 
-void StateImageViews::copy_dflash_local(std::int32_t source, std::int32_t destination,
-                                        CudaExecutionView execution) const {
-    if (!dflash_group_) { throw std::logic_error("StateImage has no DFlash local state"); }
-    storage_.copy_group(*dflash_group_, source, destination, execution);
-}
-
 } // namespace ninfer::models::qwen3_5

@@ -7,7 +7,6 @@
 #include "runtime/contract/resources.h"
 
 #include <optional>
-#include <span>
 #include <vector>
 
 namespace ninfer::models::context {

@@ -150,8 +150,6 @@ public:
     [[nodiscard]] std::uint32_t occupied() const noexcept;
     [[nodiscard]] bool owned(KVHistoryHandle history) const;
     [[nodiscard]] bool active(KVHistoryHandle history) const;
-    [[nodiscard]] std::uint32_t retained_frontier(KVHistoryHandle history) const;
-    [[nodiscard]] std::uint32_t prefix_references(KVHistoryHandle history) const;
     [[nodiscard]] std::uint32_t retained_after(KVHistoryHandle history,
                                                std::span<const KVPrefixRef* const> removed) const;
     [[nodiscard]] std::vector<LogicalKVPageHandle>
@@ -186,10 +184,8 @@ public:
                                                    std::uint32_t index) const;
     [[nodiscard]] DeviceKVPageHandle physical_page(KVHistoryHandle history,
                                                    std::uint32_t index) const;
-    [[nodiscard]] std::uint64_t content_epoch(KVHistoryHandle history, std::uint32_t index) const;
 
     [[nodiscard]] LogicalKVPageStore& pages() const noexcept { return *pages_; }
-
 
 private:
     static constexpr std::uint32_t kChunkPages = 32;

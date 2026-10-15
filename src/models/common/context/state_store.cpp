@@ -78,7 +78,7 @@ StateImageStore::Transfer::Transfer(StateImageStore& owner, std::uint64_t id,
       destination_(destination) {}
 
 StateImageStore::Transfer::~Transfer() {
-    if (owner_) owner_->abort_transfer(std::move(*this));
+    if (owner_) owner_->abort_transfer(*this);
 }
 
 StateImageStore::Transfer::Transfer(Transfer&& other) noexcept
@@ -107,7 +107,7 @@ void StateImageStore::Transfer::enqueue(CudaExecutionView execution) const {
 
 void StateImageStore::Transfer::publish(bool keep_source_replica) {
     if (!owner_) throw std::logic_error("StateImage copy already consumed");
-    owner_->publish_transfer(std::move(*this), keep_source_replica);
+    owner_->publish_transfer(*this, keep_source_replica);
 }
 
 StateImageStore::StateImageStore(StateImageStorage& device, HostContextArena* host,
@@ -234,14 +234,6 @@ bool StateImageStore::release_checkpoint_owner(Handle handle) noexcept {
         retire_released_owner(handle);
     }
     return true;
-}
-
-void StateImageStore::release_checkpoint_reference(Handle handle) {
-    Object& object = require(handle);
-    if (object.role != StateImageRole::CheckpointImmutable || object.checkpoint_references == 0) {
-        throw std::logic_error("StateImage checkpoint reference is not releasable");
-    }
-    --object.checkpoint_references;
 }
 
 std::int32_t StateImageStore::physical_slot(Handle handle) const {
@@ -456,7 +448,7 @@ StateImageStore::reserve_host_to_device(Handle source, Handle destination) {
     return transfer;
 }
 
-void StateImageStore::publish_transfer(Transfer&& transfer, bool keep_source_replica) {
+void StateImageStore::publish_transfer(Transfer& transfer, bool keep_source_replica) {
     validate_transfer(transfer);
     const auto source_handle = transfer.source_.image();
     auto& source             = require(source_handle);
@@ -485,7 +477,7 @@ void StateImageStore::publish_transfer(Transfer&& transfer, bool keep_source_rep
     transfer.source_.reset();
 }
 
-void StateImageStore::abort_transfer(Transfer&& transfer) noexcept {
+void StateImageStore::abort_transfer(Transfer& transfer) noexcept {
     if (!valid_transfer(transfer)) std::terminate();
     auto& destination = objects_[transfer.destination_.index_];
     if (transfer.host_slot_) {

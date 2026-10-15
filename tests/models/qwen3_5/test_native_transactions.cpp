@@ -458,22 +458,14 @@ public:
             require(candidate && candidate->reused_tokens == prompt_tokens &&
                         static_cast<bool>(program_.start_binding(base, {1}, *candidate)),
                     "active input could not reserve a second request without Main growth");
-            synchronize();
-            auto copying = program_.poll_context({});
-            if (!copying.complete) {
-                const bool copies_kv = std::any_of(
-                    candidate->transfers.begin(), candidate->transfers.end(),
-                    [](const auto& transfer) {
-                        return transfer.resource != runtime::ContextTransferResource{} &&
-                               transfer.direction ==
-                                   runtime::ContextTransferDirection::DeviceToDevice;
-                    });
-                require(
-                    copying.advanced && !copying.sequence &&
-                        program_.context_blocks(original) == copies_kv,
+            const bool copies_kv = std::any_of(
+                candidate->transfers.begin(), candidate->transfers.end(), [](const auto& transfer) {
+                    return !transfer.resource.is_state() &&
+                           transfer.direction == runtime::ContextTransferDirection::DeviceToDevice;
+                });
+            require(program_.context_blocks(original) == copies_kv,
                     "binding blocked a writer inconsistently with its actual KV copy dependency");
-            }
-            const auto bound = copying.complete ? std::move(copying) : settle();
+            const auto bound = settle();
             require(bound.sequence && !program_.context_blocks(original) &&
                         transferred(bound, runtime::ContextTransferDirection::DeviceToDevice,
                                     runtime::ContextTransferResource{q35::kTextKvPool}) ==

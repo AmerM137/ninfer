@@ -1397,13 +1397,13 @@ private:
     void record_context_work(const typename ModelContract::ContextProgress& progress,
                              const std::shared_ptr<Request>& owner);
 
-    bool progress_context_transaction(HostPhaseMeasurement& boundary) {
+    bool progress_context_operation(HostPhaseMeasurement& boundary) {
         if (!instance_.program->has_context_operation()) { return false; }
         const auto owner = materializing_ ? materializing_->request : context_owner_;
         const auto cancellation =
             owner ? CancellationFlagView{&owner->cancelled} : CancellationFlagView{};
         auto progress = instance_.program->poll_context(cancellation);
-        if (!progress.complete) { return progress.advanced; }
+        if (!progress.complete) { return false; }
         record_context_work(progress, owner);
         if (owner && progress.request_timings) {
             owner->generation_timings = *progress.request_timings;
@@ -2209,7 +2209,7 @@ private:
                 set_host_work_class(HostWorkClass::Control);
                 auto boundary = begin_host_phase();
                 (void)expire_pending_requests();
-                executed = progress_context_transaction(boundary);
+                executed = progress_context_operation(boundary);
                 if (!instance_.program->has_context_operation()) {
                     for (const auto& request : slots_) {
                         if (request && request->capture_pending) {
@@ -2243,7 +2243,7 @@ private:
                     ((admission_decision_ && admission_decision_->restoring) ||
                      scheduler_.should_restore(!paused_.empty(), resident_empty()))) {
                     (void)try_admit_one(true);
-                    executed |= progress_context_transaction(boundary);
+                    executed |= progress_context_operation(boundary);
                 }
                 reserve_resident_units();
                 // A failed restore leaves spare resources available to fresh requests.
@@ -2258,7 +2258,7 @@ private:
                     }
                 }
                 if (instance_.program->has_context_operation()) {
-                    executed |= progress_context_transaction(boundary);
+                    executed |= progress_context_operation(boundary);
                     if (!instance_.program->has_context_operation()) { reserve_resident_units(); }
                 }
                 const auto cancelled = snapshot_cancellations();
@@ -2310,7 +2310,7 @@ private:
                 if (instance_.program->has_context_operation()) {
                     set_host_work_class(HostWorkClass::Control);
                     auto progress_boundary = begin_host_phase();
-                    executed |= progress_context_transaction(progress_boundary);
+                    executed |= progress_context_operation(progress_boundary);
                     if (!instance_.program->has_context_operation()) {
                         // Control/Decode permits were consumed. Only the still-unexecuted
                         // Prefill/Replay turn can receive a new permit in this round.

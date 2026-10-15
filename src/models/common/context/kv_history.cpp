@@ -127,17 +127,21 @@ void KVBinding::enqueue_mapping(cudaStream_t stream) {
     auto& handles = store_->publish_;
     handles.clear();
     const auto& history = store_->require(this->history());
+    auto restore        = restores_.begin();
     for (std::uint32_t i = 0; i < page_count(frontier_); ++i) {
         const auto page = store_->membership(history, i);
+        // Restores are reserved in history order, including a restored COW source tail.
+        DeviceKVPageHandle physical;
+        if (restore != restores_.end() && restore->page() == page) {
+            physical = restore->device();
+            ++restore;
+        } else {
+            physical = store_->pages().physical(page);
+        }
         if (tail_destination_ && i + 1 == page_count(frontier_)) {
             handles.push_back(tail_destination());
-        } else if (const auto restore =
-                       std::find_if(restores_.begin(), restores_.end(),
-                                    [&](const auto& value) { return value.page() == page; });
-                   restore != restores_.end()) {
-            handles.push_back(restore->device());
         } else {
-            handles.push_back(store_->pages().physical(page));
+            handles.push_back(physical);
         }
     }
     store_->tables_->publish(row_->handle(), 0, handles, stream);
@@ -203,14 +207,6 @@ bool KVHistoryStore::owned(KVHistoryHandle h) const { return require(h).owned; }
 
 bool KVHistoryStore::active(KVHistoryHandle h) const { return require(h).row.has_value(); }
 
-std::uint32_t KVHistoryStore::retained_frontier(KVHistoryHandle h) const {
-    return require(h).retained;
-}
-
-std::uint32_t KVHistoryStore::prefix_references(KVHistoryHandle h) const {
-    return require(h).prefix_count;
-}
-
 std::uint32_t KVHistoryStore::committed_frontier(KVHistoryHandle h) const {
     return require(h).frontier;
 }
@@ -232,10 +228,6 @@ LogicalKVPageHandle KVHistoryStore::logical_page(KVHistoryHandle h, std::uint32_
 
 DeviceKVPageHandle KVHistoryStore::physical_page(KVHistoryHandle h, std::uint32_t index) const {
     return pages_->physical(logical_page(h, index));
-}
-
-std::uint64_t KVHistoryStore::content_epoch(KVHistoryHandle h, std::uint32_t index) const {
-    return pages_->content_epoch(logical_page(h, index));
 }
 
 void KVHistoryStore::update_ranges(History& history, std::uint32_t old_visible,
@@ -461,9 +453,6 @@ KVBinding KVHistoryStore::prepare_binding(const KVPrefixRef* source, std::uint32
     binding.frontier_   = frontier;
     binding.write_tail_ = frontier % kPageTokens;
     if (source) binding.source_ = *source;
-    if (source && demand.tail_copies && demand.reuse_history) {
-        throw std::logic_error("KV binding must preserve the original retained mapping");
-    }
     if (source && !demand.reuse_history) {
         binding.history_ = fork_history(*source, frontier);
     } else {

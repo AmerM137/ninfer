@@ -437,7 +437,8 @@ public:
     std::uint64_t next_transaction_id_ = 1;
 
     struct BindOperation {
-        std::uint32_t lane = 0;
+        static constexpr auto kind = ContextOperationKind::Bind;
+        std::uint32_t lane         = 0;
         std::optional<CheckpointHandle> source;
         Checkpoints::Lease source_lease;
         std::vector<CheckpointHandle> carried_points;
@@ -459,15 +460,19 @@ public:
     };
 
     struct CaptureOperation {
+        static constexpr auto kind     = ContextOperationKind::Capture;
         std::uint32_t lane             = 0;
         std::uint32_t frontier         = 0;
         std::uint32_t backend_frontier = 0;
         std::vector<std::pair<CheckpointHandle, runtime::CheckpointRole>> points;
     };
 
-    struct DemoteOperation {};
+    struct DemoteOperation {
+        static constexpr auto kind = ContextOperationKind::Demote;
+    };
 
     struct PauseOperation {
+        static constexpr auto kind = ContextOperationKind::Pause;
         std::uint32_t lane;
         ResumeState paused;
         bool preserve_state_device = true;
@@ -495,7 +500,7 @@ public:
         }
 
         [[nodiscard]] ContextOperationKind kind() const noexcept {
-            return static_cast<ContextOperationKind>(action.index());
+            return std::visit([](const auto& value) { return value.kind; }, action);
         }
     };
 

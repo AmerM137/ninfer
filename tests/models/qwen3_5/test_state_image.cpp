@@ -162,7 +162,7 @@ void test_host_roundtrip(bool dflash, ninfer::DeviceContext& device, bool dflash
     expect_slot(pool, 1, dflash ? 0x19 : 0x25, "complete Host roundtrip");
     if (dflash) {
         fill_slot(pool, 1, 0x61, device.execution_view());
-        pool.copy_dflash_local(0, 1, device.execution_view());
+        pool.storage().copy_group(pool.dflash_local_group(), 0, 1, device.execution_view());
         device.synchronize();
         expect_bytes(pool.linear().conv_slot(0, 1), 0x61, "local copy preserves GDN");
         expect_bytes(pool.continuation_hidden_slot(1), 0x81, "local copy preserves hidden");

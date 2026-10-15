@@ -34,18 +34,17 @@ struct PageDemotion {
 
 bool checkpoint_prefix(const CheckpointState& earlier, const CheckpointState& later) {
     const auto frontier = earlier.frontier();
-    if (frontier > later.frontier() || !earlier.snapshot.identity_owner() ||
-        !later.snapshot.identity_owner() || earlier.key.identity_tag != later.key.identity_tag ||
-        earlier.snapshot.identity_owner()->digests.at(frontier) !=
-            later.snapshot.identity_owner()->digests.at(frontier)) {
+    if (frontier > later.frontier() || earlier.key.identity_tag != later.key.identity_tag ||
+        earlier.snapshot.identity().digests.at(frontier) !=
+            later.snapshot.identity().digests.at(frontier)) {
         return false;
     }
     if (earlier.snapshot.identity_owner() == later.snapshot.identity_owner()) { return true; }
-    return std::equal(earlier.snapshot.identity_owner()->ledger.begin(),
-                      earlier.snapshot.identity_owner()->ledger.begin() + frontier,
-                      later.snapshot.identity_owner()->ledger.begin()) &&
-           earlier.snapshot.identity_owner()->prefix_identity.prefix_equals(
-               later.snapshot.identity_owner()->prefix_identity, frontier);
+    return std::equal(earlier.snapshot.identity().ledger.begin(),
+                      earlier.snapshot.identity().ledger.begin() + frontier,
+                      later.snapshot.identity().ledger.begin()) &&
+           earlier.snapshot.identity().prefix_identity.prefix_equals(
+               later.snapshot.identity().prefix_identity, frontier);
 }
 
 struct PhysicalPage {
@@ -397,10 +396,9 @@ struct ReclaimPlan {
     bool prefix(CheckpointHandle earlier, CheckpointHandle later) const {
         const auto& a = owner->checkpoint(earlier);
         const auto& b = owner->checkpoint(later);
-        if (a.frontier() > b.frontier() || !a.snapshot.identity_owner() ||
-            !b.snapshot.identity_owner() || a.key.identity_tag != b.key.identity_tag ||
-            a.snapshot.identity_owner()->digests.at(a.frontier()) !=
-                b.snapshot.identity_owner()->digests.at(a.frontier())) {
+        if (a.frontier() > b.frontier() || a.key.identity_tag != b.key.identity_tag ||
+            a.snapshot.identity().digests.at(a.frontier()) !=
+                b.snapshot.identity().digests.at(a.frontier())) {
             return false;
         }
         if (a.snapshot.identity_owner() == b.snapshot.identity_owner()) { return true; }

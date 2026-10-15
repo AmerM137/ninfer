@@ -25,7 +25,7 @@ target_sources(ninfer_model_runtime PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/program/storage/checkpoints.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/storage/draft_context.cpp"
 
-  "${CMAKE_CURRENT_LIST_DIR}/program/transactions/context_transaction.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/program/transactions/context_operation.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/transactions/binding.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/transactions/capture.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/transactions/commit.cpp"

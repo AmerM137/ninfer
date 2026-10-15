@@ -26,6 +26,7 @@ target_sources(ninfer_model_loading PRIVATE common/moe/weights.cpp)
 target_sources(ninfer_model_runtime PRIVATE
   common/context/state_store.cpp
   common/context/logical_kv_store.cpp
+  common/context/host_kv_store.cpp
   common/context/kv_history.cpp
   common/context/work.cpp
   common/context/migration.cpp

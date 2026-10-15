@@ -65,7 +65,6 @@ status and remaining requirements. Concrete Op contracts live in `include/ninfer
 
 | Design | Responsibility |
 |---|---|
-| [Continuation state and context snapshots](maintainer/context-state-redesign.md) | planned StateImage layout, write ownership, KV prefix references, migration and Qwen3.5 integration steps |
 | [Qwen4Exp model and weights](maintainer/qwen4_exp-model.md) | architecture, quantization, merged matrices, source binding and residency budgets |
 | [Qwen4Exp execution and state](maintainer/qwen4_exp-execution.md) | layer flow, cross-Op handoffs, transactions, state lifetime and remaining integration |
 | [Qwen4Exp GPU MoE](maintainer/qwen4_exp-moe-gpu.md) | NVFP4/block-FP8 expert computation, GPU interfaces, fixed Graph topology and workload tuning plan |

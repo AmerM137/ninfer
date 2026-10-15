@@ -1,7 +1,8 @@
 #pragma once
 
-#include "runtime/contract/request.h"
 #include "core/transfer_work.h"
+#include "runtime/contract/request.h"
+
 #include <algorithm>
 #include <array>
 #include <cstddef>

@@ -256,6 +256,7 @@ public:
 
     [[nodiscard]] bool release_reference(LogicalKVPageHandle handle) noexcept;
 
+private:
     [[nodiscard]] bool can_attach_host_replica(LogicalKVPageHandle handle, std::uint64_t epoch,
                                                std::uint32_t coverage) const noexcept;
 
@@ -268,7 +269,6 @@ public:
     [[nodiscard]] bool detach_host_replica(LogicalKVPageHandle handle,
                                            HostKVExtentCapability extent) noexcept;
 
-private:
     struct Page {
         std::uint32_t generation        = 1;
         std::uint64_t content_epoch     = 0;

@@ -11,10 +11,6 @@
 namespace ninfer::models::qwen3_5::detail {
 namespace {
 
-bool checkpoint_releasable(const ProgramImpl& program, CheckpointHandle handle) {
-    return program.checkpoints.erasable(handle);
-}
-
 bool state_evictable(const StateImageStore& states, StateImageHandle state) {
     return states.role(state) == context::StateImageRole::CheckpointImmutable &&
            states.can_release_after_checkpoint_references(state,
@@ -45,7 +41,7 @@ bool ProgramImpl::release_checkpoint(CheckpointHandle handle) noexcept {
 }
 
 bool ProgramImpl::can_release_checkpoint(CheckpointHandle handle) const noexcept {
-    return checkpoint_releasable(*this, handle);
+    return checkpoints.erasable(handle);
 }
 
 ResumeStateImpl::~ResumeStateImpl() {
@@ -94,8 +90,7 @@ PrefixShortlistKey ProgramImpl::checkpoint_key(CheckpointHandle handle,
     if (!frontier || frontier > record.frontier()) {
         throw std::logic_error("checkpoint key is outside coverage");
     }
-    return {record.snapshot.identity_owner()->digests.at(frontier), frontier,
-            record.key.identity_tag};
+    return {record.snapshot.identity().digests.at(frontier), frontier, record.key.identity_tag};
 }
 
 ContextResources
@@ -148,7 +143,7 @@ CheckpointSummary ProgramImpl::checkpoint_summary(CheckpointHandle handle) const
     CheckpointSummary out{.key = record.key, .frontier = record.frontier(), .role = record.role};
     const bool unpinned   = checkpoints[handle.index].pins == 0;
     out.leased            = checkpoint_metadata(handle).leased;
-    const bool releasable = checkpoint_releasable(*this, handle);
+    const bool releasable = checkpoints.erasable(handle);
     if (unpinned && state_evictable(*state_store, record.continuation().image)) {
         out.evictable_resources.state_slots =
             state_store->device_resident(record.continuation().image) ? 1U : 0U;

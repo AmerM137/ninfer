@@ -243,7 +243,6 @@ bool LogicalKVPageStore::can_write(LogicalKVPageHandle handle, std::uint64_t wri
         if (page.required[i] > static_cast<std::uint32_t>(own_coverage == i + 1)) return false;
     return writer != 0 && page.device_replica && page.device_columns >= begin &&
            page.protected_columns <= begin && page.readers() == 0 && !page.destination_pinned &&
-
            (page.writer_identity == 0 || page.writer_identity == writer);
 }
 
@@ -428,7 +427,7 @@ bool LogicalKVPageStore::detach_host_replica(LogicalKVPageHandle handle,
                                              HostKVExtentCapability extent) noexcept {
     if (!valid(handle)) { return false; }
     Page& page = pages_[handle.index_];
-    if (!page.host_replica || page.host_replica->extent != extent ||
+    if (!page.host_replica || page.host_replica->extent != extent || page.host_readers != 0 ||
         (!page.device_replica && page.references != 0)) {
         return false;
     }

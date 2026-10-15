@@ -717,7 +717,7 @@ consumer，且 replay in-flight期间不得改写同一 row。
 | StateImage 布局、逻辑身份与副本事务 | `src/core/state_image.*`, `src/models/common/context/state_store.*`；架构声明字段与类型化视图 |
 | 完整快照与记录 lease | `src/models/common/context/snapshot.h`, `checkpoint_store.h` |
 | 原生 checkpoint 生命周期 | `src/models/qwen3_5/program/storage/checkpoints.cpp`, `sequence.cpp` |
-| Host extent membership | `src/models/common/context/host_kv_store.h` |
+| Host extent membership | `src/models/common/context/host_kv_store.*` |
 | unit 许可与上下文事务 | `src/models/qwen3_5/program/planning/request_plan.cpp`, `transactions/` |
 | model pool layout与capacity curve | `src/models/qwen3_5/program/planning/startup.cpp` |
 | public paged consumer views | `src/core/paged_kv_cache.h` |

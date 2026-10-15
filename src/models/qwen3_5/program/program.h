@@ -290,6 +290,7 @@ public:
 
     [[nodiscard]] std::span<const TokenId> tokens() const noexcept { return tokens_; }
 
+    // Empty for one token per row; speculative rounds carry each row's produced count.
     [[nodiscard]] std::span<const std::int32_t> row_counts() const noexcept { return row_counts_; }
 
     [[nodiscard]] std::uint32_t row_stride() const noexcept { return row_stride_; }
@@ -379,7 +380,6 @@ enum class ContextOperationKind : std::uint8_t { Bind, Capture, Demote, Pause };
 
 struct ContextProgress {
     ContextOperationKind kind = ContextOperationKind::Bind;
-    bool advanced             = false;
     bool complete             = false;
     bool published            = false;
     std::optional<SequenceHandle> sequence;

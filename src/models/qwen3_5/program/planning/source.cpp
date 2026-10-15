@@ -15,12 +15,11 @@ bool ProgramImpl::checkpoint_matches(CheckpointHandle handle, const RequestBaseP
     const auto& record = checkpoint(handle);
     if (record.frontier() > base.summary().prompt_tokens ||
         record.key.identity_tag != base.impl_->prefix_identity_tag ||
-        !record.snapshot.identity_owner() ||
         base.impl_->prefix_digests.at(record.frontier()) != record.key.digests) {
         return false;
     }
-    return prefix_matches(*base.impl_->prompt, record.snapshot.identity_owner()->ledger,
-                          record.snapshot.identity_owner()->prefix_identity, record.frontier());
+    return prefix_matches(*base.impl_->prompt, record.snapshot.identity().ledger,
+                          record.snapshot.identity().prefix_identity, record.frontier());
 }
 
 std::optional<SourceCandidate>
@@ -149,7 +148,7 @@ ProgramImpl::inspect_source(const RequestBasePlan& base, std::optional<Checkpoin
         candidate.transfers.push_back(
             context::state_transfer_requirement(state_images->storage().layout().transfer_work(),
                                                 runtime::ContextTransferDirection::HostToDevice));
-    } else if (!(candidate.state_action == StateBindingAction::Move) &&
+    } else if (candidate.state_action != StateBindingAction::Move &&
                candidate.state_action != StateBindingAction::Split &&
                candidate.state_action != StateBindingAction::BackupSplit &&
                is_masked_draft_backend(speculative_backend)) {

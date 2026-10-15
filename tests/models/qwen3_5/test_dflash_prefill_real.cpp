@@ -202,8 +202,9 @@ void run(const char* artifact, SpeculativeBackend backend) {
     const auto destination = states.reserve_destination();
     require(destination.has_value(), "fixture fork destination allocation failed");
     const auto binding = states.begin_write(*source, *destination);
-    program.state_images->copy_dflash_local(binding.source, binding.destination,
-                                            device.execution_view());
+    program.state_images->storage().copy_group(program.state_images->dflash_local_group(),
+                                               binding.source, binding.destination,
+                                               device.execution_view());
     context.state_source_slot      = binding.source;
     context.state_destination_slot = binding.destination;
     prefill(23, 23); // Actual chunk is seven tokens, shortened at the capture frontier.

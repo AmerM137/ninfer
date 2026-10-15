@@ -1,10 +1,9 @@
 #include "core/device.h"
 #include "models/common/context/migration.h"
-#include <algorithm>
-#include "models/qwen3_5/state/state_image.h"
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -21,7 +20,6 @@
 
 namespace {
 
-namespace q36   = ninfer::models::qwen3_5;
 namespace store = ninfer::models::context;
 
 int failures = 0;
@@ -37,35 +35,26 @@ bool cuda_unavailable(cudaError_t error) {
 }
 
 void test_state_store(ninfer::DeviceContext& device) {
-    q36::StateImageSpec spec{
-        .slot_count = 4,
-        .linear =
-            {
-                .layers         = 1,
-                .conv_channels  = 8,
-                .conv_width     = 3,
-                .value_heads    = 2,
-                .value_head_dim = 4,
-                .key_head_dim   = 4,
-                .conv_dtype     = ninfer::DType::BF16,
-            },
-        .hidden = 8,
-        .dflash_local =
-            q36::DFlashLocalStateSpec{.layers = 1, .capacity = 8, .kv_heads = 2, .head_dim = 4},
-    };
+    ninfer::StateImageBuilder schema;
+    (void)schema.add(ninfer::DType::BF16, {8, 3}, 1, "conv");
+    (void)schema.add(ninfer::DType::FP32, {4, 4, 2}, 1, "recurrent");
+    const auto hidden_field = schema.add(ninfer::DType::BF16, {8}, 1, "hidden");
+    (void)schema.add(ninfer::DType::BF16, {4, 8, 2}, 1, "local_k");
+    (void)schema.add(ninfer::DType::FP16, {4, 8, 2}, 1, "local_v");
     ninfer::LayoutBuilder builder;
-    const q36::StateImageDeviceLayout layout = q36::plan_state_image_device_pool(builder, spec);
-    ninfer::DeviceBuffer arena_storage(device.device(), builder.finish(256));
-    ninfer::MemoryArena arena(arena_storage.span());
-    q36::StateImageViews physical(arena.storage(), layout);
-    ninfer::HostContextArena host_backing(layout.images.image_stride * 2,
-                                          layout.images.image_stride);
-    ninfer::models::qwen3_5::StateImageStore images(physical.storage(), &host_backing, 6);
+    const auto layout = schema.finish(builder, 4);
+    ninfer::DeviceBuffer backing(device.device(), builder.finish());
+    ninfer::StateImageStorage physical(backing.span(), layout);
+    ninfer::HostContextArena host_backing(layout.image_stride * 2, layout.image_stride);
+    store::StateImageStore images(physical, &host_backing, 6);
+    const auto hidden_slot = [&](std::int32_t slot) {
+        return physical.field(hidden_field).slice(1, slot, 1).view({8});
+    };
 
     const auto initialize = [&] {
         auto handle = images.reserve_destination();
         if (handle) {
-            physical.storage().clear(images.physical_slot(*handle), device.execution_view());
+            physical.clear(images.physical_slot(*handle), device.execution_view());
             images.complete_initialization(*handle);
         }
         return handle;
@@ -124,7 +113,7 @@ void test_state_store(ninfer::DeviceContext& device) {
         expect(shared && first_reader && last_reader, "shared State reader fixture allocates");
         const auto source_slot = images.physical_slot(*shared);
         const std::array<std::uint16_t, 8> content{1, 3, 5, 7, 9, 11, 13, 15};
-        const auto hidden = physical.continuation_hidden_slot(source_slot);
+        const auto hidden = hidden_slot(source_slot);
         CUDA_CHECK(cudaMemcpyAsync(hidden.data, content.data(), sizeof(content),
                                    cudaMemcpyHostToDevice, device.stream()));
         images.freeze(*shared);
@@ -139,17 +128,14 @@ void test_state_store(ninfer::DeviceContext& device) {
         expect(!images.can_release_after_checkpoint_references(*shared, 0) &&
                    images.device_occupied() == 3,
                "retired content owner does not advertise pinned State capacity as free");
-        physical.storage().copy(source_slot, images.physical_slot(*first_reader),
-                                device.execution_view());
+        physical.copy(source_slot, images.physical_slot(*first_reader), device.execution_view());
         device.synchronize();
         images.complete_write(*shared, *first_reader);
         expect(images.valid(*shared) && images.source_pins(*shared) == 1,
                "one completed reader does not release the remaining reader's State");
-        physical.storage().copy(source_slot, images.physical_slot(*last_reader),
-                                device.execution_view());
+        physical.copy(source_slot, images.physical_slot(*last_reader), device.execution_view());
         std::array<std::uint16_t, 8> observed{};
-        const auto last_hidden =
-            physical.continuation_hidden_slot(images.physical_slot(*last_reader));
+        const auto last_hidden = hidden_slot(images.physical_slot(*last_reader));
         CUDA_CHECK(cudaMemcpyAsync(observed.data(), last_hidden.data, sizeof(observed),
                                    cudaMemcpyDeviceToHost, device.stream()));
         device.synchronize();
@@ -199,9 +185,9 @@ void test_state_store(ninfer::DeviceContext& device) {
                "submitted State transfer retains a retired checkpoint source");
         CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream()));
         if (cancel_transfer) {
-            images.abort_transfer(std::move(*transfer));
+            transfer.reset();
         } else {
-            images.publish_transfer(std::move(*transfer), true);
+            transfer->publish(true);
         }
         expect(!images.valid(*shared) && images.occupied() == 0 &&
                    host_backing.occupied_bytes() == 0,
@@ -235,12 +221,12 @@ void test_state_store(ninfer::DeviceContext& device) {
     device.synchronize();
     images.freeze(*host_source);
     {
-        auto allocation     = host_backing.allocate(layout.images.image_stride);
+        auto allocation     = host_backing.allocate(layout.image_stride);
         const auto occupied = host_backing.occupied_bytes();
         auto cancelled      = images.reserve_device_to_host(*host_source, std::move(*allocation));
         expect(host_backing.occupied_bytes() == occupied && host_backing.allocation_count() == 1,
                "transfer consumes the existing Host reservation without reallocating");
-        expect(cancelled && host_backing.reserved_bytes() == layout.images.image_stride &&
+        expect(cancelled && host_backing.reserved_bytes() == layout.image_stride &&
                    host_backing.live_bytes() == 0 && images.source_pins(*host_source) == 1 &&
                    !images.release(*host_source),
                "State transfer reservation charges destination while its source is pinned");
@@ -254,9 +240,9 @@ void test_state_store(ninfer::DeviceContext& device) {
                images.residency(*host_source) == store::StateReplicaResidency::DeviceOnly,
            "incomplete State D2H does not publish a Host replica");
     CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream()));
-    images.publish_transfer(std::move(*d2h), true);
+    d2h->publish(true);
     expect(images.residency(*host_source) == store::StateReplicaResidency::Both &&
-               host_backing.live_bytes() == layout.images.image_stride &&
+               host_backing.live_bytes() == layout.image_stride &&
                host_backing.reserved_bytes() == 0,
            "State D2H backup publishes stable Both residency");
 
@@ -287,14 +273,14 @@ void test_state_store(ninfer::DeviceContext& device) {
     CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream()));
     bool rejected = false;
     try {
-        images.publish_transfer(std::move(*h2d_source), false);
+        h2d_source->publish(false);
     } catch (const std::logic_error&) { rejected = true; }
     expect(rejected && h2d_source->valid() && images.host_resident(*host_source) &&
                !images.device_resident(*host_source) && images.source_pins(*host_source) == 3,
            "restoration cannot retire Host storage retained by other transfers");
-    images.publish_transfer(std::move(*h2d_one), true);
-    images.publish_transfer(std::move(*h2d_two), true);
-    images.publish_transfer(std::move(*h2d_source), false);
+    h2d_one->publish(true);
+    h2d_two->publish(true);
+    h2d_source->publish(false);
     expect(images.role(*fork_one) == store::StateImageRole::ReservedDestination,
            "Host materialization is separate from native adoption");
     images.complete_initialization(*fork_one);
