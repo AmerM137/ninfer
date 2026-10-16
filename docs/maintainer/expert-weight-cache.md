@@ -224,10 +224,14 @@ Host backing 的子集。MTP、router、shared、Vision 和 draft 始终留在 G
 
 完整 GPU 放置可行时走原融合路径，不创建 Host expert 副本。否则保留完整原编码 Host
 来源；`EngineOptions::moe.expert_priority` 可指定每个 Main 层全部 logical ID 的优先级排列，
-35B-A3B 配置默认使用内置的逐层静态排序，其他配置使用 ID 顺序；显式排列覆盖默认值。
-内置排序以本地 Qwen3.6-35B-A3B 权重在通用问答、代码、推理、文档、写作、翻译、结构化输出、
-工具和多模态任务中的 Main 路由频率标定，按请求归一化，ordinary／MTP3／DFlash7 权重为
-50%／25%／25%。它只决定缓存放置，路由公式和 expert 计算语义不变；同配置的其他训练权重可提供自己的排序。
+35B-A3B 和 Flash Next 配置默认使用模型私有的逐层静态排序，其他配置使用 ID 顺序；
+显式排列覆盖默认值。标定统计通用问答、代码、推理、文档、写作、翻译、结构化输出、工具和
+多模态任务中的 Main 小 T 路由频率，按请求、逐层归一化，再按类别聚合。
+Qwen3.6-35B-A3B 使用 ordinary／MTP3／DFlash7 的 50%／25%／25% 混合。
+Qwen3.8-Flash-Next 使用 128 个标定任务的 ordinary 估计；训练任务内部交叉验证比较了直接
+混合与同题差值估计，另用固定留出任务、MTP3 和八路 ordinary/MTP5 检查覆盖。统计包含实际
+计算的未接受 draft 与 padding 列，排除走完整 bank 的大 T 调用和常驻 GPU 的 MTP experts。
+排序只决定缓存放置，路由公式和 expert 计算语义不变；同配置的其他训练权重可提供自己的排序。
 各层按字节均衡分配额度，以完整 expert 为单位选取优先级前缀；排列本身
 不强制启用 offload。优先级影响目标集合，实际 GPU 分工由已就绪副本决定。
 `moe.cpu_workers=0` 自动选择物理核并为控制线程留核；非零指定团队规模。

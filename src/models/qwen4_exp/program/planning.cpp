@@ -38,6 +38,8 @@ moe::Plan describe_moe_plan(const execution::ModelProfile& p, const MoeOptions& 
         moe::LayerSpec layer{m.bank, m.math, ops::MoeEpilogue::Write, {}, {64, 15}};
         if (o.expert_priority)
             layer.priority = (*o.expert_priority)[i];
+        else if (const auto priority = default_expert_priority(p.config.text, i); !priority.empty())
+            layer.priority.assign(priority.begin(), priority.end());
         else {
             layer.priority.resize(m.math.routed.experts);
             std::iota(layer.priority.begin(), layer.priority.end(), 0U);

@@ -53,6 +53,9 @@ struct ExecutionPlan {
 
 [[nodiscard]] moe::Plan describe_moe_plan(const execution::ModelProfile&, const MoeOptions&);
 
+[[nodiscard]] std::span<const std::uint32_t> default_expert_priority(const TextConfig&,
+                                                                     std::size_t layer);
+
 // Available bytes exclude immutable GPU weights and the caller's startup headroom.
 // Ordinary Host, registered expert backing, and pinned context capacity are independent budgets.
 [[nodiscard]] std::optional<ExecutionPlan>

@@ -25,4 +25,5 @@ target_sources(ninfer_model_runtime PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/program/checkpoints.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/reclaim.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/planning.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/program/expert_priority.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/resources.cpp")

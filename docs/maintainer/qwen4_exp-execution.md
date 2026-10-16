@@ -448,7 +448,8 @@ lead 规划，不假定与 Main 相同。最终容量、Host reservation、迁�
 
 Main 使用 1–8 路执行和 BF16、INT8、FP8、NVFP4、K8V4 五种 KV 存储。Main experts
 采用完整 Host backing；公共 MoE 根据实际 token 列数选择 CPU/GPU 子集或完整层流式计算。
-默认 expert 优先级为 ID 顺序，`MoeOptions::expert_priority` 可覆盖各层排序。Prefill chunk
+Flash Next 配置默认使用已标定的逐层 expert 排序，其他配置使用 ID 顺序；
+`MoeOptions::expert_priority` 可覆盖各层排序。Prefill chunk
 由启动配置决定，默认 4096。PLE 的 raw-ID tail 随 continuation 保存，准备服务与上传双槽
 由 Program 拥有，下一窗口的 I/O 不推进模型前沿。
 
