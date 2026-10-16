@@ -461,5 +461,6 @@ The first command plans component combinations, KV formats and concurrency witho
 payloads. `--materialize` additionally loads one full-component model, checks stored words and
 parameter sharing, constructs its execution resources, and reads/uploads a PLE window. It needs
 about 64 GiB of available Host memory plus system headroom. These are loading/resource checks;
-eager Text/Vision generation and text causal scoring use the public Engine, as described in the
-[CLI guide](../docs/cli.md).
+Text/Vision/MTP generation, eager or CUDA Graph decode, and text causal scoring use the public Engine,
+with current support described in the [execution reference](../docs/maintainer/qwen4_exp-execution.md)
+and commands in the [CLI guide](../docs/cli.md).

@@ -74,8 +74,8 @@ Qwen3_5 的 speculative backends 在一个 Engine 内互斥，因此该架构当
 
 | Pool | 内容 | 逻辑 frontier |
 |---|---|---|
-| Main Text | target full-attention K/V 与其 code/scale planes | target materialized KV frontier |
-| MTP | MTP persistent K/V 与其 code/scale planes | MTP KV frontier |
+| Main Text | target attention K/V、code/scale 及模型声明的压缩 index planes | target materialized KV frontier |
+| MTP | MTP persistent K/V、code/scale 及模型声明的压缩 index planes | MTP KV frontier |
 | Draft Full | selected draft 的 full-context K/V | draft context frontier |
 
 Main Text 与 MTP 使用 Engine 选择的 BF16、INT8-G64、FP8-E4M3FN-row256、NVFP4-G16 或 K8V4
@@ -86,8 +86,10 @@ FP8-E4M3FN-row256，V 固定为 NVFP4-G16。
 `PagedKVStorageLayout` 将选定的 closed profile 解析为 K/V data/scale plane schema；target planner 按
 layer 展开该 schema 并确定 plane ordinal。Common pool implementation 仍只接收已展开的
 `KVPageGeometry`、plane inventory 和 capacity，不解释 storage mode。
-上述 Qwen3.5 K/V data 与 scale planes 均使用 `tokens_per_row=1`；通用存储层同时支持第 4 节的
-四-token 行几何，具体 plane 的数学含义与消费支持由模型和 Op 定义。
+Qwen3.5 与 Qwen4Exp 的主 K/V data/scale planes 均使用 `tokens_per_row=1`。
+Qwen4Exp 在每个 QSA 层追加 BF16 index plane，使用 `tokens_per_row=4`，与该层主 KV
+共享页组和原 token coverage；未完成块的 raw tail 保存在 StateImage。其数学与模型交接见
+[Qwen4Exp 执行](qwen4_exp-execution.md)，通用行几何见第 4 节。
 
 ### 3.2 Main capacity
 
@@ -167,9 +169,9 @@ Selected backend 的 logical page capacity仍为 \(L\)。Physical capacity从 Ma
 backend off:
     Main physical pages = M
 
-MTP with draft window K:
+MTP with D draft tokens (verification width D+1):
     Main physical pages = M
-    MTP physical pages  = M + C * ceil((K - 1) / P)
+    MTP physical pages  = M + C * ceil(D / P)
 
 DFlash / DFlash2 with full-attention layers:
     Main physical pages        = M
@@ -204,7 +206,7 @@ ceiling。输入、请求 ledger 与其他 CPU 数据有各自的生命周期，
 4. 使用相同 page size；
 5. 没有独立释放或独立容量复用的语义。
 
-因此 Main layers 的 K、V、code 和 scale 可以共享一个 page-group ID；Main、MTP 与 DFlash Full
+因此 Main layers 的 K、V、code、scale 和压缩 index 可以共享一个 page-group ID；Main、MTP 与 DFlash Full
 必须属于不同 pools。
 
 ### 4.2 Page group
@@ -282,7 +284,8 @@ address=base+d\,nb_0+r\,nb_1+g\,nb_2+h\,nb_3
 所有 grouped planes 使用同一个 \(g\)，但使用各自的行跨度、leading coordinate 和 Tensor strides。
 Feature 轴连续，地址和容量计算使用能覆盖完整 Tensor span 的整数类型。
 Exact persistent codec 由 [`kv_cache_append.h`](../../include/ninfer/ops/kv_cache_append.h) 定义，
-consumer arithmetic 由 [`softmax_attention.h`](../../include/ninfer/ops/softmax_attention.h) 定义；
+consumer arithmetic 由 [`softmax_attention.h`](../../include/ninfer/ops/softmax_attention.h) 与
+[`qsa.h`](../../include/ninfer/ops/qsa.h) 定义；
 allocator 只解释 plane bytes、order 和 page-group identity。
 
 D256 Main/MTP profile 的单 token/head 物理 payload 为：

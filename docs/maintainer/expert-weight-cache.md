@@ -62,8 +62,9 @@ Qwen3.5 的 bank ID 按 Main 层顺序建立，选中的 MTP bank 追加在末�
 `Parameters` 保存 bank 身份、矩阵 profile 与 Use 元数据，可以描述 CPU 来源。
 workspace 查询消费数学 profile；完整 GPU FFN 显式接受 resident/cached CUDA bank，
 混合单层执行另外借用原生 Host bank 和交接资源。
-Flash Next Main eager 使用 NVFP4 Host bank、GPU cache 与公共混合执行；
-Block-FP8 MTP bank 已支持加载和 GPU 计算，MTP 模型编排见 [执行进度](qwen4_exp-execution.md#implementation-status)。
+Qwen3.5 MoE 在完整 GPU 放置不可行时使用 Host Main experts；Qwen4Exp Main 始终使用
+NVFP4 Host backing 和 Program GPU cache。Qwen4Exp 的 block-FP8 MTP experts 常驻 GPU，
+模型编排见 [Qwen4Exp 执行](qwen4_exp-execution.md)。
 
 ## 副本容量与 GPU 寻址
 
@@ -178,8 +179,9 @@ Host 的 release 不代表 GPU 已完成读取。CUDA 提交失败后停止接�
   它与独立 Op 共用 kernel 机制，保有自己的格式/shape 分派和调优策略；全 GPU Main/MTP
   通过这一入口执行。
 
-CUDA 数学支持 35B 的整数 expert profiles，以及 [Qwen4Exp GPU MoE](qwen4_exp-moe-gpu.md)
-的 NVFP4、block-FP8 profiles。CPU 支持 Q4+Q5、Q4+Q6 和 Main NVFP4，输入为 BF16，
+CUDA 数学支持 35B 的整数 expert profiles，以及 Flash Next 的 NVFP4、block-FP8 profiles，
+通过同一组 [MoE 语义入口](../../include/ninfer/ops/moe.h)消费实际表示与 activation Use。
+CPU 支持 Q4+Q5、Q4+Q6 和 Main NVFP4，输入为 BF16，
 SiLU 与 down 输入保持 FP32，不量化激活；CPU block-FP8 尚未实现。
 `CudaSwiGLUExperts` 借用 affine 或 indexed GPU bank；`CpuSwiGLUExperts` 借用完整原生 Host bank，
 直接按各 plane 的偏移和步长消费，NVFP4 使用每个 expert 自己的 matrix divisor。
@@ -222,16 +224,13 @@ Program 记录每次完整 traversal 中实际参与计算的 CPU 层数；连�
 显式 KV 配置仍完整兑现。Host 来源、注册范围和 pinned frame 单独报告，注册范围是
 Host backing 的子集。MTP、router、shared、Vision 和 draft 始终留在 GPU。
 
-完整 GPU 放置可行时走原融合路径，不创建 Host expert 副本。否则保留完整原编码 Host
-来源；`EngineOptions::moe.expert_priority` 可指定每个 Main 层全部 logical ID 的优先级排列，
-35B-A3B 和 Flash Next 配置默认使用模型私有的逐层静态排序，其他配置使用 ID 顺序；
-显式排列覆盖默认值。标定统计通用问答、代码、推理、文档、写作、翻译、结构化输出、工具和
-多模态任务中的 Main 小 T 路由频率，按请求、逐层归一化，再按类别聚合。
-Qwen3.6-35B-A3B 使用 ordinary／MTP3／DFlash7 的 50%／25%／25% 混合。
-Qwen3.8-Flash-Next 使用 128 个标定任务的 ordinary 估计；训练任务内部交叉验证比较了直接
-混合与同题差值估计，另用固定留出任务、MTP3 和八路 ordinary/MTP5 检查覆盖。统计包含实际
-计算的未接受 draft 与 padding 列，排除走完整 bank 的大 T 调用和常驻 GPU 的 MTP experts。
-排序只决定缓存放置，路由公式和 expert 计算语义不变；同配置的其他训练权重可提供自己的排序。
+Qwen3.5 的完整 GPU 放置可行时使用融合路径，不创建 Host expert 副本；Host 路径保留完整
+原编码来源，Qwen4Exp 当前固定采用后者。
+`EngineOptions::moe.expert_priority` 可指定每个 Main 层全部 logical ID 的优先级排列。
+35B-A3B 和 Flash Next 配置默认使用模型私有的静态标定排序，其他配置使用 ID 顺序；
+显式排列覆盖默认值。排序只决定缓存放置，不改变 router、coefficients 或 expert 数学，
+也不在请求期间更新。标定来源说明与数组分别保存在各模型的 `moe_priority.cpp` 和
+`expert_priority.cpp`；同配置的其他训练权重可提供自己的排序。
 各层按字节均衡分配额度，以完整 expert 为单位选取优先级前缀；排列本身
 不强制启用 offload。优先级影响目标集合，实际 GPU 分工由已就绪副本决定。
 `moe.cpu_workers=0` 自动选择物理核并为控制线程留核；非零指定团队规模。
@@ -270,7 +269,7 @@ MemorySummary 报告池容量、固定区、窗口总容量与数量、实际占
 受 context 剩余长度限制。测量签名包含优先级、各层缓存额度、团队、池容量和 chunk，
 不把常驻模型的重算成本标定直接套给 offload。
 
-常驻执行使用整段 CUDA Graph；混合执行支持分段 Graph，也保留 eager 提交。
+Qwen3.5 常驻执行使用整段 CUDA Graph；Main offload 使用分段 Graph，也保留 eager 提交。
 稳定小 T 将 mixer 与 MoE GPU 前段合并；窗口流式加载或额外缓存恢复期间分开提交，
 在 mixer 之后取得快照和加入权重就绪依赖。CPU 等待图中的输入就绪 external event，
 与 GPU routed/shared 并行计算；本轮没有 CPU contribution 时跳过 collective 和回传。

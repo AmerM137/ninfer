@@ -1,465 +1,418 @@
-# Qwen4Exp：模型执行与状态提交
+# Qwen4Exp 执行与状态
 
-本文维护 Qwen4Exp 的层级调用、跨 Op 表示边界、Main/MTP 特征和可恢复状态，以及
-[当前执行进度](#implementation-status)。架构、实例参数、权重表示与驻留方案见
-[模型与权重](qwen4_exp-model.md)；PLE 的 hash、NF4 行解码、读取服务和设备交接见
-[PLE I/O](qwen4_exp-ple-io.md)。
+本文是 Qwen3.8-Flash-Next 在 NInfer 中的执行支持入口，维护层连接、资源所有权、
+PLE 流水、MTP/Vision、CUDA Graph 和完整 continuation 的提交规则。
+模型数学、量化和持久布局见[模型与权重](qwen4_exp-model.md)。
+请求调度与发布由 [Engine 架构](engine-architecture.md)维护，通用
+[上下文缓存](resource-scheduling-and-context-cache.md)、
+[Paged KV](paged-kv-cache.md)及 [expert cache](expert-weight-cache.md)各自维护其公共合同。
 
-单个 Op 的完整公式、支持域、alias、workspace 和执行约束由 `include/ninfer/ops/`
-中的合同维护，本文只规定模型如何组合这些计算。[Engine 架构](engine-architecture.md)
-拥有请求事务与发布规则，[Paged KV](paged-kv-cache.md)拥有物理页、replica 和迁移机制。
-Text/Vision/MTP 已接入公共 Engine，使用下述层流程、StateImage、QSA 页池和请求事务。
-Decode 支持 eager 与分段 CUDA Graph；当前启用范围见文末执行进度。
+## 1. 当前支持范围
 
-## 1. 共同轴、前沿与所有权
+| 能力 | 当前实现 |
+|---|---|
+| Text | 公共 Engine 的 prefill、ordinary decode、forced control、Replay 和取消 |
+| 并发与上下文 | 启动固定 1–8 路 resident lanes；本实例最大上下文 262144，实际容量由启动预算决定 |
+| Vision | 图像、视频、多媒体消息；共享 Vision 编码器、MRoPE 和跨 Text chunk 特征交接 |
+| 原生 MTP | draft 数 1–5，支持 Text/Vision、1–8 路、采样 penalty 和约束输出 |
+| CUDA Graph | ordinary、MTP draft/target/Finish、单列 control；Main 使用分段图 |
+| KV 存储 | BF16、INT8-G64、FP8-row256、NVFP4-G16、K8V4；index keys 固定 BF16 |
+| 上下文复用 | 完整 StateImage 与 Main/MTP 页组、前缀命中、Device/Host checkpoint、Snapshot/Replay 恢复 |
+| 前端与服务 | thinking、thinking budget、tool call、GBNF/JSON/schema/choice/regex；共用 Qwen Frontend 和现有 HTTP 协议 |
+| CausalScoring | 公共 Engine 的单路 Text 评分；不启用 Vision 或 speculative backend |
+| Expert 放置 | Main 完整 registered Host backing，加 GPU 静态缓存与整层流式执行；MTP/shared 固定 GPU |
+| PLE | V3 磁盘表、Host hash/NF4 解码、有界行缓存、增量准备和双槽 H2D |
+
+当前限制：
+
+- Speculative backend 仅支持原生 MTP，使用完整共享 BF16 head；不支持 DFlash、DFlash2
+  或 indexed proposal head，因此不使用 `--lm-head-draft`。
+- Main experts 始终保留完整 Host 来源。GPU 缓存没有请求自适应排序或 decode 动态换入；
+  小批量缺失 expert 由 CPU 计算，没有按需换入 GPU 计算的第三条分工路径。
+- PLE 当前只有磁盘准备路径，没有整表 RAM/GPU lookup。
+- Prefill、Replay、Vision encode、MTP 历史对齐和最终状态采用走 eager。
+  Graph 改变 GPU 提交方式，不移除 CPU expert 或磁盘交接。
+
+用户命令见 [CLI](../cli.md)与[Serving](../serving.md)，产物生成见
+[转换指南](../weight-conversion.md)。这些能力描述当前实现；公开的吞吐与质量结果由
+[性能文档](../performance.md)和 model cards 单独维护。
+
+## 2. 轴、前沿与所有权
 
 | 符号 | 含义 |
 |---|---|
-| `T`、`B` | 一次调用每序列的物理列数、实际紧凑 batch 行数；`T>0`，`B=1..8` |
-| `M` | 展平列数 `T*B`，`column=t+T*b`；HC 和普通 Linear 消费这个轴 |
-| `n[b]` | 本窗口的有效输入前缀长度；Device `valid_columns[B]` |
-| `F`、`F0` | 已执行输入前沿、候选窗口的基准前沿；均在原 token 域 |
-| `R`、`u[b]`、`a[b]` | 记录容量、连续已记录列数、最终采用的输入列数；`0<=a<=u<=R` |
-| `S` | StateImage 槽数；state slot、resident lane、batch row、KV table row 是独立身份 |
+| T / B | 每行物理输入列数 / 本次紧凑 batch 行数 |
+| M | `T*B`，展平列号 `t+T*b`；Linear、HC 和 MoE 使用此轴 |
+| n[b] | 本窗口有效输入前缀长度，Device `valid_columns[B]` |
+| F / F0 | 已执行输入前沿 / 候选窗口基准前沿，均按原 token 计数 |
+| a[b] | 最终采用的输入前缀长度，不等于预取、采样或候选总长度 |
+| State slot | StateImage 的物理槽；独立于 resident lane、batch row 和 KV table row |
 
-Main 和 MTP Backend 各自维护前沿。规范提交边界的 Main 前沿为 `F`，Backend 前沿为
-`max(F-1,0)`；Backend 位置 `j` 配对 Main conditioning `j` 与输入 embedding `j+1`，
-RoPE 使用位置 `j` 的坐标。接受长度 `a` 按实际输入列计数，由 Program 从后端接受结果和
-Frontend decision 换算；预取进度和 ledger 中尚未执行的下一输入不推进前沿。
+规范边界下 Main 前沿为 F，启用 MTP 时 Backend 前沿为 `max(F-1,0)`。
+Backend 位置 j 配对 Main conditioning j 与输入 embedding j+1，RoPE 使用位置 j 的坐标。
+Ledger 可比 Main 多一枚已经发布、尚未执行的 anchor；I/O 预取不推进任何模型前沿。
 
-连续 `[H,T,B]` 与 `[H,M]`、`[H,4,T,B]` 与 `[H,4,M]` 可以零拷贝改 view；合并投影的
-子范围保留真实 parent strides。HC 的四条 stream 是 feature 轴，不使 GDN/QSA/MoE
-的 token 数或 head 数乘四。MTP 的共享 `fc_hidden` 独立作用于四条 stream 时，Linear
-列数才是 `4M`。
+HC 的四条 streams 是特征轴，GDN/QSA/MoE 的 token 数不乘四。
+只有 MTP 的共享 fc_hidden 把四条 stream 作为独立 Linear 列，使用 4M 列。
+普通 `[H,T,B]` 与 `[H,M]` 可直接改 view；parent 子范围必须保留实际 strides。
 
-HC/Linear 对全部物理列计算，Program 为 padding 提供有限安全输入。QSA/PLE 独立
-合同允许 `n=0`；现有 GDN 有效行要求 `1<=n<=T`，因此 Main 在 forward 开始前排除
-空行，并在全部层保持同一紧凑成员集合，不在 GDN 层中途单独重排。
-
-Model 持有只读参数和权重 backing。Program 独占可变 state、records、激活、workspace、
-页表及 Graph，决定槽选择、前沿和最后消费者。Ops 接收非 owning views，只计算和
-读写合同指定的区域；不分配持久设备资源，也不采用或发布请求状态。
-
-### 1.1 Vision 输入与特征交接
-
-共享 Qwen Frontend 提供原 token IDs、媒体 patches、视觉 token spans 和三轴 MRoPE。
-Program 按需调用共享 Vision 编码器，在 token embedding 后、HC 展开前替换视觉列。
-原 IDs 仍用于 PLE；KV/QSA 的因果顺序使用 token ordinal，RoPE 独立消费三轴坐标。
-生成文本使用保存的 `rope_delta` 推进位置。
-
-Vision 条目可以跨多个 Text chunk；一个执行窗口至多消费一个条目。媒体边界参与
-输入窗口和 KV 预留，PLE 准备与预取使用同一窗口。当前窗口的 PLE 读取先于 Vision
-编码提交，上传使用独立流；计算流顺序连接 Vision 输出和 Text 消费。
-
-Program 的单份 workspace 包含通用区域和不与其重叠的视觉 handoff。编码 scratch
-可复用通用区域，编码必须先于 Text 激活分配。每请求 session 借用同一个 handoff，
-按 owner/generation 判断其有效性；Text/decode 保留它，另一个 Vision 编码可以覆盖它。
-跨 chunk 继续使用有效特征，覆盖后的再次消费从保留的 prepared patches 重编码。
-Main 与 MTP 历史建立都消费完对应视觉列后，才退役绑定；暂停或取消也退役绑定。
-不为每个 lane 分配完整编码 workspace。
-
-已复用前缀覆盖的视觉条目不再编码。Checkpoint 不截断同一视觉条目的消费范围；
-条目中途暂停通过 Replay 恢复。Vision 不新增 StateImage 或 KV pool；历史效果已包含
-在 GDN、QSA、PLE 及末端特征中。Prepared media 和位置随请求保留，供 Replay 重建。
-
-## 2. 完整层流程与 HC 边界
-
-Main 的 48 层中，零基层号 `l%4==3` 使用 QSA，其余使用 GDN；每层的 attention block
-与 MoE 各有一组 HC。PLE 仅位于零基第 1 层的 attention HC 之前。MTP 有自己的
-QSA/MoE 层和 HC 参数，无独立 PLE。具体几何与权重目录见模型文档。
-
-```text
-token embedding（先完成视觉特征替换）
-  → hc_expand_norm → 四 stream residual h、第一组 normalized z
-  → attention hc_mix(z) → block input x、FP32 injection j
-  → GDN 或 QSA → block output y
-  → hc_combine_norm(h,y,j,MoE norm) → 新 residual、MoE normalized
-  → MoE hc_mix → routed experts + gated shared expert → MoE output
-  → hc_combine_norm(...,下一层 attention norm) → 下一层
-  → 最后一层 combine + final norm → h_final、z_final
-  → final hc_mix(z_final) → sample_hidden → 共享 LM head
-```
-
-[HC 合同](../../include/ninfer/ops/gated_residual.h)规定 grouped offset norm、低秩
-mixing、injection 和 residual 更新的完整数学。模型侧保留以下关系：
-
-- `hc_expand_norm` 逐 word 将 embedding 展开到四条 residual stream，各 stream 使用
-  自己的 affine；后续 combine 使用原 residual，不使用 normalized 值替代它。
-- 普通 Mix 将 normalized streams 变为一个 2560 维 block 输入和四个 FP32 injection
-  系数。系数已经是 `2*sigmoid(logit/4)`；combine 直接消费，不再次激活或缩放。
-- `hc_combine_norm` 同时输出 BF16 residual 和下一组 HC 的 normalized streams。
-  下一次 norm 必须消费实际产生的 BF16 residual words；下一组 norm 参数与本组
-  injection 属于不同参数。寄存器内保留该 BF16 表示不要求额外写回再读取。
-- Final Mix 没有 injection 或后续 combine。其 2560 维输出直接进入 LM head，
-  不再增加独立 final RMSNorm；`h_final` 是 final norm/mixing 之前的完整 residual。
-
-模型可以在 forward 内暂留 `(h,y,j)`，直到下一组 norm 融合 combine；这三个 borrowed
-views 仍须存活到实际消费。PLE、末端特征交接或 checkpoint 需要完整 residual 时，
-先物化该边界，不能保存未解释的 pending tuple。进入 PLE 的具体衔接是：
-
-```text
-第 0 层 MoE → hc_combine → 完整 BF16 residual
-  → PLE Gate / ple_conv_add_norm → h_ple、零基第 1 层 attention normalized
-  → attention hc_mix → 本层 GDN
-```
-
-MoE 消费 HC 产生的同一个 `x`：router 选择并归一化 top-10 routed probabilities，
-routed expert 加权和再与独立 sigmoid 门控的 shared SwiGLU 相加，得到一个 block
-输出供 HC 回注。路由/shared 合并 parent 不改变这些依赖；不同 expert 的输入列集合、
-NVFP4 标定和驻留时机仍须由完整 MoE 执行合同处理。
-
-### 2.1 Main/MTP 的两种末端特征
-
-HC 没有逐层 token 历史；只有模型选定的末端值进入 continuation。对 `F>0` 的 Main
-恢复点，下面两个字段来自同一次实际执行的同一个 token `F-1`：
-
-| 字段 | 表示与用途 |
+| 所有者 | 内容 |
 |---|---|
-| `main_sample_hidden` | BF16 `[2560]`；final Mix 输出，供继续采样 |
-| `main_mtp_conditioning` | BF16 `[10240]`；启用 MTP 时保存的 pre-final-mixer residual |
+| Model | Config、Binding/Use、不可变 Host/GPU 权重、PLE 文件 backing、hash controls 和 LUT |
+| Program | StateImage、Main/MTP KV pools、records、workspace、expert cache/CPU bridge、PLE 服务与上传槽、Graphs |
+| 请求 continuation | 完整 state identity、Main/MTP frontiers、RoPE delta、PLE raw-ID tail |
+| Ops | 借用的输入输出和 scratch；计算或状态提取，不发布请求状态 |
+| Runtime / Frontend | 请求调度、保留策略、输出 preview/commit 和协议语义 |
 
-两个字段共享恢复点身份、前沿和有效性，不能独立发布。Conditioning 不能由 final
-normalized、block output 或 sample hidden 代替或反推。`F=0` 没有有效末端特征；
-不启用 MTP 时，Main conditioning 在 final norm 消费后可作为临时激活释放。
+HC/Linear 可计算 padding 物理列；Program 提供有限安全输入。
+QSA/PLE 允许零有效列，GDN 的 active batch 不包含空行。Main 在完整 forward 前确定
+紧凑成员，保持各层、records 和 commit selectors 的行对应关系。
 
-Verify 保留 `[2560,T,B]` sample window 和启用 MTP 时的 `[10240,T,B]` conditioning
-window。`a>0` 使用同一 selector 选择两个窗口的 `a-1` 列；`a=0` 保留旧恢复点，
-不以负 selector gather。两种宽度分别复制，保留原 words，不重跑较短投影或 final Mix
-来重建。StateImage 的 Device/Host layout、
-clone、checkpoint 和 restore 必须显式表达这两个不同字段。
+## 3. Main 层调用
 
-MTP 第一步消费 Main conditioning，后续 draft step 消费前一步 MTP 的 pre-final
-multistream。初始化中，`pre_fc_norm_hidden` 沿完整 10240 维归约，不是四组 HC norm；
-之后共享 `fc_hidden` 作用于四条 stream。Embedding 分支独立投影，并通过无 injection
-的 `hc_combine_norm` 做 unit-weight broadcast-add 和第一组 HC norm，不需要构造
-全一 injection tensor。
+```text
+embedding + 可选视觉替换
+  → hc_expand_norm：residual、normalized
+  → attention hc_mix：block input、FP32 injection
+  → GDN 或 QSA：block output
+  → hc_combine_norm：新 residual、MoE normalized
+  → MoE hc_mix → routed + shared MoE
+  → hc_combine_norm：新 residual、下一层 attention normalized
+    （末层改用 final norm）
+  → final hc_mix → sample hidden → head
+```
 
-每步 MTP 产生 2560 维 sample hidden 供 head、10240 维 multistream 供下一步。
-多个待定前缀需要的候选版本保留到选择结束。规范 checkpoint 位于模型提交边界，保存
-Main 末端 pair 和已提交 Backend KV/QSA tail；未决 draft 内部特征不单独成为恢复点。
-Resume 从保存的 Main conditioning 和 Backend 前沿重新进入 bridge。
+Combine 与下一次 norm 融合，但 norm 消费实际 BF16 residual。
+进入 PLE 前先通过 `hc_combine` 物化完整 residual；PLE 输出 residual 和本层
+attention normalized 后，继续相同层流程。Main 最后一层保留的 conditioning
+是 final norm/mixer 之前的 residual；不是 normalized 或 block output。
 
-### 2.2 MTP 执行与采用
+### 3.1 GDN
 
-原生执行支持 `K=1..5`、`B=1..8`。MTP experts 常驻 GPU，使用产物中的 block-FP8
-权重及其 A8 许可；proposal 使用共享 BF16 全词表 head。Main MoE 按 verify 的实际物理
-列数 `T*B` 选择计算策略，不根据 prefill、decode 或 verify 名称分派。
+AB 投影经 `gdn_control_proj` 产生 FP32 g/beta，QKVZ 经下表的输入路径产生 Q/K/V/Z。
+Recurrence 使用 `normalize_qk=true`、`scale=1/sqrt(128)`，
+读取当前 token 更新后的 FP32 state；随后做 sigmoid-gated RMSNorm 和 output Linear。
 
-1. **历史建立。** Prefill、Replay 和 control 将当前输入 embedding 与前一列 Main
-   conditioning 配对。连续窗口保留一列旧 conditioning，在根部跳过第一列；不预读下一
-   chunk 的输入或媒体。只执行 MTP stem、attention HC mix、QSA projection/prepare
-   和 tail 提取，省去 attention readout、MoE、final mixer 和 head。
-2. **Draft。** Live ledger 的末尾是已发布但 Main 尚未执行的 anchor `x_F`。第一步在
-   Backend `F-1` 配对保存的 Main conditioning 与 anchor，将结果 tail 单独保留。
-   后续步骤使用 MTP 的 conditioning，候选 tail 和 hidden 双缓冲；不修改规范 StateImage。
-3. **Verify。** 固定物理窗口 `T=K+1`，每行输入为 `[anchor,drafts...]`，有效长度按输出
-   预算与上下文剩余量缩短。基准 GDN state 只读，QSA/PLE 暂不采用 tail；保存实际 records
-   及 Main sample/conditioning 窗口。成员和行顺序保持到本轮提交结束。
-4. **采用。** 后端接受 `c` 个 draft，提供 `c+1` 个许可输出；Frontend 可截断为 `a`。
-   Main 采用前 `a` 个输入，末端 pair 同取 `a-1` 列。利用第一步 draft 的真实 bridge tail，
-   用 Main verify conditioning 和已接受的 shifted IDs 重建其后的 `a-1` 列 Backend
-   历史，再提交 Main `F+a`、Backend `F+a-1`。拒绝后缀不进入有效 coverage。
-
-未接受任何 draft 时通常仍采用 anchor，即 `a=1`。`a=0` 的取消或失败行不采用候选状态。
-Penalty 采样使用临时 token counts；正式计数只增加最终发布的 token。Forced control 通过
-同一历史建立路径推进；Snapshot 同时保存两个 pool 的精确前缀与 StateImage，Replay
-从已提交 ledger 重建两套历史。
-
-PLE 在 anchor 已知时创建窗口；每个 draft ID 通过 event 排序的小型 D2H 增量交给读取服务，
-不逐步等待 GPU。Host 按 draft 顺序追加，全部有效 IDs 到齐后 seal。Main 先执行 PLE 前的
-层，再等待 embedding 上传；最终采用所需的 IDs 先复制到本轮记录，不借用即将回收的 ticket。
-
-## 3. GDN 的三条执行路径
-
-HC 输入 `x` 分别进入 QKVZ 与 AB 两个投影分支，后者通过
-[gdn_control_proj](../../include/ninfer/ops/gdn_control.h)产生 FP32 `g/beta`。
-本实例直接消费 HC 的 `x`，不使用带 input norm 的控制入口。Q/K/V 经四 tap 因果卷积
-和 SiLU 后进入 [Gated DeltaNet](../../include/ninfer/ops/gated_delta_net.h)；Z 绕过卷积，
-保留至输出 gate。
-
-16 个 Q/K heads 服务 48 个 value heads，维度均为 128。Recurrence 调用传原 Q/K、
-`normalize_qk=true` 和 `scale=1/sqrt(128)`，readout 使用当前 token 更新后的 FP32
-state。出口随后执行 [sigmoid_gated_rmsnorm](../../include/ninfer/ops/rmsnorm.h)，其
-gamma 是直接乘数，既不是 offset norm，也不是 SiLU gate；BF16 结果经 output Linear
-得到 2560 维 `y`，再交给 HC combine。两个投影分支到 recurrence 的依赖由模型显式安排。
-
-| 执行路径 | 输入与调用组合 | 状态结果 |
+| 路径 | 输入组合 | 状态处理 |
 |---|---|---|
-| Prefill、Replay、CausalScoring | `B=1` 的连续窗口；`linear_split → causal_conv1d_silu_split → gated_delta_net`，再走共同输出末端 | 整个窗口后的 conv/recurrent state；长 T 由 recurrence 选择实现，不保存逐 token 完整 state |
-| Ordinary decode、单列 control | 实际紧凑 `T=1,B=1..8`；`gdn_input_proj_conv_snapshot → gated_delta_net_batch_update` | 每行 conv 与 recurrent 结果写入同一候选 state slot 的对应层 |
-| Target verify | 原始物理 `T=2..16,B=1..8`；`gdn_input_proj_conv_record → gated_delta_net_replay_record` | 基准 state 只读，产生实际 records；接受前缀确定后调用 `GdnReplayFoldPlan` |
+| Prefill / Replay / scoring | B=1；`linear_split → causal_conv1d_silu_split → gated_delta_net` | 保存整个窗口末端 conv/recurrent state |
+| Ordinary / 单列 control | T=1，B=1..8；`gdn_input_proj_conv_snapshot → gated_delta_net_batch_update` | 写候选 state slot |
+| MTP target verify | T=K+1；`gdn_input_proj_conv_record → gated_delta_net_replay_record` | 基准只读，保存实际 records，采用时 exact fold |
 
-独立 QKVZ 分段投影及容量查询见 [LinearSplit](../../include/ninfer/ops/linear_split.h)；
-融合投影/卷积的 snapshot、record 入口及容量查询见
-[GDN input 合同](../../include/ninfer/ops/gdn_input_proj.h)，独立卷积见
-[causal convolution](../../include/ninfer/ops/causal_conv1d_silu.h)。分立投影的 BF16 出口是
-公开边界；融合投影/卷积不额外固定一个私有 BF16 投影中间值。Record 与 snapshot 的
-精确对应不意味着 prefill、不同 chunk 切分或不同物理窗口之间必须 bit-identical。
-短窗口限制属于 record/fold 的接口域，不限制 prefill 的正 T。
+Z 绕过卷积，保留到输出 gate。独立 LinearSplit 的 BF16 出口是公共边界；
+融合 projection/conv 不增加私有 BF16 投影中间边界。
 
-### 3.1 State 与 exact fold
+Verify records 包含卷积前最新 history 列、卷积/SiLU 后且 L2 norm 前的 K/V、
+以及实际消费的 FP32 g/beta。`GdnReplayFoldPlan` 从同一次基准 state 重放接受前缀；
+结果逐 bit 对齐同一物理 record-producing block 的 snapshot。
+不得缩短 T 重新跑投影来替代 fold。原物理 B、row 身份、record 布局在采用前保持不变。
+详见 [GDN input](../../include/ninfer/ops/gdn_input_proj.h)与
+[ReplaySSM](replayssm-gdn.md)。
 
-Main 每个 GDN 层在前沿 `F` 保存 BF16 `[10240,3]` 的卷积前历史和 FP32
-`[128,128,48]` recurrent state，`F=0` 均为零。36 个 compact GDN layer indices
-映射到实际 Main 层号；MTP 使用 QSA，不另建 GDN state。
+### 3.2 QSA
 
-Verify 保存四类实际记录：卷积前最新 history 列、卷积/SiLU 后且 L2 norm 前的 K、V、
-以及 recurrence 实际消费的 FP32 `g/beta`。恢复不需要 Q/Z/block output，不从卷积
-记录重算 K/V，也不重算控制投影。Program 保留产生它们的 `F0`、初始 state slot、
-原始物理 `T/B`、batch row 身份和有效长度。
+Main 的 Q8 Q/gate parent 与 BF16 KV/index parent 分别调用 LinearSplit；
+MTP 使用一个 BF16 joint parent。投影直接产出连续分段，随后依次调用：
 
-[Replay fold](../../include/ninfer/ops/gdn_replay.h)的 `rows[b]` 始终对应物理 record row
-`b`，不能只压缩或重排 selectors 一侧。对 `a>0`，从该次基准重放 `[0,a)`，结果必须
-逐 bit 等于**同一完整物理 record-producing block**的对应 snapshot；拒绝后缀不读取，
-不能以接受宽度重跑 Linear 或另一条浮点 recurrence 替代。
-
-`a=0` 的 GDN fold 是严格 no-op：不读 records/state，也不填充 destination。Program
-应继续采用基准槽，或先将所需基准字段精确复制到独立 candidate StateImage。原位 fold
-只有在旧基准已无其他恢复消费者时才能覆盖。跨多个调用的 records 按原窗口保存，必要时
-借助中间状态锚点逐段 fold，不能改写成另一种 T/row layout。
-
-## 4. QSA 三阶段、页组与 tail
-
-Main 用 Q8 Q/gate parent 和 BF16 K/V/index parent，MTP 用一个 BF16 joint parent。
-[linear_split](../../include/ninfer/ops/linear_split.h)直接产生各自连续的 BF16 分段输出，按原
-`T/B` 改 view 后依次进入三个独立 Op；输入投影和 O projection 位于三阶段之外。
-
-| 阶段 | 消费与交接 |
+| 阶段 | 交接 |
 |---|---|
-| `qsa_prepare` | 投影、norm/RoPE 参数、位置和只读旧 tail → prepared Q/index-Q、主 KV、完整四 token 块的 compressed keys、实际 raw-key/坐标 records |
-| `qsa_indexer` | prepared index-Q 和 compressed cache → Device I32 逻辑块号 `[512,T,B]` 与 counts `[T,B]` |
-| `qsa_sparse_gqa` | prepared Q、原 gate logits、selection、已写主 KV → gated BF16 attention；之后 O Linear 产生 HC block output |
+| `qsa_prepare` | projection、norm/RoPE、旧 raw tail → BF16 Q/index-Q、主 KV、完整块 index keys、raw-key/坐标 records |
+| `qsa_indexer` | index-Q 和 compressed cache → Device I32 block IDs `[512,T,B]`、counts `[T,B]` |
+| `qsa_sparse_gqa` | Q、原 gate logits、selection、主 KV → gated BF16 output，再交 O Linear |
 
-三阶段与 tail extraction 的完整数学/API 统一见 [QSA 合同](../../include/ninfer/ops/qsa.h)。
-Indexer 输出的是原 token 域的四 token 逻辑块号，与物理 page ID 无关；Sparse GQA 直接
-消费前 count 个 IDs 和主 cache，并加上该 query 未完成块的可见尾部，不需要 expanded
-token list 或 gathered KV。各 query 只看自己的因果位置，提前写完的候选后缀不因此可见。
-完整块参加 TopK，没有“当前块必须保留”的特例；index score 仅用于选块，不加入主 logits。
+Selection 是原 token 域的四-token 逻辑块号，与物理 page ID 无关。
+Sparse GQA 直接消费前 count 个 IDs，并补上当前不完整块的可见尾部，不建立展开 token
+列表或全局 gathered KV。每 query 只读取自身因果范围，候选后缀即使已经写入也不可见。
+可见完整块数 C≤512 时，Indexer 在同一 kernel 内全选并跳过评分。
 
-Cache ordinal 决定因果性、压缩分组和寻址，实际一维/三轴 RoPE 坐标只决定旋转。
-跨调用压缩先合并旧 tail 与本次 raw index-K，按四 token 平均并保留合同规定的 BF16
-均值 seam，再 norm/RoPE；旋转使用块首实际坐标。不能用已旋转/归一化的 keys 代替
-raw pooling，或用 cache ordinal 猜测多模态块首坐标。
+压缩使用 raw index-K；跨窗口先拼旧 tail，再做四列平均，保留规定的 BF16 均值舍入，
+之后 norm/RoPE。块首旋转坐标来自实际 MRoPE，不能由 token ordinal 猜测。
+主 K 的 norm/RoPE 结果直接进入存储 codec，不额外舍入为 BF16。
+Sparse GQA 保持 A16 计算，不将 Q 或 softmax probabilities 量化为低比特；
+量化 KV 在片上解码，必要的值域逆变换和完整归约后才乘 gate。
+精确公式、codec 与读写域见 [QSA](../../include/ninfer/ops/qsa.h)。
 
-Prepare 的 Q/index-Q 出口为 BF16；主 K 的 norm/RoPE 结果直接进入 codec，没有额外
-BF16 中间边界。Sparse GQA 从实际 cache 表示读取新旧 K/V；量化 value 的逆变换和全部
-split 归约完成后才乘 sigmoid gate，最终输出 BF16。Norm/RoPE 之间、attention/gate
-之间的私有 staging 不另成为公共数值边界。
+### 3.3 MoE
 
-### 4.1 五类 KV 与共同逻辑页
+MoE 消费 HC 输出的 `[2560,M]`，使用 `MoeEpilogue::Write` 产生独立 block 输出。
+Router/shared parent 的持久合并不强制一次计算；shared 始终在 GPU 上计入一次。
+GPU 的完整融合与 routed subset 入口均已实现，CPU subset 产生 FP32 contribution，
+由公共 mixed execution 汇合并最终舍入。
 
-支持 `BFloat16`、`Int8Group64`、`Fp8E4M3Row256`、`Nvfp4Group16`、
-`Fp8KeyNvfp4Value` 五个 profile，编码解释见
-[KV cache 合同](../../include/ninfer/ops/kv_cache_append.h)。`BFloat16` 实际为 BF16 K /
-FP16 V；compressed index keys 始终为 BF16，独立于主 KV profile。
+公共 `models/common/moe` 按实际 M 选择策略：
 
-每个逻辑页组覆盖 64 个原 token：主 K/V 各有 64 行，index plane 有 16 行，使用同一
-block table、页引用、epoch、COW 和 offload 事务。原 token `p` 查 `table[p/64]`；
-index block `g` 查 `table[g/16]`。Main 的 12 层位于 Main pool，MTP 的一层位于独立
-Backend pool；两者不因几何相同共用地址空间或前沿。
+- 小 M：GPU 计算 ready experts，CPU 计算补集；稳定时不搬运权重。
+- 大 M：固定缓存与窗口中补齐的缺失集合组成完整 bank，全 GPU 计算，并预取下一层。
+- 切换：固定区地址和数量不变；窗口在大 M 流式区域与小 M 额外缓存之间重用。
+  返回小 M 时逐层恢复，尚未 ready 的部分由 CPU 计算。
 
-在 `F` 下，某页有 `c` 个有效原 token，则 index 只有 `floor(c/4)` 个有效行，不能
-另建可独立推进的 index cursor。准备可写未提交后缀，commit/rollback 改变 coverage；
-已写或复制的后缀字节不自动有效。COW 在候选写入前保护全部可能覆盖的范围，迁移保留
-整个页组所有 planes 的原 words，且对应 raw tail 完成后才能发布完整恢复点。具体
-`tokens_per_row=1/4` 布局、Host packing 和传输规则沿用 Paged KV。
+各层额度按字节均衡分配，集合为启动优先级的前缀。Flash Next 默认使用已标定的静态
+逐层排序，`MoeOptions::expert_priority` 可覆盖；排序不影响 router 或 coefficients。
+阈值由计算策略和启动 CPU 团队规模解析，prefill/decode/verify 名称不参与分派。
+容量、上传、lease、CPU/GPU 交接和分段图的公共合同见 [Expert cache](expert-weight-cache.md)。
 
-### 4.2 Tail、记录与 Graph
+## 4. PLE 准备、传输与消费
 
-每层的规范 tail 保存前沿 `F` 所在未完成块的 `F%4` 个 raw BF16 keys，最多三列；
-其余列为 +0，同时保存该块首 token 的三轴坐标；完整块边界的 tail/坐标为零。
-Prepare 只读旧 tail，记录实际 raw projection words 和坐标，Program 维护记录的
-base position、offset、有效长度及连续性。
+### 4.1 磁盘表和读取服务
 
-`qsa_tail_extract` 从旧 tail 和 `[F0,F0+a)` 的实际记录精确选择新规范 tail，不重新
-投影、压缩或旋转。`a=0` 仍产生相同状态，独立 destination 可接收旧值；这与 GDN
-fold 的严格 no-op 不同。任意接受前沿无需对齐四 token 块或 64 token 页。
-例如 `F0=6,a=1` 时，新 tail 是 raw 4/5/6，候选阶段已写的块 4..7 仍不可见。
+`ple::disk::Table` 接收已绑定逻辑参数，持有长期只读文件 backing、冻结区间映射与
+每 shard 的 NF4 LUT。启动不扫描整表。行地址先映射到 V3 实际文件区间，再扩展到
+direct-I/O 对齐范围；跨续卷或非对齐边界可以产生多段读。短读只有覆盖全部必需字节
+才可接受，不能用补零替代丢失数据。
 
-Prepare → Indexer → Sparse GQA 同 stream 直接衔接，不将 counts/IDs 拷回 Host。
-固定物理 `T/B`、views、storage 和资源上界后，positions、有效列、state selectors、
-record offsets、page IDs 和 selection 都是执行时输入。同一捕获上界内允许 batch
-行之间、同一行的各 query 之间有不同历史长度，包括全选和 inert 情况；host envelope
-只承诺容量，不替代因果 metadata。Sparse GQA 在合同允许的 envelope 更新间保持
-节点数/顺序兼容，Program 使用既有 Graph update 机制，不复制 Op 的私有路由阈值。
-依照 [Indexer 合同](../../include/ninfer/ops/qsa.h)，可见完整块数 `C<=512` 时在同一
-kernel 内全选并跳过评分；混合 batch 不需要 Host 读回长度或另启短上下文拓扑。
+Program 的 `PrepareService` 使用一个 I/O worker，执行
+`hash → 行去重/cache → 物理读合并 → O_DIRECT/io_uring → 收集 → LUT 解码`。
+当前配置为 64 MiB 四路原始行缓存、128 个在途读、两个窗口槽。
+行缓存和在途读可跨窗口复用；必需窗口优先，预取保留必需窗口的容量。
+Worker 不调用 CUDA、不修改 ledger、frontier 或 StateImage。
 
-## 5. PLE 的 GPU 交接与规范状态
+输出为连续 BF16 `E[2560,T,B]`；无效尾列精确置 +0。
+Lookup 的 hash、NF4 精确舍入与布局见[模型文档](qwen4_exp-model.md#5-ple-表hash-与-lookup-出口)。
 
-Token IDs 已知后可提前 hash、读取和 NF4→BF16 解码，得到 `E[2560,T,B]`。它不依赖
-上一层 hidden；K/V Linear 的输出与 PLE 前物化的 residual 在 `ple_gate` 汇合：
+### 4.2 窗口、ticket 与上传槽
+
+Ticket 由物理 slot 和 generation 构成。每行携带 sequence、epoch、起始 frontier
+和 raw-ID tail；prepare/append 返回前复制 caller IDs，后续不借用可变 caller spans。
+
+| 操作 | 作用 |
+|---|---|
+| prepare | 固定 T/B、行身份和已知 ID 前缀；无空槽返回暂不可准备 |
+| append | 按行连续追加候选 IDs，可立即发起读取 |
+| seal | 冻结最终有效输入长度；截去尾列置零，之后不可追加 |
+| HostReady | 已 seal，全部有效 E 完成；尚不代表 Device 可消费 |
+| upload / embedding | 在独立 transfer stream 排入 H2D 和 event，consumer 等待本代次已 record 的 event |
+| consumed / release | 最后 Device 消费、H2D 和 Host writers 都退役后，才重用 slot |
+
+`UploadSlots` 独立拥有 pinned/Device E；PrepareService 借用其 Host 槽。
+Program 先创建上传槽，后创建准备服务；销毁时先结束 Host writers，再排空上传和消费。
+取消撤销该窗口的发布意图，仍有其他窗口使用的共享读继续完成。
+晚到完成可填充正确的不可变行缓存，但不能写入重用后的 ticket。
+读取失败通过当前 unit 的错误路径传播，不发布部分 E。
+
+`PlePipeline` 组合准备、增量 ID D2H、H2D、消费和回收。
+它在等待 compute 完成时继续推进已就绪窗口的上传。
+Canonical state 和 accepted IDs 不借用将要释放的 ticket。
+
+### 4.3 与 GPU 重叠
+
+| 场景 | 当前准备时机 |
+|---|---|
+| 首个输入窗口 | IDs 已知后提交，可与 Vision encode、embedding 和 PLE 前层重叠 |
+| Prefill / Replay | 消费当前 PLE 后准备下一个实际 Text 窗口，与后续 Main 层计算重叠 |
+| Ordinary decode | anchor 已知即准备，主要利用 PLE 前的计算窗口 |
+| MTP verify | 先准备 anchor；各步 draft ID 异步 D2H 后按顺序 append，全部有效 IDs 到齐后 seal |
+| Control / scoring | 使用同一真实输入前沿和准备流水 |
+
+GPU 交接为：
 
 ```text
-真实 raw IDs + 同前沿 raw-ID tail → PLE I/O → BF16 E → 合并 K/V Linear
-K/V + 完整 HC residual → ple_gate → BF16 U、BF16 N records
-U + N records + 只读旧 history + residual
-  → ple_conv_add_norm → BF16 h_ple、下一组 HC normalized → hc_mix
+raw IDs + raw-ID tail → PrepareService → HostReady → H2D/event → E → KV Linear → K/V
+Main embedding / PLE 前层 → 完整 residual
+K/V + residual → ple_gate：BF16 U、BF16 N records
+residual + U + N + 旧 history → ple_conv_add_norm：BF16 residual、下一组 normalized
+  → 继续 Main 层
 ```
 
-[PLE 合同](../../include/ninfer/ops/ple.h)维护 Gate、ConvAdd/Norm 和 StateExtract 的
-完整公式与 views。K/V 子范围保留 `[12800,M]` parent 的真实 strides；U 与 N 是不同
-的公开 BF16 值，NormConv 必须消费实际 U words，N 直接写入正式 records。卷积以 N
-为输入，四 tap 的时间偏移为 `-9,-6,-3,0`，随后 SiLU 与 residual/U 相加。
-下一 HC norm 消费实际 BF16 `h_ple`，同时保留该 residual。Gate → Conv 之间必须
-建立完成依赖，不能让不同 CTA 假定其他 CTA 已发布未来需要的 N。
+PLE 卷积消费 norm(actual BF16 U) 的 N records，四个 tap 对应 -9、-6、-3、0。
+Conv/SiLU 与 residual/U 相加后写 BF16，再做下一组 HC norm。
+E 的最后读者是 KV Linear；当前 Program 在整个 PLE GPU 段后记录 consumed，
+然后开始后续层。N records 和采用所需 IDs 保留到提交，不随 E 槽释放。
+GPU 数学见 [PLE 合同](../../include/ninfer/ops/ple.h)。
 
-Main 前沿 `F` 的 PLE 规范状态包括最近九列 BF16 N history，以及 Host 上最近两枚
-**已执行原始输入** ID。新序列负位置分别为 +0/EOS；EOS 只改变 hash 历史取值，
-不清空卷积 history。视觉位置仍消费 raw token ID；padding 不成为时间步。PLE 不增加
-独立位置 cursor 或 KV pool。
+## 5. MTP 的生成与采用
 
-`ple_state_extract` 按 `a` 从旧 history 和实际 N records 精确取得新九列历史；
-`a=0` 会复制完整旧 history，包括独立 destination，`a>=9` 只需接受记录的最后九列。
-Raw-ID tail 由同一个 `a` 从旧两枚 ID 与接受输入更新，不从已发布输出尾部猜测。
-恢复不重算 Gate/norm/conv，也不重新读取 SSD。
+MTP draft 数 K 在启动时固定为 1–5；物理 target 窗口 T=K+1。
+各行按剩余输出/上下文预算缩短有效长度；混合 batch 保持这一物理窗口，
+整批都无法再产生 draft 时走 ordinary。
+Draft 使用完整共享 head 的 argmax；target 验收支持请求的 greedy 或 sampling 配置，
+并处理 penalty 与约束 mask。验收数学由
+[SpeculativeAccept](../../include/ninfer/ops/speculative_accept.h)维护。
 
-Record offsets 是当前窗口在记录 buffer 中的列位置，不是绝对 token position。
-单次提取需要从其基准前沿开始的连续记录，较长事务可用中间状态锚点与分段记录。
-`E` 被 K/V Linear 消费后可归还其传输槽；N records 和最终提交所需 IDs 的寿命更长，
-不能随 I/O ticket 或 staging 释放。生产 ticket、H2D/event 与 Graph A/B 的精确交接
-遵循 PLE I/O 文档；文件读取和 Host 等待不放进 CUDA Graph。
+1. **历史建立。** Prefill、Replay、control 将输入 embedding 与前一列 Main conditioning
+   配对。根部跳过第一列，连续 chunk 带上一列旧 conditioning。只执行 MTP stem、
+   attention HC、QSA projection/prepare 和 tail 提取，不执行 attention readout、MoE 或 head。
+2. **Draft。** 第一步在 Backend F-1 配对 Main conditioning 与 anchor，单独保留其
+   bridge tail；后续步骤使用前一步 MTP conditioning。工作 tail/hidden 不成为 canonical state。
+3. **Target。** Main 执行 `[anchor,drafts...]`，记录 GDN transitions、QSA raw keys/坐标、
+   PLE N，以及 sample/conditioning 窗口。所有记录保留原 T/B 和成员顺序。
+4. **采用。** 后端接受 c 个 draft，许可 c+1 个输出；Frontend 可进一步截断为 a。
+   Main 采用前 a 个输入，末端两种 hidden 同取 a-1 列。Backend 从真实 bridge tail 出发，
+   用 Main conditioning 与已接受 shifted IDs 重建其后 a-1 列历史，提交到 F+a-1。
+5. **结算。** 正式 penalty counts 只增加最终发布的 tokens；拒绝后缀不进入有效
+   State/KV coverage，余下的 correction/bonus 成为下一轮 anchor。
 
-## 6. 统一提交、恢复与资源寿命
+即使零 draft 被接受，正常一轮仍采用 anchor，即 a=1。零接受的取消/失败行不采用候选，
+按 Engine 终态流程释放。Checkpoint 保存 Main 末端 pair 和已提交 Backend 状态；
+恢复不依赖未决 draft 内部特征，也不重复执行 head 来重建已保存 hidden。
 
-同一 Main 输入前沿必须同时覆盖：GDN conv/recurrent state，QSA 主 KV/index coverage
-及 raw tail，PLE conv/raw-ID tail，以及有效的 Main 末端特征。MTP Backend 状态按
-bridge 确定的自身前沿纳入同一请求事务。任一层或部分 planes 完成不代表整个恢复点有效。
+## 6. Vision 与前端
+
+共享 Qwen Frontend 提供原 IDs、媒体 patches、视觉 spans 和三轴 MRoPE。
+Program 在 embedding 后、HC 展开前替换视觉列；MTP 历史建立也使用对应视觉 embedding。
+QSA 因果顺序仍使用 token ordinal，RoPE 独立消费坐标，生成文本使用保存的 rope_delta。
+
+一个 Text 窗口至多消费一个视觉条目，条目可以跨多个 chunk。
+Program 持有一份 workspace 和独立于通用计算区的视觉 handoff；各请求 session
+按 owner/generation 借用该 handoff。编码 scratch 可以复用通用区域；
+Text/decode 不覆盖有效 handoff，另一个 Vision 编码可覆盖它，后续需要时由保留 patches 重编码。
+Main 与 MTP 完成对应消费后退役条目绑定，暂停/取消也退役。
+
+已复用前缀覆盖的视觉条目不再编码。Checkpoint 不截断同一视觉条目的消费范围，
+条目中途暂停通过 Replay 恢复。Vision 不新增 StateImage 字段或 KV pool；
+其历史效果已经进入 Main/MTP 状态。
+
+Converter 默认打包
+[Flash Next 模板](../../tools/chat_templates/qwen3_8_flash_next.jinja)，
+运行时也可用 `--chat-template` 覆盖。Thinking、reasoning effort、tool calls、结构化输出
+沿公共 Frontend 实现；模型代码不处理 HTTP 协议或执行工具。
+模板默认行为和覆盖方法见[转换指南](../weight-conversion.md)，
+输出约束见[约束解码](constrained-decoding.md)。
+采样默认值来自 artifact 的 generation_config，thinking/non-thinking 共用该组值，
+用户可显式覆盖。
+
+## 7. 完整状态、checkpoint 与恢复
+
+### 7.1 StateImage 与 metadata
+
+一个规范 Main 前沿 F 的状态包含：
+
+| 数据 | 存储与含义 |
+|---|---|
+| GDN recurrent | 36 层 FP32 `[128,128,48]` |
+| GDN conv history | 每层 BF16 `[10240,3]`，卷积前历史 |
+| Main QSA tail | 12 层，各最多三列 raw BF16 index-K 和未完成块首三轴坐标 |
+| PLE conv history | BF16 `[10240,9]`，最近九列 N |
+| Main sample hidden | BF16 `[2560]`，来自 F-1 的 final mixer 输出 |
+| Main MTP conditioning | 启用 MTP 时 BF16 `[10240]`，来自同一 F-1 的 pre-final residual |
+| Backend QSA tail | 启用 MTP 时的一层 raw tail/坐标 |
+| Host metadata | Main/MTP frontiers、rope_delta、最近两枚已执行 raw IDs |
+
+模型用 `StateImageBuilder` 声明字段；Core 将每个完整 image 连续存放，Host/Device
+使用相同内部布局。Raw-ID tail 保存在 continuation metadata 中，不重复放进 Device image。
+F=0 的 Device state 清零、raw-ID tail 补 EOS，末端 hidden 尚无有效 token。
+
+每个 QSA pool 的 tail 由自己的前沿 f 决定，保存 f%4 个 raw keys，其余为 +0；
+完整块边界时 tail/坐标均为零。它独立于主 KV 的压缩编码，
+不可用已 norm/RoPE 的 keys 代替。
+
+### 7.2 Main/MTP 共同逻辑页组
+
+每个逻辑页覆盖 64 个原 token：该 pool 所有层的主 K/V data/scale planes 各有 64 行，
+每层 BF16 index plane 有 16 行。它们共用 page ID、block table、coverage、COW 和迁移事务。
+原 token p 查 `table[p/64]`；index block g 查 `table[g/16]`。
+Main 12 层属于一个 pool，MTP 的一层属于独立 Backend pool。
+
+某页有 c 个有效原 token 时，index 只有 floor(c/4) 行有效，不能独立推进 index cursor。
+Prepare 可写候选后缀，coverage 只在采用时改变。COW 保护所有可能覆盖的 planes，
+Device/Host 迁移保留其原 words；恢复还必须具有同前沿的 StateImage 和 metadata。
+具体行密度、Host packing 和传输规则归 [Paged KV](paged-kv-cache.md)。
+
+### 7.3 提交与恢复边界
 
 ```text
-Program 预留 state/record/page 资源，完成必要 COW 与输入准备
-  → 执行完整候选 forward，保留实际 records 和末端窗口
-  → 后端验收与 Frontend preview 确定每行输入接受前缀 a
-  → GDN fold、QSA/PLE extract、末端 pair 选择到 candidate state
-  → Program 一次采用完整 StateImage、KV coverage 与执行 provenance
-  → 提交输出及预算，发布事件，释放已无消费者的候选数据
+预留 state / records / pages，完成 COW 与输入准备
+  → 候选 forward
+  → 后端验收 + Frontend preview 得到接受前缀 a
+  → GDN exact fold、QSA/PLE extract、末端 hidden 选择、MTP 历史对齐
+  → 采用完整 StateImage、各 pool coverage 与输入身份
+  → 发布输出，释放候选资源
 ```
 
-取消或零接受保留基准恢复点。外层 PendingBatch 仍可能截断时，内部已采用 working
-state 不能使外层基准、records 或特征窗口失效；原位更新须等旧值的全部恢复消费者结束。
-普通 prefill/Replay 可在 chunk 采用范围明确后提取 QSA/PLE candidate state，再复用
-记录，无需保存整个 prompt 的记录。完整 checkpoint 还需要同前沿的 GDN state；当前
-长窗口只产生末端 recurrent state，因此保存点对齐实际执行边界。需要中间保存点时应在
-该处划分执行窗口，不能仅凭 QSA/PLE 的任意前缀提取宣布完整模型 checkpoint 可用。
+`qsa_tail_extract` 从实际 raw-key/坐标 records 取得 tail；
+`ple_state_extract` 从 N records 取得九列历史；raw-ID tail 按同一个 a 更新。
+QSA/PLE 在 a=0 时可以向独立 destination 复制旧状态；GDN fold 的 a=0 是严格 no-op。
+是否采用 destination 由 Program 决定。
 
-Snapshot 的 Device/Host copy、clone 和 restore 保留原执行 words；所有组成部分的
-身份、前沿、coverage 和 readiness 一致后才发布。Replay 则重新执行已经接受的输入，
-按 Engine 合同保留请求与输出语义。不可变 PLE row cache、expert 权重缓存不属于请求
-checkpoint；缓存命中、预取、搬运和 eviction 均不推进输入前沿。
+Sample 和 conditioning 必须来自同一次执行的同一接受列，按原 words 复制；
+不能对更短窗口重算 final mixer。接受前沿可不对齐四-token 块或 64-token 页。
+例如 F0=6、a=1 时，新的 QSA tail 是 raw 4/5/6，候选阶段写出的块 4..7 仍不可见。
 
-| 数据 | 最后消费者 |
-|---|---|
-| HC residual / normalized / injection | 对应 combine / Mix / block 后的 combine |
-| GDN Q/K/V、g/beta、Z | recurrence 与 record 写入；Z 另外保留到 gated norm |
-| QSA prepared Q、gate、selection | Sparse GQA；raw records 单独保留到全部 tail 提取结束 |
-| PLE E、K/V、U | K/V Linear、Gate、Conv；N records 单独保留到全部 history 提取结束 |
-| 基准 state、候选 records、末端特征窗口 | 最后一个接受、截断、取消或恢复决定及其设备消费者 |
+长窗口只产生末端 GDN recurrent state，因此完整模型 checkpoint 对齐实际执行边界。
+Program 在选定 capture 点拆分窗口；QSA/PLE 能提取中间前缀，并不单独赋予该点完整
+模型恢复能力。保存 checkpoint 保留精确 KVPrefixRef，不因非页对齐而立即复制尾页；
+真正写冲突时才执行 COW。
 
-Planner 对顺序互斥 scratch 取峰值，对跨阶段存活数据显式保留，使用各 Op 的权威区间
-容量查询，不复制私有阈值。Host 函数返回不表示 Device 已结束使用。Graph 按实际
-exact-B topology 和稳定 backing 规划；[GDN fold](../../include/ninfer/ops/gdn_replay.h)
-的 host row descriptors 在 capture 时按值固定，改变它们需新 capture，不能套用
-QSA/PLE Device metadata 的 replay 规则。
+Snapshot 复制/恢复完整 image、各 pool 前缀和 metadata；Replay 重新执行已接受输入，
+保留原请求身份、输出 ledger 和预算，不重复发布。暂停可以释放 lane，恢复使用新的
+state slot/table row。前缀命中采用公共资源策略，不另建 QSA/PLE 专用匹配或保留算法。
+不可变 PLE row cache、expert cache、ticket、scratch 和 draft 工作特征不属于 checkpoint。
 
-### 6.1 CUDA Graph 与 Host 交接
+## 8. CUDA Graph 与启动资源
 
-`program/graphs.*` 按 exact-B 建立 ordinary `T=1`、MTP verify `T=K+1`、逐步 draft
-和 sampling/Finish 图。`program/text_graph.*` 组织原生 Main 层遍历，复用公共 MoE
-分段图。Eager 与 capture 调用同一份 stem、mixer、MoE GPU body、combine 和 final mixer。
+### 8.1 图的边界
 
-Main 在 PLE 所在位置保留 Host 交接：先执行前序层，取得上传 dependency，再重放对应
-PLE 槽的消费图并继续后序层。两个上传槽只复制 PLE 消费段；GDN 层定义和 MoE subset
-定义在上下文档位之间共享，只有 QSA 相关段随 envelope 更新。CPU experts、expert cache
-调度、文件 I/O 和 Host 等待均在 capture 外执行。
+`program/graphs.*` 按 exact-B 准备 ordinary、逐步 draft、target verify 和采样/Finish。
+Main 由 `text_graph.*` 组织 stem、逐层 mixer/MoE/combine、PLE 消费和 final mixer。
+Eager/capture 调用同一组 GPU body，CPU experts、缓存 lease 与磁盘 I/O 在图外执行。
 
-各行位置、有效列数、state selectors、KV table rows 和采样配置通过稳定 Device buffers
-更新，不属于 graph key。上下文档位是资源上界，由 Program 选取并在启动时验证 graph
-update；kernel 分派仍由 Ops 决定。短上下文、all-select 与不同 batch 行的有效范围由
-Indexer/Sparse GQA 在 kernel 内处理。
+PLE 位于前序层之后的 Host 交接处：提交前序计算，等待当前 HostReady 并排入 H2D/event，
+选择对应上传槽的 PLE 消费图，再继续后续层。两个稳定 E 地址仅各自绑定 PLE 消费段。
+每层公共 MoE 图保留 CPU/cache 交接，不能把整个 Main 描述为一次完整图重放。
 
-每个 MTP draft 图产生下一 ID，随后在图外 record event 并异步 D2H，继续增量准备 PLE。
-Target verify 与 Finish 分开，Host 在 Finish 前准备约束 mask。Frontend 决定最终采用长度
-后，仍调用 GDN fold、QSA/PLE tail 提取、末端 pair 选择与 Backend 历史对齐；这些提交
-操作不冻结 Host 的动态接受长度，也不改变规范 Main/Backend 前沿关系。
+同一 exact-B 内，位置、valid columns、state selectors、table rows、page IDs、route/mask
+内容是 Device 输入。上下文 envelope 由 Program 选择并更新兼容图；GDN 定义和
+MoE subset 定义跨档位共享，QSA 相关定义随 envelope 更新。启动时验证全部更新关系，
+Op 的私有分派仍由 Op 决定。
 
-`graph_preparation.*` 接入公共启动校准。Probe 借用已加载权重，使用少量私有 KV 页和
-公共 MoE calibration bank，保留实际 T/B、KV 格式、上下文容量和图共享关系。临时状态与
-映射在准备后释放。图销毁、probe 销毁后的驱动保留量与图重建估计按公共启动合同处理，
-再规划正式 expert cache。Graph resources 先于其引用的 workspace、bridge 和 events 销毁。
-重放的 workspace 用量依据捕获时记录的布局维护逻辑峰值。
+MTP 每步 draft 图后在图外提交 ID event/D2H，增量准备 PLE。
+Target 与 Finish 分开，Host 在 Finish 前生成约束 mask。最终接受长度仍由 Host
+事务决定，GDN fold、QSA/PLE tail 提取及 Backend 对齐在图外执行。
 
-### 6.2 Planner 的基础 payload 预算
+### 8.2 容量规划
 
-以下是本实例的逻辑 payload；state 副本数、页取整、对齐、workspace、Graph、传输槽和
-容量余量由实际 planner 另计。每份 canonical state 都对应一个完整恢复点。
+加载前从 config、Binding/Use 和各 Op 容量查询建立执行 profile。
+权重 materialize 后，Graph probe 使用少量私有 KV 页和公共 MoE calibration bank，
+保留实际 batch、draft 数、KV 格式、context envelope 与图共享关系。
+销毁 probe 后按实际可用显存和 Graph 重建估计规划正式资源，遵循公共启动的 1 GiB
+headroom 与有界容量纠偏规则。Graph 先于其引用的 workspace、bridge 和 events 销毁。
 
-| 对象 | Payload |
+Flash Next 的 prefill chunk 默认 4096，可显式指定 128 的正整数倍，
+实际窗口受剩余上下文、capture 点和媒体边界限制。没有启动自动 chunk 调优。
+自动 KV 先保证一个完整上下文，剩余预算用于 expert cache；显式 KV 容量必须兑现。
+Device pool 在启动时固定，不在请求期间扩容或动态与 expert cache 交换配额。
+
+Workspace 对顺序互斥 scratch 取峰值，跨阶段存活的 records、conditioning 和视觉
+handoff 单独计入。PLE 容量为
+`Mmax=max(prefill_chunk,max_concurrency*(draft_tokens+1))`，
+两份 pinned E 和两份 Device E 各自共占 `2*Mmax*2560*2` B，
+另计 64 MiB row cache、I/O buffers 和有界 Host metadata。
+
+以下是本实例的逻辑 state payload，尚未计入 field/slot 对齐：
+
+| 内容 | 每个状态副本 |
 |---|---:|
-| Main 36 层 GDN recurrent state，FP32 `36×48×128×128` | 113246208 B = 108 MiB/状态副本 |
-| Main 36 层 GDN conv history，BF16 `36×10240×3` | 2211840 B = 2.109375 MiB/状态副本 |
-| Main 全部 GDN canonical state | 115458048 B = 110.109375 MiB/状态副本 |
-| PLE BF16 九列 history；Host raw-ID tail | 184320 B = 180 KiB/状态副本；另 8 B metadata |
-| QSA raw tail 与块首三轴坐标 | 780 B/层/状态副本；Main 12 层，MTP 另 1 层 |
-| Main sample hidden 与 MTP conditioning pair | 25600 B = 25 KiB/状态槽；不启用 MTP 时只保留 5 KiB sample |
-| 一份 HC residual 或 normalized buffer | `20480*M` B = 20 KiB/物理列 |
-| 一份 block input/output 或 sample buffer；injection | `5120*M` B；`16*M` B |
-| Main 末端 pair 候选窗口 | `25600*T*B` B；`T=16,B=8` 时 3.125 MiB |
+| Main GDN recurrent | 108 MiB |
+| Main GDN conv history | 2.109375 MiB |
+| PLE N history | 180 KiB |
+| QSA raw tail + 块首坐标 | 780 B/层；Main 12 层，MTP 另 1 层 |
+| Main sample / MTP conditioning | 5 KiB / 启用时另 20 KiB |
 
-主 KV 与 index 的每层共同页组预算如下。每页覆盖 64 个原 token，表中已包含该层
-4096 B 的 BF16 compressed index plane；压缩没有减少主 K/V 的历史 coverage。
+每个逻辑页组包含 pool 的全部层；下面按单层列出主 KV 加 4096 B index plane：
 
-| 主 KV profile | 每层页组 bytes，含 index | Main 12 层 bytes/原 token |
+| 主 KV profile | 单层 64-token payload | Main 12 层 bytes/原 token |
 |---|---:|---:|
-| BFloat16 | 135168 | 25344 |
-| Int8Group64 | 71680 | 13440 |
-| Fp8E4M3Row256 | 70144 | 13152 |
-| Nvfp4Group16 | 40960 | 7680 |
-| Fp8KeyNvfp4Value | 55552 | 10416 |
+| BFloat16（BF16 K / FP16 V） | 135168 B | 25344 |
+| Int8Group64 | 71680 B | 13440 |
+| Fp8E4M3Row256 | 70144 B | 13152 |
+| Nvfp4Group16 | 40960 B | 7680 |
+| Fp8KeyNvfp4Value | 55552 B | 10416 |
 
-MTP 使用“每层页组”列按一个 Backend QSA 层另算，其物理页数依自身前沿与 provisional
-lead 规划，不假定与 Main 相同。最终容量、Host reservation、迁移 bytes 和资源汇总从
-同一 expanded plane schema 推导；这张表不代替运行时布局查询。
+MTP pool 按一层另计，其容量包含 provisional lead。
+实际分配从 expanded plane schema、StateImage layout 和 workspace 查询产生，
+不以该 payload 表代替启动预算。完整 Host experts、registered 子集、pinned context、
+PLE cache 和进程内存分别计费；registered 范围不是另一份专家权重。
 
-<a id="implementation-status"></a>
+## 9. 实现与维护入口
 
-## 7. 已完成能力与剩余工作
-
-本节是 Qwen4Exp 执行进度的统一入口；完成范围按当前代码和已验收结果区分。独立 Op
-验收不等于完整模型或端到端性能验收。
-
-| 已完成能力 | 范围与权威入口 |
+| 责任 | 实现 |
 |---|---|
-| 加载与执行资源 | `qwen4_exp/load.*`、`execution/profile.*`、`parameters.*`、`state/` 和 `program/` 已实现组件选择、原表示绑定、连续 StateImage、Main/MTP 页组、records/workspace、公共 MoE 资源与 PLE 双槽 |
-| Main Text | `execution/text.*` 组合 HC/GDN/QSA/PLE/MoE；原生 `program/` 支持 prefill、ordinary decode、control、Replay、scoring、checkpoint/Host 恢复与取消；公共 Qwen Frontend 提供 thinking、tool call 和约束输出 |
-| Vision | 共享图像/视频编码、HC 前 embedding 替换、MRoPE、跨 chunk handoff、媒体前缀复用及暂停恢复；PLE 使用原 IDs，与编码异步重叠 |
-| MTP | `execution/mtp.*` 与 `program/mtp.cpp`、`commit.cpp` 实现 stem、历史建立、draft/verify/bridge、精确接受前缀、双 pool 恢复、约束输出及增量 PLE；Text/Vision 共用 |
-| CUDA Graph | ordinary、MTP draft/verify/Finish、单列 control；exact-B、QSA envelope 更新、PLE 双槽、共享 MoE 交接与启动实测校准 |
-| Artifact/converter 与纯 Linear | Qwen4Exp 配置、Binding/Use、完整 Text/Vision/MTP 权重产物、NF4 持久编码/分页布局及 20 项矩阵支持；详见模型文档 |
-| GDN 输出 norm | `sigmoid_gated_rmsnorm`，与 SiLU gated 形式共用 RMSNorm 家族；已通过数学与 Op 性能验收 |
-| GDN control | BF16 `[96,2560]` 合并 AB projection、权重准备、FP32 controls 和容量查询；已通过数学与 Op 性能验收 |
-| HC 基础计算与 Mix | 五种基础形式、block/final Mix 及区间容量查询，保留 residual seam；已通过数学与 Op 性能验收 |
-| GDN input 与 ReplaySSM | Q8 `[16384,2560]` 的 `linear_split`、融合投影/卷积 snapshot/record 及各自容量查询；`(36,16,48,10240)` 全层 fold 已实现 |
-| QSA | 分段输入投影、五类 KV 的 Prepare/Sparse GQA、Indexer、tail extraction 已实现 |
-| Paged KV 机制 | `tokens_per_row=1/4` 的共同逻辑页及 Host/Device plane 布局、传输和相应覆盖语义已有通用实现；原生 Main/MTP QSA pools 与 StateImage 已接入这些公共存储机制 |
-| PLE GPU 局部能力 | `ple_gate`、`ple_conv_add`、`ple_conv_add_norm`、`ple_state_extract` 已实现；Gate 直接消费合并 K/V view，写 BF16 U 和正式 N records |
-| Main/MTP GPU MoE | NVFP4 A4、block-FP8 A8/G128、小批量 A16、BF16 router/shared、完整与子集入口及固定 Graph replay 已实现 |
-| Main CPU MoE | CPU `routed_swiglu` 直接读取 NVFP4 bank；BF16 输入、FP32 contribution、expert subset、逐 expert divisor 与有界 workspace 已实现 |
-| PLE 准备组件 | 精确 hash/NF4 解码、磁盘 backing、行/页去重与缓存、增量窗口、取消和 GPU 双槽交接已实现，并已接入 Main Program 的准备/上传/消费、下一 chunk 预取与取消退役 |
+| 配置、绑定、放置和只读 Model | [config](../../src/models/qwen4_exp/config.cpp)、[load](../../src/models/qwen4_exp/load.cpp)、[bindings](../../src/models/qwen4_exp/load/weights.cpp) |
+| 无地址 profile、Parameters 与层计算 | [execution](../../src/models/qwen4_exp/execution/) |
+| 启动预算、资源和图 | [planning](../../src/models/qwen4_exp/program/planning.cpp)、[resources](../../src/models/qwen4_exp/program/resources.cpp)、[graphs](../../src/models/qwen4_exp/program/graphs.cpp) |
+| PLE hash、读取服务和上传槽 | [ple](../../src/models/qwen4_exp/ple/)、[PlePipeline](../../src/models/qwen4_exp/program/ple_pipeline.cpp) |
+| Main/MTP unit 与采用 | [eager](../../src/models/qwen4_exp/program/eager.cpp)、[mtp](../../src/models/qwen4_exp/program/mtp.cpp)、[commit](../../src/models/qwen4_exp/program/commit.cpp) |
+| StateImage、页组和 checkpoint | [state](../../src/models/qwen4_exp/state/)、[context](../../src/models/qwen4_exp/program/context.cpp)、[checkpoints](../../src/models/qwen4_exp/program/checkpoints.cpp) |
+| 静态 expert 排序 | [expert_priority](../../src/models/qwen4_exp/program/expert_priority.cpp) |
 
-Main 使用 1–8 路执行和 BF16、INT8、FP8、NVFP4、K8V4 五种 KV 存储。Main experts
-采用完整 Host backing；公共 MoE 根据实际 token 列数选择 CPU/GPU 子集或完整层流式计算。
-Flash Next 配置默认使用已标定的逐层 expert 排序，其他配置使用 ID 顺序；
-`MoeOptions::expert_priority` 可覆盖各层排序。Prefill chunk
-由启动配置决定，默认 4096。PLE 的 raw-ID tail 随 continuation 保存，准备服务与上传双槽
-由 Program 拥有，下一窗口的 I/O 不推进模型前沿。
-
-CUDA Graph 已覆盖 ordinary、MTP draft/verify/Finish 及单列 control；Prefill、Replay、
-Vision 编码和最终接受状态采用沿用 eager 路径。
-
-后续性能工作包括本实例的 expert 优先级、CPU/GPU 切换策略和上下文成本校准。现有
-Qwen3.5 的 DFlash/DFlash2 支持不扩展为 Qwen4Exp 的执行声明。
-
-后续实现沿用 [Op 开发规则](op-development.md)及 [测试](../../tests/README.md)、
-[benchmark](../../bench/README.md)已有入口。数值计算依据独立数学 oracle；exact
-record/fold、feature selection 和状态搬运依据对应实际执行的逐 word/bit 合同。
-跨层测试关注同一接受前沿下全部状态的一致性，不以 kernel parity 或可读模型输出替代。
+[Tests](../../tests/README.md)维护 Op 数学、状态语义、PLE 和模型加载测试入口；
+[Benchmarks](../../bench/README.md)维护局部与完整 Engine 测量。

@@ -100,8 +100,8 @@ The Qwen4Exp adapter selects the dedicated
 [`qwen3_8_flash_next.jinja`](../tools/chat_templates/qwen3_8_flash_next.jinja) by default;
 `--resource chat_template.jinja=PATH` explicitly replaces it. The 27B template is independent.
 
-The Qwen4Exp adapter and Engine support Text, Vision and native MTP. CUDA Graph decode is enabled by default;
-MTP uses the full shared head. DFlash and indexed proposal execution are not enabled.
+The Qwen4Exp adapter and Engine support Text, Vision and native MTP. MTP uses the full shared head;
+omit `--proposal`. DFlash/DFlash2 and indexed proposal execution are unsupported for Qwen4Exp.
 CUDA self-quantization compiles
 the SM120 encoder on first use and requires a CUDA toolkit, C++ compiler and Ninja.
 PLE uses two bounded passes per shard, with no full-table materialization. The complete recipe
@@ -109,7 +109,8 @@ contains about 100.67 GiB of weight/control payload, split by the existing V3 wr
 Main experts use two NVFP4 banks per layer with independent matrix divisors. MTP uses two
 128×128 block-FP8 banks, preserving NVIDIA E4M3FN codes and BF16 multipliers; its other private
 parameters also come from the NVIDIA source. PLE alone uses the BF16-to-NF4 stored-scale method.
-See the [model and weight contract](maintainer/qwen4_exp-model.md) for exact layouts and precision.
+See the [model and weight contract](maintainer/qwen4_exp-model.md) for layouts and precision, and
+the [execution reference](maintainer/qwen4_exp-execution.md) for runtime support and memory use.
 
 ## Change part of a recipe
 

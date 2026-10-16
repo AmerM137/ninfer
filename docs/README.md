@@ -43,6 +43,9 @@ other references own narrower contracts:
 | [Numeric formats](maintainer/tensor-formats.md) | represented values, codes/scales, conversion arithmetic and numerical interpretation |
 | [Storage layouts](maintainer/storage-layouts.md) | packing, plane offsets, padding, encoded sizes and view addressing |
 | [Qwen3.5 model](maintainer/qwen3_5-model.md) | Dense/MoE mathematics, instance config, logical parameters, MTP, Vision and state semantics |
+| [Qwen4Exp model and weights](maintainer/qwen4_exp-model.md) | Flash Next architecture, quantization recipe, merged projections, expert banks and PLE representation |
+| [Qwen4Exp execution and state](maintainer/qwen4_exp-execution.md) | current support, layer flow, PLE pipeline, MTP/Vision, continuation, resource planning and CUDA Graph |
+| [Expert weight cache](maintainer/expert-weight-cache.md) | Host/GPU bank sources, replica cache, mixed CPU/GPU execution, streaming and graph handoffs |
 | [DFlash and DFlash2](maintainer/dflash.md) | conditioning, masked draft computation, proposal distributions and backend state |
 | [Constrained decoding](maintainer/constrained-decoding.md) | GBNF/JSON/choice/regex, tool policies, masks, speculative transactions and observations |
 | [Resource scheduling and context cache](maintainer/resource-scheduling-and-context-cache.md) | core design for continuation, retention, incremental resources, preemption and recovery |
@@ -57,17 +60,11 @@ Model cards contain official artifact facts and source provenance. The
 fields, parameter expansion and native supported domains are maintained by the code linked from
 these references.
 
-## Architecture integration and planned work
+Qwen3.8-Flash-Next is the Qwen4Exp instance; Qwen3.8-27B uses the Qwen3.5 architecture.
+The model references own mathematical and stored-representation facts, and the execution reference
+owns integrated support and its limits. Concrete Op contracts live in `include/ninfer/ops/`.
 
-Qwen3.8-Flash-Next uses the Qwen4Exp architecture. Its Text/Vision/MTP Engine includes CPU/GPU MoE
-and disk-backed PLE, with segmented CUDA Graph decode. The execution document
-owns current support and remaining work. Concrete Op contracts live in `include/ninfer/ops/`.
+## Planned work
 
-| Design | Responsibility |
-|---|---|
-| [Qwen4Exp model and weights](maintainer/qwen4_exp-model.md) | architecture, quantization, merged matrices, source binding and residency budgets |
-| [Qwen4Exp execution and state](maintainer/qwen4_exp-execution.md) | layer flow, cross-Op handoffs, transactions, state lifetime and remaining integration |
-| [Qwen4Exp GPU MoE](maintainer/qwen4_exp-moe-gpu.md) | NVFP4/block-FP8 expert computation, GPU interfaces, fixed Graph topology and workload tuning plan |
-| [Qwen4Exp PLE preparation](maintainer/qwen4_exp-ple-io.md) | lookup parameters and inputs, disk preparation, independent H2D slots and cancellation |
-| [Expert weight cache](maintainer/expert-weight-cache.md) | affine expert sources, explicit placement, GPU replica cache and pending mixed execution |
-| [Linear test maintenance](maintainer/linear-test-reorganization-plan.md) | pending consolidation of test runners and explicit case contracts |
+[Linear test maintenance](maintainer/linear-test-reorganization-plan.md) tracks the pending
+consolidation of test runners and explicit case contracts.

@@ -3,8 +3,8 @@
 > Selected checkpoints. Maximum single-GPU inference performance.
 
 NInfer is a from-scratch C++/CUDA inference engine for a single NVIDIA GeForce RTX 5090.
-Qwen3.5 Dense and MoE support text, image and video prompts; Qwen4Exp supports Text/Vision/MTP.
-Both use the local CLI or OpenAI-/Anthropic-compatible HTTP APIs. The runtime uses one GPU, one
+Qwen3.5 Dense/MoE and Qwen4Exp (Qwen3.8-Flash-Next) support text, image/video prompts and native MTP.
+They use the local CLI or OpenAI-/Anthropic-compatible HTTP APIs. The runtime uses one GPU, one
 resident model, and one to eight execution lanes fixed at startup.
 
 Five official artifacts are available. The quick-start commands use Qwen3.8-27B NVFP4.
@@ -239,13 +239,19 @@ image/video Vision prompts, plus CPU/GPU MoE expert offload with CUDA Graph deco
 `--spec dflash2 --draft-tokens 7` for the same Text/Vision Engine path, with draft counts 1..15
 and either full or optimized proposal heads.
 
+Qwen3.8-Flash-Next uses CPU/GPU Main experts, disk-backed NF4 PLE and segmented CUDA Graph.
+Its native MTP uses the full shared head; DFlash/DFlash2 and optimized proposal heads are not
+supported for this architecture. See the [CLI commands](docs/cli.md),
+[conversion recipe](docs/weight-conversion.md) and
+[current support reference](docs/maintainer/qwen4_exp-execution.md).
+
 The product boundary remains intentionally small:
 
 - one RTX 5090 and one resident model per Engine;
 - one to eight resident execution lanes with bounded FIFO ingress;
 - resource-pressure preemption with snapshot or token-replay recovery;
 - no priority/QoS, multi-GPU, or distributed serving;
-- one shared startup-fixed KV pool across active requests and retained prefixes;
+- startup-fixed typed KV pools shared by active requests and retained prefixes;
 - model architectures and format/shape combinations use explicitly implemented native paths;
 - parsed tool calls are returned to the client; NInfer does not execute tools;
 - the in-tree C++ headers are not distributed as an installed SDK.

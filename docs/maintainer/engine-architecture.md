@@ -150,8 +150,9 @@ Engine 在大权重读取前消费无地址的 `ModelProfile`，规划固定权�
 MoE backing。权重加载后以少量物理 KV 页校准完整的 Graph 集合，保留实际 context、batch、
 speculative 配置与拓扑共享关系；临时 Host context cache 为零。校准资源销毁后重新取得可用显存，
 扣除 Graph 重建估计，再确定正式 KV 与 expert cache 容量。静态容量曲线只计算显式 backing。
-全量 GPU 候选不可行时，受支持的 MoE 使用 Host 来源及 Program 所有的 GPU 副本，
-两个候选不同时持有模型，见[Expert 权重缓存](expert-weight-cache.md)。
+Qwen3.5 MoE 在全量 GPU 候选不可行时选择 Host Main experts；Qwen4Exp Main 当前固定使用
+Host 来源及 Program 所有的 GPU 副本。放置候选由原生 Startup 提供，两个候选不同时持有模型，
+见[Expert 权重缓存](expert-weight-cache.md)。
 `NINFER_VRAM_BUDGET_MIB` 限定引擎 Device 预算，实际可用显存构成另一上限。
 Runtime 的 `model_startup.h` 统一预算、候选选择、校准收敛和有界重建；模型侧 `Startup` 提供
 权重放置、容量计划、Frontend 构造和 Graph 校准合同。公共启动流程不解释具体层布局。

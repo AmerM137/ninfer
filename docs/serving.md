@@ -5,7 +5,8 @@ Anthropic-compatible HTTP endpoints over one resident NInfer Engine.
 
 Qwen3.8-Flash-Next supports Text/Vision/MTP serving with segmented CUDA Graph decode.
 Add `--vision` for media and `--spec mtp --draft-tokens 3` for native MTP with the full head.
-See the [CLI example](cli.md) for artifact and resource use.
+See the [CLI example](cli.md) for commands and the
+[execution reference](maintainer/qwen4_exp-execution.md) for support and resource limits.
 
 ## Start the server
 
