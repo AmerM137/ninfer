@@ -35,6 +35,7 @@ venv/
 out/
 
 # Local workspace and transient runtime output
+/.agent-tmp/
 /.local/
 /temp/
 /temp-*/
